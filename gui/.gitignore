@@ -1,0 +1,11 @@
+/target
+/gen
+ui/node_modules
+ui/dist
+# Built by `npm run theme` from the site's theme module, so that one file
+# defines the palette for both surfaces. Checking the output in would be
+# checking in a copy that can go stale.
+ui/src/theme/asterism.theme.css
+# Screenshots of the built app, taken by shots.sh. Artifacts of a proof,
+# not sources.
+/shots

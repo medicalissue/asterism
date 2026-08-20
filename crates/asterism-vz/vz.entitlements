@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  The only entitlement Virtualization.framework requires to create a
+	  VZVirtualMachine. Boolean, and NOT restricted: an ad-hoc signature
+	  carrying it is enough for a local build — no Apple approval, no
+	  provisioning profile. A signed *release* build needs a Developer ID
+	  and notarization on top (BACKENDS.md §4).
+
+	  Deliberately absent: com.apple.vm.networking. That one gates
+	  VZBridgedNetworkDeviceAttachment and IS restricted — it needs a
+	  managed entitlement request approved by Apple. The helper uses
+	  VZNATNetworkDeviceAttachment precisely so this file stays a
+	  one-liner, which is also why `ast ssh` has to find the guest through
+	  the DHCP lease file.
+	-->
+	<key>com.apple.security.virtualization</key>
+	<true/>
+</dict>
+</plist>

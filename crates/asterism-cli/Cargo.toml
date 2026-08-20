@@ -1,0 +1,19 @@
+[package]
+name = "asterism-cli"
+description = "The ast CLI for Asterism: boot real VMs on machines you already own."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["personal-cloud", "vm", "distributed", "self-hosted"]
+categories = ["command-line-utilities", "virtualization"]
+
+[[bin]]
+name = "ast"
+path = "src/main.rs"
+
+[dependencies]
+asterism-core.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+clap.workspace = true

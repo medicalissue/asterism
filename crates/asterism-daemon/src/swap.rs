@@ -1,0 +1,1147 @@
+//! Swapping an instance's cpu part onto another device — the offline
+//! migration of `docs/ROADMAP.md` Phase 6, in the vocabulary of
+//! `docs/MODEL.md`.
+//!
+//! An instance is a computer assembled from a pool of parts, and cpu/ram is
+//! one part of it. Which device supplies that part is a mutable attribute of
+//! the instance, not a relationship the device has to it, so
+//! `ast set dev cpu desktop` changes one line of a parts table. The
+//! instance's identity — its name, its id, its snapshots — is orbit-global
+//! and does not move, because it was never on a device to begin with.
+//!
+//! What *does* move is bytes. The disk defaults to the device supplying
+//! cpu/ram and follows it, one copy and one writer throughout.
+//!
+//! # What crosses the wire
+//!
+//! Not the distro. Base images are content-addressed and cached per device,
+//! so the target either has the same base already or fetches it **from the
+//! source over the mesh** rather than from the internet — a peer fetch, which
+//! is what MODEL.md's storage rule asks for. What is left is the instance
+//! directory: the root disk, the EFI variable store, the cloud-init seed and
+//! its fingerprint, and the snapshots.
+//!
+//! The root disk is where the size is, and it is nearly all hole. It was made
+//! with `clonefile(2)` from the base and then truncated up to the instance's
+//! shape, so a 10 GiB disk holds what the guest has actually written plus
+//! what it shares with the base. [`asterism_core::cow::extents`] walks it with
+//! `SEEK_DATA`/`SEEK_HOLE` and only the allocated ranges are sent; the holes
+//! are reconstructed on the far side by creating the file at the same length
+//! and writing only where there was data. That is the honest v1 delta: it is
+//! the divergence *plus* whatever the clone still shares with the base, and
+//! the obvious next step is to skip ranges the target could read out of its
+//! own copy of that base. It is not the naive answer, which would be to send
+//! ten gigabytes of zeroes.
+//!
+//! Snapshots cost the same way, and for now they cost it separately: locally a
+//! snapshot is a `clonefile(2)` of the disk and occupies almost nothing, but
+//! on the wire it is its own set of allocated ranges. Sending a range once and
+//! cloning it on the far side is the same optimisation as the one above,
+//! wearing a different hat.
+//!
+//! # Two phases, and an epoch
+//!
+//! There must never be two bootable copies. So:
+//!
+//! 1. **Prepare.** The source marks the instance [`Moving`] at `epoch + 1`
+//!    and refuses to boot it. Its row is still the authoritative one.
+//! 2. **Transfer.** The target writes into a *staging* directory whose name
+//!    no instance can have. Nothing lists it, nothing boots it, and a daemon
+//!    that dies in the middle leaves it there to be swept.
+//! 3. **Commit, target.** The target checks what arrived against the manifest
+//!    — every file's length, every file's allocated byte count — renames the
+//!    staging directory into place and writes its shard row with itself
+//!    supplying cpu, at the new epoch. Only now does a second copy exist, and
+//!    the source's is already fenced.
+//! 4. **Commit, source.** The source drops its row and its bytes, and leaves
+//!    a note so that asking it directly gets "moved to desktop" rather than
+//!    "no such instance".
+//!
+//! Any failure before step 3's ack is an abort: the target's staging
+//! directory goes, the source's fence comes off, and the source's row — which
+//! never stopped being the authoritative one — is authoritative again. The
+//! epoch is what settles the case nothing else can: two rows for one instance
+//! id, from two devices that could not see each other, are decided by the
+//! higher number.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
+
+use anyhow::{anyhow, bail, Context, Result};
+use serde::{Deserialize, Serialize};
+
+use asterism_core::cow;
+use asterism_core::hv::ImageRef;
+use asterism_core::instance::{now_unix, Instance, Moving, Status, VolumeKind};
+use asterism_core::paths;
+use asterism_core::protocol::{BaseImage, MoveFile, MoveManifest, Request, Response};
+use asterism_core::registry::Shard;
+
+use crate::backend;
+use crate::mesh::{ClientIo, Mesh};
+use crate::Node;
+
+/// Marks a directory that holds a half-arrived instance. Instance names are
+/// ascii letters, digits and `-`, so a name with this in it can never be one
+/// — which is exactly why the staging directory is safe to leave lying
+/// around: nothing can resolve to it.
+pub const STAGING: &str = ".moving-";
+
+/// How long a device remembers that an instance left it.
+///
+/// A cache note and nothing more. It exists so that `ast --device laptop
+/// status dev` says "moved to desktop" for a while instead of "no instance
+/// named dev in this orbit", which would be true of that shard and useless to
+/// the person reading it. Every path that matters resolves across the orbit
+/// and finds the real row.
+const NOTE_TTL_SECS: u64 = 24 * 60 * 60;
+
+// ---- the plane -------------------------------------------------------------
+//
+// Same shape as `crate::volume`'s, and for the same reason: the target's half
+// of a move is reached from a mesh stream, which is served far from anywhere
+// that could have been handed a `Node` and a `Mesh` as arguments.
+
+struct Ctx {
+    mesh: Option<Arc<Mesh>>,
+}
+
+static CTX: OnceLock<Ctx> = OnceLock::new();
+
+/// Install this device's half of the move machinery. Called once, from
+/// `main`, once the mesh is up.
+///
+/// The sweep is deliberately *not* here: it runs before anything is served
+/// (see [`sweep_staging`]), because a transfer this device was receiving when
+/// it died should be gone before the first request arrives, not shortly
+/// after.
+pub fn init(mesh: Option<Arc<Mesh>>) {
+    let _ = CTX.set(Ctx { mesh });
+}
+
+fn ctx() -> Result<&'static Ctx> {
+    CTX.get().context("this daemon's move machinery was never started")
+}
+
+/// This device's mesh presence, for the half of a move that is reached from
+/// a mesh stream and so has nothing to be handed one by.
+pub fn mesh() -> Result<Arc<Mesh>> {
+    ctx()?
+        .mesh
+        .clone()
+        .context("this daemon has no mesh endpoint, so it cannot take an instance")
+}
+
+// ---- staging ---------------------------------------------------------------
+
+/// Where a half-arrived instance lives until it is committed.
+///
+/// Under `instances/`, next to the real ones, so it is on the same filesystem
+/// and the commit is a rename rather than a copy — and named so that no
+/// instance could ever be called that.
+pub fn staging_dir(name: &str, epoch: u64) -> PathBuf {
+    paths::instance_dir(&format!("{name}{STAGING}{epoch}"))
+}
+
+/// Delete every staging directory on this device.
+///
+/// Run at daemon start — before the socket is bound, before the mesh comes
+/// up — which is the "next contact" a killed transfer gets.
+/// A staging directory is by construction not referenced by any shard row, so
+/// there is nothing to consult before removing one: if it were committed it
+/// would not be called this any more.
+pub fn sweep_staging() {
+    let dir = paths::home_dir().join("instances");
+    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.contains(STAGING) {
+            continue;
+        }
+        match std::fs::remove_dir_all(entry.path()) {
+            Ok(()) => eprintln!(
+                "astd: swept {} — an interrupted move left it, and it was never bootable",
+                entry.path().display()
+            ),
+            Err(e) => eprintln!("astd: could not sweep {}: {e}", entry.path().display()),
+        }
+    }
+}
+
+/// What the target counted as it wrote, kept inside the staging directory.
+///
+/// The commit turns on this rather than on the importer's word, so a commit
+/// that arrives after the importing daemon was restarted still checks the
+/// same numbers — and a staging directory with no receipt is a transfer that
+/// never finished, whatever else it looks like.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Receipt {
+    pub epoch: u64,
+    pub from_device: String,
+    /// Total bytes written.
+    pub bytes: u64,
+    /// Per file, relative path to bytes written.
+    pub files: BTreeMap<String, u64>,
+}
+
+impl Receipt {
+    fn path(dir: &Path) -> PathBuf {
+        dir.join(".move-receipt.json")
+    }
+
+    pub fn save(&self, dir: &Path) -> Result<()> {
+        std::fs::write(Self::path(dir), serde_json::to_vec_pretty(self)?)
+            .context("recording what arrived")
+    }
+
+    fn load(dir: &Path) -> Result<Self> {
+        let bytes = std::fs::read(Self::path(dir))
+            .context("this transfer never finished — there is no record of what arrived")?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+}
+
+// ---- the manifest ----------------------------------------------------------
+
+/// Files in an instance directory that a move does not carry.
+///
+/// Everything here is about *this* device's copy of the guest rather than
+/// about the guest: a console log belongs to the boot that wrote it, and a
+/// pid or a socket describes a process on a machine the instance is leaving.
+/// Anything else in the directory travels, so a file a future backend adds
+/// comes along without this list having to learn about it.
+fn is_plumbing(name: &str) -> bool {
+    name == "console.log"
+        || name.starts_with('.')
+        || name.ends_with(".pid")
+        || name.ends_with(".sock")
+        || name.ends_with(".tmp")
+        || name.ends_with(".part")
+}
+
+/// Everything a move of this instance would carry, with the two numbers that
+/// matter per file: what it claims to be, and what it actually holds.
+pub fn manifest(inst: &Instance) -> Result<MoveManifest> {
+    let dir = paths::instance_dir(&inst.name);
+    let mut files = Vec::new();
+    collect(&dir, &dir, &mut files)?;
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let local_volumes = inst
+        .volumes
+        .iter()
+        .filter(|v| v.kind == VolumeKind::Dir)
+        .map(|v| v.guest_path())
+        .collect();
+
+    Ok(MoveManifest {
+        instance: inst.clone(),
+        arch: std::env::consts::ARCH.to_owned(),
+        base: base_image(inst)?,
+        files,
+        local_volumes,
+    })
+}
+
+fn collect(root: &Path, dir: &Path, out: &mut Vec<MoveFile>) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // An instance that has never booted has no directory, and moving it
+        // is moving a record. That is legal and cheap.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let path = entry.path();
+        let meta = entry.metadata()?;
+        if meta.is_dir() {
+            if !is_plumbing(name) {
+                collect(root, &path, out)?;
+            }
+            continue;
+        }
+        if !meta.is_file() || is_plumbing(name) {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| anyhow!("{} is not under {}", path.display(), root.display()))?
+            .to_string_lossy()
+            .into_owned();
+        out.push(MoveFile {
+            path: relative,
+            len: meta.len(),
+            allocated: cow::allocated(&cow::extents(&path)?),
+            mode: meta.permissions().mode() & 0o777,
+        });
+    }
+    Ok(())
+}
+
+/// The base image this instance's disk was cloned from, content-addressed.
+///
+/// An instance whose image reference names nothing this device has is not an
+/// error here: the disk is a complete file and boots without the base. The
+/// zero length says "nothing to fetch" and the target's probe decides what
+/// that means for it.
+fn base_image(inst: &Instance) -> Result<BaseImage> {
+    let Some(reference) = inst.image.clone() else {
+        bail!("instance {:?} has no image recorded — there is nothing to move it to", inst.name);
+    };
+    let base: ImageRef = match backend::image_ref(&reference) {
+        Ok(base) => base,
+        // The reference does not resolve *here* either; the manifest says so
+        // and the target refuses, rather than this failing in the abstract.
+        Err(_) => return Ok(BaseImage::absent(reference)),
+    };
+    if !base.path.exists() {
+        return Ok(BaseImage::absent(reference));
+    }
+    let len = std::fs::metadata(&base.path)?.len();
+    Ok(BaseImage {
+        reference,
+        len,
+        allocated: cow::allocated(&cow::extents(&base.path)?),
+        digest: digest_of(&base.path)?,
+    })
+}
+
+/// Content address of a file, cached next to it.
+///
+/// Base images are large and immutable, and a move asks for the same digest
+/// every time. The sidecar is keyed on length and mtime, so an image that is
+/// replaced is re-hashed and one that is not costs a stat.
+pub fn digest_of(path: &Path) -> Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = std::fs::metadata(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let key = format!("{}:{}", meta.len(), meta.mtime());
+    let sidecar = path.with_extension("digest");
+    if let Ok(cached) = std::fs::read_to_string(&sidecar) {
+        if let Some(digest) = cached.strip_prefix(&format!("{key} ")) {
+            return Ok(digest.trim().to_owned());
+        }
+    }
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finalize().to_hex().to_string();
+    let _ = std::fs::write(&sidecar, format!("{key} {digest}\n"));
+    Ok(digest)
+}
+
+// ---- the source's half -----------------------------------------------------
+
+/// What a move of this instance would carry. Read-only: nothing is fenced.
+///
+/// Answers for a *running* instance too, deliberately. Whether a running
+/// guest may be moved is the caller's question — `--down` is an answer to it
+/// — and the preflight has to be able to see the instance before it can tell
+/// the user what it would take.
+pub fn offer(reg: &Shard, name: &str) -> Response {
+    match reg.get(name).cloned().and_then(|inst| unconflicted(&inst).map(|()| inst)) {
+        Ok(inst) => match manifest(&inst) {
+            Ok(manifest) => Response::MoveOffer { manifest: Box::new(manifest) },
+            Err(e) => error(e),
+        },
+        Err(e) => error(e),
+    }
+}
+
+/// Fence the instance and answer with the manifest as it stands now.
+///
+/// From here this device holds the only bootable copy and will not boot it.
+/// A fence already in place is superseded rather than refused: the epoch only
+/// ever goes up, so a move that was interrupted with nobody left to abort it
+/// does not strand the instance for good.
+pub fn prepare(reg: &mut Shard, name: &str, to_device: &str, epoch: u64) -> Response {
+    let inst = match reg.get(name).cloned().and_then(|inst| movable(&inst).map(|()| inst)) {
+        Ok(inst) => inst,
+        Err(e) => return error(e),
+    };
+    if epoch <= inst.move_epoch {
+        return error(anyhow!(
+            "instance {name:?} is already at move epoch {} — a move to {to_device} at \
+             epoch {epoch} is stale and will not be served",
+            inst.move_epoch
+        ));
+    }
+    let fenced = reg.set_moving(
+        name,
+        Some(Moving { to_device: to_device.to_owned(), epoch, started_at: now_unix() }),
+    );
+    match fenced.and_then(|inst| reg.save().map(|()| inst)) {
+        Ok(inst) => match manifest(&inst) {
+            Ok(manifest) => Response::MoveOffer { manifest: Box::new(manifest) },
+            Err(e) => error(e),
+        },
+        Err(e) => error(e),
+    }
+}
+
+/// The target has the bytes and has said so. Drop the row, drop the disk,
+/// leave a note.
+pub fn commit_source(reg: &mut Shard, name: &str, epoch: u64) -> Response {
+    let inst = match reg.get(name).cloned() {
+        Ok(inst) => inst,
+        Err(e) => return error(e),
+    };
+    let Some(moving) = inst.moving.clone() else {
+        return error(anyhow!(
+            "instance {name:?} is not being moved from this device — refusing to \
+             delete a copy nothing has taken over from"
+        ));
+    };
+    if moving.epoch != epoch {
+        return error(anyhow!(
+            "instance {name:?} is being moved at epoch {}, not {epoch} — refusing to \
+             commit a move this device is not the source of",
+            moving.epoch
+        ));
+    }
+
+    if let Err(e) = reg.remove(name).and_then(|_| reg.save()) {
+        return error(e);
+    }
+    crate::persist::forget(name);
+    let _ = std::fs::remove_dir_all(paths::instance_dir(name));
+    remember_move(name, &moving.to_device, epoch);
+    Response::Ok
+}
+
+/// The move did not happen. Take the fence off; this row never stopped being
+/// the authoritative one.
+pub fn abort_source(reg: &mut Shard, name: &str, epoch: u64) -> Response {
+    match reg.get(name).cloned() {
+        // Nothing to unfence is not a failure: an abort is sent on paths that
+        // may never have got as far as fencing anything.
+        Err(_) => Response::Ok,
+        Ok(inst) => {
+            if inst.moving.as_ref().is_some_and(|m| m.epoch != epoch) {
+                return error(anyhow!(
+                    "instance {name:?} is being moved at a different epoch — leaving \
+                     that move's fence alone"
+                ));
+            }
+            match reg.set_moving(name, None).and_then(|_| reg.save()) {
+                Ok(()) => Response::Ok,
+                Err(e) => error(e),
+            }
+        }
+    }
+}
+
+/// An instance in a name collision answers nothing but the rename that ends
+/// it, and that includes being looked at by a move.
+fn unconflicted(inst: &Instance) -> Result<()> {
+    if let Some(conflict) = &inst.conflict {
+        bail!("{}", asterism_core::registry::conflicted(inst, conflict));
+    }
+    Ok(())
+}
+
+/// Whether this instance can be moved at all, in the words the refusal needs.
+fn movable(inst: &Instance) -> Result<()> {
+    unconflicted(inst)?;
+    if inst.status == Status::Running {
+        bail!(
+            "instance {:?} is running — an offline move needs it stopped: \
+             `ast down {}`, or pass --down",
+            inst.name,
+            inst.name
+        );
+    }
+    Ok(())
+}
+
+// ---- the target's half -----------------------------------------------------
+
+/// Could this device take the instance described by `manifest`?
+///
+/// Everything checkable is checked before the instance is taken out of
+/// service, and everything that is merely *true* is reported as a note rather
+/// than dressed up as a problem.
+pub fn probe(manifest: &MoveManifest, device: &str, already_here: bool) -> Response {
+    let mut notes = Vec::new();
+    let refusal = probe_refusal(manifest, device, already_here, &mut notes);
+    let needs_base = refusal.is_none() && base_wanted(&manifest.base).unwrap_or(false);
+    Response::MoveProbe { device: device.to_owned(), refusal, notes, needs_base }
+}
+
+fn probe_refusal(
+    manifest: &MoveManifest,
+    device: &str,
+    already_here: bool,
+    notes: &mut Vec<String>,
+) -> Option<String> {
+    let inst = &manifest.instance;
+    if already_here {
+        return Some(format!(
+            "device {device} already has a row for instance {:?} — one name means one \
+             instance in this orbit",
+            inst.name
+        ));
+    }
+    if manifest.arch != std::env::consts::ARCH {
+        return Some(format!(
+            "device {device} is {}, and {:?} was built for {} — a guest does not \
+             change instruction set by being copied",
+            std::env::consts::ARCH,
+            inst.name,
+            manifest.arch
+        ));
+    }
+
+    // The backend an instance was created against is the one that keeps
+    // booting it, so the target has to have that one working — not merely a
+    // hypervisor.
+    if let Some(machine) = &inst.machine {
+        let hv = match backend::by_id(&machine.backend) {
+            Ok(hv) => hv,
+            Err(e) => return Some(format!("device {device} has no {} backend: {e:#}", machine.backend)),
+        };
+        match hv.probe() {
+            Ok(ready) => {
+                if ready.version != machine.hv_version {
+                    notes.push(format!(
+                        "{device} runs {} {} and {:?} was defined against {} — an \
+                         offline move rewrites nothing, and the guest reboots rather \
+                         than resumes",
+                        machine.backend, ready.version, inst.name, machine.hv_version
+                    ));
+                }
+                if ready.machine_type != machine.machine_type {
+                    notes.push(format!(
+                        "{device}'s {} machine type is {} and this instance records \
+                         {} — the virtual hardware differs and the guest will see it",
+                        machine.backend, ready.machine_type, machine.machine_type
+                    ));
+                }
+            }
+            Err(e) => {
+                return Some(format!(
+                    "device {device} cannot run the {} backend that {:?} was created \
+                     against: {e:#}",
+                    machine.backend, inst.name
+                ))
+            }
+        }
+    } else {
+        notes.push(format!(
+            "{:?} records no machine identity, so nothing about {device}'s hypervisor \
+             could be checked against it",
+            inst.name
+        ));
+    }
+
+    // The image reference has to mean something here, or the first `ast up`
+    // fails looking for a base this device cannot name.
+    if let Err(e) = backend::image_ref(&manifest.base.reference) {
+        return Some(format!(
+            "device {device} cannot resolve image {:?}: {e:#} — a move needs the \
+             reference to name the same base image on both devices",
+            manifest.base.reference
+        ));
+    }
+    if manifest.base.len == 0 {
+        notes.push(format!(
+            "the source has no copy of base image {:?} to hand over; the disk is a \
+             complete file and boots without it",
+            manifest.base.reference
+        ));
+    }
+
+    for path in &manifest.local_volumes {
+        notes.push(format!(
+            "the volume at {path} is a directory share, which is same-device only — \
+             it will be kept on the instance and flagged in `ast status`"
+        ));
+    }
+    None
+}
+
+/// Does the base image have to be fetched from the source?
+///
+/// Absent, or here at a different length. Length is the cheap check and the
+/// honest one to make *here*: the content address is verified on what
+/// arrives, before it is put in the image store, so a fetch cannot install
+/// the wrong bytes however this answers. A copy already here at the right
+/// length is left alone — other instances on this device are cloned from it,
+/// and rewriting it to settle a doubt about one move would be the wrong
+/// trade.
+pub fn base_wanted(base: &BaseImage) -> Result<bool> {
+    if base.len == 0 {
+        return Ok(false);
+    }
+    let resolved = backend::image_ref(&base.reference)?;
+    if !resolved.path.exists() {
+        return Ok(true);
+    }
+    Ok(std::fs::metadata(&resolved.path)?.len() != base.len)
+}
+
+/// Where a fetched base image lands on this device.
+pub fn base_path(reference: &str) -> Result<PathBuf> {
+    Ok(backend::image_ref(reference)?.path)
+}
+
+/// Adopt a staged transfer: check it, rename it into place, write the row.
+///
+/// This is the only moment a second copy of the instance exists, and by the
+/// time it does the source has been fenced for the whole transfer.
+pub fn commit_target(
+    reg: &mut Shard,
+    manifest: &MoveManifest,
+    epoch: u64,
+    device: &str,
+) -> Response {
+    let name = manifest.instance.name.clone();
+    let staging = staging_dir(&name, epoch);
+    if let Err(e) = verify(&staging, manifest, epoch) {
+        return error(e);
+    }
+
+    let live = paths::instance_dir(&name);
+    if live.exists() {
+        return error(anyhow!(
+            "device {device} already has an instance directory at {} — refusing to \
+             put a second copy of {name:?} on top of it",
+            live.display()
+        ));
+    }
+    if let Some(parent) = live.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return error(anyhow!("{e}"));
+        }
+    }
+    // The rename first, then the receipt: a rename that fails leaves the
+    // staging directory exactly as it was, receipt included, so the move can
+    // be aborted or retried against something that still adds up.
+    if let Err(e) = std::fs::rename(&staging, &live) {
+        return error(anyhow!(
+            "could not adopt {}: {e} — it is still staged and still not bootable",
+            staging.display()
+        ));
+    }
+    let _ = std::fs::remove_file(Receipt::path(&live));
+
+    let mut adopted = manifest.instance.clone();
+    adopted.cpu_device = device.to_owned();
+    // A guest that was running was shut down before any of this; anything
+    // else keeps the state it had, so an instance that had never been booted
+    // does not arrive claiming to have been.
+    if adopted.status == Status::Running {
+        adopted.status = Status::Stopped;
+    }
+    adopted.handle = None;
+    adopted.moving = None;
+    adopted.conflict = None;
+    adopted.move_epoch = epoch;
+    adopted.stranded = manifest.local_volumes.clone();
+    match reg.adopt(adopted).and_then(|inst| reg.save().map(|()| inst)) {
+        Ok(instance) => Response::Instance { instance },
+        Err(e) => error(e),
+    }
+}
+
+/// The completeness check the commit turns on.
+fn verify(staging: &Path, manifest: &MoveManifest, epoch: u64) -> Result<()> {
+    if !staging.is_dir() {
+        bail!(
+            "nothing arrived for {:?} at epoch {epoch} — there is no staging \
+             directory to adopt",
+            manifest.instance.name
+        );
+    }
+    let receipt = Receipt::load(staging)?;
+    if receipt.epoch != epoch {
+        bail!(
+            "what is staged for {:?} came from epoch {}, not {epoch}",
+            manifest.instance.name,
+            receipt.epoch
+        );
+    }
+    for file in &manifest.files {
+        let path = staging.join(&file.path);
+        let meta = std::fs::metadata(&path)
+            .with_context(|| format!("{} did not arrive", file.path))?;
+        if meta.len() != file.len {
+            bail!(
+                "{} arrived {} bytes long and should be {}",
+                file.path,
+                meta.len(),
+                file.len
+            );
+        }
+        match receipt.files.get(&file.path) {
+            Some(&written) if written == file.allocated => {}
+            Some(&written) => bail!(
+                "{} carried {written} allocated bytes and should have carried {}",
+                file.path,
+                file.allocated
+            ),
+            None => bail!("{} is not in the record of what arrived", file.path),
+        }
+    }
+    let expected = manifest.allocated();
+    if receipt.bytes != expected {
+        bail!("{} bytes arrived and {expected} were expected", receipt.bytes);
+    }
+    Ok(())
+}
+
+/// Delete a staging directory. What an abort owes the target.
+pub fn abort_target(name: &str, epoch: u64) -> Response {
+    let staging = staging_dir(name, epoch);
+    match std::fs::remove_dir_all(&staging) {
+        Ok(()) | Err(_) => Response::Ok,
+    }
+}
+
+// ---- what a device remembers about an instance that left -------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MovedNote {
+    pub to_device: String,
+    pub epoch: u64,
+    pub at: u64,
+}
+
+fn notes_path() -> PathBuf {
+    paths::home_dir().join("moved.json")
+}
+
+fn load_notes() -> BTreeMap<String, MovedNote> {
+    std::fs::read(notes_path())
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+fn remember_move(name: &str, to_device: &str, epoch: u64) {
+    let mut notes = load_notes();
+    let now = now_unix();
+    notes.retain(|_, note| now.saturating_sub(note.at) < NOTE_TTL_SECS);
+    notes.insert(
+        name.to_owned(),
+        MovedNote { to_device: to_device.to_owned(), epoch, at: now },
+    );
+    if let Ok(bytes) = serde_json::to_vec_pretty(&notes) {
+        let path = notes_path();
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
+/// What this device has to say about an instance it no longer holds.
+///
+/// Only ever reached when a request was aimed at this device directly: the
+/// ordinary path resolves the name across the orbit and lands on whoever
+/// holds the row now.
+pub fn moved_note(name: &str) -> Option<String> {
+    let note = load_notes().get(name).cloned()?;
+    if now_unix().saturating_sub(note.at) >= NOTE_TTL_SECS {
+        return None;
+    }
+    Some(format!(
+        "instance {name:?} moved to {} — its cpu is sourced there now, and \
+         `ast status {name}` from anywhere in this orbit will find it",
+        note.to_device
+    ))
+}
+
+// ---- the orchestrator ------------------------------------------------------
+
+/// `ast set <instance> cpu <device>`, driven from the daemon in front of the
+/// user.
+///
+/// This daemon is neither end of the transfer unless it happens to be: the
+/// bytes go source-to-target directly, and what runs here is the sequence.
+/// Every step is one frame aimed at one named device, so the same code drives
+/// a move between two other machines as drives one off this one.
+pub async fn run(
+    name: &str,
+    device: &str,
+    down: bool,
+    node: &Node,
+    mesh: Option<&Arc<Mesh>>,
+    io: &mut ClientIo<'_>,
+) -> Result<()> {
+    let mesh = mesh.context(
+        "this daemon has no mesh endpoint, so it cannot move an instance between devices \
+         — see the astd log for why",
+    )?;
+    asterism_core::registry::check_name(name)?;
+
+    // ---- preflight ---------------------------------------------------------
+    let here = node.device_name().await;
+    let source = locate(name, node, mesh).await?;
+    if source == device {
+        bail!("instance {name:?} already sources its cpu and ram from {device}");
+    }
+    // Refuse a device nobody has heard of, and one that is not answering,
+    // before anything has been fenced. A device does not list itself among
+    // its peers, so moving *here* skips both: this daemon is demonstrably up.
+    if device != here {
+        if !mesh.knows(device).await {
+            bail!("no device named {device:?} in this orbit — see: ast devices");
+        }
+        if !mesh.online(device).await {
+            bail!(
+                "device {device} is not answering, so it cannot take {name:?} — the move \
+                 has not started and {source} still supplies its cpu"
+            );
+        }
+    }
+
+    let mut manifest = offer_of(name, &source, node, mesh).await?;
+    if manifest.instance.status == Status::Running {
+        if !down {
+            bail!(
+                "instance {name:?} is running on {source}. Moving cpu/ram is an offline \
+                 operation on every backend Asterism has — pass --down to shut the guest \
+                 down first"
+            );
+        }
+        io.send(&line(format!("shutting {name} down on {source} first"))).await?;
+        expect_ok(ask(&source, Request::Down { name: name.to_owned() }, node, mesh).await?)
+            .with_context(|| format!("could not shut {name:?} down on {source}"))?;
+        manifest = offer_of(name, &source, node, mesh).await?;
+    }
+
+    let probed = ask(device, Request::MoveProbe { manifest: Box::new(manifest.clone()) }, node, mesh)
+        .await?;
+    let needs_base = match probed {
+        Response::MoveProbe { refusal: Some(refusal), .. } => bail!("{refusal}"),
+        Response::MoveProbe { notes, needs_base, .. } => {
+            for note in notes {
+                io.send(&line(format!("note: {note}"))).await?;
+            }
+            needs_base
+        }
+        Response::Error { message } => bail!(message),
+        other => bail!("device {device:?} answered a move probe with {other:?}"),
+    };
+
+    // The exact byte counts, not only the rounded ones. Transfer paths get
+    // measured in this project and the numbers live where they can be
+    // checked; a reader who wants to know whether the sparse walk earned its
+    // keep should not have to work it out from "1.23 GiB".
+    io.send(&line(format!(
+        "moving {name} from {source} to {device}: {} of {} across {} file(s) \
+         [allocated={} virtual={}]",
+        cow::human(manifest.allocated()),
+        cow::human(manifest.virtual_size()),
+        manifest.files.len(),
+        manifest.allocated(),
+        manifest.virtual_size(),
+    ))).await?;
+    if needs_base {
+        io.send(&line(format!(
+            "{device} does not have base image {} ({}) — it will fetch it from {source} \
+             rather than from the internet",
+            manifest.base.reference,
+            cow::human(manifest.base.cost()),
+        ))).await?;
+    }
+
+    // ---- phase one: fence the source, then move the bytes ------------------
+    let epoch = manifest.instance.move_epoch + 1;
+    let prepared = ask(
+        &source,
+        Request::MovePrepare {
+            name: name.to_owned(),
+            to_device: device.to_owned(),
+            epoch,
+        },
+        node,
+        mesh,
+    )
+    .await?;
+    let manifest = match prepared {
+        Response::MoveOffer { manifest } => *manifest,
+        Response::Error { message } => bail!(message),
+        other => bail!("device {source:?} answered a move prepare with {other:?}"),
+    };
+    io.send(&line(format!("{source} is holding {name} at move epoch {epoch}"))).await?;
+
+    let outcome = transfer_and_commit(&manifest, &source, device, epoch, node, mesh, io).await;
+    if let Err(e) = outcome {
+        // Nothing the target staged is bootable and nothing has been written
+        // to its shard, so this is a tidy-up rather than a rollback.
+        let _ = ask(
+            device,
+            Request::MoveAbortTarget { name: name.to_owned(), epoch },
+            node,
+            mesh,
+        )
+        .await;
+        let _ = ask(
+            &source,
+            Request::MoveAbortSource { name: name.to_owned(), epoch },
+            node,
+            mesh,
+        )
+        .await;
+        io.send(&line(format!(
+            "the move did not happen — {source} still supplies {name}'s cpu"
+        ))).await?;
+        return Err(e);
+    }
+
+    io.send(&Response::Move {
+        text: format!(
+            "{name}: cpu/ram now sourced from {device} (move epoch {epoch}) — \
+             `ast up {name}` boots it there"
+        ),
+        done: true,
+    })
+    .await
+}
+
+/// Phases two and three: the bytes, then the two commits in order.
+#[allow(clippy::too_many_arguments)]
+async fn transfer_and_commit(
+    manifest: &MoveManifest,
+    source: &str,
+    device: &str,
+    epoch: u64,
+    node: &Node,
+    mesh: &Arc<Mesh>,
+    io: &mut ClientIo<'_>,
+) -> Result<()> {
+    let name = manifest.instance.name.clone();
+
+    mesh.move_import(device, source, manifest, epoch, io).await?;
+
+    // The target checks what arrived against the manifest and only then does
+    // a second copy of this instance exist anywhere.
+    expect_instance(
+        ask(
+            device,
+            Request::MoveCommitTarget { manifest: Box::new(manifest.clone()), epoch },
+            node,
+            mesh,
+        )
+        .await?,
+    )
+    .with_context(|| format!("{device} would not adopt {name:?}"))?;
+    io.send(&line(format!("{device} has it, verified against the manifest"))).await?;
+
+    // Past this point the move has happened. A source that will not answer
+    // now leaves a stale copy rather than losing one, and the epoch on the
+    // target's row is what settles which is which.
+    expect_ok(
+        ask(source, Request::MoveCommitSource { name: name.clone(), epoch }, node, mesh)
+            .await?,
+    )
+    .with_context(|| {
+        format!(
+            "{device} has {name:?} at epoch {epoch} and {source} would not let go of \
+             its copy — the higher epoch is the live one, and {source}'s copy is stale"
+        )
+    })?;
+    io.send(&line(format!("{source} has dropped its copy"))).await?;
+    Ok(())
+}
+
+/// Which device holds this instance's row, in the orbit's own words.
+async fn locate(name: &str, node: &Node, mesh: &Arc<Mesh>) -> Result<String> {
+    if node.shard.lock().await.holds(name) {
+        return Ok(node.device_name().await);
+    }
+    mesh.locate(name)
+        .await?
+        .ok_or_else(|| anyhow!("no instance named {name:?} in this orbit"))
+}
+
+async fn offer_of(
+    name: &str,
+    source: &str,
+    node: &Node,
+    mesh: &Arc<Mesh>,
+) -> Result<MoveManifest> {
+    match ask(source, Request::MoveOffer { name: name.to_owned() }, node, mesh).await? {
+        Response::MoveOffer { manifest } => Ok(*manifest),
+        Response::Error { message } => bail!(message),
+        other => bail!("device {source:?} answered a move offer with {other:?}"),
+    }
+}
+
+/// One frame, aimed at one device — this one included.
+///
+/// The local short-circuit is not an optimisation: `ast move dev desktop`
+/// typed on the device that currently supplies `dev`'s cpu must reach its own
+/// shard, and putting that through the mesh would mean dialling ourselves.
+pub(crate) async fn ask(
+    device: &str,
+    request: Request,
+    node: &Node,
+    mesh: &Arc<Mesh>,
+) -> Result<Response> {
+    if device == node.device_name().await {
+        return Ok(crate::handle(request, node).await);
+    }
+    mesh.proxy(device, request).await
+}
+
+/// A step that either worked or has a sentence explaining why not.
+///
+/// `Instance` counts as a yes: `down` answers with the row it changed, and a
+/// move does not care what the row looks like, only that the guest stopped.
+fn expect_ok(response: Response) -> Result<()> {
+    match response {
+        Response::Ok | Response::Instance { .. } => Ok(()),
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected answer: {other:?}"),
+    }
+}
+
+fn expect_instance(response: Response) -> Result<Instance> {
+    match response {
+        Response::Instance { instance } => Ok(instance),
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected answer: {other:?}"),
+    }
+}
+
+pub(crate) fn line(text: String) -> Response {
+    Response::Move { text, done: false }
+}
+
+fn error(e: anyhow::Error) -> Response {
+    Response::Error { message: format!("{e:#}") }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_staging_directory_can_never_be_an_instance() {
+        // Instance names are ascii letters, digits and '-'; the staging
+        // marker is neither, which is what makes an abandoned one harmless.
+        let staged = staging_dir("dev", 7);
+        let leaf = staged.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(leaf, "dev.moving-7");
+        assert!(asterism_core::registry::check_name(&leaf).is_err(), "{leaf}");
+        assert_ne!(staged, paths::instance_dir("dev"));
+        // Same parent, so the commit is a rename rather than a copy.
+        assert_eq!(staged.parent(), paths::instance_dir("dev").parent());
+    }
+
+    #[test]
+    fn the_files_a_move_carries_leave_this_devices_plumbing_behind() {
+        for junk in ["console.log", "qemu.pid", "qmp.sock", "disk.raw.part", ".move-receipt.json"] {
+            assert!(is_plumbing(junk), "{junk} belongs to this device, not to the guest");
+        }
+        for carried in ["disk.raw", "efi-vars.fd", "seed.iso", "seed.stamp", "clean.raw"] {
+            assert!(!is_plumbing(carried), "{carried} has to travel");
+        }
+    }
+
+    fn manifest_of(files: Vec<MoveFile>) -> MoveManifest {
+        MoveManifest {
+            instance: Instance::new("dev", "laptop", "debian:13", Default::default(), None),
+            arch: std::env::consts::ARCH.to_owned(),
+            base: BaseImage::absent("debian:13".to_owned()),
+            files,
+            local_volumes: Vec::new(),
+        }
+    }
+
+    /// The completeness check is the whole of what the commit rests on, so
+    /// every way of arriving short has to be a refusal.
+    #[test]
+    fn a_transfer_that_arrived_short_is_not_adopted() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("dev.moving-1");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("disk.raw"), vec![0u8; 4096]).unwrap();
+
+        let manifest = manifest_of(vec![MoveFile {
+            path: "disk.raw".into(),
+            len: 4096,
+            allocated: 4096,
+            mode: 0o600,
+        }]);
+
+        // No receipt at all: the transfer never finished.
+        let err = verify(&staging, &manifest, 1).unwrap_err().to_string();
+        assert!(err.contains("never finished"), "{err}");
+
+        // A receipt from another epoch is somebody else's transfer.
+        Receipt {
+            epoch: 2,
+            from_device: "laptop".into(),
+            bytes: 4096,
+            files: [("disk.raw".to_owned(), 4096u64)].into_iter().collect(),
+        }
+        .save(&staging)
+        .unwrap();
+        let err = verify(&staging, &manifest, 1).unwrap_err().to_string();
+        assert!(err.contains("epoch"), "{err}");
+
+        // The right epoch and the right bytes is the one that passes.
+        Receipt {
+            epoch: 1,
+            from_device: "laptop".into(),
+            bytes: 4096,
+            files: [("disk.raw".to_owned(), 4096u64)].into_iter().collect(),
+        }
+        .save(&staging)
+        .unwrap();
+        verify(&staging, &manifest, 1).unwrap();
+
+        // A file that arrived the wrong length is refused even though the
+        // byte count adds up — sparse means those are different questions.
+        std::fs::write(staging.join("disk.raw"), vec![0u8; 2048]).unwrap();
+        let err = verify(&staging, &manifest, 1).unwrap_err().to_string();
+        assert!(err.contains("2048") && err.contains("4096"), "{err}");
+
+        // And a file that never turned up at all.
+        std::fs::remove_file(staging.join("disk.raw")).unwrap();
+        let err = verify(&staging, &manifest, 1).unwrap_err().to_string();
+        assert!(err.contains("did not arrive"), "{err}");
+
+        // A staging directory that is not there is the crashed-mid-move case.
+        let err = verify(&dir.path().join("nope"), &manifest, 1).unwrap_err().to_string();
+        assert!(err.contains("no staging directory"), "{err}");
+    }
+
+    #[test]
+    fn a_digest_is_stable_and_cached_next_to_what_it_addresses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("base.raw");
+        std::fs::write(&path, b"asterism").unwrap();
+
+        let first = digest_of(&path).unwrap();
+        assert_eq!(first.len(), 64, "a blake3 hex digest");
+        assert_eq!(first, digest_of(&path).unwrap());
+        assert!(path.with_extension("digest").exists(), "the sidecar is written");
+
+        // Different bytes, different address — and the sidecar is keyed on
+        // length and mtime, so it does not hand back the stale one.
+        std::fs::write(&path, b"something else entirely").unwrap();
+        assert_ne!(first, digest_of(&path).unwrap());
+    }
+}

@@ -1,0 +1,176 @@
+use std::path::PathBuf;
+
+/// Root directory for Asterism state. Overridable with `ASTERISM_HOME`
+/// (used by tests and by anyone running several daemons side by side).
+pub fn home_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("ASTERISM_HOME") {
+        return PathBuf::from(dir);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".asterism")
+}
+
+/// This device's shard of the orbit registry: the instances whose cpu and ram
+/// it supplies.
+pub fn state_path() -> PathBuf {
+    home_dir().join("state.json")
+}
+
+/// The other devices' shards, as this one last saw them.
+///
+/// The orbit registry is one namespace assembled from every device's shard, so
+/// a device that is asleep would otherwise take its instances out of `ast ls`
+/// entirely — which would read as "deleted" rather than "out of touch". This
+/// file is what lets those rows still be listed, marked `unknown`, with the
+/// device supplying their cpu named. It is a cache and nothing depends on it
+/// being present or fresh.
+pub fn shard_cache_path() -> PathBuf {
+    home_dir().join("orbit-shards.json")
+}
+
+pub fn socket_path() -> PathBuf {
+    short_socket(home_dir().join("astd.sock"))
+}
+
+/// Pid of the running daemon, written at startup and removed on a clean
+/// shutdown. The CLI needs it to retire a daemon left over from an older
+/// version — unlike the socket, a pid is something it can act on.
+///
+/// Deliberately *not* run through `short_socket`: it is a regular file, so
+/// it has no length limit, and it must stay findable next to the home it
+/// belongs to.
+pub fn daemon_pid_path() -> PathBuf {
+    home_dir().join("astd.pid")
+}
+
+/// QMP control socket for one instance's QEMU.
+pub fn qmp_socket_path(name: &str) -> PathBuf {
+    short_socket(instance_dir(name).join("qmp.sock"))
+}
+
+/// Control socket of the `astd-vz` helper holding one instance's guest.
+///
+/// The same shape as the QMP path and for the same reason: it is a socket,
+/// so it is subject to the same length cap. Both are recorded on the
+/// instance's `Handle` when it boots — this function is where a *new* one
+/// gets its name, not how a running one is found again.
+pub fn vz_socket_path(name: &str) -> PathBuf {
+    short_socket(instance_dir(name).join("vz.sock"))
+}
+
+// ---- block volumes ---------------------------------------------------------
+//
+// A volume is a part this device supplies to the pool, so it lives beside the
+// instances rather than inside one: `volumes.json` is the bookkeeping and
+// `volumes/<name>/` holds the bytes and whatever is currently serving them.
+
+/// This device's block volumes: sizes, epochs and leases.
+pub fn volumes_path() -> PathBuf {
+    home_dir().join("volumes.json")
+}
+
+pub fn volume_dir(name: &str) -> PathBuf {
+    home_dir().join("volumes").join(name)
+}
+
+/// The raw image behind one volume. Sparse, and the only file in there that
+/// is data rather than plumbing.
+pub fn volume_image_path(name: &str) -> PathBuf {
+    volume_dir(name).join("disk.raw")
+}
+
+/// Where `qemu-storage-daemon` serves one epoch's NBD export.
+///
+/// The epoch is in the filename on purpose: a new lease is a new socket, so
+/// revoking the old one is an unlink and a stale consumer's reconnect finds
+/// nothing rather than finding the new owner's disk.
+pub fn volume_export_socket(name: &str, epoch: u64) -> PathBuf {
+    short_socket(volume_dir(name).join(format!("nbd-e{epoch}.sock")))
+}
+
+/// Pidfile of that storage daemon, written by `--pidfile`.
+pub fn volume_export_pid(name: &str, epoch: u64) -> PathBuf {
+    volume_dir(name).join(format!("nbd-e{epoch}.pid"))
+}
+
+/// The local unix socket QEMU connects to for a volume attached to `instance`.
+///
+/// This end of the splice is always local — that is the local illusion doing
+/// its work. QEMU sees a unix socket on the machine it is running on and
+/// never learns that the daemon behind it is forwarding to another device.
+pub fn volume_bridge_socket(instance: &str, host: &str, volume: &str) -> PathBuf {
+    let safe = |s: &str| -> String {
+        s.chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+            .collect()
+    };
+    short_socket(
+        instance_dir(instance).join(format!("vol-{}-{}.sock", safe(host), safe(volume))),
+    )
+}
+
+/// Unix socket paths are capped at ~104 bytes (SUN_LEN); when the
+/// preferred path is deep, fall back to a short hashed path in the temp
+/// dir. The hash covers the full preferred path, so distinct homes (and
+/// distinct instances) never collide.
+fn short_socket(preferred: PathBuf) -> PathBuf {
+    if preferred.as_os_str().len() <= 100 {
+        return preferred;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    preferred.hash(&mut h);
+    std::env::temp_dir().join(format!("asterism-{:016x}.sock", h.finish()))
+}
+
+pub fn images_dir() -> PathBuf {
+    home_dir().join("images")
+}
+
+pub fn instance_dir(name: &str) -> PathBuf {
+    home_dir().join("instances").join(name)
+}
+
+/// Dedicated keypair used to reach guests; generated on first use.
+pub fn ssh_key_path() -> PathBuf {
+    home_dir().join("id_ed25519")
+}
+
+/// This device's long-lived mesh identity, generated on first daemon start.
+///
+/// Deliberately not `id_ed25519`: that key reaches *guests*, this one *is*
+/// the device on the mesh. Confusing the two would let a guest key be
+/// mistaken for an orbit membership.
+pub fn device_key_path() -> PathBuf {
+    home_dir().join("id_device")
+}
+
+/// The orbit store: which other devices this one trusts, and what they are
+/// called. The mesh equivalent of `state.json`.
+pub fn orbit_path() -> PathBuf {
+    home_dir().join("orbit.json")
+}
+
+/// Another device's guest key, cached here so `ast ssh` can open a guest that
+/// device seeded.
+///
+/// A guest only trusts the key of the device that built its cloud-init seed,
+/// so reaching it from elsewhere in the orbit means presenting that device's
+/// key. This is where the copy lives, at 0600, one file per device.
+///
+/// **Why this is not an escalation.** An orbit is a set of mutually trusted
+/// device keys, and that trust already includes running any command on any of
+/// each other's instances — that is what a forwarded request is. A key that
+/// opens those same guests grants nothing that membership did not already
+/// grant. It travels only over a QUIC stream that is mutually authenticated
+/// against the orbit store, and it is refused to anyone else by the same check
+/// that refuses them everything else.
+pub fn guest_key_cache(device: &str) -> PathBuf {
+    // The name comes off the wire, so it becomes a filename and not a path:
+    // anything that is not a letter, digit or dash is flattened.
+    let safe: String = device
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .collect();
+    home_dir().join("guest-keys").join(format!("{safe}.id_ed25519"))
+}

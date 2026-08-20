@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/asterism-core",
+    "crates/asterism-daemon",
+    "crates/asterism-cli",
+    "crates/asterism-mesh",
+    "crates/asterism-vz",
+]
+
+[workspace.package]
+version = "0.0.2"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/medicalissue/asterism"
+
+[workspace.dependencies]
+asterism-core = { path = "crates/asterism-core", version = "0.0.2" }
+asterism-mesh = { path = "crates/asterism-mesh", version = "0.0.2" }
+asterism-vz = { path = "crates/asterism-vz", version = "0.0.2" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tar = { version = "0.4", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "sync"] }
+clap = { version = "4", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+# Already in the tree behind the mesh crate, so this costs no build time.
+# A content address needs a hash that is fast on a gigabyte, and this is
+# the one already compiled.
+blake3 = "1"
+hostname = "0.4"
+
+# blake3 addresses base images, and a base image is about a gigabyte. Its
+# portable Rust fallback at opt-level 0 would make a debug build's move spend
+# a minute hashing what an optimised one hashes in under a second, so this one
+# dependency is built properly even in a dev profile.
+[profile.dev.package.blake3]
+opt-level = 3

@@ -1,0 +1,20 @@
+[package]
+name = "asterism-mesh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Asterism device mesh: device identity, iroh endpoints, pairing tickets, SAS confirmation."
+
+[dependencies]
+iroh = "1.0.3"
+anyhow.workspace = true
+serde.workspace = true
+tokio.workspace = true
+# Already in the tree via iroh; all three are small and dependency-light.
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+data-encoding = "2"
+blake3 = "1"
+
+[dev-dependencies]
+tempfile = "3"

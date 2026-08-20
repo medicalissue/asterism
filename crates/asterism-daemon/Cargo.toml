@@ -1,0 +1,24 @@
+[package]
+name = "asterism-daemon"
+description = "astd, the Asterism device daemon."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "astd"
+path = "src/main.rs"
+
+[dependencies]
+asterism-core.workspace = true
+asterism-mesh.workspace = true
+asterism-vz.workspace = true
+anyhow.workspace = true
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

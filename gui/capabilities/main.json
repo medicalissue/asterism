@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "What the main window may reach. It listens for the pairing and wake events its own panels start, reads its own label to know which of the two windows in this bundle it is, and drags itself by the sidebar and the pane header because it has no title bar of its own. Everything else it does goes through the commands in src/mainwindow.rs, which need no capability because the app defines them.",
+  "windows": ["main"],
+  "permissions": [
+    "core:event:default",
+    "core:window:allow-close",
+    "core:window:allow-start-dragging",
+    "core:webview:allow-internal-toggle-devtools"
+  ]
+}

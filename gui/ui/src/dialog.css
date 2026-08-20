@@ -1,0 +1,68 @@
+/*
+ * The New Instance dialog's layout, and nothing else.
+ *
+ * Every control it draws comes out of controls.css, which the main window
+ * draws from too. What is left here is the arrangement: a two-column form,
+ * a row of three number fields, and a footer with the status on the left
+ * and the buttons on the right.
+ */
+
+.dialog {
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: var(--gutter);
+}
+
+/* ---- the form -------------------------------------------------------- */
+
+.form {
+  display: grid;
+  grid-template-columns: 68px 1fr;
+  align-items: center;
+  column-gap: 12px;
+  row-gap: 15px;
+}
+
+.form > .label {
+  font-size: 13px;
+  color: var(--color-text-secondary);
+}
+
+/* The size row: three fields under three captions. */
+.trio {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.caption {
+  font-size: 13px;
+  color: var(--color-text-secondary);
+}
+
+/* ---- the footer ------------------------------------------------------ */
+
+.footer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: auto;
+  padding-top: 14px;
+  /* Full bleed, the way a divider runs the width of a panel. */
+  border-top: var(--hairline);
+  margin-inline: calc(var(--gutter) * -1);
+  padding-inline: var(--gutter);
+}
+
+.buttons {
+  display: flex;
+  gap: 10px;
+}

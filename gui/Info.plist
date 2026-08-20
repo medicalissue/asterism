@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Merged into the Info.plist the bundler generates (Tauri picks up any
+  Info.plist sitting next to tauri.conf.json).
+
+  LSUIElement makes Asterism an agent: no Dock tile, no app menu, no
+  window on launch. The app also sets ActivationPolicy::Accessory at
+  startup, which is what governs a `cargo run` outside a bundle; this key
+  is what governs the bundle, and it takes effect before our code runs, so
+  the Dock tile never flickers.
+-->
+<plist version="1.0">
+  <dict>
+    <key>LSUIElement</key>
+    <true/>
+  </dict>
+</plist>

@@ -1,0 +1,462 @@
+#!/usr/bin/env bash
+# End-to-end for swapping an instance's cpu part onto another device — the
+# offline migration of docs/ROADMAP.md Phase 6.
+#
+# Two daemons on one host, each with its own ASTERISM_HOME, paired over
+# loopback, with REAL guests booted at both ends. Asserting on output CONTENT
+# the way scripts/e2e.sh does.
+#
+#   boot on A, write a marker, snapshot, down
+#   -> ast move (base fetched peer-to-peer, disk streamed sparsely)
+#   -> ast ls says B, ast up on B boots it, ssh reads the marker back
+#   -> the snapshot came along and restoring it on B works
+#   -> A's copy is gone and A answers "moved to B" if asked directly
+#   -> a move to a paired device whose daemon is down fails, leaving A
+#      authoritative
+#   -> a move whose target dies mid-transfer leaves A bootable and B with no
+#      bootable copy, and the staging directory is swept on B's next start
+#
+# The image store is deliberately given to A only: the whole point of the base
+# being content-addressed is that B fetches it from an orbit peer that has it
+# rather than from the internet, and an e2e that pre-seeded both would never
+# exercise that.
+#
+# ASTERISM_MESH=local keeps both endpoints on loopback: no relays, no
+# discovery service, no packet that leaves the machine.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+export PATH="$HOME/.cargo/bin:$PATH"
+cd "$ROOT"
+cargo build -q
+AST="$ROOT/target/debug/ast"
+ASTD="$ROOT/target/debug/astd"
+
+# Fresh, SHORT homes: unix socket paths are capped near 104 bytes.
+RUN="/private/tmp/ast-move-$$"
+A="$RUN/a"
+B="$RUN/b"
+C="$RUN/c"           # paired, then shut down: the device that will not answer
+A_NAME="move-a-$$"
+B_NAME="move-b-$$"
+C_NAME="move-c-$$"
+INST="mv-e2e"        # the one that really moves, boots at both ends
+KILL="mv-kill"       # the one whose target dies mid-transfer
+FAIL="mv-fail"       # the small one that proves the refusals and --down
+VOL="$RUN/mv-vol"    # a directory volume, stranded by the move
+IMAGE="${E2E_IMAGE:-debian:13}"
+MARKER="marker-$$"
+POST="post-$$"
+
+cleanup() {
+  for home in "$A" "$B" "$C"; do
+    [ -d "$home" ] || continue
+    for inst in "$INST" "$KILL" "$FAIL"; do
+      ASTERISM_HOME="$home" "$AST" down "$inst" >/dev/null 2>&1 || true
+      ASTERISM_HOME="$home" "$AST" rm "$inst" >/dev/null 2>&1 || true
+    done
+  done
+  pkill -f "$ASTD" 2>/dev/null || true
+  rm -rf "$RUN"
+}
+trap cleanup EXIT
+
+fail() {
+  echo "MOVE E2E FAIL: $*" >&2
+  for home in "$A" "$B" "$C"; do
+    [ -f "$home/astd.log" ] || continue
+    echo "--- tail of $home/astd.log ---" >&2
+    tail -30 "$home/astd.log" >&2
+  done
+  exit 1
+}
+
+# expect <desc> <needle> <cmd...>: run cmd, require success AND the needle.
+expect() {
+  local desc="$1" needle="$2"; shift 2
+  local out
+  out="$("$@" 2>&1)" || fail "$desc: command failed:"$'\n'"$out"
+  grep -qF "$needle" <<<"$out" || fail "$desc: expected \"$needle\" in:"$'\n'"$out"
+  echo "ok: $desc"
+}
+
+# refute <desc> <needle> <cmd...>: the command must FAIL, and say why.
+refute() {
+  local desc="$1" needle="$2"; shift 2
+  local out
+  if out="$("$@" 2>&1)"; then
+    fail "$desc: command unexpectedly succeeded:"$'\n'"$out"
+  fi
+  grep -qF "$needle" <<<"$out" || fail "$desc: expected \"$needle\" in:"$'\n'"$out"
+  echo "ok: $desc"
+}
+
+# The log is appended to rather than replaced, so a daemon that is restarted
+# leaves its predecessor's lines in it. That makes "has it come up?" a question
+# about a *new* line, not about any line — a distinction this script depends on
+# twice, because it asserts on what a restarted daemon did on its way up.
+start_daemon() {
+  local home="$1"
+  mkdir -p "$home"
+  local before now
+  before="$(grep -c "on the mesh as" "$home/astd.log" 2>/dev/null || true)"
+  ( ASTERISM_HOME="$home" ASTERISM_MESH=local "$ASTD" >>"$home/astd.log" 2>&1 & )
+  for _ in $(seq 1 100); do
+    now="$(grep -c "on the mesh as" "$home/astd.log" 2>/dev/null || true)"
+    [ "${now:-0}" -gt "${before:-0}" ] && return 0
+    sleep 0.2
+  done
+  fail "astd for $home did not come up:"$'\n'"$(cat "$home/astd.log" 2>/dev/null)"
+}
+
+stop_daemon() {
+  local home="$1" signal="${2:--TERM}"
+  local pid
+  pid="$(cat "$home/astd.pid" 2>/dev/null || true)"
+  [ -n "$pid" ] || fail "no pid file for the daemon in $home"
+  kill "$signal" "$pid" 2>/dev/null || true
+  for _ in $(seq 1 50); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.2
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+}
+
+mkdir -p "$A" "$B" "$C" "$VOL"
+echo "$MARKER" > "$VOL/VOLUME.txt"
+start_daemon "$A"
+start_daemon "$B"
+
+# ---- 1. pair A and B -------------------------------------------------------
+
+ASTERISM_HOME="$A" "$AST" device invite --name "$A_NAME" --yes >"$A/invite.out" 2>&1 &
+INVITE_PID=$!
+TICKET=""
+for _ in $(seq 1 100); do
+  TICKET="$(grep -o 'astdev1[a-z0-9]*' "$A/invite.out" 2>/dev/null | head -1 || true)"
+  [ -n "$TICKET" ] && break
+  sleep 0.2
+done
+[ -n "$TICKET" ] || fail "no ticket printed:"$'\n'"$(cat "$A/invite.out")"
+ASTERISM_HOME="$B" "$AST" device add "$TICKET" --name "$B_NAME" --yes >"$B/add.out" 2>&1 \
+  || fail "ast device add failed:"$'\n'"$(cat "$B/add.out")"
+wait "$INVITE_PID" || fail "ast device invite failed:"$'\n'"$(cat "$A/invite.out")"
+echo "ok: A and B are one orbit"
+
+# ---- 2. a real guest on A, with a marker in it -----------------------------
+#
+# Only A gets the image store. B will have to get the base from A.
+
+mkdir -p "$A/images"
+cp "$HOME/.asterism/images/"*.qcow2 "$A/images/" 2>/dev/null || true
+ASTERISM_HOME="$A" "$AST" pull "$IMAGE" >/dev/null 2>&1 \
+  || fail "no $IMAGE image available for A (pull it once: ast pull $IMAGE)"
+[ -z "$(ls "$B/images" 2>/dev/null || true)" ] \
+  || fail "B's image store is not empty, so the peer fetch proves nothing"
+
+expect "create on A" "$INST  defined" \
+  env ASTERISM_HOME="$A" "$AST" create "$INST" --image "$IMAGE" --mem 2G --disk 10G
+# A directory share: same-device by construction, so the move has to keep the
+# row and flag it rather than drop it.
+expect "attach a directory volume" "/mnt/ast/mv-vol" \
+  env ASTERISM_HOME="$A" "$AST" attach "$INST" --volume "$VOL"
+expect "up on A" "$INST  running" env ASTERISM_HOME="$A" "$AST" up "$INST"
+
+marker_written=
+for _ in $(seq 1 30); do
+  if ASTERISM_HOME="$A" "$AST" ssh "$INST" -- \
+       "echo $MARKER | sudo tee /var/lib/asterism-marker >/dev/null && sync" >/dev/null 2>&1; then
+    marker_written=1; break
+  fi
+  sleep 3
+done
+[ -n "$marker_written" ] || fail "could not write a marker in the guest on A"
+expect "the marker is in the guest on A" "$MARKER" \
+  env ASTERISM_HOME="$A" "$AST" ssh "$INST" -- "cat /var/lib/asterism-marker"
+
+expect "down on A" "$INST  stopped" env ASTERISM_HOME="$A" "$AST" down "$INST"
+expect "snapshot on A" "$INST  snapshot clean" \
+  env ASTERISM_HOME="$A" "$AST" snapshot "$INST" clean
+
+DISK_A="$A/instances/$INST/disk.raw"
+[ -f "$DISK_A" ] || fail "no root disk at $DISK_A"
+VIRTUAL="$(stat -f %z "$DISK_A")"
+echo "ok: A's root disk claims $VIRTUAL bytes"
+
+# ---- 3. the move -----------------------------------------------------------
+
+MOVE_OUT="$RUN/move.out"
+ASTERISM_HOME="$A" "$AST" move "$INST" "$B_NAME" >"$MOVE_OUT" 2>&1 \
+  || fail "ast move failed:"$'\n'"$(cat "$MOVE_OUT")"
+cat "$MOVE_OUT"
+
+# The base image is fetched from the orbit peer that has it, not the internet.
+grep -qF "fetching base image $IMAGE" "$MOVE_OUT" \
+  || fail "B did not fetch the base image at all:"$'\n'"$(cat "$MOVE_OUT")"
+grep -qF "from $A_NAME" "$MOVE_OUT" \
+  || fail "the base image did not come from A:"$'\n'"$(cat "$MOVE_OUT")"
+grep -qF "not the internet" "$MOVE_OUT" \
+  || fail "the peer fetch is not stated as one:"$'\n'"$(cat "$MOVE_OUT")"
+grep -qF "base image $IMAGE verified and stored" "$MOVE_OUT" \
+  || fail "the fetched base was never verified:"$'\n'"$(cat "$MOVE_OUT")"
+echo "ok: B pulled the base image from A over the mesh and verified it"
+
+# Progress, not a cursor: bytes have to be reported while they move.
+PROGRESS="$(grep -c " moved$" "$MOVE_OUT" || true)"
+[ "$PROGRESS" -ge 2 ] \
+  || fail "only $PROGRESS progress line(s) for a multi-gigabyte move:"$'\n'"$(cat "$MOVE_OUT")"
+grep -qE "^disk\.raw: .* carried$" "$MOVE_OUT" \
+  || fail "the root disk's cost was never reported:"$'\n'"$(cat "$MOVE_OUT")"
+grep -qF "snapshots/clean.raw" "$MOVE_OUT" \
+  || fail "the snapshot did not travel:"$'\n'"$(cat "$MOVE_OUT")"
+echo "ok: the move reported $PROGRESS progress lines as the bytes went"
+
+# Sparse efficiency: the wire carried the allocated ranges, not the file.
+ALLOCATED="$(sed -n 's/.*\[allocated=\([0-9]*\) virtual=\([0-9]*\)\].*/\1/p' "$MOVE_OUT" | head -1)"
+CLAIMED="$(sed -n 's/.*\[allocated=\([0-9]*\) virtual=\([0-9]*\)\].*/\2/p' "$MOVE_OUT" | head -1)"
+[ -n "$ALLOCATED" ] && [ -n "$CLAIMED" ] \
+  || fail "the move never reported its byte counts:"$'\n'"$(cat "$MOVE_OUT")"
+[ "$CLAIMED" -gt "$VIRTUAL" ] || [ "$CLAIMED" -eq "$VIRTUAL" ] \
+  || fail "the manifest claims $CLAIMED bytes and the disk alone is $VIRTUAL"
+# Well under half: a fresh 10 GiB Debian instance holds a small fraction of it.
+[ "$((ALLOCATED * 2))" -lt "$CLAIMED" ] \
+  || fail "moved $ALLOCATED of $CLAIMED bytes — the sparse walk bought nothing"
+echo "ok: sparse transfer moved $ALLOCATED bytes of $CLAIMED claimed ($((ALLOCATED * 100 / CLAIMED))%)"
+
+# ...and the disk landed sparse on B too, rather than being filled in.
+DISK_B="$B/instances/$INST/disk.raw"
+[ -f "$DISK_B" ] || fail "no root disk on B at $DISK_B"
+B_SIZE="$(stat -f %z "$DISK_B")"
+B_BLOCKS="$(( $(stat -f %b "$DISK_B") * 512 ))"
+[ "$B_SIZE" = "$VIRTUAL" ] || fail "B's disk is $B_SIZE bytes and A's was $VIRTUAL"
+[ "$((B_BLOCKS * 2))" -lt "$B_SIZE" ] \
+  || fail "B's disk occupies $B_BLOCKS of $B_SIZE bytes — the holes did not survive"
+echo "ok: B's disk is $B_SIZE bytes long and occupies $B_BLOCKS — still a sparse file"
+
+# ---- 4. the orbit agrees, and A has let go ---------------------------------
+
+LS="$(ASTERISM_HOME="$A" "$AST" ls 2>&1)" || fail "ast ls failed:"$'\n'"$LS"
+grep -qE "^$INST +stopped .*$B_NAME" <<<"$LS" \
+  || fail "ast ls does not show $INST with its cpu on B:"$'\n'"$LS"
+[ "$(grep -c "^$INST " <<<"$LS")" = "1" ] \
+  || fail "$INST appears more than once — a move left two rows:"$'\n'"$LS"
+echo "ok: ast ls shows one row for $INST, cpu on $B_NAME"
+
+[ ! -d "$A/instances/$INST" ] \
+  || fail "A still has $A/instances/$INST — the source did not drop its copy"
+ASTERISM_HOME="$A" "$AST" ls --local 2>&1 | grep -qF "no instances" \
+  || fail "A's shard still holds a row for $INST"
+echo "ok: A's copy and A's row are both gone"
+
+# Asked directly, the old device says where it went rather than "no such
+# instance", which would be true of that shard and useless to a human. Asked
+# from B, because a device does not list itself among its peers.
+refute "A says where it went if asked directly" "moved to $B_NAME" \
+  env ASTERISM_HOME="$B" "$AST" --device "$A_NAME" status "$INST"
+
+# The move epoch is on the row that landed.
+expect "the row carries a move epoch" "moves:   1" \
+  env ASTERISM_HOME="$A" "$AST" status "$INST"
+
+# The directory share is same-device only, so it is flagged rather than
+# dropped: the row still says what the user asked for.
+STATUS="$(ASTERISM_HOME="$A" "$AST" status "$INST" 2>&1)"
+grep -qF "$VOL" <<<"$STATUS" || fail "the volume row was dropped by the move:"$'\n'"$STATUS"
+grep -qF "stranded by the cpu move" <<<"$STATUS" \
+  || fail "the stranded volume is not flagged:"$'\n'"$STATUS"
+echo "ok: the 9p volume survived as a row and is flagged in status"
+
+# ---- 5. it boots on B, and the guest is the same guest ---------------------
+
+# The seed travelled rather than being rebuilt, so the key that opens this
+# guest is still A's. `ast ssh` has to know that, or the move produces a guest
+# nobody can get into.
+expect "status names the device whose key opens the guest" "seed:    built on $A_NAME" \
+  env ASTERISM_HOME="$A" "$AST" status "$INST"
+
+expect "up through the orbit boots it on B" "$INST  running" \
+  env ASTERISM_HOME="$A" "$AST" up "$INST"
+# Typed on A, about a guest whose cpu is on B, reached over the ssh splice.
+expect "the marker survived the move" "$MARKER" \
+  env ASTERISM_HOME="$A" "$AST" ssh "$INST" -- "cat /var/lib/asterism-marker"
+echo "ok: the guest that booted on B is the guest that was written to on A"
+
+# ---- 6. the snapshots came along, and restoring one works on B -------------
+
+expect "the snapshot is listed on B" "clean" \
+  env ASTERISM_HOME="$A" "$AST" snapshots "$INST"
+
+ASTERISM_HOME="$A" "$AST" ssh "$INST" -- \
+  "echo $POST | sudo tee /var/lib/asterism-post >/dev/null && sync" >/dev/null 2>&1 \
+  || fail "could not write a second marker on B"
+expect "down on B" "$INST  stopped" env ASTERISM_HOME="$A" "$AST" down "$INST"
+expect "restore on B" "restored to clean" \
+  env ASTERISM_HOME="$A" "$AST" restore "$INST" clean
+expect "up after the restore" "$INST  running" env ASTERISM_HOME="$A" "$AST" up "$INST"
+expect "the snapshot still has the first marker" "$MARKER" \
+  env ASTERISM_HOME="$A" "$AST" ssh "$INST" -- "cat /var/lib/asterism-marker"
+if ASTERISM_HOME="$A" "$AST" ssh "$INST" -- "cat /var/lib/asterism-post" >/dev/null 2>&1; then
+  fail "the restore did not roll back — the post-move marker is still there"
+fi
+echo "ok: a snapshot taken on A restores on B and really rolls the disk back"
+expect "down again" "$INST  stopped" env ASTERISM_HOME="$A" "$AST" down "$INST"
+
+# ---- 7. the refusals, and --down -------------------------------------------
+#
+# A small instance that is never really booted: what is under test here is the
+# preflight and the shutdown, and neither needs a distro.
+
+DISK="$A/tiny.qcow2"
+qemu-img create -f qcow2 "$DISK" 1M >/dev/null 2>&1 \
+  || fail "qemu-img create failed (is qemu installed?)"
+expect "create a small instance on A" "$FAIL  defined" \
+  env ASTERISM_HOME="$A" "$AST" create "$FAIL" --image "$DISK" --mem 512M --disk 1G
+
+refute "moving to the device that already supplies it is refused" "already sources" \
+  env ASTERISM_HOME="$A" "$AST" move "$FAIL" "$A_NAME"
+refute "moving to a device nobody has heard of is refused" "no device named" \
+  env ASTERISM_HOME="$A" "$AST" move "$FAIL" nowhere
+refute "moving something that is not in the orbit is refused" "no instance named" \
+  env ASTERISM_HOME="$A" "$AST" move ghost "$B_NAME"
+refute "there is only one part to set today" "there is no \"gpu\" part to set" \
+  env ASTERISM_HOME="$A" "$AST" set "$FAIL" gpu "$B_NAME"
+
+# A running instance is refused without --down, because offline is the only
+# kind of move that works on every backend Asterism has.
+expect "boot the small instance" "$FAIL  running" env ASTERISM_HOME="$A" "$AST" up "$FAIL"
+refute "a running instance will not be moved silently" "pass --down" \
+  env ASTERISM_HOME="$A" "$AST" move "$FAIL" "$B_NAME"
+
+DOWN_OUT="$RUN/down.out"
+ASTERISM_HOME="$A" "$AST" move "$FAIL" "$B_NAME" --down >"$DOWN_OUT" 2>&1 \
+  || fail "ast move --down failed:"$'\n'"$(cat "$DOWN_OUT")"
+grep -qF "shutting $FAIL down on $A_NAME first" "$DOWN_OUT" \
+  || fail "--down did not shut the guest down:"$'\n'"$(cat "$DOWN_OUT")"
+LS="$(ASTERISM_HOME="$A" "$AST" ls 2>&1)"
+grep -qE "^$FAIL +stopped .*$B_NAME" <<<"$LS" \
+  || fail "--down did not finish the move:"$'\n'"$LS"
+echo "ok: --down stops the guest and completes the move"
+
+# It needed no base image: B fetched that once and content addressing did the
+# rest — including for an image that is a plain file on both devices.
+if grep -qF "fetching base image" "$DOWN_OUT"; then
+  fail "B fetched a base image it already had:"$'\n'"$(cat "$DOWN_OUT")"
+fi
+echo "ok: the second move carried no base image"
+
+# ---- 8. a move to a device that is not answering ---------------------------
+#
+# A third device, paired and then shut down. Deliberately not "stop B and
+# start it again": under ASTERISM_MESH=local a daemon binds an ephemeral port,
+# so a restarted peer is at an address its orbit no longer knows — which would
+# make the rest of this script test the wrong thing.
+
+start_daemon "$C"
+ASTERISM_HOME="$A" "$AST" device invite --name "$A_NAME" --yes >"$A/invite-c.out" 2>&1 &
+INVITE_PID=$!
+TICKET=""
+for _ in $(seq 1 100); do
+  TICKET="$(grep -o 'astdev1[a-z0-9]*' "$A/invite-c.out" 2>/dev/null | head -1 || true)"
+  [ -n "$TICKET" ] && break
+  sleep 0.2
+done
+[ -n "$TICKET" ] || fail "no ticket for C:"$'\n'"$(cat "$A/invite-c.out")"
+ASTERISM_HOME="$C" "$AST" device add "$TICKET" --name "$C_NAME" --yes >"$C/add.out" 2>&1 \
+  || fail "C could not join:"$'\n'"$(cat "$C/add.out")"
+wait "$INVITE_PID" || fail "the invite to C failed:"$'\n'"$(cat "$A/invite-c.out")"
+stop_daemon "$C"
+echo "ok: C is in the orbit and its daemon is down"
+
+# The instance that will not move — and, in section 9, the one whose move is
+# interrupted. Snapshotting materialises its root disk exactly as `ast up`
+# would, without spending a boot on it.
+expect "create the instance that will not move" "$KILL  defined" \
+  env ASTERISM_HOME="$A" "$AST" create "$KILL" --image "$IMAGE" --mem 2G --disk 10G
+expect "materialise its disk" "$KILL  snapshot base" \
+  env ASTERISM_HOME="$A" "$AST" snapshot "$KILL" base
+
+refute "a move to a device that is not answering fails cleanly" "is not answering" \
+  env ASTERISM_HOME="$A" "$AST" move "$KILL" "$C_NAME"
+
+LOCAL="$(ASTERISM_HOME="$A" "$AST" ls --local 2>&1)"
+grep -qE "^$KILL +defined" <<<"$LOCAL" \
+  || fail "A did not keep $KILL as its own after the refused move:"$'\n'"$LOCAL"
+if grep -qF "moving" <<<"$LOCAL"; then
+  fail "the refused move left a fence on A:"$'\n'"$LOCAL"
+fi
+[ ! -e "$C/instances/$KILL" ] || fail "C staged something for a move that never started"
+echo "ok: A is still authoritative and nothing was fenced"
+
+# ---- 9. the target dies mid-transfer ---------------------------------------
+#
+# The rule a half-move exists to protect: never two bootable copies. The
+# target writes into a staging directory that no instance could be named, and
+# it becomes an instance only at the commit. Kill the target before that and
+# the source is still the only place this instance can boot.
+
+KILL_OUT="$RUN/kill.out"
+# `set -e` is inherited by the subshell, so the verdict is recorded with an
+# `if` rather than with `$?` — otherwise the failing move takes the subshell
+# with it and the exit status is never written down.
+(
+  if ASTERISM_HOME="$A" "$AST" move "$KILL" "$B_NAME" >"$KILL_OUT" 2>&1; then
+    echo moved
+  else
+    echo refused
+  fi > "$RUN/kill.rc"
+) &
+MOVE_PID=$!
+
+# Wait for real bytes to be on the far side, then pull the plug on it.
+staged=
+for _ in $(seq 1 600); do
+  disk="$(ls "$B"/instances/"$KILL".moving-*/disk.raw 2>/dev/null | head -1 || true)"
+  if [ -n "$disk" ] && [ "$(( $(stat -f %b "$disk") * 512 ))" -gt $((16 * 1024 * 1024)) ]; then
+    staged="$disk"; break
+  fi
+  sleep 0.2
+done
+[ -n "$staged" ] || fail "the transfer never got as far as staging bytes on B:"$'\n'"$(cat "$KILL_OUT" 2>/dev/null)"
+STAGED_DIR="$(dirname "$staged")"
+echo "ok: B is staging $KILL at $STAGED_DIR"
+stop_daemon "$B" -KILL
+wait "$MOVE_PID" || true
+[ "$(cat "$RUN/kill.rc")" = "refused" ] \
+  || fail "the move reported success although its target was killed:"$'\n'"$(cat "$KILL_OUT")"
+grep -qF "still supplies $KILL's cpu" "$KILL_OUT" \
+  || fail "the failed move did not say who still has it:"$'\n'"$(cat "$KILL_OUT")"
+echo "ok: the interrupted move failed and named A as the instance's cpu source"
+
+# B has no bootable copy: no instance directory, no row.
+[ ! -d "$B/instances/$KILL" ] \
+  || fail "B has a bootable copy of $KILL after a killed transfer"
+# ...and A is unfenced and still bootable, which is the whole point.
+LOCAL="$(ASTERISM_HOME="$A" "$AST" ls --local 2>&1)"
+grep -qE "^$KILL +defined" <<<"$LOCAL" \
+  || fail "A lost $KILL to an interrupted move:"$'\n'"$LOCAL"
+if grep -qF "moving" <<<"$LOCAL"; then
+  fail "the interrupted move left a fence on A:"$'\n'"$LOCAL"
+fi
+expect "A can still boot the instance whose move was interrupted" "$KILL  running" \
+  env ASTERISM_HOME="$A" "$AST" up "$KILL"
+expect "the guest on A is real" "Linux" \
+  env ASTERISM_HOME="$A" "$AST" ssh "$KILL" -- "uname -s"
+expect "stop it" "$KILL  stopped" env ASTERISM_HOME="$A" "$AST" down "$KILL"
+
+# The staging directory is swept on B's next start, and B says so. The sweep
+# runs before the socket is bound and before the mesh comes up, so a daemon
+# that is answering has already done it — no polling here on purpose.
+[ -d "$STAGED_DIR" ] || fail "the killed daemon's staging directory vanished before its restart"
+start_daemon "$B"
+[ ! -d "$STAGED_DIR" ] \
+  || fail "B did not sweep $STAGED_DIR when it came back"
+grep -qF "swept" "$B/astd.log" || fail "B swept nothing and said nothing:"$'\n'"$(tail -20 "$B/astd.log")"
+echo "ok: B swept the staging directory on its next start and said so"
+
+# And A's own shard has exactly one row for the interrupted instance.
+LOCAL="$(ASTERISM_HOME="$A" "$AST" ls --local 2>&1)"
+[ "$(grep -c "^$KILL " <<<"$LOCAL")" = "1" ] \
+  || fail "$KILL appears more than once after an interrupted move:"$'\n'"$LOCAL"
+echo "ok: A holds one $KILL and B holds none"
+
+echo "MOVE E2E GREEN ($IMAGE)"

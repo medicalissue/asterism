@@ -1,0 +1,512 @@
+//! Block volumes: the bytes a device puts in the pool, and the single-writer
+//! lease that decides who may write them.
+//!
+//! A block volume is a raw image file on the device that created it, living in
+//! `$ASTERISM_HOME/volumes/<name>/disk.raw`. It is attachable to any instance
+//! in the orbit; when that instance's cpu and ram come from another device the
+//! bytes travel over the mesh as NBD (`docs/ROADMAP.md` Phase 3), and the
+//! guest still sees nothing but `/dev/vdb`.
+//!
+//! # The lease
+//!
+//! A filesystem is not a shared thing. Two guests writing one ext4 destroys
+//! it, and they would do it quietly, so the rule is enforced on the provider
+//! rather than trusted to the consumer: a volume carries at most one
+//! [`Lease`], naming the instance that holds it and the device supplying that
+//! instance's cpu, stamped with a monotonic [`BlockVolume::epoch`].
+//!
+//! Every grant — an attach, and every boot afterwards — bumps the epoch and
+//! renames the NBD export accordingly (`tank-e7`). The old export is stopped
+//! and its socket unlinked, so a consumer that was partitioned and comes back
+//! holding epoch 6 finds nothing to talk to and fails loudly, instead of
+//! writing into a filesystem another guest now owns. That is the whole of
+//! "epoch fencing": the epoch is not a number we compare politely, it is the
+//! name of the door.
+//!
+//! The epoch never goes backwards, including across a release — releasing
+//! clears the holder, not the counter.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+
+use crate::instance::now_unix;
+
+/// Who holds a volume's single writer slot, and at what epoch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lease {
+    /// The instance that may write. Instance names are orbit-global, so this
+    /// is unambiguous without naming a device.
+    pub holder: String,
+    /// The device supplying that instance's cpu and ram — where the bytes are
+    /// going. Recorded so a refusal can say where, not only who.
+    pub holder_device: String,
+    /// The epoch this grant was made at. Equal to [`BlockVolume::epoch`]
+    /// while the lease is current; a consumer holding anything lower has been
+    /// fenced out.
+    pub epoch: u64,
+    /// Unix seconds.
+    pub granted_at: u64,
+    /// NBD export name this grant is being served under: `<volume>-e<epoch>`.
+    pub export: String,
+    /// The `qemu-storage-daemon` serving it, when one is running. Tracked the
+    /// way the vz helper is tracked — a pid plus a socket that answers —
+    /// because it is the same kind of thing: a process this daemon started
+    /// and is responsible for stopping.
+    #[serde(default)]
+    pub pid: Option<u32>,
+}
+
+/// One block volume on this device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockVolume {
+    pub name: String,
+    /// Virtual size. The file is sparse: it claims this and occupies what has
+    /// been written, exactly as an instance's own disk does.
+    pub size_bytes: u64,
+    /// Unix seconds.
+    pub created_at: u64,
+    /// Highest epoch ever granted on this volume. Monotonic, and persisted,
+    /// so it survives a daemon restart — an epoch that reset would un-fence
+    /// every consumer that had been shut out.
+    #[serde(default)]
+    pub epoch: u64,
+    #[serde(default)]
+    pub lease: Option<Lease>,
+}
+
+impl BlockVolume {
+    /// The export name a given epoch is served under.
+    pub fn export_name(&self, epoch: u64) -> String {
+        format!("{}-e{}", self.name, epoch)
+    }
+
+    /// What `ast volume ls` says about who has it.
+    pub fn holder_summary(&self) -> String {
+        match &self.lease {
+            Some(l) => format!("{} on {} (epoch {})", l.holder, l.holder_device, l.epoch),
+            None => "-".to_owned(),
+        }
+    }
+}
+
+/// This device's block volumes, as one file next to the instance shard.
+///
+/// Separate from [`crate::registry::Shard`] on purpose: a volume is a part
+/// this device supplies to the pool, not an instance it runs, and the two have
+/// different lifetimes — a volume outlives every instance that ever mounted
+/// it.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Store {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    volumes: BTreeMap<String, BlockVolume>,
+    #[serde(skip)]
+    path: PathBuf,
+}
+
+impl Store {
+    pub fn load(path: &Path) -> Result<Self> {
+        let mut store: Store = match std::fs::read(path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .with_context(|| format!("reading {}", path.display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Store::default(),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        store.version = 1;
+        store.path = path.to_owned();
+        Ok(store)
+    }
+
+    pub fn save(&self) -> Result<()> {
+        if let Some(dir) = self.path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp = self.path.with_extension("tmp");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
+        std::fs::rename(&tmp, &self.path)?;
+        Ok(())
+    }
+
+    pub fn list(&self) -> Vec<BlockVolume> {
+        self.volumes.values().cloned().collect()
+    }
+
+    pub fn get(&self, name: &str) -> Result<&BlockVolume> {
+        self.volumes.get(name).with_context(|| no_such(name))
+    }
+
+    /// Record a new volume. The bytes are made by the caller; this is the
+    /// bookkeeping half, and it refuses a name that is already spoken for on
+    /// this device.
+    pub fn create(&mut self, name: &str, size_bytes: u64) -> Result<BlockVolume> {
+        check_name(name)?;
+        if self.volumes.contains_key(name) {
+            bail!("this device already has a volume called {name:?}");
+        }
+        if size_bytes == 0 {
+            bail!("a volume needs a size — try --size 10G");
+        }
+        let vol = BlockVolume {
+            name: name.to_owned(),
+            size_bytes,
+            created_at: now_unix(),
+            epoch: 0,
+            lease: None,
+        };
+        self.volumes.insert(name.to_owned(), vol.clone());
+        Ok(vol)
+    }
+
+    /// Forget a volume. Refuses one that is leased: deleting bytes out from
+    /// under a running guest is not a thing a user can have meant.
+    pub fn remove(&mut self, name: &str) -> Result<BlockVolume> {
+        let vol = self.volumes.get(name).with_context(|| no_such(name))?;
+        if let Some(lease) = &vol.lease {
+            bail!("{}", held_by(name, lease));
+        }
+        Ok(self.volumes.remove(name).expect("just looked it up"))
+    }
+
+    /// Take or renew the single-writer lease, at a new epoch.
+    ///
+    /// The same holder asking again is a renewal and still bumps the epoch:
+    /// that is what fences the *previous* connection of that same instance,
+    /// which is the case that actually happens (a guest that was killed
+    /// leaves a QEMU that may not have noticed yet).
+    pub fn lease(
+        &mut self,
+        name: &str,
+        holder: &str,
+        holder_device: &str,
+    ) -> Result<BlockVolume> {
+        let vol = self.volumes.get_mut(name).with_context(|| no_such(name))?;
+        if let Some(current) = &vol.lease {
+            if current.holder != holder {
+                bail!("{}", held_by(name, current));
+            }
+        }
+        vol.epoch += 1;
+        let export = format!("{}-e{}", vol.name, vol.epoch);
+        vol.lease = Some(Lease {
+            holder: holder.to_owned(),
+            holder_device: holder_device.to_owned(),
+            epoch: vol.epoch,
+            granted_at: now_unix(),
+            export,
+            pid: None,
+        });
+        Ok(vol.clone())
+    }
+
+    /// Pick up a lease this holder already has, without moving the epoch.
+    ///
+    /// A renewal ([`Store::lease`]) bumps the epoch because it is meant to
+    /// fence the holder's *previous* connection. That is right when a guest
+    /// is being booted and wrong when one never stopped: a consumer's astd
+    /// that restarts under a live guest has a QEMU with one export name on
+    /// its command line, and bumping would rename the door on a guest that
+    /// is doing nothing but waiting to reconnect.
+    ///
+    /// So this is the reconnect: same holder and same epoch, or a refusal in
+    /// the same words a stale consumer gets. It grants nothing — it confirms
+    /// what is already granted, which is why it can afford not to fence.
+    pub fn reconnect(&self, name: &str, holder: &str, epoch: u64) -> Result<BlockVolume> {
+        let vol = self.volumes.get(name).with_context(|| no_such(name))?;
+        let Some(lease) = &vol.lease else {
+            bail!(
+                "volume {name:?} is not leased to anything — instance {holder:?} \
+                 had it at epoch {epoch} and no longer does"
+            );
+        };
+        if lease.holder != holder {
+            bail!("{}", held_by(name, lease));
+        }
+        if lease.epoch != epoch {
+            bail!("{}", fenced(name, holder, epoch, lease.epoch));
+        }
+        Ok(vol.clone())
+    }
+
+    /// Record which process is serving the current lease.
+    pub fn set_export_pid(&mut self, name: &str, pid: Option<u32>) -> Result<()> {
+        let vol = self.volumes.get_mut(name).with_context(|| no_such(name))?;
+        if let Some(lease) = vol.lease.as_mut() {
+            lease.pid = pid;
+        }
+        Ok(())
+    }
+
+    /// Give the lease back. Only the holder may; anyone else is told who has
+    /// it. Releasing a volume nobody holds is a no-op, so a detach that is
+    /// retried after a crash still succeeds.
+    pub fn release(&mut self, name: &str, holder: &str) -> Result<Option<Lease>> {
+        let vol = self.volumes.get_mut(name).with_context(|| no_such(name))?;
+        match &vol.lease {
+            None => Ok(None),
+            Some(current) if current.holder == holder => Ok(vol.lease.take()),
+            Some(current) => bail!("{}", held_by(name, current)),
+        }
+    }
+}
+
+/// What this device says when it is asked about a volume it does not have.
+///
+/// Names the device rather than the orbit, unlike an instance miss: volumes
+/// are not a flat orbit-wide namespace. Two devices may each have a `tank`,
+/// and `desktop:tank` is how you say which.
+fn no_such(name: &str) -> String {
+    format!("no volume named {name:?} on this device — see: ast volume ls")
+}
+
+/// The refusal a second writer gets. It names the holder, because "it is
+/// busy" is not something anybody can act on.
+pub fn held_by(name: &str, lease: &Lease) -> String {
+    format!(
+        "volume {name:?} is held by instance {:?} (cpu/ram on {}) at epoch {} — \
+         detach it there first: ast detach {} --volume {name}",
+        lease.holder, lease.holder_device, lease.epoch, lease.holder
+    )
+}
+
+/// What a consumer holding an epoch that has moved on is told.
+///
+/// It says what it is holding and what is current, and stops there: the way
+/// back is to ask for a lease, which is the code path that decides whether
+/// this holder may have one.
+pub fn fenced(name: &str, holder: &str, held: u64, current: u64) -> String {
+    format!(
+        "instance {holder:?} is holding a stale lease on volume {name:?} \
+         (epoch {held}, current is {current}) — it has been fenced out"
+    )
+}
+
+/// Volume names go into filenames, NBD export names and CLI arguments, so
+/// they are kept to the same shape instance names are.
+pub fn check_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 40 {
+        bail!("a volume name must be 1-40 characters (got {name:?})");
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        bail!("a volume name may hold letters, digits, - and _ (got {name:?})");
+    }
+    if name.starts_with('-') {
+        bail!("a volume name cannot start with - (got {name:?})");
+    }
+    Ok(())
+}
+
+/// `<device>:<volume>`, the way a remote volume is written on the command
+/// line. `None` when this is not that shape — an absolute path, most often,
+/// which is a directory volume and goes down the 9p road instead.
+pub fn parse_ref(value: &str) -> Option<(String, String)> {
+    if value.starts_with('/') || value.starts_with('.') || value.starts_with('~') {
+        return None;
+    }
+    let (device, volume) = value.split_once(':')?;
+    if device.is_empty() || volume.is_empty() {
+        return None;
+    }
+    Some((device.to_owned(), volume.to_owned()))
+}
+
+/// A size as a human writes it: `10G`, `512M`, `2T`, or plain bytes.
+pub fn parse_size(value: &str) -> Result<u64> {
+    let v = value.trim();
+    let (digits, unit) = match v.chars().last() {
+        Some(c) if c.is_ascii_alphabetic() => (&v[..v.len() - 1], c.to_ascii_uppercase()),
+        _ => (v, 'B'),
+    };
+    let n: u64 = digits
+        .trim()
+        .parse()
+        .with_context(|| format!("bad size {value:?} — try 10G"))?;
+    let scale: u64 = match unit {
+        'B' => 1,
+        'K' => 1 << 10,
+        'M' => 1 << 20,
+        'G' => 1 << 30,
+        'T' => 1 << 40,
+        other => bail!("unknown size unit {other:?} in {value:?} — use K, M, G or T"),
+    };
+    n.checked_mul(scale)
+        .with_context(|| format!("{value:?} is larger than this machine can address"))
+}
+
+/// A size as a human reads it.
+pub fn format_size(bytes: u64) -> String {
+    const UNITS: [(&str, u64); 4] =
+        [("T", 1 << 40), ("G", 1 << 30), ("M", 1 << 20), ("K", 1 << 10)];
+    for (suffix, scale) in UNITS {
+        if bytes >= scale {
+            let whole = bytes as f64 / scale as f64;
+            if (whole - whole.round()).abs() < 0.05 {
+                return format!("{}{suffix}", whole.round() as u64);
+            }
+            return format!("{whole:.1}{suffix}");
+        }
+    }
+    format!("{bytes}B")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store() -> Store {
+        Store {
+            path: std::env::temp_dir()
+                .join(format!("ast-vol-test-{}.json", std::process::id())),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn sizes_round_trip_the_way_people_write_them() {
+        assert_eq!(parse_size("10G").unwrap(), 10 << 30);
+        assert_eq!(parse_size("512M").unwrap(), 512 << 20);
+        assert_eq!(parse_size("2T").unwrap(), 2 << 40);
+        assert_eq!(parse_size("4096").unwrap(), 4096);
+        assert!(parse_size("").is_err());
+        assert!(parse_size("10X").is_err());
+        assert_eq!(format_size(10 << 30), "10G");
+        assert_eq!(format_size(1536 << 20), "1.5G");
+        assert_eq!(format_size(900), "900B");
+    }
+
+    #[test]
+    fn a_device_qualified_reference_is_told_from_a_path() {
+        assert_eq!(parse_ref("desktop:tank"), Some(("desktop".into(), "tank".into())));
+        assert_eq!(parse_ref("/tank/media"), None, "an absolute path is a directory");
+        assert_eq!(parse_ref("./here"), None);
+        assert_eq!(parse_ref("~/here"), None);
+        assert_eq!(parse_ref("tank"), None, "no device, no reference");
+        assert_eq!(parse_ref("desktop:"), None);
+    }
+
+    /// The whole safety property, in one test: one writer, and the epoch only
+    /// ever goes up.
+    #[test]
+    fn one_writer_at_a_time_and_the_epoch_only_climbs() {
+        let mut s = store();
+        s.create("tank", 10 << 30).unwrap();
+        assert!(s.create("tank", 1 << 30).is_err(), "one name, one volume");
+
+        let first = s.lease("tank", "dev", "laptop").unwrap();
+        assert_eq!(first.epoch, 1);
+        assert_eq!(first.lease.as_ref().unwrap().export, "tank-e1");
+
+        // A second instance is refused, and told who has it and where.
+        let err = s.lease("tank", "other", "desktop").unwrap_err().to_string();
+        assert!(err.contains("held by instance \"dev\""), "{err}");
+        assert!(err.contains("laptop"), "{err}");
+        assert!(err.contains("ast detach dev --volume tank"), "{err}");
+
+        // The holder renewing bumps the epoch, which is what fences its own
+        // previous connection.
+        let renewed = s.lease("tank", "dev", "laptop").unwrap();
+        assert_eq!(renewed.epoch, 2);
+        assert_eq!(renewed.lease.as_ref().unwrap().export, "tank-e2");
+
+        // Only the holder may release.
+        assert!(s.release("tank", "other").is_err());
+        let released = s.release("tank", "dev").unwrap().unwrap();
+        assert_eq!(released.epoch, 2);
+        assert!(s.release("tank", "dev").unwrap().is_none(), "releasing twice is fine");
+
+        // ...and the counter did not come back down with it.
+        let elsewhere = s.lease("tank", "other", "desktop").unwrap();
+        assert_eq!(elsewhere.epoch, 3, "a released volume does not rewind the epoch");
+        assert_eq!(elsewhere.export_name(elsewhere.epoch), "tank-e3");
+    }
+
+    /// The other half of the epoch rule: a consumer that never lost the
+    /// lease, only the daemon holding the bridge, gets to pick it back up
+    /// exactly where it was. Bumping would rename the export out from under
+    /// a guest whose QEMU already has the old name on its command line.
+    #[test]
+    fn the_holder_can_pick_up_the_lease_it_still_has_without_moving_the_epoch() {
+        let mut s = store();
+        s.create("tank", 1 << 30).unwrap();
+        let granted = s.lease("tank", "dev", "laptop").unwrap();
+        let epoch = granted.epoch;
+
+        let back = s.reconnect("tank", "dev", epoch).unwrap();
+        assert_eq!(back.epoch, epoch, "a reconnect is not a renewal");
+        assert_eq!(back.lease.as_ref().unwrap().export, granted.lease.unwrap().export);
+        // Twice, and it is still the same door: nothing about it is a grant.
+        assert_eq!(s.reconnect("tank", "dev", epoch).unwrap().epoch, epoch);
+        assert_eq!(s.get("tank").unwrap().epoch, epoch);
+
+        // Somebody else's, and it says who has it.
+        let err = s.reconnect("tank", "other", epoch).unwrap_err().to_string();
+        assert!(err.contains("held by instance \"dev\""), "{err}");
+
+        // The holder's own stale epoch is refused too — that is a consumer
+        // that was fenced while it was away, and it must not be handed the
+        // current door just because the name on the lease still matches.
+        let err = s.reconnect("tank", "dev", epoch - 1).unwrap_err().to_string();
+        assert!(err.contains("fenced out"), "{err}");
+        assert!(err.contains(&format!("current is {epoch}")), "{err}");
+
+        // And once it has been given back there is nothing to reconnect to.
+        s.release("tank", "dev").unwrap();
+        let err = s.reconnect("tank", "dev", epoch).unwrap_err().to_string();
+        assert!(err.contains("no longer does"), "{err}");
+    }
+
+    #[test]
+    fn a_leased_volume_cannot_be_deleted() {
+        let mut s = store();
+        s.create("tank", 1 << 30).unwrap();
+        s.lease("tank", "dev", "laptop").unwrap();
+        let err = s.remove("tank").unwrap_err().to_string();
+        assert!(err.contains("held by instance \"dev\""), "{err}");
+        s.release("tank", "dev").unwrap();
+        assert_eq!(s.remove("tank").unwrap().name, "tank");
+        assert!(s.get("tank").is_err());
+    }
+
+    #[test]
+    fn a_missing_volume_is_missing_from_this_device_not_from_the_orbit() {
+        let s = store();
+        let err = s.get("ghost").unwrap_err().to_string();
+        assert!(err.contains("on this device"), "{err}");
+        assert!(err.contains("ast volume ls"), "{err}");
+    }
+
+    #[test]
+    fn names_that_would_not_survive_a_filename_are_refused() {
+        assert!(check_name("tank").is_ok());
+        assert!(check_name("tank-2_b").is_ok());
+        assert!(check_name("").is_err());
+        assert!(check_name("../etc").is_err());
+        assert!(check_name("a:b").is_err());
+        assert!(check_name("-lead").is_err());
+    }
+
+    /// The store is written and read back across daemon restarts, and the
+    /// epoch is the field that must not be lost.
+    #[test]
+    fn the_store_round_trips_through_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("volumes.json");
+        let mut s = Store::load(&path).unwrap();
+        s.create("tank", 5 << 30).unwrap();
+        s.lease("tank", "dev", "laptop").unwrap();
+        s.set_export_pid("tank", Some(4242)).unwrap();
+        s.save().unwrap();
+
+        let back = Store::load(&path).unwrap();
+        let vol = back.get("tank").unwrap();
+        assert_eq!(vol.size_bytes, 5 << 30);
+        assert_eq!(vol.epoch, 1);
+        let lease = vol.lease.as_ref().unwrap();
+        assert_eq!(lease.holder, "dev");
+        assert_eq!(lease.pid, Some(4242));
+        assert_eq!(lease.export, "tank-e1");
+    }
+}

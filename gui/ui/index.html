@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en" data-astryx-theme="asterism">
+<head>
+<meta charset="utf-8">
+<!--
+  Both of the app's windows. Which one a page draws is decided from the
+  window label in src/main.tsx, so the main window and the New Instance
+  dialog are one build, one bundle and one CSP.
+
+  `data-astryx-theme` on <html> is what the built theme is scoped to, the
+  same hook the site sets. `color-scheme: dark light` is what makes the
+  `light-dark()` in those tokens resolve, so both windows follow the system
+  appearance with no JavaScript and no flash of the wrong one.
+
+  Nothing here reaches off the machine: no font link, no CDN, no analytics.
+  The CSP in tauri.conf.json would refuse it anyway.
+-->
+<meta name="color-scheme" content="dark light">
+<title>Asterism</title>
+</head>
+<body>
+<div id="root"></div>
+<script type="module" src="/src/main.tsx"></script>
+</body>
+</html>

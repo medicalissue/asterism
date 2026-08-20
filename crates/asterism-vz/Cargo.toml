@@ -1,0 +1,88 @@
+[package]
+name = "asterism-vz"
+description = "astd-vz: the signed helper process that owns one Virtualization.framework guest, and the control protocol astd drives it with."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# The library half is the *protocol* — plain serde types, no Objective-C —
+# so `astd` can speak to the helper without linking Virtualization.framework
+# or needing the entitlement itself (BACKENDS.md §4).
+[lib]
+name = "asterism_vz"
+path = "src/lib.rs"
+
+# The binary half is the only thing in Asterism that touches VZ, and the
+# only thing that has to be code-signed. See scripts/sign-vz.sh.
+[[bin]]
+name = "astd-vz"
+path = "src/helper/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+block2 = "0.6.2"
+
+[target.'cfg(target_os = "macos")'.dependencies.objc2-foundation]
+version = "0.3.2"
+default-features = false
+features = [
+    "std",
+    "NSArray",
+    "NSData",
+    "NSDate",
+    "NSError",
+    "NSFileHandle",
+    "NSObject",
+    "NSRunLoop",
+    "NSString",
+    "NSURL",
+]
+
+[target.'cfg(target_os = "macos")'.dependencies.objc2-virtualization]
+version = "0.3.2"
+default-features = false
+features = [
+    "std",
+    "block2",
+    "bitflags",
+    "VZBootLoader",
+    "VZDiskImageStorageDeviceAttachment",
+    "VZEFIBootLoader",
+    "VZEFIVariableStore",
+    "VZEntropyDeviceConfiguration",
+    "VZError",
+    "VZFileHandleSerialPortAttachment",
+    "VZGenericPlatformConfiguration",
+    "VZMACAddress",
+    "VZMemoryBalloonDeviceConfiguration",
+    "VZNATNetworkDeviceAttachment",
+    "VZNetworkDevice",
+    "VZNetworkDeviceAttachment",
+    "VZNetworkDeviceConfiguration",
+    "VZPlatformConfiguration",
+    "VZSerialPortAttachment",
+    "VZSerialPortConfiguration",
+    "VZSocketDevice",
+    "VZSocketDeviceConfiguration",
+    "VZStorageDeviceAttachment",
+    "VZStorageDeviceConfiguration",
+    "VZVirtioBlockDeviceConfiguration",
+    "VZVirtioConsoleDeviceSerialPortConfiguration",
+    "VZVirtioEntropyDeviceConfiguration",
+    "VZVirtioNetworkDeviceConfiguration",
+    "VZVirtioSocketDeviceConfiguration",
+    "VZVirtioTraditionalMemoryBalloonDeviceConfiguration",
+    "VZVirtualMachine",
+    "VZVirtualMachineConfiguration",
+    "VZVirtualMachineDelegate",
+]
+
+[dev-dependencies]
+tempfile = "3"
