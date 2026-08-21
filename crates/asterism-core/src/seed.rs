@@ -335,6 +335,11 @@ const HOSTKEY_UNIT: &str = "\x20 - path: /usr/local/sbin/asterism-hostkeys\n\
 /// itself, and generating a set for it to delete would be a second of
 /// nothing on every instance anyone ever creates.
 const HOSTKEY_BOOTCMD: &str = "\x20 - |\n\
+     \x20   # A subshell, and it is load-bearing: cloud-init concatenates\n\
+     \x20   # every `bootcmd` entry into one /bin/sh script, so an `exit`\n\
+     \x20   # out here would end the entries that come after this one —\n\
+     \x20   # the console fix and the guest agent among them.\n\
+     \x20   (\n\
      \x20   [ -d /var/lib/cloud/instance ] || exit 0\n\
      \x20   for key in /etc/ssh/ssh_host_*_key; do\n\
      \x20     [ -s \"$key\" ] && exit 0\n\
@@ -342,7 +347,8 @@ const HOSTKEY_BOOTCMD: &str = "\x20 - |\n\
      \x20   echo 'asterism: no ssh host keys on this guest — generating a set' >&2\n\
      \x20   mkdir -p /etc/ssh\n\
      \x20   ssh-keygen -A\n\
-     \x20   sync\n";
+     \x20   sync\n\
+     \x20   )\n";
 
 /// Enable that unit, and flush what cloud-init has just written.
 ///
@@ -1090,5 +1096,52 @@ mod tests {
         let shares = shares(&inst);
         assert_eq!(shares.len(), 1);
         assert_eq!(shares[0].host_path, "/tank/here");
+    }
+
+    /// cloud-init concatenates every `bootcmd` entry into **one** `/bin/sh`
+    /// script, so an `exit` in one entry ends the entries after it too.
+    ///
+    /// That is not hypothetical: the host-key check exits early on a first
+    /// boot, and a first boot is exactly when the backend's own entries —
+    /// the vz console fix, and the guest agent that gives the host a
+    /// control channel — have to run. Hence the subshell in
+    /// [`HOSTKEY_BOOTCMD`], and hence this.
+    ///
+    /// Run for real, with nothing on `PATH`: every external command fails
+    /// harmlessly, both guards take their early exit, and what is being
+    /// asserted is that the script got to the end anyway.
+    #[test]
+    fn one_bootcmd_entry_cannot_end_the_others() {
+        let backend = "bootcmd:\n - |\n   echo the-backends-own-entry\n";
+        let merged = merge(&asterism_config(&[], &Egress::default()), backend).unwrap();
+
+        // What cloud-init makes of it: the entries, in order, as one
+        // script. (Block scalars only — the list form a backend may also
+        // use is quoted and joined, and is not what this is about.)
+        let mut script = String::new();
+        let mut inside = false;
+        for line in merged.lines() {
+            if !line.starts_with(' ') {
+                inside = line.starts_with("bootcmd:");
+                continue;
+            }
+            if inside && line.trim() != "- |" {
+                script.push_str(line.strip_prefix("    ").unwrap_or(line.trim_start()));
+                script.push('\n');
+            }
+        }
+        assert!(script.contains("ssh-keygen -A"), "{script}");
+
+        let ran = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("PATH=''\n{script}"))
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&ran.stdout).contains("the-backends-own-entry"),
+            "the entry after the host-key check never ran:\nstdout {}\nstderr {}",
+            String::from_utf8_lossy(&ran.stdout),
+            String::from_utf8_lossy(&ran.stderr),
+        );
     }
 }
