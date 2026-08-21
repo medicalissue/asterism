@@ -57,6 +57,12 @@ cloud-init provisioning with your SSH keys, host-directory passthrough
 (virtio-9p), disk snapshots with restore, console logs, and graceful
 shutdown. `ast` talks to a local `astd` daemon and starts it on demand.
 
+Bootstrap profiles turn a stock cloud image into somewhere an agent can
+work — git and tmux, Node, Claude Code or Codex — applied inside the guest
+and verifiable from outside it. The credential is not part of that: bind a
+secret and the guest gets an opaque handle, while the value stays on the
+device that holds it and never reaches the guest's disk or a snapshot of it.
+
 ```
 ast images                    # what you can boot
 ast create dev --image debian:13 --cpus 4 --mem 8G
@@ -64,6 +70,11 @@ ast attach dev --volume ~/work
 ast up dev · ast ssh dev · ast down dev
 ast snapshot dev clean · ast restore dev clean · ast logs dev -f
 ast ls · ast status dev · ast rm dev
+
+ast profiles                                    # what a guest can be made into
+ast create agent --image debian:13 --profile claude
+ast attach agent --secret anthropic --to api.anthropic.com
+ast profile agent --check                       # what the guest actually has
 ```
 
 ## What's next

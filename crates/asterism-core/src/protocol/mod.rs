@@ -67,6 +67,11 @@ pub enum Request {
         /// them, which is every `ast create` of a cloud image.
         #[serde(default)]
         publish: Vec<PortForward>,
+        /// Bootstrap profiles to apply at first boot (`ast create --profile
+        /// claude`). Empty from a CLI that predates them, and empty from
+        /// every `ast create` that did not ask for one.
+        #[serde(default)]
+        profiles: Vec<String>,
     },
     Up {
         name: String,
@@ -79,6 +84,13 @@ pub enum Request {
     },
     Down {
         name: String,
+    },
+    /// Change which bootstrap profiles an instance has (`ast profile dev
+    /// claude`). Recorded now, applied by the next boot: the seed is what
+    /// carries them, and a seed reaches a guest when that guest starts.
+    SetProfiles {
+        name: String,
+        profiles: Vec<String>,
     },
     Remove {
         name: String,
@@ -518,6 +530,7 @@ impl Request {
             | Request::Down { name }
             | Request::Remove { name }
             | Request::Status { name }
+            | Request::SetProfiles { name, .. }
             | Request::Rename { name, .. }
             | Request::MarkConflicted { name, .. }
             | Request::AttachVolume { name, .. }
@@ -969,10 +982,13 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(create, Request::Create { backend: None, .. }));
-        let Request::Create { publish, .. } = &create else {
+        let Request::Create { publish, profiles, .. } = &create else {
             unreachable!("a create")
         };
         assert!(publish.is_empty(), "a cloud image publishes nothing");
+        // ...and nothing about bootstrap profiles, which is the instance
+        // that CLI would have made: a stock image and nothing else.
+        assert!(profiles.is_empty(), "an older create asks for no profiles");
 
         // ...and one from a CLI that has `-p` carries what it asked for.
         let published: Request = serde_json::from_str(
@@ -1106,8 +1122,16 @@ mod tests {
             shape: Shape::default(),
             backend: None,
             publish: Vec::new(),
+            profiles: Vec::new(),
         };
         assert_eq!(create.subject(), None);
+        // Changing an instance's profiles is about that instance, so it
+        // resolves across the orbit like every other instance command.
+        assert_eq!(
+            Request::SetProfiles { name: "dev".into(), profiles: vec!["claude".into()] }
+                .subject(),
+            Some("dev")
+        );
         assert_eq!(Request::List.subject(), None);
         assert_eq!(Request::ListOrbit.subject(), None);
         assert_eq!(Request::Devices.subject(), None);
