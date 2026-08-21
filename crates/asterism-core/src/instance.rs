@@ -425,6 +425,19 @@ pub struct Instance {
     /// loads as an instance with none — which is what it was.
     #[serde(default)]
     pub secrets: Vec<Binding>,
+    /// Bootstrap profiles this instance was created with, by name.
+    ///
+    /// Names rather than rendered work, because what a profile *does* is a
+    /// property of the version of Asterism applying it: the catalog in
+    /// [`crate::profile`] is where `claude` is defined, and an instance that
+    /// asked for `claude` should get the current answer to that question at
+    /// its next boot rather than the one that was true when it was created.
+    ///
+    /// Defaulted, so every registry written before profiles existed loads as
+    /// an instance with none — which is what it was, and what an instance
+    /// created without `--profile` still is.
+    #[serde(default)]
+    pub profiles: Vec<String>,
     /// Guest paths of volumes the last cpu-part swap left behind.
     ///
     /// A volume attached over 9p is a same-device part: the hypervisor
@@ -477,6 +490,7 @@ impl Instance {
             moving: None,
             seed_device: None,
             secrets: Vec::new(),
+            profiles: Vec::new(),
             stranded: Vec::new(),
             legacy_pid: None,
             legacy_ssh_port: None,

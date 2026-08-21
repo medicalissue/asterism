@@ -11,7 +11,8 @@
 //! the secrets data plane's model and its one substitution rule, and
 //! [`protocol`] is the CLI <-> daemon wire and [`ipc`] is the door that
 //! wire arrives through. [`verify`] is the gate every boot input passes
-//! through on its way into the store and out of it again.
+//! through on its way into the store and out of it again, and [`profile`] is
+//! what a guest is asked to become once it has booted.
 
 pub mod cow;
 pub mod durable;
@@ -24,6 +25,7 @@ pub mod orbit;
 pub mod paths;
 pub mod power;
 pub mod proc;
+pub mod profile;
 pub mod protocol;
 pub mod registry;
 pub mod rewrite;

@@ -280,6 +280,19 @@ impl Shard {
         Ok(inst.clone())
     }
 
+    /// Record the bootstrap profiles an instance should have.
+    ///
+    /// Names only, and unresolved: whether `claude` means anything is a
+    /// question for [`crate::profile`], asked by the daemon before this is
+    /// called and again by the boot that builds the seed. Writing a name the
+    /// catalog does not know would be an instance that cannot boot, which is
+    /// why both ends ask.
+    pub fn set_profiles(&mut self, name: &str, profiles: Vec<String>) -> Result<Instance> {
+        let inst = self.get_mut(name)?;
+        inst.profiles = profiles;
+        Ok(inst.clone())
+    }
+
     pub fn get(&self, name: &str) -> Result<&Instance> {
         self.instances
             .get(name)
