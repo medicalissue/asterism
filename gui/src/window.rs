@@ -43,12 +43,12 @@ pub const PROGRESS: &str = "new-instance://progress";
 /// A utility dialog, sized like one. Fixed, because nothing in it reflows:
 /// the form is a fixed number of rows, and the only one that comes and goes
 /// is the backend row, which [`height`] accounts for.
-const WIDTH: f64 = 500.0;
+const WIDTH: f64 = 760.0;
 /// Name, image, the three number fields under their captions, the
 /// checkbox, the footer, and 20px of margin at each end.
-const HEIGHT: f64 = 326.0;
+const HEIGHT: f64 = 640.0;
 /// The backend row, when this device has more than one backend to offer.
-const BACKEND_ROW: f64 = 52.0;
+const BACKEND_ROW: f64 = 0.0;
 
 fn height() -> f64 {
     if newinstance::vz_available() {
@@ -182,7 +182,9 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         main::instances,
         main::device_rows,
         main::settings_rows,
+        main::volume_rows,
         main::snapshots,
+        main::console_tail,
         // ... and what its buttons do.
         main::act,
         main::copy,

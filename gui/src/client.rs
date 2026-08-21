@@ -31,6 +31,7 @@ use asterism_core::paths;
 use asterism_core::protocol::{Request, Response};
 use asterism_core::registry::OrbitRow;
 use asterism_core::snapshot::Snapshot;
+use asterism_core::volume::BlockVolume;
 
 /// How long to wait for a freshly spawned daemon to start answering.
 const STARTUP_ATTEMPTS: u32 = 20;
@@ -124,7 +125,7 @@ fn create_request(name: &str, image: &str, shape: Shape, backend: Option<&str>) 
 
 /// Boot an instance.
 pub fn up(name: &str) -> Result<()> {
-    expect_done(&Request::Up { name: name.to_owned() })
+    expect_done(&Request::Up { name: name.to_owned(), restart: None })
 }
 
 /// Shut an instance down.
@@ -152,6 +153,27 @@ pub fn snapshot_restore(name: &str, tag: &str) -> Result<()> {
     });
     forget_snapshots();
     done
+}
+
+/// The tail of an instance's guest console, routed across the orbit by astd.
+pub fn logs(name: &str, lines: u32) -> Result<(String, bool)> {
+    match send(&Request::Logs { name: name.to_owned(), lines })? {
+        Response::Log { text, truncated } => Ok((text, truncated)),
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected reply from astd: {other:?}"),
+    }
+}
+
+/// Block volumes whose bytes are supplied by this device.
+///
+/// Volumes are device parts, not orbit-global objects, so this deliberately
+/// asks the local daemon without pretending to assemble a global inventory.
+pub fn volumes() -> Result<Vec<BlockVolume>> {
+    match send(&Request::VolumeList)? {
+        Response::Volumes { volumes } => Ok(volumes),
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected reply from astd: {other:?}"),
+    }
 }
 
 /// Every snapshot on one instance's disk. Private because the menu wants

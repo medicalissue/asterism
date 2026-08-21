@@ -1,28 +1,19 @@
-// Cascade order is load-bearing:
-//   1. Astryx reset       (@layer reset)
-//   2. the Asterism theme (@layer astryx-theme) — built by `npm run theme`
-//      from ../../site/src/theme/asterism.ts, the same module the site
-//      compiles, so one file defines the palette for both surfaces
-//   3. controls.css       — the control skin both windows are built from
-//   4. dialog.css         — the New Instance dialog's own layout
-//   5. shell.css          — the main window's own layout
-//
-// `@astryxdesign/core/astryx.css` is deliberately absent. It is 140 KB of
-// component styling for components these windows do not use; see the note
-// at the top of controls.css for why they take the theme and leave the
-// components.
+// Astryx owns the reset, component primitives, and generated token layer.
+// app.css is the single product-layout layer shared by the control center
+// and the spacious New Instance flow.
 import '@astryxdesign/core/reset.css';
+import '@astryxdesign/core/astryx.css';
 import './theme/asterism.theme.css';
-import './controls.css';
-import './dialog.css';
-import './shell.css';
+import './app.css';
 
 import {StrictMode} from 'react';
 import {createRoot} from 'react-dom/client';
+import {Theme} from '@astryxdesign/core/theme';
 
 import {windowLabel} from './bridge';
 import {NewInstance} from './NewInstance';
 import {Shell} from './Shell';
+import {asterismTheme} from './theme/asterism.js';
 
 const root = document.getElementById('root');
 if (!root) {
@@ -35,4 +26,8 @@ if (!root) {
 const main = windowLabel() === 'main';
 document.title = main ? 'Asterism' : 'New Instance';
 
-createRoot(root).render(<StrictMode>{main ? <Shell /> : <NewInstance />}</StrictMode>);
+createRoot(root).render(
+  <StrictMode>
+    <Theme theme={asterismTheme}>{main ? <Shell /> : <NewInstance />}</Theme>
+  </StrictMode>,
+);

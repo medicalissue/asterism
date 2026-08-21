@@ -57,6 +57,7 @@ mod menu;
 mod newinstance;
 mod settings;
 mod shell;
+mod volumes;
 mod window;
 
 use std::sync::Mutex;

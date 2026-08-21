@@ -692,7 +692,7 @@ impl Mesh {
     pub async fn orbit_registry(self: &Arc<Self>, node: &Node) -> Result<Response> {
         let mine: Vec<Instance> = {
             let mut shard = node.shard.lock().await;
-            crate::reconcile(&mut shard);
+            crate::instance::reconcile(&mut shard);
             shard.list()
         };
         let peers = self.orbit.lock().await.devices().to_vec();

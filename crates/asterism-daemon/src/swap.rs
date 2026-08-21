@@ -347,6 +347,58 @@ pub fn digest_of(path: &Path) -> Result<String> {
     Ok(digest)
 }
 
+// ---- the steps, as frames --------------------------------------------------
+
+/// Is this one of the steps of a move, aimed at this device's shard?
+///
+/// [`Request::SetCpu`] is deliberately absent. It is the *whole* move rather
+/// than a step of one, it is driven from the connection that asked so that it
+/// can report as it goes, and a shard that was handed one would have nowhere
+/// to send the progress — so it falls through to the refusal at the end of
+/// [`crate::handle`]'s chain, which is the true thing to say about it.
+pub(crate) fn is_step(req: &Request) -> bool {
+    matches!(
+        req,
+        Request::MoveOffer { .. }
+            | Request::MoveProbe { .. }
+            | Request::MovePrepare { .. }
+            | Request::MoveCommitTarget { .. }
+            | Request::MoveCommitSource { .. }
+            | Request::MoveAbortSource { .. }
+            | Request::MoveAbortTarget { .. }
+    )
+}
+
+/// Run one step of a move against this device's shard.
+///
+/// Each step saves (or refuses) itself, which is why none of them goes
+/// through the mutation path the instance commands share: a fence that was
+/// persisted by somebody else's `reg.save()` would be a fence whose ordering
+/// against the transfer nobody had thought about.
+pub(crate) fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Response {
+    match req {
+        Request::MoveOffer { name } => tokio::task::block_in_place(|| offer(reg, &name)),
+        Request::MoveProbe { manifest } => {
+            let already_here = reg.holds(&manifest.instance.name);
+            tokio::task::block_in_place(|| probe(&manifest, cpu_device, already_here))
+        }
+        Request::MovePrepare { name, to_device, epoch } => {
+            tokio::task::block_in_place(|| prepare(reg, &name, &to_device, epoch))
+        }
+        Request::MoveCommitTarget { manifest, epoch } => {
+            tokio::task::block_in_place(|| commit_target(reg, &manifest, epoch, cpu_device))
+        }
+        Request::MoveCommitSource { name, epoch } => {
+            tokio::task::block_in_place(|| commit_source(reg, &name, epoch))
+        }
+        Request::MoveAbortSource { name, epoch } => abort_source(reg, &name, epoch),
+        Request::MoveAbortTarget { name, epoch } => abort_target(&name, epoch),
+        other => Response::Error {
+            message: format!("{other:?} is not a step of a move"),
+        },
+    }
+}
+
 // ---- the source's half -----------------------------------------------------
 
 /// What a move of this instance would carry. Read-only: nothing is fenced.
@@ -1047,6 +1099,32 @@ mod tests {
         assert_ne!(staged, paths::instance_dir("dev"));
         // Same parent, so the commit is a rename rather than a copy.
         assert_eq!(staged.parent(), paths::instance_dir("dev").parent());
+    }
+
+    /// The chain in `crate::handle` runs whichever area claims a frame, so a
+    /// step this module claims and does not answer would be refused by the
+    /// module that owns it — and, worse, a step it does *not* claim would be
+    /// told it is not answered by a shard, which is exactly what a move's
+    /// steps are.
+    #[test]
+    fn every_step_of_a_move_is_claimed_by_the_module_that_runs_it() {
+        for req in [
+            Request::MoveOffer { name: "dev".into() },
+            Request::MovePrepare { name: "dev".into(), to_device: "desktop".into(), epoch: 1 },
+            Request::MoveCommitSource { name: "dev".into(), epoch: 1 },
+            Request::MoveAbortSource { name: "dev".into(), epoch: 1 },
+            Request::MoveAbortTarget { name: "dev".into(), epoch: 1 },
+        ] {
+            assert!(is_step(&req), "{req:?}");
+        }
+        // `set cpu` is the move, not a step of it: it reports as it goes, on
+        // the connection that asked, and a shard has nowhere to send that.
+        assert!(!is_step(&Request::SetCpu {
+            name: "dev".into(),
+            device: "desktop".into(),
+            down: false,
+        }));
+        assert!(!is_step(&Request::Up { name: "dev".into(), restart: None }));
     }
 
     #[test]

@@ -1,8 +1,10 @@
 //! The QEMU backend.
 //!
 //! Everything QEMU-specific lives behind [`Hypervisor`]: tool discovery,
-//! EDK2 firmware, the argv, and QMP. Nothing outside this file names a QEMU
-//! concept.
+//! EDK2 firmware, the argv, and QMP. Nothing outside this backend names a
+//! QEMU concept. QMP is the one piece with a file of its own ([`super::qmp`]):
+//! it holds a connection and a thread per running guest, which is state, and
+//! this backend is stateless by design.
 //!
 //! Per-instance files, in `~/.asterism/instances/<name>/`:
 //!   disk.raw     — `clonefile(2)` clone of the raw base image
@@ -47,7 +49,7 @@ use asterism_core::snapshot::{self, Snapshot};
 use asterism_core::tools::{output, run, tool};
 use asterism_core::{cow, image, oci, paths};
 
-use super::{alive, grow, signal, wait_gone};
+use super::{alive, grow, qmp, signal, wait_gone};
 
 pub const ID: &str = "qemu";
 
@@ -299,6 +301,10 @@ impl Hypervisor for Qemu {
         let pidfile = req.dir.join("qemu.pid");
         let _ = std::fs::remove_file(&pidfile);
         let qmp = paths::qmp_socket_path(&inst.name);
+        // A guest that died leaves its socket path behind and the next one
+        // binds it. Any connection still held to the old one belongs to a
+        // process that is gone.
+        qmp::forget(&qmp);
 
         let mut cmd = Command::new(&p.system);
         cmd.arg("-machine").arg(p.machine_type())
@@ -415,7 +421,7 @@ impl Hypervisor for Qemu {
         // Most of the budget goes to the guest; the rest to SIGTERM before
         // SIGKILL. At the default 40s that is the historical 30s then 10s.
         let graceful = deadline.mul_f32(0.75);
-        if qmp_powerdown(h.ctl.path()).is_ok() && wait_gone(pid, graceful) {
+        if powerdown(h.ctl.path()).is_ok() && wait_gone(pid, graceful) {
             return Ok(());
         }
         signal(pid, "-TERM")?;
@@ -430,6 +436,7 @@ impl Hypervisor for Qemu {
         let Some(pid) = h.pid else {
             bail!("handle for a {} guest carries no pid", h.backend);
         };
+        qmp::forget(h.ctl.path());
         signal(pid, "-KILL")
     }
 
@@ -670,27 +677,14 @@ fn netdev_arg(ssh_port: u16, publish: &[PortForward]) -> String {
 
 // ---- QMP -------------------------------------------------------------------
 
-fn qmp_powerdown(sock: &Path) -> Result<()> {
-    use std::io::{BufRead, BufReader, Write};
-    let mut stream = std::os::unix::net::UnixStream::connect(sock)?;
-    stream.set_read_timeout(Some(Duration::from_secs(3)))?;
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut line = String::new();
-    reader.read_line(&mut line)?; // QMP greeting
-    for cmd in [r#"{"execute":"qmp_capabilities"}"#, r#"{"execute":"system_powerdown"}"#] {
-        stream.write_all(cmd.as_bytes())?;
-        stream.write_all(b"\n")?;
-        loop {
-            line.clear();
-            reader.read_line(&mut line)?;
-            if line.contains("return") {
-                break;
-            }
-            if line.contains("error") {
-                bail!("qmp {cmd} failed: {}", line.trim());
-            }
-        }
-    }
+/// Press the guest's ACPI power button.
+///
+/// The command returns as soon as QEMU has pressed it; whether the guest
+/// acts on it is what [`wait_gone`] is for. The connection stays open
+/// behind this, so the `SHUTDOWN` that follows lands on a reader rather
+/// than on a closed socket.
+fn powerdown(sock: &Path) -> Result<()> {
+    qmp::on(sock)?.execute("system_powerdown", serde_json::Value::Null)?;
     Ok(())
 }
 

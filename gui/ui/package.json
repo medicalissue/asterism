@@ -4,7 +4,7 @@
   "type": "module",
   "description": "The Asterism app's windows. React + Astryx, built to static files the webview loads off disk.",
   "scripts": {
-    "theme": "astryx theme build ../../site/src/theme/asterism.ts --out src/theme/asterism.theme.css",
+    "theme": "astryx theme build src/theme/asterism.ts --out src/theme/asterism.theme.css",
     "build": "npm run theme && tsc --noEmit && vite build",
     "dev": "vite"
   },

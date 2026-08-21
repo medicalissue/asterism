@@ -11,25 +11,29 @@ use serde::Serialize;
 use crate::devices::Devices;
 use crate::instances::Instances;
 use crate::settings::Settings;
+use crate::volumes::Volumes;
 
 /// One row of the sidebar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
     Instances,
     Devices,
+    Volumes,
     Settings,
 }
 
 impl Section {
     /// Every section, in sidebar order: what you have, who is holding it,
     /// and how this device behaves.
-    pub const ALL: [Section; 3] = [Section::Instances, Section::Devices, Section::Settings];
+    pub const ALL: [Section; 4] =
+        [Section::Instances, Section::Devices, Section::Volumes, Section::Settings];
 
     /// The name on the wire, in `--dump-main` and in the webview.
     pub fn id(self) -> &'static str {
         match self {
             Section::Instances => "instances",
             Section::Devices => "devices",
+            Section::Volumes => "volumes",
             Section::Settings => "settings",
         }
     }
@@ -47,6 +51,7 @@ impl Section {
 pub struct MainModel {
     pub instances: Instances,
     pub devices: Devices,
+    pub volumes: Volumes,
     pub settings: Settings,
 }
 
@@ -55,6 +60,7 @@ impl MainModel {
         MainModel {
             instances: Instances::load(),
             devices: Devices::load(),
+            volumes: Volumes::load(),
             settings: Settings::load(autostart),
         }
     }
@@ -62,6 +68,7 @@ impl MainModel {
     pub fn lines(&self) -> Vec<String> {
         let mut out = self.instances.lines();
         out.extend(self.devices.lines());
+        out.extend(self.volumes.lines());
         out.extend(self.settings.lines());
         out
     }
@@ -76,6 +83,7 @@ pub fn dump(section: Option<Section>, autostart: bool) -> Vec<String> {
     match section {
         Some(Section::Instances) => Instances::load().lines(),
         Some(Section::Devices) => Devices::load().lines(),
+        Some(Section::Volumes) => Volumes::load().lines(),
         Some(Section::Settings) => Settings::load(autostart).lines(),
         None => MainModel::load(autostart).lines(),
     }
@@ -99,7 +107,7 @@ mod tests {
     #[test]
     fn the_sidebar_is_in_the_order_the_window_draws_it() {
         let ids: Vec<&str> = Section::ALL.iter().map(|s| s.id()).collect();
-        assert_eq!(ids, ["instances", "devices", "settings"]);
+        assert_eq!(ids, ["instances", "devices", "volumes", "settings"]);
     }
 
     /// Every dump names its section on the first line, so a `--dump-main`
@@ -112,6 +120,7 @@ mod tests {
                 match section {
                     Section::Instances => crate::instances::Instances::of(&[]).lines(),
                     Section::Devices => crate::devices::Devices::of(&[], &[]).lines(),
+                    Section::Volumes => crate::volumes::Volumes::of(&[]).lines(),
                     Section::Settings => crate::settings::Settings {
                         autostart: false,
                         backends: Vec::new(),

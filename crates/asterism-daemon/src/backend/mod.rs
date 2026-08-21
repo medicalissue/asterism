@@ -23,6 +23,7 @@ use asterism_core::instance::{Instance, PortForward};
 use asterism_core::{image, paths, seed};
 
 pub mod qemu;
+pub mod qmp;
 pub mod vz;
 
 /// The backends this build has, constructed once.

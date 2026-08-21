@@ -40,6 +40,7 @@ use crate::feedback;
 use crate::instances::Instances;
 use crate::settings::{self, Settings};
 use crate::shell::Section;
+use crate::volumes::Volumes;
 
 /// The window's label, and where its events are sent.
 pub const LABEL: &str = "main";
@@ -51,12 +52,12 @@ pub const WAKE: &str = "main://wake";
 /// Comfortable rather than roomy: six instance rows and the section header
 /// fit without scrolling, and the whole thing still sits on a laptop screen
 /// next to a terminal.
-const WIDTH: f64 = 760.0;
-const HEIGHT: f64 = 480.0;
+const WIDTH: f64 = 1080.0;
+const HEIGHT: f64 = 700.0;
 /// Narrow enough to park beside an editor, and not so narrow that the
 /// table's last column falls off.
-const MIN_WIDTH: f64 = 640.0;
-const MIN_HEIGHT: f64 = 420.0;
+const MIN_WIDTH: f64 = 820.0;
+const MIN_HEIGHT: f64 = 560.0;
 
 /// How long a pairing waits for somebody to look at the six digits before
 /// giving up on its own. Long enough to walk to the other machine.
@@ -206,6 +207,29 @@ pub(crate) async fn device_rows() -> Result<Devices, String> {
 pub(crate) async fn settings_rows(app: AppHandle) -> Result<Settings, String> {
     let autostart = crate::autostart_enabled(&app);
     blocking(move || Settings::load(autostart)).await
+}
+
+#[tauri::command]
+pub(crate) async fn volume_rows() -> Result<Volumes, String> {
+    blocking(Volumes::load).await
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct ConsoleTail {
+    text: String,
+    truncated: bool,
+}
+
+/// Read a bounded guest-console tail through the same routed daemon frame as
+/// `ast logs`. Following is intentionally not offered across the orbit.
+#[tauri::command]
+pub(crate) async fn console_tail(name: String, lines: u32) -> Result<ConsoleTail, String> {
+    blocking(move || {
+        let (text, truncated) = client::logs(&name, lines.min(500))
+            .map_err(|error| format!("{error:#}"))?;
+        Ok(ConsoleTail { text, truncated })
+    })
+    .await?
 }
 
 /// The tags on one instance's disk, read when the Snapshots popover opens

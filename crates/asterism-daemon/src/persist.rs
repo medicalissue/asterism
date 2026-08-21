@@ -365,7 +365,7 @@ fn boot_again(reg: &mut Shard, inst: &Instance) -> anyhow::Result<Instance> {
         let _ = reg.set_stopped(&inst.name);
     }
     clear_stale_control(inst);
-    crate::up(reg, &inst.name)
+    crate::instance::up(reg, &inst.name)
 }
 
 /// A killed guest leaves its control socket behind; the next boot binds
@@ -395,6 +395,22 @@ mod tests {
         format!("persist-test-{tag}")
     }
 
+    /// Naming instances apart keeps `contains` and `forget` honest, and
+    /// that is all it keeps. `owed` counts every watch in the table and
+    /// `take_due` sweeps every watch in it, so a test asserting on either
+    /// is asserting about instances other tests own. Cargo runs these on
+    /// as many threads as the machine has cores, which is why this passed
+    /// on a two-core runner and fails on a laptop.
+    ///
+    /// A test making a whole-table claim holds this while it does. Each of
+    /// them leaves the table as it found it, so owning it is enough.
+    fn own_the_table() -> MutexGuard<'static, ()> {
+        static ONE_AT_A_TIME: StdMutex<()> = StdMutex::new(());
+        // Poisoned by an earlier failing test is still usable: the table
+        // itself is guarded separately and every holder leaves it empty.
+        ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn the_backoff_escalates_and_then_holds() {
         assert_eq!(backoff(0), Duration::from_secs(5));
@@ -406,6 +422,7 @@ mod tests {
 
     #[test]
     fn a_death_is_owed_a_restart_only_once_its_backoff_has_passed() {
+        let _table = own_the_table();
         let name = scratch("backoff");
         forget(&name);
         note_died(&name);
@@ -420,6 +437,7 @@ mod tests {
 
     #[test]
     fn repeated_deaths_walk_up_the_backoff() {
+        let _table = own_the_table();
         let name = scratch("escalate");
         forget(&name);
         note_died(&name);
@@ -441,6 +459,7 @@ mod tests {
 
     #[test]
     fn a_deliberate_down_cancels_the_restart() {
+        let _table = own_the_table();
         let name = scratch("forget");
         note_died(&name);
         forget(&name);

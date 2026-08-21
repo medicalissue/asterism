@@ -1,119 +1,60 @@
-// The Settings section: two things you can change about this device, and
-// two you can only read.
-//
-// The backend row is drawn only when this device has more than one to
-// offer, because a control with one option is clutter pretending to be a
-// choice — the same rule the New Instance dialog follows, decided in the
-// same place in Rust.
-
-import type {ReactNode} from 'react';
+import {Button} from '@astryxdesign/core/Button';
+import {CheckboxInput} from '@astryxdesign/core/CheckboxInput';
+import {Selector} from '@astryxdesign/core/Selector';
 
 import type {Settings as Model} from './bridge';
 import {setDefaultBackend} from './bridge';
-import {Check, Select} from './controls';
-import {Pane} from './Pane';
 
 export function Settings({
   model,
-  status,
   onAct,
   refresh,
   onSay,
 }: {
   model: Model | null;
-  status: ReactNode;
-  onAct: (id: string, what: string) => void;
+  onAct: (id: string, description: string) => void;
   refresh: () => void;
-  onSay: (line: string, bad: boolean) => void;
+  onSay: (line: string, bad?: boolean) => void;
 }) {
+  if (model === null) return <div className="loading-state"><span className="spinner" />Reading this device…</div>;
   return (
-    <Pane title="Settings" status={status}>
-      {model === null ? (
-        <div className="empty">
-          <span>Reading this device…</span>
+    <div className="single-pane settings-pane">
+      <section className="settings-group">
+        <div className="settings-heading"><h2>Application</h2><p>How the menu-bar app behaves on this Mac.</p></div>
+        <div className="setting-row">
+          <div><strong>Start at login</strong><p>Keep Asterism available in the menu bar after you sign in.</p></div>
+          <CheckboxInput label="Start Asterism at login" isLabelHidden size="sm" value={model.autostart} onChange={() => onAct('autostart', 'Changing start at login')} />
         </div>
-      ) : (
-        <div className="settings">
-          <Row label="Start at Login" hint="Asterism comes back when you log in.">
-            <Check
-              checked={model.autostart}
-              onChange={() => onAct('autostart', 'changing start at login')}
-            >
-              {model.autostart ? 'On' : 'Off'}
-            </Check>
-          </Row>
+        {model.backends.length > 1 ? (
+          <div className="setting-row">
+            <div><strong>Default backend</strong><p>Preselected when you create an instance on this device.</p></div>
+            <Selector
+              label="Default backend"
+              isLabelHidden
+              size="sm"
+              width={180}
+              value={model.default_backend}
+              options={model.backends.map(backend => ({value: backend.id, label: backend.label}))}
+              onChange={value => setDefaultBackend(value).then(refresh, error => onSay(String(error), true))}
+            />
+          </div>
+        ) : null}
+      </section>
 
-          {model.backends.length > 1 ? (
-            <Row label="Default backend" hint="What New Instance opens on.">
-              <Select
-                label="Default backend"
-                value={model.default_backend}
-                disabled={false}
-                options={model.backends.map(b => ({value: b.id, label: b.label}))}
-                onChange={id =>
-                  setDefaultBackend(id).then(refresh, (e: unknown) => onSay(String(e), true))
-                }
-              />
-            </Row>
-          ) : null}
-
-          <Row label="Daemon">
-            <span className="readout" title={model.daemon_error ?? undefined}>
-              {model.daemon ?? `unavailable — ${model.daemon_error ?? 'no reason given'}`}
-            </span>
-          </Row>
-
-          <Row label="Home" hint="Where astd keeps this device's state.">
-            <span className="readout mono" title={model.home}>
-              {model.home}
-            </span>
-          </Row>
-
-          <Row
-            label="Service"
-            hint={`Have ${model.service.mechanism} keep astd running.`}
-          >
-            <span className="readout" title={model.service.unit || undefined}>
-              {model.service.summary}
-            </span>
-            {model.service.installed ? (
-              <button
-                className="button"
-                onClick={() => onAct('service:uninstall', 'removing the astd service')}
-              >
-                Uninstall
-              </button>
-            ) : (
-              <button
-                className="button"
-                onClick={() => onAct('service:install', 'installing the astd service')}
-              >
-                Install
-              </button>
-            )}
-          </Row>
+      <section className="settings-group">
+        <div className="settings-heading"><h2>Daemon service</h2><p>The background process that owns this device's parts.</p></div>
+        <div className="setting-row">
+          <div><strong>{model.service.mechanism}</strong><p title={model.service.unit}>{model.service.summary}</p></div>
+          <Button
+            label={model.service.installed ? 'Uninstall service' : 'Install service'}
+            size="sm"
+            variant="secondary"
+            onClick={() => onAct(model.service.installed ? 'service:uninstall' : 'service:install', model.service.installed ? 'Removing the daemon service' : 'Installing the daemon service')}
+          />
         </div>
-      )}
-    </Pane>
-  );
-}
-
-function Row({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint?: string;
-  children: ReactNode;
-}) {
-  return (
-    <div className="setting">
-      <span className="label">
-        {label}
-        {hint ? <span className="hint">{hint}</span> : null}
-      </span>
-      <span className="control">{children}</span>
+        <div className="setting-row read-only"><div><strong>Daemon version</strong><p>{model.daemon ?? `Unavailable — ${model.daemon_error ?? 'no response'}`}</p></div><span className={`status-dot ${model.daemon ? 'running' : 'unknown'}`} /></div>
+        <div className="setting-row read-only"><div><strong>Asterism home</strong><p className="mono" title={model.home}>{model.home}</p></div></div>
+      </section>
     </div>
   );
 }

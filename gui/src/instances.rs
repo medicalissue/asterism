@@ -15,7 +15,7 @@
 
 use serde::Serialize;
 
-use asterism_core::instance::{Instance, Shape, Status};
+use asterism_core::instance::{Instance, Shape, Status, VolumeKind};
 use asterism_core::registry::OrbitRow;
 
 use crate::client;
@@ -72,10 +72,24 @@ pub struct Row {
     /// `2 CPU · 2 GB · 20 GB`, formatted once so the dump and the table
     /// cannot disagree.
     pub shape: String,
+    /// The source used to define this machine. Kept as a reference rather
+    /// than guessed into a friendlier product name.
+    pub image: String,
+    /// Storage parts already attached to this instance.
+    pub volumes: Vec<VolumeRow>,
     pub can_start: bool,
     pub can_stop: bool,
     pub can_shell: bool,
     pub can_snapshot: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct VolumeRow {
+    pub kind: String,
+    pub name: String,
+    pub source_device: String,
+    pub guest_path: String,
+    pub size: String,
 }
 
 impl Row {
@@ -91,6 +105,28 @@ impl Row {
             cpu_device: instance.cpu_device.clone(),
             backend: instance.machine.as_ref().map(|m| m.backend.clone()).unwrap_or_default(),
             shape: shape(&instance.shape),
+            image: instance.image.clone().unwrap_or_else(|| "unknown".to_owned()),
+            volumes: instance
+                .volumes
+                .iter()
+                .map(|volume| VolumeRow {
+                    kind: match volume.kind {
+                        VolumeKind::Dir => "directory".to_owned(),
+                        VolumeKind::Block => "block".to_owned(),
+                    },
+                    name: volume.path.clone(),
+                    source_device: volume.host.clone(),
+                    guest_path: if volume.is_block() {
+                        "guest-managed disk".to_owned()
+                    } else {
+                        volume.guest_path()
+                    },
+                    size: volume
+                        .size_bytes
+                        .map(asterism_core::volume::format_size)
+                        .unwrap_or_default(),
+                })
+                .collect(),
             // Nothing is offered on a row whose device is out of touch: the
             // request would be forwarded to a daemon that is not there.
             can_start: live && can_start(instance.status),

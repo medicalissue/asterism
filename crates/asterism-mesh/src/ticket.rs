@@ -441,7 +441,14 @@ mod tests {
         assert!(rendered.contains("redacted"));
 
         let ticket = PairingTicket::from_parts(sample_addr(), 0, token);
-        assert!(!format!("{ticket:?}").contains("171"));
+        let rendered = format!("{ticket:?}");
+        // A leaked token prints as its bytes, so two adjacent ones are the
+        // signal. A bare "171" is not: `sample_addr` carries a freshly
+        // generated device key, and three of those hex digits land on
+        // "171" about once in seventy runs, which is how this assertion
+        // used to fail for a reason that had nothing to do with the token.
+        assert!(!rendered.contains("171, 171"), "token leaked into Debug: {rendered}");
+        assert!(rendered.contains("redacted"), "the token field is redacted: {rendered}");
     }
 
     #[test]

@@ -1,9 +1,31 @@
+//! The CLI <-> daemon wire, and the daemon <-> daemon wire, which are the
+//! same wire.
+//!
+//! Two serde enums and nothing else: that is the whole protocol. Because they
+//! are internally tagged (`{"cmd":"up",...}`), a variant's *name* is the wire
+//! and its position in the enum is not — so frames may be reordered and
+//! regrouped freely, and only a rename or a field change is a break.
+//!
+//! This module is a directory rather than a file because the two enums are
+//! the one thing every feature branch has to edit. The variants are banded
+//! into the same areas the CLI and the daemon are split along, so two branches
+//! adding two commands to two different areas edit two different bands and
+//! merge cleanly; the payload structs that hang off a band live in that
+//! band's own file ([`swap`], [`wake`]), where they take their tests with
+//! them.
+
 use serde::{Deserialize, Serialize};
 
 use crate::instance::{Instance, PortForward, Restart, Shape};
 use crate::orbit::{Device, DeviceStatus, WakeFacts};
 use crate::registry::OrbitRow;
 use crate::snapshot::Snapshot;
+
+mod swap;
+mod wake;
+
+pub use swap::{BaseImage, MoveFile, MoveManifest};
+pub use wake::{CheckRow, Verdict};
 
 /// One request per line of JSON over the daemon's unix socket;
 /// the daemon answers with one `Response` line.
@@ -19,7 +41,13 @@ use crate::snapshot::Snapshot;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
+    // ---- the handshake -------------------------------------------------------
     Ping,
+
+    // ---- instances -----------------------------------------------------------
+    //
+    // Everything a device answers out of its own shard of the orbit registry.
+    // Served by `astd`'s `instance` module.
     Create {
         name: String,
         image: String,
@@ -93,12 +121,19 @@ pub enum Request {
         #[serde(default)]
         host: Option<String>,
     },
+
+    // ---- snapshots -----------------------------------------------------------
+    //
+    // A snapshot lives in the instance's disk rather than in the registry, so
+    // these are answered without the shard ever being written.
     Snapshot { name: String, tag: String },
     SnapshotList { name: String },
     SnapshotRestore { name: String, tag: String },
     /// Delete one snapshot. Additive: a daemon too old to know this frame
     /// refuses it by name rather than doing something else with it.
     SnapshotRemove { name: String, tag: String },
+
+    // ---- the console, and the way in -----------------------------------------
     /// The last `lines` lines of an instance's guest console.
     ///
     /// A daemon-side read, so it works when the console log is on another
@@ -285,94 +320,6 @@ pub enum Request {
     MoveAbortTarget { name: String, epoch: u64 },
 }
 
-/// A base image, as one device describes it to another.
-///
-/// Base images are content-addressed and cached per device: a device that
-/// lacks one pulls it from an orbit peer that has it before it would ever
-/// reach for the internet (`docs/MODEL.md`, "Where bytes live"). `digest` is
-/// what makes that safe — the reference names the image, the digest says
-/// which bytes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BaseImage {
-    /// The reference recorded on the instance: `debian:13`, a url, a path.
-    pub reference: String,
-    /// Length of the base image file.
-    pub len: u64,
-    /// What it actually occupies — a raw base image converted from a cloud
-    /// image is mostly hole, so this is what a peer fetch really costs and
-    /// what its progress is measured against.
-    #[serde(default)]
-    pub allocated: u64,
-    /// Content address of its bytes.
-    pub digest: String,
-}
-
-impl BaseImage {
-    /// A reference the source cannot hand over: it does not resolve there, or
-    /// the bytes are not on that device either. Not an error — an instance's
-    /// disk is a complete file and boots without its base — so this travels
-    /// as a fact the target's probe reports rather than as a refusal.
-    pub fn absent(reference: String) -> Self {
-        BaseImage { reference, len: 0, allocated: 0, digest: String::new() }
-    }
-
-    /// What a peer fetch of it would really cost.
-    pub fn cost(&self) -> u64 {
-        if self.allocated == 0 { self.len } else { self.allocated }
-    }
-}
-
-/// One file a move will carry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MoveFile {
-    /// Path relative to the instance directory, `/`-separated.
-    pub path: String,
-    /// What the file claims to be — 20 GiB, for a root disk.
-    pub len: u64,
-    /// What it actually holds, and therefore what will cross the wire.
-    pub allocated: u64,
-    /// Permission bits. `seed.iso` and a disk are not the same secret.
-    pub mode: u32,
-}
-
-/// Everything a cpu-part swap will carry, computed on the source device
-/// before any of it moves.
-///
-/// This doubles as the estimate the roadmap asks for and as the completeness
-/// check the commit turns on: the target counts what arrived against
-/// `allocated` per file and refuses to adopt a directory that does not add
-/// up.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MoveManifest {
-    /// The instance record itself, which the target adopts on commit.
-    pub instance: Instance,
-    /// The architecture the source is running. A guest built for one
-    /// instruction set does not boot on another, and no amount of copying
-    /// changes that, so this is checked before a byte moves.
-    pub arch: String,
-    /// The base image the disk was cloned from, which the target must have.
-    pub base: BaseImage,
-    /// The files, in the order they will be sent.
-    pub files: Vec<MoveFile>,
-    /// Guest paths of volumes that are same-device 9p shares on the source.
-    /// They do not survive the move as working parts; they survive as rows
-    /// with a flag on them.
-    #[serde(default)]
-    pub local_volumes: Vec<String>,
-}
-
-impl MoveManifest {
-    /// Total bytes the transfer will really carry.
-    pub fn allocated(&self) -> u64 {
-        self.files.iter().map(|f| f.allocated).sum()
-    }
-
-    /// Total bytes the files claim between them.
-    pub fn virtual_size(&self) -> u64 {
-        self.files.iter().map(|f| f.len).sum()
-    }
-}
-
 impl Request {
     /// The instance this request is about, when it is about one.
     ///
@@ -385,6 +332,13 @@ impl Request {
     /// [`Request::Create`] is deliberately absent. It does not resolve a name,
     /// it *claims* one — a different question, asked of every device rather
     /// than answered by one.
+    ///
+    /// The `None` half is banded by area rather than written as one
+    /// or-pattern, so that adding a device command and adding a volume
+    /// command are edits to two different places. It stays exhaustive on
+    /// purpose: this match is the compiler's one chance to stop a new
+    /// instance command from silently only ever working on the device it was
+    /// typed on.
     pub fn subject(&self) -> Option<&str> {
         match self {
             Request::Up { name, .. }
@@ -402,41 +356,49 @@ impl Request {
             | Request::SnapshotRemove { name, .. }
             | Request::Logs { name, .. }
             | Request::SshEndpoint { name } => Some(name),
+
+            // The handshake, and the two views of the registry. A list is
+            // about every instance, which is not one instance.
             Request::Ping
             | Request::Create { .. }
             | Request::List
-            | Request::ListOrbit
-            | Request::Proxy { .. }
+            | Request::ListOrbit => None,
+
+            // About the orbit and the devices in it.
+            Request::Proxy { .. }
             | Request::Devices
             | Request::DeviceInvite { .. }
             | Request::DeviceAdd { .. }
             | Request::PairConfirm { .. }
             | Request::DeviceRemove { .. }
-            | Request::DevicePing { .. }
+            | Request::DevicePing { .. } => None,
+
             // About devices, not instances. `ast device wake desktop` names a
             // device on purpose — it is the one command whose subject really
             // is a machine — so it must never be routed as if `desktop` were
             // an instance somebody else holds.
-            | Request::DeviceWake { .. }
+            Request::DeviceWake { .. }
             | Request::WakeBroadcast { .. }
             | Request::DeviceFacts
-            | Request::DeviceCheck
+            | Request::DeviceCheck => None,
+
             // A volume belongs to a device, not to an instance, and volume
             // names are not orbit-global — two devices may each have a
             // `tank`. Resolving one through the instance namespace would send
             // it to whoever happens to hold an instance of that name.
-            | Request::VolumeCreate { .. }
+            Request::VolumeCreate { .. }
             | Request::VolumeList
             | Request::VolumeRemove { .. }
             | Request::VolumeLease { .. }
             | Request::VolumeReconnect { .. }
-            | Request::VolumeRelease { .. }
+            | Request::VolumeRelease { .. } => None,
+
             // Every step of a cpu-part swap names one device on purpose and
             // is aimed at it. Half of them go to a device that does *not*
             // hold the row — that is what a move is — so resolving them by
             // instance name would send them back to the wrong end of the
             // transfer, and `set cpu` itself names the destination.
-            | Request::SetCpu { .. }
+            Request::SetCpu { .. }
             | Request::MoveOffer { .. }
             | Request::MoveProbe { .. }
             | Request::MovePrepare { .. }
@@ -489,13 +451,19 @@ pub enum Response {
     /// the *absence* of a version is itself the mismatch signal — which is
     /// what makes this a backward-compatible change rather than a break.
     Pong { version: String },
+
+    // ---- instances -----------------------------------------------------------
     Instance { instance: Instance },
     /// Reply to [`Request::List`]: one device's shard.
     Instances { instances: Vec<Instance> },
     /// Reply to [`Request::ListOrbit`]: the orbit registry, assembled from
     /// every shard that answered plus the cached rows of those that did not.
     Orbit { rows: Vec<OrbitRow> },
+
+    // ---- snapshots -----------------------------------------------------------
     Snapshots { snapshots: Vec<Snapshot> },
+
+    // ---- the console, and the way in -----------------------------------------
     /// Reply to [`Request::Logs`]. `truncated` says whether older lines were
     /// left behind, so the CLI can offer `--lines` rather than imply the
     /// guest has been quiet.
@@ -606,50 +574,6 @@ pub enum Response {
     Error { message: String },
 }
 
-/// One line of `ast device check`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CheckRow {
-    /// What is being reported on: `wake on magic packet`, `interface`, ...
-    pub item: String,
-    /// How it stands.
-    pub verdict: Verdict,
-    /// The evidence, or the reason there is none.
-    pub detail: String,
-}
-
-/// How sure this device is about one line of its own wake readiness.
-///
-/// [`Verdict::Unknown`] is a first-class answer and gets used a lot, on
-/// purpose. Almost nothing about waking can be *verified* from the machine
-/// that would be asleep — whether the NIC keeps power after shutdown, whether
-/// the switch floods the broadcast, whether a Bonjour proxy is holding the
-/// Wi-Fi address — and a check that guessed `ok` at those would be worse than
-/// no check at all, because it would be believed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Verdict {
-    /// Verified on this machine, right now.
-    Ok,
-    /// Verified, and it will not work.
-    No,
-    /// True as far as it goes, with a caveat that decides whether it works.
-    Warn,
-    /// Not knowable from here.
-    Unknown,
-}
-
-impl Verdict {
-    /// The word the table prints.
-    pub fn label(&self) -> &'static str {
-        match self {
-            Verdict::Ok => "ok",
-            Verdict::No => "no",
-            Verdict::Warn => "warn",
-            Verdict::Unknown => "?",
-        }
-    }
-}
-
 /// How a daemon that is too old to understand us gives itself away: serde
 /// rejects the request variant it has never heard of, and the daemon dutifully
 /// reports the parse error. Matching on the text is unlovely, but it is the
@@ -708,6 +632,30 @@ mod tests {
         .unwrap();
         let Request::Create { publish, .. } = &published else { unreachable!("a create") };
         assert_eq!(publish, &[PortForward { host: 8080, guest: 80 }]);
+    }
+
+    /// Banding the variants by area is a merge-conflict measure, and it is
+    /// only free because the tag is the wire. If a regroup ever moved a frame
+    /// off its tag this is what would say so.
+    #[test]
+    fn a_frames_tag_is_its_name_and_not_its_position() {
+        assert_eq!(
+            serde_json::to_string(&Request::Down { name: "dev".into() }).unwrap(),
+            r#"{"cmd":"down","name":"dev"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Request::SnapshotRemove {
+                name: "dev".into(),
+                tag: "nightly".into()
+            })
+            .unwrap(),
+            r#"{"cmd":"snapshot_remove","name":"dev","tag":"nightly"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Response::Log { text: "boot".into(), truncated: true })
+                .unwrap(),
+            r#"{"result":"log","text":"boot","truncated":true}"#
+        );
     }
 
     #[test]
@@ -792,34 +740,6 @@ mod tests {
         assert_eq!(Request::DeviceCheck.subject(), None);
     }
 
-    /// Wake was added to a protocol already in the field, so it has to be
-    /// purely additive: old frames keep parsing, and the new ones parse
-    /// without the field a newer daemon would send.
-    #[test]
-    fn the_wake_frames_are_additive() {
-        let wake: Request = serde_json::from_str(r#"{"cmd":"device_wake","name":"desktop"}"#).unwrap();
-        assert!(matches!(wake, Request::DeviceWake { name } if name == "desktop"));
-
-        // An `astd` that predates lan-id checking sends the MAC and nothing
-        // else; that must not be a parse error on the device being asked.
-        let bare: Request =
-            serde_json::from_str(r#"{"cmd":"wake_broadcast","mac":"de:ad:be:ef:00:01"}"#).unwrap();
-        assert!(matches!(bare, Request::WakeBroadcast { lan_id: None, .. }));
-
-        // Likewise a progress line with no `done` is not the last one.
-        let line: Response = serde_json::from_str(r#"{"result":"wake","text":"sent"}"#).unwrap();
-        assert!(matches!(line, Response::Wake { done: false, .. }));
-
-        // And a peer that knows only half of its own story still answers.
-        let facts: Response =
-            serde_json::from_str(r#"{"result":"wake_facts","facts":{"mac":"de:ad:be:ef:00:01"}}"#)
-                .unwrap();
-        let Response::WakeFacts { facts } = facts else { panic!("should be facts") };
-        assert_eq!(facts.mac.as_deref(), Some("de:ad:be:ef:00:01"));
-        assert_eq!(facts.lan_id, None);
-        assert_eq!(facts.wakeable(), None, "half a story cannot wake anything");
-    }
-
     /// Volumes came to a protocol already in the field, so they are additive
     /// in both directions: old frames keep parsing, and the new ones are new
     /// *variants* — so a daemon too old to hold a lease says "unknown
@@ -874,58 +794,6 @@ mod tests {
             .subject(),
             Some("dev")
         );
-    }
-
-    /// Every step of a move names one device and is aimed at it, so none of
-    /// them may report a subject: half go to a device that does not hold the
-    /// row, and resolving them by instance name would send them to the wrong
-    /// end of the transfer.
-    #[test]
-    fn the_move_frames_are_aimed_at_devices_not_resolved_by_name() {
-        let manifest = Box::new(MoveManifest {
-            instance: Instance::new("dev", "laptop", "debian:13", Shape::default(), None),
-            arch: "aarch64".into(),
-            base: BaseImage::absent("debian:13".to_owned()),
-            files: vec![
-                MoveFile { path: "disk.raw".into(), len: 20 << 30, allocated: 1 << 30, mode: 0o600 },
-                MoveFile { path: "seed.iso".into(), len: 366 << 10, allocated: 366 << 10, mode: 0o644 },
-            ],
-            local_volumes: vec!["/mnt/ast/tank".into()],
-        });
-
-        assert_eq!(manifest.allocated(), (1 << 30) + (366 << 10));
-        assert_eq!(manifest.virtual_size(), (20 << 30) + (366 << 10));
-        assert!(
-            manifest.allocated() * 4 < manifest.virtual_size(),
-            "a root disk is mostly hole, and that is the whole economics of a move"
-        );
-
-        for req in [
-            Request::SetCpu { name: "dev".into(), device: "desktop".into(), down: false },
-            Request::MoveOffer { name: "dev".into() },
-            Request::MoveProbe { manifest: manifest.clone() },
-            Request::MovePrepare { name: "dev".into(), to_device: "desktop".into(), epoch: 1 },
-            Request::MoveCommitTarget { manifest: manifest.clone(), epoch: 1 },
-            Request::MoveCommitSource { name: "dev".into(), epoch: 1 },
-            Request::MoveAbortSource { name: "dev".into(), epoch: 1 },
-            Request::MoveAbortTarget { name: "dev".into(), epoch: 1 },
-        ] {
-            assert_eq!(req.subject(), None, "{req:?} names a device, not an instance");
-            assert!(!req.survives_a_move(), "{req:?} is not a read");
-        }
-
-        // `--down` is defaulted, so a CLI that predates it still parses.
-        let bare: Request =
-            serde_json::from_str(r#"{"cmd":"set_cpu","name":"dev","device":"desktop"}"#).unwrap();
-        assert!(matches!(bare, Request::SetCpu { down: false, .. }));
-
-        // A fenced instance answers what reads and nothing that writes.
-        assert!(Request::Status { name: "dev".into() }.survives_a_move());
-        assert!(Request::Logs { name: "dev".into(), lines: 10 }.survives_a_move());
-        assert!(!Request::Up { name: "dev".into(), restart: None }.survives_a_move());
-        assert!(!Request::Remove { name: "dev".into() }.survives_a_move());
-        assert!(!Request::Snapshot { name: "dev".into(), tag: "t".into() }.survives_a_move());
-        assert!(!Request::Rename { name: "dev".into(), new_name: "e".into() }.survives_a_move());
     }
 
     /// A conflicted instance has to leave a way out, and looking before you

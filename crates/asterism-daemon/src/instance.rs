@@ -1,0 +1,533 @@
+//! Everything this device answers out of its own shard of the orbit
+//! registry: defining an instance, booting it, stopping it, renaming it,
+//! deleting it, and hanging volumes off it.
+//!
+//! This is the last stop in [`crate::handle`]'s chain and therefore the one
+//! that owns the refusal at the end of it. A request that no area claimed is
+//! one this device's shard cannot answer, and saying so here — once, in one
+//! place — is what lets every other area be a short list of frames it does
+//! know rather than a long list of frames it does not.
+//!
+//! The split exists so that six branches adding six commands are six edits to
+//! six files. Adding an instance command means a variant in
+//! [`asterism_core::protocol`] and an arm in [`serve`]; nothing in `main.rs`
+//! moves, because `main.rs` no longer knows what an instance command is.
+//!
+//! # What the shard is not
+//!
+//! Nothing here consults the orbit. By the time a request reaches this module
+//! its name has already been resolved (or claimed) against every device, so
+//! this is deliberately the shard-local end of the world — which is also what
+//! stops a forwarded request from fanning out again on arrival.
+
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+
+use asterism_core::hv::{ImageKind, RunState, STOP_DEADLINE};
+use asterism_core::instance::{local_host, Instance, Policy, Status};
+use asterism_core::protocol::{Request, Response};
+use asterism_core::registry::{self, Shard};
+use asterism_core::{paths, VERSION};
+
+use crate::mesh::Mesh;
+use crate::{backend, persist, swap, volume, Node};
+
+/// Answer one request against this device's shard.
+///
+/// Reached from the unix socket and from a mesh stream alike — a forwarded
+/// request is not a different kind of request, it just arrived by a different
+/// door, and that is the whole reason no command needed a second
+/// implementation to be answerable from anywhere in the orbit.
+pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Response {
+    // Reads answer straight from memory; mutations persist before replying.
+    let mutation = match req {
+        // The version handshake, answered here rather than earlier on purpose:
+        // `ast` sends it before every command, and a daemon that has just
+        // noticed a dead guest should have reconciled that before it says it
+        // is well.
+        Request::Ping => return Response::Pong { version: VERSION.to_owned() },
+        Request::List => return Response::Instances { instances: reg.list() },
+        Request::Status { name } => {
+            return match reg.get(&name) {
+                Ok(instance) => Response::Instance { instance: instance.clone() },
+                Err(e) => Response::Error { message: format!("{e:#}") },
+            }
+        }
+        // The backend is chosen once, here, and recorded on the instance:
+        // `--backend vz` is opt-in until vz has survived a release
+        // (BACKENDS.md §7), and an explicit choice this device cannot honour
+        // fails now rather than at the first `ast up`.
+        Request::Create { name, image, shape, backend: requested, publish } => {
+            backend::select_for(requested.as_deref()).and_then(|hv| {
+                let r = backend::image_ref(&image)?;
+                // What the image turned out to be is checked against the
+                // backend before the registry moves: an instance defined
+                // against a backend that could never boot it is worse than
+                // a create that says no.
+                backend::check_can_boot(&*hv, &r, &publish)?;
+                reg.create(&name, cpu_device, &r.name, shape, backend::machine_identity(&*hv))?;
+                if r.kind == ImageKind::OciRootfs {
+                    // A container that has finished is not a crash; see
+                    // `Policy::never`.
+                    reg.set_policy(&name, Policy::never())?;
+                }
+                reg.set_source(&name, r.kind, publish)
+            })
+        }
+        // `--restart` is recorded before the boot, so an instance that comes
+        // up and immediately dies is already carrying the policy the user
+        // asked for when the supervisor looks at the corpse.
+        Request::Up { name, restart } => match restart {
+            Some(restart) => reg.set_restart(&name, restart).and_then(|_| up(reg, &name)),
+            None => up(reg, &name),
+        },
+        // The bridges go before the guest does: a QEMU that is being asked to
+        // shut down cleanly should find its disks still there, and the local
+        // sockets should be gone by the time it is.
+        Request::Down { name } => {
+            let stopped = down(reg, &name);
+            volume::take_down(&name).await;
+            stopped
+        }
+        Request::Remove { name } => {
+            // Leases are handed back while we still know what they were.
+            // A device that will not answer does not block the removal — its
+            // volume stays leased to an instance that no longer exists, which
+            // `ast detach` on that device's side is the remedy for, and which
+            // is a great deal better than an instance that cannot be deleted
+            // because a NAS is asleep.
+            if let Ok(inst) = reg.get(&name).cloned() {
+                volume::take_down(&name).await;
+                volume::release_all(&inst).await;
+            }
+            reg.remove(&name).inspect(|inst| {
+                persist::forget(&inst.name);
+                let _ = std::fs::remove_dir_all(paths::instance_dir(&inst.name));
+            })
+        }
+        // The instance's directory is named after the instance, so the rename
+        // is not done until the bytes have moved too.
+        Request::Rename { name, new_name } => reg.rename(&name, &new_name).inspect(|_| {
+            let (from, to) = (paths::instance_dir(&name), paths::instance_dir(&new_name));
+            if from.exists() {
+                let _ = std::fs::rename(&from, &to);
+            }
+        }),
+        Request::MarkConflicted { name, other_cpu_device } => {
+            reg.mark_conflicted(&name, &other_cpu_device)
+        }
+        Request::AttachVolume { name, path, host, mount_point } => {
+            let host = host.unwrap_or_else(local_host);
+            // Recording a volume the instance's backend could never show
+            // the guest would leave something that looks configured and is
+            // not, so the capability is checked before the registry moves.
+            reg.get(&name)
+                .cloned()
+                .and_then(|inst| backend::check_can_share(&inst))
+                .and_then(|()| resolve_volume_path(&path, &host))
+                .and_then(|path| reg.attach_volume(&name, &path, &host, mount_point.as_deref()))
+        }
+        // A block volume is taken, not merely recorded: the lease is asked
+        // for now, from the device that holds the bytes, so that "somebody
+        // else has it" is a refusal at attach time rather than a boot that
+        // fails later for reasons the user has to go and read about.
+        Request::AttachBlock { name, volume: vol, device } => {
+            attach_block(reg, &name, &vol, &device).await
+        }
+        Request::Detach { name, volume: vol, host } => {
+            detach(reg, &name, &vol, host.as_deref()).await
+        }
+        // A file on this device's disk, read here rather than by the CLI, so
+        // that the answer is the same whoever asked and from wherever.
+        Request::Logs { name, lines } => {
+            return match reg.get(&name).map(|i| i.name.clone()) {
+                Ok(name) => match console_tail(&name, lines) {
+                    Ok((text, truncated)) => Response::Log { text, truncated },
+                    Err(e) => Response::Error { message: format!("{e:#}") },
+                },
+                Err(e) => Response::Error { message: format!("{e:#}") },
+            }
+        }
+        _ => return not_a_shard_request(),
+    };
+    match mutation {
+        Ok(instance) => {
+            if let Err(e) = reg.save() {
+                return Response::Error { message: format!("saving registry: {e:#}") };
+            }
+            Response::Instance { instance }
+        }
+        Err(e) => Response::Error { message: format!("{e:#}") },
+    }
+}
+
+/// What a request that no area of this daemon claims is told.
+///
+/// Four families end up here, and each of them was already answered
+/// somewhere else: `ssh` and `set cpu` on the connection that asked, because
+/// they report as they go; the orbit views and the pairing frames in
+/// [`crate::dispatch`], because they are about the orbit rather than about a
+/// shard; the wake frames in [`crate::wake`] and `mesh::serve_stream`,
+/// because they are about this device's NIC; the volume frames in
+/// [`crate::volume`], before the shard was ever locked. Arriving here means
+/// one of them came in by a door that does not lead anywhere, which is worth
+/// a sentence rather than a panic.
+fn not_a_shard_request() -> Response {
+    Response::Error {
+        message: "that request is not answered by a single device's shard".into(),
+    }
+}
+
+// ---- the fences ------------------------------------------------------------
+
+/// The refusal an instance owes this request before any area gets to run it,
+/// or `None` if there is none.
+///
+/// Two states put an instance out of reach, and both are about the orbit
+/// rather than about the guest: a name that turned out not to be unique, and
+/// bytes that are in flight to another device. They are checked here, once,
+/// ahead of the per-area dispatch, because they hold for every command an
+/// instance has — a snapshot of an instance whose disk is being copied away
+/// is exactly as wrong as a boot of it.
+pub(crate) fn refusal(req: &Request, reg: &Shard) -> Option<Response> {
+    let name = req.subject()?;
+
+    // An instance whose name turned out not to be unique answers exactly the
+    // commands that can end that, and tells everything else what to do.
+    if !req.survives_a_conflict() {
+        if let Ok(inst) = reg.get(name) {
+            if let Some(conflict) = &inst.conflict {
+                return Some(Response::Error {
+                    message: registry::conflicted(inst, conflict),
+                });
+            }
+        }
+    }
+
+    // An instance whose bytes are in flight to another device answers only
+    // what cannot change them. This is the half of "never two bootable
+    // copies" that lives on the source: the target's half is that its copy is
+    // not called anything an instance could be called until it commits.
+    if !req.survives_a_move() {
+        if let Ok(inst) = reg.get(name) {
+            if let Some(moving) = &inst.moving {
+                return Some(Response::Error {
+                    message: format!(
+                        "instance {name:?} is moving to {} — its bytes are in \
+                         flight, so this device will not touch them. Wait for the \
+                         move to finish, or run it again if it was interrupted.",
+                        moving.to_device
+                    ),
+                });
+            }
+        }
+    }
+
+    // What a device says about an instance that used to be here. Only ever
+    // reached by a request aimed at this device directly; the ordinary path
+    // resolves the name across the orbit and lands on whoever holds the row
+    // now.
+    if !reg.holds(name) {
+        if let Some(note) = swap::moved_note(name) {
+            return Some(Response::Error { message: note });
+        }
+    }
+    None
+}
+
+// ---- claiming a name -------------------------------------------------------
+
+/// The refusal a request owes the orbit's one flat instance namespace before
+/// it is routed anywhere, or `None` if it claims no name.
+///
+/// Two commands claim rather than resolve, and they are here together because
+/// they are the same question asked twice: `create` claims the name it is
+/// given, `rename` claims the name it is moving to. Renaming claims first and
+/// resolves second, in that order — an instance that fails the claim must
+/// keep the name it has.
+pub(crate) async fn claim_name(
+    req: &Request,
+    node: &Node,
+    mesh: Option<&Arc<Mesh>>,
+) -> Option<Response> {
+    let name = claimed_name(req)?;
+    claim(name, node, mesh)
+        .await
+        .err()
+        .map(|e| Response::Error { message: format!("{e:#}") })
+}
+
+/// The name a request claims outright, as opposed to the name it resolves.
+///
+/// A rename claims the name it is moving *to*: the one it already has is
+/// taken by definition, and claiming that would refuse every rename there is.
+fn claimed_name(req: &Request) -> Option<&str> {
+    match req {
+        Request::Create { name, .. } => Some(name),
+        Request::Rename { new_name, .. } => Some(new_name),
+        _ => None,
+    }
+}
+
+/// Claims a name in the orbit's one flat instance namespace.
+///
+/// This device's shard first, then every peer it can reach. A peer it cannot
+/// reach is not a veto — see `Shard::mark_conflicted` for why, and for what
+/// happens instead when the two devices can see each other again.
+async fn claim(name: &str, node: &Node, mesh: Option<&Arc<Mesh>>) -> Result<()> {
+    registry::check_name(name)?;
+    if let Ok(existing) = node.shard.lock().await.get(name) {
+        anyhow::bail!("{}", registry::taken(existing));
+    }
+    let Some(mesh) = mesh else { return Ok(()) };
+    if let Some(existing) = mesh.claim(name).await? {
+        anyhow::bail!("{}", registry::taken(&existing));
+    }
+    Ok(())
+}
+
+// ---- booting and stopping --------------------------------------------------
+
+pub(crate) fn up(reg: &mut Shard, name: &str) -> Result<Instance> {
+    let inst = reg.get(name)?.clone();
+    if inst.status == Status::Running {
+        anyhow::bail!("instance {name:?} is already running");
+    }
+    // A cloud-init seed bakes in the guest key of the device that builds it,
+    // so whoever builds one is whose key opens that guest from then on.
+    // Normally that is settled at the first boot and never moves again; it
+    // moves when the seed is rebuilt, which is why the stamp is compared
+    // rather than assumed. `up` only ever runs on the device holding the row,
+    // so that device is this instance's own cpu device.
+    let stamp = paths::instance_dir(name).join("seed.stamp");
+    let before = std::fs::read(&stamp).ok();
+    let (handle, leases) = tokio::task::block_in_place(|| -> Result<_> {
+        let hv = backend::for_instance(&inst)?;
+        let mut req = backend::boot_req(&inst, &*hv)?;
+        // Every boot renews the lease on every block volume this instance
+        // holds, at a higher epoch, and raises the local socket the guest's
+        // disk arrives on. A volume somebody else has taken in the meantime
+        // stops the boot here, saying who has it — which is the whole point
+        // of doing it before the hypervisor is asked for anything.
+        let raised = volume::bring_up(&inst, &*hv)?;
+        req.extra_disks = raised.disks;
+        let prep = hv.prepare(&req)?;
+        Ok((hv.boot(&req, &prep)?, raised.leases))
+    })?;
+    // The epoch this boot was granted, written back onto the instance. The
+    // one recorded before was the attach's, and it stopped being true the
+    // moment this boot renewed it — which matters to `ast status`, and
+    // matters more to the next daemon that has to reconnect this guest's
+    // disks without disturbing the guest (`volume::reattach`).
+    for lease in leases {
+        let _ = reg.attach_block(name, &lease.volume, &lease.device, lease.epoch, lease.size_bytes);
+    }
+    if inst.seed_device.is_none() || std::fs::read(&stamp).ok() != before {
+        let _ = reg.set_seed_device(name, &inst.cpu_device);
+    }
+    reg.set_running(name, handle)
+}
+
+fn down(reg: &mut Shard, name: &str) -> Result<Instance> {
+    let inst = reg.get(name)?.clone();
+    let Some(handle) = inst.handle.clone() else {
+        anyhow::bail!("instance {name:?} is not running");
+    };
+    // A deliberate stop is not a crash: it cancels any restart owed.
+    persist::forget(name);
+    tokio::task::block_in_place(|| -> Result<()> {
+        // The handle names its own backend, so a guest booted by one
+        // backend is always stopped by that same one — even if the
+        // instance has since been redefined, or the device's default has
+        // moved on since it booted.
+        backend::for_handle(&handle.backend)?.stop(&handle, STOP_DEADLINE)
+    })?;
+    reg.set_stopped(name)
+}
+
+/// Instances marked running whose guest died (host reboot, crash) get
+/// flipped back to stopped so the state file tracks reality.
+pub(crate) fn reconcile(reg: &mut Shard) {
+    let stale: Vec<String> = reg
+        .list()
+        .into_iter()
+        .filter(|i| i.status == Status::Running && !is_running(i))
+        .map(|i| i.name)
+        .collect();
+    if stale.is_empty() {
+        return;
+    }
+    for name in stale {
+        // Stopped is the truth right now; the supervisor decides whether it
+        // stays that way.
+        persist::note_died(&name);
+        let _ = reg.set_stopped(&name);
+    }
+    let _ = reg.save();
+}
+
+/// A handle reloaded from the registry is never assumed valid — and it is
+/// asked about by the backend that booted it, which the handle names. A
+/// device running both backends has both kinds of guest to reconcile, and
+/// "is it alive" means something different for each.
+fn is_running(inst: &Instance) -> bool {
+    let Some(h) = &inst.handle else { return false };
+    let Ok(hv) = backend::for_handle(&h.backend) else { return false };
+    matches!(hv.state(h), Ok(RunState::Running))
+}
+
+// ---- volumes on an instance ------------------------------------------------
+
+/// Take a block volume's lease from the device that holds it, and record it
+/// on the instance.
+///
+/// The lease first, the registry second: a record written against a lease we
+/// were refused would be an instance that looks configured and cannot boot,
+/// which is the failure `check_can_share` exists to prevent for directories.
+async fn attach_block(
+    reg: &mut Shard,
+    name: &str,
+    vol: &str,
+    device: &str,
+) -> Result<Instance> {
+    let inst = reg.get(name)?.clone();
+    let hv = backend::for_instance(&inst)?;
+    volume::check_backend(&*hv)?;
+    let (epoch, _export, size) = volume::take_lease(vol, device, name).await?;
+    reg.attach_block(name, vol, device, epoch, size)
+}
+
+/// Take a volume off an instance, handing back a block volume's lease.
+///
+/// Refused while the guest is running: neither backend offers disk hotplug
+/// (`Caps::disk_hotplug` is false on both), so pulling the bytes out from
+/// under a live guest would be a yanked cable rather than a detach.
+async fn detach(
+    reg: &mut Shard,
+    name: &str,
+    vol: &str,
+    host: Option<&str>,
+) -> Result<Instance> {
+    let inst = reg.get(name)?.clone();
+    if inst.status == Status::Running {
+        anyhow::bail!(
+            "instance {name:?} is running and its guest has this volume — \
+             `ast down {name}` first"
+        );
+    }
+    // `--host` is optional because most of the time there is only one volume
+    // by that name on the instance, and making the user name a device to
+    // remove a part they can see in `ast status` would be a riddle.
+    let matches: Vec<&asterism_core::instance::Volume> =
+        inst.volumes.iter().filter(|v| v.path == vol).collect();
+    let host = match host {
+        Some(host) => host.to_owned(),
+        None => match matches.as_slice() {
+            [only] => only.host.clone(),
+            [] => anyhow::bail!(
+                "{name:?} has no volume called {vol:?} — see: ast status {name}"
+            ),
+            many => anyhow::bail!(
+                "{name:?} has {vol:?} from {} devices — say which: {}",
+                many.len(),
+                many.iter()
+                    .map(|v| format!("--volume {}:{}", v.host, v.path))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        },
+    };
+
+    let record = inst
+        .volumes
+        .iter()
+        .find(|v| v.path == vol && v.host == host)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("{host}:{vol} is not attached to {name:?}"))?;
+
+    // The lease goes back before the record does. A provider that will not
+    // answer fails the detach rather than leaving a volume this device has
+    // forgotten and that device still thinks is spoken for.
+    if record.is_block() {
+        volume::give_lease_back(vol, &host, name).await?;
+    }
+    reg.detach_volume(name, vol, &host).map(|(inst, _)| inst)
+}
+
+/// A volume on this device is about to be handed to a hypervisor, so it has
+/// to be a real directory and it has to be named absolutely — the CLI may
+/// have been run from anywhere, and the daemon's cwd is not the user's.
+/// Volumes on other devices are taken on faith; we cannot see their disks.
+fn resolve_volume_path(path: &str, host: &str) -> Result<String> {
+    if host != local_host() {
+        return Ok(path.to_owned());
+    }
+    let canonical =
+        std::fs::canonicalize(path).with_context(|| format!("cannot use {path} as a volume"))?;
+    if !canonical.is_dir() {
+        anyhow::bail!("{path} is not a directory — volumes are directories");
+    }
+    Ok(canonical.display().to_string())
+}
+
+// ---- the console -----------------------------------------------------------
+
+/// The last `lines` lines of a guest's console, and whether older ones were
+/// left behind. `lines` of 0 means all of it.
+fn console_tail(name: &str, lines: u32) -> Result<(String, bool)> {
+    let path = paths::instance_dir(name).join("console.log");
+    let text = std::fs::read_to_string(&path).map_err(|_| {
+        anyhow::anyhow!("no console log for {name:?} yet — `ast up {name}` starts one")
+    })?;
+    if lines == 0 {
+        return Ok((text, false));
+    }
+    let all: Vec<&str> = text.lines().collect();
+    let keep = all.len().min(lines as usize);
+    let tail = all[all.len() - keep..].join("\n");
+    Ok((tail, keep < all.len()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Claiming and resolving are different questions, and a rename asks
+    /// both — the old name is resolved, the new one is claimed. Getting that
+    /// round the wrong way would refuse every rename ever typed, because the
+    /// name an instance already has is taken by that instance.
+    #[test]
+    fn a_rename_claims_the_name_it_is_moving_to_and_not_the_one_it_has() {
+        assert_eq!(
+            claimed_name(&Request::Rename { name: "dev".into(), new_name: "dev2".into() }),
+            Some("dev2")
+        );
+        assert_eq!(
+            claimed_name(&Request::Create {
+                name: "dev".into(),
+                image: "debian:13".into(),
+                shape: Default::default(),
+                backend: None,
+                publish: Vec::new(),
+            }),
+            Some("dev")
+        );
+        // Everything else resolves a name it did not invent, so it claims
+        // nothing and must not be made to wait on every peer in the orbit.
+        assert_eq!(claimed_name(&Request::Up { name: "dev".into(), restart: None }), None);
+        assert_eq!(claimed_name(&Request::Status { name: "dev".into() }), None);
+        assert_eq!(claimed_name(&Request::List), None);
+    }
+
+    /// The refusal the chain ends on is a sentence, not a panic: a frame that
+    /// arrived by the wrong door is a bug in a daemon, and the daemon on the
+    /// other end has to be able to print something.
+    #[test]
+    fn a_frame_no_area_claims_is_refused_in_words() {
+        let Response::Error { message } = not_a_shard_request() else {
+            panic!("a refusal");
+        };
+        assert!(message.contains("single device's shard"), "{message}");
+    }
+}
