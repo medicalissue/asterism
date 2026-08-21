@@ -9,7 +9,7 @@
 //! Per-instance files, in `~/.asterism/instances/<name>/`:
 //!   disk.raw     — `clonefile(2)` clone of the raw base image
 //!   snapshots/   — clones of that disk, one file per snapshot
-//!   efi-vars.fd  — UEFI variable store
+//!   efi-vars.fd  — UEFI variable store, cut from this host's firmware
 //!   qemu.pid     — written by `qemu -daemonize`
 //!   qmp.sock     — the control channel recorded on the Handle
 //!
@@ -60,12 +60,17 @@ pub struct Qemu {
 
 /// The facts about this host's QEMU that every other method needs, worked
 /// out once. `probe()` is called on the `ast create` path, so it stays
-/// cheap: three subprocess runs, cached for the life of the daemon.
+/// cheap: three subprocess runs and one device open, cached for the life of
+/// the daemon.
 struct Probe {
     system: PathBuf,
     img: PathBuf,
-    firmware: PathBuf,
+    firmware: FirmwareFiles,
     version: String,
+    /// What this host accelerates guests with — a fact asked of the host,
+    /// not read off the target triple: on Linux it is `Kvm` only once
+    /// `/dev/kvm` has actually been opened read-write.
+    accel: Accel,
     /// virtio-9p is a build-time option, and some builds ship without it.
     virtfs: bool,
 }
@@ -145,11 +150,15 @@ impl Probe {
     fn run() -> Result<Self> {
         let system = tool(&format!("qemu-system-{}", image::host_arch()))?;
         let img = tool("qemu-img")?;
-        let firmware = firmware_path(&system)?;
+        // Acceleration before firmware: a host with no KVM cannot run a
+        // guest at all, and being told that is more use than being told
+        // which firmware file is missing.
+        let accel = probe_accel()?;
+        let firmware = find_firmware(&system)?;
         let version = parse_version(&output(Command::new(&system).arg("--version"))?)
             .unwrap_or_else(|| "unknown".to_owned());
         let virtfs = supports_virtfs(&system);
-        Ok(Probe { system, img, firmware, version, virtfs })
+        Ok(Probe { system, img, firmware, version, accel, virtfs })
     }
 
     /// Machine type is per-arch: "virt" exists only on aarch64; x86 wants q35.
@@ -160,18 +169,10 @@ impl Probe {
         }
     }
 
-    fn accel(&self) -> &'static str {
-        if cfg!(target_os = "macos") {
-            "hvf"
-        } else {
-            "kvm"
-        }
-    }
-
     fn ready(&self) -> Ready {
         Ready {
             version: self.version.clone(),
-            accel: self.accel().to_owned(),
+            accel: self.accel.as_arg().to_owned(),
             machine_type: self.machine_type().to_owned(),
             cpu: CPU_MODEL.to_owned(),
         }
@@ -260,15 +261,17 @@ impl Hypervisor for Qemu {
             });
         }
 
+        // Probed before the store is cut, because what the store has to be
+        // is a fact about the firmware this host turned out to have.
+        let fw = &self.probed()?.firmware;
         let vars = req.dir.join("efi-vars.fd");
         if !vars.exists() {
-            // AArch64 EDK2 wants a 64 MiB variable store matching the code flash.
-            std::fs::write(&vars, vec![0u8; 64 * 1024 * 1024])?;
+            cut_vars(fw, &vars)?;
         }
 
         Ok(Prepared {
             root,
-            firmware: Some(Firmware { code: self.probed()?.firmware.clone(), vars }),
+            firmware: Some(Firmware { code: fw.code.clone(), vars }),
             kernel: None,
         })
     }
@@ -308,7 +311,7 @@ impl Hypervisor for Qemu {
 
         let mut cmd = Command::new(&p.system);
         cmd.arg("-machine").arg(p.machine_type())
-            .arg("-accel").arg(p.accel())
+            .arg("-accel").arg(p.accel.as_arg())
             .arg("-cpu").arg(CPU_MODEL)
             .arg("-smp").arg(inst.shape.cpus.to_string())
             .arg("-m").arg(format!("{}M", inst.shape.mem_mib));
@@ -699,28 +702,270 @@ fn free_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
-// ---- discovery -------------------------------------------------------------
+// ---- acceleration ----------------------------------------------------------
 
-/// EDK2 firmware ships next to the qemu binary under ../share/qemu/.
-fn firmware_path(qemu: &Path) -> Result<PathBuf> {
-    let file = match image::host_arch() {
-        "aarch64" => "edk2-aarch64-code.fd",
-        "x86_64" => "edk2-x86_64-code.fd",
-        other => bail!("no firmware mapping for {other}"),
+/// What this host runs guests on.
+///
+/// There is no TCG arm and there will not be one: this backend boots with
+/// `-cpu host`, which means nothing without hardware underneath it, and an
+/// agent host emulated instruction by instruction would not be worth the
+/// electricity. A host with neither is a host this backend refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Accel {
+    /// Hypervisor.framework, which every supported macOS has.
+    Hvf,
+    /// KVM, reached through `/dev/kvm`.
+    Kvm,
+}
+
+impl Accel {
+    fn as_arg(self) -> &'static str {
+        match self {
+            Accel::Hvf => "hvf",
+            Accel::Kvm => "kvm",
+        }
+    }
+}
+
+const KVM_DEVICE: &str = "/dev/kvm";
+
+/// Whether this host can accelerate a guest — asked of the host, not assumed
+/// from the target it was built for.
+///
+/// On Linux the question is exactly the one QEMU asks a moment later: can
+/// this process open `/dev/kvm` read-write. A module that was never loaded,
+/// a CPU with virtualisation switched off in its firmware, a user outside
+/// the `kvm` group, a container that did not pass the device through — all
+/// four answer here, at `ast create`, instead of as a QEMU exit code with a
+/// guest that never appeared.
+fn probe_accel() -> Result<Accel> {
+    if cfg!(target_os = "macos") {
+        return Ok(Accel::Hvf);
+    }
+    match std::fs::OpenOptions::new().read(true).write(true).open(KVM_DEVICE) {
+        Ok(_) => Ok(Accel::Kvm),
+        Err(e) => bail!("{}", kvm_advice(&e)),
+    }
+}
+
+/// Why `/dev/kvm` could not be opened, and what to do about it.
+///
+/// Pure, and separate from the open, so the way out of each fault is
+/// something a test pins down rather than something a user finds out on the
+/// one host that has it.
+fn kvm_advice(e: &std::io::Error) -> String {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::NotFound => format!(
+            "{KVM_DEVICE} is not there, so this host cannot accelerate a guest — \
+             turn virtualisation (VT-x or AMD-V) on in its firmware and load the \
+             module with `sudo modprobe kvm_intel` (or `kvm_amd`). If this host is \
+             itself a virtual machine or a WSL distro, nested virtualisation has \
+             to be turned on where it runs."
+        ),
+        ErrorKind::PermissionDenied => format!(
+            "{KVM_DEVICE} is there, but this user cannot open it — join the group \
+             that owns it with `sudo usermod -aG kvm $USER` and log out and back \
+             in, or grant this user alone with \
+             `sudo setfacl -m u:$USER:rw {KVM_DEVICE}`."
+        ),
+        _ => format!(
+            "{KVM_DEVICE} is there and could not be opened: {e}. A CPU with no \
+             virtualisation extensions reports itself this way."
+        ),
+    }
+}
+
+// ---- firmware --------------------------------------------------------------
+
+/// The UEFI firmware this host boots cloud images with: read-only code, and
+/// the template an instance's own variable store is cut from.
+///
+/// Two files, because they are a matched pair. A distro's OVMF is linked
+/// against a variable store of a particular size and ships that store beside
+/// the code; QEMU's own AArch64 build ships code alone and formats a
+/// zero-filled store on first boot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FirmwareFiles {
+    code: PathBuf,
+    /// `None` for firmware that ships no template, which is a fact about the
+    /// firmware and not a failure to look.
+    vars_template: Option<PathBuf>,
+}
+
+/// One place firmware might live, and what it is called there.
+///
+/// Every distro packages EDK2 under its own name in its own directory, so
+/// discovery is a table rather than a rule. Naming a variable store is what
+/// makes one mandatory: a layout that names templates has to have one of
+/// them, and a layout that names none boots on a store this backend fills
+/// with zeroes.
+#[derive(Debug)]
+struct FirmwareLayout {
+    dir: PathBuf,
+    code: &'static str,
+    /// Variable-store templates that pair with that code, best first.
+    vars: &'static [&'static str],
+}
+
+impl FirmwareLayout {
+    fn code_path(&self) -> PathBuf {
+        self.dir.join(self.code)
+    }
+
+    /// This layout as files on this host, if it is here at all.
+    fn resolve(&self) -> Option<FirmwareFiles> {
+        let code = self.code_path();
+        if !code.exists() {
+            return None;
+        }
+        let vars_template = self.vars.iter().map(|v| self.dir.join(v)).find(|p| p.exists());
+        if vars_template.is_none() && !self.vars.is_empty() {
+            // The code is here and the store it was built against is not.
+            // Handing that firmware a zero-filled store of the wrong size is
+            // a QEMU error with no explanation in it, so keep looking.
+            return None;
+        }
+        Some(FirmwareFiles { code, vars_template })
+    }
+}
+
+/// Everywhere EDK2 lives on the hosts this runs on, best first.
+///
+/// QEMU's own `share/qemu` leads on every platform: it is what Homebrew
+/// installs beside the binary, it is the firmware macOS instances have
+/// always booted, and a host that has it has a build matched to its qemu.
+/// The distro packages follow, because a Linux host usually has only those —
+/// Debian and Ubuntu ship `/usr/share/OVMF` and `/usr/share/AAVMF`, Fedora
+/// and Arch ship under `/usr/share/edk2` — and each of them names the
+/// variable store it was built against.
+fn firmware_layouts(qemu: &Path, arch: &str) -> Result<Vec<FirmwareLayout>> {
+    // AArch64 names no template on purpose: `edk2-aarch64-code.fd` is padded
+    // to the 64 MiB flash the `virt` machine has, EDK2 formats a zero-filled
+    // store of the same size on first boot, and that is the store every
+    // macOS instance in the field is already running on. x86 has no such
+    // luxury — its flash window is 8 MiB, so a 64 MiB store is not a store
+    // QEMU will map, and the paired `edk2-i386-vars.fd` is the only one.
+    let (qemu_code, qemu_vars): (&'static str, &'static [&'static str]) = match arch {
+        "aarch64" => ("edk2-aarch64-code.fd", &[]),
+        "x86_64" => ("edk2-x86_64-code.fd", &["edk2-i386-vars.fd"]),
+        other => bail!(
+            "no UEFI firmware is mapped for {other} — this backend boots \
+             aarch64 and x86_64 guests"
+        ),
     };
-    let mut candidates = vec![
-        PathBuf::from("/opt/homebrew/share/qemu").join(file),
-        PathBuf::from("/usr/local/share/qemu").join(file),
-        PathBuf::from("/usr/share/qemu").join(file),
+    let mut dirs = vec![
+        PathBuf::from("/opt/homebrew/share/qemu"),
+        PathBuf::from("/usr/local/share/qemu"),
+        PathBuf::from("/usr/share/qemu"),
     ];
     if let Some(bin_dir) = qemu.parent() {
-        candidates.insert(0, bin_dir.join("../share/qemu").join(file));
+        dirs.insert(0, bin_dir.join("../share/qemu"));
     }
-    candidates
+    let mut layouts: Vec<FirmwareLayout> = dirs
         .into_iter()
-        .find(|p| p.exists())
-        .with_context(|| format!("{file} not found near {}", qemu.display()))
+        .map(|dir| FirmwareLayout { dir, code: qemu_code, vars: qemu_vars })
+        .collect();
+
+    let distro: &[(&str, &'static str, &'static [&'static str])] = match arch {
+        "aarch64" => &[
+            ("/usr/share/AAVMF", "AAVMF_CODE_4M.fd", &["AAVMF_VARS_4M.fd"]),
+            ("/usr/share/AAVMF", "AAVMF_CODE.no-secboot.fd", &["AAVMF_VARS.fd"]),
+            ("/usr/share/AAVMF", "AAVMF_CODE.fd", &["AAVMF_VARS.fd"]),
+            (
+                "/usr/share/edk2/aarch64",
+                "QEMU_EFI-silent-pflash.raw",
+                &["vars-template-pflash.raw"],
+            ),
+            ("/usr/share/edk2/aarch64", "QEMU_EFI-pflash.raw", &["vars-template-pflash.raw"]),
+            ("/usr/share/edk2/aarch64", "QEMU_CODE.fd", &["QEMU_VARS.fd"]),
+        ],
+        _ => &[
+            // Debian and Ubuntu ship both the 4 MiB build and the older
+            // 2 MiB one in the same directory, and the store that goes with
+            // each is the one named after it — never the other.
+            ("/usr/share/OVMF", "OVMF_CODE_4M.fd", &["OVMF_VARS_4M.fd"]),
+            ("/usr/share/OVMF", "OVMF_CODE.fd", &["OVMF_VARS.fd"]),
+            ("/usr/share/edk2/ovmf", "OVMF_CODE.fd", &["OVMF_VARS.fd"]),
+            ("/usr/share/edk2/x64", "OVMF_CODE.4m.fd", &["OVMF_VARS.4m.fd"]),
+            ("/usr/share/edk2/x64", "OVMF_CODE.fd", &["OVMF_VARS.fd"]),
+            ("/usr/share/qemu", "ovmf-x86_64-code.bin", &["ovmf-x86_64-vars.bin"]),
+        ],
+    };
+    layouts.extend(
+        distro
+            .iter()
+            .map(|(dir, code, vars)| FirmwareLayout { dir: PathBuf::from(*dir), code, vars }),
+    );
+    Ok(layouts)
 }
+
+/// The first layout this host actually has. Existence is the whole test:
+/// nothing here reads a firmware file and nothing here runs qemu.
+fn pick_firmware(layouts: &[FirmwareLayout]) -> Option<FirmwareFiles> {
+    layouts.iter().find_map(FirmwareLayout::resolve)
+}
+
+fn find_firmware(qemu: &Path) -> Result<FirmwareFiles> {
+    let arch = image::host_arch();
+    let layouts = firmware_layouts(qemu, arch)?;
+    pick_firmware(&layouts).with_context(|| {
+        let looked: Vec<String> =
+            layouts.iter().map(|l| l.code_path().display().to_string()).collect();
+        format!(
+            "no UEFI firmware for {arch} guests near {} — install it with {}. \
+             Looked for: {}",
+            qemu.display(),
+            firmware_package_hint(arch),
+            looked.join(", ")
+        )
+    })
+}
+
+/// What to install, in the words of the package managers that have it.
+fn firmware_package_hint(arch: &str) -> &'static str {
+    match arch {
+        "aarch64" => {
+            "`sudo apt install qemu-efi-aarch64`, `sudo dnf install edk2-aarch64`, \
+             or `brew install qemu`"
+        }
+        _ => {
+            "`sudo apt install ovmf`, `sudo dnf install edk2-ovmf`, \
+             `sudo pacman -S edk2-ovmf`, or `brew install qemu`"
+        }
+    }
+}
+
+/// AArch64 EDK2's flash device is 64 MiB and its variable store has to
+/// match. Only reached for firmware that ships no template of its own.
+const VARS_BYTES: usize = 64 * 1024 * 1024;
+
+/// Cut an instance its own UEFI variable store, the way this host's firmware
+/// wants one.
+///
+/// A distro's OVMF ships the store it was built against: the size is the one
+/// its code flash was linked for, and the contents are the empty variable
+/// database that build expects, so the instance's store is a copy of it.
+/// Firmware that ships no template gets the zero-filled store EDK2 formats
+/// on first boot, which is what every instance had when QEMU's own build was
+/// the only firmware this backend could find.
+fn cut_vars(fw: &FirmwareFiles, vars: &Path) -> Result<()> {
+    let Some(template) = &fw.vars_template else {
+        std::fs::write(vars, vec![0u8; VARS_BYTES])?;
+        return Ok(());
+    };
+    std::fs::copy(template, vars)
+        .with_context(|| format!("cutting {} from {}", vars.display(), template.display()))?;
+    // The template is a package file, owned by root and often read-only. The
+    // copy takes its mode, and pflash opens a variable store read-write.
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(vars)?.permissions();
+    perms.set_mode(0o600);
+    std::fs::set_permissions(vars, perms)?;
+    Ok(())
+}
+
+// ---- discovery -------------------------------------------------------------
 
 /// 9p host support is a build-time option, and on some platforms it has
 /// historically been left out. Ask the binary in front of us rather than
@@ -764,7 +1009,12 @@ mod tests {
             &local_host(),
             "debian:13",
             Shape { cpus: 1, mem_mib: 512, disk_gib },
-            None,
+            asterism_core::hv::Machine {
+                backend: ID.into(),
+                machine_type: "virt".into(),
+                cpu: "host".into(),
+                hv_version: "test".into(),
+            },
         )
         .unwrap()
     }
@@ -949,6 +1199,181 @@ mod tests {
     fn commas_in_host_paths_survive_qemus_option_parser() {
         assert_eq!(qemu_escape("/tank/a,b"), "/tank/a,,b");
         assert_eq!(qemu_escape("/tank/media"), "/tank/media");
+    }
+
+    /// Each way `/dev/kvm` can be unusable has a different way out, and the
+    /// message is the only place a user meets it. Wrong advice — telling
+    /// someone to load a module they already have — costs more than none.
+    #[test]
+    fn each_kvm_fault_carries_its_own_way_out() {
+        use std::io::{Error, ErrorKind};
+
+        let absent = kvm_advice(&Error::from(ErrorKind::NotFound));
+        assert!(absent.contains("/dev/kvm"), "{absent}");
+        assert!(absent.contains("modprobe kvm_intel"), "{absent}");
+        assert!(absent.contains("nested virtualisation"), "a WSL host needs this: {absent}");
+        assert!(!absent.contains("usermod"), "nothing to join a group over: {absent}");
+
+        let denied = kvm_advice(&Error::from(ErrorKind::PermissionDenied));
+        assert!(denied.contains("usermod -aG kvm"), "{denied}");
+        assert!(denied.contains("setfacl"), "the way out for one login: {denied}");
+        assert!(!denied.contains("modprobe"), "the module is loaded already: {denied}");
+
+        // Anything else still names the device and carries the OS's own words.
+        let odd = kvm_advice(&Error::other("boom"));
+        assert!(odd.contains("/dev/kvm"), "{odd}");
+        assert!(odd.contains("boom"), "{odd}");
+    }
+
+    /// Acceleration is a fact about the host, so both answers are the
+    /// contract: hvf on macOS, and on Linux either kvm or the reason why not.
+    #[test]
+    fn acceleration_is_asked_of_the_host() {
+        assert_eq!(Accel::Hvf.as_arg(), "hvf");
+        assert_eq!(Accel::Kvm.as_arg(), "kvm");
+
+        match probe_accel() {
+            Ok(accel) => {
+                let expected = if cfg!(target_os = "macos") { Accel::Hvf } else { Accel::Kvm };
+                assert_eq!(accel, expected);
+            }
+            Err(e) => {
+                // Only Linux can answer no, and only by naming the device.
+                assert_eq!(std::env::consts::OS, "linux", "macOS always has hvf: {e}");
+                assert!(e.to_string().contains("/dev/kvm"), "{e}");
+            }
+        }
+    }
+
+    /// A layout with several builds in one directory: the store that goes
+    /// with a code file is the one named after it, never the neighbour.
+    #[test]
+    fn firmware_is_found_as_a_code_and_vars_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in ["OVMF_CODE_4M.fd", "OVMF_VARS_4M.fd", "OVMF_CODE.fd", "OVMF_VARS.fd"] {
+            std::fs::write(dir.path().join(f), f.as_bytes()).unwrap();
+        }
+        let layouts = vec![
+            FirmwareLayout {
+                dir: dir.path().to_owned(),
+                code: "OVMF_CODE_4M.fd",
+                vars: &["OVMF_VARS_4M.fd"],
+            },
+            FirmwareLayout {
+                dir: dir.path().to_owned(),
+                code: "OVMF_CODE.fd",
+                vars: &["OVMF_VARS.fd"],
+            },
+        ];
+        let found = pick_firmware(&layouts).expect("the 4M build is there");
+        assert_eq!(found.code, dir.path().join("OVMF_CODE_4M.fd"));
+        assert_eq!(found.vars_template, Some(dir.path().join("OVMF_VARS_4M.fd")));
+    }
+
+    /// Firmware whose store is missing is not firmware this host can boot:
+    /// the search passes over it rather than pairing it with a zero-filled
+    /// store of the wrong size. Firmware that never wanted one is taken as it
+    /// is — that is the AArch64 build every macOS instance runs on.
+    #[test]
+    fn a_layout_missing_the_store_it_needs_is_passed_over() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("OVMF_CODE_4M.fd"), b"code").unwrap();
+        std::fs::write(dir.path().join("edk2-aarch64-code.fd"), b"code").unwrap();
+
+        let needs_a_store = FirmwareLayout {
+            dir: dir.path().to_owned(),
+            code: "OVMF_CODE_4M.fd",
+            vars: &["OVMF_VARS_4M.fd"],
+        };
+        let needs_none = FirmwareLayout {
+            dir: dir.path().to_owned(),
+            code: "edk2-aarch64-code.fd",
+            vars: &[],
+        };
+        let absent = FirmwareLayout {
+            dir: dir.path().join("nowhere"),
+            code: "edk2-aarch64-code.fd",
+            vars: &[],
+        };
+
+        assert!(pick_firmware(std::slice::from_ref(&needs_a_store)).is_none());
+        let found = pick_firmware(&[needs_a_store, needs_none]).expect("the second one");
+        assert_eq!(found.code, dir.path().join("edk2-aarch64-code.fd"));
+        assert_eq!(found.vars_template, None, "and it is cut zero-filled");
+
+        assert!(pick_firmware(&[absent]).is_none());
+        assert!(pick_firmware(&[]).is_none());
+    }
+
+    /// The order is the policy: qemu's own firmware, next to the binary that
+    /// will boot it, before anything a distro packages. macOS never leaves
+    /// the first group, which is why its instances keep the store they have.
+    #[test]
+    fn qemus_own_firmware_is_searched_before_the_distros() {
+        let layouts =
+            firmware_layouts(Path::new("/opt/homebrew/bin/qemu-system-x86_64"), "x86_64").unwrap();
+        assert_eq!(layouts[0].dir, Path::new("/opt/homebrew/bin/../share/qemu"));
+        assert_eq!(layouts[0].code, "edk2-x86_64-code.fd");
+        assert_eq!(layouts[0].vars, &["edk2-i386-vars.fd"], "x86 flash is 8 MiB, not 64");
+
+        let names: Vec<_> = layouts.iter().map(|l| l.code_path()).collect();
+        let qemus = names.iter().filter(|p| p.ends_with("edk2-x86_64-code.fd")).count();
+        let distro = names.iter().position(|p| p.ends_with("OVMF/OVMF_CODE_4M.fd")).unwrap();
+        assert_eq!(distro, qemus, "every qemu path comes first: {names:?}");
+        assert!(names.contains(&PathBuf::from("/usr/share/OVMF/OVMF_CODE_4M.fd")));
+        assert!(names.contains(&PathBuf::from("/usr/share/edk2/ovmf/OVMF_CODE.fd")));
+        assert_eq!(layouts[distro].vars, &["OVMF_VARS_4M.fd"]);
+
+        // AArch64 keeps the mapping macOS has always had, and keeps asking
+        // for no template with it.
+        let arm = firmware_layouts(Path::new("/opt/homebrew/bin/qemu-system-aarch64"), "aarch64")
+            .unwrap();
+        assert_eq!(arm[0].code, "edk2-aarch64-code.fd");
+        assert!(arm[0].vars.is_empty(), "the 64 MiB zero fill is the store here");
+        assert!(arm.iter().any(|l| l.code_path() == Path::new("/usr/share/AAVMF/AAVMF_CODE_4M.fd")));
+        assert!(
+            arm.iter().skip(4).all(|l| !l.vars.is_empty()),
+            "every distro layout names the store it was built against"
+        );
+
+        let err = firmware_layouts(Path::new("/usr/bin/qemu-system-riscv64"), "riscv64")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("riscv64"), "{err}");
+    }
+
+    /// The store an instance boots on is the one its firmware was built
+    /// against — a copy of the template, writable, whatever mode the
+    /// package file had. Firmware with no template keeps the zero fill.
+    #[test]
+    fn a_variable_store_is_cut_from_the_template_when_there_is_one() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let template = dir.path().join("OVMF_VARS_4M.fd");
+        std::fs::write(&template, b"an empty variable database").unwrap();
+        // Package files are root-owned and read-only; the copy must not be.
+        std::fs::set_permissions(&template, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let paired = FirmwareFiles {
+            code: dir.path().join("OVMF_CODE_4M.fd"),
+            vars_template: Some(template),
+        };
+        let vars = dir.path().join("efi-vars.fd");
+        cut_vars(&paired, &vars).unwrap();
+        assert_eq!(std::fs::read(&vars).unwrap(), b"an empty variable database");
+        let mode = std::fs::metadata(&vars).unwrap().permissions().mode();
+        assert_eq!(mode & 0o200, 0o200, "pflash opens the store read-write: {mode:o}");
+
+        let alone = FirmwareFiles {
+            code: dir.path().join("edk2-aarch64-code.fd"),
+            vars_template: None,
+        };
+        let zeroed = dir.path().join("zeroed.fd");
+        cut_vars(&alone, &zeroed).unwrap();
+        let meta = std::fs::metadata(&zeroed).unwrap();
+        assert_eq!(meta.len(), VARS_BYTES as u64, "64 MiB, matching the code flash");
+        assert!(std::fs::read(&zeroed).unwrap().iter().all(|b| *b == 0));
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! `astd-vz` — one Virtualization.framework guest, one process.
 //!
 //! This binary is the only thing in Asterism that touches VZ, and therefore
-//! the only thing that has to carry `com.apple.security.virtualization`.
+//! the only thing that has to carry `com.apple.security.virtualization` and
+//! `com.apple.security.network.client`.
 //! `astd` spawns one per running instance and drives it over the unix
 //! socket in [`asterism_vz`]; the guest lives exactly as long as this
 //! process does, which is *why* it is a separate process — restarting or

@@ -746,7 +746,18 @@ mod tests {
             &std::env::temp_dir().join("nonexistent-registry.json"),
         )
         .unwrap()
-        .create("dev", &local_host(), "debian:13", Default::default(), None)
+        .create(
+            "dev",
+            &local_host(),
+            "debian:13",
+            Default::default(),
+            crate::hv::Machine {
+                backend: "qemu".into(),
+                machine_type: "virt".into(),
+                cpu: "host".into(),
+                hv_version: "test".into(),
+            },
+        )
         .unwrap();
         inst.volumes = vec![
             Volume::dir("/tank/here", &local_host(), None),

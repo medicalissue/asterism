@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
-use asterism_core::hv::{Hypervisor, RunState};
+use asterism_core::hv::RunState;
 use asterism_core::instance::{Instance, Restart, Status};
 use asterism_core::paths;
 use asterism_core::power::{Change, SleepGuard};
@@ -176,7 +176,6 @@ fn note_alive(name: &str) {
 /// up because one guest will not boot is worse than the guest being down.
 pub async fn resurrect(registry: &Arc<Mutex<Shard>>) {
     let mut reg = registry.lock().await;
-    let hv = backend::select();
     let recorded: Vec<Instance> =
         reg.list().into_iter().filter(|i| i.status == Status::Running).collect();
     if recorded.is_empty() {
@@ -191,7 +190,7 @@ pub async fn resurrect(registry: &Arc<Mutex<Shard>>) {
         // volume reaches the guest through a socket *this* daemon binds and
         // an accept loop it runs, and both died with the last one, so the
         // guest is sitting there retrying a socket nothing is behind.
-        if alive(&*hv, &inst) {
+        if alive(&inst) {
             eprintln!(
                 "astd: {name} was already running (pid {}) and kept running",
                 inst.pid().unwrap_or(0)
@@ -238,13 +237,12 @@ pub fn supervise(registry: Arc<Mutex<Shard>>) -> tokio::task::JoinHandle<()> {
 /// sleep assertion in step with what is running.
 async fn tick(registry: &Arc<Mutex<Shard>>, guard: &mut SleepGuard) {
     let mut reg = registry.lock().await;
-    let hv = backend::select();
 
     for inst in reg.list() {
         if inst.status != Status::Running {
             continue;
         }
-        if alive(&*hv, &inst) {
+        if alive(&inst) {
             note_alive(&inst.name);
         } else {
             note_died(&inst.name);
@@ -253,7 +251,7 @@ async fn tick(registry: &Arc<Mutex<Shard>>, guard: &mut SleepGuard) {
 
     let mut changed = false;
     for name in take_due(Instant::now()) {
-        changed |= restart(&mut reg, &name, &*hv);
+        changed |= restart(&mut reg, &name);
     }
     if changed {
         if let Err(e) = reg.save() {
@@ -266,7 +264,7 @@ async fn tick(registry: &Arc<Mutex<Shard>>, guard: &mut SleepGuard) {
     // that it may sleep and then immediately take the assertion again.
     // An instance waiting out its backoff is still meant to be up, so it
     // counts too: nothing sleeps during the gap.
-    match guard.set(live_count(&reg, &*hv) + owed()) {
+    match guard.set(live_count(&reg) + owed()) {
         Change::Held(mechanism) => eprintln!("astd: holding this device awake ({mechanism})"),
         Change::Released => eprintln!("astd: nothing is running — this device may sleep"),
         Change::Unavailable(why) => eprintln!("astd: cannot keep this device awake: {why}"),
@@ -274,23 +272,23 @@ async fn tick(registry: &Arc<Mutex<Shard>>, guard: &mut SleepGuard) {
     }
 }
 
-fn live_count(reg: &Shard, hv: &dyn Hypervisor) -> usize {
+fn live_count(reg: &Shard) -> usize {
     reg.list()
         .iter()
-        .filter(|i| i.status == Status::Running && alive(hv, i))
+        .filter(|i| i.status == Status::Running && alive(i))
         .count()
 }
 
 /// Restart one instance whose guest died. Returns whether the registry
 /// changed and needs saving.
-fn restart(reg: &mut Shard, name: &str, hv: &dyn Hypervisor) -> bool {
+fn restart(reg: &mut Shard, name: &str) -> bool {
     let Ok(inst) = reg.get(name).cloned() else {
         // Removed while it was owed a restart.
         forget(name);
         return false;
     };
     // It may have been started by hand while the backoff was running.
-    if inst.status == Status::Running && alive(hv, &inst) {
+    if inst.status == Status::Running && alive(&inst) {
         return false;
     }
     if inst.policy.restart == Restart::Never {
@@ -381,8 +379,11 @@ fn clear_stale_control(inst: &Instance) {
 }
 
 /// A handle reloaded from the registry is never assumed valid.
-fn alive(hv: &dyn Hypervisor, inst: &Instance) -> bool {
-    inst.handle.as_ref().is_some_and(|h| matches!(hv.state(h), Ok(RunState::Running)))
+fn alive(inst: &Instance) -> bool {
+    inst.handle.as_ref().is_some_and(|handle| {
+        backend::for_handle(&handle.backend)
+            .is_ok_and(|hv| matches!(hv.state(handle), Ok(RunState::Running)))
+    })
 }
 
 #[cfg(test)]
@@ -473,7 +474,8 @@ mod tests {
     fn an_instance_with_no_policy_of_its_own_still_comes_back() {
         let inst: Instance = serde_json::from_str(
             r#"{"id":"i","name":"dev","cpu_device":"laptop","status":"stopped",
-                "created_at":0,"volumes":[]}"#,
+                "created_at":0,"volumes":[],
+                "machine":{"backend":"qemu","machine_type":"virt","cpu":"host","hv_version":"test"}}"#,
         )
         .unwrap();
         assert_eq!(inst.policy.restart, Restart::Always);

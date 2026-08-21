@@ -22,7 +22,10 @@
 $ brew install --HEAD medicalissue/asterism/asterism
 ```
 
-macOS today. Homebrew pulls in QEMU, which does the virtualization.
+macOS today. Asterism probes the host when an instance is created and uses
+Virtualization.framework (VZ) when it can satisfy the request, otherwise QEMU.
+Pass `--backend vz` or `--backend qemu` to force one and get its exact probe or
+capability refusal immediately.
 
 An agent has to stay up, and your laptop sleeps. That is why you rent
 a VPS: two vCPUs, no GPU, a monthly bill. A better machine already sits
@@ -39,8 +42,9 @@ forward a port or install a new OS.
 
 ## What works today
 
-Real virtual machines on macOS (QEMU with Hypervisor.framework
-acceleration) behind a pluggable hypervisor interface: pick an image
+Real virtual machines on macOS (native Virtualization.framework when capable,
+otherwise QEMU with Hypervisor.framework acceleration) behind a pluggable
+hypervisor interface: pick an image
 from the catalog (Ubuntu, Debian, Fedora, Alpine) or point at any
 cloud-image URL or local qcow2. Instances get copy-on-write disks,
 cloud-init provisioning with your SSH keys, host-directory passthrough

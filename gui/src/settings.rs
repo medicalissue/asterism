@@ -150,10 +150,9 @@ impl Settings {
 
 /// Which backend the New Instance window opens on.
 ///
-/// Falls back to [`DEFAULT_BACKEND`] for everything that is not a backend
-/// this device can currently offer: a stale preference for `vz` on a machine
-/// that has since lost the helper must not produce a create that fails when
-/// pressed.
+/// Falls back to [`DEFAULT_BACKEND`] (`Automatic`) for everything this device
+/// can no longer force. A stale preference for `vz` on a machine that lost
+/// the helper must not produce a create that fails when pressed.
 pub fn preferred_backend() -> String {
     let Some(stored) = read_pref() else {
         return DEFAULT_BACKEND.to_owned();

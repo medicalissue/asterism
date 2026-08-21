@@ -100,10 +100,7 @@ pub(crate) fn print_detail(inst: &Instance) {
     }
     // The machine this instance was defined against. Recorded at create
     // time, and what a live migration would have to match on.
-    match &inst.machine {
-        Some(m) => println!("machine: {m}"),
-        None => println!("machine: - (defined before this was recorded)"),
-    }
+    println!("machine: {}", inst.machine);
     if let Some(h) = &inst.handle {
         let pid = h.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
         println!("running: {} pid {pid}, ssh {}", h.backend, h.endpoint);

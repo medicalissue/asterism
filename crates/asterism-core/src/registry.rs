@@ -139,9 +139,8 @@ impl Shard {
     }
 
     /// Define an instance in this shard, sourcing its cpu and ram from
-    /// `cpu_device`. `machine` records what it was defined against — `None`
-    /// where no backend could be probed, which keeps `ast create` working on a
-    /// device that has not installed a hypervisor yet.
+    /// `cpu_device`. `machine` records the runnable backend that was probed
+    /// before this row was created.
     ///
     /// The name must already have been claimed against the whole orbit; all
     /// this can see is one shard, so all it can refuse is a name this shard
@@ -152,7 +151,7 @@ impl Shard {
         cpu_device: &str,
         image: &str,
         shape: Shape,
-        machine: Option<Machine>,
+        machine: Machine,
     ) -> Result<Instance> {
         check_name(name)?;
         if let Some(existing) = self.instances.get(name) {
@@ -484,11 +483,20 @@ mod tests {
             .join("state.json")
     }
 
+    fn machine() -> Machine {
+        Machine {
+            backend: "qemu".into(),
+            machine_type: "virt".into(),
+            cpu: "host".into(),
+            hv_version: "test".into(),
+        }
+    }
+
     #[test]
     fn create_save_load_round_trip() {
         let path = scratch();
         let mut shard = Shard::load(&path).unwrap();
-        shard.create("dev", "laptop", "ubuntu:24.04", Shape::default(), None).unwrap();
+        shard.create("dev", "laptop", "ubuntu:24.04", Shape::default(), machine()).unwrap();
         shard.attach_volume("dev", "/tank/media", "desktop", None).unwrap();
         shard.save().unwrap();
 
@@ -510,7 +518,7 @@ mod tests {
         let home = path.parent().unwrap().to_owned();
         let mut shard = Shard::load(&path).unwrap();
         for name in ["kept-up", "left-down", "corrupt", "silent"] {
-            shard.create(name, "laptop", "ubuntu:24.04", Shape::default(), None).unwrap();
+            shard.create(name, "laptop", "ubuntu:24.04", Shape::default(), machine()).unwrap();
         }
         shard.save().unwrap();
 
@@ -555,7 +563,7 @@ mod tests {
     #[test]
     fn volumes_get_mount_points_and_do_not_collide() {
         let mut shard = Shard::load(&scratch()).unwrap();
-        shard.create("dev", "laptop", "ubuntu:24.04", Shape::default(), None).unwrap();
+        shard.create("dev", "laptop", "ubuntu:24.04", Shape::default(), machine()).unwrap();
 
         let inst = shard.attach_volume("dev", "/tank/media", "desktop", None).unwrap();
         assert_eq!(inst.volumes[0].mount_point.as_deref(), Some("/mnt/ast/media"));
@@ -578,7 +586,7 @@ mod tests {
     #[test]
     fn block_volumes_carry_an_epoch_and_re_attach_in_place() {
         let mut shard = Shard::load(&scratch()).unwrap();
-        shard.create("dev", "laptop", "ubuntu:24.04", Shape::default(), None).unwrap();
+        shard.create("dev", "laptop", "ubuntu:24.04", Shape::default(), machine()).unwrap();
 
         let inst = shard.attach_block("dev", "tank", "desktop", 1, 10 << 30).unwrap();
         assert_eq!(inst.volumes.len(), 1);
@@ -619,7 +627,7 @@ mod tests {
     fn adopting_a_moved_instance_keeps_everything_but_the_cpu_device() {
         let mut source = Shard::load(&scratch()).unwrap();
         let mut inst = source
-            .create("dev", "laptop", "debian:13", Shape::default(), None)
+            .create("dev", "laptop", "debian:13", Shape::default(), machine())
             .unwrap();
 
         // The fence, and the boot it refuses.
@@ -660,15 +668,15 @@ mod tests {
     #[test]
     fn a_name_this_shard_holds_is_refused_in_the_orbits_words() {
         let mut shard = Shard::load(&scratch()).unwrap();
-        shard.create("dev", "laptop", "ubuntu:24.04", Shape::default(), None).unwrap();
+        shard.create("dev", "laptop", "ubuntu:24.04", Shape::default(), machine()).unwrap();
 
         let err = shard
-            .create("dev", "laptop", "ubuntu:24.04", Shape::default(), None)
+            .create("dev", "laptop", "ubuntu:24.04", Shape::default(), machine())
             .unwrap_err()
             .to_string();
         assert_eq!(err, "instance \"dev\" already exists in this orbit (cpu/ram on laptop)");
-        assert!(shard.create("has space", "laptop", "u", Shape::default(), None).is_err());
-        assert!(shard.create("", "laptop", "u", Shape::default(), None).is_err());
+        assert!(shard.create("has space", "laptop", "u", Shape::default(), machine()).is_err());
+        assert!(shard.create("", "laptop", "u", Shape::default(), machine()).is_err());
     }
 
     #[test]
@@ -681,7 +689,7 @@ mod tests {
     #[test]
     fn lifecycle_transitions() {
         let mut shard = Shard::load(&scratch()).unwrap();
-        shard.create("dev", "laptop", "ubuntu:24.04", Shape::default(), None).unwrap();
+        shard.create("dev", "laptop", "ubuntu:24.04", Shape::default(), machine()).unwrap();
         let inst = shard.set_running("dev", handle(4242, 22022)).unwrap();
         assert_eq!(inst.status, Status::Running);
         assert_eq!(inst.endpoint().unwrap().ssh_target(), ("127.0.0.1".to_owned(), 22022));
@@ -700,7 +708,7 @@ mod tests {
     #[test]
     fn renaming_moves_the_row_and_clears_the_conflict() {
         let mut shard = Shard::load(&scratch()).unwrap();
-        shard.create("dev", "laptop", "ubuntu:24.04", Shape::default(), None).unwrap();
+        shard.create("dev", "laptop", "ubuntu:24.04", Shape::default(), machine()).unwrap();
         let marked = shard.mark_conflicted("dev", "desktop").unwrap();
         assert_eq!(marked.conflict.unwrap().other_cpu_device, "desktop");
 
@@ -714,8 +722,8 @@ mod tests {
     #[test]
     fn a_rename_cannot_collide_or_run_over_a_live_guest() {
         let mut shard = Shard::load(&scratch()).unwrap();
-        shard.create("dev", "laptop", "ubuntu:24.04", Shape::default(), None).unwrap();
-        shard.create("other", "laptop", "ubuntu:24.04", Shape::default(), None).unwrap();
+        shard.create("dev", "laptop", "ubuntu:24.04", Shape::default(), machine()).unwrap();
+        shard.create("other", "laptop", "ubuntu:24.04", Shape::default(), machine()).unwrap();
 
         let err = shard.rename("dev", "other").unwrap_err().to_string();
         assert!(err.contains("already exists in this orbit"), "{err}");
@@ -735,7 +743,7 @@ mod tests {
     #[test]
     fn the_conflict_message_says_what_to_do() {
         let mut shard = Shard::load(&scratch()).unwrap();
-        shard.create("dev", "laptop", "ubuntu:24.04", Shape::default(), None).unwrap();
+        shard.create("dev", "laptop", "ubuntu:24.04", Shape::default(), machine()).unwrap();
         let inst = shard.mark_conflicted("dev", "desktop").unwrap();
         let text = conflicted(&inst, inst.conflict.as_ref().unwrap());
         assert!(text.contains("shares its name with another instance in this orbit"), "{text}");
@@ -755,6 +763,7 @@ mod tests {
                 "id":"6f1c","name":"dev","anchor":"laptop","status":"running",
                 "created_at":1700000000,"volumes":[],"image":"debian:13",
                 "shape":{"cpus":2,"mem_mib":2048,"disk_gib":20},
+                "machine":{"backend":"qemu","machine_type":"virt","cpu":"host","hv_version":"9.0.0"},
                 "pid":4242,"ssh_port":22022
             }}"#,
         )
@@ -772,8 +781,7 @@ mod tests {
         assert_eq!(h.endpoint, GuestEndpoint::HostForward { ssh_port: 22022 });
         // The control path is the one the old backend derived from the name.
         assert_eq!(h.ctl, ControlChannel::Qmp { path: crate::paths::qmp_socket_path("dev") });
-        // No machine identity was recorded back then; absence is allowed.
-        assert!(inst.machine.is_none());
+        assert_eq!(inst.machine.backend, "qemu");
 
         // Saving rewrites it in the new shape, and the legacy keys go away.
         // (Checked on the parsed object, because the handle's own endpoint
@@ -802,7 +810,8 @@ mod tests {
         std::fs::write(
             &path,
             r#"{"dev":{"id":"6f1c","name":"dev","anchor":"laptop","status":"stopped",
-                "created_at":1700000000,"volumes":[],"image":"debian:13"}}"#,
+                "created_at":1700000000,"volumes":[],"image":"debian:13",
+                "machine":{"backend":"qemu","machine_type":"virt","cpu":"host","hv_version":"9.0.0"}}}"#,
         )
         .unwrap();
         let shard = Shard::load(&path).unwrap();
@@ -812,5 +821,23 @@ mod tests {
         assert_eq!(inst.status, Status::Stopped);
         // Shape falls back to the default, as it did before.
         assert_eq!(inst.shape.cpus, Shape::default().cpus);
+    }
+
+    #[test]
+    fn a_registry_row_without_a_machine_is_rejected() {
+        let path = scratch();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"dev":{
+                "id":"6f1c","name":"dev","cpu_device":"laptop","status":"defined",
+                "created_at":1700000000,"volumes":[],"image":"debian:13"
+            }}"#,
+        )
+        .unwrap();
+
+        let error = Shard::load(&path).err().expect("missing machine must fail");
+        let error = format!("{error:#}");
+        assert!(error.contains("machine"), "{error}");
     }
 }

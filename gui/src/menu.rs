@@ -328,8 +328,18 @@ fn ellipsize(s: &str, width: usize) -> String {
 mod tests {
     use super::*;
 
+    fn machine() -> asterism_core::hv::Machine {
+        asterism_core::hv::Machine {
+            backend: "qemu".into(),
+            machine_type: "virt".into(),
+            cpu: "host".into(),
+            hv_version: "test".into(),
+        }
+    }
+
     fn instance(name: &str, status: Status) -> Instance {
-        let mut instance = Instance::new(name, "test", "debian:13", Default::default(), None);
+        let mut instance =
+            Instance::new(name, "test", "debian:13", Default::default(), machine());
         instance.status = status;
         instance
     }

@@ -66,8 +66,8 @@ pub struct Row {
     pub live: bool,
     /// The device supplying its cpu and ram.
     pub cpu_device: String,
-    /// The backend it was defined against, or empty where the registry
-    /// predates the field or no backend could be probed at create.
+    /// The backend it was defined against. Creation records this before the
+    /// instance enters the registry.
     pub backend: String,
     /// `2 CPU · 2 GB · 20 GB`, formatted once so the dump and the table
     /// cannot disagree.
@@ -103,7 +103,7 @@ impl Row {
             status,
             live,
             cpu_device: instance.cpu_device.clone(),
-            backend: instance.machine.as_ref().map(|m| m.backend.clone()).unwrap_or_default(),
+            backend: instance.machine.backend.clone(),
             shape: shape(&instance.shape),
             image: instance.image.clone().unwrap_or_else(|| "unknown".to_owned()),
             volumes: instance
@@ -236,8 +236,18 @@ mod tests {
 
     use asterism_core::hv::Machine;
 
+    fn machine(backend: &str) -> Machine {
+        Machine {
+            backend: backend.into(),
+            machine_type: "virt".into(),
+            cpu: "host".into(),
+            hv_version: "test".into(),
+        }
+    }
+
     fn instance(name: &str, status: Status) -> Instance {
-        let mut instance = Instance::new(name, "laptop", "debian:13", Shape::default(), None);
+        let mut instance =
+            Instance::new(name, "laptop", "debian:13", Shape::default(), machine("qemu"));
         instance.status = status;
         instance
     }
@@ -288,19 +298,12 @@ mod tests {
     #[test]
     fn a_row_names_the_device_supplying_its_cpu_and_the_backend_it_was_cut_against() {
         let mut inst = instance("dev", Status::Stopped);
-        inst.machine = Some(Machine {
-            backend: "vz".into(),
-            machine_type: "virt".into(),
-            cpu: "host".into(),
-            hv_version: "15.0".into(),
-        });
+        inst.machine = machine("vz");
         let row = Row::of(&inst, true);
         assert_eq!(row.cpu_device, "laptop");
         assert_eq!(row.backend, "vz");
 
-        // A registry written before backends were recorded says nothing
-        // rather than guessing qemu.
-        assert_eq!(Row::of(&instance("dev", Status::Stopped), true).backend, "");
+        assert_eq!(Row::of(&instance("dev", Status::Stopped), true).backend, "qemu");
     }
 
     #[test]

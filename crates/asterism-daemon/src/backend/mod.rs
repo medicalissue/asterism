@@ -54,35 +54,94 @@ pub fn by_id(id: &str) -> Result<Arc<dyn Hypervisor>> {
     }
 }
 
-/// The backend a new instance gets when nobody asks for one.
+/// The capabilities a backend must have for one create request.
 ///
-/// QEMU everywhere, deliberately: BACKENDS.md §7 ships vz opt-in
-/// (`ast create --backend vz`) and promotes it to the macOS default only
-/// after it has survived a release. `$ASTERISM_BACKEND` moves the default
-/// for a whole daemon, which is what the vz end-to-end test uses and what
-/// anyone trying vz on everything wants.
-pub fn select() -> Arc<dyn Hypervisor> {
-    match std::env::var("ASTERISM_BACKEND").ok().and_then(|id| by_id(&id).ok()) {
-        Some(hv) => hv,
-        None => backends().qemu.clone(),
+/// This is intentionally backend-neutral. Image resolution and CLI parsing
+/// turn image kind and published ports into facts here; selection only
+/// compares those facts to [`Hypervisor::caps`]. Directory shares are added
+/// later and are checked at attach time by [`check_can_share`]. Adding another
+/// host OS therefore does not add OS conditionals to creation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateRequirements {
+    image_kind: ImageKind,
+    port_forward: bool,
+}
+
+impl CreateRequirements {
+    pub fn new(image: &ImageRef, publish: &[PortForward]) -> Self {
+        Self {
+            image_kind: image.kind,
+            port_forward: !publish.is_empty(),
+        }
+    }
+
+    fn check(self, hv: &dyn Hypervisor) -> Result<()> {
+        let caps = hv.caps();
+        if self.image_kind == ImageKind::OciRootfs && !caps.direct_kernel {
+            bail!(
+                "the {} backend cannot boot an OCI image: it is a root filesystem with \
+                 no bootloader, so it needs direct kernel boot, which this backend \
+                 does not provide",
+                hv.id()
+            );
+        }
+        if self.port_forward && !caps.port_forward {
+            bail!(
+                "the {} backend gives each guest an address of its own, so there is \
+                 nothing for -p to forward from this device's loopback",
+                hv.id()
+            );
+        }
+        Ok(())
     }
 }
 
-/// The backend to create an instance against.
+fn runnable(hv: Arc<dyn Hypervisor>, requirements: CreateRequirements) -> Result<Machine> {
+    let ready = hv
+        .probe()
+        .with_context(|| format!("the {} backend is not runnable on this device", hv.id()))?;
+    requirements.check(&*hv)?;
+    Ok(Machine::new(hv.id(), &ready))
+}
+
+fn select_with(
+    requested: Option<&str>,
+    requirements: CreateRequirements,
+    mut resolve: impl FnMut(&str) -> Result<Arc<dyn Hypervisor>>,
+) -> Result<Machine> {
+    if let Some(id) = requested {
+        let hv = resolve(id)?;
+        return runnable(hv, requirements).with_context(|| {
+            format!("the explicitly requested {id} backend cannot create this instance")
+        });
+    }
+
+    // VZ is the lightest path on a capable host. Capability mismatches are
+    // ordinary reasons to try QEMU: OCI direct boot and loopback publishing
+    // need facilities VZ does not currently expose.
+    let mut refusals = Vec::new();
+    for id in [vz::ID, qemu::ID] {
+        match resolve(id).and_then(|hv| runnable(hv, requirements)) {
+            Ok(selection) => return Ok(selection),
+            Err(error) => refusals.push(format!("{id}: {error:#}")),
+        }
+    }
+    bail!(
+        "no runnable backend can create this instance ({})",
+        refusals.join("; ")
+    )
+}
+
+/// Select and probe the backend for a create request.
 ///
-/// An explicit `--backend` is probed here, at create, so that asking for a
-/// backend this device cannot run says why immediately — the unsigned
-/// helper, the too-old macOS — rather than at the first `ast up`. The
-/// default path deliberately does not probe: defining instances on a device
-/// with no hypervisor installed yet has always worked, and should.
-pub fn select_for(requested: Option<&str>) -> Result<Arc<dyn Hypervisor>> {
-    let Some(id) = requested else {
-        return Ok(select());
-    };
-    let hv = by_id(id)?;
-    hv.probe()
-        .with_context(|| format!("this device cannot run the {id} backend"))?;
-    Ok(hv)
+/// An explicit `--backend` is forced: its own probe or capability refusal is
+/// returned. The default tries the fastest/lightest capable backend now — VZ
+/// first, then QEMU — and returns both reasons if neither can run the request.
+pub fn select_for(
+    requested: Option<&str>,
+    requirements: CreateRequirements,
+) -> Result<Machine> {
+    select_with(requested, requirements, by_id)
 }
 
 /// The backend that should run `inst`: the one it was created against.
@@ -92,12 +151,12 @@ pub fn select_for(requested: Option<&str>) -> Result<Arc<dyn Hypervisor>> {
 /// of is an error rather than a silent fallback: its disks are in whatever
 /// format that backend chose.
 pub fn for_instance(inst: &Instance) -> Result<Arc<dyn Hypervisor>> {
-    match &inst.machine {
-        Some(machine) => by_id(&machine.backend).with_context(|| {
-            format!("instance {:?} was created for the {} backend", inst.name, machine.backend)
-        }),
-        None => Ok(select()),
-    }
+    by_id(&inst.machine.backend).with_context(|| {
+        format!(
+            "instance {:?} was created for the {} backend",
+            inst.name, inst.machine.backend
+        )
+    })
 }
 
 /// The backend that booted a running guest, named on its handle.
@@ -107,15 +166,6 @@ pub fn for_instance(inst: &Instance) -> Result<Arc<dyn Hypervisor>> {
 /// booted by one backend must never be asked about by another.
 pub fn for_handle(backend: &str) -> Result<Arc<dyn Hypervisor>> {
     by_id(backend)
-}
-
-/// The machine identity to record on a new instance.
-///
-/// Best effort: a host with no hypervisor installed can still define
-/// instances, and finds out at `ast up`. That keeps `ast create` working
-/// exactly as it did before this was recorded at all.
-pub fn machine_identity(hv: &dyn Hypervisor) -> Option<Machine> {
-    hv.probe().ok().map(|ready| Machine::new(hv.id(), &ready))
 }
 
 /// Refuse a volume that the instance's backend could never show the guest.
@@ -161,32 +211,15 @@ pub fn check_can_share(inst: &Instance) -> Result<()> {
 /// refused at attach — an instance that looks defined and cannot boot is
 /// worse than a command that says no.
 pub fn check_can_boot(hv: &dyn Hypervisor, image: &ImageRef, publish: &[PortForward]) -> Result<()> {
-    let caps = hv.caps();
-    if image.kind == ImageKind::OciRootfs && !caps.direct_kernel {
-        bail!(
-            "the {} backend cannot boot {} — an OCI image is a root filesystem with \
-             no bootloader, so it needs a kernel booted directly, which this backend \
-             does not do yet: create it with --backend qemu",
-            hv.id(),
-            image.name
-        );
-    }
-    if !publish.is_empty() && !caps.port_forward {
-        bail!(
-            "the {} backend gives each guest an address of its own, so there is \
-             nothing for -p to forward from this device's loopback",
-            hv.id()
-        );
-    }
-    Ok(())
+    CreateRequirements::new(image, publish).check(hv)
 }
 
 /// Resolve an image reference into the backend-neutral [`ImageRef`].
 /// Image resolution is deliberately outside the backend: what a reference
 /// means is a property of the catalog, not of the hypervisor.
 ///
-/// Pure — it reports what the store holds and changes nothing, so
-/// `ast create` still works on a device with no hypervisor installed.
+/// Pure — it reports what the store holds and changes nothing. Backend
+/// probing happens immediately afterwards, before the registry is changed.
 pub fn image_ref(reference: &str) -> Result<ImageRef> {
     let resolved = image::resolve(reference)?;
     Ok(ImageRef {
@@ -336,6 +369,85 @@ pub(crate) fn wait_gone(pid: u32, budget: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asterism_core::hv::{Caps, Handle, Prepared, Ready, RunState};
+
+    struct Fake {
+        id: &'static str,
+        probe_error: Option<&'static str>,
+        direct_kernel: bool,
+        port_forward: bool,
+    }
+
+    impl Hypervisor for Fake {
+        fn id(&self) -> &'static str {
+            self.id
+        }
+
+        fn probe(&self) -> Result<Ready> {
+            if let Some(error) = self.probe_error {
+                bail!(error);
+            }
+            Ok(Ready {
+                version: "test".into(),
+                accel: "test".into(),
+                machine_type: format!("{}-machine", self.id),
+                cpu: "host".into(),
+            })
+        }
+
+        fn caps(&self) -> Caps {
+            Caps {
+                live_snapshot: false,
+                disk_snapshot: false,
+                live_migration: false,
+                disk_hotplug: false,
+                shared_dir: None,
+                nbd_disks: false,
+                foreign_arch: false,
+                direct_kernel: self.direct_kernel,
+                port_forward: self.port_forward,
+                disk_formats: &[],
+            }
+        }
+
+        fn prepare(&self, _req: &BootReq) -> Result<Prepared> {
+            bail!("unused fake")
+        }
+
+        fn boot(&self, _req: &BootReq, _prep: &Prepared) -> Result<Handle> {
+            bail!("unused fake")
+        }
+
+        fn stop(&self, _handle: &Handle, _deadline: Duration) -> Result<()> {
+            bail!("unused fake")
+        }
+
+        fn kill(&self, _handle: &Handle) -> Result<()> {
+            bail!("unused fake")
+        }
+
+        fn state(&self, _handle: &Handle) -> Result<RunState> {
+            bail!("unused fake")
+        }
+    }
+
+    fn fake(
+        id: &'static str,
+        probe_error: Option<&'static str>,
+        direct_kernel: bool,
+        port_forward: bool,
+    ) -> Arc<dyn Hypervisor> {
+        Arc::new(Fake { id, probe_error, direct_kernel, port_forward })
+    }
+
+    fn image(kind: ImageKind) -> ImageRef {
+        ImageRef {
+            name: "test-image".into(),
+            path: "/images/test.raw".into(),
+            format: asterism_core::hv::DiskFormat::Raw,
+            kind,
+        }
+    }
 
     /// An image that will not fit the shape says so, rather than handing a
     /// hypervisor a disk that has silently lost its tail.
@@ -384,20 +496,95 @@ mod tests {
         assert!(!vz.caps().direct_kernel, "vz wires up EFI only");
         let err = check_can_boot(&*vz, &oci, &[]).unwrap_err().to_string();
         assert!(err.contains("vz"), "{err}");
-        assert!(err.contains("--backend qemu"), "the way out is in the message: {err}");
+        assert!(err.contains("direct kernel"), "the missing capability is named: {err}");
         // ...and a cloud image on vz is exactly as fine as it ever was.
         check_can_boot(&*vz, &disk, &[]).unwrap();
         // Publishing to loopback needs a guest that is reached that way.
         assert!(check_can_boot(&*vz, &disk, &port).is_err());
     }
 
-    /// The default has to stay qemu until vz has survived a release
-    /// (BACKENDS.md §7), whatever host this is built on.
     #[test]
-    fn the_default_backend_is_qemu() {
-        assert_eq!(select().id(), "qemu");
-        assert_eq!(select_for(None).unwrap().id(), "qemu");
-        assert!(select_for(Some("nothing-like-this")).is_err());
+    fn the_default_prefers_runnable_capable_vz_then_falls_back_to_qemu() {
+        let vz = fake("vz", None, false, false);
+        let qemu = fake("qemu", None, true, true);
+        let resolve = |id: &str| match id {
+            "vz" => Ok(vz.clone()),
+            "qemu" => Ok(qemu.clone()),
+            _ => bail!("unknown backend"),
+        };
+
+        let disk = image(ImageKind::Disk);
+        let selected = select_with(None, CreateRequirements::new(&disk, &[]), resolve).unwrap();
+        assert_eq!(selected.backend, "vz", "the lighter capable backend wins");
+
+        let vz = fake("vz", None, false, false);
+        let qemu = fake("qemu", None, true, true);
+        let oci = image(ImageKind::OciRootfs);
+        let selected = select_with(None, CreateRequirements::new(&oci, &[]), |id| match id {
+            "vz" => Ok(vz.clone()),
+            "qemu" => Ok(qemu.clone()),
+            _ => bail!("unknown backend"),
+        })
+        .unwrap();
+        assert_eq!(selected.backend, "qemu", "capability refusal falls through");
+
+        let vz = fake("vz", None, false, false);
+        let qemu = fake("qemu", None, true, true);
+        let port = [PortForward { host: 8080, guest: 80 }];
+        let selected = select_with(None, CreateRequirements::new(&disk, &port), |id| match id {
+            "vz" => Ok(vz.clone()),
+            "qemu" => Ok(qemu.clone()),
+            _ => bail!("unknown backend"),
+        })
+        .unwrap();
+        assert_eq!(selected.backend, "qemu", "port forwarding is a create requirement");
+
+        let vz = fake("vz", Some("helper is unsigned"), false, false);
+        let qemu = fake("qemu", None, true, true);
+        let selected = select_with(None, CreateRequirements::new(&disk, &[]), |id| match id {
+            "vz" => Ok(vz.clone()),
+            "qemu" => Ok(qemu.clone()),
+            _ => bail!("unknown backend"),
+        })
+        .unwrap();
+        assert_eq!(selected.backend, "qemu", "probe refusal falls through");
+
+        let vz = fake("vz", Some("unsigned helper"), false, false);
+        let qemu = fake("qemu", Some("qemu missing"), true, true);
+        let error = select_with(None, CreateRequirements::new(&disk, &[]), |id| match id {
+            "vz" => Ok(vz.clone()),
+            "qemu" => Ok(qemu.clone()),
+            _ => bail!("unknown backend"),
+        })
+        .expect_err("neither backend is runnable");
+        let error = format!("{error:#}");
+        assert!(error.contains("vz") && error.contains("unsigned helper"), "{error}");
+        assert!(error.contains("qemu") && error.contains("qemu missing"), "{error}");
+    }
+
+    #[test]
+    fn an_explicit_backend_is_forced_and_explains_probe_or_capability_failure() {
+        let disk = image(ImageKind::Disk);
+        let broken = fake("vz", Some("helper is unsigned"), false, false);
+        let error = select_with(Some("vz"), CreateRequirements::new(&disk, &[]), |_| {
+            Ok(broken.clone())
+        })
+        .expect_err("the forced broken backend must fail");
+        let error = format!("{error:#}");
+        assert!(error.contains("explicitly requested vz"), "{error}");
+        assert!(error.contains("helper is unsigned"), "{error}");
+
+        let oci = image(ImageKind::OciRootfs);
+        let vz = fake("vz", None, false, false);
+        let error = select_with(Some("vz"), CreateRequirements::new(&oci, &[]), |_| {
+            Ok(vz.clone())
+        })
+        .expect_err("the forced incapable backend must fail");
+        let error = format!("{error:#}");
+        assert!(error.contains("explicitly requested vz"), "{error}");
+        assert!(error.contains("direct kernel"), "{error}");
+
+        assert!(select_for(Some("nothing-like-this"), CreateRequirements::new(&disk, &[])).is_err());
     }
 
     /// An instance carries its backend, and that is what runs it — not the
@@ -413,20 +600,23 @@ mod tests {
             &asterism_core::instance::local_host(),
             "debian:13",
             Default::default(),
-            None,
+            Machine {
+                backend: "qemu".into(),
+                machine_type: "virt".into(),
+                cpu: "host".into(),
+                hv_version: "11.0.0".into(),
+            },
         )
         .unwrap();
 
-        // Nothing recorded: an instance from before this existed falls back
-        // to the device default rather than refusing to boot.
-        assert_eq!(for_instance(&inst).unwrap().id(), select().id());
+        assert_eq!(for_instance(&inst).unwrap().id(), "qemu");
 
-        inst.machine = Some(Machine {
+        inst.machine = Machine {
             backend: "vz".into(),
             machine_type: "generic".into(),
             cpu: "host".into(),
             hv_version: "15.6.1".into(),
-        });
+        };
         assert_eq!(for_instance(&inst).unwrap().id(), "vz");
         assert_eq!(for_handle("vz").unwrap().id(), "vz");
 
@@ -445,12 +635,16 @@ mod tests {
             assert!(check_can_share(&inst).is_ok(), "a backend we cannot ask cannot refuse");
         }
 
-        inst.machine = Some(Machine {
+        inst.machine = Machine {
             backend: "qemu".into(),
             machine_type: "virt".into(),
             cpu: "host".into(),
             hv_version: "11.0.0".into(),
-        });
+        };
         assert_eq!(for_instance(&inst).unwrap().id(), "qemu");
+
+        inst.machine.backend = "xen".into();
+        let error = for_instance(&inst).err().expect("xen is not available").to_string();
+        assert!(error.contains("created for the xen backend"), "{error}");
     }
 }

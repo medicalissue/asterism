@@ -3,20 +3,26 @@
 <plist version="1.0">
 <dict>
 	<!--
-	  The only entitlement Virtualization.framework requires to create a
-	  VZVirtualMachine. Boolean, and NOT restricted: an ad-hoc signature
+	  The virtualization entitlement is what Virtualization.framework needs
+	  to create a VZVirtualMachine. Boolean, and NOT restricted: an ad-hoc signature
 	  carrying it is enough for a local build — no Apple approval, no
 	  provisioning profile. A signed *release* build needs a Developer ID
 	  and notarization on top (BACKENDS.md §4).
 
+	  The ordinary App Sandbox network-client entitlement is also required
+	  by VZNetworkBlockDeviceStorageDeviceAttachment, including for a local
+	  nbd+unix socket. It is likewise unrestricted.
+
 	  Deliberately absent: com.apple.vm.networking. That one gates
 	  VZBridgedNetworkDeviceAttachment and IS restricted — it needs a
 	  managed entitlement request approved by Apple. The helper uses
-	  VZNATNetworkDeviceAttachment precisely so this file stays a
-	  one-liner, which is also why `ast ssh` has to find the guest through
+	  VZNATNetworkDeviceAttachment precisely so this file needs no restricted
+	  entitlement, which is also why `ast ssh` has to find the guest through
 	  the DHCP lease file.
 	-->
 	<key>com.apple.security.virtualization</key>
+	<true/>
+	<key>com.apple.security.network.client</key>
 	<true/>
 </dict>
 </plist>

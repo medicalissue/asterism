@@ -564,43 +564,36 @@ fn probe_refusal(
     // The backend an instance was created against is the one that keeps
     // booting it, so the target has to have that one working — not merely a
     // hypervisor.
-    if let Some(machine) = &inst.machine {
-        let hv = match backend::by_id(&machine.backend) {
-            Ok(hv) => hv,
-            Err(e) => return Some(format!("device {device} has no {} backend: {e:#}", machine.backend)),
-        };
-        match hv.probe() {
-            Ok(ready) => {
-                if ready.version != machine.hv_version {
-                    notes.push(format!(
-                        "{device} runs {} {} and {:?} was defined against {} — an \
-                         offline move rewrites nothing, and the guest reboots rather \
-                         than resumes",
-                        machine.backend, ready.version, inst.name, machine.hv_version
-                    ));
-                }
-                if ready.machine_type != machine.machine_type {
-                    notes.push(format!(
-                        "{device}'s {} machine type is {} and this instance records \
-                         {} — the virtual hardware differs and the guest will see it",
-                        machine.backend, ready.machine_type, machine.machine_type
-                    ));
-                }
+    let machine = &inst.machine;
+    let hv = match backend::by_id(&machine.backend) {
+        Ok(hv) => hv,
+        Err(e) => return Some(format!("device {device} has no {} backend: {e:#}", machine.backend)),
+    };
+    match hv.probe() {
+        Ok(ready) => {
+            if ready.version != machine.hv_version {
+                notes.push(format!(
+                    "{device} runs {} {} and {:?} was defined against {} — an \
+                     offline move rewrites nothing, and the guest reboots rather \
+                     than resumes",
+                    machine.backend, ready.version, inst.name, machine.hv_version
+                ));
             }
-            Err(e) => {
-                return Some(format!(
-                    "device {device} cannot run the {} backend that {:?} was created \
-                     against: {e:#}",
-                    machine.backend, inst.name
-                ))
+            if ready.machine_type != machine.machine_type {
+                notes.push(format!(
+                    "{device}'s {} machine type is {} and this instance records \
+                     {} — the virtual hardware differs and the guest will see it",
+                    machine.backend, ready.machine_type, machine.machine_type
+                ));
             }
         }
-    } else {
-        notes.push(format!(
-            "{:?} records no machine identity, so nothing about {device}'s hypervisor \
-             could be checked against it",
-            inst.name
-        ));
+        Err(e) => {
+            return Some(format!(
+                "device {device} cannot run the {} backend that {:?} was created \
+                 against: {e:#}",
+                machine.backend, inst.name
+            ))
+        }
     }
 
     // The image reference has to mean something here, or the first `ast up`
@@ -1088,6 +1081,15 @@ fn error(e: anyhow::Error) -> Response {
 mod tests {
     use super::*;
 
+    fn test_machine() -> asterism_core::hv::Machine {
+        asterism_core::hv::Machine {
+            backend: "qemu".into(),
+            machine_type: "virt".into(),
+            cpu: "host".into(),
+            hv_version: "test".into(),
+        }
+    }
+
     #[test]
     fn a_staging_directory_can_never_be_an_instance() {
         // Instance names are ascii letters, digits and '-'; the staging
@@ -1139,7 +1141,13 @@ mod tests {
 
     fn manifest_of(files: Vec<MoveFile>) -> MoveManifest {
         MoveManifest {
-            instance: Instance::new("dev", "laptop", "debian:13", Default::default(), None),
+            instance: Instance::new(
+                "dev",
+                "laptop",
+                "debian:13",
+                Default::default(),
+                test_machine(),
+            ),
             arch: std::env::consts::ARCH.to_owned(),
             base: BaseImage::absent("debian:13".to_owned()),
             files,

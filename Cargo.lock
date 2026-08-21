@@ -164,6 +164,7 @@ dependencies = [
  "asterism-mesh",
  "asterism-vz",
  "blake3",
+ "security-framework",
  "serde",
  "serde_json",
  "tempfile",

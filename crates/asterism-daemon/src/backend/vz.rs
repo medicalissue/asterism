@@ -51,7 +51,7 @@ use asterism_core::hv::{
 use asterism_core::instance::now_unix;
 use asterism_core::snapshot::{self, Snapshot};
 use asterism_core::{cow, paths, tools};
-use asterism_vz::{Command as VzCommand, Config, Reply, StopReason};
+use asterism_vz::{Command as VzCommand, Config, Disk as VzDisk, Reply, StopReason};
 
 use super::{alive, grow, signal, wait_gone};
 
@@ -159,7 +159,11 @@ impl Vz {
     fn create_root(&self, req: &BootReq, raw: &Path) -> Result<DiskSpec> {
         let base = &req.base;
         if !base.path.exists() {
-            bail!("image {} is not pulled yet — run: ast pull {}", base.name, base.name);
+            bail!(
+                "image {} is not pulled yet — run: ast pull {}",
+                base.name,
+                base.name
+            );
         }
         if base.format != DiskFormat::Raw {
             bail!(
@@ -181,7 +185,11 @@ impl Vz {
             let _ = std::fs::remove_file(raw);
             return Err(e);
         }
-        Ok(DiskSpec::File { path: raw.to_owned(), format: DiskFormat::Raw, readonly: false })
+        Ok(DiskSpec::File {
+            path: raw.to_owned(),
+            format: DiskFormat::Raw,
+            readonly: false,
+        })
     }
 
     /// Ask the running helper for its view of the guest.
@@ -209,11 +217,12 @@ impl Probe {
         // what to run.
         if !is_entitled(&helper) {
             bail!(
-                "{} is not code-signed with {} — VZ refuses to create a virtual \
-                 machine without it, and cargo emits unsigned binaries. Run: \
-                 scripts/sign-vz.sh",
+                "{} is not code-signed with the required {} and {} entitlements — \
+                 VZ refuses to create the machine or its NBD client without them, \
+                 and cargo emits unsigned binaries. Run: scripts/sign-vz.sh",
                 helper.display(),
-                asterism_vz::ENTITLEMENT
+                asterism_vz::ENTITLEMENT,
+                asterism_vz::NETWORK_CLIENT_ENTITLEMENT,
             );
         }
         Ok(Probe { helper, os_version })
@@ -261,10 +270,11 @@ impl Hypervisor for Vz {
             // into a refusal that names the instance and its volumes rather
             // than a guest that silently has no /mnt/ast.
             shared_dir: None,
-            // `VZNetworkBlockDeviceStorageDeviceAttachment` exists and is
-            // the single most valuable VZ feature for the mesh — and it is
-            // not wired up here yet.
-            nbd_disks: false,
+            // Both DiskSpec NBD transports are translated to
+            // VZNetworkBlockDeviceStorageDeviceAttachment: TCP URLs pass
+            // through, while local volume bridges use standard nbd+unix
+            // URIs assembled and validated by the signed helper.
+            nbd_disks: true,
             // Rosetta translates x86-64 *user binaries* inside an arm64
             // guest; it is not a foreign-arch machine.
             foreign_arch: false,
@@ -299,11 +309,19 @@ impl Hypervisor for Vz {
 
         let raw = req.dir.join("disk.raw");
         let root = if raw.exists() {
-            DiskSpec::File { path: raw, format: DiskFormat::Raw, readonly: false }
+            DiskSpec::File {
+                path: raw,
+                format: DiskFormat::Raw,
+                readonly: false,
+            }
         } else {
             self.create_root(req, &raw)?
         };
-        Ok(Prepared { root, firmware: None, kernel: None })
+        Ok(Prepared {
+            root,
+            firmware: None,
+            kernel: None,
+        })
     }
 
     /// Start the helper, then wait until the guest is *found*.
@@ -409,7 +427,9 @@ impl Hypervisor for Vz {
         let graceful = deadline.mul_f32(0.75);
         let asked = asterism_vz::call(
             h.ctl.path(),
-            &VzCommand::Stop { timeout_secs: Some(graceful.as_secs()) },
+            &VzCommand::Stop {
+                timeout_secs: Some(graceful.as_secs()),
+            },
             // The helper takes `graceful` to give up on the guest, then up
             // to ten seconds to force it; outliving that is what the
             // signals below are for.
@@ -421,7 +441,9 @@ impl Hypervisor for Vz {
             // had not written down.
             Ok(Reply::Stopped { reason, seconds }) => {
                 if !matches!(reason, StopReason::GuestStopped) {
-                    eprintln!("astd: the vz guest did not stop cleanly after {seconds:.1}s — {reason}");
+                    eprintln!(
+                        "astd: the vz guest did not stop cleanly after {seconds:.1}s — {reason}"
+                    );
                 }
                 if wait_gone(pid, deadline - graceful) {
                     return Ok(());
@@ -564,7 +586,10 @@ fn wait_for_guest(ctl: &Path, pid: u32, log: &Path) -> Result<IpAddr> {
                     );
                 }
             }
-            Err(e) => bail!("the vz helper stopped answering on {}: {e:#}", ctl.display()),
+            Err(e) => bail!(
+                "the vz helper stopped answering on {}: {e:#}",
+                ctl.display()
+            ),
         }
         if Instant::now() >= deadline {
             bail!(
@@ -595,29 +620,34 @@ fn reap_in_background(mut child: std::process::Child) {
 /// One extra volume, as the helper wants it. Everything VZ cannot attach as
 /// a plain raw file is refused here by name rather than left to fail inside
 /// the framework.
-fn extra_disk(disk: &DiskSpec) -> Result<asterism_vz::Disk> {
+fn extra_disk(disk: &DiskSpec) -> Result<VzDisk> {
     match disk {
-        DiskSpec::File { path, format: DiskFormat::Raw, readonly }
-        | DiskSpec::Block { path, readonly } => {
-            Ok(asterism_vz::Disk { path: path.clone(), readonly: *readonly })
+        DiskSpec::File {
+            path,
+            format: DiskFormat::Raw,
+            readonly,
         }
+        | DiskSpec::Block { path, readonly } => Ok(VzDisk::File {
+            path: path.clone(),
+            readonly: *readonly,
+        }),
         DiskSpec::File { path, format, .. } => bail!(
             "{} is a {format} image, and the {ID} backend attaches raw disks only",
             path.display()
         ),
-        DiskSpec::Nbd { url, .. } => bail!(
-            "the {ID} backend cannot attach {url} yet — VZ has \
-             VZNetworkBlockDeviceStorageDeviceAttachment and this backend does not \
-             drive it (Caps::nbd_disks is false)"
-        ),
-        // A block volume, which should have been refused at attach time by
-        // `volume::check_backend`. Reaching here means an instance was
-        // recorded against a backend that later stopped being able to serve
-        // it, so it refuses in the same words rather than in different ones.
-        DiskSpec::NbdUnix { export, .. } => bail!(
-            "the {ID} backend cannot attach the block volume behind export \
-             {export} — remote volumes ride the qemu backend today"
-        ),
+        DiskSpec::Nbd { url, readonly } => Ok(VzDisk::Nbd {
+            url: url.clone(),
+            readonly: *readonly,
+        }),
+        DiskSpec::NbdUnix {
+            socket,
+            export,
+            readonly,
+        } => Ok(VzDisk::NbdUnix {
+            socket: socket.clone(),
+            export: export.clone(),
+            readonly: *readonly,
+        }),
     }
 }
 
@@ -647,7 +677,10 @@ fn helper_path() -> Result<PathBuf> {
         if path.is_file() {
             return Ok(path);
         }
-        bail!("$ASTERISM_VZ_HELPER points at {}, which is not a file", path.display());
+        bail!(
+            "$ASTERISM_VZ_HELPER points at {}, which is not a file",
+            path.display()
+        );
     }
     if let Ok(me) = std::env::current_exe() {
         let sibling = me.with_file_name(asterism_vz::HELPER_BIN);
@@ -663,7 +696,7 @@ fn helper_path() -> Result<PathBuf> {
     })
 }
 
-/// Does this binary carry the virtualization entitlement?
+/// Does this binary carry both entitlements required by the helper?
 ///
 /// `codesign -d --entitlements -` prints the entitlement plist; an unsigned
 /// binary, or one cargo has rewritten since it was signed, prints an error
@@ -680,6 +713,7 @@ fn is_entitled(bin: &Path) -> bool {
     let printed =
         String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
     printed.contains(asterism_vz::ENTITLEMENT)
+        && printed.contains(asterism_vz::NETWORK_CLIENT_ENTITLEMENT)
 }
 
 /// `sw_vers -productVersion`, e.g. `15.6.1`.
@@ -721,8 +755,17 @@ mod tests {
             "vzdisky",
             &local_host(),
             "debian:13",
-            Shape { cpus: 1, mem_mib: 512, disk_gib },
-            None,
+            Shape {
+                cpus: 1,
+                mem_mib: 512,
+                disk_gib,
+            },
+            asterism_core::hv::Machine {
+                backend: ID.into(),
+                machine_type: "generic".into(),
+                cpu: "host".into(),
+                hv_version: "test".into(),
+            },
         )
         .unwrap()
     }
@@ -761,15 +804,29 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let root = Vz::new()
-            .create_root(&req(&inst, &dir, raw_base(home.path())), &dir.join("disk.raw"))
+            .create_root(
+                &req(&inst, &dir, raw_base(home.path())),
+                &dir.join("disk.raw"),
+            )
             .unwrap();
         let DiskSpec::File { path, format, .. } = &root else {
             panic!("the root disk is a file: {root:?}");
         };
         assert_eq!(*format, DiskFormat::Raw);
-        assert_eq!(std::fs::metadata(path).unwrap().len(), 2 << 30, "2 GiB as asked");
-        assert!(cow::usage(path).unwrap() < 8 << 20, "a clone of a 64 KiB base costs nothing");
-        assert_eq!(std::fs::read(path).unwrap()[..4], [0xab; 4], "and it is the base");
+        assert_eq!(
+            std::fs::metadata(path).unwrap().len(),
+            2 << 30,
+            "2 GiB as asked"
+        );
+        assert!(
+            cow::usage(path).unwrap() < 8 << 20,
+            "a clone of a 64 KiB base costs nothing"
+        );
+        assert_eq!(
+            std::fs::read(path).unwrap()[..4],
+            [0xab; 4],
+            "and it is the base"
+        );
     }
 
     /// A qcow2 base is not something to fail on deep inside the framework:
@@ -806,7 +863,11 @@ mod tests {
         let disk = dir.path().join("disk.raw");
         std::fs::write(&disk, b"pristine").unwrap();
         let prep = Prepared {
-            root: DiskSpec::File { path: disk.clone(), format: DiskFormat::Raw, readonly: false },
+            root: DiskSpec::File {
+                path: disk.clone(),
+                format: DiskFormat::Raw,
+                readonly: false,
+            },
             firmware: None,
             kernel: None,
         };
@@ -820,7 +881,9 @@ mod tests {
         std::fs::write(&disk, b"diverged").unwrap();
         hv.disk_restore(&prep, &id).unwrap();
         assert_eq!(std::fs::read(&disk).unwrap(), b"pristine");
-        assert!(hv.disk_restore(&prep, &SnapshotId("absent".into())).is_err());
+        assert!(hv
+            .disk_restore(&prep, &SnapshotId("absent".into()))
+            .is_err());
     }
 
     /// The capability table is what the daemon gates on. Everything false
@@ -829,11 +892,17 @@ mod tests {
     #[test]
     fn the_capabilities_are_what_is_implemented_not_what_vz_could_do() {
         let caps = Vz::new().caps();
-        assert!(caps.disk_snapshot, "file-level, so it works on every backend");
+        assert!(
+            caps.disk_snapshot,
+            "file-level, so it works on every backend"
+        );
         assert!(!caps.live_snapshot);
         assert!(!caps.live_migration);
-        assert!(caps.shared_dir.is_none(), "virtiofs is a follow-up, and 9p is QEMU's");
-        assert!(!caps.nbd_disks);
+        assert!(
+            caps.shared_dir.is_none(),
+            "virtiofs is a follow-up, and 9p is QEMU's"
+        );
+        assert!(caps.nbd_disks);
         assert_eq!(caps.disk_formats, &[DiskFormat::Raw], "no qcow2, ever");
     }
 
@@ -841,8 +910,14 @@ mod tests {
     /// traps in doing it.
     #[test]
     fn the_guest_config_fixes_the_console_the_image_does_not_know_about() {
-        assert!(GUEST_CONFIG.contains("serial-getty@hvc0"), "a login prompt in the log");
-        assert!(GUEST_CONFIG.contains("console=hvc0"), "and a kernel transcript next boot");
+        assert!(
+            GUEST_CONFIG.contains("serial-getty@hvc0"),
+            "a login prompt in the log"
+        );
+        assert!(
+            GUEST_CONFIG.contains("console=hvc0"),
+            "and a kernel transcript next boot"
+        );
         // `cloud-init status --wait` in the foreground would deadlock:
         // runcmd *is* cloud-final (VZ-SPIKE-NOTES landmine 7).
         assert!(GUEST_CONFIG.contains("setsid sh -c 'cloud-init status --wait"));
@@ -857,7 +932,7 @@ mod tests {
     }
 
     #[test]
-    fn only_raw_files_can_be_extra_disks() {
+    fn raw_and_nbd_extra_disks_reach_the_helper_config() {
         let raw = DiskSpec::File {
             path: "/vol/data.raw".into(),
             format: DiskFormat::Raw,
@@ -865,7 +940,10 @@ mod tests {
         };
         assert_eq!(
             extra_disk(&raw).unwrap(),
-            asterism_vz::Disk { path: "/vol/data.raw".into(), readonly: true }
+            VzDisk::File {
+                path: "/vol/data.raw".into(),
+                readonly: true
+            }
         );
 
         let qcow2 = DiskSpec::File {
@@ -873,13 +951,36 @@ mod tests {
             format: DiskFormat::Qcow2,
             readonly: false,
         };
-        assert!(extra_disk(&qcow2).unwrap_err().to_string().contains("raw disks only"));
+        assert!(extra_disk(&qcow2)
+            .unwrap_err()
+            .to_string()
+            .contains("raw disks only"));
 
-        // A remote volume names the mechanism that will serve it one day,
-        // rather than pretending it is not there.
-        let nbd = DiskSpec::Nbd { url: "nbd://desktop:10809/vol".into(), readonly: false };
-        let err = extra_disk(&nbd).unwrap_err().to_string();
-        assert!(err.contains("VZNetworkBlockDeviceStorageDeviceAttachment"), "{err}");
+        let nbd = DiskSpec::Nbd {
+            url: "nbd://desktop:10809/vol".into(),
+            readonly: false,
+        };
+        assert_eq!(
+            extra_disk(&nbd).unwrap(),
+            VzDisk::Nbd {
+                url: "nbd://desktop:10809/vol".into(),
+                readonly: false
+            }
+        );
+
+        let unix = DiskSpec::NbdUnix {
+            socket: "/tmp/asterism.sock".into(),
+            export: "team/data".into(),
+            readonly: true,
+        };
+        assert_eq!(
+            extra_disk(&unix).unwrap(),
+            VzDisk::NbdUnix {
+                socket: "/tmp/asterism.sock".into(),
+                export: "team/data".into(),
+                readonly: true,
+            }
+        );
     }
 
     #[test]
@@ -910,8 +1011,12 @@ mod tests {
         let h = Handle {
             backend: ID.into(),
             pid: None,
-            ctl: ControlChannel::Rpc { path: "/tmp/nothing-here.sock".into() },
-            endpoint: GuestEndpoint::GuestAddr { addr: "192.168.64.3".parse().unwrap() },
+            ctl: ControlChannel::Rpc {
+                path: "/tmp/nothing-here.sock".into(),
+            },
+            endpoint: GuestEndpoint::GuestAddr {
+                addr: "192.168.64.3".parse().unwrap(),
+            },
             started_at: 0,
         };
         assert!(hv.stop(&h, Duration::from_millis(1)).is_err());
@@ -928,8 +1033,12 @@ mod tests {
         let h = Handle {
             backend: ID.into(),
             pid: Some(1),
-            ctl: ControlChannel::Rpc { path: "/tmp/x.sock".into() },
-            endpoint: GuestEndpoint::GuestAddr { addr: "192.168.64.3".parse().unwrap() },
+            ctl: ControlChannel::Rpc {
+                path: "/tmp/x.sock".into(),
+            },
+            endpoint: GuestEndpoint::GuestAddr {
+                addr: "192.168.64.3".parse().unwrap(),
+            },
             started_at: 0,
         };
         let err = hv.snapshot(&h, "t").unwrap_err().to_string();

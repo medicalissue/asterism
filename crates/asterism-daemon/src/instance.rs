@@ -54,19 +54,14 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
                 Err(e) => Response::Error { message: format!("{e:#}") },
             }
         }
-        // The backend is chosen once, here, and recorded on the instance:
-        // `--backend vz` is opt-in until vz has survived a release
-        // (BACKENDS.md §7), and an explicit choice this device cannot honour
-        // fails now rather than at the first `ast up`.
+        // The backend is chosen once, here, and recorded on the instance. An
+        // explicit choice is forced; the default probes VZ first and falls
+        // back to QEMU when VZ is unavailable or lacks a required capability.
         Request::Create { name, image, shape, backend: requested, publish } => {
-            backend::select_for(requested.as_deref()).and_then(|hv| {
-                let r = backend::image_ref(&image)?;
-                // What the image turned out to be is checked against the
-                // backend before the registry moves: an instance defined
-                // against a backend that could never boot it is worse than
-                // a create that says no.
-                backend::check_can_boot(&*hv, &r, &publish)?;
-                reg.create(&name, cpu_device, &r.name, shape, backend::machine_identity(&*hv))?;
+            backend::image_ref(&image).and_then(|r| {
+                let requirements = backend::CreateRequirements::new(&r, &publish);
+                let machine = backend::select_for(requested.as_deref(), requirements)?;
+                reg.create(&name, cpu_device, &r.name, shape, machine)?;
                 if r.kind == ImageKind::OciRootfs {
                     // A container that has finished is not a crash; see
                     // `Policy::never`.

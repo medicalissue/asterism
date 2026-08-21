@@ -20,6 +20,7 @@ pub mod power;
 pub mod protocol;
 pub mod registry;
 pub mod seed;
+pub mod secret;
 pub mod service;
 pub mod snapshot;
 pub mod tools;

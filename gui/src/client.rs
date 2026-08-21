@@ -464,6 +464,15 @@ fn tool_path(tool: &str, override_var: &str) -> PathBuf {
 mod tests {
     use super::*;
 
+    fn machine() -> asterism_core::hv::Machine {
+        asterism_core::hv::Machine {
+            backend: "qemu".into(),
+            machine_type: "virt".into(),
+            cpu: "host".into(),
+            hv_version: "test".into(),
+        }
+    }
+
     /// The window is a second surface, not a second backend: what it sends
     /// to define an instance has to be the frame `ast create` sends, field
     /// for field. This is what catches a window that grew its own idea of a
@@ -528,7 +537,7 @@ mod tests {
         // `Create` answers with the instance it defined; the poll picks the
         // new row up, so the body is not needed here and not an error.
         let inst = serde_json::to_string(&Response::Instance {
-            instance: Instance::new("dev", "here", "debian:13", Shape::default(), None),
+            instance: Instance::new("dev", "here", "debian:13", Shape::default(), machine()),
         })
         .unwrap();
         assert!(reply_to_done(&inst).is_ok());

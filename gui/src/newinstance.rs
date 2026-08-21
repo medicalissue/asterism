@@ -12,11 +12,11 @@
 //! [`Shape::default`], the ones `ast create` documents. A second surface
 //! that restated any of them would be a second surface that could disagree.
 //!
-//! ## The backend row, and when it exists at all
+//! ## The backend row
 //!
-//! Most devices have one backend, and a control with one option is clutter
-//! pretending to be a choice. So the backend row appears only when this
-//! device can actually run `vz`, and is absent otherwise.
+//! `Automatic` is the product default: the daemon probes and chooses the
+//! lightest capable backend, VZ first. QEMU is always available as an explicit
+//! force, and VZ appears as an explicit force when this device can run it.
 //!
 //! Answering "can it" means running the daemon's own probe conditions
 //! ([`vz_available`]) against the daemon's own binary: the helper the
@@ -35,12 +35,10 @@ use asterism_core::registry;
 use crate::client;
 use crate::feedback;
 
-/// The backend a create with no explicit choice gets. Named rather than
-/// sent: `None` on the wire is what tells the daemon to take the device
-/// default without probing, and that is what "qemu" means here.
-pub const DEFAULT_BACKEND: &str = "qemu";
-/// The other backend `astd` has. Offered, never assumed — see the module
-/// docs.
+/// The UI value that means capability-based selection by the daemon.
+pub const DEFAULT_BACKEND: &str = "auto";
+/// The concrete backends `astd` can be forced to use.
+pub const QEMU_BACKEND: &str = "qemu";
 pub const VZ_BACKEND: &str = "vz";
 
 /// One row of the image dropdown: a catalog alias, and whether the bytes
@@ -152,10 +150,14 @@ pub fn catalog() -> Vec<Image> {
 /// The backends this device can offer. One entry means the window draws no
 /// backend row at all: a choice between one thing is not a choice.
 pub fn backends() -> Vec<Backend> {
-    let mut out = vec![Backend { id: DEFAULT_BACKEND.to_owned(), label: "QEMU".to_owned() }];
+    let mut out = vec![Backend {
+        id: DEFAULT_BACKEND.to_owned(),
+        label: "Automatic".to_owned(),
+    }];
     if vz_available() {
         out.push(Backend { id: VZ_BACKEND.to_owned(), label: "Apple".to_owned() });
     }
+    out.push(Backend { id: QEMU_BACKEND.to_owned(), label: "QEMU".to_owned() });
     out
 }
 
@@ -269,9 +271,8 @@ impl Wanted {
         }
     }
 
-    /// The `backend` field of the frame. The default is sent as absence,
-    /// which is what an `ast create` with no `--backend` sends and what
-    /// tells the daemon not to probe.
+    /// The `backend` field of the frame. Automatic is sent as absence, exactly
+    /// like `ast create` without `--backend`; concrete ids force that backend.
     pub fn backend(&self) -> Option<&str> {
         match self.backend.as_str() {
             DEFAULT_BACKEND | "" => None,
@@ -402,18 +403,18 @@ mod tests {
         assert_eq!(w.shape().mem_mib, 8192);
     }
 
-    /// qemu is the default, and a default is sent as absence: the daemon
-    /// reads `None` as "this device's default, do not probe" and an id as
-    /// "probe it now". Sending "qemu" explicitly would make every create
-    /// from this window probe a backend nobody asked about.
+    /// Automatic is sent as absence so the daemon can choose VZ first when
+    /// capable. Concrete ids are sent as themselves and therefore forced.
     #[test]
-    fn the_default_backend_travels_as_absence_and_vz_travels_as_itself() {
+    fn automatic_travels_as_absence_and_concrete_backends_force_themselves() {
         assert_eq!(wanted().backend(), None);
         let mut w = wanted();
         w.backend = String::new();
         assert_eq!(w.backend(), None);
         w.backend = VZ_BACKEND.into();
         assert_eq!(w.backend(), Some("vz"));
+        w.backend = QEMU_BACKEND.into();
+        assert_eq!(w.backend(), Some("qemu"));
     }
 
     /// The field's rule is the daemon's rule, reached through the daemon's
@@ -460,15 +461,18 @@ mod tests {
         assert!(names.contains(&DEFAULT_IMAGE), "the form's default is in the catalog");
     }
 
-    /// qemu is always offered; vz only when this device could run it. The
-    /// list is never empty and never has a backend `astd` has not got.
+    /// Automatic and qemu are always offered; vz only when this device could
+    /// run it. The list never names a concrete backend `astd` has not got.
     #[test]
     fn qemu_is_always_offered_and_vz_only_when_it_would_work() {
         let offered = backends();
         let ids: Vec<&str> = offered.iter().map(|b| b.id.as_str()).collect();
         assert_eq!(ids[0], DEFAULT_BACKEND);
-        assert_eq!(ids.len(), if vz_available() { 2 } else { 1 });
-        assert!(ids.iter().all(|id| *id == DEFAULT_BACKEND || *id == VZ_BACKEND));
+        assert_eq!(ids.len(), if vz_available() { 3 } else { 2 });
+        assert!(ids.contains(&QEMU_BACKEND));
+        assert!(ids
+            .iter()
+            .all(|id| matches!(*id, DEFAULT_BACKEND | QEMU_BACKEND | VZ_BACKEND)));
     }
 
     /// The probe is wrong in the cautious direction only. Pointed at a file
@@ -488,13 +492,16 @@ mod tests {
     #[test]
     fn a_lone_backend_gets_no_row() {
         let mut form = bare_form();
-        form.backends = vec![Backend { id: "qemu".into(), label: "QEMU".into() }];
-        assert!(form.lines().contains(&"backend qemu (only, no row)".to_owned()));
+        form.backends = vec![Backend {
+            id: DEFAULT_BACKEND.into(),
+            label: "Automatic".into(),
+        }];
+        assert!(form.lines().contains(&"backend auto (only, no row)".to_owned()));
 
-        form.backends.push(Backend { id: "vz".into(), label: "Apple".into() });
+        form.backends.push(Backend { id: QEMU_BACKEND.into(), label: "QEMU".into() });
         let lines = form.lines().join("\n");
-        assert!(lines.contains("backend qemu   QEMU  (default)"), "{lines}");
-        assert!(lines.contains("backend vz     Apple"), "{lines}");
+        assert!(lines.contains("backend auto   Automatic  (default)"), "{lines}");
+        assert!(lines.contains("backend qemu   QEMU"), "{lines}");
     }
 
     /// An empty fleet and an unreachable daemon must not both render as
@@ -523,6 +530,7 @@ mod tests {
         let lines = form.lines();
         assert_eq!(lines[0], "image debian:13      pulled  (default)");
         assert_eq!(lines[1], "image alpine:3.22    not pulled");
+        assert!(lines.iter().any(|l| l.starts_with("backend auto")));
         assert!(lines.iter().any(|l| l.starts_with("backend qemu")));
         assert!(lines.contains(&"shape cpus=2 mem_mib=2048 disk_gib=20".to_owned()));
         assert!(lines.contains(&"taken dev".to_owned()));

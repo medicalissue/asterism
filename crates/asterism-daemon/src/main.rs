@@ -46,6 +46,7 @@ mod instance;
 mod mesh;
 mod orbit;
 mod persist;
+mod secret;
 mod snapshot;
 mod ssh;
 mod swap;
@@ -128,6 +129,12 @@ async fn main() -> Result<()> {
             None
         }
     };
+
+    // Metadata lives in ASTERISM_HOME; values live behind the platform store
+    // (the macOS login Keychain). There is intentionally no file fallback.
+    if let Err(e) = secret::init() {
+        eprintln!("astd: secrets are unavailable: {e:#}");
+    }
 
     // The volume plane, before anything can be resurrected onto it: an
     // instance coming back up may need a lease taken and a bridge raised
@@ -293,6 +300,9 @@ async fn send(
 /// resolved across the orbit and forwarded to whichever device holds that
 /// row — which is where `--device` stops being necessary.
 async fn dispatch(request: Request, node: &Node, mesh: Option<&Arc<Mesh>>) -> Response {
+    if secret::is_orbit_request(&request) {
+        return secret::serve(request, node, mesh).await;
+    }
     if orbit::claims(&request) {
         return orbit::serve(request, node, mesh).await;
     }
@@ -348,6 +358,9 @@ async fn route(request: Request, node: &Node, mesh: Option<&Arc<Mesh>>) -> Respo
 /// area in turn, ending at [`instance`], which owns both the shard's own
 /// commands and the refusal for a frame nobody claimed.
 pub(crate) async fn handle(req: Request, node: &Node) -> Response {
+    if secret::is_source_request(&req) {
+        return secret::serve_source(req);
+    }
     // Volumes are this device's own part of the pool, not a row in its shard,
     // and they are answered before the shard is touched. That is not only
     // tidiness: `up` holds the shard while it boots, and an instance whose

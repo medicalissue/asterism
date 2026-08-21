@@ -17,7 +17,7 @@
 //! about devices: pairing, and the orbit's own membership.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Seek, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Seek, Write};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
@@ -308,6 +308,11 @@ enum Command {
     /// Create, list and delete this device's block volumes.
     #[command(subcommand)]
     Volume(VolumeCommand),
+    /// Create, list, remove and rotate orbit-scoped secrets.
+    ///
+    /// Values are read from stdin and are never accepted as arguments.
+    #[command(subcommand)]
+    Secret(SecretCommand),
     /// List the devices in this orbit.
     Devices,
     /// Add, list and remove the devices in this orbit.
@@ -376,6 +381,22 @@ enum VolumeCommand {
         /// The volume to delete, by its name on this device.
         name: String,
     },
+}
+
+/// `ast secret ...` — orbit metadata backed by independent source devices.
+#[derive(Subcommand)]
+enum SecretCommand {
+    /// Add this device as a source for a new or existing named secret.
+    ///
+    /// Pipe the exact bytes on stdin. `--device` selects a different source
+    /// device over the existing mesh.
+    Create { name: String },
+    /// List orbit-visible secret metadata. Values are never shown.
+    Ls,
+    /// Remove a secret from every reachable source device.
+    Rm { name: String },
+    /// Replace the value on every reachable source device with stdin.
+    Rotate { name: String },
 }
 
 #[derive(Subcommand)]
@@ -522,6 +543,7 @@ fn main() -> Result<()> {
         },
         Command::Volume(VolumeCommand::Ls) => Request::VolumeList,
         Command::Volume(VolumeCommand::Rm { name }) => Request::VolumeRemove { name },
+        Command::Secret(cmd) => return secret_command(cmd, device.as_deref()),
         Command::Logs { name, follow, lines } => {
             local_only("logs", device.as_deref())?;
             return logs(&name, follow, lines);
@@ -648,9 +670,101 @@ fn main() -> Result<()> {
         // A lease is granted daemon-to-daemon, on the way to an attach or a
         // boot. Nobody types a request that gets one back.
         | Response::VolumeLease { .. } => bail!("unexpected reply from astd: {request:?}"),
+        // Secret commands return from `secret_command`.
+        Response::Secrets { .. } => {
+            bail!("unexpected reply from astd: {request:?}")
+        }
         Response::Error { message } => bail!(message),
     }
     Ok(())
+}
+
+// ---- secrets ---------------------------------------------------------------
+
+fn secret_command(command: SecretCommand, device: Option<&str>) -> Result<()> {
+    let request = match command {
+        SecretCommand::Create { name } => Request::SecretCreate {
+            name,
+            value: read_secret_stdin()?,
+            source_device: device.map(str::to_owned),
+        },
+        SecretCommand::Ls => {
+            local_only("secret ls", device)?;
+            Request::SecretList
+        }
+        SecretCommand::Rm { name } => {
+            local_only("secret rm", device)?;
+            Request::SecretRemove { name }
+        }
+        SecretCommand::Rotate { name } => {
+            local_only("secret rotate", device)?;
+            Request::SecretRotate {
+                name,
+                value: read_secret_stdin()?,
+            }
+        }
+    };
+
+    match send(&request)? {
+        Response::Secrets { secrets } => match request {
+            Request::SecretRemove { name } => println!("{name}  removed from all sources"),
+            Request::SecretCreate { ref name, .. } => {
+                let secret = secrets.iter().find(|secret| secret.name == *name);
+                if let Some(secret) = secret {
+                    println!(
+                        "{}  version {}  {} source{}",
+                        secret.name,
+                        secret.version,
+                        secret.sources.len(),
+                        if secret.sources.len() == 1 { "" } else { "s" }
+                    );
+                } else {
+                    print_secrets(&secrets);
+                }
+            }
+            _ => print_secrets(&secrets),
+        },
+        Response::Error { message } => bail!(message),
+        _ => bail!("unexpected reply from astd: {request:?}"),
+    }
+    Ok(())
+}
+
+fn read_secret_stdin() -> Result<asterism_core::protocol::SecretValue> {
+    let mut stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        bail!(
+            "secret values are read from stdin, never argv; pipe the exact bytes, for example: \
+             printf %s \"$TOKEN\" | ast secret create NAME"
+        );
+    }
+    let mut value = Vec::new();
+    stdin
+        .read_to_end(&mut value)
+        .context("reading secret value from stdin")?;
+    if value.is_empty() {
+        bail!("refusing an empty secret value from stdin");
+    }
+    Ok(asterism_core::protocol::SecretValue::new(value))
+}
+
+fn print_secrets(secrets: &[asterism_core::secret::Secret]) {
+    println!("{:<28} {:<9} SOURCES", "NAME", "VERSION");
+    for secret in secrets {
+        let sources = secret
+            .sources
+            .iter()
+            .map(|source| {
+                if source.version == secret.version {
+                    source.device.clone()
+                } else {
+                    format!("{}@v{}", source.device, source.version)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("{:<28} {:<9} {}", secret.name, secret.version, sources);
+    }
 }
 
 /// Puts a request in the envelope `--device` implies.
@@ -1758,10 +1872,7 @@ fn print_detail(inst: &Instance) {
     }
     // The machine this instance was defined against. Recorded at create
     // time, and what a live migration would have to match on.
-    match &inst.machine {
-        Some(m) => println!("machine: {m}"),
-        None => println!("machine: - (defined before this was recorded)"),
-    }
+    println!("machine: {}", inst.machine);
     if let Some(h) = &inst.handle {
         let pid = h.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
         println!("running: {} pid {pid}, ssh {}", h.backend, h.endpoint);

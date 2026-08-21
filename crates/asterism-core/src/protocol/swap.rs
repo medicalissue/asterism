@@ -105,6 +105,7 @@ impl MoveManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hv::Machine;
     use crate::instance::Shape;
     use crate::protocol::Request;
 
@@ -115,7 +116,18 @@ mod tests {
     #[test]
     fn the_move_frames_are_aimed_at_devices_not_resolved_by_name() {
         let manifest = Box::new(MoveManifest {
-            instance: Instance::new("dev", "laptop", "debian:13", Shape::default(), None),
+            instance: Instance::new(
+                "dev",
+                "laptop",
+                "debian:13",
+                Shape::default(),
+                Machine {
+                    backend: "qemu".into(),
+                    machine_type: "virt".into(),
+                    cpu: "host".into(),
+                    hv_version: "test".into(),
+                },
+            ),
             arch: "aarch64".into(),
             base: BaseImage::absent("debian:13".to_owned()),
             files: vec![

@@ -60,9 +60,17 @@ LAN_FAR="lan-far-$$"
 B_MAC="de:ad:be:ef:0b:0b"
 B_MAC_HEX="deadbeef0b0b"
 PORT=$(( 19000 + ($$ % 900) ))
+DAEMON_PIDS=()
 
 cleanup() {
-  pkill -f "$ASTD" 2>/dev/null || true
+  capture_stop
+  # Kill only daemons started by this test. A path-wide `pkill -f` can stop a
+  # developer's real daemon (or another e2e running beside this one).
+  local pid
+  for pid in "${DAEMON_PIDS[@]}"; do
+    kill -CONT "$pid" 2>/dev/null || true
+    kill -TERM "$pid" 2>/dev/null || true
+  done
   # E2E_KEEP=1 leaves the homes and their logs behind, for when a failure
   # needs reading rather than reproducing.
   [ -n "${E2E_KEEP:-}" ] || rm -rf "$RUN"
@@ -95,12 +103,11 @@ refute() {
 start_daemon() {
   local home="$1" lan="$2" mac="$3" wait="$4"
   mkdir -p "$home"
-  (
-    ASTERISM_HOME="$home" ASTERISM_MESH=local \
+  ASTERISM_HOME="$home" ASTERISM_MESH=local \
     ASTERISM_LAN_ID="$lan" ASTERISM_WAKE_MAC="$mac" \
     ASTERISM_WAKE_PORT="$PORT" ASTERISM_WAKE_WAIT="$wait" \
     "$ASTD" >>"$home/astd.log" 2>&1 &
-  )
+  DAEMON_PIDS+=("$!")
   for _ in $(seq 1 50); do
     grep -q "on the mesh as" "$home/astd.log" 2>/dev/null && return 0
     sleep 0.2

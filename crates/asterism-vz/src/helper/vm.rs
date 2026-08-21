@@ -36,19 +36,21 @@ use objc2_foundation::{
 };
 use objc2_virtualization::{
     VZDiskImageCachingMode, VZDiskImageStorageDeviceAttachment, VZDiskImageSynchronizationMode,
-    VZEFIBootLoader, VZEFIVariableStore, VZEFIVariableStoreInitializationOptions,
-    VZEntropyDeviceConfiguration, VZFileHandleSerialPortAttachment,
-    VZGenericPlatformConfiguration, VZMACAddress, VZMemoryBalloonDeviceConfiguration,
-    VZNATNetworkDeviceAttachment, VZNetworkDevice, VZNetworkDeviceConfiguration,
-    VZSerialPortConfiguration, VZSocketDeviceConfiguration, VZStorageDeviceConfiguration,
-    VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
-    VZVirtioEntropyDeviceConfiguration, VZVirtioNetworkDeviceConfiguration,
-    VZVirtioSocketDeviceConfiguration, VZVirtioTraditionalMemoryBalloonDeviceConfiguration,
-    VZVirtualMachine, VZVirtualMachineConfiguration, VZVirtualMachineDelegate,
-    VZVirtualMachineState,
+    VZDiskSynchronizationMode, VZEFIBootLoader, VZEFIVariableStore,
+    VZEFIVariableStoreInitializationOptions, VZEntropyDeviceConfiguration,
+    VZFileHandleSerialPortAttachment, VZGenericPlatformConfiguration, VZMACAddress,
+    VZMemoryBalloonDeviceConfiguration, VZNATNetworkDeviceAttachment,
+    VZNetworkBlockDeviceStorageDeviceAttachment,
+    VZNetworkBlockDeviceStorageDeviceAttachmentDelegate, VZNetworkDevice,
+    VZNetworkDeviceConfiguration, VZSerialPortConfiguration, VZSocketDeviceConfiguration,
+    VZStorageDeviceConfiguration, VZVirtioBlockDeviceConfiguration,
+    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioEntropyDeviceConfiguration,
+    VZVirtioNetworkDeviceConfiguration, VZVirtioSocketDeviceConfiguration,
+    VZVirtioTraditionalMemoryBalloonDeviceConfiguration, VZVirtualMachine,
+    VZVirtualMachineConfiguration, VZVirtualMachineDelegate, VZVirtualMachineState,
 };
 
-use asterism_vz::{Config, State, StopReason};
+use asterism_vz::{Config, Disk, State, StopReason};
 
 /// Shared between the delegate object and the run loop. `Rc`, not `Arc`:
 /// both live on the queue the VM is bound to, and nothing here crosses a
@@ -60,6 +62,13 @@ pub struct Signals {
     /// Set when a network attachment drops. VZ reports this per boot and it
     /// is otherwise completely silent.
     net_disconnects: Cell<u32>,
+    /// The NBD delegate can report this more than once: the first callback
+    /// is the initial connection and later callbacks are transparent
+    /// reconnects after recoverable failures.
+    nbd_connections: Cell<u32>,
+    /// Only non-recoverable NBD failures arrive here. Recoverable failures
+    /// are intentionally left to VZ's built-in reconnect loop.
+    nbd_terminal_errors: Cell<u32>,
 }
 
 impl Signals {
@@ -121,12 +130,149 @@ define_class!(
     }
 );
 
+struct NbdDelegateIvars {
+    signals: Rc<Signals>,
+    uri: String,
+}
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "AsterismVzNbdDelegate"]
+    #[ivars = NbdDelegateIvars]
+    struct NbdDelegate;
+
+    unsafe impl NSObjectProtocol for NbdDelegate {}
+
+    unsafe impl VZNetworkBlockDeviceStorageDeviceAttachmentDelegate for NbdDelegate {
+        #[unsafe(method(attachmentWasConnected:))]
+        fn attachment_was_connected(
+            &self,
+            _attachment: &VZNetworkBlockDeviceStorageDeviceAttachment,
+        ) {
+            let previous = self.ivars().signals.nbd_connections.get();
+            self.ivars().signals.nbd_connections.set(previous + 1);
+            eprintln!(
+                "astd-vz: NBD {} to {}",
+                if previous == 0 {
+                    "connected"
+                } else {
+                    "reconnected"
+                },
+                self.ivars().uri
+            );
+        }
+
+        #[unsafe(method(attachment:didEncounterError:))]
+        fn attachment_did_encounter_error(
+            &self,
+            _attachment: &VZNetworkBlockDeviceStorageDeviceAttachment,
+            error: &NSError,
+        ) {
+            let n = self.ivars().signals.nbd_terminal_errors.get();
+            self.ivars().signals.nbd_terminal_errors.set(n + 1);
+            eprintln!(
+                "astd-vz: NBD attachment {} entered a non-recoverable state: {}",
+                self.ivars().uri,
+                error.localizedDescription()
+            );
+        }
+    }
+);
+
 fn url(path: &Path) -> Retained<NSURL> {
     NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()))
 }
 
 fn vz_err(e: Retained<NSError>) -> anyhow::Error {
     anyhow!("{}", e.localizedDescription())
+}
+
+/// Percent-encode one free-text NBD URI component according to RFC 3986.
+///
+/// Encoding all bytes outside the unreserved set is deliberately stricter
+/// than necessary. In particular it keeps an export's `/`, `?`, and `#`
+/// as data rather than allowing them to change the URI's structure.
+fn uri_component(value: &str) -> Result<String> {
+    if value.contains('\0') {
+        bail!("an NBD URI component cannot contain NUL");
+    }
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for &byte in value.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    Ok(encoded)
+}
+
+/// The standard NBD URI for a Unix-domain-socket transport.
+fn nbd_unix_uri(socket: &Path, export: &str) -> Result<String> {
+    let socket = socket.to_str().with_context(|| {
+        format!(
+            "the NBD socket path {} is not valid UTF-8",
+            socket.display()
+        )
+    })?;
+    Ok(format!(
+        "nbd+unix:///{export}?socket={socket}",
+        export = uri_component(export)?,
+        socket = uri_component(socket)?,
+    ))
+}
+
+fn network_url(value: &str) -> Result<Retained<NSURL>> {
+    NSURL::initWithString(NSURL::alloc(), &NSString::from_str(value))
+        .ok_or_else(|| anyhow!("{value:?} is not a URL"))
+}
+
+/// Construct one VZ NBD device and keep its weak delegate alive.
+///
+/// VZ itself owns the reconnect policy: a timeout or recoverable transport
+/// error schedules another attempt and later calls `attachmentWasConnected:`
+/// again. The helper must not tear down or replace the attachment in that
+/// window; retaining the delegate alongside the VM is the entire policy.
+unsafe fn nbd_device(
+    uri: String,
+    readonly: bool,
+    signals: &Rc<Signals>,
+    mtm: MainThreadMarker,
+    delegates: &mut Vec<Retained<NbdDelegate>>,
+) -> Result<Retained<VZStorageDeviceConfiguration>> {
+    let url = network_url(&uri)?;
+    VZNetworkBlockDeviceStorageDeviceAttachment::validateURL_error(&url)
+        .map_err(vz_err)
+        .with_context(|| format!("validating NBD URI {uri}"))?;
+    let attachment = VZNetworkBlockDeviceStorageDeviceAttachment::initWithURL_timeout_forcedReadOnly_synchronizationMode_error(
+        VZNetworkBlockDeviceStorageDeviceAttachment::alloc(),
+        &url,
+        30.0,
+        readonly,
+        VZDiskSynchronizationMode::Full,
+    )
+    .map_err(vz_err)
+    .with_context(|| format!("creating NBD attachment {uri}"))?;
+    let delegate = {
+        let this = NbdDelegate::alloc(mtm).set_ivars(NbdDelegateIvars {
+            signals: signals.clone(),
+            uri,
+        });
+        let this: Retained<NbdDelegate> = msg_send![super(this), init];
+        this
+    };
+    attachment.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+    delegates.push(delegate);
+
+    let dev = VZVirtioBlockDeviceConfiguration::initWithAttachment(
+        VZVirtioBlockDeviceConfiguration::alloc(),
+        &Retained::into_super(attachment),
+    );
+    Ok(Retained::into_super(dev))
 }
 
 /// A running guest plus everything that has to outlive it.
@@ -136,6 +282,10 @@ pub struct Machine {
     /// this would silently stop every callback. This field is the entire
     /// reason `Machine` owns it (spike landmine 4).
     _delegate: Retained<Delegate>,
+    /// NBD attachment delegates are weak properties too. There is one per
+    /// disk and each must survive for the entire VM lifetime so reconnect
+    /// and terminal-error callbacks do not silently disappear.
+    _nbd_delegates: Vec<Retained<NbdDelegate>>,
     /// Same story: VZ does not retain the file descriptors behind the
     /// serial attachment's file handles, so the `File`s have to live as
     /// long as the VM does.
@@ -151,6 +301,9 @@ unsafe fn build_config(
     config: &Config,
     mac: &VZMACAddress,
     console_files: &mut Vec<std::fs::File>,
+    nbd_delegates: &mut Vec<Retained<NbdDelegate>>,
+    signals: &Rc<Signals>,
+    mtm: MainThreadMarker,
 ) -> Result<Retained<VZVirtualMachineConfiguration>> {
     let vm_config = VZVirtualMachineConfiguration::new();
 
@@ -195,7 +348,7 @@ unsafe fn build_config(
     // permanent storage, and it is the only honest choice for a backend
     // holding someone's agent workload (spike landmine 10).
     let mut disks: Vec<Retained<VZStorageDeviceConfiguration>> = Vec::new();
-    let mut attach = |path: &Path, readonly: bool| -> Result<()> {
+    let attach = |path: &Path, readonly: bool| -> Result<Retained<VZStorageDeviceConfiguration>> {
         if !path.exists() {
             bail!("{} is not there to attach", path.display());
         }
@@ -213,13 +366,34 @@ unsafe fn build_config(
             VZVirtioBlockDeviceConfiguration::alloc(),
             &Retained::into_super(attachment),
         );
-        disks.push(Retained::into_super(dev));
-        Ok(())
+        Ok(Retained::into_super(dev))
     };
-    attach(&config.root, false)?;
-    attach(&config.seed, true)?;
+    disks.push(attach(&config.root, false)?);
+    disks.push(attach(&config.seed, true)?);
     for disk in &config.extra_disks {
-        attach(&disk.path, disk.readonly)?;
+        match disk {
+            Disk::File { path, readonly } => disks.push(attach(path, *readonly)?),
+            Disk::Nbd { url, readonly } => disks.push(nbd_device(
+                url.clone(),
+                *readonly,
+                signals,
+                mtm,
+                nbd_delegates,
+            )?),
+            Disk::NbdUnix {
+                socket,
+                export,
+                readonly,
+            } => {
+                disks.push(nbd_device(
+                    nbd_unix_uri(socket, export)?,
+                    *readonly,
+                    signals,
+                    mtm,
+                    nbd_delegates,
+                )?);
+            }
+        }
     }
     vm_config.setStorageDevices(&NSArray::from_retained_slice(&disks));
 
@@ -228,7 +402,9 @@ unsafe fn build_config(
     // com.apple.vm.networking. The MAC is pinned rather than random because
     // it is the only key into /var/db/dhcpd_leases (spike landmine 8).
     let net = VZVirtioNetworkDeviceConfiguration::new();
-    net.setAttachment(Some(&Retained::into_super(VZNATNetworkDeviceAttachment::new())));
+    net.setAttachment(Some(&Retained::into_super(
+        VZNATNetworkDeviceAttachment::new(),
+    )));
     net.setMACAddress(mac);
     let nets: Vec<Retained<VZNetworkDeviceConfiguration>> = vec![Retained::into_super(net)];
     vm_config.setNetworkDevices(&NSArray::from_retained_slice(&nets));
@@ -281,16 +457,18 @@ unsafe fn build_config(
     // does today (spike landmine 8's "better:"). Attaching the device now
     // costs nothing, needs no guest cooperation, and means the plumbing is
     // already in every guest by the time there is an agent to talk to.
-    let vsock: Vec<Retained<VZSocketDeviceConfiguration>> =
-        vec![Retained::into_super(VZVirtioSocketDeviceConfiguration::new())];
+    let vsock: Vec<Retained<VZSocketDeviceConfiguration>> = vec![Retained::into_super(
+        VZVirtioSocketDeviceConfiguration::new(),
+    )];
     vm_config.setSocketDevices(&NSArray::from_retained_slice(&vsock));
 
     // ---- odds and ends -------------------------------------------------
     // Entropy is not optional in practice: without virtio-rng a Debian
     // guest stalls for tens of seconds seeding sshd's host keys on first
     // boot, which is exactly the wait `ast up` is measured on.
-    let rng: Vec<Retained<VZEntropyDeviceConfiguration>> =
-        vec![Retained::into_super(VZVirtioEntropyDeviceConfiguration::new())];
+    let rng: Vec<Retained<VZEntropyDeviceConfiguration>> = vec![Retained::into_super(
+        VZVirtioEntropyDeviceConfiguration::new(),
+    )];
     vm_config.setEntropyDevices(&NSArray::from_retained_slice(&rng));
 
     let balloon: Vec<Retained<VZMemoryBalloonDeviceConfiguration>> = vec![Retained::into_super(
@@ -316,20 +494,25 @@ pub unsafe fn start(config: &Config) -> Result<Machine> {
     let mtm = MainThreadMarker::new()
         .ok_or_else(|| anyhow!("the VZ helper must build its VM on the main thread"))?;
 
-    let mac = VZMACAddress::initWithString(
-        VZMACAddress::alloc(),
-        &NSString::from_str(&config.mac),
-    )
-    .ok_or_else(|| anyhow!("{} is not a valid MAC address", config.mac))?;
+    let mac = VZMACAddress::initWithString(VZMACAddress::alloc(), &NSString::from_str(&config.mac))
+        .ok_or_else(|| anyhow!("{} is not a valid MAC address", config.mac))?;
 
+    let signals = Rc::new(Signals::default());
     let mut console_files = Vec::new();
-    let vm_config = build_config(config, &mac, &mut console_files)?;
+    let mut nbd_delegates = Vec::new();
+    let vm_config = build_config(
+        config,
+        &mac,
+        &mut console_files,
+        &mut nbd_delegates,
+        &signals,
+        mtm,
+    )?;
 
     // No queue argument: `initWithConfiguration:` binds the VM to the main
     // queue, so callbacks arrive when the loop below pumps it.
     let vm = VZVirtualMachine::initWithConfiguration(VZVirtualMachine::alloc(), &vm_config);
 
-    let signals = Rc::new(Signals::default());
     let delegate = {
         let this = Delegate::alloc(mtm).set_ivars(signals.clone());
         let this: Retained<Delegate> = msg_send![super(this), init];
@@ -367,19 +550,26 @@ pub unsafe fn start(config: &Config) -> Result<Machine> {
     }
     if outcome.get() == Some(false) {
         let why = message.borrow().clone();
-        // The two failures a user can actually fix, named.
+        // The failures a user can actually fix, named.
         if why.contains("not supported") || why.to_lowercase().contains("entitle") {
             bail!(
-                "{why} — this usually means {} is not code-signed with {}: \
+                "{why} — this usually means {} is not code-signed with {} and {}: \
                  run scripts/sign-vz.sh",
                 asterism_vz::HELPER_BIN,
-                asterism_vz::ENTITLEMENT
+                asterism_vz::ENTITLEMENT,
+                asterism_vz::NETWORK_CLIENT_ENTITLEMENT,
             );
         }
         bail!("startWithCompletionHandler failed: {why}");
     }
 
-    Ok(Machine { vm, _delegate: delegate, _console_files: console_files, signals })
+    Ok(Machine {
+        vm,
+        _delegate: delegate,
+        _nbd_delegates: nbd_delegates,
+        _console_files: console_files,
+        signals,
+    })
 }
 
 /// Run the main run loop for `slice`, letting VZ deliver its callbacks.
@@ -458,5 +648,57 @@ impl Machine {
             pump(Duration::from_millis(100));
         }
         StopReason::Forced
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unix_nbd_uri_preserves_free_text_as_data() {
+        let uri = nbd_unix_uri(
+            Path::new("/tmp/asterism volume?#.sock"),
+            "team/working set?#한글",
+        )
+        .unwrap();
+        assert_eq!(
+            uri,
+            "nbd+unix:///team%2Fworking%20set%3F%23%ED%95%9C%EA%B8%80?\
+             socket=%2Ftmp%2Fasterism%20volume%3F%23.sock"
+        );
+    }
+
+    #[test]
+    fn apple_accepts_and_constructs_standard_nbd_attachments_without_connecting() {
+        let uri = nbd_unix_uri(Path::new("/tmp/asterism-nbd.sock"), "volume").unwrap();
+        for uri in [&uri, "nbd://127.0.0.1:10809/volume"] {
+            let url = network_url(uri).unwrap();
+            // Apple's validator and initializer are purely local: the NBD
+            // connection is deferred until VM start, so this test needs
+            // neither a server nor entitlements.
+            unsafe {
+                VZNetworkBlockDeviceStorageDeviceAttachment::validateURL_error(&url).unwrap();
+                let attachment = VZNetworkBlockDeviceStorageDeviceAttachment::initWithURL_timeout_forcedReadOnly_synchronizationMode_error(
+                    VZNetworkBlockDeviceStorageDeviceAttachment::alloc(),
+                    &url,
+                    30.0,
+                    true,
+                    VZDiskSynchronizationMode::Full,
+                )
+                .unwrap();
+                assert_eq!(attachment.timeout(), 30.0);
+                assert!(attachment.isForcedReadOnly());
+                assert_eq!(
+                    attachment.synchronizationMode(),
+                    VZDiskSynchronizationMode::Full
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nbd_uri_components_refuse_nul() {
+        assert!(nbd_unix_uri(Path::new("/tmp/socket"), "bad\0export").is_err());
     }
 }

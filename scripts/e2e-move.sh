@@ -91,6 +91,40 @@ refute() {
   echo "ok: $desc"
 }
 
+# file_size <path>: what the file claims to be, in bytes.
+#
+# stat(1) is one of the places BSD and GNU never agreed, and this script runs
+# on both: macOS asks with -f, Linux with -c. Which one is in front of us is
+# asked rather than guessed from `uname`, so a mac with coreutils on its PATH
+# answers correctly too. Never as `bsd || gnu`, though: GNU stat reads a -f
+# format as a filename, prints filesystem status for the real path to stdout,
+# and only then fails — and that junk would land in the answer. Trying it into
+# a variable keeps it out.
+file_size() {
+  local size
+  if size="$(stat -f %z "$1" 2>/dev/null)"; then
+    echo "$size"
+  else
+    stat -c %s "$1"
+  fi
+}
+
+# allocated_bytes <path>: what it actually occupies, holes excluded. This is
+# the number the sparse assertions turn on, so it is bytes on both platforms
+# rather than each stat's own unit.
+allocated_bytes() {
+  local blocks unit
+  if blocks="$(stat -f %b "$1" 2>/dev/null)"; then
+    # BSD reports st_blocks in 512-byte units, always.
+    echo "$((blocks * 512))"
+  else
+    # GNU counts in a unit of its own choosing and %B is which one.
+    blocks="$(stat -c %b "$1")" || return 1
+    unit="$(stat -c %B "$1")" || return 1
+    echo "$((blocks * unit))"
+  fi
+}
+
 # The log is appended to rather than replaced, so a daemon that is restarted
 # leaves its predecessor's lines in it. That makes "has it come up?" a question
 # about a *new* line, not about any line — a distinction this script depends on
@@ -180,7 +214,7 @@ expect "snapshot on A" "$INST  snapshot clean" \
 
 DISK_A="$A/instances/$INST/disk.raw"
 [ -f "$DISK_A" ] || fail "no root disk at $DISK_A"
-VIRTUAL="$(stat -f %z "$DISK_A")"
+VIRTUAL="$(file_size "$DISK_A")"
 echo "ok: A's root disk claims $VIRTUAL bytes"
 
 # ---- 3. the move -----------------------------------------------------------
@@ -226,8 +260,8 @@ echo "ok: sparse transfer moved $ALLOCATED bytes of $CLAIMED claimed ($((ALLOCAT
 # ...and the disk landed sparse on B too, rather than being filled in.
 DISK_B="$B/instances/$INST/disk.raw"
 [ -f "$DISK_B" ] || fail "no root disk on B at $DISK_B"
-B_SIZE="$(stat -f %z "$DISK_B")"
-B_BLOCKS="$(( $(stat -f %b "$DISK_B") * 512 ))"
+B_SIZE="$(file_size "$DISK_B")"
+B_BLOCKS="$(allocated_bytes "$DISK_B")"
 [ "$B_SIZE" = "$VIRTUAL" ] || fail "B's disk is $B_SIZE bytes and A's was $VIRTUAL"
 [ "$((B_BLOCKS * 2))" -lt "$B_SIZE" ] \
   || fail "B's disk occupies $B_BLOCKS of $B_SIZE bytes — the holes did not survive"
@@ -411,7 +445,10 @@ MOVE_PID=$!
 staged=
 for _ in $(seq 1 600); do
   disk="$(ls "$B"/instances/"$KILL".moving-*/disk.raw 2>/dev/null | head -1 || true)"
-  if [ -n "$disk" ] && [ "$(( $(stat -f %b "$disk") * 512 ))" -gt $((16 * 1024 * 1024)) ]; then
+  # A disk that cannot be measured yet has not been staged yet: the file is
+  # appearing under this loop, so "no answer" is 0 and not a failure.
+  if [ -n "$disk" ] \
+    && [ "$(allocated_bytes "$disk" 2>/dev/null || echo 0)" -gt $((16 * 1024 * 1024)) ]; then
     staged="$disk"; break
   fi
   sleep 0.2

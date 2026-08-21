@@ -75,6 +75,24 @@ refute() {
   echo "ok: $desc"
 }
 
+# file_size <path>: what the file claims to be, in bytes.
+#
+# stat(1) is one of the places BSD and GNU never agreed, and this script runs
+# on both: macOS asks with -f, Linux with -c. Which one is in front of us is
+# asked rather than guessed from `uname`, so a mac with coreutils on its PATH
+# answers correctly too. Never as `bsd || gnu`, though: GNU stat reads a -f
+# format as a filename, prints filesystem status for the real path to stdout,
+# and only then fails — and that junk would land in the answer. Trying it into
+# a variable keeps it out.
+file_size() {
+  local size
+  if size="$(stat -f %z "$1" 2>/dev/null)"; then
+    echo "$size"
+  else
+    stat -c %s "$1"
+  fi
+}
+
 start_daemon() {
   local home="$1"
   mkdir -p "$home"
@@ -175,7 +193,7 @@ expect "and it says what an empty disk is" "no filesystem on it yet" \
   env ASTERISM_HOME="$B" "$AST" volume create x-scratch --size 1G
 
 [ -f "$B/volumes/$VOL/disk.raw" ] || fail "no image behind the volume"
-SIZE="$(stat -f %z "$B/volumes/$VOL/disk.raw")"
+SIZE="$(file_size "$B/volumes/$VOL/disk.raw")"
 [ "$SIZE" = "$((2 * 1024 * 1024 * 1024))" ] || fail "the volume is $SIZE bytes, not 2 GiB"
 USED="$(du -k "$B/volumes/$VOL/disk.raw" | cut -f1)"
 [ "$USED" -lt 4096 ] || fail "a fresh 2 GiB volume occupies ${USED}K, so it is not sparse"

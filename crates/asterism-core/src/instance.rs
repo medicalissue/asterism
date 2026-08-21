@@ -376,10 +376,9 @@ pub struct Instance {
     /// The machine this instance was defined against: backend, machine
     /// type, cpu model, hypervisor version. Recorded at create time and
     /// left alone afterwards — it is what a future live migration has to
-    /// match on (BACKENDS.md §5). `None` on registries written before it
-    /// existed, and on hosts where no backend could be probed at create.
-    #[serde(default)]
-    pub machine: Option<Machine>,
+    /// match on (BACKENDS.md §5). Creation only succeeds after probing a
+    /// runnable backend, so every instance has this identity.
+    pub machine: Machine,
     /// The running guest, while there is one.
     #[serde(default)]
     pub handle: Option<Handle>,
@@ -443,7 +442,7 @@ impl Instance {
         cpu_device: &str,
         image: &str,
         shape: Shape,
-        machine: Option<Machine>,
+        machine: Machine,
     ) -> Self {
         Instance {
             id: uuid::Uuid::new_v4().to_string(),
@@ -640,6 +639,15 @@ pub fn now_unix() -> u64 {
 mod tests {
     use super::*;
 
+    fn machine() -> Machine {
+        Machine {
+            backend: "qemu".into(),
+            machine_type: "virt".into(),
+            cpu: "host".into(),
+            hv_version: "test".into(),
+        }
+    }
+
     fn vol(path: &str, host: &str) -> Volume {
         Volume::dir(path, host, None)
     }
@@ -667,7 +675,7 @@ mod tests {
     /// device that opens the guest is not the device running it.
     #[test]
     fn the_key_that_opens_a_guest_follows_the_seed_not_the_cpu() {
-        let mut inst = Instance::new("dev", "laptop", "debian:13", Shape::default(), None);
+        let mut inst = Instance::new("dev", "laptop", "debian:13", Shape::default(), machine());
         // Nothing recorded: the invariant that held before instances could
         // move, which is that the cpu device seeded it.
         assert_eq!(inst.seeded_by(), "laptop");
@@ -698,7 +706,8 @@ mod tests {
     fn a_registry_that_says_anchor_still_names_the_cpu_device() {
         let inst: Instance = serde_json::from_str(
             r#"{"id":"6f1c","name":"dev","anchor":"desktop","status":"stopped",
-                "created_at":1700000000,"volumes":[],"image":"debian:13"}"#,
+                "created_at":1700000000,"volumes":[],"image":"debian:13",
+                "machine":{"backend":"qemu","machine_type":"virt","cpu":"host","hv_version":"test"}}"#,
         )
         .unwrap();
         assert_eq!(inst.cpu_device, "desktop");
@@ -712,7 +721,7 @@ mod tests {
 
     #[test]
     fn every_part_names_the_device_that_supplies_it() {
-        let mut inst = Instance::new("dev", "desktop", "debian:13", Shape::default(), None);
+        let mut inst = Instance::new("dev", "desktop", "debian:13", Shape::default(), machine());
         inst.volumes.push(vol("/tank/media", "nas"));
         let parts = inst.parts();
 
@@ -742,7 +751,7 @@ mod tests {
             "desktop",
             "docker.io/library/nginx:latest",
             Shape::default(),
-            None,
+            machine(),
         );
         inst.image_kind = ImageKind::OciRootfs;
         inst.publish = vec![PortForward { host: 8080, guest: 80 }];
@@ -769,7 +778,8 @@ mod tests {
     fn an_older_record_is_a_disk_with_nothing_published() {
         let inst: Instance = serde_json::from_str(
             r#"{"id":"6f1c","name":"dev","cpu_device":"desktop","status":"stopped",
-                "created_at":1700000000,"volumes":[],"image":"debian:13"}"#,
+                "created_at":1700000000,"volumes":[],"image":"debian:13",
+                "machine":{"backend":"qemu","machine_type":"virt","cpu":"host","hv_version":"test"}}"#,
         )
         .unwrap();
         assert_eq!(inst.image_kind, ImageKind::Disk);
@@ -805,7 +815,7 @@ mod tests {
     /// that is the fact a user needs when something is fenced out.
     #[test]
     fn a_block_volume_reads_as_a_disk_with_a_lease() {
-        let mut inst = Instance::new("dev", "laptop", "debian:13", Shape::default(), None);
+        let mut inst = Instance::new("dev", "laptop", "debian:13", Shape::default(), machine());
         inst.volumes.push(Volume::block("tank", "desktop", 7, 10 << 30));
         let part = inst.parts().into_iter().find(|p| p.kind == "volume").expect("volume");
         assert_eq!(part.source, "desktop");

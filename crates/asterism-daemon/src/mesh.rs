@@ -2559,6 +2559,15 @@ async fn read_frame<T: serde::de::DeserializeOwned>(recv: &mut RecvStream) -> Re
 mod tests {
     use super::*;
 
+    fn test_machine() -> asterism_core::hv::Machine {
+        asterism_core::hv::Machine {
+            backend: "qemu".into(),
+            machine_type: "virt".into(),
+            cpu: "host".into(),
+            hv_version: "test".into(),
+        }
+    }
+
     fn device(addrs: &[&str], relays: &[&str]) -> Device {
         orbit::device_now(
             "desktop",
@@ -2692,8 +2701,13 @@ mod tests {
     }
 
     fn row(name: &str, cpu_device: &str, created_at: u64, live: bool) -> OrbitRow {
-        let mut instance =
-            Instance::new(name, cpu_device, "debian:13", Default::default(), None);
+        let mut instance = Instance::new(
+            name,
+            cpu_device,
+            "debian:13",
+            Default::default(),
+            test_machine(),
+        );
         instance.created_at = created_at;
         OrbitRow { instance, live }
     }
@@ -2778,7 +2792,13 @@ mod tests {
         let mut cache = ShardCache::default();
         assert!(cache.last_seen("desktop").is_empty());
 
-        let shard = vec![Instance::new("dev", "desktop", "debian:13", Default::default(), None)];
+        let shard = vec![Instance::new(
+            "dev",
+            "desktop",
+            "debian:13",
+            Default::default(),
+            test_machine(),
+        )];
         cache.remember("desktop", &shard);
         assert_eq!(cache.last_seen("desktop")[0].name, "dev");
         assert_eq!(cache.last_seen("desktop")[0].cpu_device, "desktop");

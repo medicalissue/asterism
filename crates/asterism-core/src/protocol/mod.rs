@@ -20,6 +20,7 @@ use crate::instance::{Instance, PortForward, Restart, Shape};
 use crate::orbit::{Device, DeviceStatus, WakeFacts};
 use crate::registry::OrbitRow;
 use crate::snapshot::Snapshot;
+use crate::secret::Secret;
 
 mod swap;
 mod wake;
@@ -53,9 +54,10 @@ pub enum Request {
         image: String,
         shape: Shape,
         /// Hypervisor to define the instance against, recorded on it and
-        /// used for every later boot. `None` takes the device's default,
-        /// which is what every `ast create` before `--backend` existed
-        /// sent — so an older CLI's frame still parses.
+        /// used for every later boot. `None` probes VZ first and then QEMU,
+        /// choosing the first runnable backend capable of this request. It is
+        /// also what every `ast create` before `--backend` existed sent, so
+        /// an older CLI's frame still parses.
         #[serde(default)]
         backend: Option<String>,
         /// Guest ports to publish on the loopback of the device supplying
@@ -267,6 +269,31 @@ pub enum Request {
     /// Hand the lease back and stop the export.
     VolumeRelease { volume: String, holder: String },
 
+    // ---- secrets ------------------------------------------------------------
+    // Public operations are orbit-scoped. `secret_source_*` are the narrow
+    // daemon-to-daemon boundary: they run only on the device whose Keychain
+    // holds the bytes and are routable over the existing authenticated mesh.
+    SecretCreate {
+        name: String,
+        value: SecretValue,
+        #[serde(default)]
+        source_device: Option<String>,
+    },
+    SecretList,
+    SecretRemove { name: String },
+    SecretRotate { name: String, value: SecretValue },
+    SecretSourceList,
+    /// Replicate metadata only. This frame can never carry material.
+    SecretSourceSync { secret: Secret },
+    SecretSourcePut { secret: Secret, value: SecretValue },
+    SecretSourceRemove { id: crate::secret::SecretId },
+    SecretSourceRotate {
+        id: crate::secret::SecretId,
+        version: u64,
+        updated_at: u64,
+        value: SecretValue,
+    },
+
     // ---- swapping the cpu part ----------------------------------------------
     //
     // `ast set <instance> cpu <device>` — an offline migration, and in the
@@ -392,6 +419,19 @@ impl Request {
             | Request::VolumeLease { .. }
             | Request::VolumeReconnect { .. }
             | Request::VolumeRelease { .. } => None,
+
+            // Secret names are orbit-scoped, but not instance names. Public
+            // operations are routed by the secret plane; source operations
+            // are explicitly aimed at one source device over the mesh.
+            Request::SecretCreate { .. }
+            | Request::SecretList
+            | Request::SecretRemove { .. }
+            | Request::SecretRotate { .. }
+            | Request::SecretSourceList
+            | Request::SecretSourceSync { .. }
+            | Request::SecretSourcePut { .. }
+            | Request::SecretSourceRemove { .. }
+            | Request::SecretSourceRotate { .. } => None,
 
             // Every step of a cpu-part swap names one device on purpose and
             // is aimed at it. Half of them go to a device that does *not*
@@ -541,6 +581,9 @@ pub enum Response {
         size_bytes: u64,
     },
 
+    // ---- secrets ------------------------------------------------------------
+    Secrets { secrets: Vec<Secret> },
+
     // ---- swapping the cpu part ----------------------------------------------
     /// One line of a move in progress, and whether it was the last one.
     ///
@@ -574,6 +617,35 @@ pub enum Response {
     Error { message: String },
 }
 
+/// Bytes in flight to or from a platform secret store.
+///
+/// Debug output is always redacted, and serde represents the material as a
+/// byte array instead of embedding plaintext in a JSON string. Persistent
+/// metadata types never contain this wrapper at all.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretValue(Vec<u8>);
+
+impl SecretValue {
+    pub fn new(value: Vec<u8>) -> Self {
+        Self(value)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for SecretValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 /// How a daemon that is too old to understand us gives itself away: serde
 /// rejects the request variant it has never heard of, and the daemon dutifully
 /// reports the parse error. Matching on the text is unlovely, but it is the
@@ -596,6 +668,65 @@ mod tests {
         let new: Response =
             serde_json::from_str(r#"{"result":"pong","version":"0.0.2"}"#).unwrap();
         assert!(matches!(new, Response::Pong { version } if version == "0.0.2"));
+    }
+
+    #[test]
+    fn secret_material_is_redacted_and_not_encoded_as_a_plaintext_string() {
+        let request = Request::SecretCreate {
+            name: "api".into(),
+            value: SecretValue::new(b"literal-sensitive-value".to_vec()),
+            source_device: None,
+        };
+        assert!(!format!("{request:?}").contains("literal-sensitive-value"));
+        let wire = serde_json::to_string(&request).unwrap();
+        assert!(!wire.contains("literal-sensitive-value"));
+        let decoded: Request = serde_json::from_str(&wire).unwrap();
+        assert!(matches!(
+            decoded,
+            Request::SecretCreate { value, .. }
+                if value.as_bytes() == b"literal-sensitive-value"
+        ));
+    }
+
+    #[test]
+    fn secret_source_operations_never_route_through_the_instance_namespace() {
+        let id = crate::secret::SecretId::from_name("api").unwrap();
+        let source = crate::secret::SourceDevice {
+            device_id: "source-public-key".into(),
+            device: "desktop".into(),
+            version: 3,
+            updated_at: 3,
+        };
+        let secret = crate::secret::Secret {
+            id,
+            name: "api".into(),
+            version: 3,
+            created_at: 1,
+            updated_at: 3,
+            sources: vec![source.clone()],
+        };
+        assert!(Request::SecretSourceList.subject().is_none());
+        let sync = Request::SecretSourceSync {
+            secret: secret.clone(),
+        };
+        assert!(sync.subject().is_none());
+
+        // The existing mesh proxy envelope preserves the source operation.
+        // It does not consult an instance/cpu device or a global exit.
+        let routed = Request::Proxy {
+            device: source.device.clone(),
+            inner: Box::new(sync),
+        };
+        let wire = serde_json::to_string(&routed).unwrap();
+        let decoded: Request = serde_json::from_str(&wire).unwrap();
+        assert!(matches!(
+            decoded,
+            Request::Proxy { device, inner }
+                if device == "desktop"
+                    && matches!(&*inner, Request::SecretSourceSync { secret }
+                        if secret.sources[0].device_id == "source-public-key"
+                            && secret.version == 3)
+        ));
     }
 
     #[test]

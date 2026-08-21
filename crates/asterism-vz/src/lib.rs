@@ -38,12 +38,21 @@ use serde::{Deserialize, Serialize};
 /// signs it.
 pub const HELPER_BIN: &str = "astd-vz";
 
-/// The one entitlement Virtualization.framework requires. Boolean and
-/// unrestricted: an ad-hoc signature carrying it is enough locally, no
-/// Apple approval involved. Deliberately *not* `com.apple.vm.networking`,
-/// which gates bridged networking and does need Apple's blessing — which is
-/// why the helper uses NAT.
+/// The entitlement Virtualization.framework requires to create a VM.
+/// Boolean and unrestricted: an ad-hoc signature carrying it is enough
+/// locally, with no Apple approval involved. NBD additionally needs
+/// [`NETWORK_CLIENT_ENTITLEMENT`]. Deliberately *not*
+/// `com.apple.vm.networking`, which gates bridged networking and does need
+/// Apple's blessing — which is why the helper uses NAT.
 pub const ENTITLEMENT: &str = "com.apple.security.virtualization";
+
+/// Entitlement required by Virtualization.framework's NBD client.
+///
+/// This is a normal App Sandbox client entitlement, not the restricted
+/// `com.apple.vm.networking` entitlement used by bridged guest networking.
+/// The helper needs it even for `nbd+unix` because the framework classifies
+/// every network-block attachment as an outgoing connection.
+pub const NETWORK_CLIENT_ENTITLEMENT: &str = "com.apple.security.network.client";
 
 /// Everything one helper needs to build and run its guest.
 ///
@@ -78,11 +87,30 @@ pub struct Config {
 }
 
 /// One additional disk to put in front of the guest.
+///
+/// Untagged serialization deliberately keeps the original file-disk JSON
+/// shape (`{"path": ..., "readonly": ...}`) readable across daemon/helper
+/// upgrades. NBD variants have disjoint keys, so old configs remain
+/// unambiguous while a running guest's `vz.json` stays human-readable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Disk {
-    pub path: PathBuf,
-    #[serde(default)]
-    pub readonly: bool,
+#[serde(untagged)]
+pub enum Disk {
+    File {
+        path: PathBuf,
+        #[serde(default)]
+        readonly: bool,
+    },
+    Nbd {
+        url: String,
+        #[serde(default)]
+        readonly: bool,
+    },
+    NbdUnix {
+        socket: PathBuf,
+        export: String,
+        #[serde(default)]
+        readonly: bool,
+    },
 }
 
 impl Config {
@@ -129,8 +157,13 @@ pub enum Command {
 pub enum Reply {
     Info(Info),
     /// The guest is down and the helper is about to exit.
-    Stopped { reason: StopReason, seconds: f64 },
-    Error { message: String },
+    Stopped {
+        reason: StopReason,
+        seconds: f64,
+    },
+    Error {
+        message: String,
+    },
 }
 
 /// What the helper knows about its guest right now.
@@ -172,7 +205,10 @@ impl State {
     /// Is there still a guest to talk to? `Stopping` counts: the VM is
     /// there, it is on its way out.
     pub fn is_live(self) -> bool {
-        matches!(self, State::Starting | State::Running | State::Paused | State::Stopping)
+        matches!(
+            self,
+            State::Starting | State::Running | State::Paused | State::Stopping
+        )
     }
 }
 
@@ -293,7 +329,10 @@ mod tests {
             efi_vars: "/i/dev/efi-vars.bin".into(),
             console: "/i/dev/console.log".into(),
             ctl: "/i/dev/vz.sock".into(),
-            extra_disks: vec![Disk { path: "/vol/data.raw".into(), readonly: true }],
+            extra_disks: vec![Disk::File {
+                path: "/vol/data.raw".into(),
+                readonly: true,
+            }],
             cpus: 2,
             mem_mib: 2048,
             mac: mac_for("dev"),
@@ -315,8 +354,50 @@ mod tests {
     }
 
     #[test]
+    fn old_file_disks_and_new_nbd_transports_round_trip() {
+        let old: Disk =
+            serde_json::from_str(r#"{"path":"/vol/data.raw","readonly":true}"#).unwrap();
+        assert_eq!(
+            old,
+            Disk::File {
+                path: "/vol/data.raw".into(),
+                readonly: true
+            }
+        );
+        assert_eq!(
+            serde_json::to_string(&old).unwrap(),
+            r#"{"path":"/vol/data.raw","readonly":true}"#
+        );
+
+        let unix = Disk::NbdUnix {
+            socket: "/tmp/asterism volume.sock".into(),
+            export: "team/working set".into(),
+            readonly: false,
+        };
+        let json = serde_json::to_string(&unix).unwrap();
+        assert!(
+            json.contains(r#""socket":"/tmp/asterism volume.sock""#),
+            "{json}"
+        );
+        assert!(json.contains(r#""export":"team/working set""#), "{json}");
+        assert_eq!(serde_json::from_str::<Disk>(&json).unwrap(), unix);
+
+        let tcp = Disk::Nbd {
+            url: "nbd://storage:10809/data".into(),
+            readonly: true,
+        };
+        assert_eq!(
+            serde_json::from_str::<Disk>(&serde_json::to_string(&tcp).unwrap()).unwrap(),
+            tcp
+        );
+    }
+
+    #[test]
     fn the_wire_is_one_json_object_per_line() {
-        let cmd = serde_json::to_string(&Command::Stop { timeout_secs: Some(30) }).unwrap();
+        let cmd = serde_json::to_string(&Command::Stop {
+            timeout_secs: Some(30),
+        })
+        .unwrap();
         assert_eq!(cmd, r#"{"cmd":"stop","timeout_secs":30}"#);
         assert!(!cmd.contains('\n'));
         assert_eq!(
@@ -354,7 +435,10 @@ mod tests {
         assert_eq!(StopReason::GuestStopped.to_string(), "guest powered off");
         assert!(StopReason::Forced.to_string().contains("ACPI"));
         assert_eq!(
-            StopReason::Failed { message: "no disk".into() }.to_string(),
+            StopReason::Failed {
+                message: "no disk".into()
+            }
+            .to_string(),
             "failed: no disk"
         );
     }
@@ -362,9 +446,13 @@ mod tests {
     #[test]
     fn calling_a_socket_nobody_is_listening_on_says_so() {
         let dir = tempfile::tempdir().unwrap();
-        let err = call(&dir.path().join("absent.sock"), &Command::Info, Duration::from_millis(50))
-            .unwrap_err()
-            .to_string();
+        let err = call(
+            &dir.path().join("absent.sock"),
+            &Command::Info,
+            Duration::from_millis(50),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("no vz helper listening"), "{err}");
     }
 }
