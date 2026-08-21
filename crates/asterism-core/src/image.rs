@@ -2,7 +2,8 @@
 //!
 //! An image reference is one of:
 //!   - a catalog alias like `ubuntu:24.04` (or bare `ubuntu` for the default)
-//!   - an `http(s)://` URL to a cloud image
+//!   - an `http(s)://` URL to a cloud image, carrying the digest it should
+//!     have: `https://mirror/x.qcow2#sha256:<hex>`
 //!   - a local path to a qcow2 or raw disk image
 //!   - an OCI/Docker reference like `docker.io/library/nginx:latest` (or bare
 //!     `nginx`), booted as a microVM from an ext4 built out of its layers
@@ -16,6 +17,14 @@
 //!
 //! Catalog images and URLs are downloaded once into `~/.asterism/images/`;
 //! local files are used in place.
+//!
+//! Every one of those has something to be checked against before it is
+//! adopted ([`crate::verify`]): a catalog entry carries the digest its
+//! publisher published, an OCI reference is checked against the digests its
+//! manifest names, and a url has to carry one the user wrote. A url with no
+//! digest is refused by [`resolve`] itself — before a directory is made or a
+//! byte is fetched — because there would be nothing to compare the download
+//! to, and "downloaded successfully" is not a check.
 //!
 //! **Base images in the store are raw** (BACKENDS.md §4). Cloud images ship
 //! as qcow2, so a pull downloads one and converts it: `<slug>.qcow2` is a
@@ -104,7 +113,46 @@ impl Resolved {
             );
         }
         verify::check_recorded(&self.path, &self.record, Depth::from_env())
-            .with_context(|| format!("{} cannot be booted from", self.name))
+            .with_context(|| format!("{} cannot be booted from", self.name))?;
+        self.pin_satisfied()
+    }
+
+    /// The store is holding the bytes *this reference* asked for, and not
+    /// merely something that is internally consistent.
+    ///
+    /// The two are different questions and the second one is easy to mistake
+    /// for the first. A url is slugged without its pin — deliberately, so
+    /// that re-pinning is not a second copy of the same image — which means
+    /// `<url>#sha256:aaa` and `<url>#sha256:bbb` name one file in the store.
+    /// Without this, asking for the second on a device holding the first is
+    /// answered "already pulled", and the digest the user typed does nothing
+    /// at all.
+    ///
+    /// What is compared is the *provenance*, not the file: a pin names the
+    /// bytes upstream published, and what is on disk is usually a raw image
+    /// converted out of them. The published digest is the record's parent,
+    /// which is exactly what `derived_from` is for.
+    fn pin_satisfied(&self) -> Result<()> {
+        let Some(want) = &self.expected else { return Ok(()) };
+        let Some(record) = verify::provenance(&self.record) else { return Ok(()) };
+        let want = want.to_string();
+        if record.content.to_string() == want || record.derived_from.contains(&want) {
+            return Ok(());
+        }
+        bail!(
+            "{} is on this device, but it was pulled from a source that published a \
+             different digest than the one asked for.\n\
+             \x20 asked for: {want}\n\
+             \x20 the copy here came from: {}\n\
+             \x20 They are not the same image. Delete it and pull again to fetch the \
+             one you named.",
+            self.name,
+            record
+                .derived_from
+                .first()
+                .cloned()
+                .unwrap_or_else(|| record.content.to_string())
+        )
     }
 
     /// Record what a local file is, so that [`Resolved::verify_bootable`] has
@@ -128,14 +176,23 @@ impl Resolved {
         if self.staging.is_some() || self.oci.is_some() || !self.path.exists() {
             return Ok(());
         }
-        if verify::check_recorded(&self.path, &self.record, Depth::Quick).is_ok() {
+        if verify::check_recorded(&self.path, &self.record, Depth::Quick).is_ok()
+            && self.pin_satisfied().is_ok()
+        {
             return Ok(());
         }
-        verify::record(
-            &self.path,
-            &self.record,
-            Source::new("local-image", &self.path.display().to_string()),
-        )?;
+        // A pin on a local path is the user saying which bytes they mean, so
+        // it is checked here — the one moment they said it — rather than
+        // written down unexamined and compared to itself forever after.
+        let origin = self.path.display().to_string();
+        let mut source = Source::new("local-image", &origin);
+        if let Some(want) = &self.expected {
+            want.verify_file(&self.path, "it").with_context(|| {
+                format!("{} is not the file {want} names", self.path.display())
+            })?;
+            source = source.derived_from([want.to_string()]);
+        }
+        verify::record(&self.path, &self.record, source)?;
         Ok(())
     }
 
@@ -469,7 +526,30 @@ pub fn resolve(reference: &str) -> Result<Resolved> {
     }
 
     if reference.starts_with("http://") || reference.starts_with("https://") {
-        return Ok(stored(reference, Some(reference.to_owned()), pin));
+        // The one source nobody has vouched for. A catalog entry carries the
+        // digest its publisher published; a registry blob carries the one its
+        // manifest names; a file on this disk is already here. A url somebody
+        // typed has none of that, and the only thing that can stand behind it
+        // is the person who typed it.
+        //
+        // So it is refused rather than fetched-and-remembered. Refused *here*,
+        // in a function that reads a string and touches nothing, so that
+        // "unverifiable" is settled before a directory is made, a byte is
+        // downloaded, or anything in the store changes — and the caller does
+        // not have to be trusted to check first.
+        let Some(expected) = pin else {
+            bail!(
+                "nothing publishes a digest for {reference}, and Asterism will not adopt \
+                 bytes it cannot check — nothing was downloaded.\n\
+                 \x20 Pin it to the bytes you mean and it will be verified:\n\
+                 \x20   {reference}#sha256:<hex>\n\
+                 \x20 The digest usually sits next to the image as a SHA256SUMS or \
+                 .sha256 file; sha512 and blake3 are accepted too.\n\
+                 \x20 Or use an image that comes with one: an alias from `ast images`, \
+                 or an OCI reference like docker.io/library/nginx:latest."
+            );
+        };
+        return Ok(stored(reference, Some(reference.to_owned()), Some(expected)));
     }
 
     let path = PathBuf::from(shellexpand_home(reference));
@@ -503,7 +583,8 @@ pub fn resolve(reference: &str) -> Result<Resolved> {
     }
 
     bail!(
-        "unknown image {reference:?} — try an alias from `ast images`, an https:// url, \
+        "unknown image {reference:?} — try an alias from `ast images`, an https:// url \
+         with the digest it should have (`https://mirror/x.qcow2#sha256:<hex>`), \
          a path to a local qcow2 or raw disk image, or an OCI image reference \
          like docker.io/library/nginx:latest"
     );
@@ -601,7 +682,8 @@ mod tests {
 
     #[test]
     fn urls_resolve() {
-        let r = resolve("https://example.com/x.qcow2").unwrap();
+        let pinned = format!("https://example.com/x.qcow2#sha256:{}", "a".repeat(64));
+        let r = resolve(&pinned).unwrap();
         assert_eq!(r.url.as_deref(), Some("https://example.com/x.qcow2"));
         assert_eq!(r.format, DiskFormat::Raw, "the store keeps raw, whatever the url says");
     }
@@ -700,9 +782,21 @@ mod tests {
         let r = resolve(&format!("https://mirror.example/x.qcow2#sha256:{hex}")).unwrap();
         assert_eq!(r.url.as_deref(), Some("https://mirror.example/x.qcow2"));
         assert_eq!(r.expected.as_ref().unwrap().to_string(), format!("sha256:{hex}"));
-        // The pin is not part of the name, so pinning an image does not make
-        // it a different image in the store.
-        assert_eq!(r.path, resolve("https://mirror.example/x.qcow2").unwrap().path);
+        // The pin is not part of the name, so re-pinning the same url to a
+        // digest of a different algorithm is still the same image in the
+        // store rather than a second copy of it.
+        let same = resolve(&format!("https://mirror.example/x.qcow2#blake3:{hex}")).unwrap();
+        assert_eq!(r.path, same.path);
+        assert_eq!(r.name, same.name, "the pin is not part of the name either");
+
+        // All three algorithms this build can compute are accepted.
+        for algo in ["sha256", "blake3"] {
+            let r = resolve(&format!("https://mirror.example/x.qcow2#{algo}:{hex}")).unwrap();
+            assert_eq!(r.expected.unwrap().algo().name(), algo);
+        }
+        let long = "b".repeat(128);
+        let r = resolve(&format!("https://mirror.example/x.qcow2#sha512:{long}")).unwrap();
+        assert_eq!(r.expected.unwrap().algo(), verify::Algo::Sha512);
 
         // A catalog alias takes one too: it is how you pull an image whose
         // publisher has moved the url out from under the entry.
@@ -731,10 +825,13 @@ mod tests {
         };
         assert!(text.contains("pins a digest"), "{text}");
 
-        // And a fragment that was never meant as one is left alone.
-        let r = resolve("https://mirror.example/x.qcow2#anchor").unwrap();
-        assert_eq!(r.url.as_deref(), Some("https://mirror.example/x.qcow2#anchor"));
-        assert!(r.expected.is_none());
+        // A fragment that is not a digest is not read as one, so the url
+        // is simply a url with no pin — and an unpinned url is refused.
+        let text = match resolve("https://mirror.example/x.qcow2#anchor") {
+            Err(e) => format!("{e:#}"),
+            Ok(r) => panic!("an unpinned url resolved to {}", r.name),
+        };
+        assert!(text.contains("nothing publishes a digest"), "{text}");
     }
 
     /// Architecture is a property of the catalog entry, and an entry with
@@ -1058,6 +1155,74 @@ mod tests {
         let container = resolve(&format!("nginx@sha256:{}", "0".repeat(64))).unwrap();
         assert!(!container.is_ours());
         assert!(!container.discard());
+    }
+
+    /// A url is slugged without its pin, so two pins name one file in the
+    /// store. "Is it pulled" and "is the *right* thing pulled" are then
+    /// different questions, and answering only the first makes the digest
+    /// the user typed do nothing.
+    #[test]
+    fn a_reference_pinned_to_other_bytes_does_not_accept_what_is_already_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("url-abc.raw");
+        let staging = dir.path().join("url-abc.qcow2");
+        let served = vec![1u8; 512];
+        let published = verify::Digest::of_bytes(verify::Algo::Sha256, &served);
+        let other = verify::Digest::of_bytes(verify::Algo::Sha256, b"a different build");
+
+        let mut r = Resolved {
+            name: "https://mirror.example/x.qcow2".into(),
+            url: Some("https://mirror.example/x.qcow2".into()),
+            record: path.clone(),
+            path,
+            format: DiskFormat::Raw,
+            staging: Some(staging.clone()),
+            oci: None,
+            expected: Some(published.clone()),
+        };
+        std::fs::write(&staging, &served).unwrap();
+        assert!(r.materialise().unwrap());
+        r.verify_bootable().unwrap();
+
+        // The same store, asked for a different build of the same url.
+        r.expected = Some(other.clone());
+        let text = format!("{:#}", r.verify_bootable().unwrap_err());
+        assert!(text.contains("published a different digest"), "{text}");
+        assert!(text.contains(&other.to_string()), "it names what was asked for: {text}");
+        assert!(text.contains(&published.to_string()), "and what is here: {text}");
+        assert!(text.contains("pull again"), "{text}");
+
+        // Which is what makes `ast pull` fetch it: the copy here is the
+        // store's own, so it is discardable, and the next pull is a real one.
+        assert!(r.is_ours());
+        assert!(r.discard());
+        assert!(!r.path.exists());
+    }
+
+    /// A pin on a local path is checked the moment the user writes it, not
+    /// written down unexamined and then compared to itself forever.
+    #[test]
+    fn a_pin_on_a_local_file_is_checked_when_it_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let theirs = dir.path().join("mine.raw");
+        std::fs::write(&theirs, b"the bytes they meant").unwrap();
+        let right = verify::Digest::of_bytes(verify::Algo::Sha256, b"the bytes they meant");
+        let wrong = verify::Digest::of_bytes(verify::Algo::Sha256, b"some other bytes");
+
+        let mut r = resolve(&format!("{}#{right}", theirs.display())).unwrap();
+        r.record = dir.path().join("store").join("mine");
+        r.record_local().unwrap();
+        r.verify_bootable().unwrap();
+        assert!(verify::provenance(&r.record)
+            .unwrap()
+            .derived_from
+            .contains(&right.to_string()));
+
+        let mut wrongly = resolve(&format!("{}#{wrong}", theirs.display())).unwrap();
+        wrongly.record = r.record.clone();
+        let text = format!("{:#}", wrongly.record_local().unwrap_err());
+        assert!(text.contains("is not the file"), "{text}");
+        assert!(text.contains("does not match its digest"), "{text}");
     }
 
     /// An image in the store that nothing can account for is not booted, and

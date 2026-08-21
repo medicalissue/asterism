@@ -31,10 +31,11 @@
 //! carries a publisher digest: see [`Pinned`], the catalog in
 //! [`crate::image`], and the kernel table in [`crate::oci`]. A registry blob
 //! is checked against the digest its manifest names. A url the *user* typed
-//! is checked if they pin it and recorded-but-unchecked if they do not,
-//! because they named the source and there is nothing else to hold it
-//! against — and Asterism says so out loud rather than implying a check it
-//! did not do.
+//! has nobody to publish one on their behalf, so it must carry the digest
+//! itself (`#sha256:<hex>`) and is refused outright when it does not —
+//! refused by [`crate::image::resolve`], before a byte is fetched or a
+//! directory is made, because there would be nothing to compare a download
+//! against and "downloaded successfully" is not a check.
 //!
 //! ## Surviving the power going out
 //!
@@ -401,9 +402,9 @@ fn mtime_of(meta: &std::fs::Metadata) -> i64 {
 /// cuts a release is the price of the check, and it is the right price.
 ///
 /// A source Asterism did *not* choose — a url the user typed — has no entry
-/// here. That one is verified if the user pins it (`#sha256:<hex>`) and
-/// recorded but unverified if they do not, because they named the source and
-/// there is nothing else to check it against.
+/// here, so the user supplies the digest themselves (`#sha256:<hex>`). A url
+/// with none is refused rather than adopted on trust: see
+/// [`crate::image::resolve`].
 pub struct Pinned {
     pub url: &'static str,
     pub digest: &'static str,

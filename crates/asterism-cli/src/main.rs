@@ -227,9 +227,12 @@ enum Command {
         /// The image to download: an alias, an https:// url, a path, or an
         /// OCI/Docker reference.
         ///
-        /// A url or a path may carry a digest, written as a fragment:
-        /// `https://mirror/x.qcow2#sha256:<hex>`. The download is then
-        /// refused unless it hashes to exactly that.
+        /// A url must carry the digest it should have, written as a
+        /// fragment: `https://mirror/x.qcow2#sha256:<hex>` — sha256, sha512
+        /// and blake3 are accepted. Nothing publishes a digest for an
+        /// arbitrary url on the user's behalf, so an unpinned one is refused
+        /// before anything is downloaded rather than fetched and hoped for.
+        /// A path may carry one too.
         image: String,
     },
     /// Attach a part to an instance: a volume, or a secret.
@@ -1129,18 +1132,11 @@ fn ensure_pulled(reference: &str) -> Result<String> {
         let part = staging.with_extension("qcow2.part");
         let _ = std::fs::remove_file(&part);
         eprintln!("pulling {} ({})", resolved.name, url);
-        match &resolved.expected {
-            Some(want) => eprintln!("it must hash to {want}"),
-            // Said out loud rather than left to be assumed. Every source
-            // Asterism picked — the catalog, the guest kernel, a registry
-            // blob — carries a digest from whoever published it. A url the
-            // user typed has nobody to carry one, so this is the one place
-            // where what arrives is recorded rather than checked, and the
-            // user is the only person who can close that gap.
-            None => eprintln!(
-                "nothing publishes a digest for this url, so Asterism can only record \
-                 what it fetched\n  pin it to check: {url}#sha256:<hex>"
-            ),
+        // Always `Some` by the time a download starts: `image::resolve`
+        // refuses a source with nothing to check it against before any of
+        // this runs.
+        if let Some(want) = &resolved.expected {
+            eprintln!("it must hash to {want}");
         }
         let status = std::process::Command::new("curl")
             .arg("--location")
@@ -1307,7 +1303,8 @@ fn print_images(full: bool) -> Result<()> {
     println!("\nalso accepted: an https:// url, a path to a local qcow2 or raw image, or");
     println!("an OCI/Docker reference — `nginx`, `ghcr.io/owner/app:v1` — booted as a");
     println!("microVM from the image's own filesystem (ast create web --image nginx -p 8080:80)");
-    println!("a url or path may pin its bytes: --image https://mirror/x.qcow2#sha256:<hex>");
+    println!("a url must pin its bytes: --image https://mirror/x.qcow2#sha256:<hex>");
+    println!("(sha256, sha512 and blake3 are accepted; a path may pin its bytes too)");
     Ok(())
 }
 
