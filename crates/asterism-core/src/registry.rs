@@ -23,8 +23,9 @@
 //!   an instance's cpu and ram is a mutable attribute of the instance, not a
 //!   relationship the device has to it.
 //!
-//! Writes go through a temp file + rename so a crash mid-save never leaves a
-//! torn shard.
+//! Writes go through [`crate::durable`], so a crash mid-save never leaves a
+//! torn shard, a shard that never reached the drive, or a shard with no
+//! last-known-good copy beside it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -32,6 +33,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::durable::{self, Loaded};
 use crate::hv::{Handle, ImageKind, Machine};
 use crate::instance::{
     self, now_unix, Conflict, Instance, Moving, Policy, PortForward, Restart, Shape, Status,
@@ -39,10 +41,74 @@ use crate::instance::{
 };
 use crate::secret::Binding;
 
+/// The shard file format this build writes.
+///
+/// Version 1 is `{"version": 1, "instances": {...}}`. What came before it had
+/// no envelope at all — the map on its own — and is still read, then written
+/// back in this shape the first time a shard is loaded. There is nothing to
+/// convert inside the rows themselves; the envelope exists so that the *next*
+/// change of shape can be refused by name instead of arriving as a parse
+/// error.
+pub const SHARD_VERSION: u32 = 1;
+
 /// One device's shard of the orbit registry, persisted as JSON at `path`.
 pub struct Shard {
     path: PathBuf,
     instances: BTreeMap<String, Instance>,
+}
+
+/// What a shard file holds.
+#[derive(Debug, Serialize, Deserialize)]
+struct ShardFile {
+    version: u32,
+    instances: BTreeMap<String, Instance>,
+}
+
+/// Either shape of shard file, decided by what is in the one on disk.
+///
+/// Deliberately *not* `#[serde(untagged)]`, which would be one line shorter
+/// and would replace every diagnosis with "data did not match any variant".
+/// A registry that will not load is exactly the moment a user needs to be
+/// told that the row for `dev` is missing its `machine`, so the shape is
+/// decided by looking for the envelope's `version` key and the chosen shape
+/// then reports its own error.
+///
+/// A file from a *newer* Asterism never reaches here: `durable` reads the
+/// version field before the document and refuses it there.
+#[derive(Debug)]
+enum AnyShard {
+    Current(ShardFile),
+    /// Written by an Asterism before shards were versioned.
+    Legacy(BTreeMap<String, Instance>),
+}
+
+impl<'de> Deserialize<'de> for AnyShard {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> std::result::Result<Self, D::Error> {
+        use serde::de::Error as _;
+        let value = serde_json::Value::deserialize(de)?;
+        // An envelope has a numeric `version`. An instance called "version"
+        // is not a number, so the two cannot be confused.
+        if value.get("version").is_some_and(serde_json::Value::is_number) {
+            serde_json::from_value(value).map(AnyShard::Current).map_err(D::Error::custom)
+        } else {
+            serde_json::from_value(value).map(AnyShard::Legacy).map_err(D::Error::custom)
+        }
+    }
+}
+
+impl AnyShard {
+    /// Whether reading this shard is itself a migration, and so has to be
+    /// written back in the current shape.
+    fn is_legacy(&self) -> bool {
+        matches!(self, AnyShard::Legacy(_))
+    }
+
+    fn into_instances(self) -> BTreeMap<String, Instance> {
+        match self {
+            AnyShard::Current(file) => file.instances,
+            AnyShard::Legacy(instances) => instances,
+        }
+    }
 }
 
 /// One row of the assembled orbit registry, as `ast ls` prints it.
@@ -61,12 +127,23 @@ pub struct OrbitRow {
 
 impl Shard {
     pub fn load(path: &Path) -> Result<Self> {
-        let mut instances: BTreeMap<String, Instance> = match std::fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .with_context(|| format!("corrupt registry shard at {}", path.display()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
-            Err(e) => return Err(e).context("reading this device's registry shard"),
+        let what = "this device's registry shard";
+        let (raw, repaired) = match durable::load_json_versioned::<AnyShard>(
+            path,
+            what,
+            SHARD_VERSION,
+        )? {
+            Some(Loaded { value, repaired }) => (Some(value), repaired),
+            None => (None, None),
         };
+        if let Some(why) = &repaired {
+            // Loud, and on the daemon's log rather than swallowed: the rows
+            // that were in the failed commit are gone, and the user is owed
+            // the chance to notice which.
+            eprintln!("astd: {why}");
+        }
+        let migrated = raw.as_ref().is_some_and(AnyShard::is_legacy);
+        let mut instances = raw.map(AnyShard::into_instances).unwrap_or_default();
         // Entries written before instances carried a Handle are folded into
         // the current shape here, so nothing downstream has to know that an
         // older format ever existed.
@@ -74,19 +151,24 @@ impl Shard {
             inst.migrate_legacy();
         }
         let mut shard = Self { path: path.to_owned(), instances };
-        if shard.adopt_policy_sidecars() {
-            // Written back now rather than at the next mutation: the files
-            // have just been deleted, and a daemon that read them and then
-            // died without saving would have lost what they said.
+        // A shard that was recovered from its backup, or that arrived in the
+        // pre-envelope shape, is written back now rather than at the next
+        // mutation: a daemon that read it and then died would otherwise do
+        // the same recovery again, and the second time the backup may be the
+        // broken file.
+        if repaired.is_some() || migrated {
             if let Err(e) = shard.save() {
-                eprintln!("astd: saving the registry after folding in policy.json: {e:#}");
+                eprintln!("astd: could not write the repaired registry back: {e:#}");
             }
+        }
+        if let Err(e) = shard.adopt_policy_sidecars() {
+            eprintln!("astd: folding policy.json into the registry: {e:#}");
         }
         Ok(shard)
     }
 
     /// Fold each instance's `policy.json` into the instance, once, and
-    /// delete the file. Reports whether anything moved.
+    /// delete the file.
     ///
     /// The restart policy was a sidecar while the registry was being
     /// rewritten for orbit-global namespaces; it is a field on the instance
@@ -97,9 +179,17 @@ impl Shard {
     /// The directory is derived from the shard's own path rather than from
     /// `ASTERISM_HOME`, so a shard loaded from anywhere reads (and deletes)
     /// only the sidecars that belong to it.
-    fn adopt_policy_sidecars(&mut self) -> bool {
-        let Some(home) = self.path.parent().map(Path::to_owned) else { return false };
-        let mut moved = false;
+    ///
+    /// **The order matters.** The shard is committed *before* a single
+    /// sidecar is deleted, so a migration interrupted anywhere is a migration
+    /// that runs again from the start: either the policies are in the shard
+    /// (and the leftover files say the same thing, and are re-read to the
+    /// same values), or they are not and the files are all still there. The
+    /// other order — delete, then save — loses a hand-set `never` to a
+    /// `kill -9` in between.
+    fn adopt_policy_sidecars(&mut self) -> Result<()> {
+        let Some(home) = self.path.parent().map(Path::to_owned) else { return Ok(()) };
+        let mut adopted: Vec<PathBuf> = Vec::new();
         for (name, inst) in self.instances.iter_mut() {
             let path = home.join("instances").join(name).join("policy.json");
             if !path.exists() {
@@ -123,20 +213,25 @@ impl Shard {
                     path.display()
                 ),
             }
-            let _ = std::fs::remove_file(&path);
-            moved = true;
+            adopted.push(path);
         }
-        moved
+        if adopted.is_empty() {
+            return Ok(());
+        }
+        self.save().context("saving the registry after folding in policy.json")?;
+        for path in adopted {
+            let _ = std::fs::remove_file(path);
+        }
+        Ok(())
     }
 
     pub fn save(&self) -> Result<()> {
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&self.instances)?)?;
-        std::fs::rename(&tmp, &self.path).context("committing this device's registry shard")?;
-        Ok(())
+        let file = ShardFile {
+            version: SHARD_VERSION,
+            instances: self.instances.clone(),
+        };
+        durable::commit_json(&self.path, &file)
+            .context("committing this device's registry shard")
     }
 
     /// Define an instance in this shard, sourcing its cpu and ram from
@@ -839,7 +934,8 @@ mod tests {
         shard.save().unwrap();
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        let saved = &raw["dev"];
+        assert_eq!(raw["version"], SHARD_VERSION, "and in the current envelope");
+        let saved = &raw["instances"]["dev"];
         assert!(saved.get("handle").is_some());
         assert_eq!(saved["cpu_device"], "laptop");
         assert!(saved.get("anchor").is_none(), "the old key is not written back: {saved}");
@@ -850,6 +946,172 @@ mod tests {
         // ...and the migrated file loads to the same thing.
         let again = Shard::load(&path).unwrap();
         assert_eq!(again.get("dev").unwrap().handle, shard.get("dev").unwrap().handle);
+    }
+
+    // ---- crash recovery ----------------------------------------------------
+    //
+    // The primitive is proved in `durable`; these are the claims that only
+    // mean something at this level, where the value is a registry.
+
+    fn shard_with(path: &Path, names: &[&str]) -> Shard {
+        let mut shard = Shard::load(path).unwrap();
+        for name in names {
+            shard.create(name, "laptop", "debian:13", Shape::default(), machine()).unwrap();
+        }
+        shard.save().unwrap();
+        shard
+    }
+
+    /// `kill -9` during the save: the shard on disk is the one committed
+    /// before it, every row of it, and the staging file is swept.
+    #[test]
+    fn a_shard_killed_mid_save_converges_on_the_last_committed_rows() {
+        let path = scratch();
+        let mut shard = shard_with(&path, &["one"]);
+        shard.create("two", "laptop", "debian:13", Shape::default(), machine()).unwrap();
+
+        let armed = durable::faults::arm(
+            "shard-kill",
+            durable::faults::Point::Rename,
+            path.display().to_string(),
+            std::io::ErrorKind::Other,
+        );
+        assert!(shard.save().is_err(), "the commit did not land");
+        drop(armed);
+
+        let swept = durable::sweep_temporaries(path.parent().unwrap());
+        assert_eq!(swept, vec![durable::tmp_path(&path)]);
+
+        let reloaded = Shard::load(&path).unwrap();
+        assert!(reloaded.holds("one"));
+        assert!(!reloaded.holds("two"), "a row from a commit that never landed is not a row");
+    }
+
+    /// ENOSPC: the save fails and says so, and the registry that was on disk
+    /// is untouched. An instance is not silently forgotten because a disk
+    /// filled up.
+    #[test]
+    fn a_full_disk_does_not_cost_the_registry() {
+        let path = scratch();
+        let mut shard = shard_with(&path, &["one"]);
+        shard.create("two", "laptop", "debian:13", Shape::default(), machine()).unwrap();
+
+        let armed = durable::faults::arm_errno(
+            "shard-enospc",
+            durable::faults::Point::Write,
+            path.display().to_string(),
+            libc::ENOSPC,
+        );
+        let err = shard.save().unwrap_err();
+        assert!(format!("{err:#}").contains("registry shard"), "{err:#}");
+        drop(armed);
+
+        let reloaded = Shard::load(&path).unwrap();
+        assert!(reloaded.holds("one"));
+        assert!(!reloaded.holds("two"));
+    }
+
+    /// A shard truncated by the filesystem is repaired from the copy the last
+    /// commit left, and the repaired file is written back — so the next boot
+    /// finds a healthy registry rather than doing the same recovery against a
+    /// backup that is now the only copy.
+    #[test]
+    fn a_truncated_shard_is_repaired_and_written_back() {
+        let path = scratch();
+        let mut shard = shard_with(&path, &["one"]);
+        shard.create("two", "laptop", "debian:13", Shape::default(), machine()).unwrap();
+        shard.save().unwrap();
+
+        let whole = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, &whole[..whole.len() / 3]).unwrap();
+
+        let reloaded = Shard::load(&path).unwrap();
+        assert!(reloaded.holds("one"), "the commit before the damage is what survives");
+        // Written back on load, in the current shape, with no hand-editing.
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw["version"], SHARD_VERSION);
+        assert!(raw["instances"]["one"].is_object());
+    }
+
+    /// Both copies unreadable is the ambiguous case, and it is refused. An
+    /// empty shard would tell the rest of the daemon that this device runs
+    /// nothing, and the guests would still be running.
+    #[test]
+    fn a_shard_with_no_readable_copy_is_refused_with_a_repair_path() {
+        let path = scratch();
+        let mut shard = shard_with(&path, &["one"]);
+        shard.create("two", "laptop", "debian:13", Shape::default(), machine()).unwrap();
+        shard.save().unwrap();
+
+        std::fs::write(&path, b"{\"instances\": ").unwrap();
+        std::fs::write(durable::backup_path(&path), b"neither is this").unwrap();
+
+        let err = Shard::load(&path).err().expect("an unreadable pair is refused");
+        let text = format!("{err:#}");
+        assert!(text.contains("will not guess"), "{text}");
+        assert!(text.contains("To repair"), "{text}");
+    }
+
+    /// The policy sidecar migration, interrupted between the save and the
+    /// deletes — the window a `kill -9` fits in. Re-running it lands on the
+    /// same registry: the files say what the shard already says.
+    #[test]
+    fn a_half_finished_policy_migration_runs_again_to_the_same_place() {
+        let path = scratch();
+        let home = path.parent().unwrap().to_owned();
+        shard_with(&path, &["kept-up", "left-down"]);
+
+        let sidecar = |name: &str| home.join("instances").join(name).join("policy.json");
+        for name in ["kept-up", "left-down"] {
+            std::fs::create_dir_all(sidecar(name).parent().unwrap()).unwrap();
+        }
+        std::fs::write(sidecar("kept-up"), r#"{"restart":"always","max_attempts":9}"#).unwrap();
+        std::fs::write(sidecar("left-down"), r#"{"restart":"never"}"#).unwrap();
+
+        // First load folds them in and deletes the files.
+        let once = Shard::load(&path).unwrap();
+        assert_eq!(once.get("left-down").unwrap().policy.restart, Restart::Never);
+
+        // Now put one back, which is exactly what a crash between the commit
+        // and the unlink leaves: the shard already says it, and the file is
+        // still there saying the same thing.
+        std::fs::create_dir_all(sidecar("left-down").parent().unwrap()).unwrap();
+        std::fs::write(sidecar("left-down"), r#"{"restart":"never"}"#).unwrap();
+
+        let twice = Shard::load(&path).unwrap();
+        assert_eq!(twice.get("left-down").unwrap().policy.restart, Restart::Never);
+        assert_eq!(twice.get("kept-up").unwrap().policy.max_attempts, 9);
+        assert!(!sidecar("left-down").exists(), "and the second pass finished the job");
+    }
+
+    /// The other half of that ordering: a migration whose commit fails keeps
+    /// every sidecar, so nothing has been read and then thrown away.
+    #[test]
+    fn a_policy_migration_that_cannot_commit_keeps_the_sidecars() {
+        let path = scratch();
+        let home = path.parent().unwrap().to_owned();
+        shard_with(&path, &["left-down"]);
+        let sidecar = home.join("instances").join("left-down").join("policy.json");
+        std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        std::fs::write(&sidecar, r#"{"restart":"never"}"#).unwrap();
+
+        let armed = durable::faults::arm_errno(
+            "policy-enospc",
+            durable::faults::Point::Write,
+            path.display().to_string(),
+            libc::ENOSPC,
+        );
+        // Load still succeeds — a daemon that will not start because a
+        // migration could not be written is worse than one that retries it
+        // next time — but it must not have deleted what it could not save.
+        let _ = Shard::load(&path).unwrap();
+        drop(armed);
+
+        assert!(sidecar.exists(), "the sidecar is the only copy of what it says");
+        let retried = Shard::load(&path).unwrap();
+        assert_eq!(retried.get("left-down").unwrap().policy.restart, Restart::Never);
+        assert!(!sidecar.exists());
     }
 
     /// A stopped pre-Handle entry has no pid, and must not grow a handle.

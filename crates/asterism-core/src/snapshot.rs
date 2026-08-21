@@ -25,6 +25,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::cow;
+use crate::durable;
 use crate::hv::SnapshotId;
 use crate::instance::now_unix;
 
@@ -203,7 +204,7 @@ pub fn restore(instance_dir: &Path, disk: &Path, tag: &str) -> Result<()> {
         if let Some(warning) = how.warning(&source, &staged) {
             eprintln!("astd: {warning}");
         }
-        std::fs::rename(&staged, disk)
+        durable::publish_file(&staged, disk)
             .with_context(|| format!("replacing {} with snapshot {tag:?}", disk.display()))
     });
     if result.is_ok() {
@@ -259,6 +260,54 @@ fn mark_restoring(instance_dir: &Path, tag: &str) {
 
 fn clear_restoring(instance_dir: &Path) {
     let _ = std::fs::remove_file(restoring_path(instance_dir));
+}
+
+/// Settle a restore that a crash interrupted. Run once per instance at
+/// daemon start; returns a line to log when there was something to settle.
+///
+/// A restore is a clone beside the disk followed by a rename over it, so an
+/// interrupted one leaves the marker and — crucially — tells us *which side*
+/// of the rename it stopped on:
+///
+/// * the staged clone is still there, so the rename never happened: the disk
+///   is byte for byte what it was, and the restore simply did not occur. The
+///   clone goes and the user is told to run it again.
+/// * the staged clone is gone, so the rename did happen: the disk *is* the
+///   snapshot, and all that is left over is the marker.
+///
+/// Either way the instance is bootable and the marker stops blocking
+/// `ast snapshot rm`. There is deliberately no third outcome where this
+/// guesses — the two states are distinguishable, which is the reason the
+/// marker is written before the clone starts rather than after.
+pub fn converge(instance_dir: &Path) -> Option<String> {
+    let tag = restoring(instance_dir)?;
+    let staged = staged_clone(instance_dir);
+    clear_restoring(instance_dir);
+    match staged {
+        Some(path) => {
+            let _ = std::fs::remove_file(&path);
+            Some(format!(
+                "a restore of snapshot {tag:?} was interrupted before it replaced the \
+                 disk — the disk is exactly as it was, and the half-made copy has been \
+                 removed. Run the restore again to roll back."
+            ))
+        }
+        None => Some(format!(
+            "a restore of snapshot {tag:?} finished but was interrupted before it \
+             said so — the disk is the snapshot, and the marker has been cleared."
+        )),
+    }
+}
+
+/// The `<disk>.restoring` clone a restore builds, whatever the disk is
+/// called. Found by extension rather than by name so this stays true for any
+/// backend's disk layout.
+fn staged_clone(instance_dir: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(instance_dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e == "restoring"))
 }
 
 // ---- qcow2 internal snapshots (legacy instances) ---------------------------
@@ -409,6 +458,63 @@ mod tests {
     /// A restore that was interrupted leaves a disk that is not finished and
     /// a snapshot that is the only copy of what it was being rebuilt from.
     /// Deleting that snapshot would leave the instance with neither.
+    /// A restore killed before the rename: the disk is untouched, and the
+    /// convergence at the next daemon start says so and clears the way.
+    #[test]
+    fn a_restore_killed_before_the_rename_leaves_the_disk_alone() {
+        let (dir, disk) = instance_with_disk(b"pristine");
+        take(dir.path(), &disk, "clean").unwrap();
+        std::fs::write(&disk, b"diverged").unwrap();
+
+        let armed = crate::durable::faults::arm(
+            "restore-kill",
+            crate::durable::faults::Point::Rename,
+            disk.display().to_string(),
+            std::io::ErrorKind::Other,
+        );
+        assert!(restore(dir.path(), &disk, "clean").is_err());
+        drop(armed);
+
+        assert_eq!(std::fs::read(&disk).unwrap(), b"diverged", "the disk was never replaced");
+        assert_eq!(restoring(dir.path()).as_deref(), Some("clean"), "and it is still pinned");
+
+        let said = converge(dir.path()).expect("there was something to settle");
+        assert!(said.contains("interrupted before it replaced the disk"), "{said}");
+        assert_eq!(restoring(dir.path()), None, "the snapshot is unpinned again");
+        assert!(!disk.with_extension("restoring").exists(), "the half-made copy is gone");
+        assert_eq!(std::fs::read(&disk).unwrap(), b"diverged");
+
+        // And the restore can simply be run again.
+        restore(dir.path(), &disk, "clean").unwrap();
+        assert_eq!(std::fs::read(&disk).unwrap(), b"pristine");
+    }
+
+    /// The other side of the same rename: it landed, and only the marker was
+    /// left. The disk is the snapshot, and convergence says so rather than
+    /// telling the user to redo work that is already done.
+    #[test]
+    fn a_restore_killed_after_the_rename_is_recognised_as_finished() {
+        let (dir, disk) = instance_with_disk(b"pristine");
+        take(dir.path(), &disk, "clean").unwrap();
+        restore(dir.path(), &disk, "clean").unwrap();
+        // What a crash between the rename and clearing the marker leaves.
+        std::fs::write(dir.path().join("snapshots/.restoring"), "clean").unwrap();
+
+        let said = converge(dir.path()).expect("there was something to settle");
+        assert!(said.contains("the disk is the snapshot"), "{said}");
+        assert_eq!(restoring(dir.path()), None);
+        assert_eq!(std::fs::read(&disk).unwrap(), b"pristine");
+    }
+
+    /// Nothing to settle is not a message. A daemon start on a healthy
+    /// device says nothing at all.
+    #[test]
+    fn an_instance_with_no_interrupted_restore_is_left_alone() {
+        let (dir, disk) = instance_with_disk(b"pristine");
+        take(dir.path(), &disk, "clean").unwrap();
+        assert!(converge(dir.path()).is_none());
+    }
+
     #[test]
     fn a_snapshot_a_restore_is_reading_from_cannot_be_deleted() {
         let (dir, disk) = instance_with_disk(b"pristine");

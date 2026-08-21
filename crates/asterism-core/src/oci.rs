@@ -61,6 +61,7 @@ use std::process::{Command, Stdio};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
+use crate::durable;
 use crate::image::host_arch;
 use crate::paths;
 use crate::tools::{output, run, tool};
@@ -638,7 +639,10 @@ impl<'a> Registry<'a> {
             let _ = std::fs::remove_file(&part);
             bail!("downloading {digest} from {}", self.reference.registry);
         }
-        std::fs::rename(&part, &path)?;
+        // Forced down and then renamed: a blob is addressed by its digest,
+        // and a digest-named file that is half a blob is a lie every later
+        // pull would believe.
+        durable::publish_file(&part, &path)?;
         Ok(path)
     }
 }
@@ -1090,7 +1094,7 @@ fn build_ext4(root: &Path, tree: &Tree, image: &Path, digest: &str) -> Result<()
     .with_context(|| format!("building an ext4 filesystem for {digest}"))?;
 
     apply_ownership(tree, &part)?;
-    std::fs::rename(&part, image)?;
+    durable::publish_file(&part, image)?;
     Ok(())
 }
 
@@ -1204,7 +1208,7 @@ pub fn ensure_kernel(fetch: impl Fn(&str, &Path) -> Result<()>) -> Result<bool> 
         }
         let part = dest.with_extension("part");
         fetch(url, &part).with_context(|| format!("fetching the guest kernel from {url}"))?;
-        std::fs::rename(&part, dest)?;
+        durable::publish_file(&part, dest)?;
     }
     Ok(true)
 }

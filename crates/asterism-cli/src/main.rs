@@ -1109,7 +1109,10 @@ fn ensure_pulled(reference: &str) -> Result<String> {
             let _ = std::fs::remove_file(&part);
             bail!("download failed for {url}");
         }
-        std::fs::rename(&part, staging)?;
+        // A base image that everything on this device clones from is worth
+        // forcing down before it takes its final name: half a cloud image
+        // under the name of a whole one is a boot failure with no clue in it.
+        asterism_core::durable::publish_file(&part, staging)?;
     }
 
     // Converting an image already in the store is how a cache written by an

@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::durable::{self, Loaded};
 use crate::instance::{local_host, now_unix};
 
 /// Format version of `orbit.json`, so a later shape is distinguishable
@@ -293,15 +294,26 @@ struct OrbitFile {
 impl Orbit {
     /// Loads the store, or starts an empty one named after this host.
     pub fn load(path: &Path) -> Result<Self> {
-        let file: OrbitFile = match std::fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .with_context(|| format!("corrupt orbit store at {}", path.display()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => OrbitFile {
+        // A newer format is refused inside `durable`, by version, before the
+        // document is parsed — an orbit store from a future Asterism holds
+        // trust this build would silently drop.
+        let loaded =
+            durable::load_json_versioned::<OrbitFile>(path, "the orbit store", ORBIT_VERSION)?;
+        let file = match loaded {
+            Some(Loaded { value, repaired }) => {
+                if let Some(why) = repaired {
+                    // The devices in the failed commit are the ones a user
+                    // will find missing, so this is said rather than logged
+                    // quietly and forgotten.
+                    eprintln!("astd: {why}");
+                }
+                value
+            }
+            None => OrbitFile {
                 version: ORBIT_VERSION,
                 self_name: local_host(),
                 devices: Vec::new(),
             },
-            Err(e) => return Err(e).context("reading the orbit store"),
         };
         if file.version != ORBIT_VERSION {
             bail!(
@@ -319,18 +331,12 @@ impl Orbit {
 
     /// Persists the store.
     pub fn save(&self) -> Result<()> {
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
         let file = OrbitFile {
             version: ORBIT_VERSION,
             self_name: self.self_name.clone(),
             devices: self.devices.clone(),
         };
-        let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&file)?)?;
-        std::fs::rename(&tmp, &self.path).context("committing the orbit store")?;
-        Ok(())
+        durable::commit_json(&self.path, &file).context("committing the orbit store")
     }
 
     /// What this device calls itself.
@@ -778,12 +784,62 @@ mod tests {
         }
     }
 
+    /// A pairing whose commit was killed leaves the orbit exactly as it was.
+    /// Half a trust relationship is the one shape that must not exist: a
+    /// device this one would answer but not dial, or the reverse.
+    #[test]
+    fn a_pairing_killed_mid_commit_leaves_the_orbit_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orbit.json");
+        let mut o = orbit(dir.path());
+        o.add(peer("desktop", "aa")).unwrap();
+        o.save().unwrap();
+
+        o.add(peer("nas", "bb")).unwrap();
+        let armed = durable::faults::arm(
+            "orbit-kill",
+            durable::faults::Point::Rename,
+            path.display().to_string(),
+            std::io::ErrorKind::Other,
+        );
+        assert!(o.save().is_err());
+        drop(armed);
+        assert_eq!(durable::sweep_temporaries(dir.path()), vec![durable::tmp_path(&path)]);
+
+        let reloaded = Orbit::load(&path).unwrap();
+        assert!(reloaded.trusts("aa"));
+        assert!(!reloaded.trusts("bb"), "a pairing that did not commit is not a pairing");
+    }
+
+    /// A torn orbit store is repaired from the last-known-good copy rather
+    /// than read as "this device trusts nobody" — which would silently leave
+    /// the orbit and need every device paired again by hand.
+    #[test]
+    fn a_torn_orbit_store_is_repaired_rather_than_read_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orbit.json");
+        let mut o = orbit(dir.path());
+        o.add(peer("desktop", "aa")).unwrap();
+        o.save().unwrap();
+        o.add(peer("nas", "bb")).unwrap();
+        o.save().unwrap();
+
+        let whole = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, &whole[..whole.len() / 2]).unwrap();
+
+        let reloaded = Orbit::load(&path).unwrap();
+        assert!(reloaded.trusts("aa"), "the devices from the commit before are still trusted");
+    }
+
     #[test]
     fn a_future_format_version_is_refused_rather_than_misread() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("orbit.json");
         std::fs::write(&path, r#"{"version":99,"self_name":"x","devices":[]}"#).unwrap();
         let err = Orbit::load(&path).unwrap_err().to_string();
-        assert!(err.contains("orbit format 99"), "{err}");
+        assert!(err.contains("version 99"), "{err}");
+        // And the refusal says what to do about it, rather than only that
+        // something is wrong.
+        assert!(err.contains("upgrade Asterism"), "{err}");
     }
 }

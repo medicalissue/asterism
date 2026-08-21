@@ -1051,21 +1051,14 @@ fn ca_params(instance: &str) -> Result<rcgen::CertificateParams> {
 }
 
 /// Write a private key where only this user can read it.
+///
+/// Through the durable commit rather than straight at the path: this is an
+/// instance's CA key, the guest is pinned to the certificate it signs, and a
+/// key file that is half-written is an instance whose egress proxy will not
+/// start until someone deletes it by hand.
 fn write_private(path: &std::path::Path, pem: &str) -> Result<()> {
-    use std::io::Write;
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).truncate(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("writing {}", path.display()))?;
-    file.write_all(pem.as_bytes())?;
-    file.sync_all()?;
-    Ok(())
+    asterism_core::durable::commit_private(path, pem.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 #[cfg(test)]

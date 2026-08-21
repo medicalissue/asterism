@@ -13,14 +13,13 @@
 //! is somebody else's maintained code all the way down.
 
 use std::collections::BTreeMap;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use asterism_core::durable::{self, Loaded};
 use asterism_core::instance::now_unix;
 use asterism_core::paths;
 use asterism_core::protocol::{EgressRequest, EgressResponse, Request, Response, SecretValue};
@@ -125,14 +124,24 @@ struct Catalog {
 
 impl Catalog {
     fn load(path: &Path) -> Result<Self> {
-        let file = match std::fs::read(path) {
-            Ok(bytes) => serde_json::from_slice::<CatalogFile>(&bytes)
-                .with_context(|| format!("corrupt secret metadata at {}", path.display()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => CatalogFile {
-                version: CATALOG_VERSION,
-                secrets: Vec::new(),
-            },
-            Err(e) => return Err(e).context("reading secret metadata"),
+        let loaded = durable::load_json_versioned::<CatalogFile>(
+            path,
+            "secret metadata",
+            CATALOG_VERSION,
+        )?;
+        let file = match loaded {
+            Some(Loaded { value, repaired }) => {
+                if let Some(why) = repaired {
+                    // The values themselves are in the platform store and are
+                    // untouched by any of this; what a repair can cost is the
+                    // *binding* written by the last commit, which is why the
+                    // user is told rather than left to find a guest that
+                    // cannot see its secret.
+                    eprintln!("astd: {why}");
+                }
+                value
+            }
+            None => CatalogFile { version: CATALOG_VERSION, secrets: Vec::new() },
         };
         if file.version != CATALOG_VERSION {
             bail!(
@@ -148,34 +157,14 @@ impl Catalog {
     }
 
     fn save(&self) -> Result<()> {
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
         let file = CatalogFile {
             version: CATALOG_VERSION,
             secrets: self.secrets.clone(),
         };
-        let tmp = self.path.with_extension("json.tmp");
-        #[cfg(unix)]
-        let mut out = {
-            use std::os::unix::fs::OpenOptionsExt;
-            OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .mode(0o600)
-                .open(&tmp)?
-        };
-        #[cfg(not(unix))]
-        let mut out = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp)?;
-        out.write_all(&serde_json::to_vec_pretty(&file)?)?;
-        out.sync_all()?;
-        std::fs::rename(&tmp, &self.path).context("committing secret metadata")?;
-        Ok(())
+        // Private from the first byte: the catalog names authorities and
+        // handles, and which instance is bound to which credential is not
+        // for a second user on this machine to read.
+        durable::commit_json_private(&self.path, &file).context("committing secret metadata")
     }
 }
 
@@ -1251,6 +1240,54 @@ mod tests {
 
     fn local_plane(path: &Path, device_id: &str, store: MemoryStore) -> SecretPlane {
         SecretPlane::new(device_id.into(), path.to_owned(), Box::new(store)).unwrap()
+    }
+
+    /// The catalog is metadata, not material: the values are in the platform
+    /// store and a torn catalog cannot reach them. What a repair recovers is
+    /// which secret exists and which instance is bound to it, and doing that
+    /// beats starting empty — an empty catalog would read as "this device
+    /// holds no secrets" while the keychain still held every one of them.
+    #[test]
+    fn a_torn_catalog_is_repaired_from_the_last_known_good() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.json");
+        let lineage = ValueRevision::mint();
+        let plane = local_plane(&path, "laptop", MemoryStore::default());
+        plane.put(secret(1, vec![source("laptop", 1, &lineage)]), &value(b"v1")).unwrap();
+        // A second secret, so there is a second commit and therefore a
+        // last-known-good copy holding only the first.
+        let other = Secret {
+            id: SecretId::from_name("other").unwrap(),
+            name: "other".into(),
+            ..secret(1, vec![source("laptop", 1, &ValueRevision::mint())])
+        };
+        plane.put(other, &value(b"v2")).unwrap();
+
+        let whole = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, &whole[..whole.len() / 2]).unwrap();
+
+        let recovered = Catalog::load(&path).expect("a torn catalog is repaired, not fatal");
+        assert_eq!(recovered.secrets.len(), 1);
+        assert_eq!(recovered.secrets[0].name, "api");
+    }
+
+    /// And the catalog it writes is only readable by its owner, from the
+    /// first byte — the commit sets the mode on the open, so there is no
+    /// window where a second user could read which authorities this device
+    /// holds credentials for.
+    #[test]
+    fn the_catalog_is_private_from_the_first_byte() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.json");
+        let lineage = ValueRevision::mint();
+        let plane = local_plane(&path, "laptop", MemoryStore::default());
+        plane.put(secret(1, vec![source("laptop", 1, &lineage)]), &value(b"v1")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 
     #[test]

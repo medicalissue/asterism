@@ -72,6 +72,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use asterism_core::cow;
+use asterism_core::durable;
 use asterism_core::hv::ImageRef;
 use asterism_core::instance::{now_unix, Instance, Moving, Status, VolumeKind};
 use asterism_core::paths;
@@ -218,6 +219,11 @@ fn is_plumbing(name: &str) -> bool {
         || name.ends_with(".pid")
         || name.ends_with(".sock")
         || name.ends_with(".tmp")
+        // The last-known-good copy a durable commit leaves is this device's
+        // recovery artifact, not part of the instance — and for the egress
+        // CA key it is a *superseded private key*, which is the last thing
+        // that should ride to another machine.
+        || name.ends_with(".bak")
         || name.ends_with(".part")
 }
 
@@ -679,9 +685,14 @@ pub fn commit_target(
     // The rename first, then the receipt: a rename that fails leaves the
     // staging directory exactly as it was, receipt included, so the move can
     // be aborted or retried against something that still adds up.
-    if let Err(e) = std::fs::rename(&staging, &live) {
+    //
+    // Every byte of the tree is forced down before the rename. This is the
+    // one moment a second copy of the instance exists, and the source is
+    // about to be told it can stop existing: a disk still sitting in the page
+    // cache when the power goes is a move that lost the instance.
+    if let Err(e) = durable::publish_dir(&staging, &live) {
         return error(anyhow!(
-            "could not adopt {}: {e} — it is still staged and still not bootable",
+            "could not adopt {}: {e:#} — it is still staged and still not bootable",
             staging.display()
         ));
     }
@@ -788,13 +799,11 @@ fn remember_move(name: &str, to_device: &str, epoch: u64) {
         name.to_owned(),
         MovedNote { to_device: to_device.to_owned(), epoch, at: now },
     );
-    if let Ok(bytes) = serde_json::to_vec_pretty(&notes) {
-        let path = notes_path();
-        let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, bytes).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
-        }
-    }
+    // Best effort by design: a note is a courtesy to whoever types
+    // `ast status` at the old device, and losing it costs a redirect, not an
+    // instance. It is still committed durably, because the alternative is a
+    // torn file that the next read has to treat as a lost note anyway.
+    let _ = durable::commit_json(&notes_path(), &notes);
 }
 
 /// What this device has to say about an instance it no longer holds.
@@ -1131,7 +1140,14 @@ mod tests {
 
     #[test]
     fn the_files_a_move_carries_leave_this_devices_plumbing_behind() {
-        for junk in ["console.log", "qemu.pid", "qmp.sock", "disk.raw.part", ".move-receipt.json"] {
+        for junk in [
+            "console.log",
+            "qemu.pid",
+            "qmp.sock",
+            "disk.raw.part",
+            "egress-ca.key.bak",
+            ".move-receipt.json",
+        ] {
             assert!(is_plumbing(junk), "{junk} belongs to this device, not to the guest");
         }
         for carried in ["disk.raw", "efi-vars.fd", "seed.iso", "seed.stamp", "clean.raw"] {

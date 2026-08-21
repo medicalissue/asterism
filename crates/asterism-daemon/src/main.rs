@@ -105,6 +105,14 @@ async fn main() -> Result<()> {
     let listener =
         UnixListener::bind(&sock).with_context(|| format!("binding {}", sock.display()))?;
 
+    // Now, and not before, this process has proved it is the only daemon on
+    // this home — the bind is the mutex, so nothing here can be tidying up
+    // after a daemon that is still running. Both of these are crash cleanup:
+    // the staging file of a commit that never published, and the marker of a
+    // disk restore that never finished.
+    sweep_interrupted_commits();
+    converge_restores(&node).await;
+
     // The pid file is how an `ast` newer than this daemon retires it: the
     // socket says something is listening, but only a pid can be acted on.
     let pidfile = paths::daemon_pid_path();
@@ -179,6 +187,49 @@ async fn main() -> Result<()> {
                 eprintln!("astd: shutting down");
                 return Ok(());
             }
+        }
+    }
+}
+
+/// Settle every instance whose disk restore was interrupted.
+///
+/// A restore is the one state change that is not a file this daemon commits:
+/// it is a clone of a snapshot renamed over a running instance's disk. A
+/// crash in the middle leaves a marker, and until it is settled the snapshot
+/// it was reading from cannot be deleted. Which side of the rename it stopped
+/// on is readable from the directory, so this converges rather than guesses —
+/// see [`asterism_core::snapshot::converge`].
+async fn converge_restores(node: &Node) {
+    let names: Vec<String> = node.shard.lock().await.list().into_iter().map(|i| i.name).collect();
+    for name in names {
+        let dir = paths::instance_dir(&name);
+        if let Some(what) = asterism_core::snapshot::converge(&dir) {
+            eprintln!("astd: {name}: {what}");
+        }
+    }
+}
+
+/// Remove what a commit killed halfway through left behind.
+///
+/// The directories that hold committed state, and only those: everything
+/// `durable` writes is a sibling of the file it commits, so a sweep of the
+/// home and of the one subdirectory that holds per-device files is the whole
+/// of it. Each staging file is a value that either landed — in which case it
+/// is a duplicate — or did not, in which case it was never committed and
+/// nothing has ever read it. The `.bak` files beside them are the safety net
+/// and stay.
+///
+/// Anything found is logged: an interrupted commit came to nothing, but it is
+/// the fingerprint of a crash and worth a line.
+fn sweep_interrupted_commits() {
+    let home = paths::home_dir();
+    let dirs = [home.clone(), home.join("guest-keys")];
+    for dir in dirs {
+        for swept in asterism_core::durable::sweep_temporaries(&dir) {
+            eprintln!(
+                "astd: swept {} — a commit was interrupted before it published",
+                swept.display()
+            );
         }
     }
 }

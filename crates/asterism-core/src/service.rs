@@ -232,7 +232,12 @@ mod imp {
             if let Some(dir) = spec.log.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            std::fs::write(&unit, plist(spec))
+            // Committed rather than written: launchd reads this file at
+            // login, and a truncated plist is a device that comes back from a
+            // reboot with no daemon and no explanation. This is the one piece
+            // of Asterism's state that lives outside ASTERISM_HOME, and it
+            // gets the same treatment as the rest.
+            crate::durable::commit(&unit, plist(spec).as_bytes())
                 .with_context(|| format!("writing {}", unit.display()))?;
             report.step(format!("wrote {}", unit.display()));
 
@@ -282,6 +287,10 @@ mod imp {
                 }
                 Err(e) => return Err(e).with_context(|| format!("removing {}", unit.display())),
             }
+            // The commit leaves a last-known-good copy beside the unit.
+            // Uninstall means uninstall: it goes too, or the next `ls` of
+            // that directory would find Asterism still in it.
+            let _ = std::fs::remove_file(crate::durable::backup_path(&unit));
             Ok(report)
         }
 
@@ -495,7 +504,7 @@ mod imp {
                 std::fs::create_dir_all(dir)
                     .with_context(|| format!("creating {}", dir.display()))?;
             }
-            std::fs::write(&unit, service_unit(spec))
+            crate::durable::commit(&unit, service_unit(spec).as_bytes())
                 .with_context(|| format!("writing {}", unit.display()))?;
             report.step(format!("wrote {}", unit.display()));
 
@@ -540,6 +549,10 @@ mod imp {
                 }
                 Err(e) => return Err(e).with_context(|| format!("removing {}", unit.display())),
             }
+            // The commit leaves a last-known-good copy beside the unit.
+            // Uninstall means uninstall: it goes too, or the next `ls` of
+            // that directory would find Asterism still in it.
+            let _ = std::fs::remove_file(crate::durable::backup_path(&unit));
             if systemctl_present() {
                 let _ = run(std::process::Command::new("systemctl")
                     .args(["--user", "daemon-reload"]))?;

@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::durable::{self, Loaded};
 use crate::instance::now_unix;
 
 /// Who holds a volume's single writer slot, and at what epoch.
@@ -92,6 +93,12 @@ impl BlockVolume {
     }
 }
 
+/// The volume book's on-disk format version.
+///
+/// A file written before the field existed deserialises to 0 and is written
+/// back as 1; nothing inside a row changed, so that is the whole migration.
+pub const VOLUME_VERSION: u32 = 1;
+
 /// This device's block volumes, as one file next to the instance shard.
 ///
 /// Separate from [`crate::registry::Shard`] on purpose: a volume is a part
@@ -110,25 +117,30 @@ pub struct Store {
 
 impl Store {
     pub fn load(path: &Path) -> Result<Self> {
-        let mut store: Store = match std::fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .with_context(|| format!("reading {}", path.display()))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Store::default(),
-            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        let mut store = match durable::load_json_versioned::<Store>(
+            path,
+            "this device's volumes",
+            VOLUME_VERSION,
+        )? {
+            Some(Loaded { value, repaired }) => {
+                if let Some(why) = repaired {
+                    // A volume recovered from the backup may be one epoch
+                    // behind, which is the one thing a holder needs to know:
+                    // its lease will be refused and it will take a new one.
+                    eprintln!("astd: {why}");
+                }
+                value
+            }
+            None => Store::default(),
         };
-        store.version = 1;
+        store.version = VOLUME_VERSION;
         store.path = path.to_owned();
         Ok(store)
     }
 
     pub fn save(&self) -> Result<()> {
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let tmp = self.path.with_extension("tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
-        std::fs::rename(&tmp, &self.path)?;
-        Ok(())
+        durable::commit_json(&self.path, self)
+            .with_context(|| format!("committing {}", self.path.display()))
     }
 
     pub fn list(&self) -> Vec<BlockVolume> {
@@ -508,5 +520,58 @@ mod tests {
         assert_eq!(lease.holder, "dev");
         assert_eq!(lease.pid, Some(4242));
         assert_eq!(lease.export, "tank-e1");
+    }
+
+    /// A lease is a fence, and a fence that half-exists is worse than no
+    /// fence: two writers would both believe they hold epoch 2. A commit
+    /// killed before it published leaves the epoch where it was, so the
+    /// holder's next lease takes the same number and the export socket it
+    /// names is the one nobody else is serving.
+    #[test]
+    fn a_lease_killed_mid_commit_leaves_the_epoch_where_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("volumes.json");
+        let mut s = Store::load(&path).unwrap();
+        s.create("tank", 5 << 30).unwrap();
+        s.lease("tank", "dev", "laptop").unwrap();
+        s.save().unwrap();
+
+        // The renewal that never lands.
+        s.lease("tank", "dev", "laptop").unwrap();
+        let armed = durable::faults::arm(
+            "vol-kill",
+            durable::faults::Point::Rename,
+            path.display().to_string(),
+            std::io::ErrorKind::Other,
+        );
+        assert!(s.save().is_err());
+        drop(armed);
+
+        let back = Store::load(&path).unwrap();
+        let vol = back.get("tank").unwrap();
+        assert_eq!(vol.epoch, 1, "the epoch that was committed is the epoch that holds");
+        assert_eq!(vol.lease.as_ref().unwrap().export, "tank-e1");
+    }
+
+    /// A truncated volume book is repaired from the last-known-good copy,
+    /// which may be an epoch behind — and being an epoch behind is safe in
+    /// the one direction that matters, because the next lease climbs from
+    /// there and the holder is fenced by the export name, not by the number.
+    #[test]
+    fn a_truncated_volume_book_is_repaired_rather_than_emptied() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("volumes.json");
+        let mut s = Store::load(&path).unwrap();
+        s.create("tank", 5 << 30).unwrap();
+        s.save().unwrap();
+        s.lease("tank", "dev", "laptop").unwrap();
+        s.save().unwrap();
+
+        let whole = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, &whole[..whole.len() / 2]).unwrap();
+
+        let back = Store::load(&path).unwrap();
+        let vol = back.get("tank").expect("the volume is not forgotten because a page went");
+        assert_eq!(vol.size_bytes, 5 << 30);
     }
 }

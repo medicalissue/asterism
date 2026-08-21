@@ -34,6 +34,7 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
+use crate::durable;
 use crate::hv::{DiskFormat, ImageKind};
 use crate::oci;
 use crate::paths;
@@ -93,7 +94,7 @@ impl Resolved {
         let from = detect_format(staging)?;
         if from == DiskFormat::Raw {
             // Some publishers ship raw already; nothing to convert.
-            std::fs::rename(staging, &self.path)?;
+            durable::publish_file(staging, &self.path)?;
             return Ok(true);
         }
         convert_to_raw(staging, from, &self.path)
@@ -122,7 +123,10 @@ fn convert_to_raw(src: &Path, from: DiskFormat, dst: &Path) -> Result<()> {
         .args(["convert", "-f", from.as_str(), "-O", "raw", "-S", "4k"])
         .arg(src)
         .arg(&part))?;
-    std::fs::rename(&part, dst)?;
+    // The convert is a subprocess, so its bytes are only as durable as the
+    // page cache until this forces them down. A base image every instance
+    // clones from is worth the one fsync.
+    durable::publish_file(&part, dst)?;
     Ok(())
 }
 

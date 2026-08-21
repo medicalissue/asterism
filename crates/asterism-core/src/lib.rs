@@ -5,12 +5,14 @@
 //! devices supplying the pool, [`instance`] is what gets assembled and which
 //! device each of its parts comes from, [`registry`] is the one flat
 //! orbit-wide namespace those instances live in (stored as a shard per
-//! device), [`hv`] is the hypervisor boundary, [`volume`] is the block
+//! device), [`durable`] is how any of that survives a crash, [`hv`] is the
+//! hypervisor boundary, [`volume`] is the block
 //! storage a device contributes to the pool, [`secret`] and [`rewrite`] are
 //! the secrets data plane's model and its one substitution rule, and
 //! [`protocol`] is the CLI <-> daemon wire.
 
 pub mod cow;
+pub mod durable;
 pub mod hv;
 pub mod image;
 pub mod instance;

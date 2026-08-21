@@ -286,6 +286,10 @@ ok "$("$AST" service status | head -1)"
 expect "uninstall" "launchctl bootout" "$AST" service uninstall
 WE_INSTALLED=
 if [ -e "$PLIST" ]; then fail "$PLIST survived uninstall"; fi
+# The plist is committed durably, which leaves a last-known-good copy beside
+# it. Uninstall means uninstall: that goes too.
+if [ -e "$PLIST.bak" ]; then fail "$PLIST.bak survived uninstall"; fi
+if [ -e "$PLIST.tmp" ]; then fail "$PLIST.tmp survived uninstall"; fi
 if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
   fail "launchd still has $LABEL loaded after uninstall"
 fi

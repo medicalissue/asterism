@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
+use asterism_core::durable;
 use asterism_core::hv::{ImageKind, RunState, STOP_DEADLINE};
 use asterism_core::instance::{local_host, Instance, Policy, Status};
 use asterism_core::protocol::{Request, Response};
@@ -113,7 +114,13 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
         Request::Rename { name, new_name } => reg.rename(&name, &new_name).inspect(|_| {
             let (from, to) = (paths::instance_dir(&name), paths::instance_dir(&new_name));
             if from.exists() {
-                let _ = std::fs::rename(&from, &to);
+                // The rename is published like any other: the row committed
+                // above names the new directory, so a crash between the two
+                // with the rename still in the page cache would leave a row
+                // pointing at a directory that is not there.
+                if let Err(e) = durable::publish_rename(&from, &to) {
+                    eprintln!("astd: renaming {} to {}: {e:#}", from.display(), to.display());
+                }
             }
         }),
         Request::MarkConflicted { name, other_cpu_device } => {

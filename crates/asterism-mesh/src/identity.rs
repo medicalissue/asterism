@@ -230,7 +230,14 @@ impl DeviceIdentity {
         let tmp = temp_path(path);
         write_private(&tmp, body.as_bytes())?;
         match std::fs::rename(&tmp, path) {
-            Ok(()) => Ok(()),
+            // The rename is a change to the *directory*, and until the
+            // directory is flushed it is a promise the drive has not made.
+            // This device's identity is the one file it cannot regenerate —
+            // losing it is losing every pairing — so the barrier is paid.
+            Ok(()) => sync_dir(match path.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent,
+                _ => Path::new("."),
+            }),
             Err(e) => {
                 let _ = std::fs::remove_file(&tmp);
                 Err(e.into())
@@ -251,6 +258,21 @@ impl DeviceIdentity {
     /// This device's stable id.
     pub fn device_id(&self) -> DeviceId {
         DeviceId(self.secret.public())
+    }
+}
+
+/// Flush a directory's entries, so a rename into it survives power loss.
+///
+/// A filesystem that refuses `fsync` on a directory (some network mounts,
+/// most container fakes) is not a reason to refuse to save a key: the rename
+/// is still ordered, it is only the barrier that is missing.
+fn sync_dir(dir: &Path) -> Result<(), IdentityError> {
+    match std::fs::File::open(dir).and_then(|handle| handle.sync_all()) {
+        Ok(()) => Ok(()),
+        Err(e) if matches!(e.kind(), io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported) => {
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
     }
 }
 

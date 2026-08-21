@@ -46,6 +46,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Mutex};
 
 use asterism_core::cow;
+use asterism_core::durable;
 use asterism_core::instance::Instance;
 use asterism_core::orbit::{self, Device, DeviceStatus, Orbit, WakeFacts};
 use asterism_core::paths;
@@ -1054,15 +1055,12 @@ impl Mesh {
         .await;
 
         if let Some(key) = fetched {
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
             // Written unreadable, then filled: ssh refuses a key file anyone
-            // else on this machine could have read in the meantime.
-            let tmp = path.with_extension("tmp");
-            std::fs::write(&tmp, &key)?;
-            set_private(&tmp)?;
-            std::fs::rename(&tmp, &path)?;
+            // else on this machine could have read in the meantime — so the
+            // mode is on the `open(2)`, not a `chmod` after it — and the
+            // commit is durable, because a torn key file is an `ast ssh` that
+            // fails with a parse error rather than a permission one.
+            durable::commit_private(&path, key.as_bytes())?;
         }
         if !path.exists() {
             bail!(
@@ -1918,7 +1916,7 @@ async fn fetch_base(
             &base.digest[..16.min(base.digest.len())]
         );
     }
-    std::fs::rename(&staging, &path)
+    durable::publish_file(&staging, &path)
         .with_context(|| format!("putting the fetched base image at {}", path.display()))?;
     report
         .progress(format!("base image {} verified and stored", base.reference), 0)
@@ -2265,15 +2263,14 @@ impl ShardCache {
         self.shards.get(device).cloned().unwrap_or_default()
     }
 
+    /// Committed like everything else, and read back with none of the
+    /// ceremony: this is the one file in `ASTERISM_HOME` that really is a
+    /// cache. A shard cache that will not parse costs a row printed as
+    /// `unknown` until the device it names answers again, so [`Self::load`]
+    /// starts empty rather than refusing or reaching for the copy the commit
+    /// leaves beside it.
     fn save(&self) -> Result<()> {
-        let path = paths::shard_cache_path();
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
+        durable::commit_json(&paths::shard_cache_path(), self)
     }
 }
 
