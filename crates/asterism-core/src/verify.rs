@@ -23,6 +23,34 @@
 //! file. A missing record is a refusal, not a shrug: an artifact nobody can
 //! account for is exactly the one not to boot.
 //!
+//! ## What the first fetch is checked against
+//!
+//! The boot gate compares an artifact to what this device adopted. That is
+//! worth nothing on its own if what this device adopted was never checked
+//! against anything, so every source Asterism chooses on the user's behalf
+//! carries a publisher digest: see [`Pinned`], the catalog in
+//! [`crate::image`], and the kernel table in [`crate::oci`]. A registry blob
+//! is checked against the digest its manifest names. A url the *user* typed
+//! is checked if they pin it and recorded-but-unchecked if they do not,
+//! because they named the source and there is nothing else to hold it
+//! against — and Asterism says so out loud rather than implying a check it
+//! did not do.
+//!
+//! ## Surviving the power going out
+//!
+//! `rename(2)` is atomic against other processes, which is what makes the
+//! staged-then-renamed pattern safe against a crash. It says nothing about a
+//! power cut: the directory entry and the bytes behind it can each be
+//! sitting in a write-back cache. [`crate::durable`] is where this tree
+//! answers that, and this module uses it rather than repeating it — what is
+//! particular here is only the *ordering*, that the record is committed
+//! before the artifact takes its name, spelled out on [`adopt`].
+//!
+//! The ordering is invisible when nothing goes wrong, so it is checked by
+//! making the syscalls fail: `durable::faults` arms a real error at each
+//! step of a commit, and the tests at the bottom of this file assert that no
+//! injected failure leaves something bootable that nothing can account for.
+//!
 //! ## What the boot gate actually costs
 //!
 //! A base image is about a gigabyte and `ast up` is expected to be quick, so
@@ -338,8 +366,15 @@ pub fn provenance_path(artifact: &Path) -> PathBuf {
 
 /// Read what was recorded when this artifact was adopted.
 pub fn provenance(artifact: &Path) -> Option<Provenance> {
-    let text = std::fs::read_to_string(provenance_path(artifact)).ok()?;
-    Provenance::parse(&text).ok()
+    let path = provenance_path(artifact);
+    let read = |p: &Path| -> Option<Provenance> {
+        Provenance::parse(&std::fs::read_to_string(p).ok()?).ok()
+    };
+    // The live record, and the copy [`durable::commit`] kept if it will not
+    // parse. Falling back is safe because the fallback is not trusted on its
+    // own: whatever it says, the digest in it is still checked against the
+    // bytes on disk, so a stale record refuses rather than admits.
+    read(&path).or_else(|| read(&durable::backup_path(&path)))
 }
 
 fn mtime_of(meta: &std::fs::Metadata) -> i64 {
@@ -347,21 +382,31 @@ fn mtime_of(meta: &std::fs::Metadata) -> i64 {
     meta.mtime()
 }
 
-/// A source Asterism fetches from, and the digest it must produce.
+/// A source Asterism fetches from, and the digest the publisher says it will
+/// produce.
 ///
-/// `digest` is `Option` because not every publisher pins one. A url that
-/// republishes in place — Ubuntu's `.../releases/noble/release/`, Debian's
-/// `latest/` — cannot have a digest written down in this tree without turning
-/// every point release into a refusal for anybody who upgraded Asterism but
-/// not their store. What stands in for it is the other half of this module:
-/// whatever is fetched is hashed, recorded, and checked against that record
-/// before every boot, so an artifact is pinned to the bytes this device
-/// adopted even when upstream would not pin them for us. A filled-in digest
-/// is strictly better and the field is here so it can be filled in, per
-/// entry, with no other change anywhere.
+/// Both fields are required, and that is the whole design. A first fetch is
+/// the one an attacker most wants to own: nothing on the device contradicts
+/// it, so trusting it and remembering what arrived — trust on first use —
+/// pins the device to whatever was served that day, for good. Asterism does
+/// not do that for anything it chose on the user's behalf. Every url in the
+/// catalog and the kernel table is an *immutable* one — a dated Ubuntu
+/// serial, a versioned Debian build, a Fedora compose, an Alpine point
+/// release — precisely so that the digest its publisher signed can be
+/// written down here and checked against what arrives.
+///
+/// The alternative, `latest/` plus a hope, is what the moving urls these
+/// entries used to point at bought: a table that never needed editing, and a
+/// first fetch nobody could check. Editing the table when a distribution
+/// cuts a release is the price of the check, and it is the right price.
+///
+/// A source Asterism did *not* choose — a url the user typed — has no entry
+/// here. That one is verified if the user pins it (`#sha256:<hex>`) and
+/// recorded but unverified if they do not, because they named the source and
+/// there is nothing else to check it against.
 pub struct Pinned {
     pub url: &'static str,
-    pub digest: Option<&'static str>,
+    pub digest: &'static str,
 }
 
 impl Pinned {
@@ -370,10 +415,8 @@ impl Pinned {
     /// Called before anything is fetched or removed: a pin this build cannot
     /// compute has to refuse the operation with the store exactly as it was,
     /// rather than after a download has already landed somewhere.
-    pub fn expected(&self, what: &str) -> Result<Option<Digest>> {
-        self.digest
-            .map(Digest::parse)
-            .transpose()
+    pub fn expected(&self, what: &str) -> Result<Digest> {
+        Digest::parse(self.digest)
             .with_context(|| format!("the pinned digest for {what} is one Asterism cannot check"))
     }
 }
@@ -400,22 +443,28 @@ impl<'a> Source<'a> {
 }
 
 /// Give a staged file its durable name, but only once its bytes are accounted
-/// for.
-///
-/// The order is the point:
+/// for — and only in an order a power cut cannot turn into something
+/// bootable that should not be.
 ///
 /// 1. hash what is in `staged`;
 /// 2. if `expected` was published, refuse anything else — and delete the
 ///    staged file, so a poisoned mirror cannot be resumed into place by a
 ///    later run that skips the download because "the part is already there";
-/// 3. write the provenance record;
-/// 4. rename `staged` to `dest`.
+/// 3. commit the provenance record durably ([`durable::commit`]);
+/// 4. publish the artifact durably ([`durable::publish_file`]): force the
+///    staged bytes down, rename, force the directory entry down.
 ///
-/// Step 3 before step 4 is what makes an interrupted adoption safe: the
-/// artifact never exists without a record, so [`check`] refusing a record-less
-/// file cannot be triggered by a crash. The other order — rename, then
-/// record — has a window in which a bootable file has no provenance, and that
-/// window is exactly a power cut.
+/// Step 3 before step 4 is the invariant this whole module rests on: the
+/// artifact never has its durable name without a durable record beside it.
+/// So [`check`] refusing a record-less file can only ever mean somebody put
+/// a file there by hand — never that the power went out at the wrong
+/// microsecond. The other order leaves a window in which a bootable file has
+/// no provenance, and a window is exactly what a power cut finds.
+///
+/// The flushing itself is [`crate::durable`]'s, not this module's. That is
+/// where the tree already answers "how does a file become real, given that a
+/// rename is atomic against a reader and not against power", and two answers
+/// to that question would be one answer and one liability.
 pub fn adopt(
     staged: &Path,
     dest: &Path,
@@ -440,6 +489,10 @@ pub fn adopt(
         }
     }
 
+    // `rename(2)` leaves mtime alone — it moves a directory entry, not a
+    // file — so what was measured on the staged file is what the artifact
+    // will carry. Recording it now means the record is written once and the
+    // ordering above is not broken by a second pass over it afterwards.
     let record = Provenance {
         content,
         size: meta.len(),
@@ -452,37 +505,26 @@ pub fn adopt(
         std::fs::create_dir_all(dir)?;
     }
     write_record(dest, &record)?;
-    // `publish_file` rather than a bare rename: the staged bytes are forced
-    // down before the name that will point at them exists, and the directory
-    // entry is forced down after. A base image every instance clones from is
-    // worth the one flush, and half a cloud image under the name of a whole
-    // one is a boot failure with no clue in it.
+
+    // Last, and only now: the staged bytes are forced down, the name is
+    // created, and the directory entry is forced down after it.
+    // [`durable::publish_file`] is all three, and using it rather than a
+    // flush written out here means there is one answer in this tree to "how
+    // does a file become real", not two that can drift apart.
     durable::publish_file(staged, dest)?;
-    // The rename may have carried an mtime the staged file had; re-read it so
-    // the quick check compares against what is actually on disk now.
-    if let Ok(after) = std::fs::metadata(dest) {
-        let settled = mtime_of(&after);
-        if settled != record.mtime {
-            let record = Provenance { mtime: settled, ..record.clone() };
-            write_record(dest, &record)?;
-            return Ok(record);
-        }
-    }
     Ok(record)
 }
 
+/// Write a provenance record so that a power cut cannot leave a torn one.
+///
+/// [`durable::commit`] is the tree's answer for a small document built in
+/// memory — stage under a name of its own, force it down, keep the value it
+/// replaced as `.bak`, rename, force the directory. The `.bak` earns its
+/// keep here for a reason particular to this module: a torn record reads
+/// back as *no* record, and no record is a refusal, so without the copy a
+/// half-written record would take a perfectly good image out of service.
 fn write_record(artifact: &Path, record: &Provenance) -> Result<()> {
-    let path = provenance_path(artifact);
-    // Appended, never `with_extension`: that would replace `.raw`, and
-    // `<slug>.raw` and `<slug>.qcow2` would then stage their records through
-    // one shared name.
-    let mut staging = path.as_os_str().to_owned();
-    staging.push(".part");
-    let staging = PathBuf::from(staging);
-    std::fs::write(&staging, record.render())
-        .with_context(|| format!("writing {}", path.display()))?;
-    durable::publish_file(&staging, &path)?;
-    Ok(())
+    durable::commit(&provenance_path(artifact), record.render().as_bytes())
 }
 
 /// Record provenance for a file that is already where it belongs.
@@ -778,46 +820,248 @@ mod tests {
         assert!(err.contains("has changed since it was pulled"), "{err}");
     }
 
-    /// An adoption interrupted at every point it can be interrupted at, and
-    /// what is left behind each time. The invariant the ordering buys is
-    /// that no state a crash can produce is one where the artifact has its
-    /// durable name and no record — so the boot gate's refusal of an
-    /// unaccounted file can never be triggered by a power cut.
+    /// A machine that loses power in the middle of an adoption, injected at
+    /// each step that can fail.
+    ///
+    /// The claim being checked is one thing: **no interruption leaves an
+    /// artifact holding its durable name without a durable record beside
+    /// it.** That is what lets [`check`] treat a record-less file as
+    /// something a person put there rather than something a power cut left,
+    /// and it is only true because of the order the steps run in — which is
+    /// invisible when nothing goes wrong.
+    ///
+    /// [`durable::faults`] makes it visible without a test-only branch in
+    /// the code being tested: the real syscalls are made to fail, at the
+    /// points a real machine fails them, scoped to this test's own temporary
+    /// directory so it cannot disturb a neighbour running beside it.
     #[test]
-    fn no_interruption_leaves_something_bootable_that_should_not_be() {
+    fn no_injected_failure_leaves_something_bootable_that_should_not_be() {
+        use durable::faults::{arm, Point};
+
+        // (tag, point, which path the fault is scoped to, what should be on
+        // disk afterwards).
+        let cases: &[(&'static str, Point, bool)] = &[
+            // The record cannot be staged, written, forced down or renamed.
+            // Every one of these has to abort before the artifact is
+            // published — that is the ordering claim.
+            ("verify-fault-create", Point::Create, false),
+            ("verify-fault-write", Point::Write, false),
+            ("verify-fault-syncfile", Point::SyncFile, false),
+            ("verify-fault-rename", Point::Rename, false),
+        ];
+
+        for (tag, point, artifact_expected) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let scope = dir.path().to_string_lossy().into_owned();
+            let staged = dir.path().join("img.part");
+            let dest = dir.path().join("img.raw");
+            write(&staged, b"the image, all of it");
+
+            let failed = {
+                let _armed = arm(tag, *point, scope.clone(), std::io::ErrorKind::Other);
+                adopt(
+                    &staged,
+                    &dest,
+                    None,
+                    Source::new("base-image", "https://mirror/img"),
+                )
+                .is_err()
+            };
+            assert!(failed, "{tag}: the failure was swallowed");
+            assert_eq!(dest.exists(), *artifact_expected, "{tag}");
+            assert!(staged.exists(), "{tag}: the staged bytes were lost");
+            assert!(
+                check(&dest, Depth::Full).is_err(),
+                "{tag}: something unaccounted became bootable"
+            );
+
+            // Recovery: with the fault disarmed the same staged file adopts
+            // cleanly. A crash costs a retry, never a manual repair.
+            let record = adopt(
+                &staged,
+                &dest,
+                None,
+                Source::new("base-image", "https://mirror/img"),
+            )
+            .unwrap();
+            check(&dest, Depth::Full).unwrap();
+            assert_eq!(record.size, 20);
+            assert_eq!(provenance(&dest).unwrap(), record);
+            assert!(!staged.exists(), "{tag}");
+        }
+    }
+
+    /// The other half of the ordering, from the artifact's side: with the
+    /// record already committed, the artifact's own publish is made to fail.
+    /// A record with no artifact is the state a power cut is *allowed* to
+    /// leave — the reverse never is.
+    ///
+    /// Scoped to the staged file's name rather than the directory, because
+    /// [`durable::commit`] stages the record at `<record>.tmp` and only the
+    /// artifact's publish touches `img.part`.
+    #[test]
+    fn a_failure_publishing_the_artifact_leaves_a_record_and_no_artifact() {
+        use durable::faults::{arm, Point};
+
         let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("img.raw");
-
-        // Interrupted during the download: a `.part` and nothing else.
         let staged = dir.path().join("img.part");
-        write(&staged, b"half a download");
-        assert!(!dest.exists());
-        assert!(check(&dest, Depth::Quick).is_err());
+        let dest = dir.path().join("img.raw");
+        write(&staged, b"the image, all of it");
 
-        // Interrupted after the record was written and before the rename.
-        // The record is an orphan; the artifact still is not there.
-        let orphan = Provenance {
-            content: Digest::of_bytes(OWN_ALGO, b"whatever this was going to be"),
-            size: 29,
-            mtime: 0,
-            kind: "base-image".into(),
-            source: "https://x".into(),
-            derived_from: Vec::new(),
-        };
-        write_record(&dest, &orphan).unwrap();
-        assert!(!dest.exists(), "a record is not an image");
-        assert!(check(&dest, Depth::Quick).is_err());
+        {
+            let _armed = arm(
+                "verify-fault-artifact",
+                Point::SyncFile,
+                staged.to_string_lossy().into_owned(),
+                std::io::ErrorKind::Other,
+            );
+            assert!(adopt(&staged, &dest, None, Source::new("base-image", "u")).is_err());
+        }
+        assert!(!dest.exists(), "the artifact must not have taken its name");
+        assert!(
+            provenance_path(&dest).exists(),
+            "and its record is allowed to be there first — that is the whole ordering"
+        );
+        assert!(check(&dest, Depth::Quick).is_err(), "a record is not an image");
 
-        // And the next attempt overwrites the orphan rather than trusting
-        // it: the record that survives is the one describing what is
-        // actually there.
-        write(&staged, b"the whole download");
-        adopt(&staged, &dest, None, Source::new("base-image", "https://x")).unwrap();
+        // The orphan record does not bless a later, different artifact: the
+        // retry overwrites it with one describing what is actually there.
+        write(&staged, b"a different image entirely");
+        let record = adopt(&staged, &dest, None, Source::new("base-image", "u")).unwrap();
         check(&dest, Depth::Full).unwrap();
-        assert_eq!(provenance(&dest).unwrap().size, 18);
+        assert_eq!(provenance(&dest).unwrap(), record);
+        assert_eq!(record.size, 26);
+    }
 
-        // A record's staging file is named off the artifact, so two images
-        // sharing a stem do not share one.
+    /// The directory flush failing is the one point that lands *after* the
+    /// artifact has its name, and it is the one case where the invariant is
+    /// kept by the record already being durable rather than by the artifact
+    /// not existing yet.
+    #[test]
+    fn a_directory_flush_that_fails_still_leaves_an_accountable_store() {
+        use durable::faults::{arm, Point};
+
+        let dir = tempfile::tempdir().unwrap();
+        let scope = dir.path().to_string_lossy().into_owned();
+        let staged = dir.path().join("k.part");
+        let dest = dir.path().join("k.raw");
+        write(&staged, b"a kernel");
+
+        {
+            let _armed = arm("verify-fault-syncdir", Point::SyncDir, scope, std::io::ErrorKind::Other);
+            assert!(adopt(&staged, &dest, None, Source::new("kernel", "u")).is_err());
+        }
+        // Whatever landed, it is accountable: either nothing is there, or
+        // what is there has a record that matches it. Never a bootable file
+        // nobody can vouch for.
+        match dest.exists() {
+            true => check(&dest, Depth::Full).unwrap(),
+            false => assert!(check(&dest, Depth::Full).is_err()),
+        }
+    }
+
+    /// A record that will not parse falls back to the copy `durable::commit`
+    /// keeps — and the fallback is still checked against the bytes, so it
+    /// cannot admit the wrong ones.
+    #[test]
+    fn a_torn_record_falls_back_to_the_copy_it_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("r.part");
+        let dest = dir.path().join("r.raw");
+        write(&staged, b"an image");
+        adopt(&staged, &dest, None, Source::new("base-image", "u")).unwrap();
+        // A second commit is what puts a `.bak` there at all.
+        record(&dest, &dest, Source::new("base-image", "u")).unwrap();
+
+        let whole = std::fs::read_to_string(provenance_path(&dest)).unwrap();
+        std::fs::write(provenance_path(&dest), &whole[..whole.len() / 2]).unwrap();
+        check(&dest, Depth::Full).unwrap();
+
+        // But the copy is not a licence: point it at a record for different
+        // bytes and the digest check refuses, rather than the fallback
+        // waving it through.
+        std::fs::write(&dest, b"different bytes entirely").unwrap();
+        assert!(check(&dest, Depth::Full).is_err());
+    }
+
+    /// The record written for an artifact describes *that* artifact.
+    ///
+    /// `rename(2)` moves a directory entry and leaves mtime alone, so the
+    /// mtime measured on the staged file is the one the adopted file
+    /// carries. If that ever stopped being true the quick check would
+    /// re-hash every boot — not wrong, but a gigabyte of wrong-feeling — so
+    /// it is pinned rather than assumed.
+    #[test]
+    fn the_record_describes_the_file_that_ends_up_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("a.part");
+        let dest = dir.path().join("a.raw");
+        write(&staged, b"0123456789");
+        set_mtime(&staged, 1_000_000_000);
+
+        let record = adopt(&staged, &dest, None, Source::new("base-image", "u")).unwrap();
+        let meta = std::fs::metadata(&dest).unwrap();
+        assert_eq!(record.size, meta.len());
+        assert_eq!(record.mtime, mtime_of(&meta), "a rename does not move mtime");
+        assert_eq!(provenance(&dest).unwrap(), record);
+        // Which is what makes the cheap check cheap: it must not re-hash.
+        check(&dest, Depth::Quick).unwrap();
+    }
+
+    /// A record cut off halfway — the other thing a power cut writes. It
+    /// reads back as no record at all, which refuses a good image rather
+    /// than admitting a bad one, and the retry repairs it.
+    #[test]
+    fn a_half_written_record_is_no_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("b.part");
+        let dest = dir.path().join("b.raw");
+        write(&staged, b"an image");
+        adopt(&staged, &dest, None, Source::new("base-image", "u")).unwrap();
+
+        let whole = std::fs::read_to_string(provenance_path(&dest)).unwrap();
+        for cut in [0, 8, whole.len() / 2, whole.len() - 1] {
+            std::fs::write(provenance_path(&dest), &whole[..cut]).unwrap();
+            // Truncated at the very end this still parses, because the last
+            // line is a `derived-from` and there are none — so only assert
+            // the thing that matters: it never reads as a *different*
+            // record, and never as one that would admit the wrong bytes.
+            if let Some(read) = provenance(&dest) {
+                assert_eq!(read.content, Digest::of_file(OWN_ALGO, &dest).unwrap());
+            } else {
+                assert!(check(&dest, Depth::Quick).is_err(), "cut at {cut}");
+            }
+        }
+        std::fs::write(provenance_path(&dest), &whole).unwrap();
+        check(&dest, Depth::Full).unwrap();
+    }
+
+    /// An artifact cut off halfway is a digest mismatch, and the store is
+    /// left exactly as it was.
+    #[test]
+    fn a_half_written_artifact_is_never_adopted() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("c.raw");
+        let whole = vec![3u8; 8192];
+        let want = Digest::of_bytes(Algo::Sha256, &whole);
+        for cut in [0, 1, 4096, whole.len() - 1] {
+            let staged = dir.path().join("c.part");
+            write(&staged, &whole[..cut]);
+            assert!(
+                adopt(&staged, &dest, Some(&want), Source::new("base-image", "u")).is_err(),
+                "cut at {cut}"
+            );
+            assert!(!dest.exists(), "cut at {cut}");
+            assert!(!provenance_path(&dest).exists(), "cut at {cut}");
+            assert!(!staged.exists(), "cut at {cut}");
+        }
+    }
+
+    /// A record's staging file is named off the artifact, so two images
+    /// sharing a stem do not stage their records through one name.
+    #[test]
+    fn records_do_not_collide_between_an_image_and_its_download() {
+        let dir = tempfile::tempdir().unwrap();
         let raw = dir.path().join("deb.raw");
         let qcow = dir.path().join("deb.qcow2");
         write(&raw, b"raw");

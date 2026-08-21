@@ -88,8 +88,16 @@ pub const INIT_PATH: &str = "/sbin/asterism-init";
 /// Guest kernel and initrd per host architecture.
 ///
 /// Ubuntu publishes the cloud image's kernel and initrd as loose files next
-/// to the image itself. Pinned to the release the catalog already carries, so
-/// a device is not running a kernel nobody chose.
+/// to the image itself, with a `SHA256SUMS` covering them. Both are taken
+/// from a dated release serial rather than the `release/` name that
+/// republishes over itself, so the digest below is a fact about a specific
+/// pair of files rather than a snapshot of whatever was there the day a
+/// device first asked. Same release as the catalog's `ubuntu:24.04`, so a
+/// device is not running a kernel nobody chose.
+///
+/// This is the artifact where an unverified first fetch would matter most:
+/// it is not a filesystem a guest mounts, it is the code the host's
+/// hypervisor loads and jumps to.
 pub struct GuestKernel {
     pub arch: &'static str,
     pub kernel: Pinned,
@@ -100,23 +108,23 @@ pub const KERNELS: &[GuestKernel] = &[
     GuestKernel {
         arch: "aarch64",
         kernel: Pinned {
-            url: "https://cloud-images.ubuntu.com/releases/noble/release/unpacked/ubuntu-24.04-server-cloudimg-arm64-vmlinuz-generic",
-            digest: None,
+            url: "https://cloud-images.ubuntu.com/releases/noble/release-20260814/unpacked/ubuntu-24.04-server-cloudimg-arm64-vmlinuz-generic",
+            digest: "sha256:9ff21f2798055943e5a28da044a5eb701bc85e1f1817c34bd1bd62729cdeca25",
         },
         initrd: Pinned {
-            url: "https://cloud-images.ubuntu.com/releases/noble/release/unpacked/ubuntu-24.04-server-cloudimg-arm64-initrd-generic",
-            digest: None,
+            url: "https://cloud-images.ubuntu.com/releases/noble/release-20260814/unpacked/ubuntu-24.04-server-cloudimg-arm64-initrd-generic",
+            digest: "sha256:66b3257ccc43c088f7b7c14ebf74dee30172a9a0eb0e6ccd8db1374e18a281de",
         },
     },
     GuestKernel {
         arch: "x86_64",
         kernel: Pinned {
-            url: "https://cloud-images.ubuntu.com/releases/noble/release/unpacked/ubuntu-24.04-server-cloudimg-amd64-vmlinuz-generic",
-            digest: None,
+            url: "https://cloud-images.ubuntu.com/releases/noble/release-20260814/unpacked/ubuntu-24.04-server-cloudimg-amd64-vmlinuz-generic",
+            digest: "sha256:76a7f2ef15fcbd2f5c25cd7e7b413f903b2078396063557f1dffb4a0b089a964",
         },
         initrd: Pinned {
-            url: "https://cloud-images.ubuntu.com/releases/noble/release/unpacked/ubuntu-24.04-server-cloudimg-amd64-initrd-generic",
-            digest: None,
+            url: "https://cloud-images.ubuntu.com/releases/noble/release-20260814/unpacked/ubuntu-24.04-server-cloudimg-amd64-initrd-generic",
+            digest: "sha256:194f73c17ca4795f987f2e1713c7184f8d1bb88f063f79a753dada5da6a9987c",
         },
     },
 ];
@@ -1373,18 +1381,34 @@ pub fn kernel() -> Result<(PathBuf, PathBuf)> {
 /// than kept: this is the one artifact on the device whose bytes the host
 /// hands straight to a hypervisor's kernel loader.
 pub fn ensure_kernel(fetch: impl Fn(&str, &Path) -> Result<()>) -> Result<bool> {
-    let (kernel, initrd) = kernel_paths();
     let arch = host_arch();
     let pinned = KERNELS
         .iter()
         .find(|k| k.arch == arch)
         .with_context(|| format!("no guest kernel published for {arch}"))?;
+    let (kernel, initrd) = kernel_paths();
+    ensure_kernel_at(pinned, &kernel, &initrd, fetch)
+}
+
+/// The whole of [`ensure_kernel`] with the store's paths passed in.
+///
+/// Split out so the tests can drive it against a temporary directory and a
+/// fetcher that misbehaves. There is no other way to check what happens on a
+/// *first* fetch — the case where the device has nothing to contradict what
+/// arrives — without either a network or a process-wide `ASTERISM_HOME` the
+/// neighbouring tests share.
+fn ensure_kernel_at(
+    pinned: &GuestKernel,
+    kernel: &Path,
+    initrd: &Path,
+    fetch: impl Fn(&str, &Path) -> Result<()>,
+) -> Result<bool> {
     std::fs::create_dir_all(kernel.parent().expect("the kernel has a directory"))?;
 
     let mut fetched = false;
     for (want, dest, kind) in [
-        (&pinned.kernel, &kernel, "kernel"),
-        (&pinned.initrd, &initrd, "initrd"),
+        (&pinned.kernel, kernel, "kernel"),
+        (&pinned.initrd, initrd, "initrd"),
     ] {
         // Parsed before anything is fetched or removed, so a digest this
         // build cannot compute refuses the whole operation with the store
@@ -1401,7 +1425,11 @@ pub fn ensure_kernel(fetch: impl Fn(&str, &Path) -> Result<()>) -> Result<bool> 
         let _ = std::fs::remove_file(&part);
         fetch(want.url, &part)
             .with_context(|| format!("fetching the guest {kind} from {}", want.url))?;
-        verify::adopt(&part, dest, expected.as_ref(), Source::new(kind, want.url))?;
+        // A first fetch is checked against what Ubuntu published, not
+        // remembered as whatever turned up. This is the line that decides
+        // whether a device that has never had a kernel can be given one by
+        // anybody who can answer for the mirror.
+        verify::adopt(&part, dest, Some(&expected), Source::new(kind, want.url))?;
         fetched = true;
     }
     Ok(fetched)
@@ -1907,6 +1935,99 @@ mod tests {
         assert_eq!(Digest::parse(&digest).unwrap().hex().len(), 64);
     }
 
+    /// The case a pinned kernel exists for: a device that has never had one,
+    /// being handed a substituted one by whoever can answer for the mirror.
+    /// There is nothing on the device to contradict it — which is exactly
+    /// why remembering what arrived is not a check.
+    #[test]
+    fn a_substituted_first_fetch_of_the_kernel_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let kernel = dir.path().join("aarch64-vmlinuz");
+        let initrd = dir.path().join("aarch64-initrd");
+        let pinned = KERNELS.iter().find(|k| k.arch == "aarch64").unwrap();
+
+        let err = ensure_kernel_at(pinned, &kernel, &initrd, |_url, dest| {
+            std::fs::write(dest, b"not the kernel Ubuntu published")?;
+            Ok(())
+        })
+        .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("does not match its published digest"), "{text}");
+        assert!(text.contains(pinned.kernel.digest), "the error names what was expected: {text}");
+        assert!(!kernel.exists(), "nothing was adopted");
+        assert!(!initrd.exists());
+        assert!(!verify::provenance_path(&kernel).exists());
+        assert!(
+            !kernel.with_extension("part").exists(),
+            "and the substituted bytes are not left to be resumed"
+        );
+    }
+
+    /// The same fetch against a pin the test controls: the honest bytes are
+    /// adopted, the second call is a no-op, and both files carry a record.
+    /// Between this and the test above, the fetch path is pinned in both
+    /// directions.
+    #[test]
+    fn a_first_fetch_that_matches_its_pin_is_adopted_and_then_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let kernel = dir.path().join("test-vmlinuz");
+        let initrd = dir.path().join("test-initrd");
+        let (kbytes, ibytes) = (b"a kernel".as_slice(), b"an initrd".as_slice());
+        let kd = sha(kbytes);
+        let id = sha(ibytes);
+        let pinned = GuestKernel {
+            arch: "test",
+            kernel: Pinned { url: "https://example/vmlinuz", digest: leak(kd) },
+            initrd: Pinned { url: "https://example/initrd", digest: leak(id) },
+        };
+        let serve = |url: &str, dest: &Path| -> Result<()> {
+            let bytes = if url.ends_with("vmlinuz") { kbytes } else { ibytes };
+            std::fs::write(dest, bytes)?;
+            Ok(())
+        };
+
+        assert!(ensure_kernel_at(&pinned, &kernel, &initrd, serve).unwrap());
+        assert_eq!(std::fs::read(&kernel).unwrap(), kbytes);
+        assert_eq!(verify::provenance(&kernel).unwrap().kind, "kernel");
+        assert_eq!(verify::provenance(&initrd).unwrap().kind, "initrd");
+
+        // Offline reuse: a fetcher that would fail on any request at all.
+        let refuse = |_: &str, _: &Path| -> Result<()> { bail!("the network is not here") };
+        assert!(!ensure_kernel_at(&pinned, &kernel, &initrd, refuse).unwrap());
+
+        // And a kernel corrupted after adoption is re-fetched rather than
+        // trusted, which is the other half of why the check is at both ends.
+        std::fs::write(&kernel, b"tampered with, at a length of its own").unwrap();
+        assert!(ensure_kernel_at(&pinned, &kernel, &initrd, serve).unwrap());
+        assert_eq!(std::fs::read(&kernel).unwrap(), kbytes);
+    }
+
+    /// A pin is only a pin if the url cannot move under it. Both entries in
+    /// the table have to name an artifact that is published once.
+    #[test]
+    fn every_pinned_kernel_url_is_an_immutable_one() {
+        for k in KERNELS {
+            for (what, p) in [("kernel", &k.kernel), ("initrd", &k.initrd)] {
+                assert!(!p.url.contains("/latest/"), "{} {what}: {}", k.arch, p.url);
+                assert!(
+                    !p.url.contains("/release/"),
+                    "{} {what} points at the name Ubuntu republishes over: {}",
+                    k.arch,
+                    p.url
+                );
+                let d = p.expected(what).unwrap();
+                assert_eq!(d.algo(), Algo::Sha256, "Ubuntu publishes sha256");
+            }
+        }
+    }
+
+    /// `&'static str` for a digest a test computed at runtime. Only reached
+    /// twice, and the alternative is a lifetime on `Pinned` that exists
+    /// solely so the tests can borrow.
+    fn leak(s: String) -> &'static str {
+        Box::leak(s.into_boxed_str())
+    }
+
     /// Every architecture the catalog serves has a kernel to boot OCI images
     /// with, and both files come off the same release.
     #[test]
@@ -1922,8 +2043,14 @@ mod tests {
             // A pin nobody can compute would refuse every OCI boot on that
             // architecture, and it would do it at `ast pull` on a user's
             // machine rather than here. Check the table can be read.
-            k.kernel.expected("the guest kernel").unwrap();
-            k.initrd.expected("the guest initrd").unwrap();
+            let kernel = k.kernel.expected("the guest kernel").unwrap();
+            let initrd = k.initrd.expected("the guest initrd").unwrap();
+            assert_ne!(kernel, initrd, "{}", k.arch);
+            // A dated serial, not the `release/` name that republishes over
+            // itself: a pinned digest is only a pin if the url cannot move.
+            for p in [&k.kernel, &k.initrd] {
+                assert!(p.url.contains("/release-2"), "{} is not an immutable url", p.url);
+            }
         }
         assert!(KERNELS.iter().any(|k| k.arch == host_arch()));
     }

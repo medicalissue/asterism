@@ -312,78 +312,90 @@ impl CatalogImage {
 
 /// Catalog of known cloud images per architecture, newest first.
 ///
-/// None of these carry a pinned digest yet, and the doc on [`Pinned`] says
-/// why: every url here is a moving one — Debian's `latest/`, Ubuntu's
-/// republished `release/` — so a digest in this table would expire on the
-/// publisher's schedule rather than ours. The verification these images
-/// actually get is adoption-time hashing plus the boot gate, which pins each
-/// device to the bytes it pulled. An entry that ever moves to an immutable
-/// url should fill its digest in.
+/// Every url here names an *immutable* artifact — a dated Ubuntu serial, a
+/// versioned Debian build, a Fedora compose, an Alpine point release — and
+/// carries the digest its publisher published for it. That pairing is the
+/// point. These entries used to point at the moving names beside them
+/// (`releases/noble/release/`, `cloud/trixie/latest/`), which never needed
+/// editing and could never be checked: the first fetch on a device had
+/// nothing to contradict it, so whatever a mirror served that day became
+/// what that device believed the image was, permanently.
+///
+/// The cost is that a new distribution release is a change to this table.
+/// That is the right cost: a catalog entry is Asterism choosing a source on
+/// the user's behalf, and it should not be able to do that without also
+/// saying which bytes it means. Refreshing one means fetching the
+/// publisher's checksum file for the new serial and pasting two lines.
+///
+/// Digest algorithms follow whatever each publisher signs — Ubuntu and
+/// Fedora publish sha256, Debian and Alpine sha512 — because the point is to
+/// carry their number rather than one of ours computed from a download that
+/// was never checked.
 pub const CATALOG: &[CatalogImage] = &[
     CatalogImage {
         alias: "ubuntu:24.04",
         aarch64: Pinned {
-            url: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-arm64.img",
-            digest: None,
+            url: "https://cloud-images.ubuntu.com/releases/noble/release-20260814/ubuntu-24.04-server-cloudimg-arm64.img",
+            digest: "sha256:4a281a921b8d7db952895ab619736f10efe9f63e111fa5b5779ed18f023818aa",
         },
         x86_64: Pinned {
-            url: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img",
-            digest: None,
+            url: "https://cloud-images.ubuntu.com/releases/noble/release-20260814/ubuntu-24.04-server-cloudimg-amd64.img",
+            digest: "sha256:6e40c07ae715f744f84af0bec76415cc1987dd115b4b8de437818561f01a3733",
         },
     },
     CatalogImage {
         alias: "ubuntu:22.04",
         aarch64: Pinned {
-            url: "https://cloud-images.ubuntu.com/releases/jammy/release/ubuntu-22.04-server-cloudimg-arm64.img",
-            digest: None,
+            url: "https://cloud-images.ubuntu.com/releases/jammy/release-20260807/ubuntu-22.04-server-cloudimg-arm64.img",
+            digest: "sha256:b17d9ac9b6249ab30f8c95630acdab3b7a51d76050229ab0ce6c013e303f5ccd",
         },
         x86_64: Pinned {
-            url: "https://cloud-images.ubuntu.com/releases/jammy/release/ubuntu-22.04-server-cloudimg-amd64.img",
-            digest: None,
+            url: "https://cloud-images.ubuntu.com/releases/jammy/release-20260807/ubuntu-22.04-server-cloudimg-amd64.img",
+            digest: "sha256:ff271290a23279ce764561dbe2e9c3ec29da899535b571a987c37b47970c2ad9",
         },
     },
     CatalogImage {
         alias: "debian:13",
         aarch64: Pinned {
-            url: "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-arm64.qcow2",
-            digest: None,
+            url: "https://cloud.debian.org/images/cloud/trixie/20260819-2575/debian-13-generic-arm64-20260819-2575.qcow2",
+            digest: "sha512:23f829b360500c185ee5923667319b258d5ed2e41e614982e779b87abca6fd7a5903a42e9b62635f7774d4ac4c44e9ee3037f5a9e0f61186f6a8c2e856a6f0c4",
         },
         x86_64: Pinned {
-            url: "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-generic-amd64.qcow2",
-            digest: None,
+            url: "https://cloud.debian.org/images/cloud/trixie/20260819-2575/debian-13-generic-amd64-20260819-2575.qcow2",
+            digest: "sha512:ae204682c015fd026838b71f1ce82585368dbb8c050b779ffd8a21a90a6c94f20648133dd078ee8fca9f0aa956e6901a943899be69ee24480035da6aeecd4f68",
         },
     },
     CatalogImage {
         alias: "debian:12",
         aarch64: Pinned {
-            url: "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-arm64.qcow2",
-            digest: None,
+            url: "https://cloud.debian.org/images/cloud/bookworm/20260806-2562/debian-12-generic-arm64-20260806-2562.qcow2",
+            digest: "sha512:8f872616a25ac6ca7c0d1b169b062931db51cd03fda4c8cbc74f228d045b186edd1c7d105933a7149c3377372cd0196d7659f07574d7bf6425b82b01df323026",
         },
         x86_64: Pinned {
-            url: "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2",
-            digest: None,
+            url: "https://cloud.debian.org/images/cloud/bookworm/20260806-2562/debian-12-generic-amd64-20260806-2562.qcow2",
+            digest: "sha512:0b04eda1c80b255d6234ae6fe63c43a6cb0de4afc5c37873acbc82d5b1feba7a619d2402d2341af1cf9e0898fa7d5225be343fef47349b18fe28b838001bd8eb",
         },
     },
     CatalogImage {
         alias: "fedora:42",
         aarch64: Pinned {
             url: "https://download.fedoraproject.org/pub/fedora/linux/releases/42/Cloud/aarch64/images/Fedora-Cloud-Base-Generic-42-1.1.aarch64.qcow2",
-            digest: None,
+            digest: "sha256:e10658419a8d50231037dc781c3155aa94180a8c7a74e5cac2a6b09eaa9342b7",
         },
         x86_64: Pinned {
             url: "https://download.fedoraproject.org/pub/fedora/linux/releases/42/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-42-1.1.x86_64.qcow2",
-            digest: None,
+            digest: "sha256:e401a4db2e5e04d1967b6729774faa96da629bcf3ba90b67d8d9cce9906bec0f",
         },
     },
     CatalogImage {
         alias: "alpine:3.22",
         aarch64: Pinned {
             url: "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/nocloud_alpine-3.22.0-aarch64-uefi-cloudinit-r0.qcow2",
-            digest: None,
+            digest: "sha512:30b347397387926eeb939d93c926e09833f5b49c6c6de5cc225ccdfe6e54aba88251c71da264c7e4260e78132b50e34b93409c8b4da2e843e68a4dc35fc6b155",
         },
         x86_64: Pinned {
             url: "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/nocloud_alpine-3.22.0-x86_64-uefi-cloudinit-r0.qcow2",
-            digest: None,
+            digest: "sha512:2ebfc0d515dee0b8a0732d77c99f050bf2a413a5d6bc3634ac94cb48f7b31a3e59431f732810edccf4b39cc0045275a947496aff534804f2cac6e7e9d63c7c74",
         },
     },
 ];
@@ -446,14 +458,14 @@ pub fn resolve(reference: &str) -> Result<Resolved> {
         let published = entry
             .for_arch(arch)
             .with_context(|| format!("no {reference} image for architecture {arch}"))?;
+        // A pin the user wrote wins over the catalog's: they are saying which
+        // bytes they mean, and it is how somebody pulls a build newer than
+        // this table without waiting for a release of Asterism.
         let expected = match &pin {
-            // A pin the user wrote wins over the catalog's: they are saying
-            // which bytes they mean, and this is the only way to pull a
-            // catalog image whose publisher has moved it.
-            Some(d) => Some(d.clone()),
+            Some(d) => d.clone(),
             None => published.expected(reference)?,
         };
-        return Ok(stored(reference, Some(published.url.to_owned()), expected));
+        return Ok(stored(reference, Some(published.url.to_owned()), Some(expected)));
     }
 
     if reference.starts_with("http://") || reference.starts_with("https://") {
@@ -730,16 +742,32 @@ mod tests {
     /// somebody else's build.
     #[test]
     fn a_catalog_entry_publishes_per_architecture_and_says_when_it_does_not() {
+        let mut digests = std::collections::BTreeSet::new();
         for entry in CATALOG {
             assert!(entry.for_arch("aarch64").is_some(), "{}", entry.alias);
             assert!(entry.for_arch("x86_64").is_some(), "{}", entry.alias);
             assert!(entry.for_arch("riscv64").is_none(), "{}", entry.alias);
-            // Every url is fetched over TLS and every pin, if one is ever
-            // filled in, has to be one this build can compute.
             for arch in ["aarch64", "x86_64"] {
                 let p = entry.for_arch(arch).unwrap();
                 assert!(p.url.starts_with("https://"), "{} {arch}", entry.alias);
-                p.expected(entry.alias).unwrap();
+                // Every pin has to be one this build can compute, and it has
+                // to be checked here rather than on a user's machine halfway
+                // through a gigabyte.
+                let digest = p.expected(entry.alias).unwrap();
+                assert!(
+                    digests.insert(digest.to_string()),
+                    "{} {arch} repeats a digest another entry already claims",
+                    entry.alias
+                );
+                // A pin is only a pin if the url cannot move under it. These
+                // are the two names that republish over themselves.
+                assert!(!p.url.contains("/latest/"), "{} {arch}: {}", entry.alias, p.url);
+                assert!(
+                    !p.url.contains("/release/"),
+                    "{} {arch} points at a name that republishes: {}",
+                    entry.alias,
+                    p.url
+                );
             }
             // The two builds are different files — an entry that pointed both
             // architectures at one url would boot the wrong one on half the
@@ -760,6 +788,101 @@ mod tests {
             .for_arch(host_arch())
             .unwrap();
         assert_eq!(r.url.as_deref(), Some(want.url));
+    }
+
+    /// A catalog image is a source Asterism chose on the user's behalf, so
+    /// the first fetch of one is checked against what its publisher
+    /// published — not remembered as whatever the mirror served. This is the
+    /// regression for that: substituted bytes on a device that has nothing
+    /// to contradict them.
+    #[test]
+    fn a_substituted_first_fetch_of_a_catalog_image_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = CATALOG.iter().find(|c| c.alias == "ubuntu:24.04").unwrap();
+        let published = entry.for_arch("aarch64").unwrap();
+        let path = dir.path().join("ubuntu-24.04.raw");
+        let staging = dir.path().join("ubuntu-24.04.qcow2");
+        let r = Resolved {
+            name: "ubuntu:24.04".into(),
+            url: Some(published.url.to_owned()),
+            record: path.clone(),
+            path,
+            format: DiskFormat::Raw,
+            staging: Some(staging.clone()),
+            oci: None,
+            expected: Some(published.expected("ubuntu:24.04").unwrap()),
+        };
+
+        // The download stage: what `ast pull` hands to `verify::adopt`.
+        let part = dir.path().join("ubuntu-24.04.qcow2.part");
+        std::fs::write(&part, b"an image somebody else would like you to boot").unwrap();
+        let text = format!(
+            "{:#}",
+            verify::adopt(
+                &part,
+                &staging,
+                r.expected.as_ref(),
+                verify::Source::new("download", published.url),
+            )
+            .unwrap_err()
+        );
+        assert!(text.contains("does not match its published digest"), "{text}");
+        assert!(text.contains(published.digest), "the error names the pin: {text}");
+        assert!(!staging.exists(), "the substituted download was not adopted");
+        assert!(!part.exists(), "nor left where a retry would resume it");
+
+        // And the conversion stage refuses the same bytes, so a store left
+        // holding a staged download from before this check existed cannot
+        // finish into a bootable image either.
+        std::fs::write(&staging, b"an image somebody else would like you to boot").unwrap();
+        let text = format!("{:#}", r.materialise().unwrap_err());
+        assert!(text.contains("is not what was published"), "{text}");
+        assert!(!r.path.exists());
+    }
+
+    /// The pins in the table are the publishers' own numbers, in the
+    /// publishers' own algorithms — Ubuntu and Fedora sign sha256, Debian
+    /// and Alpine sha512 — because the point is to carry their number rather
+    /// than one of ours computed from a download nothing checked.
+    #[test]
+    fn catalog_pins_are_the_publishers_own_digests() {
+        let expect = |alias: &str, algo: verify::Algo| {
+            let entry = CATALOG.iter().find(|c| c.alias == alias).unwrap();
+            for arch in ["aarch64", "x86_64"] {
+                assert_eq!(
+                    entry.for_arch(arch).unwrap().expected(alias).unwrap().algo(),
+                    algo,
+                    "{alias} {arch}"
+                );
+            }
+        };
+        expect("ubuntu:24.04", verify::Algo::Sha256);
+        expect("ubuntu:22.04", verify::Algo::Sha256);
+        expect("debian:13", verify::Algo::Sha512);
+        expect("debian:12", verify::Algo::Sha512);
+        expect("fedora:42", verify::Algo::Sha256);
+        expect("alpine:3.22", verify::Algo::Sha512);
+    }
+
+    /// Resolving a catalog alias always carries a pin, and a user's own pin
+    /// replaces it — which is how somebody pulls a build newer than this
+    /// table without waiting for a release of Asterism.
+    #[test]
+    fn a_catalog_alias_always_resolves_with_something_to_check_against() {
+        for entry in CATALOG {
+            let r = resolve(entry.alias).unwrap();
+            let want = entry.for_arch(host_arch()).unwrap();
+            assert_eq!(
+                r.expected.as_ref().map(|d| d.to_string()),
+                Some(want.digest.to_owned()),
+                "{}",
+                entry.alias
+            );
+        }
+        let mine = format!("blake3:{}", "c".repeat(64));
+        let overridden = resolve(&format!("debian:13#{mine}")).unwrap();
+        assert_eq!(overridden.name, "debian:13");
+        assert_eq!(overridden.expected.unwrap().to_string(), mine);
     }
 
     /// A converted image is bytes nobody upstream ever published, so what

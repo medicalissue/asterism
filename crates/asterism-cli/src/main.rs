@@ -1129,8 +1129,18 @@ fn ensure_pulled(reference: &str) -> Result<String> {
         let part = staging.with_extension("qcow2.part");
         let _ = std::fs::remove_file(&part);
         eprintln!("pulling {} ({})", resolved.name, url);
-        if let Some(want) = &resolved.expected {
-            eprintln!("it must hash to {want}");
+        match &resolved.expected {
+            Some(want) => eprintln!("it must hash to {want}"),
+            // Said out loud rather than left to be assumed. Every source
+            // Asterism picked — the catalog, the guest kernel, a registry
+            // blob — carries a digest from whoever published it. A url the
+            // user typed has nobody to carry one, so this is the one place
+            // where what arrives is recorded rather than checked, and the
+            // user is the only person who can close that gap.
+            None => eprintln!(
+                "nothing publishes a digest for this url, so Asterism can only record \
+                 what it fetched\n  pin it to check: {url}#sha256:<hex>"
+            ),
         }
         let status = std::process::Command::new("curl")
             .arg("--location")
