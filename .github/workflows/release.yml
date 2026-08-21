@@ -1,0 +1,219 @@
+# Cutting a release.
+#
+# A tag is the only thing that starts this, and the tag is the only thing
+# that names the version. The job builds the binaries, writes SHA256SUMS
+# beside them, and then — before anything is published — installs the exact
+# artifacts it just built with the exact script users run, from a local
+# directory over file://. If that install does not produce a working `ast`
+# reporting the tagged version, nothing is published.
+#
+# Dry runs: workflow_dispatch builds, checksums and tests, and stops short
+# of publishing. Use it to prove a release candidate before tagging it.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build for a dry run, e.g. v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    # macos-14 is Apple silicon, which is the target these binaries are for.
+    runs-on: macos-14
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: version
+        name: Take the version from the tag, and check the tree agrees
+        run: |
+          set -eu
+          version="${{ inputs.version || github.ref_name }}"
+          case "$version" in
+            v*) ;;
+            *) echo "version must look like v0.1.0, got ${version}" >&2; exit 1 ;;
+          esac
+          # The tag says v0.1.0; Cargo.toml has to say 0.1.0, or the binary
+          # would report a version nobody can install.
+          cargo_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [ "${version#v}" != "$cargo_version" ]; then
+            echo "tag ${version} does not match the workspace version ${cargo_version}" >&2
+            exit 1
+          fi
+          echo "version=${version}" >>"$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked --package asterism-cli --package asterism-daemon
+
+      - name: Package
+        run: |
+          set -eu
+          version="${{ steps.version.outputs.version }}"
+          target=darwin-arm64
+          dist="dist/${version}"
+          mkdir -p "$dist"
+          strip -x target/release/ast target/release/astd
+          # COPYFILE_DISABLE keeps macOS tar from smuggling ._ AppleDouble
+          # entries into the tarball, which would change the digest for no
+          # reason anyone could see.
+          COPYFILE_DISABLE=1 tar -czf "${dist}/asterism-${version}-${target}.tar.gz" \
+            -C target/release ast astd
+
+      - name: Render the tap formula for this tag
+        run: |
+          set -eu
+          version="${{ steps.version.outputs.version }}"
+          # The tag's source tarball is what the formula points at; GitHub
+          # only serves it once the tag is pushed, so a dry run renders with
+          # a placeholder digest and says so.
+          if [ "${{ github.event_name }}" = "push" ]; then
+            ./scripts/render-formula.sh "$version" >"dist/${version}/asterism.rb"
+          else
+            ./scripts/render-formula.sh "$version" DRY-RUN-NO-DIGEST >"dist/${version}/asterism.rb"
+          fi
+
+      - name: Checksum every artifact
+        run: |
+          set -eu
+          version="${{ steps.version.outputs.version }}"
+          # Every artifact, not just the tarball — asterism.rb is checked
+          # against this file too when the installer stands up a local tap.
+          ( cd "dist/${version}" && shasum -a 256 "asterism-${version}-darwin-arm64.tar.gz" asterism.rb >SHA256SUMS )
+          cat "dist/${version}/SHA256SUMS"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ steps.version.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+
+  # Install what was just built, with the script users run, on a clean
+  # runner. The artifacts are served over file:// from the download
+  # directory, so this exercises the real download-verify-install-upgrade-
+  # uninstall path against the real bytes.
+  verify:
+    needs: build
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-${{ needs.build.outputs.version }}
+          path: dist
+
+      - name: The installer's own suite, against a fake release
+        run: bash scripts/install-test.sh
+
+      - name: Install the exact artifacts this run built
+        run: |
+          set -eu
+          version="${{ needs.build.outputs.version }}"
+          prefix="${RUNNER_TEMP}/asterism-prefix"
+          export ASTERISM_YES=1
+          export ASTERISM_PREFIX="$prefix"
+          export ASTERISM_BASE_URL="file://${PWD}/dist"
+          export ASTERISM_VERSION="$version"
+
+          sh packaging/install.sh
+
+          # The version the binary reports is the version that was tagged,
+          # or the artifact and the tag have come apart.
+          got="$("${prefix}/bin/ast" --version)"
+          echo "ast --version: ${got}"
+          [ "$got" = "ast ${version#v}" ] || { echo "expected 'ast ${version#v}'" >&2; exit 1; }
+
+          # astd takes no arguments — running it starts a daemon — so the
+          # check on it is that it arrived, executable, built for this
+          # machine's architecture.
+          [ -x "${prefix}/bin/astd" ] || { echo "astd is not executable" >&2; exit 1; }
+          file "${prefix}/bin/astd" | grep -q 'arm64' || { echo "astd is not an arm64 binary" >&2; exit 1; }
+
+          # The catalog is compiled in, so this needs no daemon and no
+          # network — it is the cheapest proof the binary actually runs.
+          "${prefix}/bin/ast" images | grep -q 'debian:13'
+
+          # Re-running changes nothing.
+          sh packaging/install.sh | tee /tmp/second-run.txt
+          grep -q "already installed: ${version}" /tmp/second-run.txt
+
+          # And the machine can be put back the way it was found.
+          sh packaging/install.sh --uninstall
+          [ ! -e "${prefix}/bin/ast" ] || { echo "uninstall left ast behind" >&2; exit 1; }
+
+      - name: Refuse a tampered artifact
+        run: |
+          set -eu
+          version="${{ needs.build.outputs.version }}"
+          cp -R dist "${RUNNER_TEMP}/tampered"
+          printf 'tampered' >>"${RUNNER_TEMP}/tampered/${version}/asterism-${version}-darwin-arm64.tar.gz"
+          if ASTERISM_YES=1 \
+             ASTERISM_PREFIX="${RUNNER_TEMP}/tampered-prefix" \
+             ASTERISM_BASE_URL="file://${RUNNER_TEMP}/tampered" \
+             ASTERISM_VERSION="$version" \
+             sh packaging/install.sh; then
+            echo "a tampered artifact was installed" >&2
+            exit 1
+          fi
+          [ ! -e "${RUNNER_TEMP}/tampered-prefix/bin/ast" ]
+
+  publish:
+    needs: [build, verify]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-${{ needs.build.outputs.version }}
+          path: dist
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          version="${{ needs.build.outputs.version }}"
+          notes="$(mktemp)"
+          {
+            echo "## Install"
+            echo
+            echo '```console'
+            echo "\$ curl -fsSL https://asterism.run/install.sh | ASTERISM_VERSION=${version} sh"
+            echo '```'
+            echo
+            echo "macOS on Apple silicon. Everything else builds from source:"
+            echo "\`ASTERISM_METHOD=source\`."
+            echo
+            echo "The desktop app is a separate download."
+            echo
+            echo "## Checksums"
+            echo
+            echo '```'
+            cat "dist/${version}/SHA256SUMS"
+            echo '```'
+            echo
+            echo "\`asterism.rb\` is the Homebrew formula for this tag; copy it into"
+            echo "the tap as \`Formula/asterism.rb\`."
+          } >"$notes"
+
+          gh release create "$version" \
+            --title "$version" \
+            --notes-file "$notes" \
+            "dist/${version}/asterism-${version}-darwin-arm64.tar.gz" \
+            "dist/${version}/SHA256SUMS" \
+            "dist/${version}/asterism.rb"

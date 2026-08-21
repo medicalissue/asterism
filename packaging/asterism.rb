@@ -6,12 +6,17 @@
 #
 # Homebrew only installs formulae that live in a tap — a loose .rb path or a
 # raw URL is rejected — so this file is the source of truth and the tap
-# medicalissue/homebrew-asterism carries a copy. Until the first tag it is
-# HEAD-only:
+# medicalissue/homebrew-asterism carries a copy.
 #
-#   brew install --HEAD medicalissue/asterism/asterism
+# This copy is HEAD-only on purpose: `head` is a moving branch and nobody
+# should be installed onto it by accident, so it is never what a plain
+# `brew install` resolves to. The tap's copy is the same file with a stable
+# block rendered into it at release time:
 #
-# See packaging/README.md for the local-tap workflow.
+#   scripts/render-formula.sh v0.1.0 > Formula/asterism.rb
+#
+# which pins one tag and one source-tarball digest. The release workflow
+# renders it and attaches it to the release. See packaging/README.md.
 #
 class Asterism < Formula
   desc "Run your AI agents 24/7 on hardware you already own"
@@ -19,20 +24,11 @@ class Asterism < Formula
   license any_of: ["MIT", "Apache-2.0"]
   head "https://github.com/medicalissue/asterism.git", branch: "main"
 
-  # TODO: first tagged release. When v0.1.0 is cut, add above the `head` line:
-  #
-  #   stable do
-  #     url "https://github.com/medicalissue/asterism/archive/refs/tags/v0.1.0.tar.gz"
-  #     sha256 "<shasum -a 256 of that tarball>"
-  #   end
-  #
-  #   livecheck do
-  #     url :stable
-  #     strategy :github_latest
-  #   end
-  #
-  # and add a bottle block once CI publishes bottles. A tagged tarball is also
-  # what `brew audit --strict` wants; a HEAD-only formula cannot pass it.
+  # scripts/render-formula.sh replaces the next line with the `stable` and
+  # `livecheck` blocks for one tag. A tagged tarball is what `brew audit
+  # --strict` wants; a HEAD-only formula cannot pass it, which is why the
+  # tap's copy is rendered and this one is not.
+  # release:stable-block
 
   depends_on "rust" => :build
   depends_on "qemu"

@@ -23,3 +23,40 @@ jobs:
       - run: cargo build --workspace
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # The installer is the first thing a user runs and the one piece of this
+  # project that is not Rust, so it gets the same treatment: a linter and a
+  # test suite, on both a Linux and a macOS shell.
+  packaging:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: |
+          set -eu
+          if command -v shellcheck >/dev/null 2>&1; then exit 0; fi
+          if [ "$RUNNER_OS" = "macOS" ]; then brew install shellcheck; else
+            sudo apt-get update && sudo apt-get install -y shellcheck
+          fi
+
+      - name: sh -n and shellcheck
+        run: |
+          set -eu
+          sh -n packaging/install.sh
+          sh -n scripts/render-formula.sh
+          shellcheck -s sh packaging/install.sh scripts/render-formula.sh
+          shellcheck scripts/install-test.sh
+
+      - name: The installer's test suite
+        run: bash scripts/install-test.sh
+
+      - name: The formula renders, and is Ruby
+        run: |
+          set -eu
+          ./scripts/render-formula.sh v0.0.0 0000000000000000000000000000000000000000000000000000000000000000 >/tmp/asterism.rb
+          ruby -c /tmp/asterism.rb
+          ruby -c packaging/asterism.rb

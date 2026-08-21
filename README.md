@@ -19,8 +19,14 @@
 </p>
 
 ```console
-$ brew install --HEAD medicalissue/asterism/asterism
+$ curl -fsSL https://asterism.run/install.sh | sh
 ```
+
+One tagged release, checksummed against the `SHA256SUMS` published beside it,
+into `~/.local/bin`. Re-running upgrades; `--uninstall` puts the machine back.
+Building it yourself, from a tag or from a branch you name, is
+`ASTERISM_METHOD=source` — see [packaging/README.md](packaging/README.md) for
+that and for the Homebrew tap.
 
 macOS today. Asterism probes the host when an instance is created and uses
 Virtualization.framework (VZ) when it can satisfy the request, otherwise QEMU.
