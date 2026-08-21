@@ -55,6 +55,8 @@ $ sh install.sh --uninstall
 | `ASTERISM_REQUIRE_SIGNATURE=1` | refuse unless the signature on `SHA256SUMS` verifies |
 | `ASTERISM_PUBKEY=KEY` | minisign/signify public key to verify with |
 | `ASTERISM_REF=main` | `source`/`brew` only: build this git ref instead of a tag |
+| `ASTERISM_TAP=user/tap` | brew only: the tap to install from |
+| `ASTERISM_PIN_TAP=user/tap` | brew only: the tap to build when the one above does not pin the requested version |
 | `ASTERISM_BASE_URL=URL` | where release assets live — a mirror, or a local directory for tests |
 | `ASTERISM_INDEX_URL=URL` | JSON naming the latest tag |
 
@@ -122,12 +124,22 @@ That local tap is refreshed on every version change, and a stamp file beside
 the formula records which release it was rendered for. Without it, a tap built
 for v0.1.0 would be reused when v0.2.0 is the version being installed, and
 Homebrew — which resolves whatever the formula in the tap says — would
-install v0.1.0 again. A tap with no stamp was not built here; it is a
-published tap, Homebrew keeps it current, and this script does not rewrite it.
+install v0.1.0 again.
 
-Because the formula pins exactly one tag, moving between releases is a
-`brew reinstall` rather than a `brew upgrade`: upgrade refuses to go
-backwards, and a named version has to be reachable from either direction.
+A tap with no stamp was not built here. It is a published tap: the distributor
+of record, kept current by Homebrew, and never written to by this script. But
+a published tap pins exactly one version, and someone who names a different
+one with `ASTERISM_VERSION` is owed that version rather than the tap's. So
+when the two disagree, the install comes from `ASTERISM_PIN_TAP` (`<tap>-pin`
+by default) — a second tap this script builds, stamps and verifies the same
+way — and the published tap is left exactly as it was found. Asking again for
+the version the published tap does pin goes back to using it directly.
+
+Moving between releases is an uninstall followed by an install, not a
+`brew upgrade` or a `brew reinstall`. Upgrade refuses to go backwards, and a
+named version has to be reachable from either direction; reinstall reinstalls
+what is already there, which is the wrong formula when the version being
+installed lives in a different tap. Every command is printed before it runs.
 
 ## Cutting a release
 
@@ -153,19 +165,23 @@ $ bash scripts/install-test.sh
 Hermetic: it builds a fake release on disk, serves it over `file://`, and
 shims `uname`, `git` and `cargo` where a test needs the machine to be a
 machine it is not. No network, and nothing is written outside one temp
-directory. Twenty-nine checks: the default install, an explicit version,
+directory. Thirty-two checks: the default install, an explicit version,
 a pinned digest, upgrade, downgrade, reinstall, `ASTERISM_FORCE`, uninstall
 and uninstalling twice, a tampered tarball, an unlisted artifact, a missing
 `SHA256SUMS`, an unreachable index, unreachable assets, four unsupported
 hosts, an unwritable prefix, and the source escape hatch with and without
 `ASTERISM_REF`.
 
-The Homebrew path gets its own five: a first install, a no-op re-run, and a
-two-release upgrade and downgrade that assert on the version the tap's
+The Homebrew path gets its own eight, all asserting on the version the tap's
 formula actually pinned rather than on what the script said it would do —
-which is the only way to catch a stale tap quietly serving an old release.
-A published tap is asserted to be left alone, and a tampered formula to be
-refused before Homebrew sees it.
+which is the only way to catch a tap quietly serving a version nobody asked
+for. A first install, a no-op re-run, a two-release upgrade and downgrade,
+and then the published-tap cases: a published tap that pins the resolved
+version is used as it stands; one that does not is left byte-for-byte
+unchanged and unstamped while the requested version is installed from the pin
+tap; asking again for the published version goes back to the published tap;
+an unstamped formula in either tap is refused rather than overwritten; and a
+tampered formula is refused before Homebrew sees it.
 
 It also asserts the script still passes `sh -n` and `shellcheck`, still names
 no `master` branch, and still has exactly one `sudo` in it.

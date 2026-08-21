@@ -25,6 +25,8 @@
 #   ASTERISM_PUBKEY=KEY       minisign/signify public key to verify with
 #   ASTERISM_REF=main         source/brew only: build this git ref instead of a tag
 #   ASTERISM_TAP=user/tap     brew only: tap to install from
+#   ASTERISM_PIN_TAP=user/tap brew only: tap to build when the one above
+#                             does not pin the version asked for
 #
 #   --uninstall               remove exactly what a previous run installed
 #
@@ -43,6 +45,9 @@ ASSUME_YES="${ASTERISM_YES:-0}"
 FORCE="${ASTERISM_FORCE:-0}"
 REF="${ASTERISM_REF:-}"
 TAP="${ASTERISM_TAP:-medicalissue/asterism}"
+# Where a version the published tap does not pin gets installed from. Never
+# the published tap, always one this script created and stamped.
+PIN_TAP="${ASTERISM_PIN_TAP:-${TAP}-pin}"
 PINNED_SHA="${ASTERISM_SHA256:-}"
 REQUIRE_SIG="${ASTERISM_REQUIRE_SIGNATURE:-0}"
 PUBKEY="${ASTERISM_PUBKEY:-}"
@@ -453,85 +458,132 @@ no_homebrew() {
 }
 
 # Homebrew only installs formulae that live in a tap — a loose .rb file or a
-# raw URL is rejected outright. Use the published tap when it exists, and
-# until it does, stand up a local tap holding this one formula.
+# raw URL is rejected outright — so an install through Homebrew is really a
+# question of which tap, holding which formula.
 #
-# Which formula matters. The copy in the repository is HEAD-only, so a plain
-# `brew install` of it has no stable version to resolve and fails. The one
-# published with the release has the tag and its digest rendered in, and is
-# listed in that release's SHA256SUMS like every other artifact — so that is
-# the one fetched, and it is checksummed before Homebrew is pointed at it.
-# The repository copy is only ever used for an explicitly requested HEAD.
-ensure_tap() {
-	brew_bin="$1" version="$2"
+# The formula in the repository is HEAD-only, so a plain `brew install` of it
+# has no stable version to resolve and fails. The one published with the
+# release has the tag and its digest rendered in, and is listed in that
+# release's SHA256SUMS like every other artifact — so that is the one
+# fetched, and it is checksummed before Homebrew is pointed at it. The
+# repository copy is only ever used for an explicitly requested HEAD.
+STAMP_NAME=".asterism-local-tap"
 
-	if ! "$brew_bin" tap | grep -qx "$TAP"; then
-		if "$brew_bin" tap "$TAP" 2>/dev/null; then
-			say "tapped ${TAP}"
-			return 0
-		fi
-		# A failed tap can leave the directory behind; clear it before
-		# creating the local one, or tap-new refuses.
-		"$brew_bin" untap "$TAP" >/dev/null 2>&1 || true
-		say "${TAP} is not published yet — building a local tap from ${version}"
-		"$brew_bin" tap-new --no-git "$TAP" >/dev/null
-	fi
+# Fetch the formula for one version into $2, verified.
+fetch_release_formula() {
+	version="$1" dest="$2"
 
-	tapdir="$("$brew_bin" --repository "$TAP")"
-	formula="${tapdir}/Formula/asterism.rb"
-	stamp="${tapdir}/.asterism-local-tap"
-
-	# A formula with no stamp beside it belongs to a published tap, which
-	# Homebrew keeps current. Not ours to rewrite.
-	if [ -f "$formula" ] && [ ! -f "$stamp" ]; then
+	if [ -n "$REF" ]; then
+		formula_url="https://raw.githubusercontent.com/${REPO}/${REF}/packaging/asterism.rb"
+		say "fetching ${formula_url}"
+		fetch "$formula_url" "$dest" ||
+			die "could not fetch the formula from ${formula_url}"
 		return 0
 	fi
 
-	# The stamp says which release this script rendered the local tap for.
-	# Without it, a tap built for v0.1.0 is reused verbatim when v0.2.0 is
-	# the version being installed — and Homebrew would dutifully install
-	# v0.1.0 again, which is exactly the stale resolution this script
-	# exists to prevent. A ref is never cached: a branch moves.
-	if [ -n "$REF" ]; then
-		want_stamp="head:${REF}"
-	else
-		want_stamp="$version"
+	formula_url="${BASE_URL}/${version}/asterism.rb"
+	say "fetching ${formula_url}"
+	fetch "$formula_url" "$dest" ||
+		die "could not fetch the release formula from ${formula_url}. Refusing to fall back to the moving branch."
+	sums="${TMPDIR_SELF}/SHA256SUMS.brew"
+	fetch "${BASE_URL}/${version}/SHA256SUMS" "$sums" 2>/dev/null ||
+		die "could not download SHA256SUMS for ${version}. Refusing to install an unverified formula."
+	want="$(expected_digest "$sums" asterism.rb)"
+	got="$(sha256_of "$dest")"
+	[ "$got" = "$want" ] ||
+		die "checksum mismatch on asterism.rb: expected ${want}, got ${got}. Refusing."
+	say "sha256 ok: ${got}"
+}
+
+# Does this formula's stable url name this tag?
+formula_pins() {
+	grep -q "/tags/${2}\.tar\.gz" "$1" 2>/dev/null
+}
+
+# Stand up, or refresh, a tap this script owns, holding the release formula
+# for one version. The stamp records what it was built for: a tap built for
+# v0.1.0 reused when v0.2.0 is the version being installed would have
+# Homebrew install v0.1.0 again, which is the stale resolution this whole
+# script exists to prevent. A ref is never cached — a branch moves.
+build_local_tap() {
+	brew_bin="$1" tap="$2" want_stamp="$3" version="$4"
+
+	if ! "$brew_bin" tap | grep -qx "$tap"; then
+		# A failed tap can leave the directory behind; clear it before
+		# creating the local one, or tap-new refuses.
+		"$brew_bin" untap "$tap" >/dev/null 2>&1 || true
+		say "building a local tap ${tap} for ${want_stamp}"
+		"$brew_bin" tap-new --no-git "$tap" >/dev/null
+	fi
+
+	dir="$("$brew_bin" --repository "$tap")"
+	formula="${dir}/Formula/asterism.rb"
+	stamp="${dir}/${STAMP_NAME}"
+
+	# Belt and braces: this function only ever writes into taps this script
+	# stamped, and it says so rather than clobbering someone else's file.
+	if [ -f "$formula" ] && [ ! -f "$stamp" ]; then
+		die "${formula} was not written by this script. Refusing to overwrite it."
 	fi
 	if [ -f "$formula" ] && [ -f "$stamp" ] && [ -z "$REF" ] &&
 		[ "$(cat "$stamp")" = "$want_stamp" ]; then
 		return 0
 	fi
 	if [ -f "$stamp" ]; then
-		say "the local tap holds $(cat "$stamp") — refreshing it for ${want_stamp}"
+		say "${tap} holds $(cat "$stamp") — refreshing it for ${want_stamp}"
 	fi
 
-	mkdir -p "${tapdir}/Formula"
 	staged="${TMPDIR_SELF}/asterism.rb"
-
-	if [ -n "$REF" ]; then
-		formula_url="https://raw.githubusercontent.com/${REPO}/${REF}/packaging/asterism.rb"
-		say "fetching ${formula_url}"
-		fetch "$formula_url" "$staged" ||
-			die "could not fetch the formula from ${formula_url}"
-	else
-		formula_url="${BASE_URL}/${version}/asterism.rb"
-		say "fetching ${formula_url}"
-		fetch "$formula_url" "$staged" ||
-			die "could not fetch the release formula from ${formula_url}. Refusing to fall back to the moving branch."
-		sums="${TMPDIR_SELF}/SHA256SUMS.brew"
-		if fetch "${BASE_URL}/${version}/SHA256SUMS" "$sums" 2>/dev/null; then
-			want="$(expected_digest "$sums" asterism.rb)"
-			got="$(sha256_of "$staged")"
-			[ "$got" = "$want" ] ||
-				die "checksum mismatch on asterism.rb: expected ${want}, got ${got}. Refusing."
-			say "sha256 ok: ${got}"
-		else
-			die "could not download SHA256SUMS for ${version}. Refusing to install an unverified formula."
-		fi
-	fi
+	fetch_release_formula "$version" "$staged"
+	mkdir -p "${dir}/Formula"
 	cp "$staged" "$formula"
 	printf '%s\n' "$want_stamp" >"$stamp"
 	say "wrote ${formula}"
+}
+
+# Decide which tap the install comes from, and leave $SELECTED_TAP naming it.
+#
+# A published tap is the distributor of record: Homebrew keeps it current and
+# this script never writes to it. But a published tap pins one version, and a
+# user who named another one is owed that version, not the tap's. When the
+# two disagree the install comes from a second tap this script owns and
+# stamps — and the published tap is left exactly as it was found.
+select_tap() {
+	brew_bin="$1" version="$2"
+
+	if [ -n "$REF" ]; then
+		build_local_tap "$brew_bin" "$TAP" "head:${REF}" "$version"
+		SELECTED_TAP="$TAP"
+		return 0
+	fi
+
+	# Tap the published tap if it exists and is not tapped yet; it may well
+	# be the one that pins what was asked for.
+	if ! "$brew_bin" tap | grep -qx "$TAP"; then
+		if "$brew_bin" tap "$TAP" 2>/dev/null; then
+			say "tapped ${TAP}"
+		fi
+	fi
+
+	if "$brew_bin" tap | grep -qx "$TAP"; then
+		dir="$("$brew_bin" --repository "$TAP")"
+		formula="${dir}/Formula/asterism.rb"
+		if [ -f "$formula" ] && [ ! -f "${dir}/${STAMP_NAME}" ]; then
+			if formula_pins "$formula" "$version"; then
+				say "${TAP} is a published tap and pins ${version}"
+				SELECTED_TAP="$TAP"
+				return 0
+			fi
+			say "${TAP} is a published tap and does not pin ${version} — leaving it untouched"
+			say "installing ${version} from ${PIN_TAP} instead, a tap this script owns"
+			build_local_tap "$brew_bin" "$PIN_TAP" "$version" "$version"
+			SELECTED_TAP="$PIN_TAP"
+			return 0
+		fi
+	fi
+
+	build_local_tap "$brew_bin" "$TAP" "$version" "$version"
+	SELECTED_TAP="$TAP"
 }
 
 # QEMU arrives as a formula dependency: Homebrew builds and ships it, we only
@@ -547,29 +599,24 @@ install_brew() {
 		say "release ${version} through Homebrew"
 	fi
 
-	# The tap is refreshed before anything is decided, because what Homebrew
+	# The tap is settled before anything is decided, because what Homebrew
 	# resolves is whatever the formula in the tap says. Reading the installed
 	# version first and deciding against a stale formula is how a machine
 	# ends up pinned to whichever release it happened to see first.
-	ensure_tap "$brew_bin" "$version"
+	select_tap "$brew_bin" "$version"
+	formula_ref="${SELECTED_TAP}/asterism"
 
 	installed="$("$brew_bin" list --formula --versions asterism 2>/dev/null |
 		head -n 1 | awk '{ print $2 }')"
 
 	if [ -n "$REF" ]; then
-		if [ -n "$installed" ]; then
-			action=reinstall
-		else
-			action=install
-		fi
-		say "brew ${action} --HEAD ${TAP}/asterism"
-		"$brew_bin" "$action" --HEAD "${TAP}/asterism"
+		replace_brew_install "$brew_bin" "$installed" "$formula_ref" --HEAD
 		return 0
 	fi
 
 	if [ -z "$installed" ]; then
-		say "brew install ${TAP}/asterism"
-		"$brew_bin" install "${TAP}/asterism"
+		say "brew install ${formula_ref}"
+		"$brew_bin" install "$formula_ref"
 		return 0
 	fi
 
@@ -582,12 +629,28 @@ install_brew() {
 	if [ "$installed" != "${version#v}" ]; then
 		say "moving ${installed} -> ${version#v}"
 	fi
-	# reinstall, not upgrade: `brew upgrade` refuses to go backwards, and a
-	# named version has to be reachable from either direction. The formula
-	# in the tap pins exactly one tag, so a reinstall lands on that tag
-	# whether it is newer or older than what is there.
-	say "brew reinstall ${TAP}/asterism"
-	"$brew_bin" reinstall "${TAP}/asterism"
+	replace_brew_install "$brew_bin" "$installed" "$formula_ref"
+}
+
+# Uninstall then install, rather than `brew reinstall`: the formula being
+# installed can live in a different tap from the one the installed copy came
+# from, and reinstall reinstalls what is already there. Uninstalling first
+# makes the tap that wins unambiguous, and works the same going backwards
+# between versions as forwards — `brew upgrade` does not.
+replace_brew_install() {
+	brew_bin="$1" installed="$2" formula_ref="$3"
+	shift 3
+
+	if [ -n "$installed" ]; then
+		say "brew uninstall asterism"
+		"$brew_bin" uninstall asterism
+	fi
+	if [ $# -gt 0 ]; then
+		say "brew install $* ${formula_ref}"
+	else
+		say "brew install ${formula_ref}"
+	fi
+	"$brew_bin" install "$@" "$formula_ref"
 }
 
 # ---- uninstall -------------------------------------------------------------
@@ -652,7 +715,9 @@ usage() {
 	# Under `curl | sh` there is no file at $0 to read the header out of, so
 	# say the short version rather than printing whatever $0 happens to be.
 	if [ -r "$0" ] && head -n 1 "$0" | grep -q '^#!/bin/sh'; then
-		sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'
+		# From the line after the shebang to the last comment line of the
+		# header, however long that header grows.
+		awk 'NR > 1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"
 	else
 		printf 'asterism installer: installs the latest tagged release into ~/.local/bin.\n'
 		printf '  ASTERISM_VERSION=vX.Y.Z   install exactly that tag\n'
