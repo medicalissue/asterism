@@ -25,6 +25,16 @@
 //! ctl threads   accept() and JSON, handing commands to the main thread
 //! prober thread lease file + ssh banner, because connect() blocks
 //! ```
+//!
+//! ## The helper can end its own guest
+//!
+//! Usually the guest decides (`poweroff`) or the daemon does (`stop`,
+//! `kill`). There is one case where this process decides for itself: a disk
+//! attached over the network has failed for good. VZ cannot re-attach one
+//! under a running VM, the guest's writes to it are going nowhere, and the
+//! framework goes on reporting the machine as `Running` — so the helper
+//! asks the guest to power down and then pulls the cord, which is the death
+//! `astd`'s supervisor already knows how to act on.
 
 #[cfg(target_os = "macos")]
 mod ctl;
@@ -75,7 +85,10 @@ fn main() -> anyhow::Result<()> {
 
     let t0 = Instant::now();
     let machine = unsafe { vm::start(&config) }.with_context(|| {
-        format!("starting the {} guest under Virtualization.framework", config.instance)
+        format!(
+            "starting the {} guest under Virtualization.framework",
+            config.instance
+        )
     })?;
     eprintln!(
         "astd-vz: {} started in {:.2}s (pid {}, mac {})",
@@ -126,18 +139,32 @@ fn main() -> anyhow::Result<()> {
             started_at,
             boot_secs: slot.boot_secs,
             console: config.console.clone(),
+            // The *reason* for the state beside it: `machine.state()`
+            // already refuses to call a guest with a dead disk live, and
+            // this says which disk and why.
+            storage_error: machine.signals.storage_failure(),
         }
     };
 
     // The run loop. Every wait is a pump rather than a sleep, and the only
     // work that happens here is work that must happen on the VM's queue.
+    //
+    // `losing_a_disk` is set the first time a disk fails for good, and is
+    // the deadline the guest has to power itself off before the cord comes
+    // out. Deliberately *not* `machine.graceful_stop`, which would block
+    // this loop: `info` has to keep being answered while the guest goes, or
+    // the daemon times out, falls back to the pid, and calls it running.
+    let mut losing_a_disk: Option<Instant> = None;
+
     let reason: StopReason = 'run: loop {
         vm::pump(Duration::from_millis(100));
 
         while let Ok(job) = jobs_rx.try_recv() {
             match job.command {
                 Command::Info => {
-                    let _ = job.reply.send(Reply::Info(info(unsafe { machine.state() })));
+                    let _ = job
+                        .reply
+                        .send(Reply::Info(info(unsafe { machine.state() })));
                 }
                 // `stop` and `kill` both answer with the outcome and then
                 // end the process: the VM cannot outlive it, so a helper
@@ -145,7 +172,10 @@ fn main() -> anyhow::Result<()> {
                 Command::Stop { timeout_secs } => {
                     let budget = Duration::from_secs(timeout_secs.unwrap_or(30));
                     let asked = Instant::now();
-                    let reason = unsafe { machine.graceful_stop(budget) };
+                    let stopped = unsafe { machine.graceful_stop(budget) };
+                    // A guest that was already on its way out because a disk
+                    // went did not "ignore ACPI"; say what actually happened.
+                    let reason = exit_reason(machine.signals.storage_failure(), Some(stopped));
                     let _ = job.reply.send(Reply::Stopped {
                         reason: reason.clone(),
                         seconds: asked.elapsed().as_secs_f64(),
@@ -155,7 +185,8 @@ fn main() -> anyhow::Result<()> {
                 }
                 Command::Kill => {
                     let asked = Instant::now();
-                    let reason = unsafe { machine.force_stop() };
+                    let stopped = unsafe { machine.force_stop() };
+                    let reason = exit_reason(machine.signals.storage_failure(), Some(stopped));
                     let _ = job.reply.send(Reply::Stopped {
                         reason: reason.clone(),
                         seconds: asked.elapsed().as_secs_f64(),
@@ -169,7 +200,46 @@ fn main() -> anyhow::Result<()> {
         // The guest powering itself off (`poweroff` inside, or a panic VZ
         // reported through the delegate) ends this process the same way.
         if machine.signals.stopped() {
-            break 'run machine.signals.reason().unwrap_or(StopReason::Forced);
+            break 'run exit_reason(machine.signals.storage_failure(), machine.signals.reason());
+        }
+
+        // A disk that will never come back. Apple is explicit that the NBD
+        // client is non-functional after `didEncounterError:`, and there is
+        // no API to swap the attachment out from under a live guest — so
+        // the only honest end is to stop, and to stop *soon*: every second
+        // longer is another second of the guest believing writes landed.
+        if let Some(failure) = machine.signals.storage_failure() {
+            match losing_a_disk {
+                None => {
+                    eprintln!("astd-vz: {}: {failure}", config.instance);
+                    // ACPI first, so the guest can flush the disks it has
+                    // *not* lost — its root among them. A request VZ will
+                    // not take leaves nothing to wait for, so the deadline
+                    // is now and the next turn of this loop forces it.
+                    losing_a_disk = Some(match unsafe { machine.request_stop() } {
+                        true => {
+                            eprintln!(
+                                "astd-vz: asked {} to power off — up to {}s",
+                                config.instance,
+                                STORAGE_FAILURE_GRACE.as_secs()
+                            );
+                            Instant::now() + STORAGE_FAILURE_GRACE
+                        }
+                        false => Instant::now(),
+                    });
+                }
+                // Out of budget. A guest that is not answering ACPI is
+                // often one wedged flushing the disk that went.
+                Some(until) if Instant::now() >= until => {
+                    eprintln!(
+                        "astd-vz: {} would not power down after losing a disk — forcing it",
+                        config.instance
+                    );
+                    unsafe { machine.force_stop() };
+                    break 'run exit_reason(Some(failure), machine.signals.reason());
+                }
+                Some(_) => {}
+            }
         }
     };
 
@@ -178,12 +248,72 @@ fn main() -> anyhow::Result<()> {
         "astd-vz: {} down after {:.1}s — {reason}{}",
         config.instance,
         t0.elapsed().as_secs_f64(),
-        match machine.signals.net_disconnects() {
-            0 => String::new(),
-            n => format!(" ({n} network drop(s))"),
-        }
+        churn(
+            machine.signals.net_disconnects(),
+            machine.signals.nbd_connections(),
+            machine.signals.nbd_terminal_errors(),
+        )
     );
     Ok(())
+}
+
+/// How long the guest gets to power itself off after a disk it is using has
+/// failed for good.
+///
+/// Shorter than the thirty seconds a `stop` allows, and for the opposite
+/// reason: the guest may well be blocked in the kernel flushing the device
+/// that just went, in which case waiting the full budget buys nothing and
+/// only delays the restart.
+#[cfg(target_os = "macos")]
+const STORAGE_FAILURE_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Why this guest is going away, given what the delegate saw.
+///
+/// A disk that failed for good outranks whatever came after it: the guest
+/// powering off politely is the *answer* to the shutdown that failure
+/// forced, not the reason for it, and "guest powered off" would read like a
+/// clean `ast down` in the log and in the daemon's `stop`.
+///
+/// Deliberately an existing [`StopReason`] rather than a new variant —
+/// `StopReason` is internally tagged, so a new `kind` an older `astd`
+/// cannot parse would fail the whole reply and send it off to signal a
+/// helper that is already gone.
+#[cfg(target_os = "macos")]
+fn exit_reason(
+    storage: Option<asterism_vz::StorageError>,
+    delegate: Option<asterism_vz::StopReason>,
+) -> asterism_vz::StopReason {
+    match storage {
+        Some(failure) => asterism_vz::StopReason::Failed {
+            message: failure.to_string(),
+        },
+        None => delegate.unwrap_or(asterism_vz::StopReason::Forced),
+    }
+}
+
+/// The line's worth of network trouble a boot accumulated, or nothing.
+///
+/// NBD reconnects and terminal failures are counted apart on purpose: the
+/// first is VZ's reconnect loop working as designed and the guest never
+/// knowing, the second is the disk being gone. Reporting them together was
+/// how a permanent failure came to look like ordinary churn.
+#[cfg(target_os = "macos")]
+fn churn(net_disconnects: u32, nbd_connections: u32, nbd_terminal_errors: u32) -> String {
+    let mut said = Vec::new();
+    if net_disconnects > 0 {
+        said.push(format!("{net_disconnects} network drop(s)"));
+    }
+    // The first connection is not a reconnect.
+    if let Some(reconnects) = nbd_connections.checked_sub(1).filter(|n| *n > 0) {
+        said.push(format!("{reconnects} nbd reconnect(s)"));
+    }
+    if nbd_terminal_errors > 0 {
+        said.push(format!("{nbd_terminal_errors} nbd disk(s) lost for good"));
+    }
+    match said.is_empty() {
+        true => String::new(),
+        false => format!(" ({})", said.join(", ")),
+    }
 }
 
 /// Let the control thread write its answer before this process exits.
@@ -207,7 +337,8 @@ fn parse_args() -> anyhow::Result<std::path::PathBuf> {
         match arg.as_str() {
             "--config" => {
                 config = Some(std::path::PathBuf::from(
-                    args.next().ok_or_else(|| anyhow::anyhow!("--config needs a path"))?,
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("--config needs a path"))?,
                 ))
             }
             "-h" | "--help" => {
@@ -246,4 +377,76 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    use asterism_vz::{StopReason, StorageError};
+
+    fn lost() -> StorageError {
+        StorageError {
+            uri: "nbd+unix:///team%2Fdata?socket=%2Ftmp%2Fv.sock".into(),
+            message: "Connection reset by peer".into(),
+        }
+    }
+
+    /// Whatever the guest does after losing a disk, the log and the daemon
+    /// hear about the disk — including when it powers off politely, which
+    /// is what our own ACPI request asked it to do.
+    #[test]
+    fn a_lost_disk_outranks_the_shutdown_it_caused() {
+        for after in [
+            None,
+            Some(StopReason::GuestStopped),
+            Some(StopReason::Forced),
+        ] {
+            let StopReason::Failed { message } = exit_reason(Some(lost()), after.clone()) else {
+                panic!("a lost disk is a failure, whatever followed it: {after:?}");
+            };
+            assert!(message.contains("nbd+unix:///team%2Fdata"), "{message}");
+            assert!(message.contains("Connection reset by peer"), "{message}");
+        }
+    }
+
+    /// ...and with no disk lost, nothing changes: the delegate's own
+    /// account stands, exactly as it did before.
+    #[test]
+    fn an_ordinary_stop_still_reads_as_itself() {
+        assert_eq!(
+            exit_reason(None, Some(StopReason::GuestStopped)),
+            StopReason::GuestStopped
+        );
+        assert_eq!(
+            exit_reason(
+                None,
+                Some(StopReason::Failed {
+                    message: "vz gave up".into()
+                })
+            ),
+            StopReason::Failed {
+                message: "vz gave up".into()
+            }
+        );
+        // Nothing said at all: the VM went without the delegate naming a
+        // reason, which is a forced stop as far as anyone can tell.
+        assert_eq!(exit_reason(None, None), StopReason::Forced);
+    }
+
+    #[test]
+    fn reconnects_and_a_lost_disk_are_counted_apart() {
+        assert_eq!(churn(0, 0, 0), "", "a quiet boot says nothing");
+        assert_eq!(
+            churn(0, 1, 0),
+            "",
+            "the first connection is not a reconnect"
+        );
+        assert_eq!(churn(0, 3, 0), " (2 nbd reconnect(s))");
+        assert_eq!(churn(2, 1, 0), " (2 network drop(s))");
+        let both = churn(1, 4, 1);
+        assert!(both.contains("3 nbd reconnect(s)"), "{both}");
+        assert!(both.contains("1 nbd disk(s) lost for good"), "{both}");
+        assert!(both.contains("1 network drop(s)"), "{both}");
+    }
 }

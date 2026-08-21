@@ -41,8 +41,8 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 
 use asterism_core::hv::{
-    BootReq, Caps, ControlChannel, DirectKernel, DiskFormat, DiskSpec, Firmware, GuestEndpoint,
-    Handle, Hypervisor, ImageKind, Prepared, Ready, RunState, ShareKind, SnapshotId,
+    BootReq, Caps, ControlChannel, DirectKernel, DiskFormat, DiskSpec, Firmware, GuestEgress,
+    GuestEndpoint, Handle, Hypervisor, ImageKind, Prepared, Ready, RunState, ShareKind, SnapshotId,
 };
 use asterism_core::instance::{now_unix, PortForward};
 use asterism_core::snapshot::{self, Snapshot};
@@ -56,16 +56,26 @@ pub const ID: &str = "qemu";
 #[derive(Default)]
 pub struct Qemu {
     probed: OnceLock<Probe>,
+    /// Firmware discovery, cached separately from the host probe because it
+    /// is a different question asked at a different time — see
+    /// [`Qemu::firmware`].
+    firmware: OnceLock<FirmwareFiles>,
 }
 
 /// The facts about this host's QEMU that every other method needs, worked
 /// out once. `probe()` is called on the `ast create` path, so it stays
 /// cheap: three subprocess runs and one device open, cached for the life of
 /// the daemon.
+///
+/// Firmware is deliberately not in here. Whether this host has EDK2 is a
+/// question about one *kind of boot*, not about whether QEMU runs at all: an
+/// OCI rootfs is handed a kernel and never maps pflash, so a host with qemu
+/// and no EDK2 runs container images perfectly well and must not be told it
+/// has no working backend. [`Qemu::firmware`] asks it, once, where it is
+/// actually needed.
 struct Probe {
     system: PathBuf,
     img: PathBuf,
-    firmware: FirmwareFiles,
     version: String,
     /// What this host accelerates guests with — a fact asked of the host,
     /// not read off the target triple: on Linux it is `Kvm` only once
@@ -92,6 +102,30 @@ impl Qemu {
         Ok(self.probed.get_or_init(|| probe))
     }
 
+    /// The UEFI firmware this host boots cloud images with, found once.
+    ///
+    /// Separate from [`Qemu::probed`] on purpose. A cloud image is a whole
+    /// disk and needs EDK2 in front of it to find the bootloader; an OCI
+    /// rootfs is handed `-kernel/-initrd` and needs none. Asking for both at
+    /// probe time made a missing EDK2 look like a missing *backend*, so a
+    /// host that could have run container images was told to install
+    /// firmware it would never map. Now the two probes answer independently
+    /// and each is asked by exactly what needs it.
+    ///
+    /// Cached the same way, and for the same reason: the search is a
+    /// dozen-odd `stat`s, so it costs nothing to repeat while it is failing,
+    /// and `OnceLock` records only the hit — installing OVMF fixes a running
+    /// daemon without a restart.
+    fn firmware(&self) -> Result<&FirmwareFiles> {
+        if let Some(fw) = self.firmware.get() {
+            return Ok(fw);
+        }
+        // Through the cached probe, so the qemu binary is discovered once:
+        // where firmware lives is partly a fact about where that binary is.
+        let found = find_firmware(&self.probed()?.system)?;
+        Ok(self.firmware.get_or_init(|| found))
+    }
+
     /// Materialise an instance's root disk for the first time.
     ///
     /// A raw base is cloned: on APFS `clonefile(2)` shares every block with
@@ -103,7 +137,11 @@ impl Qemu {
     fn create_root(&self, req: &BootReq, raw: &Path, legacy: &Path) -> Result<DiskSpec> {
         let base = &req.base;
         if !base.path.exists() {
-            bail!("image {} is not pulled yet — run: ast pull {}", base.name, base.name);
+            bail!(
+                "image {} is not pulled yet — run: ast pull {}",
+                base.name,
+                base.name
+            );
         }
         let gib = u64::from(req.instance.shape.disk_gib);
         match base.format {
@@ -150,15 +188,20 @@ impl Probe {
     fn run() -> Result<Self> {
         let system = tool(&format!("qemu-system-{}", image::host_arch()))?;
         let img = tool("qemu-img")?;
-        // Acceleration before firmware: a host with no KVM cannot run a
-        // guest at all, and being told that is more use than being told
-        // which firmware file is missing.
+        // The binaries, then the accelerator: a host with no KVM cannot run
+        // a guest at all, whatever else it has, and each of these is asked
+        // of the host in its own right rather than standing in for another.
         let accel = probe_accel()?;
-        let firmware = find_firmware(&system)?;
         let version = parse_version(&output(Command::new(&system).arg("--version"))?)
             .unwrap_or_else(|| "unknown".to_owned());
         let virtfs = supports_virtfs(&system);
-        Ok(Probe { system, img, firmware, version, accel, virtfs })
+        Ok(Probe {
+            system,
+            img,
+            version,
+            accel,
+            virtfs,
+        })
     }
 
     /// Machine type is per-arch: "virt" exists only on aarch64; x86 wants q35.
@@ -221,6 +264,14 @@ impl Hypervisor for Qemu {
             // User-mode networking, so every guest port that is reachable
             // at all is reachable as a hostfwd on this device's loopback.
             port_forward: true,
+            // The same user-net, seen from the other side: connections the
+            // guest makes to 10.0.2.2 are proxied to this host's loopback, so
+            // a listener on 127.0.0.1 is reachable from the guest and from
+            // nothing on the wire. That is the whole of what the secrets
+            // egress proxy needs, and it is why it works here and not on vz.
+            guest_egress: Some(GuestEgress::LoopbackGateway {
+                gateway: GUEST_GATEWAY,
+            }),
             // Raw first: it is what new instances get, and what a VZ host
             // would be able to boot. qcow2 stays readable for the instances
             // and the hand-supplied images that are already in it.
@@ -241,9 +292,17 @@ impl Hypervisor for Qemu {
         let raw = req.dir.join("disk.raw");
         let legacy = req.dir.join("disk.qcow2");
         let root = if raw.exists() {
-            DiskSpec::File { path: raw, format: DiskFormat::Raw, readonly: false }
+            DiskSpec::File {
+                path: raw,
+                format: DiskFormat::Raw,
+                readonly: false,
+            }
         } else if legacy.exists() {
-            DiskSpec::File { path: legacy, format: DiskFormat::Qcow2, readonly: false }
+            DiskSpec::File {
+                path: legacy,
+                format: DiskFormat::Qcow2,
+                readonly: false,
+            }
         } else {
             self.create_root(req, &raw, &legacy)?
         };
@@ -257,13 +316,19 @@ impl Hypervisor for Qemu {
             return Ok(Prepared {
                 root,
                 firmware: None,
-                kernel: Some(DirectKernel { kernel, initrd: Some(initrd), cmdline: cmdline() }),
+                kernel: Some(DirectKernel {
+                    kernel,
+                    initrd: Some(initrd),
+                    cmdline: cmdline(),
+                }),
             });
         }
 
-        // Probed before the store is cut, because what the store has to be
-        // is a fact about the firmware this host turned out to have.
-        let fw = &self.probed()?.firmware;
+        // Found before the store is cut, because what the store has to be is
+        // a fact about the firmware this host turned out to have. This is the
+        // only caller: the OCI path above has already returned, and it is the
+        // whole reason firmware is asked for here rather than at probe time.
+        let fw = self.firmware()?;
         let vars = req.dir.join("efi-vars.fd");
         if !vars.exists() {
             cut_vars(fw, &vars)?;
@@ -271,7 +336,10 @@ impl Hypervisor for Qemu {
 
         Ok(Prepared {
             root,
-            firmware: Some(Firmware { code: fw.code.clone(), vars }),
+            firmware: Some(Firmware {
+                code: fw.code.clone(),
+                vars,
+            }),
             kernel: None,
         })
     }
@@ -310,11 +378,16 @@ impl Hypervisor for Qemu {
         qmp::forget(&qmp);
 
         let mut cmd = Command::new(&p.system);
-        cmd.arg("-machine").arg(p.machine_type())
-            .arg("-accel").arg(p.accel.as_arg())
-            .arg("-cpu").arg(CPU_MODEL)
-            .arg("-smp").arg(inst.shape.cpus.to_string())
-            .arg("-m").arg(format!("{}M", inst.shape.mem_mib));
+        cmd.arg("-machine")
+            .arg(p.machine_type())
+            .arg("-accel")
+            .arg(p.accel.as_arg())
+            .arg("-cpu")
+            .arg(CPU_MODEL)
+            .arg("-smp")
+            .arg(inst.shape.cpus.to_string())
+            .arg("-m")
+            .arg(format!("{}M", inst.shape.mem_mib));
 
         // Firmware or a kernel, never both: a machine either finds a
         // bootloader on its disk or is handed the kernel to start. Disks are
@@ -332,12 +405,16 @@ impl Hypervisor for Qemu {
                     .firmware
                     .as_ref()
                     .context("the qemu backend needs firmware, and prepare() produced none")?;
-                cmd.arg("-drive").arg(format!(
-                    "if=pflash,format=raw,readonly=on,file={}",
-                    firmware.code.display()
-                ))
-                .arg("-drive")
-                .arg(format!("if=pflash,format=raw,file={}", firmware.vars.display()));
+                cmd.arg("-drive")
+                    .arg(format!(
+                        "if=pflash,format=raw,readonly=on,file={}",
+                        firmware.code.display()
+                    ))
+                    .arg("-drive")
+                    .arg(format!(
+                        "if=pflash,format=raw,file={}",
+                        firmware.vars.display()
+                    ));
             }
         }
 
@@ -371,14 +448,21 @@ impl Hypervisor for Qemu {
             }
         }
 
-        cmd.arg("-netdev").arg(netdev_arg(ssh_port, &inst.publish))
-            .arg("-device").arg("virtio-net-pci,netdev=n0")
-            .arg("-device").arg("virtio-rng-pci")
-            .arg("-qmp").arg(format!("unix:{},server,nowait", qmp.display()))
-            .arg("-display").arg("none")
-            .arg("-serial").arg(format!("file:{}", req.console.display()))
+        cmd.arg("-netdev")
+            .arg(netdev_arg(ssh_port, &inst.publish))
+            .arg("-device")
+            .arg("virtio-net-pci,netdev=n0")
+            .arg("-device")
+            .arg("virtio-rng-pci")
+            .arg("-qmp")
+            .arg(format!("unix:{},server,nowait", qmp.display()))
+            .arg("-display")
+            .arg("none")
+            .arg("-serial")
+            .arg(format!("file:{}", req.console.display()))
             .arg("-daemonize")
-            .arg("-pidfile").arg(&pidfile);
+            .arg("-pidfile")
+            .arg(&pidfile);
 
         for share in &req.shares {
             // mapped-xattr keeps guest ownership and permissions in host
@@ -536,7 +620,13 @@ impl Hypervisor for Qemu {
 /// Snapshots are the one place the two disk layouts genuinely differ, so
 /// this is the only thing that branches on it.
 fn is_legacy_qcow2(prep: &Prepared) -> bool {
-    matches!(prep.root, DiskSpec::File { format: DiskFormat::Qcow2, .. })
+    matches!(
+        prep.root,
+        DiskSpec::File {
+            format: DiskFormat::Qcow2,
+            ..
+        }
+    )
 }
 
 /// The instance directory a root disk sits in — where its snapshots go.
@@ -554,7 +644,11 @@ fn instance_dir(disk: &Path) -> Result<&Path> {
 /// not, say, a volume's name off the wire.
 fn disk_args(disk: &DiskSpec, id: &str) -> Result<Vec<String>> {
     let node = match disk {
-        DiskSpec::File { path, format, readonly } => format!(
+        DiskSpec::File {
+            path,
+            format,
+            readonly,
+        } => format!(
             "if=none,id={id},format={},{}file={}",
             format.as_str(),
             if *readonly { "readonly=on," } else { "" },
@@ -574,7 +668,11 @@ fn disk_args(disk: &DiskSpec, id: &str) -> Result<Vec<String>> {
         // options that make a remote disk survive a network blip —
         // `reconnect-delay` and `open-timeout` — are properties of the nbd
         // node, and `-drive` has no way to express them.
-        DiskSpec::NbdUnix { socket, export, readonly } => {
+        DiskSpec::NbdUnix {
+            socket,
+            export,
+            readonly,
+        } => {
             return Ok(vec![
                 "-blockdev".to_owned(),
                 format!(
@@ -742,7 +840,11 @@ fn probe_accel() -> Result<Accel> {
     if cfg!(target_os = "macos") {
         return Ok(Accel::Hvf);
     }
-    match std::fs::OpenOptions::new().read(true).write(true).open(KVM_DEVICE) {
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(KVM_DEVICE)
+    {
         Ok(_) => Ok(Accel::Kvm),
         Err(e) => bail!("{}", kvm_advice(&e)),
     }
@@ -819,14 +921,21 @@ impl FirmwareLayout {
         if !code.exists() {
             return None;
         }
-        let vars_template = self.vars.iter().map(|v| self.dir.join(v)).find(|p| p.exists());
+        let vars_template = self
+            .vars
+            .iter()
+            .map(|v| self.dir.join(v))
+            .find(|p| p.exists());
         if vars_template.is_none() && !self.vars.is_empty() {
             // The code is here and the store it was built against is not.
             // Handing that firmware a zero-filled store of the wrong size is
             // a QEMU error with no explanation in it, so keep looking.
             return None;
         }
-        Some(FirmwareFiles { code, vars_template })
+        Some(FirmwareFiles {
+            code,
+            vars_template,
+        })
     }
 }
 
@@ -864,20 +973,36 @@ fn firmware_layouts(qemu: &Path, arch: &str) -> Result<Vec<FirmwareLayout>> {
     }
     let mut layouts: Vec<FirmwareLayout> = dirs
         .into_iter()
-        .map(|dir| FirmwareLayout { dir, code: qemu_code, vars: qemu_vars })
+        .map(|dir| FirmwareLayout {
+            dir,
+            code: qemu_code,
+            vars: qemu_vars,
+        })
         .collect();
 
     let distro: &[(&str, &'static str, &'static [&'static str])] = match arch {
         "aarch64" => &[
-            ("/usr/share/AAVMF", "AAVMF_CODE_4M.fd", &["AAVMF_VARS_4M.fd"]),
-            ("/usr/share/AAVMF", "AAVMF_CODE.no-secboot.fd", &["AAVMF_VARS.fd"]),
+            (
+                "/usr/share/AAVMF",
+                "AAVMF_CODE_4M.fd",
+                &["AAVMF_VARS_4M.fd"],
+            ),
+            (
+                "/usr/share/AAVMF",
+                "AAVMF_CODE.no-secboot.fd",
+                &["AAVMF_VARS.fd"],
+            ),
             ("/usr/share/AAVMF", "AAVMF_CODE.fd", &["AAVMF_VARS.fd"]),
             (
                 "/usr/share/edk2/aarch64",
                 "QEMU_EFI-silent-pflash.raw",
                 &["vars-template-pflash.raw"],
             ),
-            ("/usr/share/edk2/aarch64", "QEMU_EFI-pflash.raw", &["vars-template-pflash.raw"]),
+            (
+                "/usr/share/edk2/aarch64",
+                "QEMU_EFI-pflash.raw",
+                &["vars-template-pflash.raw"],
+            ),
             ("/usr/share/edk2/aarch64", "QEMU_CODE.fd", &["QEMU_VARS.fd"]),
         ],
         _ => &[
@@ -887,16 +1012,24 @@ fn firmware_layouts(qemu: &Path, arch: &str) -> Result<Vec<FirmwareLayout>> {
             ("/usr/share/OVMF", "OVMF_CODE_4M.fd", &["OVMF_VARS_4M.fd"]),
             ("/usr/share/OVMF", "OVMF_CODE.fd", &["OVMF_VARS.fd"]),
             ("/usr/share/edk2/ovmf", "OVMF_CODE.fd", &["OVMF_VARS.fd"]),
-            ("/usr/share/edk2/x64", "OVMF_CODE.4m.fd", &["OVMF_VARS.4m.fd"]),
+            (
+                "/usr/share/edk2/x64",
+                "OVMF_CODE.4m.fd",
+                &["OVMF_VARS.4m.fd"],
+            ),
             ("/usr/share/edk2/x64", "OVMF_CODE.fd", &["OVMF_VARS.fd"]),
-            ("/usr/share/qemu", "ovmf-x86_64-code.bin", &["ovmf-x86_64-vars.bin"]),
+            (
+                "/usr/share/qemu",
+                "ovmf-x86_64-code.bin",
+                &["ovmf-x86_64-vars.bin"],
+            ),
         ],
     };
-    layouts.extend(
-        distro
-            .iter()
-            .map(|(dir, code, vars)| FirmwareLayout { dir: PathBuf::from(*dir), code, vars }),
-    );
+    layouts.extend(distro.iter().map(|(dir, code, vars)| FirmwareLayout {
+        dir: PathBuf::from(*dir),
+        code,
+        vars,
+    }));
     Ok(layouts)
 }
 
@@ -910,8 +1043,10 @@ fn find_firmware(qemu: &Path) -> Result<FirmwareFiles> {
     let arch = image::host_arch();
     let layouts = firmware_layouts(qemu, arch)?;
     pick_firmware(&layouts).with_context(|| {
-        let looked: Vec<String> =
-            layouts.iter().map(|l| l.code_path().display().to_string()).collect();
+        let looked: Vec<String> = layouts
+            .iter()
+            .map(|l| l.code_path().display().to_string())
+            .collect();
         format!(
             "no UEFI firmware for {arch} guests near {} — install it with {}. \
              Looked for: {}",
@@ -974,8 +1109,8 @@ fn supports_virtfs(qemu: &Path) -> bool {
     let Ok(out) = Command::new(qemu).args(["-device", "help"]).output() else {
         return false;
     };
-    let listed = String::from_utf8_lossy(&out.stdout).into_owned()
-        + &String::from_utf8_lossy(&out.stderr);
+    let listed =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
     listed.contains("virtio-9p-pci")
 }
 
@@ -984,9 +1119,9 @@ fn supports_virtfs(qemu: &Path) -> bool {
 /// must not be fatal — the caller falls back to "unknown".
 fn parse_version(banner: &str) -> Option<String> {
     let line = banner.lines().next()?;
-    let v = line.split_whitespace().find(|w| {
-        w.starts_with(|c: char| c.is_ascii_digit()) && w.contains('.')
-    })?;
+    let v = line
+        .split_whitespace()
+        .find(|w| w.starts_with(|c: char| c.is_ascii_digit()) && w.contains('.'))?;
     // Homebrew and distro builds suffix the version: "9.1.0(v9.1.0-mac)".
     Some(v.split(['(', '-']).next().unwrap_or(v).to_owned())
 }
@@ -1008,7 +1143,11 @@ mod tests {
             "disky",
             &local_host(),
             "debian:13",
-            Shape { cpus: 1, mem_mib: 512, disk_gib },
+            Shape {
+                cpus: 1,
+                mem_mib: 512,
+                disk_gib,
+            },
             asterism_core::hv::Machine {
                 backend: ID.into(),
                 machine_type: "virt".into(),
@@ -1036,7 +1175,12 @@ mod tests {
     fn raw_base(dir: &Path) -> ImageRef {
         let path = dir.join("debian-13.raw");
         std::fs::write(&path, vec![0xab; 64 * 1024]).unwrap();
-        ImageRef { name: "debian:13".into(), path, format: DiskFormat::Raw, kind: ImageKind::Disk }
+        ImageRef {
+            name: "debian:13".into(),
+            path,
+            format: DiskFormat::Raw,
+            kind: ImageKind::Disk,
+        }
     }
 
     /// The Phase 1 disk: a clone of the raw base, truncated up to the
@@ -1061,7 +1205,11 @@ mod tests {
         };
         assert_eq!(*format, DiskFormat::Raw);
         assert!(path.ends_with("disk.raw"), "{path:?}");
-        assert_eq!(std::fs::metadata(path).unwrap().len(), 2 << 30, "2 GiB as asked");
+        assert_eq!(
+            std::fs::metadata(path).unwrap().len(),
+            2 << 30,
+            "2 GiB as asked"
+        );
         assert!(
             cow::usage(path).unwrap() < 8 << 20,
             "a clone of a 64 KiB base costs nothing like 2 GiB"
@@ -1078,7 +1226,11 @@ mod tests {
         let disk = dir.path().join("disk.raw");
         std::fs::write(&disk, b"pristine").unwrap();
         let prep = Prepared {
-            root: DiskSpec::File { path: disk.clone(), format: DiskFormat::Raw, readonly: false },
+            root: DiskSpec::File {
+                path: disk.clone(),
+                format: DiskFormat::Raw,
+                readonly: false,
+            },
             firmware: None,
             kernel: None,
         };
@@ -1093,12 +1245,17 @@ mod tests {
         let listed = hv.disk_snapshot_list(&prep).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].tag, "clean");
-        assert!(hv.disk_snapshot(&prep, "clean").is_err(), "one tag, one snapshot");
+        assert!(
+            hv.disk_snapshot(&prep, "clean").is_err(),
+            "one tag, one snapshot"
+        );
 
         std::fs::write(&disk, b"diverged").unwrap();
         hv.disk_restore(&prep, &id).unwrap();
         assert_eq!(std::fs::read(&disk).unwrap(), b"pristine");
-        assert!(hv.disk_restore(&prep, &SnapshotId("absent".into())).is_err());
+        assert!(hv
+            .disk_restore(&prep, &SnapshotId("absent".into()))
+            .is_err());
     }
 
     /// An instance created before raw disks keeps its overlay, and with it
@@ -1115,7 +1272,10 @@ mod tests {
             kernel: None,
         };
         assert!(is_legacy_qcow2(&legacy));
-        assert_eq!(instance_dir(Path::new("/i/disky/disk.raw")).unwrap(), Path::new("/i/disky"));
+        assert_eq!(
+            instance_dir(Path::new("/i/disky/disk.raw")).unwrap(),
+            Path::new("/i/disky")
+        );
     }
 
     /// An OCI rootfs gets a kernel and no firmware; a cloud image gets
@@ -1143,14 +1303,107 @@ mod tests {
             Ok(prep) => {
                 let kernel = prep.kernel.expect("an oci rootfs boots a kernel");
                 assert!(prep.firmware.is_none(), "and gets no firmware with it");
-                assert!(kernel.initrd.is_some(), "the initrd carries virtio_blk and ext4");
+                assert!(
+                    kernel.initrd.is_some(),
+                    "the initrd carries virtio_blk and ext4"
+                );
                 assert!(kernel.cmdline.contains("root=/dev/vda"));
-                assert!(!dir.join("efi-vars.fd").exists(), "no variable store either");
+                assert!(
+                    !dir.join("efi-vars.fd").exists(),
+                    "no variable store either"
+                );
             }
             Err(e) => {
                 let e = e.to_string();
                 assert!(e.contains("no kernel of its own"), "{e}");
                 assert!(e.contains("ast pull"), "the way out is in the message: {e}");
+            }
+        }
+    }
+
+    /// The two boots ask this host for different things, which is why they
+    /// are probed apart. A cloud image is a whole disk and needs EDK2 in
+    /// front of it; an OCI rootfs is handed `-kernel/-initrd` and never maps
+    /// pflash. Firmware was once part of `probe()`, so a host with qemu and
+    /// no EDK2 reported no working backend at all and could not create the
+    /// container instances it was perfectly able to run.
+    ///
+    /// The firmware cache is the evidence: it is only ever filled by the
+    /// path that actually maps firmware.
+    #[test]
+    fn only_a_firmware_boot_asks_this_host_for_firmware() {
+        let home = tempfile::tempdir().unwrap();
+        let inst = instance(2);
+        let dir = home.path().join("instances/disky");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let path = home.path().join("oci-abc.raw");
+        std::fs::write(&path, vec![0xcd; 64 * 1024]).unwrap();
+        let oci = ImageRef {
+            name: "docker.io/library/nginx:latest".into(),
+            path,
+            format: DiskFormat::Raw,
+            kind: ImageKind::OciRootfs,
+        };
+
+        let hv = Qemu::new();
+        // Probing the host is a question about tooling and acceleration, and
+        // it answers without a firmware search — which is exactly what it
+        // could not do when EDK2 was one of the things `probe()` demanded.
+        let _ = hv.probe();
+        assert!(
+            hv.firmware.get().is_none(),
+            "probing this host is not a firmware search"
+        );
+
+        // Whether this device has fetched a guest kernel is not this test's
+        // business — either way, the OCI path must not have gone looking for
+        // firmware on the way there.
+        let _ = hv.prepare(&req(&inst, &dir, oci));
+        assert!(
+            hv.firmware.get().is_none(),
+            "an OCI boot never asks for EDK2"
+        );
+        assert!(
+            !dir.join("efi-vars.fd").exists(),
+            "and cuts no variable store"
+        );
+
+        // A cloud image on the same host does ask, and gets either the
+        // firmware this host has or the reason it has none.
+        match hv.prepare(&req(&inst, &dir, raw_base(home.path()))) {
+            Ok(prep) => {
+                let fw = prep.firmware.expect("a cloud image boots firmware");
+                assert!(
+                    prep.kernel.is_none(),
+                    "firmware and a kernel are alternatives"
+                );
+                assert!(fw.code.exists(), "{}", fw.code.display());
+                assert!(fw.vars.exists(), "the instance got a store of its own");
+                assert_eq!(
+                    hv.firmware.get().map(|f| &f.code),
+                    Some(&fw.code),
+                    "found once and kept: the second cloud image runs no search"
+                );
+            }
+            Err(e) => {
+                let e = format!("{e:#}");
+                if hv.probe().is_ok() {
+                    // The case the split exists for: qemu runs here, EDK2 is
+                    // not installed, and this host is still a working backend
+                    // for every instance that boots a kernel instead.
+                    assert!(e.contains("UEFI firmware"), "{e}");
+                    assert!(e.contains("install it with"), "the way out: {e}");
+                } else {
+                    assert!(
+                        e.contains("not found"),
+                        "no qemu on this device at all: {e}"
+                    );
+                }
+                assert!(
+                    hv.firmware.get().is_none(),
+                    "a miss is never cached, so installing firmware fixes a running daemon"
+                );
             }
         }
     }
@@ -1163,7 +1416,10 @@ mod tests {
         let line = cmdline();
         assert!(line.contains("root=/dev/vda rw"), "{line}");
         assert!(line.contains("init=/sbin/asterism-init"), "{line}");
-        assert!(line.contains("net.ifnames=0"), "eth0 is what images expect: {line}");
+        assert!(
+            line.contains("net.ifnames=0"),
+            "eth0 is what images expect: {line}"
+        );
         assert!(line.contains("asterism.ip=10.0.2.15/24"), "{line}");
         assert!(line.contains("asterism.gw=10.0.2.2"), "{line}");
         assert!(line.contains("asterism.dns=10.0.2.3"), "{line}");
@@ -1188,7 +1444,16 @@ mod tests {
         assert_eq!(
             netdev_arg(
                 22022,
-                &[PortForward { host: 8080, guest: 80 }, PortForward { host: 5432, guest: 5432 }]
+                &[
+                    PortForward {
+                        host: 8080,
+                        guest: 80
+                    },
+                    PortForward {
+                        host: 5432,
+                        guest: 5432
+                    }
+                ]
             ),
             "user,id=n0,hostfwd=tcp:127.0.0.1:22022-:22,\
              hostfwd=tcp:127.0.0.1:8080-:80,hostfwd=tcp:127.0.0.1:5432-:5432"
@@ -1211,13 +1476,25 @@ mod tests {
         let absent = kvm_advice(&Error::from(ErrorKind::NotFound));
         assert!(absent.contains("/dev/kvm"), "{absent}");
         assert!(absent.contains("modprobe kvm_intel"), "{absent}");
-        assert!(absent.contains("nested virtualisation"), "a WSL host needs this: {absent}");
-        assert!(!absent.contains("usermod"), "nothing to join a group over: {absent}");
+        assert!(
+            absent.contains("nested virtualisation"),
+            "a WSL host needs this: {absent}"
+        );
+        assert!(
+            !absent.contains("usermod"),
+            "nothing to join a group over: {absent}"
+        );
 
         let denied = kvm_advice(&Error::from(ErrorKind::PermissionDenied));
         assert!(denied.contains("usermod -aG kvm"), "{denied}");
-        assert!(denied.contains("setfacl"), "the way out for one login: {denied}");
-        assert!(!denied.contains("modprobe"), "the module is loaded already: {denied}");
+        assert!(
+            denied.contains("setfacl"),
+            "the way out for one login: {denied}"
+        );
+        assert!(
+            !denied.contains("modprobe"),
+            "the module is loaded already: {denied}"
+        );
 
         // Anything else still names the device and carries the OS's own words.
         let odd = kvm_advice(&Error::other("boom"));
@@ -1234,7 +1511,11 @@ mod tests {
 
         match probe_accel() {
             Ok(accel) => {
-                let expected = if cfg!(target_os = "macos") { Accel::Hvf } else { Accel::Kvm };
+                let expected = if cfg!(target_os = "macos") {
+                    Accel::Hvf
+                } else {
+                    Accel::Kvm
+                };
                 assert_eq!(accel, expected);
             }
             Err(e) => {
@@ -1250,7 +1531,12 @@ mod tests {
     #[test]
     fn firmware_is_found_as_a_code_and_vars_pair() {
         let dir = tempfile::tempdir().unwrap();
-        for f in ["OVMF_CODE_4M.fd", "OVMF_VARS_4M.fd", "OVMF_CODE.fd", "OVMF_VARS.fd"] {
+        for f in [
+            "OVMF_CODE_4M.fd",
+            "OVMF_VARS_4M.fd",
+            "OVMF_CODE.fd",
+            "OVMF_VARS.fd",
+        ] {
             std::fs::write(dir.path().join(f), f.as_bytes()).unwrap();
         }
         let layouts = vec![
@@ -1267,7 +1553,10 @@ mod tests {
         ];
         let found = pick_firmware(&layouts).expect("the 4M build is there");
         assert_eq!(found.code, dir.path().join("OVMF_CODE_4M.fd"));
-        assert_eq!(found.vars_template, Some(dir.path().join("OVMF_VARS_4M.fd")));
+        assert_eq!(
+            found.vars_template,
+            Some(dir.path().join("OVMF_VARS_4M.fd"))
+        );
     }
 
     /// Firmware whose store is missing is not firmware this host can boot:
@@ -1314,11 +1603,21 @@ mod tests {
             firmware_layouts(Path::new("/opt/homebrew/bin/qemu-system-x86_64"), "x86_64").unwrap();
         assert_eq!(layouts[0].dir, Path::new("/opt/homebrew/bin/../share/qemu"));
         assert_eq!(layouts[0].code, "edk2-x86_64-code.fd");
-        assert_eq!(layouts[0].vars, &["edk2-i386-vars.fd"], "x86 flash is 8 MiB, not 64");
+        assert_eq!(
+            layouts[0].vars,
+            &["edk2-i386-vars.fd"],
+            "x86 flash is 8 MiB, not 64"
+        );
 
         let names: Vec<_> = layouts.iter().map(|l| l.code_path()).collect();
-        let qemus = names.iter().filter(|p| p.ends_with("edk2-x86_64-code.fd")).count();
-        let distro = names.iter().position(|p| p.ends_with("OVMF/OVMF_CODE_4M.fd")).unwrap();
+        let qemus = names
+            .iter()
+            .filter(|p| p.ends_with("edk2-x86_64-code.fd"))
+            .count();
+        let distro = names
+            .iter()
+            .position(|p| p.ends_with("OVMF/OVMF_CODE_4M.fd"))
+            .unwrap();
         assert_eq!(distro, qemus, "every qemu path comes first: {names:?}");
         assert!(names.contains(&PathBuf::from("/usr/share/OVMF/OVMF_CODE_4M.fd")));
         assert!(names.contains(&PathBuf::from("/usr/share/edk2/ovmf/OVMF_CODE.fd")));
@@ -1326,11 +1625,19 @@ mod tests {
 
         // AArch64 keeps the mapping macOS has always had, and keeps asking
         // for no template with it.
-        let arm = firmware_layouts(Path::new("/opt/homebrew/bin/qemu-system-aarch64"), "aarch64")
-            .unwrap();
+        let arm = firmware_layouts(
+            Path::new("/opt/homebrew/bin/qemu-system-aarch64"),
+            "aarch64",
+        )
+        .unwrap();
         assert_eq!(arm[0].code, "edk2-aarch64-code.fd");
-        assert!(arm[0].vars.is_empty(), "the 64 MiB zero fill is the store here");
-        assert!(arm.iter().any(|l| l.code_path() == Path::new("/usr/share/AAVMF/AAVMF_CODE_4M.fd")));
+        assert!(
+            arm[0].vars.is_empty(),
+            "the 64 MiB zero fill is the store here"
+        );
+        assert!(arm
+            .iter()
+            .any(|l| l.code_path() == Path::new("/usr/share/AAVMF/AAVMF_CODE_4M.fd")));
         assert!(
             arm.iter().skip(4).all(|l| !l.vars.is_empty()),
             "every distro layout names the store it was built against"
@@ -1363,7 +1670,11 @@ mod tests {
         cut_vars(&paired, &vars).unwrap();
         assert_eq!(std::fs::read(&vars).unwrap(), b"an empty variable database");
         let mode = std::fs::metadata(&vars).unwrap().permissions().mode();
-        assert_eq!(mode & 0o200, 0o200, "pflash opens the store read-write: {mode:o}");
+        assert_eq!(
+            mode & 0o200,
+            0o200,
+            "pflash opens the store read-write: {mode:o}"
+        );
 
         let alone = FirmwareFiles {
             code: dir.path().join("edk2-aarch64-code.fd"),
@@ -1372,7 +1683,11 @@ mod tests {
         let zeroed = dir.path().join("zeroed.fd");
         cut_vars(&alone, &zeroed).unwrap();
         let meta = std::fs::metadata(&zeroed).unwrap();
-        assert_eq!(meta.len(), VARS_BYTES as u64, "64 MiB, matching the code flash");
+        assert_eq!(
+            meta.len(),
+            VARS_BYTES as u64,
+            "64 MiB, matching the code flash"
+        );
         assert!(std::fs::read(&zeroed).unwrap().iter().all(|b| *b == 0));
     }
 
@@ -1426,7 +1741,10 @@ mod tests {
 
         // A url someone runs an NBD server behind goes to QEMU's built-in
         // client, which is why Caps::nbd_disks is true.
-        let nbd = DiskSpec::Nbd { url: "nbd://desktop:10809/vol".into(), readonly: false };
+        let nbd = DiskSpec::Nbd {
+            url: "nbd://desktop:10809/vol".into(),
+            readonly: false,
+        };
         assert_eq!(
             disk_args(&nbd, "astvol0").unwrap()[1],
             "if=none,id=astvol0,file=nbd://desktop:10809/vol"
@@ -1497,13 +1815,17 @@ mod tests {
         let h = Handle {
             backend: ID.into(),
             pid: Some(1),
-            ctl: ControlChannel::Qmp { path: "/tmp/x.sock".into() },
+            ctl: ControlChannel::Qmp {
+                path: "/tmp/x.sock".into(),
+            },
             endpoint: GuestEndpoint::HostForward { ssh_port: 22 },
             started_at: 0,
         };
         let err = hv.snapshot(&h, "t").unwrap_err().to_string();
         assert!(err.contains("qemu"), "{err}");
-        assert!(hv.migrate_out(&h, asterism_core::hv::MigrationTarget { url: "x".into() }).is_err());
+        assert!(hv
+            .migrate_out(&h, asterism_core::hv::MigrationTarget { url: "x".into() })
+            .is_err());
     }
 
     #[test]
@@ -1512,7 +1834,9 @@ mod tests {
         let h = Handle {
             backend: ID.into(),
             pid: None,
-            ctl: ControlChannel::Qmp { path: "/tmp/x.sock".into() },
+            ctl: ControlChannel::Qmp {
+                path: "/tmp/x.sock".into(),
+            },
             endpoint: GuestEndpoint::HostForward { ssh_port: 22 },
             started_at: 0,
         };

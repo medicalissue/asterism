@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # End-to-end for the Virtualization.framework backend, on real boots:
 #
+#   default selection resolves to vz (no boot)
 #   create --backend vz -> up -> ssh -> logs -> daemon restart while running
 #   -> down (graceful, delegate-confirmed) -> snapshot -> diverge -> restore
 #   -> up -> content proof -> rm
 #
-# ...and a boot-time comparison against the same image under qemu at the end.
+# ...and, only when asked for and only when this device can actually run it,
+# a boot-time comparison against the same image under qemu.
 #
 # Same house style as scripts/e2e.sh: bash with -euo pipefail (a mid-script
 # `set -e` under zsh demonstrably did not abort on `ast ssh` failures), and
@@ -20,6 +22,13 @@
 #     image's kernel cmdline does on its own
 #   * astd is killed while a guest runs: the guest belongs to astd-vz, not to
 #     astd, and must survive its daemon
+#
+# Selection policy this test holds the product to (backend/mod.rs, capability
+# -first since b295fbf): a create with no --backend probes vz first and falls
+# through to qemu only when vz cannot probe or lacks a capability the request
+# needs. So on a signed macOS 14+ device an ordinary create resolves to vz,
+# and QEMU is a fallback that may simply not be installed. This script asserts
+# that policy and never requires QEMU to be present.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -47,27 +56,121 @@ export ASTERISM_HOME="/private/tmp/ast-vz-$$"
 export ASTERISM_MESH=local
 IMAGE="${E2E_IMAGE:-debian:13}"
 INST=vze2e
+DEF=vzdefault        # the create that names no backend at all
 REF=vzref            # the qemu instance the timings are compared against
 MARKER="marker-$$"
 PROOF=/home/ast/PROOF
 
+# The qemu boot-time comparison is opt-in, and gated again on qemu actually
+# being runnable here. A Mac with no QEMU installed is the supported
+# configuration now, not a broken one, so its absence skips a comparison and
+# never fails a run.
+QEMU_COMPARE="${E2E_VZ_QEMU_COMPARE:-0}"
+
+# ---- process bookkeeping ---------------------------------------------------
+#
+# Every process this run is responsible for is tracked by pid, never by a
+# pattern. `pkill -f` on a path under this repo would reach a developer's own
+# astd started from the same binary against a different ASTERISM_HOME, and
+# killing a helper by pattern would kill somebody else's guest — which is the
+# exact accident the daemon-restart step below exists to prove cannot happen.
+#
+# Both pid sources are exact and scoped to this run: astd writes its own pid
+# to $ASTERISM_HOME/astd.pid (paths::daemon_pid_path, deliberately never
+# relocated), and a running guest's pid is on its own `ast status` line.
+GUEST_PIDS=""
+
+track_guest() {
+  local pid="$1"
+  case " $GUEST_PIDS " in
+    *" $pid "*) return 0 ;;
+  esac
+  GUEST_PIDS="$GUEST_PIDS $pid"
+}
+
+# This run's daemon, or nothing. Never another home's.
+astd_pid() {
+  local pid
+  pid="$(cat "$ASTERISM_HOME/astd.pid" 2>/dev/null || true)"
+  case "$pid" in
+    '' | *[!0-9]*) return 1 ;;
+  esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  printf '%s\n' "$pid"
+}
+
+# The helper holding one instance's guest — vz and only vz. A qemu-backed
+# instance yields nothing here on purpose: every assertion that wants a
+# helper pid must fail loudly rather than quietly accept a qemu process.
+vz_helper_pid() {
+  "$AST" status "$1" 2>/dev/null |
+    sed -n 's/^running: vz pid \([0-9][0-9]*\).*/\1/p'
+}
+
+# Whatever process is running one instance's guest, whichever backend it is.
+# Used for cleanup bookkeeping, never for an assertion about which backend.
+running_pid() {
+  "$AST" status "$1" 2>/dev/null |
+    sed -n 's/^running: [a-z][a-z]* pid \([0-9][0-9]*\).*/\1/p'
+}
+
+# Record whatever is running one instance's guest, so cleanup can reach it by
+# pid. Deliberately called in the parent shell rather than from inside
+# boot_seconds: that runs in a $( ) subshell, whose GUEST_PIDS would be
+# thrown away with it.
+track_running() {
+  local pid
+  pid="$(running_pid "$1" || true)"
+  [ -n "$pid" ] && track_guest "$pid" || true
+}
+
+# <pid> <ticks>: has it gone within ticks * 0.2s?
+wait_gone() {
+  local pid="$1" budget="$2" _i
+  for _i in $(seq 1 "$budget"); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.2
+  done
+  return 1
+}
+
+# Ask, wait, insist — bounded at each step, and idempotent: a pid that is
+# already gone is a success.
+stop_pid() {
+  local pid="$1" label="$2"
+  kill -0 "$pid" 2>/dev/null || return 0
+  kill -TERM "$pid" 2>/dev/null || true
+  if wait_gone "$pid" 50; then return 0; fi
+  kill -KILL "$pid" 2>/dev/null || true
+  if wait_gone "$pid" 25; then return 0; fi
+  echo "e2e-vz cleanup: $label ($pid) would not exit" >&2
+  return 1
+}
+
 cleanup() {
-  "$AST" down "$INST" >/dev/null 2>&1 || true
-  "$AST" down "$REF" >/dev/null 2>&1 || true
-  "$AST" rm "$INST" >/dev/null 2>&1 || true
-  "$AST" rm "$REF" >/dev/null 2>&1 || true
-  # -x: match the whole command line, so this never catches `astd-vz`, whose
-  # path starts with the same characters. Killing a helper here would kill a
-  # guest, which is precisely what the daemon-restart step proves cannot
-  # happen by accident.
-  pkill -x -f "$ASTD" 2>/dev/null || true
-  pkill -f "astd-vz --config $ASTERISM_HOME" 2>/dev/null || true
+  # The product's own path first, so a normal run's cleanup is the graceful
+  # one and the signals below have nothing left to do.
+  local name pid
+  for name in "$INST" "$DEF" "$REF"; do
+    track_running "$name"
+    "$AST" down "$name" >/dev/null 2>&1 || true
+    "$AST" rm "$name" >/dev/null 2>&1 || true
+  done
+  for pid in $GUEST_PIDS; do
+    stop_pid "$pid" "guest process" || true
+  done
+  pid="$(astd_pid || true)"
+  [ -n "$pid" ] && stop_pid "$pid" "astd" || true
   rm -rf "$ASTERISM_HOME"
 }
 trap cleanup EXIT
 
 mkdir -p "$ASTERISM_HOME/images"
-# Reuse already-pulled images instead of re-downloading.
+# Reuse already-pulled images instead of re-downloading. The .raw is the one
+# that matters: a base already in raw form is what lets `ast pull` below be a
+# no-op. Converting a .qcow2 is the one step in this script that still shells
+# out to qemu-img (core/image.rs), which is a property of the image store and
+# not of the vz backend — hence the message on the pull.
 if [ -d "$HOME/.asterism/images" ]; then
   cp "$HOME/.asterism/images/"*.qcow2 "$ASTERISM_HOME/images/" 2>/dev/null || true
   cp "$HOME/.asterism/images/"*.raw "$ASTERISM_HOME/images/" 2>/dev/null || true
@@ -114,9 +217,18 @@ boot_seconds() {
   python3 -c "print(f'{$(date +%s.%N) - $started:.1f}')"
 }
 
-"$AST" pull "$IMAGE" >/dev/null 2>&1 || fail "pull $IMAGE"
+pull_out="$("$AST" pull "$IMAGE" 2>&1)" || fail \
+  "pull $IMAGE:"$'\n'"$pull_out"$'\n'"(a base image that is still qcow2 is converted with qemu-img, \
+which is the image store's dependency, not the vz backend's — put a raw base in \
+$HOME/.asterism/images to run this on a device with no QEMU at all)"
 
 # ---- the vz instance -------------------------------------------------------
+#
+# The explicit create comes first on purpose: on a device vz cannot run at
+# all — Intel, macOS < 14, an unsigned helper — this is the line that fails,
+# and it fails with the probe's own reason. The default-selection assertion
+# below would fail on the same device saying only "it chose qemu", which is
+# true and much less useful as a first error.
 
 expect "create --backend vz" "$INST  defined" \
   "$AST" create "$INST" --backend vz --image "$IMAGE" --mem 2G --disk 10G
@@ -126,7 +238,26 @@ expect "create --backend vz" "$INST  defined" \
 expect "status records the backend"  "machine: vz" "$AST" status "$INST"
 expect "status records the platform" "generic"     "$AST" status "$INST"
 
+# ---- and the default is the same backend, unasked --------------------------
+#
+# Not a second boot: `ast create` is a registry operation, and the backend is
+# chosen and recorded there (backend::select_for -> Machine). Creating one
+# instance and reading it back is the whole proof, and it costs no guest.
+#
+# What this asserts is the policy, stated honestly: with an ordinary disk
+# image and no published ports — a request vz has every capability for — the
+# default resolves to vz on this device. It does not assert that qemu was
+# refused or absent; it asserts that vz won, which is what the policy says.
+
+expect "create with no --backend" "$DEF  defined" \
+  "$AST" create "$DEF" --image "$IMAGE" --mem 2G --disk 10G
+expect "an ordinary create resolves to vz" "machine: vz" "$AST" status "$DEF"
+expect "rm the default-selection instance" "$DEF  removed" "$AST" rm "$DEF"
+
+# ---- the vz guest, on a real boot ------------------------------------------
+
 VZ_BOOT=$(boot_seconds "$INST")
+track_running "$INST"
 echo "ok: up (first boot, ${VZ_BOOT}s to ssh)"
 expect "status says running under vz" "running: vz" "$AST" status "$INST"
 expect "the endpoint is the guest's own address" "192.168." "$AST" status "$INST"
@@ -153,13 +284,18 @@ expect_eventually "logs show a login prompt" "login:" "$AST" logs "$INST"
 # VZVirtualMachine dies with the process that made it, which is exactly why
 # that process is astd-vz and not astd.
 
-VZ_PID="$("$AST" status "$INST" | sed -n 's/^running: vz pid \([0-9]*\).*/\1/p')"
-[ -n "$VZ_PID" ] || fail "no helper pid in: $("$AST" status "$INST")"
-pkill -x -f "$ASTD" || fail "no astd to kill"
-for _ in $(seq 1 50); do pgrep -x -f "$ASTD" >/dev/null || break; sleep 0.2; done
-pgrep -x -f "$ASTD" >/dev/null && fail "astd did not die"
+VZ_PID="$(vz_helper_pid "$INST" || true)"
+[ -n "$VZ_PID" ] || fail "no vz helper pid in: $("$AST" status "$INST")"
+track_guest "$VZ_PID"
+
+# By pid, from this run's own pidfile: a pattern would have reached any astd
+# built from this checkout, including one serving somebody's real instances.
+ASTD_PID="$(astd_pid || true)"
+[ -n "$ASTD_PID" ] || fail "no live astd recorded in $ASTERISM_HOME/astd.pid"
+kill -TERM "$ASTD_PID" 2>/dev/null || fail "could not signal astd $ASTD_PID"
+wait_gone "$ASTD_PID" 50 || fail "astd $ASTD_PID did not die"
 kill -0 "$VZ_PID" 2>/dev/null || fail "the vz helper died with its daemon"
-echo "ok: helper $VZ_PID survived astd"
+echo "ok: helper $VZ_PID survived astd $ASTD_PID"
 
 # The next command starts a fresh astd, which reloads the registry and asks
 # the helper — not its own memory — whether the guest is still there.
@@ -187,6 +323,7 @@ expect "snapshot" "$INST  snapshot clean" "$AST" snapshot "$INST" clean
 expect "list"     "clean"                 "$AST" snapshots "$INST"
 
 expect "up again" "$INST  running" "$AST" up "$INST"
+track_running "$INST"
 expect "the proof survived the reboot" "$MARKER" "$AST" ssh "$INST" -- "cat $PROOF"
 "$AST" ssh "$INST" -- "echo diverged | sudo tee $PROOF >/dev/null && sync" \
   >/dev/null 2>&1 || fail "diverging the guest"
@@ -195,6 +332,7 @@ expect "down 2" "$INST  stopped" "$AST" down "$INST"
 
 expect "restore" "restored to clean" "$AST" restore "$INST" clean
 expect "up after restore" "$INST  running" "$AST" up "$INST"
+track_running "$INST"
 out="$("$AST" ssh "$INST" -- "cat $PROOF" 2>&1)" || fail "reading the proof after restore"
 grep -qF "$MARKER" <<<"$out" || fail "restore did not roll the disk back: $out"
 grep -qF "diverged" <<<"$out" && fail "the divergence survived the restore: $out"
@@ -205,7 +343,9 @@ echo "ok: restore rolled the disk back to the snapshot's contents"
 # child answers `kill -0` for as long as the daemon lives, and `kill -0` is
 # how a lost control socket is second-guessed — so a zombie here would read
 # as a running guest forever.
-VZ_PID2="$("$AST" status "$INST" | sed -n 's/^running: vz pid \([0-9]*\).*/\1/p')"
+VZ_PID2="$(vz_helper_pid "$INST" || true)"
+[ -n "$VZ_PID2" ] || fail "no vz helper pid in: $("$AST" status "$INST")"
+track_guest "$VZ_PID2"
 expect "down 3" "$INST  stopped"  "$AST" down "$INST"
 sleep 1
 kill -0 "$VZ_PID2" 2>/dev/null && fail "helper $VZ_PID2 still answers kill -0 after down (zombie?)"
@@ -214,17 +354,42 @@ expect "status agrees it is stopped" "status:  stopped" "$AST" status "$INST"
 expect "rm"     "$INST  removed"  "$AST" rm "$INST"
 
 # ---- the same image under qemu, for the timing -----------------------------
+#
+# Opt-in, and then capability-gated by the product's own probe: an explicit
+# `--backend qemu` either produces a qemu instance or refuses with the reason
+# (no qemu-system on this device, no firmware, an accelerator it cannot get).
+# The refusal happens before the registry is touched, so a skip leaves
+# nothing behind. The timing is only printed for an instance that has been
+# *proved* to be on the other backend — a vz instance is never labelled qemu
+# to fill in a number.
 
-expect "create (qemu, the default)" "$REF  defined" \
-  "$AST" create "$REF" --image "$IMAGE" --mem 2G --disk 10G
-expect "the default backend is still qemu" "machine: qemu" "$AST" status "$REF"
-QEMU_BOOT=$(boot_seconds "$REF")
-expect "down (qemu)" "$REF  stopped" "$AST" down "$REF"
-expect "rm (qemu)"   "$REF  removed" "$AST" rm "$REF"
+QEMU_BOOT=""
+if [ "$QEMU_COMPARE" != "1" ]; then
+  echo "skipped: qemu boot-time comparison — set E2E_VZ_QEMU_COMPARE=1 to run it"
+elif ! qemu_create="$("$AST" create "$REF" --backend qemu --image "$IMAGE" --mem 2G --disk 10G 2>&1)"; then
+  echo "skipped: qemu boot-time comparison — this device cannot run the qemu backend:"
+  sed 's/^/  /' <<<"$qemu_create"
+else
+  grep -qF "$REF  defined" <<<"$qemu_create" \
+    || fail "create --backend qemu said something unexpected:"$'\n'"$qemu_create"
+  echo "ok: create --backend qemu"
+  # Before any timing: this really is the other backend. Without this line a
+  # selection change could quietly time vz twice and call one of them qemu.
+  expect "the reference instance really is qemu" "machine: qemu" "$AST" status "$REF"
+  QEMU_BOOT=$(boot_seconds "$REF")
+  track_running "$REF"
+  expect "running under qemu" "running: qemu" "$AST" status "$REF"
+  expect "down (qemu)" "$REF  stopped" "$AST" down "$REF"
+  expect "rm (qemu)"   "$REF  removed" "$AST" rm "$REF"
+fi
 
 echo
 echo "boot to ssh, $IMAGE, 2 cpus / 2048 MiB, first boot (cloud-init runs):"
 echo "  vz    ${VZ_BOOT}s"
-echo "  qemu  ${QEMU_BOOT}s"
+if [ -n "$QEMU_BOOT" ]; then
+  echo "  qemu  ${QEMU_BOOT}s"
+else
+  echo "  qemu  not measured"
+fi
 echo
 echo "E2E-VZ GREEN ($IMAGE)"

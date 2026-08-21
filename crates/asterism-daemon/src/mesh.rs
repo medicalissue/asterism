@@ -77,7 +77,7 @@ const PAIR_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Largest mesh frame we will read. An instance list is the big one and it is
 /// nowhere near this; the cap exists so a peer cannot ask for an allocation.
-const MAX_FRAME: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_FRAME: usize = 4 * 1024 * 1024;
 
 /// What the daemon says when it closes a connection from a stranger.
 const REFUSAL: &[u8] = b"not in this orbit";

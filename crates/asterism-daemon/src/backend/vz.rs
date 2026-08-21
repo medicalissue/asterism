@@ -36,10 +36,11 @@
 //!   [`Vz::boot`].
 //! * **The console is `/dev/hvc0`.** VZ has no 16550; see [`GUEST_CONFIG`].
 
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -78,6 +79,15 @@ const BOOT_TIMEOUT: Duration = Duration::from_secs(180);
 /// because this is a local process starting: exceeding it means the binary
 /// is wrong, not that a guest is slow.
 const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a boot waits for the *previous* helper to let go of the control
+/// socket. See [`await_helper_exit`].
+///
+/// Sized from the longest a helper can take to go on its own: the fifteen
+/// seconds it gives a guest to power off after losing a disk, the ten the
+/// framework's forced stop can take after that, and room to spare. A cap
+/// rather than a wait — an ordinary boot spends none of it.
+const HELPER_HANDOVER: Duration = Duration::from_secs(45);
 
 /// Cloud-config every vz guest gets, on top of the backend-neutral seed.
 ///
@@ -120,6 +130,22 @@ runcmd:
 #[derive(Default)]
 pub struct Vz {
     probed: OnceLock<Probe>,
+    /// Helpers that have told us their guest lost a disk, by pid.
+    ///
+    /// Two jobs, and the second is why this is a set rather than a log
+    /// line. The first is not turning one dead volume into a page of
+    /// identical lines: the supervisor asks [`Hypervisor::state`] every few
+    /// seconds. The second is answering a question `info` stops being able
+    /// to answer — a helper taking its guest down spends up to ten seconds
+    /// inside the framework's forced stop with nothing draining its control
+    /// queue, and a pid that is still alive must not read back as a healthy
+    /// guest for the length of it.
+    ///
+    /// Keyed by pid rather than by instance, because the pid is what the
+    /// failed path has: it identifies the exact helper that said so, and it
+    /// expires on its own — a pid that is not alive is stopped before this
+    /// is ever consulted.
+    lost_disks: Mutex<HashSet<u32>>,
 }
 
 /// What this host can tell us about running VZ guests, worked out once.
@@ -195,6 +221,36 @@ impl Vz {
     /// Ask the running helper for its view of the guest.
     fn info(&self, h: &Handle, timeout: Duration) -> Result<asterism_vz::Info> {
         asterism_vz::info(h.ctl.path(), timeout)
+    }
+
+    /// Remember that this helper's guest lost a disk, and say so once.
+    ///
+    /// Worth a line because it is the whole explanation for a guest the
+    /// supervisor is about to restart, and because the alternative is a
+    /// human reading `vz-helper.log` to find out that a volume server went
+    /// away. Worth *remembering* because the helper is about to stop
+    /// answering — see [`Vz::lost_a_disk`].
+    fn report_lost_disk(&self, pid: u32, instance: &str, lost: &asterism_vz::StorageError) {
+        if self.lost_disks_mut().insert(pid) {
+            eprintln!("astd: {instance} lost a disk and is going down — {lost}");
+        }
+    }
+
+    /// Has this helper already told us its guest lost a disk?
+    ///
+    /// The one thing that makes a silent control socket mean something.
+    fn lost_a_disk(&self, pid: u32) -> bool {
+        self.lost_disks_mut().contains(&pid)
+    }
+
+    fn lost_disks_mut(&self) -> std::sync::MutexGuard<'_, HashSet<u32>> {
+        // A poisoned lock here would mean a panic inside this bookkeeping,
+        // and the worst taking it anyway can cost is a repeated log line.
+        // Refusing it would cost a guest being called healthy.
+        match self.lost_disks.lock() {
+            Ok(seen) => seen,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 }
 
@@ -285,6 +341,15 @@ impl Hypervisor for Vz {
             // The guest gets an address of its own on the NAT, so there is
             // nothing to forward from this host's loopback.
             port_forward: false,
+            // And for the same reason, no guest-only door into this host.
+            // macOS's NAT puts the guest on a shared bridge with an address
+            // of its own; a listener the guest could reach would have to be
+            // bound on that bridge's host address, which is a real interface
+            // that other guests — and, on some configurations, the LAN — can
+            // reach too. There is no loopback path here, so this says so and
+            // the secrets data plane refuses to bind on vz rather than
+            // opening an unauthenticated proxy for somebody's API keys.
+            guest_egress: None,
             disk_formats: &[DiskFormat::Raw],
         }
     }
@@ -371,6 +436,10 @@ impl Hypervisor for Vz {
         };
         let config_path = req.dir.join("vz.json");
         config.write(&config_path)?;
+
+        // A helper taking its own guest down still owns this socket, and
+        // the new one will not steal it. Let it finish first.
+        await_helper_exit(&config.ctl, HELPER_HANDOVER);
 
         // The helper's stderr is the only account of a boot that fails
         // before the socket answers, so it goes to a file rather than to
@@ -490,19 +559,72 @@ impl Hypervisor for Vz {
     /// cannot fake that. Only when nothing answers does this fall back to
     /// asking whether the pid is alive, which covers a helper that was
     /// SIGKILLed and left its socket file behind.
+    ///
+    /// A guest that has lost a disk for good is `Stopped` here even though
+    /// its helper is still up: the helper is in the middle of taking it
+    /// down (see the `astd-vz` module docs), and `Running` for that window
+    /// is what would let the supervisor leave a guest sitting on storage it
+    /// cannot write to. `RunState` has no rung between running and stopped,
+    /// and inventing one is not what a caller wants anyway — restarting is.
+    ///
+    /// ## Why an unexplained silence is still `Running`
+    ///
+    /// A helper that has stopped answering is not thereby dead, and the
+    /// difference matters more than it looks. Every caller reads this the
+    /// same way — `matches!(hv.state(h), Ok(RunState::Running))`, in
+    /// `persist::alive` and `instance::is_running` — so `Err` and `Stopped`
+    /// are one answer to all of them, and it is an answer they *act* on:
+    /// `note_died` owes the instance a restart, `reconcile` rewrites the
+    /// registry, and `boot_again` runs `clear_stale_control`, which unlinks
+    /// the control socket. Unlinking a *live* helper's socket removes the
+    /// only thing stopping the next helper binding the same path, and the
+    /// second guest boots on the first one's `disk.raw`.
+    ///
+    /// Silence alone is easy to come by: `ast down` produces thirty seconds
+    /// of it, because the helper spends the guest's shutdown budget inside
+    /// `graceful_stop` without draining its control queue, and any request
+    /// arriving meanwhile runs `reconcile`. So silence alone does not make
+    /// a guest dead here. Silence *from a helper that has already said its
+    /// disk is gone* does — that helper is finishing a shutdown it started
+    /// itself, and it is the only window in which nothing answering and
+    /// nothing wrong are different things.
     fn state(&self, h: &Handle) -> Result<RunState> {
         match self.info(h, Duration::from_secs(2)) {
             Ok(info) => {
                 let ours = h.pid.is_none_or(|pid| pid == info.pid);
-                Ok(match ours && info.state.is_live() {
-                    true => RunState::Running,
-                    false => RunState::Stopped,
+                match &info.storage_error {
+                    // Whatever state a helper puts beside a lost disk, the
+                    // guest is on its way out. Only for *our* helper: a
+                    // socket answering with another pid is another
+                    // instance's, and its troubles are not ours to report.
+                    Some(lost) if ours => {
+                        self.report_lost_disk(info.pid, &info.instance, lost);
+                        Ok(RunState::Stopped)
+                    }
+                    _ => Ok(match ours && info.state.is_live() {
+                        true => RunState::Running,
+                        false => RunState::Stopped,
+                    }),
+                }
+            }
+            // Nothing answered, so the pid is all there is to go on — and
+            // what it settles is narrower than it looks.
+            Err(_) => {
+                let Some(pid) = h.pid.filter(|pid| alive(*pid)) else {
+                    // No pid, or one nothing is holding: the helper is gone
+                    // and the guest with it. A helper that was SIGKILLed
+                    // and left its socket file behind lands here too, which
+                    // is what this fallback was always for.
+                    return Ok(RunState::Stopped);
+                };
+                Ok(match self.lost_a_disk(pid) {
+                    // Told, then silent: this is the forced stop it started
+                    // when the disk went, not a guest anyone can use.
+                    true => RunState::Stopped,
+                    // Live, and nothing has said otherwise.
+                    false => RunState::Running,
                 })
             }
-            Err(_) => Ok(match h.pid.map(alive).unwrap_or(false) {
-                true => RunState::Running,
-                false => RunState::Stopped,
-            }),
         }
     }
 
@@ -539,6 +661,37 @@ impl Hypervisor for Vz {
 
 // ---- boot ------------------------------------------------------------------
 
+/// Wait for a helper that is on its way out to let go of its socket.
+///
+/// A helper binds `vz.sock` for as long as it has a guest, and refuses to
+/// take one another helper is still answering on — rightly, because that
+/// other helper owns a running guest. But a helper that is taking its own
+/// guest down after losing a disk goes on answering for the whole of that
+/// shutdown, and `astd`'s supervisor is trying to restart the instance the
+/// entire time. Spawning into that window fails on the socket, and an
+/// instance's restart budget is three attempts.
+///
+/// Returns the moment nothing answers, which is every ordinary boot: a path
+/// with no socket, and a stale file a killed helper left behind, both
+/// refuse the connection immediately. A helper with a *live* guest is a
+/// real conflict rather than a handover, and is left to fail exactly as it
+/// always has.
+fn await_helper_exit(ctl: &Path, budget: Duration) {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        match asterism_vz::info(ctl, Duration::from_secs(2)) {
+            Ok(info) if info.state.is_live() && info.storage_error.is_none() => return,
+            Ok(_) => std::thread::sleep(Duration::from_millis(200)),
+            Err(_) => return,
+        }
+    }
+    eprintln!(
+        "astd: a vz helper still holds {} after {}s — starting anyway",
+        ctl.display(),
+        budget.as_secs()
+    );
+}
+
 /// Wait for the helper to come up and for its guest to answer on port 22.
 ///
 /// Two waits with different meanings: the first is "did the helper start at
@@ -566,8 +719,15 @@ fn wait_for_guest(ctl: &Path, pid: u32, log: &Path) -> Result<IpAddr> {
                 }
                 if !info.state.is_live() {
                     bail!(
-                        "the vz guest stopped while booting (state {:?}) — {}:\n{}",
+                        "the vz guest stopped while booting (state {:?}{}) — {}:\n{}",
                         info.state,
+                        // The one state that has a plainer explanation than
+                        // the helper's log: a volume that never came up, or
+                        // one that went away mid-boot.
+                        info.storage_error
+                            .as_ref()
+                            .map(|lost| format!(" — {lost}"))
+                            .unwrap_or_default(),
                         log.display(),
                         tail(log, 20)
                     );
@@ -1024,6 +1184,349 @@ mod tests {
         // ...and with nothing answering its socket, it is not running,
         // which is what `reconcile` needs to know after a restart.
         assert_eq!(hv.state(&h).unwrap(), RunState::Stopped);
+    }
+
+    // ---- talking to a helper ---------------------------------------------
+
+    /// A stand-in for a running `astd-vz`: answers every `info` on `sock`
+    /// with the same reply, on the same one-JSON-object-per-line wire.
+    fn fake_helper(sock: &Path, info: asterism_vz::Info) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::os::unix::net::UnixListener::bind(sock).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let Ok(reading) = stream.try_clone() else {
+                    continue;
+                };
+                let mut asked = String::new();
+                if BufReader::new(reading).read_line(&mut asked).is_err() {
+                    continue;
+                }
+                let mut said = serde_json::to_string(&Reply::Info(info.clone())).unwrap();
+                said.push('\n');
+                let _ = stream.write_all(said.as_bytes());
+            }
+        });
+    }
+
+    /// This process's own pid, so the handle and the reply agree and the
+    /// `alive(pid)` fallback would answer *running* — which is what makes
+    /// these tests about `info` rather than about liveness.
+    fn helper_info(
+        state: asterism_vz::State,
+        lost: Option<asterism_vz::StorageError>,
+    ) -> asterism_vz::Info {
+        asterism_vz::Info {
+            instance: "vzdisky".into(),
+            pid: std::process::id(),
+            state,
+            mac: asterism_vz::mac_for("vzdisky"),
+            guest_ip: Some("192.168.64.3".parse().unwrap()),
+            started_at: 1,
+            boot_secs: Some(4.0),
+            console: "/i/vzdisky/console.log".into(),
+            storage_error: lost,
+        }
+    }
+
+    fn handle_on(sock: &Path) -> Handle {
+        Handle {
+            backend: ID.into(),
+            pid: Some(std::process::id()),
+            ctl: ControlChannel::Rpc {
+                path: sock.to_owned(),
+            },
+            endpoint: GuestEndpoint::GuestAddr {
+                addr: "192.168.64.3".parse().unwrap(),
+            },
+            started_at: 0,
+        }
+    }
+
+    fn lost_disk() -> asterism_vz::StorageError {
+        asterism_vz::StorageError {
+            uri: "nbd+unix:///team%2Fdata?socket=%2Ftmp%2Fv.sock".into(),
+            message: "Connection reset by peer".into(),
+        }
+    }
+
+    /// A helper that answers `answers` times and then goes quiet without
+    /// letting go of its socket.
+    ///
+    /// What `stopWithCompletionHandler:` looks like from out here: the
+    /// process is up, the socket is bound and still accepting, and nothing
+    /// behind it is draining the queue — so a client connects, writes, and
+    /// waits out its read timeout. Accepted connections are held rather
+    /// than dropped, because a dropped one would answer with EOF, which is
+    /// a different failure from no answer at all.
+    fn fake_helper_going_quiet(sock: &Path, info: asterism_vz::Info, answers: usize) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::os::unix::net::UnixListener::bind(sock).unwrap();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            let mut answered = 0;
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                if answered >= answers {
+                    held.push(stream);
+                    continue;
+                }
+                let Ok(reading) = stream.try_clone() else {
+                    continue;
+                };
+                let mut asked = String::new();
+                if BufReader::new(reading).read_line(&mut asked).is_err() {
+                    continue;
+                }
+                let mut said = serde_json::to_string(&Reply::Info(info.clone())).unwrap();
+                said.push('\n');
+                let _ = stream.write_all(said.as_bytes());
+                answered += 1;
+            }
+        });
+    }
+
+    /// A pid nothing is holding: a child that has already been waited for.
+    /// Every test using it asserts it really is dead first, so a reused
+    /// number fails the test rather than passing it for the wrong reason.
+    fn dead_pid() -> u32 {
+        let mut child = Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    /// Sol P2. The helper answers `info` throughout the fifteen seconds it
+    /// gives the guest to power off, then spends up to ten more inside the
+    /// framework's forced stop with nothing draining the control queue. Its
+    /// pid is alive for all of it — and before this, that silence read back
+    /// as a healthy running guest, which is the one thing this whole path
+    /// exists to prevent.
+    #[test]
+    fn a_helper_that_went_quiet_after_losing_a_disk_is_not_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("dying.sock");
+        // One answer — the last `info` of the shutdown grace — then silence.
+        fake_helper_going_quiet(
+            &sock,
+            helper_info(asterism_vz::State::Error, Some(lost_disk())),
+            1,
+        );
+        let hv = Vz::new();
+        let h = handle_on(&sock);
+
+        assert_eq!(
+            hv.state(&h).unwrap(),
+            RunState::Stopped,
+            "the answer that says the disk is gone"
+        );
+        assert!(
+            alive(h.pid.unwrap()),
+            "and the helper is still very much up"
+        );
+        assert_eq!(
+            hv.state(&h).unwrap(),
+            RunState::Stopped,
+            "so is the silence that follows it"
+        );
+    }
+
+    /// ...but only because we were told. Silence on its own is not death:
+    /// every caller reads `Stopped` and `Err` alike as "restart it", and
+    /// the restart runs `clear_stale_control`, which unlinks the socket a
+    /// live helper is still holding — after which nothing stops a second
+    /// guest booting on the same disk. `ast down` alone produces up to
+    /// thirty seconds of exactly this silence.
+    #[test]
+    fn an_unexplained_silence_from_a_live_helper_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let hv = Vz::new();
+
+        // Bound, accepting, answering nothing.
+        let quiet = dir.path().join("quiet.sock");
+        fake_helper_going_quiet(&quiet, helper_info(asterism_vz::State::Running, None), 0);
+        assert_eq!(hv.state(&handle_on(&quiet)).unwrap(), RunState::Running);
+
+        // Not bound at all — a helper that has not got there yet.
+        let absent = dir.path().join("absent.sock");
+        assert_eq!(hv.state(&handle_on(&absent)).unwrap(), RunState::Running);
+    }
+
+    /// The case the pid fallback was always for: a helper that was killed
+    /// leaves its socket file behind, and a dead pid settles it whatever
+    /// the socket does.
+    #[test]
+    fn a_dead_helper_is_stopped_whatever_its_socket_is_doing() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("orphan.sock");
+        fake_helper_going_quiet(&sock, helper_info(asterism_vz::State::Running, None), 0);
+        let hv = Vz::new();
+
+        let mut h = handle_on(&sock);
+        h.pid = Some(dead_pid());
+        assert!(!alive(h.pid.unwrap()), "the pid really is nobody's");
+        assert_eq!(hv.state(&h).unwrap(), RunState::Stopped);
+
+        // ...and a handle carrying no pid has nothing to fall back on.
+        h.pid = None;
+        assert_eq!(hv.state(&h).unwrap(), RunState::Stopped);
+    }
+
+    /// One helper going quiet says nothing about another. The memory is
+    /// keyed by pid, so it cannot leak between guests — and a live helper
+    /// still answering is read from its answer, never from the memory.
+    #[test]
+    fn a_lost_disk_is_remembered_against_one_helper_not_all_of_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let hv = Vz::new();
+
+        let lost = dir.path().join("lost.sock");
+        fake_helper_going_quiet(
+            &lost,
+            helper_info(asterism_vz::State::Error, Some(lost_disk())),
+            1,
+        );
+        assert_eq!(hv.state(&handle_on(&lost)).unwrap(), RunState::Stopped);
+
+        // A different helper, just as silent, whose pid never said
+        // anything. A real live process, so the pid genuinely resolves.
+        let mut sleeper = Command::new("sleep").arg("30").spawn().unwrap();
+        let other = dir.path().join("other.sock");
+        fake_helper_going_quiet(&other, helper_info(asterism_vz::State::Running, None), 0);
+        let mut elsewhere = handle_on(&other);
+        elsewhere.pid = Some(sleeper.id());
+        assert!(
+            alive(sleeper.id()),
+            "the second helper stands in for one that is up"
+        );
+        assert_eq!(
+            hv.state(&elsewhere).unwrap(),
+            RunState::Running,
+            "one guest's dead disk is not another's"
+        );
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+
+        // And one that is still answering is read from its answer.
+        let healthy = dir.path().join("healthy.sock");
+        fake_helper(&healthy, helper_info(asterism_vz::State::Running, None));
+        assert_eq!(hv.state(&handle_on(&healthy)).unwrap(), RunState::Running);
+    }
+
+    /// The bug this exists to prevent: VZ reports a guest whose network
+    /// disk has failed for good as `Running`, so a helper that only counted
+    /// the failure left `astd` supervising a guest writing into nothing.
+    ///
+    /// The two halves are told apart by what the helper sends, not by
+    /// anything guessed here: VZ's own reconnect loop is transparent and
+    /// never reaches the wire, so ordinary NBD churn is a plain running
+    /// `info` — while a `didEncounterError:` arrives as a state that is not
+    /// live *and* the disk that caused it.
+    #[test]
+    fn nbd_churn_is_running_and_a_lost_disk_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let hv = Vz::new();
+
+        // Reconnecting under the guest's feet: still a running guest.
+        let churning = dir.path().join("churn.sock");
+        fake_helper(&churning, helper_info(asterism_vz::State::Running, None));
+        assert_eq!(hv.state(&handle_on(&churning)).unwrap(), RunState::Running);
+
+        // The disk is gone for good. The helper is still up — it is in the
+        // middle of powering the guest down — so `alive(pid)` would say
+        // running, and this must not.
+        let lost = dir.path().join("lost.sock");
+        fake_helper(
+            &lost,
+            helper_info(asterism_vz::State::Error, Some(lost_disk())),
+        );
+        let h = handle_on(&lost);
+        assert!(alive(h.pid.unwrap()), "the helper answering has not exited");
+        assert_eq!(
+            hv.state(&h).unwrap(),
+            RunState::Stopped,
+            "a guest that lost a disk is never reported as running"
+        );
+        // Idempotent, because the supervisor asks over and over.
+        assert_eq!(hv.state(&h).unwrap(), RunState::Stopped);
+    }
+
+    /// Belt and braces: even if a future helper still called itself live
+    /// while reporting a lost disk, the disk wins.
+    #[test]
+    fn a_lost_disk_outranks_a_live_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("confused.sock");
+        fake_helper(
+            &sock,
+            helper_info(asterism_vz::State::Running, Some(lost_disk())),
+        );
+        assert_eq!(
+            Vz::new().state(&handle_on(&sock)).unwrap(),
+            RunState::Stopped
+        );
+    }
+
+    /// A volume that never came up, or went away mid-boot: `ast up` should
+    /// say which disk rather than leaving a human to read the helper's log.
+    #[test]
+    fn a_boot_that_loses_its_disk_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("booting.sock");
+        let log = dir.path().join("vz-helper.log");
+        std::fs::write(&log, "astd-vz: vzdisky started in 0.30s\n").unwrap();
+        fake_helper(
+            &sock,
+            asterism_vz::Info {
+                // Nothing has answered on port 22 yet, so `boot` is still
+                // waiting when the disk goes.
+                guest_ip: None,
+                ..helper_info(asterism_vz::State::Error, Some(lost_disk()))
+            },
+        );
+
+        let err = wait_for_guest(&sock, std::process::id(), &log)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("stopped while booting"), "{err}");
+        assert!(err.contains("nbd+unix:///team%2Fdata"), "{err}");
+        assert!(err.contains("Connection reset by peer"), "{err}");
+        assert!(err.contains("astd-vz: vzdisky started"), "{err}");
+    }
+
+    /// The other half of taking a guest down over a lost disk: for as long
+    /// as the helper is doing it, it still owns `vz.sock` — and the
+    /// supervisor is already trying to bring the instance back.
+    #[test]
+    fn a_boot_waits_out_a_helper_that_is_still_letting_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let budget = Duration::from_millis(600);
+
+        // Nothing listening — every ordinary boot, and a stale socket file
+        // a killed helper left behind. Neither is waited on.
+        let t = Instant::now();
+        await_helper_exit(&dir.path().join("absent.sock"), budget);
+        assert!(t.elapsed() < budget, "took {:?}", t.elapsed());
+
+        // A live guest is a genuine conflict, not a handover: `ctl::listen`
+        // refuses it by name, and waiting first would only delay saying so.
+        let live = dir.path().join("live.sock");
+        fake_helper(&live, helper_info(asterism_vz::State::Running, None));
+        let t = Instant::now();
+        await_helper_exit(&live, budget);
+        assert!(t.elapsed() < budget, "took {:?}", t.elapsed());
+
+        // One that has lost a disk and is powering its guest off: waited
+        // for, so the restart lands on a socket that is free.
+        let dying = dir.path().join("dying.sock");
+        fake_helper(
+            &dying,
+            helper_info(asterism_vz::State::Error, Some(lost_disk())),
+        );
+        let t = Instant::now();
+        await_helper_exit(&dying, budget);
+        assert!(t.elapsed() >= budget, "took {:?}", t.elapsed());
     }
 
     /// The one thing a live snapshot would be, refused by name.

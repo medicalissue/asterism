@@ -50,7 +50,7 @@ use objc2_virtualization::{
     VZVirtualMachineConfiguration, VZVirtualMachineDelegate, VZVirtualMachineState,
 };
 
-use asterism_vz::{Config, Disk, State, StopReason};
+use asterism_vz::{Config, Disk, State, StopReason, StorageError};
 
 /// Shared between the delegate object and the run loop. `Rc`, not `Arc`:
 /// both live on the queue the VM is bound to, and nothing here crosses a
@@ -69,6 +69,10 @@ pub struct Signals {
     /// Only non-recoverable NBD failures arrive here. Recoverable failures
     /// are intentionally left to VZ's built-in reconnect loop.
     nbd_terminal_errors: Cell<u32>,
+    /// The first of those failures, kept whole. Once this is set the guest
+    /// is running on a disk that is not there, and the run loop takes it
+    /// down — see [`Machine::state`] and `main`.
+    storage_failure: std::cell::RefCell<Option<StorageError>>,
 }
 
 impl Signals {
@@ -89,6 +93,80 @@ impl Signals {
 
     pub fn net_disconnects(&self) -> u32 {
         self.net_disconnects.get()
+    }
+
+    /// `attachmentWasConnected:` — the initial connect, and every
+    /// transparent reconnect after a *recoverable* failure. Telemetry and
+    /// nothing else: the guest never noticed, so neither does the state.
+    fn note_nbd_connected(&self, uri: &str) {
+        let previous = self.nbd_connections.get();
+        self.nbd_connections.set(previous + 1);
+        eprintln!(
+            "astd-vz: NBD {} to {uri}",
+            if previous == 0 {
+                "connected"
+            } else {
+                "reconnected"
+            },
+        );
+    }
+
+    /// `attachment:didEncounterError:` — the end of that disk. Apple: "the
+    /// NBD client will be in a non-functional state after this method is
+    /// invoked", and there is no API to re-attach one under a running VM.
+    ///
+    /// Counting it and carrying on was the bug this replaces: the guest
+    /// went on writing into a device that would never take a byte again,
+    /// and `info` went on saying `running`.
+    fn note_storage_failure(&self, uri: &str, message: String) {
+        self.nbd_terminal_errors
+            .set(self.nbd_terminal_errors.get() + 1);
+        eprintln!("astd-vz: NBD attachment {uri} entered a non-recoverable state: {message}");
+        // First one wins: it is the failure that killed the guest, and
+        // anything after it is fallout from the same loss.
+        let mut slot = self.storage_failure.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(StorageError {
+                uri: uri.to_owned(),
+                message,
+            });
+        }
+    }
+
+    /// How many times a network disk connected — one for the first
+    /// connection, one more for each transparent reconnect after it.
+    pub fn nbd_connections(&self) -> u32 {
+        self.nbd_connections.get()
+    }
+
+    /// How many attachments have failed for good. Distinct from
+    /// [`Signals::nbd_connections`] by construction: a reconnect is
+    /// recoverable and this never sees one.
+    pub fn nbd_terminal_errors(&self) -> u32 {
+        self.nbd_terminal_errors.get()
+    }
+
+    /// The failure that ends this guest, if one has happened.
+    pub fn storage_failure(&self) -> Option<StorageError> {
+        self.storage_failure.borrow().clone()
+    }
+}
+
+/// What `info` should say, given what VZ says and whether a disk has gone.
+///
+/// The framework has no state for "running, but on a disk that is not
+/// there": `VZVirtualMachineState` stays `Running` after the NBD client
+/// gives up. So the helper substitutes one. It reports [`State::Error`]
+/// rather than a new state of its own because an `astd` older than this
+/// change cannot parse a new one — it would fail the whole `Info`, fall
+/// back to "is the pid alive", and answer *running* for exactly the guest
+/// this exists to stop reporting as healthy.
+fn reported_state(vm: State, storage_failed: bool) -> State {
+    match storage_failed && vm.is_live() {
+        true => State::Error,
+        // Once VZ agrees the machine is down, its own answer is the more
+        // precise one.
+        false => vm,
     }
 }
 
@@ -150,17 +228,8 @@ define_class!(
             &self,
             _attachment: &VZNetworkBlockDeviceStorageDeviceAttachment,
         ) {
-            let previous = self.ivars().signals.nbd_connections.get();
-            self.ivars().signals.nbd_connections.set(previous + 1);
-            eprintln!(
-                "astd-vz: NBD {} to {}",
-                if previous == 0 {
-                    "connected"
-                } else {
-                    "reconnected"
-                },
-                self.ivars().uri
-            );
+            let ivars = self.ivars();
+            ivars.signals.note_nbd_connected(&ivars.uri);
         }
 
         #[unsafe(method(attachment:didEncounterError:))]
@@ -169,13 +238,10 @@ define_class!(
             _attachment: &VZNetworkBlockDeviceStorageDeviceAttachment,
             error: &NSError,
         ) {
-            let n = self.ivars().signals.nbd_terminal_errors.get();
-            self.ivars().signals.nbd_terminal_errors.set(n + 1);
-            eprintln!(
-                "astd-vz: NBD attachment {} entered a non-recoverable state: {}",
-                self.ivars().uri,
-                error.localizedDescription()
-            );
+            let ivars = self.ivars();
+            ivars
+                .signals
+                .note_storage_failure(&ivars.uri, error.localizedDescription().to_string());
         }
     }
 );
@@ -583,9 +649,24 @@ pub fn pump(slice: Duration) {
 }
 
 impl Machine {
+    /// What to tell the daemon about this guest.
+    ///
+    /// Not simply `VZVirtualMachine.state`: a guest whose disk has failed
+    /// for good still reads as `Running` there, and answering `running` to
+    /// `info` is what let a permanently broken guest look healthy. See
+    /// [`reported_state`].
+    ///
     /// # Safety
     /// Main thread only.
     pub unsafe fn state(&self) -> State {
+        reported_state(self.vm_state(), self.signals.storage_failure().is_some())
+    }
+
+    /// VZ's own answer, untouched.
+    ///
+    /// # Safety
+    /// Main thread only.
+    unsafe fn vm_state(&self) -> State {
         match self.vm.state() {
             VZVirtualMachineState::Stopped => State::Stopped,
             VZVirtualMachineState::Running => State::Running,
@@ -593,6 +674,34 @@ impl Machine {
             VZVirtualMachineState::Starting => State::Starting,
             VZVirtualMachineState::Stopping => State::Stopping,
             _ => State::Error,
+        }
+    }
+
+    /// Ask the guest to power down and return immediately.
+    ///
+    /// [`Machine::graceful_stop`] pumps the run loop until the guest
+    /// answers, which is right when the daemon is waiting on the other end
+    /// of a `stop`. It is wrong when the helper takes the guest down on its
+    /// own: nothing is draining the control socket's jobs during that wait,
+    /// so `info` would time out for the whole budget and the daemon would
+    /// fall back to the pid — and call a dying guest running. Requesting
+    /// without waiting leaves the run loop free to keep answering.
+    ///
+    /// Returns whether VZ took the request; `false` means only
+    /// [`Machine::force_stop`] is left.
+    ///
+    /// # Safety
+    /// Main thread only.
+    pub unsafe fn request_stop(&self) -> bool {
+        if !self.vm.canRequestStop() {
+            return false;
+        }
+        match self.vm.requestStopWithError() {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("astd-vz: requestStop refused: {}", e.localizedDescription());
+                false
+            }
         }
     }
 
@@ -610,20 +719,13 @@ impl Machine {
         if let Some(reason) = self.signals.reason() {
             return reason;
         }
-        if self.vm.canRequestStop() {
-            match self.vm.requestStopWithError() {
-                Ok(()) => {
-                    let until = Instant::now() + budget;
-                    while !self.signals.stopped() && Instant::now() < until {
-                        pump(Duration::from_millis(100));
-                    }
-                    if let Some(reason) = self.signals.reason() {
-                        return reason;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("astd-vz: requestStop refused: {}", e.localizedDescription());
-                }
+        if self.request_stop() {
+            let until = Instant::now() + budget;
+            while !self.signals.stopped() && Instant::now() < until {
+                pump(Duration::from_millis(100));
+            }
+            if let Some(reason) = self.signals.reason() {
+                return reason;
             }
         }
         self.force_stop()
@@ -695,6 +797,69 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The two NBD callbacks mean opposite things, and the difference is
+    /// the whole of this fix: a reconnect is bookkeeping, a
+    /// `didEncounterError:` is the disk never coming back.
+    #[test]
+    fn a_reconnect_is_telemetry_and_a_terminal_error_ends_the_guest() {
+        let uri = "nbd+unix:///team%2Fdata?socket=%2Ftmp%2Fv.sock";
+        let signals = Signals::default();
+
+        // First connect, then a transparent reconnect after something
+        // recoverable. VZ retried; the guest never noticed.
+        signals.note_nbd_connected(uri);
+        signals.note_nbd_connected(uri);
+        assert_eq!(signals.nbd_connections(), 2);
+        assert_eq!(signals.nbd_terminal_errors(), 0);
+        assert!(signals.storage_failure().is_none());
+        assert!(!signals.stopped(), "a reconnect is not a death");
+        assert_eq!(
+            reported_state(State::Running, signals.storage_failure().is_some()),
+            State::Running,
+            "and the guest is still healthy while VZ is reconnecting"
+        );
+
+        signals.note_storage_failure(uri, "Connection reset by peer".into());
+        assert_eq!(signals.nbd_terminal_errors(), 1);
+        assert_eq!(
+            signals.nbd_connections(),
+            2,
+            "no reconnect follows this one"
+        );
+        let failure = signals.storage_failure().expect("the disk is gone");
+        assert_eq!(failure.uri, uri);
+        assert_eq!(failure.message, "Connection reset by peer");
+
+        // The first loss is the one that killed the guest; later noise from
+        // the same dead attachment does not overwrite it, but is counted.
+        signals.note_storage_failure(uri, "Broken pipe".into());
+        assert_eq!(signals.nbd_terminal_errors(), 2);
+        assert_eq!(
+            signals.storage_failure().unwrap().message,
+            "Connection reset by peer"
+        );
+    }
+
+    /// A guest VZ still calls `Running` must not be reported as running
+    /// once its disk has failed — that is the state a supervisor would sit
+    /// on forever while the guest writes into nothing.
+    #[test]
+    fn no_live_state_survives_a_lost_disk() {
+        for live in [
+            State::Starting,
+            State::Running,
+            State::Paused,
+            State::Stopping,
+        ] {
+            assert_eq!(reported_state(live, false), live, "healthy: VZ's answer");
+            assert_eq!(reported_state(live, true), State::Error);
+            assert!(!reported_state(live, true).is_live());
+        }
+        // Once VZ agrees, its answer is the more precise one and stands.
+        assert_eq!(reported_state(State::Stopped, true), State::Stopped);
+        assert_eq!(reported_state(State::Error, true), State::Error);
     }
 
     #[test]

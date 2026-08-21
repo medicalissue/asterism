@@ -37,6 +37,7 @@ use crate::instance::{
     self, now_unix, Conflict, Instance, Moving, Policy, PortForward, Restart, Shape, Status,
     Volume,
 };
+use crate::secret::Binding;
 
 /// One device's shard of the orbit registry, persisted as JSON at `path`.
 pub struct Shard {
@@ -361,6 +362,55 @@ impl Shard {
             inst.volumes.push(Volume::block(volume, host, epoch, size_bytes));
         }
         Ok(inst.clone())
+    }
+
+    /// Record a secret binding on an instance.
+    ///
+    /// Attach-time is where a binding is refused, for the same reason a
+    /// volume is: an instance that looks configured and whose guest then
+    /// finds a handle nothing will honour is worse than a command that says
+    /// no. What this function owns is the part of that which is about the
+    /// *shard* — one binding per authority, one environment variable per
+    /// guest — while whether the secret exists, whether it is in conflict and
+    /// whether this backend can carry egress at all belong to the daemon,
+    /// which is the only thing that can ask.
+    pub fn attach_secret(&mut self, name: &str, binding: Binding) -> Result<Instance> {
+        let inst = self.get_mut(name)?;
+        if let Some(clash) = inst
+            .secrets
+            .iter()
+            .find(|held| held.authority == binding.authority)
+        {
+            bail!(
+                "{name:?} already sends {:?} to {} — one authority takes one secret, because \
+                 a request carries one credential",
+                clash.secret,
+                clash.authority
+            );
+        }
+        if let Some(clash) = inst.secrets.iter().find(|held| held.env == binding.env) {
+            bail!(
+                "{name:?} already exports {:?} as ${} — pick another with --env",
+                clash.secret,
+                clash.env
+            );
+        }
+        inst.secrets.push(binding);
+        Ok(inst.clone())
+    }
+
+    /// Take a secret off an instance, by its orbit name.
+    ///
+    /// Returns the binding, because revoking one is more than forgetting a
+    /// row: the handle it carried has to stop being honoured by the running
+    /// proxy, and the seed that told the guest about it has to be reissued.
+    pub fn detach_secret(&mut self, name: &str, secret: &str) -> Result<(Instance, Binding)> {
+        let inst = self.get_mut(name)?;
+        let Some(index) = inst.secrets.iter().position(|held| held.secret == secret) else {
+            bail!("{secret:?} is not attached to {name:?} — see: ast status {name}");
+        };
+        let removed = inst.secrets.remove(index);
+        Ok((inst.clone(), removed))
     }
 
     /// Take a volume off an instance. Returns the record that was removed, so

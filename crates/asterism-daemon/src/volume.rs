@@ -783,6 +783,7 @@ mod tests {
                 foreign_arch: false,
                 direct_kernel: false,
                 port_forward: false,
+                guest_egress: None,
                 disk_formats: &[DiskFormat::Raw],
             }
         }

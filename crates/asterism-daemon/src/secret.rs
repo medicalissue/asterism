@@ -4,8 +4,13 @@
 //! orbit metadata catalog; material is held by [`SecretStore`] (the login
 //! Keychain on macOS, explicitly unavailable elsewhere).  Public operations
 //! fan out to independent source devices through the existing authenticated
-//! mesh.  There is deliberately no CA, CONNECT proxy, or header injection in
-//! this layer.
+//! mesh.
+//!
+//! This module owns the *policy* half of the secrets data plane: which source
+//! device may serve a value, what a binding is allowed to say, and where a
+//! request has to be sent to be given one. The transport half — the proxy,
+//! the certificates, the two TLS connections — is [`crate::egress`], and it
+//! is somebody else's maintained code all the way down.
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -18,8 +23,11 @@ use serde::{Deserialize, Serialize};
 
 use asterism_core::instance::now_unix;
 use asterism_core::paths;
-use asterism_core::protocol::{Request, Response, SecretValue};
-use asterism_core::secret::{Binding, Handle, Secret, SecretId, SourceDevice};
+use asterism_core::protocol::{EgressRequest, EgressResponse, Request, Response, SecretValue};
+use asterism_core::secret::{
+    self, Binding, GuestHandle, Handle, HandleShape, Placement, Refreshed, Secret, SecretId,
+    SourceDevice, ValueRevision,
+};
 use asterism_mesh::DeviceIdentity;
 
 use crate::mesh::Mesh;
@@ -95,19 +103,24 @@ impl SecretStore for PlatformSecretStore {
     }
 }
 
+/// The on-disk catalog.
+///
+/// Note what is *not* here: bindings. When they were a bare
+/// `(secret, authority)` pair they could plausibly have lived beside the
+/// metadata; now that one carries an opaque guest handle, it is a per-instance
+/// bearer credential, and this file replicates to every device in the orbit.
+/// A binding lives on its instance, in that device's shard, and travels only
+/// with the instance.
 #[derive(Debug, Serialize, Deserialize)]
 struct CatalogFile {
     version: u32,
     #[serde(default)]
     secrets: Vec<Secret>,
-    #[serde(default)]
-    bindings: Vec<Binding>,
 }
 
 struct Catalog {
     path: PathBuf,
     secrets: Vec<Secret>,
-    bindings: Vec<Binding>,
 }
 
 impl Catalog {
@@ -118,7 +131,6 @@ impl Catalog {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => CatalogFile {
                 version: CATALOG_VERSION,
                 secrets: Vec::new(),
-                bindings: Vec::new(),
             },
             Err(e) => return Err(e).context("reading secret metadata"),
         };
@@ -132,7 +144,6 @@ impl Catalog {
         Ok(Self {
             path: path.to_owned(),
             secrets: file.secrets,
-            bindings: file.bindings,
         })
     }
 
@@ -143,7 +154,6 @@ impl Catalog {
         let file = CatalogFile {
             version: CATALOG_VERSION,
             secrets: self.secrets.clone(),
-            bindings: self.bindings.clone(),
         };
         let tmp = self.path.with_extension("json.tmp");
         #[cfg(unix)]
@@ -210,6 +220,14 @@ impl SecretPlane {
         Ok(synced)
     }
 
+    /// Take custody of material for one secret on this device.
+    ///
+    /// The metadata arriving alongside the bytes names the lineage and the
+    /// revision they belong to, which is what makes this the authenticated
+    /// copy path: a second source becomes interchangeable with the first only
+    /// by receiving both together.  Bytes offered under a lineage this device
+    /// already knows the name by are the partitioned create seen from the
+    /// source side, and this is the last place able to refuse them.
     fn put(&self, secret: Secret, value: &SecretValue) -> Result<Secret> {
         let source = secret
             .sources
@@ -217,24 +235,38 @@ impl SecretPlane {
             .find(|source| source.device_id == self.device_id)
             .cloned()
             .ok_or_else(|| anyhow!("source metadata does not identify this device"))?;
-        let mut catalog = self.catalog.lock().expect("secret catalog poisoned");
-        if catalog.secrets.iter().any(|held| {
-            held.id == secret.id
-                && held
-                    .sources
-                    .iter()
-                    .any(|source| source.device_id == self.device_id)
-        }) {
+        if let Some(conflict) = secret.conflict() {
             bail!(
-                "secret {:?} already has a source on this device; use `ast secret rotate`",
+                "refusing to hold material for secret {:?}: {conflict}",
                 secret.name
             );
         }
+        let mut catalog = self.catalog.lock().expect("secret catalog poisoned");
+        if let Some(held) = catalog.secrets.iter().find(|held| held.id == secret.id) {
+            if held
+                .sources
+                .iter()
+                .any(|held| held.device_id == self.device_id)
+            {
+                bail!(
+                    "secret {:?} already has a source on this device; use `ast secret rotate`",
+                    secret.name
+                );
+            }
+            if let Some(other) = held
+                .sources
+                .iter()
+                .find(|known| known.origin != source.origin)
+            {
+                bail!(
+                    "secret {:?} is already a different value in this orbit, held by {}; \
+                     remove it from every source before creating it again",
+                    secret.name,
+                    other.device
+                );
+            }
+        }
         self.store.put(&secret.id, value.as_bytes())?;
-        debug_assert!(secret
-            .sources
-            .iter()
-            .any(|held| held.device_id == source.device_id));
         let local = match catalog.secrets.iter_mut().find(|held| held.id == secret.id) {
             Some(held) => {
                 *held = merge([held.clone(), secret]).remove(0);
@@ -277,6 +309,7 @@ impl SecretPlane {
         id: &SecretId,
         version: u64,
         updated_at: u64,
+        revision: &ValueRevision,
         value: &SecretValue,
     ) -> Result<Secret> {
         let mut catalog = self.catalog.lock().expect("secret catalog poisoned");
@@ -292,11 +325,30 @@ impl SecretPlane {
         {
             bail!("this device is not a source for secret {:?}", id.as_str());
         }
+        if let Some(conflict) = secret.conflict() {
+            bail!(
+                "secret {:?} cannot be rotated while it is in conflict: {conflict}",
+                secret.name
+            );
+        }
         if version <= secret.version {
             bail!(
                 "secret {:?} is already at version {}",
                 secret.name,
                 secret.version
+            );
+        }
+        // The orbit mints one revision per rotation and hands the same one to
+        // every source.  Reusing a revision already in this secret would claim
+        // these bytes are ones some source is known to hold.
+        if secret
+            .sources
+            .iter()
+            .any(|source| &source.revision == revision)
+        {
+            bail!(
+                "secret {:?} was handed a value revision one of its sources already holds",
+                secret.name
             );
         }
         self.store.put(id, value.as_bytes())?;
@@ -306,6 +358,7 @@ impl SecretPlane {
             if source.device_id == self.device_id {
                 source.version = version;
                 source.updated_at = updated_at;
+                source.revision = revision.clone();
             }
         }
         let changed = secret.clone();
@@ -329,12 +382,32 @@ impl SecretPlane {
             .iter()
             .find(|secret| secret.id == handle.secret_id)
             .ok_or_else(|| anyhow!("this device is not a source for that secret"))?;
+        if let Some(conflict) = secret.conflict() {
+            bail!(
+                "secret {:?} is in conflict — {conflict}; resolve it before use",
+                secret.name
+            );
+        }
         if secret.version != handle.version || handle.source.version != handle.version {
             bail!(
                 "secret {:?} rotated from version {} to {}; select a fresh handle",
                 secret.name,
                 handle.version,
                 secret.version
+            );
+        }
+        let local = secret
+            .sources
+            .iter()
+            .find(|source| source.device_id == self.device_id)
+            .ok_or_else(|| anyhow!("this device is not a source for that secret"))?;
+        // The version alone cannot say which value it meant.  A handle
+        // selected from a snapshot taken on the far side of a partition can
+        // name this version and still mean the other lineage's bytes.
+        if local.origin != handle.source.origin || local.revision != handle.source.revision {
+            bail!(
+                "secret {:?} does not hold the value this handle selected; select a fresh handle",
+                secret.name
             );
         }
         Ok(SecretValue::new(self.store.get(&handle.secret_id)?))
@@ -381,6 +454,7 @@ pub(crate) fn is_source_request(req: &Request) -> bool {
             | Request::SecretSourcePut { .. }
             | Request::SecretSourceRemove { .. }
             | Request::SecretSourceRotate { .. }
+            | Request::SecretSourceEgress { .. }
     )
 }
 
@@ -403,7 +477,14 @@ pub(crate) async fn serve(req: Request, node: &Node, mesh: Option<&Arc<Mesh>>) -
     })
 }
 
-pub(crate) fn serve_source(req: Request) -> Response {
+pub(crate) async fn serve_source(req: Request) -> Response {
+    // The one source operation that is not a question about the catalog: it
+    // resolves material and then spends a network round trip with it. It is
+    // answered before the lock below is taken, because it holds no lock at
+    // all while it is waiting on somebody else's server.
+    if let Request::SecretSourceEgress { handle, request } = req {
+        return crate::egress::serve_source(handle, *request).await;
+    }
     let result = (|| -> Result<Response> {
         let plane = plane()?;
         match req {
@@ -423,9 +504,10 @@ pub(crate) fn serve_source(req: Request) -> Response {
                 id,
                 version,
                 updated_at,
+                revision,
                 value,
             } => Ok(Response::Secrets {
-                secrets: vec![plane.rotate(&id, version, updated_at, &value)?],
+                secrets: vec![plane.rotate(&id, version, updated_at, &revision, &value)?],
             }),
             _ => unreachable!("is_source_request and serve_source disagree"),
         }
@@ -449,58 +531,178 @@ async fn create(
         .find(|secret| secret.id == id);
     let now = now_unix();
     let source = source_identity(target, node).await?;
-    if existing.as_ref().is_some_and(|secret| {
-        secret
-            .sources
-            .iter()
-            .any(|held| held.device_id == source.device_id)
-    }) {
+    let secret = match existing {
+        None => begin_lineage(id, name, &source, value, now, node, mesh).await?,
+        Some(existing) => widen_by_rotation(existing, &source, value, now, node, mesh).await?,
+    };
+    sync_metadata(&secret, node, mesh).await;
+    Ok(Response::Secrets {
+        secrets: list(node, mesh).await?,
+    })
+}
+
+/// Create a name nobody in the orbit has used, on one source device.
+async fn begin_lineage(
+    id: SecretId,
+    name: &str,
+    source: &SourceRoute,
+    value: SecretValue,
+    now: u64,
+    node: &Node,
+    mesh: Option<&Arc<Mesh>>,
+) -> Result<Secret> {
+    // A lineage is named by the first value in it, so origin and first
+    // revision are one mint.  Nothing derives either from the bytes.
+    let origin = ValueRevision::mint();
+    let target_source = SourceDevice {
+        device_id: source.device_id.clone(),
+        device: source.device.clone(),
+        version: 1,
+        updated_at: now,
+        origin: origin.clone(),
+        revision: origin,
+    };
+    let secret = Secret {
+        id,
+        name: name.to_owned(),
+        version: 1,
+        created_at: now,
+        updated_at: now,
+        sources: vec![target_source.clone()],
+    };
+    expect_source_ok(
+        call_source(
+            source,
+            Request::SecretSourcePut {
+                secret: secret.clone(),
+                value,
+            },
+            node,
+            mesh,
+        )
+        .await,
+        &target_source.device,
+    )?;
+    Ok(secret)
+}
+
+/// Add a source to a name the orbit already holds.
+///
+/// The bytes on stdin cannot be checked against the value the orbit already
+/// has: the only check would be a digest, and a digest of a secret in
+/// replicated metadata is an offline verifier for every weak value in the
+/// orbit.  So this does not pretend the new device is joining at the current
+/// version.  It is an explicit rotation that happens to widen the source set:
+/// one fresh revision reaches the joining device and every existing source, so
+/// they end interchangeable no matter what was typed.  If a source cannot be
+/// reached the operation fails rather than leaving two values at one version,
+/// which is the state this whole design exists to make unrepresentable.
+async fn widen_by_rotation(
+    existing: Secret,
+    source: &SourceRoute,
+    value: SecretValue,
+    now: u64,
+    node: &Node,
+    mesh: Option<&Arc<Mesh>>,
+) -> Result<Secret> {
+    let name = existing.name.clone();
+    if let Some(conflict) = existing.conflict() {
+        bail!(
+            "secret {name:?} is in conflict — {conflict}; remove it from every source with \
+             `ast secret rm {name}` and create it once"
+        );
+    }
+    if existing
+        .sources
+        .iter()
+        .any(|held| held.device_id == source.device_id)
+    {
         bail!(
             "secret {name:?} already has {} as a source; use `ast secret rotate`",
             source.device
         );
     }
-    let (version, created_at) = existing
-        .as_ref()
-        .map(|secret| (secret.version, secret.created_at))
-        .unwrap_or((1, now));
-    let mut sources = existing
-        .as_ref()
-        .map(|secret| secret.sources.clone())
-        .unwrap_or_default();
-    let target_source = SourceDevice {
+    let origin = existing
+        .sources
+        .first()
+        .map(|held| held.origin.clone())
+        .ok_or_else(|| anyhow!("secret {name:?} has no source to join"))?;
+    let version = existing.version.saturating_add(1);
+    let revision = ValueRevision::mint();
+    let joining = SourceDevice {
+        device_id: source.device_id.clone(),
+        device: source.device.clone(),
         version,
         updated_at: now,
-        ..source
+        origin,
+        revision: revision.clone(),
     };
-    sources.push(target_source.clone());
+
+    // The joining device is told the truth as it stands: it holds the new
+    // revision, and the existing sources are still on the old one.  Announcing
+    // them as already rotated would make a value they no longer hold look
+    // current if the rotation below then failed.
+    let mut sources = existing.sources.clone();
+    sources.push(joining.clone());
     let secret = Secret {
-        id,
-        name: name.to_owned(),
         version,
-        created_at,
         updated_at: now,
         sources,
+        ..existing.clone()
     };
-    let response = call_source(
-        &target_source,
-        Request::SecretSourcePut {
-            secret: secret.clone(),
-            value,
-        },
-        node,
-        mesh,
-    )
-    .await?;
-    match response {
-        Response::Secrets { .. } => {
-            sync_metadata(&secret, node, mesh).await;
-            Ok(Response::Secrets {
-                secrets: list(node, mesh).await?,
-            })
+    expect_source_ok(
+        call_source(
+            source,
+            Request::SecretSourcePut {
+                secret: secret.clone(),
+                value: value.clone(),
+            },
+            node,
+            mesh,
+        )
+        .await,
+        &joining.device,
+    )?;
+
+    let mut failures = Vec::new();
+    for held in &existing.sources {
+        let request = Request::SecretSourceRotate {
+            id: existing.id.clone(),
+            version,
+            updated_at: now,
+            revision: revision.clone(),
+            value: value.clone(),
+        };
+        let reply = call_source(&SourceRoute::to(held), request, node, mesh).await;
+        if let Err(e) = expect_source_ok(reply, &held.device) {
+            failures.push(format!("{e:#}"));
         }
-        Response::Error { message } => bail!(message),
-        other => bail!("secret source answered create with {other:?}"),
+    }
+    if !failures.is_empty() {
+        bail!(
+            "{} joined secret {name:?} at version {version}, but the value did not reach every \
+             existing source: {}. Finish with `ast secret rotate {name}`.",
+            joining.device,
+            failures.join("; ")
+        );
+    }
+
+    let mut widened = secret;
+    for source in &mut widened.sources {
+        source.version = version;
+        source.updated_at = now;
+        source.revision = revision.clone();
+    }
+    Ok(widened)
+}
+
+/// Collapse one source device's reply into a plain success or a named failure.
+fn expect_source_ok(reply: Result<Response>, device: &str) -> Result<()> {
+    match reply {
+        Ok(Response::Secrets { .. }) => Ok(()),
+        Ok(Response::Error { message }) => bail!("{device}: {message}"),
+        Ok(other) => bail!("{device}: unexpected {other:?}"),
+        Err(e) => bail!("{device}: {e:#}"),
     }
 }
 
@@ -559,11 +761,9 @@ async fn remove(name: &str, node: &Node, mesh: Option<&Arc<Mesh>>) -> Result<Res
             .await
             .devices()
             .iter()
-            .map(|peer| SourceDevice {
+            .map(|peer| SourceRoute {
                 device_id: peer.device_id.clone(),
                 device: peer.name.clone(),
-                version: 0,
-                updated_at: 0,
             }),
     );
 
@@ -617,23 +817,31 @@ async fn rotate(
         .into_iter()
         .find(|secret| secret.id == id)
         .ok_or_else(|| anyhow!("no secret named {name:?} in this orbit"))?;
+    if let Some(conflict) = secret.conflict() {
+        bail!(
+            "secret {name:?} is in conflict — {conflict}; rotating would hand every source one \
+             value and silently discard the other, so remove it with `ast secret rm {name}` and \
+             create it once"
+        );
+    }
     let version = secret.version.saturating_add(1);
     let updated_at = now_unix();
+    // One mint for the whole orbit.  Every source that accepts these bytes
+    // records the same revision, and that shared revision is the only thing
+    // that later proves they agree.
+    let revision = ValueRevision::mint();
     let mut failures = Vec::new();
     for source in &secret.sources {
         let request = Request::SecretSourceRotate {
             id: id.clone(),
             version,
             updated_at,
+            revision: revision.clone(),
             value: value.clone(),
         };
-        match call_source(source, request, node, mesh).await {
-            Ok(Response::Secrets { .. }) => {}
-            Ok(Response::Error { message }) => {
-                failures.push(format!("{}: {message}", source.device))
-            }
-            Ok(other) => failures.push(format!("{}: unexpected {other:?}", source.device)),
-            Err(e) => failures.push(format!("{}: {e:#}", source.device)),
+        let reply = call_source(&SourceRoute::to(source), request, node, mesh).await;
+        if let Err(e) = expect_source_ok(reply, &source.device) {
+            failures.push(format!("{e:#}"));
         }
     }
     if !failures.is_empty() {
@@ -648,6 +856,7 @@ async fn rotate(
     for source in &mut rotated.sources {
         source.version = version;
         source.updated_at = updated_at;
+        source.revision = revision.clone();
     }
     sync_metadata(&rotated, node, mesh).await;
     Ok(Response::Secrets {
@@ -655,42 +864,57 @@ async fn rotate(
     })
 }
 
-async fn source_identity(target: Option<&str>, node: &Node) -> Result<SourceDevice> {
+/// Where to send a source operation: the mesh identity, plus the name to
+/// route by today.
+///
+/// This is deliberately not a [`SourceDevice`].  A routing target has no
+/// version and no revision, and the placeholders it would need are exactly the
+/// fields the merge trusts to decide whether two devices hold one value.
+#[derive(Clone)]
+struct SourceRoute {
+    device_id: String,
+    device: String,
+}
+
+impl SourceRoute {
+    fn to(source: &SourceDevice) -> Self {
+        Self {
+            device_id: source.device_id.clone(),
+            device: source.device.clone(),
+        }
+    }
+}
+
+async fn source_identity(target: Option<&str>, node: &Node) -> Result<SourceRoute> {
     let plane = plane()?;
     let orbit = node.orbit.lock().await;
     match target {
-        None => Ok(SourceDevice {
+        None => Ok(SourceRoute {
             device_id: plane.device_id.clone(),
             device: orbit.self_name().to_owned(),
-            version: 0,
-            updated_at: 0,
         }),
-        Some(name) if name == orbit.self_name() => Ok(SourceDevice {
+        Some(name) if name == orbit.self_name() => Ok(SourceRoute {
             device_id: plane.device_id.clone(),
             device: name.to_owned(),
-            version: 0,
-            updated_at: 0,
         }),
         Some(name) => orbit
             .get(name)
-            .map(|peer| SourceDevice {
+            .map(|peer| SourceRoute {
                 device_id: peer.device_id.clone(),
                 device: peer.name.clone(),
-                version: 0,
-                updated_at: 0,
             })
             .ok_or_else(|| anyhow!("no device named {name:?} in this orbit — see: ast devices")),
     }
 }
 
 async fn call_source(
-    source: &SourceDevice,
+    source: &SourceRoute,
     request: Request,
     node: &Node,
     mesh: Option<&Arc<Mesh>>,
 ) -> Result<Response> {
     if source.device_id == plane()?.device_id {
-        return Ok(serve_source(request));
+        return Ok(serve_source(request).await);
     }
     let current_name = node
         .orbit
@@ -705,46 +929,262 @@ async fn call_source(
     mesh.proxy(&current_name, request).await
 }
 
+/// Fold every device's view of the orbit's secrets into one catalog.
+///
+/// Merging is evidence-preserving.  It never decides that two source records
+/// describe one value; it only drops a record that some other record provably
+/// supersedes, and leaves everything else standing for [`Secret::conflict`] to
+/// report.  The bug this replaces did the opposite: it keyed sources by device
+/// alone, so two devices that had independently created one name during a
+/// partition merged into a single secret with two interchangeable sources, and
+/// whichever one a consumer picked was the value it got.
 fn merge(secrets: impl IntoIterator<Item = Secret>) -> Vec<Secret> {
     let mut merged: BTreeMap<SecretId, Secret> = BTreeMap::new();
-    for mut incoming in secrets {
-        match merged.get_mut(&incoming.id) {
-            None => {
-                incoming
-                    .sources
-                    .sort_by(|a, b| a.device_id.cmp(&b.device_id));
-                merged.insert(incoming.id.clone(), incoming);
-            }
-            Some(secret) => {
-                secret.created_at = secret.created_at.min(incoming.created_at);
-                secret.updated_at = secret.updated_at.max(incoming.updated_at);
-                secret.version = secret.version.max(incoming.version);
-                for source in incoming.sources {
-                    match secret
-                        .sources
-                        .iter_mut()
-                        .find(|held| held.device_id == source.device_id)
-                    {
-                        Some(held) if source.version > held.version => *held = source,
-                        Some(_) => {}
-                        None => secret.sources.push(source),
-                    }
-                }
-                secret.sources.sort_by(|a, b| a.device_id.cmp(&b.device_id));
-            }
+    for incoming in secrets {
+        let secret = merged.entry(incoming.id.clone()).or_insert_with(|| Secret {
+            sources: Vec::new(),
+            ..incoming.clone()
+        });
+        secret.created_at = secret.created_at.min(incoming.created_at);
+        secret.updated_at = secret.updated_at.max(incoming.updated_at);
+        secret.version = secret.version.max(incoming.version);
+        for source in incoming.sources {
+            absorb(&mut secret.sources, source);
         }
+        secret.sources.sort_by(|a, b| {
+            (&a.device_id, a.version, &a.revision).cmp(&(&b.device_id, b.version, &b.revision))
+        });
     }
     let mut out: Vec<_> = merged.into_values().collect();
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }
 
+/// Fold one source record into a secret's source list.
+///
+/// A device supersedes its own earlier record only inside one lineage, only
+/// forward in version, and only while it speaks with a single voice.  Every
+/// other shape is kept: a second lineage, or two values claimed at one
+/// version, is precisely the evidence a conflict is made of, and dropping it
+/// here is how a partitioned create used to disappear into a merge.
+fn absorb(sources: &mut Vec<SourceDevice>, incoming: SourceDevice) {
+    let same_lineage = |held: &SourceDevice| {
+        held.device_id == incoming.device_id && held.origin == incoming.origin
+    };
+    // A record already held, or one this device has moved past, adds nothing.
+    if sources.iter().any(|held| {
+        same_lineage(held)
+            && (held.version > incoming.version
+                || (held.version == incoming.version && held.revision == incoming.revision))
+    }) {
+        return;
+    }
+    let (first, second) = {
+        let mut lineage = sources
+            .iter()
+            .enumerate()
+            .filter(|(_, held)| same_lineage(held))
+            .map(|(index, _)| index);
+        (lineage.next(), lineage.next())
+    };
+    match (first, second) {
+        (Some(index), None) if incoming.version > sources[index].version => {
+            sources[index] = incoming;
+        }
+        _ => sources.push(incoming),
+    }
+}
+
+/// Read material for one pinned handle, on the device that holds it.
+///
+/// The only caller is [`crate::egress::serve_source`], and the only thing it
+/// does with the result is put it in a header and open a connection. There is
+/// deliberately no protocol frame that returns this: plaintext travels to the
+/// upstream, never back to a consumer daemon.
+pub(crate) fn resolve(handle: &Handle) -> Result<SecretValue> {
+    plane()?.resolve(handle)
+}
+
+/// Everything `ast attach --secret` has to decide, on the device that will
+/// run the guest.
+///
+/// This is where a binding is refused, and the refusals are the feature: a
+/// secret nobody in the orbit has, a secret in conflict, a source device that
+/// does not hold the current version, an authority that cannot be intercepted
+/// honestly. Each of them is a sentence here rather than a guest that boots
+/// with a handle nothing will ever honour.
+pub(crate) async fn plan_binding(
+    secret: &str,
+    authority: &str,
+    placement: Option<Placement>,
+    env: Option<String>,
+    source_device: Option<&str>,
+    node: &Node,
+    mesh: Option<&Arc<Mesh>>,
+) -> Result<Binding> {
+    let authority = secret::check_authority(authority)?;
+    let id = SecretId::from_name(secret)?;
+    let held = list(node, mesh)
+        .await?
+        .into_iter()
+        .find(|held| held.id == id)
+        .ok_or_else(|| anyhow!("no secret named {secret:?} in this orbit — see: ast secret ls"))?;
+    if let Some(conflict) = held.conflict() {
+        bail!(
+            "secret {secret:?} is in conflict — {conflict}; a binding has to name one value, \
+             so resolve it with `ast secret rm {secret}` and create it once before attaching it"
+        );
+    }
+    // A named device must be a source; an unnamed one picks a source that
+    // actually holds the current version, preferring this device because a
+    // local resolve is a function call and a remote one is a network.
+    let source = match source_device {
+        Some(name) => {
+            let route = source_identity(Some(name), node).await?;
+            held.sources
+                .iter()
+                .find(|held| held.device_id == route.device_id)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "{name} is not a source for secret {secret:?} — it is held by {}",
+                        named(&held)
+                    )
+                })?
+        }
+        None => {
+            let here = plane()?.device_id.clone();
+            held.sources
+                .iter()
+                .find(|source| source.device_id == here && source.version == held.version)
+                .or_else(|| {
+                    held.sources
+                        .iter()
+                        .find(|source| source.version == held.version)
+                })
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "no source for secret {secret:?} holds its current version {} — \
+                         finish the rotation with `ast secret rotate {secret}`",
+                        held.version
+                    )
+                })?
+        }
+    };
+    // Proves now, at attach time, that this source can be asked at all.
+    held.handle(&source.device_id)?;
+
+    let placement = placement.unwrap_or_else(|| Placement::for_authority(&authority));
+    let env = match env {
+        Some(env) => {
+            secret::check_env_name(&env)?;
+            env
+        }
+        None => secret::default_env_name(secret),
+    };
+    Ok(Binding {
+        id: binding_id(),
+        secret_id: held.id.clone(),
+        secret: held.name.clone(),
+        authority: authority.clone(),
+        guest_handle: GuestHandle::mint(HandleShape::for_authority(&authority)),
+        placement,
+        env,
+        source_device_id: source.device_id.clone(),
+        source_device: source.device.clone(),
+        version: held.version,
+        bound_at: now_unix(),
+    })
+}
+
+/// The devices a secret is held by, for a refusal that has to name them.
+fn named(secret: &Secret) -> String {
+    let names: Vec<&str> = secret
+        .sources
+        .iter()
+        .map(|source| source.device.as_str())
+        .collect();
+    match names.is_empty() {
+        true => "no device".to_owned(),
+        false => names.join(", "),
+    }
+}
+
+/// A random id for a binding row.
+///
+/// Spelled through [`ValueRevision::mint`] because `uuid` is a dependency of
+/// asterism-core and not of this crate, and one identifier is not worth a
+/// second one — the randomness underneath is the same either way. The *type*
+/// is a plain string, deliberately: a revision means "which bytes", and a
+/// binding is not bytes.
+fn binding_id() -> String {
+    ValueRevision::mint().to_string()
+}
+
+/// The source handle to redeem for a binding, selected fresh.
+///
+/// Per request, and deliberately: a handle pins a version *and* the revision
+/// that version meant, so one written down at attach time is a promise about
+/// bytes that a later rotation makes false. Re-selecting means a rotation is
+/// picked up by the next request, and a source that has genuinely gone is
+/// refused here, in words, rather than as somebody else's 401.
+pub(crate) async fn refresh(
+    binding: &Binding,
+    node: &Node,
+    mesh: Option<&Arc<Mesh>>,
+) -> Result<Refreshed> {
+    let held = list(node, mesh)
+        .await?
+        .into_iter()
+        .find(|held| held.id == binding.secret_id)
+        .ok_or_else(|| {
+            anyhow!(
+                "secret {:?} is no longer in this orbit — the binding on this instance \
+                 has nothing left to resolve",
+                binding.secret
+            )
+        })?;
+    binding.refresh(&held)
+}
+
+/// Send one outbound request to the device that holds the value.
+///
+/// Local when this device is the source, over the authenticated mesh when it
+/// is not, and the same code either way — which is the only reason a bound
+/// secret can live on a machine that is not the one running the guest.
+pub(crate) async fn egress_via_source(
+    binding: &Binding,
+    handle: Option<Handle>,
+    request: EgressRequest,
+    node: &Node,
+    mesh: Option<&Arc<Mesh>>,
+) -> Result<EgressResponse> {
+    let route = SourceRoute {
+        device_id: binding.source_device_id.clone(),
+        device: binding.source_device.clone(),
+    };
+    let frame = Request::SecretSourceEgress {
+        handle,
+        request: Box::new(request),
+    };
+    match call_source(&route, frame, node, mesh).await? {
+        Response::Egress { response } => Ok(*response),
+        Response::Error { message } => bail!("{}: {message}", route.device),
+        other => bail!("{}: unexpected {other:?}", route.device),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[derive(Default)]
-    struct MemoryStore(StdMutex<BTreeMap<SecretId, Vec<u8>>>);
+    use asterism_core::secret::SecretConflict;
+
+    /// A store whose contents the test can still see, so a refusal can be
+    /// checked to have refused before any material was written.
+    #[derive(Clone, Default)]
+    struct MemoryStore(Arc<StdMutex<BTreeMap<SecretId, Vec<u8>>>>);
 
     impl SecretStore for MemoryStore {
         fn put(&self, id: &SecretId, value: &[u8]) -> Result<()> {
@@ -767,153 +1207,378 @@ mod tests {
         }
     }
 
-    fn source(version: u64) -> SourceDevice {
+    fn id() -> SecretId {
+        SecretId::from_name("api").unwrap()
+    }
+
+    fn value(bytes: &[u8]) -> SecretValue {
+        SecretValue::new(bytes.to_vec())
+    }
+
+    /// A source holding the first value of a lineage: origin and revision are
+    /// the same mint, exactly as `begin_lineage` produces them.
+    fn source(device_id: &str, version: u64, lineage: &ValueRevision) -> SourceDevice {
+        holding(device_id, version, lineage, lineage)
+    }
+
+    /// A source that has rotated: same lineage, a revision of its own.
+    fn holding(
+        device_id: &str,
+        version: u64,
+        lineage: &ValueRevision,
+        revision: &ValueRevision,
+    ) -> SourceDevice {
         SourceDevice {
-            device_id: "device-public-key".into(),
-            device: "laptop".into(),
+            device_id: device_id.into(),
+            device: device_id.into(),
             version,
             updated_at: version,
+            origin: lineage.clone(),
+            revision: revision.clone(),
         }
+    }
+
+    fn secret(version: u64, sources: Vec<SourceDevice>) -> Secret {
+        Secret {
+            id: id(),
+            name: "api".into(),
+            version,
+            created_at: 1,
+            updated_at: version,
+            sources,
+        }
+    }
+
+    fn local_plane(path: &Path, device_id: &str, store: MemoryStore) -> SecretPlane {
+        SecretPlane::new(device_id.into(), path.to_owned(), Box::new(store)).unwrap()
     }
 
     #[test]
     fn plaintext_never_enters_the_metadata_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("secrets.json");
-        let plane = SecretPlane::new(
-            "device-public-key".into(),
-            path.clone(),
-            Box::new(MemoryStore::default()),
-        )
-        .unwrap();
+        let lineage = ValueRevision::mint();
+        let plane = local_plane(&path, "laptop", MemoryStore::default());
         let sentinel = b"NEVER-WRITE-THIS-PLAINTEXT";
         plane
             .put(
-                Secret {
-                    id: SecretId::from_name("api").unwrap(),
-                    name: "api".into(),
-                    version: 1,
-                    created_at: 1,
-                    updated_at: 1,
-                    sources: vec![source(1)],
-                },
-                &SecretValue::new(sentinel.to_vec()),
+                secret(1, vec![source("laptop", 1, &lineage)]),
+                &value(sentinel),
             )
             .unwrap();
         let disk = std::fs::read(path).unwrap();
         assert!(!disk
             .windows(sentinel.len())
             .any(|window| window == sentinel));
-        assert!(String::from_utf8(disk)
-            .unwrap()
-            .contains("device-public-key"));
+        let text = String::from_utf8(disk).unwrap();
+        assert!(text.contains("laptop"));
+        // The commitment that reached the file is a mint, not a digest: it
+        // cannot be recomputed from the value, so a reader of this file has no
+        // offline oracle against a weak secret.
+        assert!(text.contains(&lineage.to_string()));
     }
 
     #[test]
     fn merging_keeps_independent_sources_and_highest_version() {
-        let id = SecretId::from_name("api").unwrap();
-        let one = Secret {
-            id: id.clone(),
-            name: "api".into(),
-            version: 1,
-            created_at: 1,
-            updated_at: 1,
-            sources: vec![source(1)],
-        };
-        let mut other_source = source(2);
-        other_source.device_id = "other-public-key".into();
-        other_source.device = "desktop".into();
-        let two = Secret {
-            id,
-            name: "api".into(),
-            version: 2,
-            created_at: 1,
-            updated_at: 2,
-            sources: vec![other_source],
-        };
+        let lineage = ValueRevision::mint();
+        let next = ValueRevision::mint();
+        let one = secret(1, vec![source("laptop", 1, &lineage)]);
+        let two = secret(2, vec![holding("desktop", 2, &lineage, &next)]);
         let merged = merge([one, two]);
         assert_eq!(merged[0].version, 2);
         assert_eq!(merged[0].sources.len(), 2);
+        // One source simply has not caught up with a rotation yet, which is
+        // not divergence.
+        assert!(merged[0].conflict().is_none());
     }
 
     #[test]
     fn orbit_metadata_keeps_remote_sources_across_restart() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("secrets.json");
-        let id = SecretId::from_name("api").unwrap();
-        let mut remote = source(4);
-        remote.device_id = "remote-public-key".into();
-        remote.device = "desktop".into();
+        let lineage = ValueRevision::mint();
+        let current = ValueRevision::mint();
         {
-            let plane = SecretPlane::new(
-                "device-public-key".into(),
-                path.clone(),
-                Box::new(MemoryStore::default()),
-            )
-            .unwrap();
+            let plane = local_plane(&path, "laptop", MemoryStore::default());
             plane
-                .sync(Secret {
-                    id,
-                    name: "api".into(),
-                    version: 4,
-                    created_at: 1,
-                    updated_at: 4,
-                    sources: vec![source(4), remote],
-                })
+                .sync(secret(
+                    4,
+                    vec![
+                        holding("laptop", 4, &lineage, &current),
+                        holding("desktop", 4, &lineage, &current),
+                    ],
+                ))
                 .unwrap();
         }
-        let restarted = SecretPlane::new(
-            "device-public-key".into(),
-            path,
-            Box::new(MemoryStore::default()),
-        )
-        .unwrap();
+        let restarted = local_plane(&path, "laptop", MemoryStore::default());
         assert_eq!(restarted.list()[0].sources.len(), 2);
         assert_eq!(restarted.list()[0].version, 4);
+        assert!(restarted.list()[0].conflict().is_none());
     }
 
     #[test]
     fn source_resolution_is_version_pinned_across_rotation() {
         let dir = tempfile::tempdir().unwrap();
-        let plane = SecretPlane::new(
-            "device-public-key".into(),
-            dir.path().join("secrets.json"),
-            Box::new(MemoryStore::default()),
-        )
-        .unwrap();
-        let id = SecretId::from_name("api").unwrap();
+        let lineage = ValueRevision::mint();
+        let plane = local_plane(
+            &dir.path().join("secrets.json"),
+            "laptop",
+            MemoryStore::default(),
+        );
         plane
             .put(
-                Secret {
-                    id: id.clone(),
-                    name: "api".into(),
-                    version: 1,
-                    created_at: 1,
-                    updated_at: 1,
-                    sources: vec![source(1)],
-                },
-                &SecretValue::new(b"old".to_vec()),
+                secret(1, vec![source("laptop", 1, &lineage)]),
+                &value(b"old"),
             )
             .unwrap();
-        let stale = Handle {
-            secret_id: id.clone(),
-            source: source(1),
-            version: 1,
-        };
-        plane
-            .rotate(&id, 2, 2, &SecretValue::new(b"new".to_vec()))
-            .unwrap();
+        let stale = plane.list()[0].handle("laptop").unwrap();
+        let next = ValueRevision::mint();
+        plane.rotate(&id(), 2, 2, &next, &value(b"new")).unwrap();
         assert!(plane
             .resolve(&stale)
             .unwrap_err()
             .to_string()
             .contains("rotated"));
-        let fresh = Handle {
-            secret_id: id,
-            source: source(2),
-            version: 2,
-        };
+        let fresh = plane.list()[0].handle("laptop").unwrap();
+        assert_eq!(fresh.source.revision, next);
         assert_eq!(plane.resolve(&fresh).unwrap().as_bytes(), b"new");
+    }
+
+    #[test]
+    fn a_partitioned_create_of_one_name_survives_the_merge_as_a_conflict() {
+        // Two devices, cut off from each other, each ran `ast secret create
+        // api` with a value of its own.  Both landed on the same name-derived
+        // id and both called it version 1.  Before revisions this merged into
+        // one secret with two sources that a consumer could pick between, and
+        // it got whichever value it happened to select.
+        let here = ValueRevision::mint();
+        let there = ValueRevision::mint();
+        let merged = merge([
+            secret(1, vec![source("laptop", 1, &here)]),
+            secret(1, vec![source("desktop", 1, &there)]),
+        ]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].sources.len(), 2, "neither value may be dropped");
+        match merged[0].conflict() {
+            Some(SecretConflict::Origin { origins }) => assert_eq!(origins.len(), 2),
+            other => panic!("expected an origin conflict, got {other:?}"),
+        }
+        assert!(merged[0].handle("laptop").is_err());
+        assert!(merged[0].handle("desktop").is_err());
+    }
+
+    #[test]
+    fn sources_that_diverged_at_one_version_do_not_merge_as_interchangeable() {
+        // One lineage, rotated on both sides of a partition.  The origins
+        // agree, so only the per-version revision separates the two values.
+        let lineage = ValueRevision::mint();
+        let merged = merge([
+            secret(
+                2,
+                vec![holding("laptop", 2, &lineage, &ValueRevision::mint())],
+            ),
+            secret(
+                2,
+                vec![holding("desktop", 2, &lineage, &ValueRevision::mint())],
+            ),
+        ]);
+        match merged[0].conflict() {
+            Some(SecretConflict::Revision { version, revisions }) => {
+                assert_eq!(version, 2);
+                assert_eq!(revisions.len(), 2);
+            }
+            other => panic!("expected a revision conflict, got {other:?}"),
+        }
+        assert!(merged[0].handle("laptop").is_err());
+    }
+
+    #[test]
+    fn one_device_claiming_two_values_at_one_version_keeps_both_records() {
+        // A device cannot legitimately reach this, so a peer reporting it is
+        // either confused or lying.  Collapsing the two records by device
+        // would decide which of the two claims to believe; keeping them lets
+        // the conflict be reported instead.
+        let lineage = ValueRevision::mint();
+        let merged = merge([
+            secret(
+                1,
+                vec![holding("laptop", 1, &lineage, &ValueRevision::mint())],
+            ),
+            secret(
+                1,
+                vec![holding("laptop", 1, &lineage, &ValueRevision::mint())],
+            ),
+        ]);
+        assert_eq!(merged[0].sources.len(), 2);
+        assert!(matches!(
+            merged[0].conflict(),
+            Some(SecretConflict::Revision { .. })
+        ));
+    }
+
+    #[test]
+    fn a_conflict_outlives_a_restart_and_refuses_every_ambiguous_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.json");
+        let here = ValueRevision::mint();
+        let there = ValueRevision::mint();
+        {
+            let plane = local_plane(&path, "laptop", MemoryStore::default());
+            plane
+                .put(secret(1, vec![source("laptop", 1, &here)]), &value(b"mine"))
+                .unwrap();
+            // The partition heals and the other side's metadata arrives.  A
+            // sync records the conflict; refusing the frame would only hide it.
+            plane
+                .sync(secret(1, vec![source("desktop", 1, &there)]))
+                .unwrap();
+        }
+
+        let restarted = local_plane(&path, "laptop", MemoryStore::default());
+        let held = restarted.list().remove(0);
+        assert!(matches!(
+            held.conflict(),
+            Some(SecretConflict::Origin { .. })
+        ));
+
+        // Rotating would hand every source one value and quietly destroy the
+        // other, so it is refused until a human resolves the name.
+        let refused = restarted
+            .rotate(&id(), 2, 2, &ValueRevision::mint(), &value(b"either"))
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("conflict"), "{refused}");
+
+        // A handle cannot be obtained for an ambiguous secret, and one built
+        // by hand from the pre-partition view does not get around that.
+        assert!(held.handle("laptop").is_err());
+        let forged = Handle {
+            secret_id: id(),
+            source: source("laptop", 1, &here),
+            version: 1,
+        };
+        assert!(restarted
+            .resolve(&forged)
+            .unwrap_err()
+            .to_string()
+            .contains("conflict"));
+    }
+
+    #[test]
+    fn a_source_refuses_material_offered_under_a_foreign_lineage() {
+        // The partitioned create seen from the joining device: it already
+        // knows this name as another value, so the bytes on offer are not a
+        // copy of anything, whatever the version says.
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::default();
+        let plane = local_plane(&dir.path().join("secrets.json"), "desktop", store.clone());
+        let here = ValueRevision::mint();
+        let there = ValueRevision::mint();
+        plane
+            .sync(secret(1, vec![source("laptop", 1, &here)]))
+            .unwrap();
+        let refused = plane
+            .put(
+                secret(1, vec![source("desktop", 1, &there)]),
+                &value(b"a different value"),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("different value"), "{refused}");
+        assert!(
+            store.0.lock().unwrap().is_empty(),
+            "material must not be stored by a refused put"
+        );
+    }
+
+    #[test]
+    fn copying_one_revision_to_a_second_source_keeps_both_usable() {
+        // The valid way to widen a source set: the bytes travel on the
+        // authenticated source path together with the lineage and revision
+        // they belong to, so the second device becomes interchangeable with
+        // the first instead of merely claiming the same version.
+        let dir = tempfile::tempdir().unwrap();
+        let lineage = ValueRevision::mint();
+        let holder = local_plane(
+            &dir.path().join("laptop.json"),
+            "laptop",
+            MemoryStore::default(),
+        );
+        holder
+            .put(
+                secret(1, vec![source("laptop", 1, &lineage)]),
+                &value(b"token"),
+            )
+            .unwrap();
+
+        let joining = local_plane(
+            &dir.path().join("desktop.json"),
+            "desktop",
+            MemoryStore::default(),
+        );
+        joining
+            .put(
+                secret(
+                    1,
+                    vec![
+                        source("laptop", 1, &lineage),
+                        source("desktop", 1, &lineage),
+                    ],
+                ),
+                &value(b"token"),
+            )
+            .unwrap();
+
+        let merged = merge([holder.list(), joining.list()].concat());
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].sources.len(), 2);
+        assert!(merged[0].conflict().is_none());
+        assert!(merged[0].handle("laptop").is_ok());
+        let handle = merged[0].handle("desktop").unwrap();
+        assert_eq!(handle.source.revision, lineage);
+        assert_eq!(joining.resolve(&handle).unwrap().as_bytes(), b"token");
+    }
+
+    #[test]
+    fn one_rotation_reaches_every_source_as_the_same_revision() {
+        // The counterpart of the divergence test: a rotation that the orbit
+        // drove from one mint leaves the sources agreeing, so the conflict
+        // check must stay quiet or it would fire on every ordinary rotation.
+        let dir = tempfile::tempdir().unwrap();
+        let lineage = ValueRevision::mint();
+        let both = secret(
+            1,
+            vec![
+                source("laptop", 1, &lineage),
+                source("desktop", 1, &lineage),
+            ],
+        );
+        let laptop = local_plane(
+            &dir.path().join("laptop.json"),
+            "laptop",
+            MemoryStore::default(),
+        );
+        let desktop = local_plane(
+            &dir.path().join("desktop.json"),
+            "desktop",
+            MemoryStore::default(),
+        );
+        laptop.put(both.clone(), &value(b"one")).unwrap();
+        desktop.put(both, &value(b"one")).unwrap();
+
+        let next = ValueRevision::mint();
+        laptop.rotate(&id(), 2, 2, &next, &value(b"two")).unwrap();
+        desktop.rotate(&id(), 2, 2, &next, &value(b"two")).unwrap();
+
+        let merged = merge([laptop.list(), desktop.list()].concat());
+        assert_eq!(merged[0].version, 2);
+        assert_eq!(merged[0].sources.len(), 2);
+        assert!(merged[0].conflict().is_none());
+        assert_eq!(merged[0].handle("laptop").unwrap().source.revision, next);
+
+        // Replaying a revision would tell the other sources they still hold
+        // bytes that have since been replaced.
+        assert!(laptop.rotate(&id(), 3, 3, &next, &value(b"three")).is_err());
     }
 
     #[test]

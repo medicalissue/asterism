@@ -9,10 +9,28 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 hostname.workspace = true
+# Bodies crossing the mesh are base64 in the frame rather than a JSON array
+# of numbers, which is a 4x expansion against a transport with a hard frame
+# cap. Already in the tree behind asterism-mesh.
+data-encoding = "2"
+# The canonical HTTP types. The secrets policy engine reads and writes real
+# headers, and `http::HeaderMap` is the type every maintained Rust HTTP
+# component in this tree already speaks — including its `set_sensitive` flag,
+# which is the mechanism that keeps a credential out of a Debug line.
+http = "1"
+# The cow seam: clonefile(2) on macOS, ioctl(FICLONE) on Linux, and
+# SEEK_DATA/SEEK_HOLE, whose two values are swapped between the two. One
+# crate that computes all of it per-architecture beats constants written
+# down here that would only be right on some architectures.
+libc = "0.2"
 serde.workspace = true
 serde_json.workspace = true
 tar.workspace = true
 uuid.workspace = true
+# Secret material passes through this crate's types on its way to and from a
+# platform store; wiping the buffer on drop is cheap and the crate is already
+# in the tree behind rustls.
+zeroize = "1"
 
 [dev-dependencies]
 tempfile = "3"

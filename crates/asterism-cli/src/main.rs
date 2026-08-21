@@ -217,7 +217,7 @@ enum Command {
         /// OCI/Docker reference.
         image: String,
     },
-    /// Attach a volume to an instance.
+    /// Attach a part to an instance: a volume, or a secret.
     ///
     /// Two kinds of volume, and they reach the guest differently.
     ///
@@ -236,36 +236,77 @@ enum Command {
     /// `mkfs.ext4 /dev/vdb`, then mount it. It can come from any device in
     /// the orbit. One instance may hold it at a time; attaching takes that
     /// lease.
+    ///
+    /// A SECRET (`--secret anthropic --to api.anthropic.com`, made with `ast
+    /// secret create`) is a part like the others, and it is sourced from a
+    /// device like the others — but the part that reaches the guest is not
+    /// the value. The guest is given an opaque handle, in `$ANTHROPIC_API_KEY`
+    /// by default; the daemon routes that one host through a proxy on this
+    /// device and swaps the handle for the real value on the source device,
+    /// on its way out. The value never enters the guest, the seed, the
+    /// registry or this device's disk.
     Attach {
         /// The instance to attach it to.
         name: String,
         /// A directory path, or `<device>:<volume>` for a block volume.
-        #[arg(long)]
-        volume: String,
+        #[arg(long, conflicts_with = "secret")]
+        volume: Option<String>,
         /// Device that provides the volume (default: this device).
-        #[arg(long)]
+        #[arg(long, requires = "volume")]
         host: Option<String>,
         /// Where a directory volume mounts in the guest (default:
         /// /mnt/ast/<name>). Meaningless for a block volume: the guest
         /// decides where its own disks go.
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", requires = "volume")]
         at: Option<String>,
+        /// An orbit secret to bind, by the name `ast secret ls` shows.
+        #[arg(long, value_name = "NAME")]
+        secret: Option<String>,
+        /// The one authority the secret may be used against: `host`, or
+        /// `host:port`. Required with --secret, and deliberately not spelled
+        /// `--host`, which on this command already means the device a volume
+        /// comes from.
+        #[arg(long, value_name = "AUTHORITY", requires = "secret")]
+        to: Option<String>,
+        /// Where the credential rides on a request: `bearer`, `x-api-key`,
+        /// or `header:<Name>`. Defaults to whatever that authority's own
+        /// clients use.
+        #[arg(long = "as", value_name = "PLACEMENT", requires = "secret")]
+        placement: Option<String>,
+        /// The environment variable the guest finds its handle in. Defaults
+        /// to the secret's name, shouted.
+        #[arg(long, value_name = "VAR", requires = "secret")]
+        env: Option<String>,
+        /// Which device's store resolves the value, if the secret has more
+        /// than one source. Not `--host`, for the same reason as `--to`.
+        #[arg(long, value_name = "DEVICE", requires = "secret")]
+        from: Option<String>,
     },
-    /// Take a volume off a stopped instance.
+    /// Take a volume or a secret off an instance.
     ///
-    /// A block volume's lease goes back to the device that holds the bytes,
-    /// so something else may take it. Nothing on the volume is deleted.
-    /// Refused while the guest is running: neither backend can pull a disk
-    /// out from under a live guest, so that would be a yanked cable.
+    /// A VOLUME comes off a stopped instance only. Its lease goes back to the
+    /// device that holds the bytes, so something else may take it, and
+    /// nothing on it is deleted. Refused while the guest is running: neither
+    /// backend can pull a disk out from under a live guest, so that would be
+    /// a yanked cable.
+    ///
+    /// A SECRET comes off at any time, and comes off a running guest on
+    /// purpose — that is what revoking one means. The handle stops being
+    /// honoured at once, including on a connection the guest already has
+    /// open; the guest keeps a string in its environment that now buys
+    /// nothing, until its next boot reissues the seed without it.
     Detach {
         /// The instance to take it off.
         name: String,
         /// The directory path, or `<device>:<volume>` for a block volume.
-        #[arg(long)]
-        volume: String,
+        #[arg(long, conflicts_with = "secret")]
+        volume: Option<String>,
         /// The device it came from, if the name alone is ambiguous.
-        #[arg(long)]
+        #[arg(long, requires = "volume")]
         host: Option<String>,
+        /// The secret to revoke, by its orbit name.
+        #[arg(long, value_name = "NAME")]
+        secret: Option<String>,
     },
     /// Change one of an instance's parts.
     ///
@@ -497,32 +538,55 @@ fn main() -> Result<()> {
         // because the user already said which they meant by how they wrote
         // it — and because a directory on another device has always had to be
         // an absolute path, so there is nothing ambiguous left over.
-        Command::Attach { name, volume, host, at } => match block_ref(&volume, host.as_deref()) {
-            Some((device, volume)) => {
-                if at.is_some() {
-                    bail!(
-                        "--at is for directory volumes; a block volume arrives as a disk \
-                         and the guest mounts it wherever it likes"
-                    );
+        Command::Attach { name, volume, host, at, secret, to, placement, env, from } => {
+            match attaching(volume, secret)? {
+                Attaching::Secret(secret) => Request::AttachSecret {
+                    name,
+                    secret,
+                    authority: to.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "a secret is bound to one authority — say which with --to, \
+                             e.g. --to api.anthropic.com"
+                        )
+                    })?,
+                    placement: placement
+                        .as_deref()
+                        .map(asterism_core::secret::Placement::parse)
+                        .transpose()?,
+                    env,
+                    source_device: from,
+                },
+                Attaching::Volume(volume) => match block_ref(&volume, host.as_deref()) {
+                    Some((device, volume)) => {
+                        if at.is_some() {
+                            bail!(
+                                "--at is for directory volumes; a block volume arrives as a \
+                                 disk and the guest mounts it wherever it likes"
+                            );
+                        }
+                        warn_if_far(&device);
+                        Request::AttachBlock { name, volume, device }
+                    }
+                    None => Request::AttachVolume {
+                        name,
+                        path: volume_path(&volume, host.as_deref())?,
+                        host,
+                        mount_point: at,
+                    },
+                },
+            }
+        }
+        Command::Detach { name, volume, host, secret } => match attaching(volume, secret)? {
+            Attaching::Secret(secret) => Request::DetachSecret { name, secret },
+            Attaching::Volume(volume) => match block_ref(&volume, host.as_deref()) {
+                Some((device, volume)) => {
+                    Request::Detach { name, volume, host: Some(device) }
                 }
-                warn_if_far(&device);
-                Request::AttachBlock { name, volume, device }
-            }
-            None => Request::AttachVolume {
-                name,
-                path: volume_path(&volume, host.as_deref())?,
-                host,
-                mount_point: at,
-            },
-        },
-        Command::Detach { name, volume, host } => match block_ref(&volume, host.as_deref()) {
-            Some((device, volume)) => {
-                Request::Detach { name, volume, host: Some(device) }
-            }
-            None => Request::Detach {
-                name,
-                volume: volume_path(&volume, host.as_deref())?,
-                host,
+                None => Request::Detach {
+                    name,
+                    volume: volume_path(&volume, host.as_deref())?,
+                    host,
+                },
             },
         },
         // A move reports as it goes — a preflight, a fence, a disk crossing a
@@ -628,6 +692,15 @@ fn main() -> Result<()> {
             Request::AttachVolume { .. } | Request::AttachBlock { .. } => {
                 print_attached(&instance)
             }
+            Request::AttachSecret { ref secret, .. } => print_bound(&instance, secret),
+            Request::DetachSecret { ref secret, .. } => {
+                println!("{}  {secret} revoked", instance.name);
+                println!(
+                    "the handle the guest holds is no longer honoured; it disappears from \
+                     the guest on the next boot: ast down {0} && ast up {0}",
+                    instance.name
+                );
+            }
             Request::Detach { volume, .. } => {
                 println!("{}  {volume} detached", instance.name)
             }
@@ -670,8 +743,10 @@ fn main() -> Result<()> {
         // A lease is granted daemon-to-daemon, on the way to an attach or a
         // boot. Nobody types a request that gets one back.
         | Response::VolumeLease { .. } => bail!("unexpected reply from astd: {request:?}"),
-        // Secret commands return from `secret_command`.
-        Response::Secrets { .. } => {
+        // Secret commands return from `secret_command`; an egress reply is
+        // daemon-to-daemon, on the inside of a proxied request, and nothing
+        // the CLI can ask for.
+        Response::Secrets { .. } | Response::Egress { .. } => {
             bail!("unexpected reply from astd: {request:?}")
         }
         Response::Error { message } => bail!(message),
@@ -1942,6 +2017,66 @@ fn local_disk(inst: &Instance) -> Option<String> {
         cow::human(used),
         inst.shape.disk_gib
     ))
+}
+
+/// Which part `ast attach` was asked for.
+///
+/// One flag each, and exactly one of them, checked here rather than left to
+/// clap so the refusal can say what the command is *for*. A volume and a
+/// secret are both parts an instance is assembled from, but they are not two
+/// settings of one flag: they arrive by different mechanisms, are sourced
+/// from devices for different reasons, and a command that took both would
+/// have to invent an order between them.
+enum Attaching {
+    Volume(String),
+    Secret(String),
+}
+
+fn attaching(volume: Option<String>, secret: Option<String>) -> Result<Attaching> {
+    match (volume, secret) {
+        (Some(volume), None) => Ok(Attaching::Volume(volume)),
+        (None, Some(secret)) => Ok(Attaching::Secret(secret)),
+        // clap refuses this one first; the arm exists so that adding a third
+        // part later cannot make it fall through to "say which".
+        (Some(_), Some(_)) => bail!(
+            "--volume and --secret are two different parts — attach them one command at a time"
+        ),
+        (None, None) => bail!(
+            "say which part: --volume /tank/media, --volume desktop:tank, or \
+             --secret anthropic --to api.anthropic.com"
+        ),
+    }
+}
+
+/// Report on the secret that was just bound — the one at the end.
+///
+/// The handle is printed in full and on purpose. It is what the guest holds,
+/// it is worth nothing outside this instance's proxy, and a user who cannot
+/// see it cannot check that the thing in `$ANTHROPIC_API_KEY` is the thing
+/// this device will honour. The value is not printed because this process
+/// never had it.
+fn print_bound(inst: &Instance, secret: &str) {
+    let Some(binding) = inst.secrets.iter().find(|b| b.secret == secret) else {
+        return;
+    };
+    println!(
+        "{}  {secret} -> {}  ({}, from {})",
+        inst.name, binding.authority, binding.placement, binding.source_device
+    );
+    println!(
+        "the guest gets ${}={} — an opaque handle, honoured only by this instance's \
+         proxy and only for {}. The value stays on {}.",
+        binding.env,
+        binding.guest_handle.as_str(),
+        binding.authority,
+        binding.source_device
+    );
+    if inst.status == asterism_core::instance::Status::Running {
+        println!(
+            "reaches the guest on the next boot: ast down {0} && ast up {0}",
+            inst.name
+        );
+    }
 }
 
 /// Report on the volume that was just attached — the one at the end.

@@ -106,7 +106,9 @@ pub fn broadcast(mac: &str, expect_lan: Option<&str>) -> Result<Vec<String>> {
                 "this device is on {id}, not {expected} — it has moved networks since \
                  you last heard from it, so its broadcast would not reach that LAN"
             ),
-            None => bail!("this device cannot tell which network it is on, so it will not broadcast"),
+            None => {
+                bail!("this device cannot tell which network it is on, so it will not broadcast")
+            }
         }
     }
 
@@ -125,7 +127,9 @@ pub fn broadcast(mac: &str, expect_lan: Option<&str>) -> Result<Vec<String>> {
         }
     }
     if sent.is_empty() {
-        let why = last.map(|e| e.to_string()).unwrap_or_else(|| "no broadcast address".into());
+        let why = last
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "no broadcast address".into());
         bail!("could not broadcast a magic packet: {why}");
     }
     Ok(sent)
@@ -151,15 +155,32 @@ pub fn broadcast(mac: &str, expect_lan: Option<&str>) -> Result<Vec<String>> {
 /// 192.168.50.109 as the source, the en0 routes are the ones that match, and
 /// both frames leave by the wire.
 ///
-/// The wildcard is kept as the fallback for a device that could not read its
-/// own address, because a socket that is merely unpinned still works
-/// everywhere there is no tunnel to be confused by.
+/// The wildcard is for exactly one case: a device that could not read its own
+/// address at all, where an unpinned socket is still right everywhere there
+/// is no tunnel to be confused by.
+///
+/// It is emphatically *not* a fallback for a pin that failed. An address is
+/// only ever passed in here because it is the wire the packet has to leave
+/// by; quietly binding 0.0.0.0 instead would put the frame back in the tunnel
+/// and then report the send as a success, which is the silent failure this
+/// module exists to refuse. So a chosen address that cannot be bound is an
+/// error, and it names the address, because "the interface went down between
+/// the look and the bind" is the thing that actually happened and the thing
+/// the user needs to be told.
 fn broadcast_socket(source: Option<Ipv4Addr>) -> Result<UdpSocket> {
-    let socket = match source.and_then(|source| UdpSocket::bind((source, 0)).ok()) {
-        Some(socket) => socket,
+    let socket = match source {
+        Some(source) => UdpSocket::bind((source, 0)).with_context(|| {
+            format!(
+                "binding a udp socket to {source}, this device's own address on the \
+                 LAN the packet has to leave by — it was there a moment ago, so the \
+                 interface has most likely just gone down or changed address"
+            )
+        })?,
         None => UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).context("binding a udp socket")?,
     };
-    socket.set_broadcast(true).context("asking for broadcast on a udp socket")?;
+    socket
+        .set_broadcast(true)
+        .context("asking for broadcast on a udp socket")?;
     Ok(socket)
 }
 
@@ -292,8 +313,11 @@ struct Inet {
 /// should print rather than paper over with a route that looks like one.
 fn lan_route() -> (Option<Interface>, Vec<String>) {
     let routes = default_routes();
-    let mut skipped: Vec<String> =
-        routes.iter().filter(|r| r.tunnel).map(|r| r.name.clone()).collect();
+    let mut skipped: Vec<String> = routes
+        .iter()
+        .filter(|r| r.tunnel)
+        .map(|r| r.name.clone())
+        .collect();
 
     for mut iface in routes.into_iter().filter(|r| !r.tunnel) {
         iface.mac = iface_mac(&iface.name);
@@ -330,7 +354,10 @@ fn interface() -> Option<Interface> {
 /// be read at all is kept, because `ifconfig` failing to answer is not a
 /// reason to decide a device has no LAN.
 fn carries_broadcast(iface: &Interface) -> bool {
-    !iface.point_to_point && iface.netmask.is_none_or(|m| u32::from(m).count_ones() <= 30)
+    !iface.point_to_point
+        && iface
+            .netmask
+            .is_none_or(|m| u32::from(m).count_ones() <= 30)
 }
 
 /// Interface-name prefixes that are never a broadcast LAN, whatever priority
@@ -349,12 +376,26 @@ fn carries_broadcast(iface: &Interface) -> bool {
 /// `wlp*`, `eno*`, `br*`, `bond*`. The risk of matching is a false positive
 /// that nobody has; the risk of not matching is every wake failing silently.
 const TUNNEL_PREFIXES: &[&str] = &[
-    "utun", "tun", "tap", "ipsec", "ppp", "wg", "gpd", "nordlynx", "proton", "tailscale", "zt",
-    "ham", "awdl", "llw",
+    "utun",
+    "tun",
+    "tap",
+    "ipsec",
+    "ppp",
+    "wg",
+    "gpd",
+    "nordlynx",
+    "proton",
+    "tailscale",
+    "zt",
+    "ham",
+    "awdl",
+    "llw",
 ];
 
 fn is_tunnel_iface(name: &str) -> bool {
-    TUNNEL_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+    TUNNEL_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
 // ---- platform probes -------------------------------------------------------
@@ -420,7 +461,9 @@ fn netstat_defaults(listing: &str) -> Vec<Interface> {
         if f.get(flags_col).is_some_and(|flags| !flags.contains('U')) {
             continue;
         }
-        let Some(name) = f.get(netif_col).filter(|n| n.starts_with(|c: char| c.is_ascii_alphabetic()))
+        let Some(name) = f
+            .get(netif_col)
+            .filter(|n| n.starts_with(|c: char| c.is_ascii_alphabetic()))
         else {
             continue;
         };
@@ -513,12 +556,18 @@ fn proc_net_route_defaults(table: &str) -> Vec<Interface> {
         if f.len() < 8 || f[1] != "00000000" || f[7] != "00000000" {
             continue;
         }
-        let Ok(flags) = u32::from_str_radix(f[3], 16) else { continue };
+        let Ok(flags) = u32::from_str_radix(f[3], 16) else {
+            continue;
+        };
         if flags & RTF_UP == 0 {
             continue;
         }
         let gateway = (flags & RTF_GATEWAY != 0)
-            .then(|| u32::from_str_radix(f[2], 16).ok().map(|gw| Ipv4Addr::from(gw.to_be())))
+            .then(|| {
+                u32::from_str_radix(f[2], 16)
+                    .ok()
+                    .map(|gw| Ipv4Addr::from(gw.to_be()))
+            })
             .flatten()
             .filter(|gw| !gw.is_unspecified());
         let iface = Interface {
@@ -621,13 +670,22 @@ fn ip_addr_inet(out: &str) -> Option<Inet> {
         None => (*f.get(i + 1)?, 32u32),
     };
     let addr: Ipv4Addr = addr.parse().ok()?;
-    let netmask = Ipv4Addr::from(if prefix == 0 { 0 } else { u32::MAX << (32 - prefix.min(32)) });
+    let netmask = Ipv4Addr::from(if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix.min(32))
+    });
     let broadcast = f[i..]
         .iter()
         .position(|w| *w == "brd")
         .and_then(|b| f.get(i + b + 1))
         .and_then(|b| b.parse().ok());
-    Some(Inet { addr, netmask, broadcast, point_to_point })
+    Some(Inet {
+        addr,
+        netmask,
+        broadcast,
+        point_to_point,
+    })
 }
 
 /// The gateway's MAC, from whatever the platform calls its ARP cache.
@@ -693,7 +751,9 @@ fn run(program: &str, args: &[&str]) -> Option<String> {
         }
     };
     let out = reader.join().ok()?;
-    status.success().then(|| String::from_utf8_lossy(&out).into_owned())
+    status
+        .success()
+        .then(|| String::from_utf8_lossy(&out).into_owned())
 }
 
 // ---- ast device check ------------------------------------------------------
@@ -711,25 +771,27 @@ pub fn check() -> Vec<CheckRow> {
     let mut rows = platform_rows(net.as_ref());
 
     let facts = facts_from(net.as_ref());
-    rows.push(match (&facts.mac, net.as_ref().and_then(|n| n.mac.as_ref())) {
-        (Some(mac), _) if is_locally_administered(mac) => row(
-            "mac address",
-            Verdict::Warn,
-            format!(
-                "{mac} is a private (locally administered) address — the platform \
+    rows.push(
+        match (&facts.mac, net.as_ref().and_then(|n| n.mac.as_ref())) {
+            (Some(mac), _) if is_locally_administered(mac) => row(
+                "mac address",
+                Verdict::Warn,
+                format!(
+                    "{mac} is a private (locally administered) address — the platform \
                  made it up per network, so a peer that recorded it on one LAN will \
                  not match it on another"
+                ),
             ),
-        ),
-        (Some(mac), _) => row("mac address", Verdict::Ok, mac.clone()),
-        (None, _) => row(
-            "mac address",
-            Verdict::Unknown,
-            "no address found for the default-route interface — nothing can be \
+            (Some(mac), _) => row("mac address", Verdict::Ok, mac.clone()),
+            (None, _) => row(
+                "mac address",
+                Verdict::Unknown,
+                "no address found for the default-route interface — nothing can be \
              addressed to this device"
-                .into(),
-        ),
-    });
+                    .into(),
+            ),
+        },
+    );
 
     rows.push(match facts.lan_id.as_deref() {
         Some(id) if id.starts_with("net-") => row(
@@ -812,9 +874,11 @@ pub fn check() -> Vec<CheckRow> {
 #[cfg(target_os = "macos")]
 fn platform_rows(net: Option<&Interface>) -> Vec<CheckRow> {
     let pmset = run("pmset", &["-g"]).unwrap_or_default();
-    let womp = pmset
-        .lines()
-        .find_map(|l| l.split_whitespace().nth(1).filter(|_| l.trim().starts_with("womp ")));
+    let womp = pmset.lines().find_map(|l| {
+        l.split_whitespace()
+            .nth(1)
+            .filter(|_| l.trim().starts_with("womp "))
+    });
 
     let mut rows = vec![match womp {
         Some("1") => row("wake on magic packet", Verdict::Ok, "pmset womp = 1".into()),
@@ -823,7 +887,11 @@ fn platform_rows(net: Option<&Interface>) -> Vec<CheckRow> {
             Verdict::No,
             "pmset womp = 0 — turn it on with: sudo pmset -a womp 1".into(),
         ),
-        Some(other) => row("wake on magic packet", Verdict::Unknown, format!("pmset womp = {other}")),
+        Some(other) => row(
+            "wake on magic packet",
+            Verdict::Unknown,
+            format!("pmset womp = {other}"),
+        ),
         None => row(
             "wake on magic packet",
             Verdict::Unknown,
@@ -869,7 +937,11 @@ fn platform_rows(net: Option<&Interface>) -> Vec<CheckRow> {
              full stop. Plug it in"
                 .into(),
         ),
-        _ => row("power source", Verdict::Unknown, "pmset could not say".into()),
+        _ => row(
+            "power source",
+            Verdict::Unknown,
+            "pmset could not say".into(),
+        ),
     });
 
     rows.push(row(
@@ -976,14 +1048,16 @@ fn is_locally_administered(mac: &str) -> bool {
 }
 
 fn row(item: &str, verdict: Verdict, detail: String) -> CheckRow {
-    CheckRow { item: item.to_owned(), verdict, detail }
+    CheckRow {
+        item: item.to_owned(),
+        verdict,
+        detail,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-
 
     /// The one thing about a magic packet that is not a matter of taste. A
     /// sleeping NIC does a byte comparison, so this is a byte test.
@@ -997,7 +1071,11 @@ mod tests {
         for (i, chunk) in frame[6..].chunks(6).enumerate() {
             assert_eq!(chunk, &mac, "repeat {i} is not the target's mac");
         }
-        assert_eq!(frame[6..].len() / 6, 16, "sixteen repeats, not fifteen or seventeen");
+        assert_eq!(
+            frame[6..].len() / 6,
+            16,
+            "sixteen repeats, not fifteen or seventeen"
+        );
     }
 
     #[test]
@@ -1030,10 +1108,16 @@ mod tests {
         };
         assert_eq!(iface.subnet().as_deref(), Some("192.168.0.0/24"));
 
-        let moved = Interface { addr: Some(Ipv4Addr::new(192, 168, 0, 77)), ..iface.clone() };
+        let moved = Interface {
+            addr: Some(Ipv4Addr::new(192, 168, 0, 77)),
+            ..iface.clone()
+        };
         assert_eq!(moved.subnet(), iface.subnet());
 
-        let wider = Interface { netmask: Some(Ipv4Addr::new(255, 255, 0, 0)), ..iface };
+        let wider = Interface {
+            netmask: Some(Ipv4Addr::new(255, 255, 0, 0)),
+            ..iface
+        };
         assert_eq!(wider.subnet().as_deref(), Some("192.168.0.0/16"));
         assert_eq!(Interface::default().subnet(), None);
     }
@@ -1055,12 +1139,19 @@ default            192.168.50.1       UGScIg                en0
 192.168.50.1/32    link#14            UCS                   en0
 ";
         let routes = netstat_defaults(listing);
-        assert_eq!(routes.len(), 2, "both defaults, and only the defaults: {routes:?}");
+        assert_eq!(
+            routes.len(),
+            2,
+            "both defaults, and only the defaults: {routes:?}"
+        );
         assert_eq!(routes[0].name, "en0", "the wire is preferred: {routes:?}");
         assert_eq!(routes[0].gateway, Some(Ipv4Addr::new(192, 168, 50, 1)));
         assert!(!routes[0].tunnel);
         assert_eq!(routes[1].name, "utun4");
-        assert!(routes[1].tunnel, "a utun is a tunnel whatever priority it has");
+        assert!(
+            routes[1].tunnel,
+            "a utun is a tunnel whatever priority it has"
+        );
         assert_eq!(routes[1].gateway, None, "`link#25` is not a next hop");
     }
 
@@ -1146,7 +1237,10 @@ default            192.168.50.1       UGScIg                en0
 
         let tunnel = "utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1280\n\tinet6 fe80::7487:a49c:3993:547c%utun4 prefixlen 64 scopeid 0x19\n\tinet 100.121.213.11 --> 100.121.213.11 netmask 0xffffffff\n";
         let inet = ifconfig_inet(tunnel).expect("an address");
-        assert!(inet.point_to_point, "`-->` is one peer, not a broadcast domain");
+        assert!(
+            inet.point_to_point,
+            "`-->` is one peer, not a broadcast domain"
+        );
         assert_eq!(inet.netmask, Ipv4Addr::new(255, 255, 255, 255));
         assert_eq!(inet.broadcast, None);
     }
@@ -1162,33 +1256,57 @@ default            192.168.50.1       UGScIg                en0
         };
         assert!(carries_broadcast(&wire));
 
-        let slash_32 =
-            Interface { netmask: Some(Ipv4Addr::new(255, 255, 255, 255)), ..wire.clone() };
-        assert!(!carries_broadcast(&slash_32), "a /32 has no broadcast address");
+        let slash_32 = Interface {
+            netmask: Some(Ipv4Addr::new(255, 255, 255, 255)),
+            ..wire.clone()
+        };
+        assert!(
+            !carries_broadcast(&slash_32),
+            "a /32 has no broadcast address"
+        );
 
-        let slash_31 =
-            Interface { netmask: Some(Ipv4Addr::new(255, 255, 255, 254)), ..wire.clone() };
-        assert!(!carries_broadcast(&slash_31), "a /31 is a point-to-point link");
+        let slash_31 = Interface {
+            netmask: Some(Ipv4Addr::new(255, 255, 255, 254)),
+            ..wire.clone()
+        };
+        assert!(
+            !carries_broadcast(&slash_31),
+            "a /31 is a point-to-point link"
+        );
 
-        let peered = Interface { point_to_point: true, ..wire.clone() };
+        let peered = Interface {
+            point_to_point: true,
+            ..wire.clone()
+        };
         assert!(!carries_broadcast(&peered), "a peer is not a domain");
 
         // Nothing read is not the same as nothing there: an `ifconfig` that
         // would not answer must not decide a device has no LAN.
-        let unread = Interface { netmask: None, ..wire };
+        let unread = Interface {
+            netmask: None,
+            ..wire
+        };
         assert!(carries_broadcast(&unread));
     }
 
     #[test]
     fn a_tunnel_is_recognised_by_name_and_a_wire_is_not() {
-        for name in
-            ["utun4", "tun0", "tap0", "wg0", "ipsec1", "ppp0", "tailscale0", "ztabc123", "awdl0"]
-        {
+        for name in [
+            "utun4",
+            "tun0",
+            "tap0",
+            "wg0",
+            "ipsec1",
+            "ppp0",
+            "tailscale0",
+            "ztabc123",
+            "awdl0",
+        ] {
             assert!(is_tunnel_iface(name), "{name} is a tunnel");
         }
-        for name in
-            ["en0", "en5", "eth0", "enp3s0", "wlan0", "wlp2s0", "eno1", "bridge0", "br0", "bond0"]
-        {
+        for name in [
+            "en0", "en5", "eth0", "enp3s0", "wlan0", "wlp2s0", "eno1", "bridge0", "br0", "bond0",
+        ] {
             assert!(!is_tunnel_iface(name), "{name} is a wire");
         }
     }
@@ -1207,8 +1325,15 @@ eth0\t00000000\t0132A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
 eth0\t0032A8C0\t00000000\t0001\t0\t0\t100\t00FFFFFF\t0\t0\t0
 ";
         let routes = proc_net_route_defaults(table);
-        assert_eq!(routes.len(), 2, "the on-link route is not a default: {routes:?}");
-        assert_eq!(routes[0].name, "eth0", "the tunnel is listed first and still loses");
+        assert_eq!(
+            routes.len(),
+            2,
+            "the on-link route is not a default: {routes:?}"
+        );
+        assert_eq!(
+            routes[0].name, "eth0",
+            "the tunnel is listed first and still loses"
+        );
         assert_eq!(routes[0].gateway, Some(Ipv4Addr::new(192, 168, 50, 1)));
         assert!(routes[1].tunnel);
     }
@@ -1242,8 +1367,15 @@ eth0\t00000000\t0132A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
 ";
         let routes = proc_net_route_defaults(table);
         let names: Vec<&str> = routes.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, ["eth0", "eth1"], "junk is unparseable and down0 is not up");
-        assert_eq!(routes[1].gateway, None, "`default dev eth1` has no next hop");
+        assert_eq!(
+            names,
+            ["eth0", "eth1"],
+            "junk is unparseable and down0 is not up"
+        );
+        assert_eq!(
+            routes[1].gateway, None,
+            "`default dev eth1` has no next hop"
+        );
     }
 
     #[test]
@@ -1263,7 +1395,10 @@ eth0\t00000000\t0132A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
 
         let wireguard = "4: wg0    inet 10.9.0.2/32 scope global wg0\\       valid_lft forever preferred_lft forever";
         let inet = ip_addr_inet(wireguard).expect("an address");
-        assert!(!inet.point_to_point, "no peer field — and a /32 all the same");
+        assert!(
+            !inet.point_to_point,
+            "no peer field — and a /32 all the same"
+        );
         assert_eq!(inet.netmask, Ipv4Addr::new(255, 255, 255, 255));
     }
 
@@ -1282,8 +1417,50 @@ eth0\t00000000\t0132A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         );
         assert_eq!(broadcast_targets(None), [Ipv4Addr::BROADCAST]);
 
-        let odd = Interface { broadcast: Some(Ipv4Addr::BROADCAST), ..Interface::default() };
-        assert_eq!(broadcast_targets(Some(&odd)), [Ipv4Addr::BROADCAST], "not twice");
+        let odd = Interface {
+            broadcast: Some(Ipv4Addr::BROADCAST),
+            ..Interface::default()
+        };
+        assert_eq!(
+            broadcast_targets(Some(&odd)),
+            [Ipv4Addr::BROADCAST],
+            "not twice"
+        );
+    }
+
+    /// An address reaches [`broadcast_socket`] only because it is the wire the
+    /// packet has to leave by, so a pin that cannot be bound has to be heard
+    /// about. Falling back to the wildcard would put the frame back in the
+    /// tunnel and then report a successful broadcast — the silent failure the
+    /// interface is chosen to avoid in the first place.
+    #[test]
+    fn a_pin_that_cannot_be_bound_is_an_error_rather_than_a_wildcard() {
+        // TEST-NET-1: reserved for documentation, and therefore an address no
+        // host is holding, so the bind fails the same way everywhere.
+        let unheld = Ipv4Addr::new(192, 0, 2, 1);
+        let err = broadcast_socket(Some(unheld)).unwrap_err();
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("192.0.2.1"),
+            "the error has to name the address: {err}"
+        );
+
+        // A pin that *can* be bound is the socket that comes back — the point
+        // of the error above is the pin, not a refusal to bind at all.
+        let pinned = broadcast_socket(Some(Ipv4Addr::LOCALHOST)).expect("a pinned socket");
+        assert_eq!(pinned.local_addr().unwrap().ip(), Ipv4Addr::LOCALHOST);
+    }
+
+    /// The wildcard still belongs to the one case it is for: a device that
+    /// never had an address to pin to.
+    #[test]
+    fn a_device_with_no_address_to_pin_to_still_gets_a_socket() {
+        let socket = broadcast_socket(None).expect("a wildcard socket");
+        assert_eq!(socket.local_addr().unwrap().ip(), Ipv4Addr::UNSPECIFIED);
+        assert!(
+            socket.broadcast().unwrap(),
+            "a socket that cannot broadcast is no use here"
+        );
     }
 
     /// A private Wi-Fi address is the quiet way a recorded MAC goes stale, so
@@ -1304,7 +1481,11 @@ eth0\t00000000\t0132A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         assert!(rows.len() >= 4, "{rows:?}");
         for r in &rows {
             assert!(!r.item.is_empty());
-            assert!(!r.detail.is_empty(), "{} has a verdict and no evidence", r.item);
+            assert!(
+                !r.detail.is_empty(),
+                "{} has a verdict and no evidence",
+                r.item
+            );
         }
         assert!(
             rows.iter().any(|r| r.verdict == Verdict::Unknown),
@@ -1335,7 +1516,11 @@ eth0\t00000000\t0132A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0
         std::env::set_var(PORT_ENV, "19999");
 
         let facts = facts();
-        assert_eq!(facts.mac.as_deref(), Some("de:ad:be:ef:00:09"), "normalised, not echoed");
+        assert_eq!(
+            facts.mac.as_deref(),
+            Some("de:ad:be:ef:00:09"),
+            "normalised, not echoed"
+        );
         assert_eq!(facts.lan_id.as_deref(), Some("lan-pretend"));
         assert_eq!(wol_port(), 19999);
 

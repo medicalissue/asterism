@@ -38,17 +38,66 @@ OTHER="vol-e2e-two"   # the second claimant, defined and never booted
 VOL="tank"
 IMAGE="${E2E_IMAGE:-debian:13}"
 
+# ---- the processes this test starts ----------------------------------------
+#
+# Everything started here writes down its own pid inside its own
+# ASTERISM_HOME: astd in $home/astd.pid, each guest's qemu in
+# $home/instances/<name>/qemu.pid, each storage daemon in
+# $home/volumes/<name>/nbd-e<epoch>.pid. Those files are what cleanup acts
+# on, so it can only ever reach a process this run started.
+#
+# The alternative — `pkill -f` on the astd path — reaches every astd built
+# from this tree: the one the developer running this test has open on their
+# own ~/.asterism, and any other e2e in this suite running beside it.
+
+# kill_pid <pid> [signal]: bounded and idempotent. A pid that is already
+# gone is success; one that will not take a hint gets ~5s and then -KILL.
+kill_pid() {
+  local pid="$1" sig="${2:--TERM}" _i
+  case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+  kill -0 "$pid" 2>/dev/null || return 0
+  kill "$sig" "$pid" 2>/dev/null || true
+  for _i in $(seq 1 25); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.2
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+}
+
+# kill_pidfile <path>: whatever a pidfile names, and then the file.
+kill_pidfile() {
+  local f="$1"
+  [ -f "$f" ] || return 0
+  kill_pid "$(cat "$f" 2>/dev/null || true)"
+  rm -f "$f"
+}
+
+# Deliberately no `ast` in here. The socket read in the CLI has no timeout,
+# so `ast down` against a daemon that is wedged blocks this trap forever —
+# and `ast` starts a daemon when the socket does not answer, so a cleanup
+# built out of it can resurrect, and re-boot, the very instances it came to
+# remove. Killing by pid needs no daemon to be well.
 cleanup() {
+  if [ -n "${CLEANED:-}" ]; then return 0; fi
+  CLEANED=1
+  local home f pid
+  # The daemons first: astd is what restarts a guest it notices die, so a
+  # guest killed while its daemon is up can come straight back.
   for home in "$A" "$B"; do
-    [ -d "$home" ] || continue
-    for inst in "$INST" "$OTHER"; do
-      ASTERISM_HOME="$home" "$AST" down "$inst" >/dev/null 2>&1 || true
-      ASTERISM_HOME="$home" "$AST" rm "$inst" >/dev/null 2>&1 || true
+    kill_pidfile "$home/astd.pid"
+  done
+  # Then what they left running. Both outlive astd by design.
+  for home in "$A" "$B"; do
+    for f in "$home"/instances/*/qemu.pid; do kill_pidfile "$f"; done
+    for f in "$home"/volumes/*/nbd-e*.pid; do kill_pidfile "$f"; done
+    # A backend that keeps its guest's pid on the handle rather than in a
+    # pidfile of its own — the vz helper on macOS — is written down in the
+    # registry instead. Every pid in that file was put there by a daemon
+    # this run started, so it is the same exact-pid rule by another route.
+    for pid in $(grep -o '"pid":[0-9]*' "$home/state.json" 2>/dev/null | cut -d: -f2 || true); do
+      kill_pid "$pid"
     done
   done
-  pkill -f "$ASTD" 2>/dev/null || true
-  # The storage daemons are this test's children too, and they outlive astd.
-  pkill -f "qemu-storage-daemon.*$RUN" 2>/dev/null || true
   rm -rf "$RUN"
 }
 trap cleanup EXIT
@@ -90,6 +139,23 @@ file_size() {
     echo "$size"
   else
     stat -c %s "$1"
+  fi
+}
+
+# inode_of <path>: which inode is at that path right now, or nothing at all
+# if there is no file there. Same BSD/GNU split as file_size, asked the same
+# way and for the same reason: a GNU stat handed -f prints filesystem status
+# for the real path before it fails, so the answer is taken only from a call
+# that succeeded.
+#
+# A bind always makes a new inode. That is what lets a caller tell a socket
+# this daemon just put down from the one the last daemon left behind.
+inode_of() {
+  local ino
+  if ino="$(stat -f %i "$1" 2>/dev/null)"; then
+    echo "$ino"
+  else
+    stat -c %i "$1" 2>/dev/null || true
   fi
 }
 
@@ -466,13 +532,59 @@ grep -qF "nbd over the mesh · lease epoch $E_BEFORE" <<<"$PARTS" \
   || fail "ast status does not show the epoch this boot is running on ($E_BEFORE):"$'\n'"$PARTS"
 echo "ok: the instance records the epoch its guest is actually using ($E_BEFORE)"
 
+# Both of these are read BEFORE the restart, because both are how the next
+# daemon is told apart from the one it replaces.
+BRIDGE_INO="$(inode_of "$BRIDGE")"
+LOG_AT="$(file_size "$A/astd.log")"
+
 restart_daemon "$A"
 kill -0 "$GUEST_PID" 2>/dev/null || fail "the guest died while astd was away"
-for _ in $(seq 1 50); do [ -S "$BRIDGE" ] && break; sleep 0.2; done
-[ -S "$BRIDGE" ] || fail "the new astd did not put the bridge back at $BRIDGE"
-grep -qF "is bridged again at epoch $E_BEFORE" "$A/astd.log" \
-  || fail "astd did not report re-establishing the bridge:"$'\n'"$(tail -20 "$A/astd.log")"
-echo "ok: $(grep -m1 'is bridged again' "$A/astd.log")"
+
+# Nothing unlinked the old bridge socket. astd was killed with -KILL, so the
+# file it had bound is still sitting at that path: `[ -S "$BRIDGE" ]` is true
+# the instant the restart returns, a loop waiting on it falls straight
+# through, and the one-shot grep behind it then races the daemon startup it
+# is asking about. Existence at that path proves nothing about who owns it.
+#
+# So wait — boundedly — on two facts only the NEW daemon can make true.
+#
+# The socket is one it bound itself: a bind always makes a new inode, so an
+# inode that has not moved is the corpse rather than the reattachment.
+#
+# And it finished, at the epoch its guest is already running on. That line is
+# read only past where the log stood a moment ago, because the log is
+# appended to across restarts — the same reason restart_daemon waits on a pid
+# and not on a banner — and an earlier run's line would otherwise match.
+#
+# 60s is long for a local reconnect and deliberately so: it is a bound, not a
+# schedule, and the cost of one that is too tight is a green test that fails
+# on a slow machine for a reason that has nothing to do with volumes.
+REATTACHED=""
+NEW_LOG=""
+for _ in $(seq 1 300); do
+  if [ -S "$BRIDGE" ] && [ "$(inode_of "$BRIDGE")" != "$BRIDGE_INO" ]; then
+    # Read into a variable rather than piping into grep -q: under pipefail a
+    # grep that quits on its first match can leave tail holding a closed pipe,
+    # and the whole condition then reports failure for having succeeded early.
+    NEW_LOG="$(tail -c "+$((LOG_AT + 1))" "$A/astd.log" 2>/dev/null || true)"
+    if grep -qF "is bridged again at epoch $E_BEFORE" <<<"$NEW_LOG"; then
+      REATTACHED=1
+      break
+    fi
+  fi
+  sleep 0.2
+done
+
+if [ -z "$REATTACHED" ]; then
+  NEW_LOG="$(tail -c "+$((LOG_AT + 1))" "$A/astd.log" 2>/dev/null || true)"
+  BRIDGE_INO_NOW="$(inode_of "$BRIDGE")"
+  if [ ! -S "$BRIDGE" ] || [ "$BRIDGE_INO_NOW" = "$BRIDGE_INO" ]; then
+    fail "the new astd did not bind its own bridge socket at $BRIDGE"\
+" (inode ${BRIDGE_INO:-none} before the restart, ${BRIDGE_INO_NOW:-none} now):"$'\n'"$NEW_LOG"
+  fi
+  fail "astd bound the bridge but never reported re-establishing it at epoch $E_BEFORE:"$'\n'"$NEW_LOG"
+fi
+echo "ok: $(grep -m1 -F "is bridged again at epoch $E_BEFORE" <<<"$NEW_LOG")"
 
 # The epoch did not move, which is the whole reason this is a reconnect and
 # not a renewal: the guest's QEMU is still asking for the export it booted

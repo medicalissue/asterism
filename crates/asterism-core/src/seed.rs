@@ -25,7 +25,9 @@ use crate::{instance, paths};
 ///
 /// 3: guest key durability — a `sync` at the end of cloud-init's final
 /// stage, and a unit that regenerates missing host keys at boot.
-const SEED_TEMPLATE_VERSION: u32 = 3;
+/// 4: secrets egress — the per-instance CA, the proxy environment, and the
+/// opaque handles that stand in for values.
+const SEED_TEMPLATE_VERSION: u32 = 4;
 
 /// One locally-hosted volume, resolved into everything the two sides of a
 /// directory share have to agree on.
@@ -59,6 +61,34 @@ impl Share {
     }
 }
 
+/// What a guest is told about its egress proxy, and the whole of what a seed
+/// says about secrets.
+///
+/// Read the fields and the invariant reads itself: an address, a certificate,
+/// a list of hostnames, and a handle per secret. No value, and nothing a
+/// value could be derived from. A seed ISO is a file on disk that a guest
+/// mounts and that `ast logs` will happily show you the cloud-init log of, so
+/// what may go in it is exactly what may be public to whoever holds the
+/// instance — which is what a handle is for.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Egress {
+    /// Where the guest reaches the proxy: `http://10.0.2.2:38123`.
+    pub proxy: String,
+    /// PEM of this instance's own CA, whose private key stays on the host.
+    pub ca_pem: String,
+    /// The authorities that have a binding, so the guest's `NO_PROXY` can be
+    /// the complement rather than the proxy being asked to carry everything.
+    pub authorities: Vec<String>,
+    /// `(environment variable, opaque handle)`, one per bound secret.
+    pub handles: Vec<(String, String)>,
+}
+
+impl Egress {
+    pub fn is_empty(&self) -> bool {
+        self.handles.is_empty()
+    }
+}
+
 /// The directory volumes this device can actually share into the guest.
 ///
 /// Two filters, and they are different rules. 9p (like virtiofs) has no
@@ -83,14 +113,20 @@ pub fn shares(inst: &Instance) -> Vec<Share> {
 /// `extra` is cloud-config the *backend* needs in the guest — see
 /// [`crate::hv::Hypervisor::guest_config`]. It is appended verbatim, so it
 /// arrives in the guest exactly as the backend wrote it.
-pub fn ensure(name: &str, seed: &Path, shares: &[Share], extra: &str) -> Result<()> {
+pub fn ensure(
+    name: &str,
+    seed: &Path,
+    shares: &[Share],
+    extra: &str,
+    egress: &Egress,
+) -> Result<()> {
     let stamp_path = seed.with_file_name("seed.stamp");
-    let stamp = fingerprint(name, shares, extra);
+    let stamp = fingerprint(name, shares, extra, egress);
     let current = std::fs::read_to_string(&stamp_path).unwrap_or_default();
     if seed.exists() && current.trim() == stamp {
         return Ok(());
     }
-    build(name, seed, shares, extra, &stamp)?;
+    build(name, seed, shares, extra, egress, &stamp)?;
     std::fs::write(&stamp_path, &stamp)?;
     Ok(())
 }
@@ -104,7 +140,7 @@ pub fn ensure(name: &str, seed: &Path, shares: &[Share], extra: &str) -> Result<
 /// line, so adding backend cloud-config to this module does not reissue the
 /// seed of every instance that does not use any — a reissued seed carries a
 /// new `instance-id`, which makes a guest run its first-boot work again.
-fn fingerprint(name: &str, shares: &[Share], extra: &str) -> String {
+fn fingerprint(name: &str, shares: &[Share], extra: &str, egress: &Egress) -> String {
     let mut material = format!("v{SEED_TEMPLATE_VERSION}\n{name}\n");
     for share in shares {
         material.push_str(&format!(
@@ -115,12 +151,38 @@ fn fingerprint(name: &str, shares: &[Share], extra: &str) -> String {
     if !extra.is_empty() {
         material.push_str(extra);
     }
+    // Folded in whole, and the port with it: a proxy that comes back on a
+    // different port is a guest that has to be told, and the only way to tell
+    // one is a new seed. An instance with no bindings folds in nothing at
+    // all, so adding this section did not reissue every existing seed.
+    if !egress.is_empty() {
+        material.push_str(&egress.proxy);
+        material.push('\n');
+        material.push_str(&egress.ca_pem);
+        for authority in &egress.authorities {
+            material.push_str(authority);
+            material.push('\n');
+        }
+        for (env, handle) in &egress.handles {
+            material.push_str(env);
+            material.push('\t');
+            material.push_str(handle);
+            material.push('\n');
+        }
+    }
     format!("{:016x}", instance::fnv1a(&material))
 }
 
 /// Guests get an `ast` user carrying the dedicated Asterism key plus any
 /// keys already in ~/.ssh, so both `ast ssh` and plain ssh work.
-fn build(name: &str, seed: &Path, shares: &[Share], extra: &str, stamp: &str) -> Result<()> {
+fn build(
+    name: &str,
+    seed: &Path,
+    shares: &[Share],
+    extra: &str,
+    egress: &Egress,
+    stamp: &str,
+) -> Result<()> {
     let mut keys = vec![ensure_asterism_key()?];
     if let Ok(home) = std::env::var("HOME") {
         if let Ok(entries) = std::fs::read_dir(PathBuf::from(home).join(".ssh")) {
@@ -140,7 +202,7 @@ fn build(name: &str, seed: &Path, shares: &[Share], extra: &str, stamp: &str) ->
     // the backend's half both want `write_files` and `runcmd`, so they are
     // merged key by key rather than concatenated. A key that cannot be
     // merged says so instead of quietly losing one side.
-    let config = merge(&asterism_config(shares), extra)
+    let config = merge(&asterism_config(shares, egress), extra)
         .with_context(|| format!("building the seed for {name:?}"))?;
 
     let user_data = format!(
@@ -191,15 +253,17 @@ fn build(name: &str, seed: &Path, shares: &[Share], extra: &str, stamp: &str) ->
 /// One function because it is one cloud-config: `write_files` and `runcmd`
 /// are written once each, whether or not there are volumes, and merged with
 /// the backend's own half by [`merge`].
-fn asterism_config(shares: &[Share]) -> String {
+fn asterism_config(shares: &[Share], egress: &Egress) -> String {
     let mut out = String::from("bootcmd:\n");
     out.push_str(HOSTKEY_BOOTCMD);
     out.push_str("write_files:\n");
     out.push_str(HOSTKEY_UNIT);
     out.push_str(&mount_units(shares));
+    out.push_str(&egress_files(egress));
     out.push_str("runcmd:\n");
     out.push_str(HOSTKEY_RUNCMD);
     out.push_str(&mount_runcmd(shares));
+    out.push_str(&egress_runcmd(egress));
     out
 }
 
@@ -338,6 +402,152 @@ fn mount_units(shares: &[Share]) -> String {
     out
 }
 
+/// The `write_files` entries that make a guest trust this instance's CA and
+/// send bound traffic through the proxy.
+///
+/// Three files, and each of them is deliberately inert on its own:
+///
+/// * The CA certificate, written to both trust-store drop-in directories the
+///   distributions use. It is a *certificate*: the key that signs with it
+///   never leaves the host, so a guest that copies this file out has copied
+///   something already public to it.
+/// * A `profile.d` script, which is what an interactive shell and anything
+///   started from one will read.
+/// * An `environment.d` drop-in, which is what a systemd *user* service will
+///   read. `/etc/environment` is appended in `runcmd` rather than written
+///   here, because the image already ships one and `write_files` replaces.
+///
+/// `NO_PROXY` is the complement of the bound set and not a blanket: a guest
+/// that sent every connection through this proxy would have its package
+/// manager and its own health checks queueing behind a listener whose whole
+/// job is a handful of API calls.
+fn egress_files(egress: &Egress) -> String {
+    if egress.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for path in [
+        "/usr/local/share/ca-certificates/asterism-egress.crt",
+        "/etc/pki/ca-trust/source/anchors/asterism-egress.crt",
+    ] {
+        out.push_str(&format!(
+            "\x20 - path: {path}\n\
+             \x20   permissions: '0644'\n\
+             \x20   content: |\n"
+        ));
+        for line in egress.ca_pem.lines() {
+            out.push_str(&format!("\x20     {line}\n"));
+        }
+    }
+    let exports = environment(egress);
+    out.push_str(
+        "\x20 - path: /etc/profile.d/asterism-egress.sh\n\
+         \x20   permissions: '0644'\n\
+         \x20   content: |\n\
+         \x20     # Written by Asterism. The values below are opaque handles,\n\
+         \x20     # not credentials: each one is honoured by this instance's\n\
+         \x20     # egress proxy, for one host, and is worth nothing anywhere\n\
+         \x20     # else. The real value never enters this machine.\n",
+    );
+    for (key, value) in &exports {
+        out.push_str(&format!("\x20     export {key}={}\n", shell_quote(value)));
+    }
+    out.push_str(
+        "\x20 - path: /etc/environment.d/50-asterism-egress.conf\n\
+         \x20   permissions: '0644'\n\
+         \x20   content: |\n",
+    );
+    for (key, value) in &exports {
+        out.push_str(&format!("\x20     {key}={value}\n"));
+    }
+    out
+}
+
+/// The `runcmd` that installs the CA and puts the environment where processes
+/// that never read a profile will find it.
+///
+/// Both trust-store updaters are tried and neither is required: an image with
+/// neither still boots, and the guest sees a TLS failure it can act on rather
+/// than a machine that would not come up.
+///
+/// The `/etc/environment` edit is a delete-then-append between two markers, so
+/// it is idempotent — `runcmd` runs again whenever a binding changes and the
+/// seed is reissued, and a guest must not end up with three copies of its own
+/// proxy settings.
+///
+/// Two shapes here are deliberate and both were bugs first. The lines are
+/// written with one `printf` rather than a heredoc, because a heredoc's
+/// terminator has to sit at column zero and every line of this string is
+/// indented inside a YAML block scalar. And the delete is `sed` to a temporary
+/// file rather than `sed -i`, because `-i` takes a mandatory suffix argument
+/// on BSD and none on GNU — the one spelling that works on both is neither.
+/// Writing back with `cat` rather than `mv` keeps the file's mode and owner,
+/// which `pam_env` cares about.
+fn egress_runcmd(egress: &Egress) -> String {
+    if egress.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<String> = environment(egress)
+        .iter()
+        .map(|(key, value)| shell_quote(&format!("{key}={value}")))
+        .collect();
+    format!(
+        "\x20 - |\n\
+         \x20   for cert in /usr/local/share/ca-certificates/asterism-egress.crt \\\n\
+         \x20               /etc/pki/ca-trust/source/anchors/asterism-egress.crt; do\n\
+         \x20     [ -s \"$cert\" ] || rm -f \"$cert\"\n\
+         \x20   done\n\
+         \x20   update-ca-certificates >/dev/null 2>&1 \\\n\
+         \x20     || update-ca-trust extract >/dev/null 2>&1 \\\n\
+         \x20     || echo 'asterism: this image has no ca-certificates tool, so the egress \
+         proxy is not trusted yet — install one and re-run it' >&2\n\
+         \x20   if [ -f /etc/environment ]; then\n\
+         \x20     sed '/^# BEGIN asterism egress$/,/^# END asterism egress$/d' \
+         /etc/environment >/tmp/asterism-env \\\n\
+         \x20       && cat /tmp/asterism-env >/etc/environment\n\
+         \x20     rm -f /tmp/asterism-env\n\
+         \x20   fi\n\
+         \x20   {{\n\
+         \x20     echo '# BEGIN asterism egress'\n\
+         \x20     printf '%s\\n' {lines}\n\
+         \x20     echo '# END asterism egress'\n\
+         \x20   }} >>/etc/environment\n\
+         \x20   exit 0\n",
+        lines = lines.join(" \\\n\x20                  "),
+    )
+}
+
+/// The environment a bound guest runs with, in the order it is written.
+fn environment(egress: &Egress) -> Vec<(String, String)> {
+    let mut out = vec![
+        ("HTTPS_PROXY".to_owned(), egress.proxy.clone()),
+        ("https_proxy".to_owned(), egress.proxy.clone()),
+        // Everything that is not bound goes out of the guest's own NAT.
+        // Naming the exceptions rather than the rule keeps this proxy on the
+        // path of the traffic it exists for and off everything else's.
+        (
+            "NO_PROXY".to_owned(),
+            "localhost,127.0.0.1,::1,169.254.169.254".to_owned(),
+        ),
+        (
+            "no_proxy".to_owned(),
+            "localhost,127.0.0.1,::1,169.254.169.254".to_owned(),
+        ),
+        (
+            "ASTERISM_EGRESS_HOSTS".to_owned(),
+            egress.authorities.join(","),
+        ),
+    ];
+    out.extend(egress.handles.iter().cloned());
+    out
+}
+
+/// Single-quote for `sh`, which is the only quoting a handle could need and
+/// is written out rather than assumed because a value here reaches a shell.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 /// The `runcmd` entry that enables those mount units.
 ///
 /// Enabling rather than just starting is what carries the mounts across
@@ -433,7 +643,7 @@ const INDENT: &str = "  ";
 /// claims, or a list that can absorb ours. `build` runs the same check, but
 /// it runs it at boot — this is here so a backend's test can run it now.
 pub fn mergeable(guest_config: &str) -> Result<()> {
-    merge(&asterism_config(&[]), guest_config).map(|_| ())
+    merge(&asterism_config(&[], &Egress::default()), guest_config).map(|_| ())
 }
 
 /// One top-level cloud-config key and what is under it.
@@ -580,7 +790,7 @@ mod tests {
     /// its host keys flushed, and a way back if it lost them anyway.
     #[test]
     fn every_guest_gets_the_host_key_insurance_volumes_or_not() {
-        let bare = asterism_config(&[]);
+        let bare = asterism_config(&[], &Egress::default());
         assert!(bare.contains("- path: /etc/systemd/system/asterism-hostkeys.service"));
         assert!(bare.contains("ssh-keygen -A"));
         assert!(bare.contains("systemctl enable asterism-hostkeys.service"));
@@ -606,7 +816,7 @@ mod tests {
             share("/tank/media", "/mnt/ast/media"),
             share("/tank/code", "/srv/code"),
         ];
-        let config = asterism_config(&shares);
+        let config = asterism_config(&shares, &Egress::default());
         assert!(config.contains("- path: /etc/systemd/system/mnt-ast-media.mount"));
         assert!(config.contains("- path: /etc/systemd/system/srv-code.mount"));
         assert!(config.contains("Where=/mnt/ast/media"));
@@ -623,7 +833,7 @@ mod tests {
 
         // A dash in the mount point becomes `\x2d` in the unit name; the
         // runcmd list must deliver that backslash to systemctl intact.
-        let dashed = asterism_config(&[share("/tank/a", "/mnt/ast/e2e-vol")]);
+        let dashed = asterism_config(&[share("/tank/a", "/mnt/ast/e2e-vol")], &Egress::default());
         assert!(dashed.contains(r"- path: /etc/systemd/system/mnt-ast-e2e\x2dvol.mount"));
         assert!(dashed.contains(r"for unit in 'mnt-ast-e2e\x2dvol.mount'; do"));
         // Everything sits under a top-level key, at an indent cloud-init
@@ -641,7 +851,10 @@ mod tests {
     /// both arrive in the guest.
     #[test]
     fn both_halves_of_the_config_keep_their_runcmd() {
-        let ours = asterism_config(&[share("/tank/media", "/mnt/ast/media")]);
+        let ours = asterism_config(
+            &[share("/tank/media", "/mnt/ast/media")],
+            &Egress::default(),
+        );
         let vz = VZ_LIKE;
         let merged = merge(&ours, vz).unwrap();
 
@@ -698,7 +911,7 @@ mod tests {
     #[test]
     fn the_assembled_user_data_never_says_the_same_key_twice() {
         let shares = vec![share("/tank/media", "/mnt/ast/media")];
-        let config = merge(&asterism_config(&shares), VZ_LIKE).unwrap();
+        let config = merge(&asterism_config(&shares, &Egress::default()), VZ_LIKE).unwrap();
         let user_data = format!(
             "#cloud-config\n\
              hostname: dev\n\
@@ -724,20 +937,128 @@ mod tests {
         );
     }
 
+    fn egress() -> Egress {
+        Egress {
+            proxy: "http://10.0.2.2:38123".into(),
+            ca_pem: "-----BEGIN CERTIFICATE-----\nMIIBfake\n-----END CERTIFICATE-----".into(),
+            authorities: vec!["api.anthropic.com".into()],
+            handles: vec![("ANTHROPIC_API_KEY".into(), "sk-ant-ast-ZZZ".into())],
+        }
+    }
+
+    #[test]
+    fn a_seed_carries_the_certificate_and_the_handle_and_nothing_else() {
+        let config = asterism_config(&[], &egress());
+        // The certificate, in both places a distribution looks.
+        assert!(config.contains("/usr/local/share/ca-certificates/asterism-egress.crt"));
+        assert!(config.contains("/etc/pki/ca-trust/source/anchors/asterism-egress.crt"));
+        assert!(config.contains("-----BEGIN CERTIFICATE-----"));
+        // The proxy, where a shell and a systemd unit will each find it.
+        assert!(config.contains("export HTTPS_PROXY='http://10.0.2.2:38123'"));
+        assert!(config.contains("HTTPS_PROXY=http://10.0.2.2:38123"));
+        // The handle, which is what the guest uses instead of the value.
+        assert!(config.contains("export ANTHROPIC_API_KEY='sk-ant-ast-ZZZ'"));
+        // And nothing that is or leads to a private key: the CA signs on the
+        // host, so only the certificate half of it may be in here.
+        assert!(!config.contains("PRIVATE KEY"), "{config}");
+        assert!(!config.contains("BEGIN EC"), "{config}");
+
+        // Still one of each key after the merge, which is the rule this
+        // file's whole `merge` exists to keep.
+        let merged = merge(&config, "runcmd:\n - [ sh, -c, x ]\n").unwrap();
+        let keys: Vec<String> = blocks(&merged).into_iter().map(|b| b.key).collect();
+        assert_eq!(keys, vec!["bootcmd", "write_files", "runcmd"]);
+
+        // An instance with no bindings gets none of it, and its seed does not
+        // move just because this section was added to the file.
+        let bare = asterism_config(&[], &Egress::default());
+        assert!(!bare.contains("asterism-egress"));
+    }
+
+    /// The guest's half of a binding is a shell script, and a shell script in
+    /// a YAML block scalar has two ways to be quietly wrong. Both were, once.
+    #[test]
+    fn the_script_a_bound_guest_runs_is_shell_a_guest_can_actually_run() {
+        let config = asterism_config(&[], &egress());
+        // Pull the runcmd entry back out of the cloud-config, undoing the
+        // block scalar's indentation, which is what cloud-init hands `sh`.
+        let script: String = config
+            .lines()
+            .skip_while(|line| !line.trim_start().starts_with("for cert in"))
+            .take_while(|line| !line.trim_start().starts_with("- |"))
+            .map(|line| format!("{}\n", line.strip_prefix("   ").unwrap_or(line)))
+            .collect();
+        assert!(script.contains("BEGIN asterism egress"), "{script}");
+
+        // 1. A heredoc's terminator has to be at column zero, and nothing in
+        //    a block scalar is. So there is no heredoc.
+        assert!(!script.contains("<<"), "a heredoc cannot terminate in here:\n{script}");
+        assert!(script.contains("printf '%s\\n'"), "{script}");
+        // 2. `sed -i` takes a mandatory suffix on BSD and none on GNU. The
+        //    guest is Linux, but the spelling that works on both is neither,
+        //    and this is testable where `sed -i` would not be.
+        assert!(!script.contains("sed -i"), "{script}");
+
+        // And it is shell. `sh -n` parses without running, which is exactly
+        // the question being asked.
+        let checked = Command::new("sh")
+            .arg("-n")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("this machine has an sh");
+        assert!(
+            checked.status.success(),
+            "the guest's script does not parse: {}\n{script}",
+            String::from_utf8_lossy(&checked.stderr)
+        );
+    }
+
+    #[test]
+    fn a_binding_that_changes_reissues_the_seed_and_one_that_does_not_does_not() {
+        // A reissued seed carries a new instance-id, which makes a guest redo
+        // its first-boot work — so this must move exactly when the guest has
+        // something new to be told, and never otherwise.
+        let none = fingerprint("dev", &[], "", &Egress::default());
+        let bound = fingerprint("dev", &[], "", &egress());
+        assert_ne!(none, bound);
+        assert_eq!(bound, fingerprint("dev", &[], "", &egress()));
+
+        // The port is in it: a proxy that came back somewhere else is a guest
+        // that has to be told where.
+        let moved = Egress { proxy: "http://10.0.2.2:39000".into(), ..egress() };
+        assert_ne!(bound, fingerprint("dev", &[], "", &moved));
+
+        // So is the handle: revoking a binding and making a new one must not
+        // leave a guest holding the old handle.
+        let reminted = Egress {
+            handles: vec![("ANTHROPIC_API_KEY".into(), "sk-ant-ast-YYY".into())],
+            ..egress()
+        };
+        assert_ne!(bound, fingerprint("dev", &[], "", &reminted));
+    }
+
     #[test]
     fn the_fingerprint_moves_when_the_volumes_do() {
-        let none = fingerprint("dev", &[], "");
-        let one = fingerprint("dev", &[share("/tank/media", "/mnt/ast/media")], "");
-        let elsewhere = fingerprint("dev", &[share("/tank/media", "/srv/media")], "");
-        assert_eq!(none, fingerprint("dev", &[], ""));
+        let bare = Egress::default();
+        let none = fingerprint("dev", &[], "", &bare);
+        let one = fingerprint("dev", &[share("/tank/media", "/mnt/ast/media")], "", &bare);
+        let elsewhere = fingerprint("dev", &[share("/tank/media", "/srv/media")], "", &bare);
+        assert_eq!(none, fingerprint("dev", &[], "", &bare));
         assert_ne!(none, one);
         assert_ne!(one, elsewhere);
-        assert_ne!(one, fingerprint("other", &[share("/tank/media", "/mnt/ast/media")], ""));
+        assert_ne!(
+            one,
+            fingerprint("other", &[share("/tank/media", "/mnt/ast/media")], "", &bare)
+        );
 
         // Backend cloud-config is part of what the seed says, so it moves
         // the fingerprint too — a guest that changes backends gets a seed
         // built for the backend it is actually running on.
-        assert_ne!(none, fingerprint("dev", &[], "bootcmd:\n - [ sh, -c, x ]\n"));
+        assert_ne!(
+            none,
+            fingerprint("dev", &[], "bootcmd:\n - [ sh, -c, x ]\n", &bare)
+        );
     }
 
     #[test]

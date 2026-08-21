@@ -261,6 +261,30 @@ pub enum ShareKind {
     NinePfs,
 }
 
+/// How a guest reaches a listener the daemon put up for it, and — the part
+/// that matters — how it does so without that listener being reachable by
+/// anything else.
+///
+/// This is a capability and not a constant because it is genuinely a property
+/// of the *hypervisor's* networking, and the two backends in this tree differ
+/// on it in a way that cannot be papered over. A backend with no safe answer
+/// says `None`, and the secrets data plane refuses to bind on it. That is the
+/// whole reason this enum exists: the alternative to refusing is binding a
+/// wildcard address and calling the result guest-only, which would put an
+/// unauthenticated proxy for somebody's API keys on their LAN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestEgress {
+    /// The backend runs a user-mode NAT whose gateway address is a virtual
+    /// one, proxied to the host's *loopback*. A listener on `127.0.0.1:p` is
+    /// reachable from the guest as `gateway:p` and from nothing on the wire —
+    /// which is the same door `ast create -p` and `ast ssh` already use.
+    LoopbackGateway {
+        /// The address the guest calls the host by: `10.0.2.2` for QEMU's
+        /// user-net, whose layout is fixed and documented.
+        gateway: &'static str,
+    },
+}
+
 /// What a backend can do. Callers gate on this, never on [`Hypervisor::id`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Caps {
@@ -283,6 +307,10 @@ pub struct Caps {
     /// guest is reached through a host forward rather than at an address of
     /// its own.
     pub port_forward: bool,
+    /// How a guest reaches a host-side listener without one existing on the
+    /// LAN, or `None` where this backend has no such path. See
+    /// [`GuestEgress`]; `None` is what the secrets data plane refuses on.
+    pub guest_egress: Option<GuestEgress>,
     pub disk_formats: &'static [DiskFormat],
 }
 
@@ -543,6 +571,7 @@ mod tests {
                     foreign_arch: false,
                     direct_kernel: false,
                     port_forward: false,
+                    guest_egress: None,
                     disk_formats: &[DiskFormat::Raw],
                 }
             }

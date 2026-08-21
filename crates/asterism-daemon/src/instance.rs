@@ -31,7 +31,7 @@ use asterism_core::registry::{self, Shard};
 use asterism_core::{paths, VERSION};
 
 use crate::mesh::Mesh;
-use crate::{backend, persist, swap, volume, Node};
+use crate::{backend, egress, persist, swap, volume, Node};
 
 /// Answer one request against this device's shard.
 ///
@@ -83,6 +83,10 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
         Request::Down { name } => {
             let stopped = down(reg, &name);
             volume::take_down(&name).await;
+            // The egress proxy exists for a guest, so it goes when the guest
+            // does. Its port is remembered, so the next boot puts it back
+            // where the seed already says it is.
+            egress::stop(&name);
             stopped
         }
         Request::Remove { name } => {
@@ -95,6 +99,9 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             if let Ok(inst) = reg.get(&name).cloned() {
                 volume::take_down(&name).await;
                 volume::release_all(&inst).await;
+                // The instance directory goes below, and this instance's CA
+                // private key is in it.
+                egress::stop(&inst.name);
             }
             reg.remove(&name).inspect(|inst| {
                 persist::forget(&inst.name);
@@ -133,6 +140,30 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
         Request::Detach { name, volume: vol, host } => {
             detach(reg, &name, &vol, host.as_deref()).await
         }
+        // A secret is taken, not merely recorded: the orbit is asked which
+        // devices hold it, and a source that cannot serve its current version
+        // is a refusal here rather than a guest that boots holding a handle
+        // nothing will ever honour.
+        Request::AttachSecret {
+            name,
+            secret,
+            authority,
+            placement,
+            env,
+            source_device,
+        } => {
+            attach_secret(
+                reg,
+                &name,
+                &secret,
+                &authority,
+                placement,
+                env,
+                source_device.as_deref(),
+            )
+            .await
+        }
+        Request::DetachSecret { name, secret } => detach_secret(reg, &name, &secret),
         // A file on this device's disk, read here rather than by the CLI, so
         // that the answer is the same whoever asked and from wherever.
         Request::Logs { name, lines } => {
@@ -391,6 +422,56 @@ async fn attach_block(
     volume::check_backend(&*hv)?;
     let (epoch, _export, size) = volume::take_lease(vol, device, name).await?;
     reg.attach_block(name, vol, device, epoch, size)
+}
+
+/// Bind an orbit secret to one authority this instance may reach.
+///
+/// Everything that could make the binding a lie is checked before the shard
+/// moves: a backend with no guest-only door, an OCI guest with nothing to
+/// install a trust root into, a secret in conflict, a source device that does
+/// not hold the current version. What is written down afterwards is a policy
+/// and an opaque handle, and the proxy is restarted so that the handle is
+/// honoured from this moment rather than from the next boot.
+async fn attach_secret(
+    reg: &mut Shard,
+    name: &str,
+    secret: &str,
+    authority: &str,
+    placement: Option<asterism_core::secret::Placement>,
+    env: Option<String>,
+    source_device: Option<&str>,
+) -> Result<Instance> {
+    let inst = reg.get(name)?.clone();
+    egress::check_can_bind(&inst)?;
+    let (node, mesh) = egress::orbit()?;
+    let binding = crate::secret::plan_binding(
+        secret,
+        authority,
+        placement,
+        env,
+        source_device,
+        &node,
+        mesh.as_ref(),
+    )
+    .await?;
+    let inst = reg.attach_secret(name, binding)?;
+    egress::refresh_bindings(&inst);
+    Ok(inst)
+}
+
+/// Revoke a binding.
+///
+/// The proxy is torn down and restarted against what is left, which is what
+/// makes this a revocation rather than a note: the old proxy held the
+/// bindings it started with and is marked revoked as it goes, so a request
+/// already inside it is refused and no new one is accepted against the old
+/// policy. The handle the guest still has in its environment stops being
+/// honoured the moment this returns; the guest keeps a string that now means
+/// nothing, until its next boot reissues the seed without it.
+fn detach_secret(reg: &mut Shard, name: &str, secret: &str) -> Result<Instance> {
+    let (inst, _revoked) = reg.detach_secret(name, secret)?;
+    egress::refresh_bindings(&inst);
+    Ok(inst)
 }
 
 /// Take a volume off an instance, handing back a block volume's lease.

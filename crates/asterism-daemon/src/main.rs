@@ -42,6 +42,7 @@ use asterism_core::registry::Shard;
 use asterism_core::{paths, VERSION};
 
 mod backend;
+mod egress;
 mod instance;
 mod mesh;
 mod orbit;
@@ -141,6 +142,13 @@ async fn main() -> Result<()> {
     // before its guest has a disk to boot with.
     if let Err(e) = volume::init(node.clone(), mesh.clone()) {
         eprintln!("astd: block volumes are unavailable: {e:#}");
+    }
+
+    // The egress plane, for the same reason and in the same shape: a bound
+    // guest's proxy is put up by the boot that builds its seed, and the
+    // source half of a bound request arrives from a mesh stream.
+    if let Err(e) = egress::init(node.clone(), mesh.clone()) {
+        eprintln!("astd: secret egress is unavailable: {e:#}");
     }
 
     // Moving an instance's cpu part needs the mesh, and the target's half of
@@ -359,7 +367,7 @@ async fn route(request: Request, node: &Node, mesh: Option<&Arc<Mesh>>) -> Respo
 /// commands and the refusal for a frame nobody claimed.
 pub(crate) async fn handle(req: Request, node: &Node) -> Response {
     if secret::is_source_request(&req) {
-        return secret::serve_source(req);
+        return secret::serve_source(req).await;
     }
     // Volumes are this device's own part of the pool, not a row in its shard,
     // and they are answered before the shard is touched. That is not only

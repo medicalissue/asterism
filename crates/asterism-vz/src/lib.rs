@@ -24,6 +24,24 @@
 //! upgrading the daemon must not kill anybody's guests, so `state()` after a
 //! restart is a question asked down this socket rather than anything the
 //! daemon remembers.
+//!
+//! ## Changing this protocol
+//!
+//! Because a running helper outlives the daemon that spawned it, both ends
+//! of this socket are routinely a version apart — most often a new `astd`
+//! talking to helpers it did not build. So the wire grows by **addition
+//! only**:
+//!
+//! * New fields are `#[serde(default)]` and skipped when empty, so a
+//!   healthy `info` is byte-for-byte what it always was and an older reader
+//!   ignores what it does not know.
+//! * No existing variant changes meaning, and none is removed.
+//! * A new [`State`] *string* is the one change that is not safe on its
+//!   own: an older daemon cannot parse it, fails the whole [`Info`], and
+//!   falls back to asking whether the helper's pid is alive — which answers
+//!   "running" for a guest that is not. Anything an older daemon must act
+//!   on is therefore said in a state it already has (see
+//!   [`Info::storage_error`], which rides alongside [`State::Error`]).
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::IpAddr;
@@ -187,6 +205,44 @@ pub struct Info {
     #[serde(default)]
     pub boot_secs: Option<f64>,
     pub console: PathBuf,
+    /// Set once a disk this guest is running on has failed for good, and
+    /// never unset: it is the *reason* for the [`State::Error`] reported
+    /// beside it, and the helper is on its way down by the time a daemon
+    /// can read it.
+    ///
+    /// Additive and omitted while everything is healthy, so an older daemon
+    /// parses this `info` exactly as before and still reads a state that is
+    /// not [live](State::is_live). A newer one can name the disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_error: Option<StorageError>,
+}
+
+/// A disk attachment that has failed permanently.
+///
+/// Today this is only ever a network block device: VZ's NBD client calls
+/// `attachment:didEncounterError:` when it gives up, and Apple is explicit
+/// that "the NBD client will be in a non-functional state after this method
+/// is invoked" — there is no reconnect after it and no way to replace the
+/// attachment under a running VM. Recoverable trouble never arrives here;
+/// it is retried by the framework and shows up as another
+/// `attachmentWasConnected:`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageError {
+    /// The attachment's URI, as the helper built it — which is what names
+    /// the volume a human has to go and fix.
+    pub uri: String,
+    /// `localizedDescription` of the `NSError` VZ handed the delegate.
+    pub message: String,
+}
+
+impl std::fmt::Display for StorageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the disk attached from {} entered a non-recoverable state: {}",
+            self.uri, self.message
+        )
+    }
 }
 
 /// `VZVirtualMachineState`, as far as anyone outside the helper cares.
@@ -198,6 +254,11 @@ pub enum State {
     Paused,
     Stopping,
     Stopped,
+    /// Either a `VZVirtualMachineState` this helper does not know, or a
+    /// guest the helper has decided is no longer healthy — today, one whose
+    /// disk failed for good (see [`Info::storage_error`]). Both mean the
+    /// same thing to a caller: whatever is left of this guest, it is not
+    /// something to keep using.
     Error,
 }
 
@@ -421,13 +482,90 @@ mod tests {
         );
     }
 
+    /// The shape every reader of this protocol depends on, in both
+    /// directions at once: a healthy `info` is exactly the JSON it has
+    /// always been, and a helper that has lost a disk says so in a state an
+    /// older daemon already understands.
+    #[test]
+    fn a_lost_disk_is_additive_json_an_older_daemon_still_reads_as_not_running() {
+        /// `Info` as it was before `storage_error` existed. Serde ignores
+        /// unknown fields, so this is what an older `astd` sees.
+        #[derive(Deserialize)]
+        struct OldInfo {
+            state: State,
+        }
+
+        let mut info = Info {
+            instance: "dev".into(),
+            pid: 4242,
+            state: State::Running,
+            mac: mac_for("dev"),
+            guest_ip: Some("192.168.64.7".parse().unwrap()),
+            started_at: 1_700_000_000,
+            boot_secs: Some(4.25),
+            console: "/i/dev/console.log".into(),
+            storage_error: None,
+        };
+
+        // Healthy: not one byte more on the wire than before the field.
+        let healthy = serde_json::to_string(&Reply::Info(info.clone())).unwrap();
+        assert!(!healthy.contains("storage_error"), "{healthy}");
+        assert_eq!(
+            serde_json::from_str::<OldInfo>(&serde_json::to_string(&info).unwrap())
+                .unwrap()
+                .state,
+            State::Running
+        );
+
+        // Failed: the detail is new, the state is not.
+        info.state = State::Error;
+        info.storage_error = Some(StorageError {
+            uri: "nbd+unix:///team%2Fdata?socket=%2Ftmp%2Fv.sock".into(),
+            message: "Connection reset by peer".into(),
+        });
+        let json = serde_json::to_string(&info).unwrap();
+        assert_eq!(serde_json::from_str::<Info>(&json).unwrap(), info);
+        let old = serde_json::from_str::<OldInfo>(&json).unwrap();
+        assert_eq!(old.state, State::Error);
+        assert!(
+            !old.state.is_live(),
+            "a daemon that never heard of storage_error must still not call this running"
+        );
+    }
+
+    /// An `info` from a helper built before this field still parses, which
+    /// is the direction that actually happens: helpers outlive the daemon
+    /// that spawned them, so a new `astd` reads old JSON every upgrade.
+    #[test]
+    fn an_info_from_an_older_helper_still_parses() {
+        let json = r#"{"instance":"dev","pid":9,"state":"running","mac":"52:54:00:aa:bb:cc",
+            "guest_ip":null,"started_at":1,"boot_secs":null,"console":"/c.log"}"#;
+        let info: Info = serde_json::from_str(json).unwrap();
+        assert!(info.storage_error.is_none());
+        assert!(info.state.is_live());
+    }
+
+    #[test]
+    fn a_storage_error_names_the_volume_and_what_went_wrong() {
+        let said = StorageError {
+            uri: "nbd://desktop:10809/vol".into(),
+            message: "The operation couldn\u{2019}t be completed.".into(),
+        }
+        .to_string();
+        assert!(said.contains("nbd://desktop:10809/vol"), "{said}");
+        assert!(said.contains("non-recoverable"), "{said}");
+    }
+
     #[test]
     fn only_a_live_state_means_there_is_still_a_guest() {
         assert!(State::Running.is_live());
         assert!(State::Starting.is_live());
         assert!(State::Stopping.is_live(), "on its way out is still there");
         assert!(!State::Stopped.is_live());
-        assert!(!State::Error.is_live());
+        assert!(
+            !State::Error.is_live(),
+            "and a guest whose disk went is not one to keep running on"
+        );
     }
 
     #[test]

@@ -19,12 +19,14 @@ use serde::{Deserialize, Serialize};
 use crate::instance::{Instance, PortForward, Restart, Shape};
 use crate::orbit::{Device, DeviceStatus, WakeFacts};
 use crate::registry::OrbitRow;
-use crate::snapshot::Snapshot;
 use crate::secret::Secret;
+use crate::snapshot::Snapshot;
 
+mod egress;
 mod swap;
 mod wake;
 
+pub use egress::{EgressRequest, EgressResponse, MESH_FRAME_LIMIT};
 pub use swap::{BaseImage, MoveFile, MoveManifest};
 pub use wake::{CheckRow, Verdict};
 
@@ -75,8 +77,12 @@ pub enum Request {
         #[serde(default)]
         restart: Option<Restart>,
     },
-    Down { name: String },
-    Remove { name: String },
+    Down {
+        name: String,
+    },
+    Remove {
+        name: String,
+    },
     /// One device's shard of the orbit registry — the instances whose cpu/ram
     /// it supplies. What one daemon asks another for while assembling
     /// [`Request::ListOrbit`], and what `ast ls --local` prints.
@@ -84,15 +90,23 @@ pub enum Request {
     /// The whole orbit registry, assembled: every shard the daemon can reach,
     /// plus the last-seen rows of the devices it cannot. This is `ast ls`.
     ListOrbit,
-    Status { name: String },
+    Status {
+        name: String,
+    },
     /// Give an instance a different name. The only command a conflicted
     /// instance answers, because it is the only one that ends the conflict.
-    Rename { name: String, new_name: String },
+    Rename {
+        name: String,
+        new_name: String,
+    },
     /// Tell the device holding `name` that the orbit has another instance of
     /// that name on it. Sent daemon-to-daemon when an assembled view finds a
     /// collision a partition had hidden; see `Shard::mark_conflicted` for the
     /// rule that decides which of the two is told.
-    MarkConflicted { name: String, other_cpu_device: String },
+    MarkConflicted {
+        name: String,
+        other_cpu_device: String,
+    },
     AttachVolume {
         name: String,
         path: String,
@@ -113,6 +127,39 @@ pub enum Request {
         /// The device that holds them.
         device: String,
     },
+    /// Bind an orbit secret to one authority an instance may reach.
+    ///
+    /// A separate frame from [`Request::AttachVolume`] and not a flag on it,
+    /// for the same reason [`Request::AttachBlock`] is: a daemon too old to
+    /// carry egress must refuse this by name rather than record something
+    /// else. Nothing here is or becomes material — the daemon answers with
+    /// the instance, and the instance holds a policy and an opaque handle.
+    AttachSecret {
+        name: String,
+        /// The secret's orbit name, as `ast secret ls` prints it.
+        secret: String,
+        /// The one authority this secret may be used against: `host`, or
+        /// `host:port`.
+        authority: String,
+        /// Where the credential rides on a request. `None` takes the bound
+        /// authority's own convention.
+        #[serde(default)]
+        placement: Option<crate::secret::Placement>,
+        /// The environment variable the guest finds its handle in. `None`
+        /// takes the secret's name, shouted.
+        #[serde(default)]
+        env: Option<String>,
+        /// Which source device resolves the value. `None` picks one the
+        /// secret says holds its current version.
+        #[serde(default)]
+        source_device: Option<String>,
+    },
+    /// Revoke a binding: the row goes, the handle stops being honoured, and
+    /// the seed that told the guest about it is reissued without it.
+    DetachSecret {
+        name: String,
+        secret: String,
+    },
     /// Take a volume off an instance: the record goes, and a block volume's
     /// lease is handed back to the device that owns it.
     Detach {
@@ -128,12 +175,23 @@ pub enum Request {
     //
     // A snapshot lives in the instance's disk rather than in the registry, so
     // these are answered without the shard ever being written.
-    Snapshot { name: String, tag: String },
-    SnapshotList { name: String },
-    SnapshotRestore { name: String, tag: String },
+    Snapshot {
+        name: String,
+        tag: String,
+    },
+    SnapshotList {
+        name: String,
+    },
+    SnapshotRestore {
+        name: String,
+        tag: String,
+    },
     /// Delete one snapshot. Additive: a daemon too old to know this frame
     /// refuses it by name rather than doing something else with it.
-    SnapshotRemove { name: String, tag: String },
+    SnapshotRemove {
+        name: String,
+        tag: String,
+    },
 
     // ---- the console, and the way in -----------------------------------------
     /// The last `lines` lines of an instance's guest console.
@@ -141,7 +199,10 @@ pub enum Request {
     /// A daemon-side read, so it works when the console log is on another
     /// device's disk. `ast logs -f` still tails the file directly, which is
     /// why following is only offered where the file is.
-    Logs { name: String, lines: u32 },
+    Logs {
+        name: String,
+        lines: u32,
+    },
     /// Where to point `ssh` at to reach this instance's guest.
     ///
     /// Answered with a loopback address every time. When the guest's cpu/ram
@@ -149,7 +210,9 @@ pub enum Request {
     /// they are elsewhere the daemon binds an ephemeral listener and splices
     /// it to the far daemon over the mesh, so `ast ssh dev` is one command
     /// from anywhere and never mentions a device.
-    SshEndpoint { name: String },
+    SshEndpoint {
+        name: String,
+    },
 
     // ---- the mesh ----------------------------------------------------------
     //
@@ -164,7 +227,10 @@ pub enum Request {
     /// itself, once it has resolved the instance name to the device holding
     /// that shard. `ast --device <name> <command>` is the manual override, for
     /// asking one specific daemon a question about itself.
-    Proxy { device: String, inner: Box<Request> },
+    Proxy {
+        device: String,
+        inner: Box<Request>,
+    },
     /// The orbit as `ast devices` shows it: every peer plus this device,
     /// with liveness probed as the request is served.
     Devices,
@@ -190,11 +256,17 @@ pub enum Request {
         name: Option<String>,
     },
     /// The human's verdict on the six digits both terminals just printed.
-    PairConfirm { accept: bool },
+    PairConfirm {
+        accept: bool,
+    },
     /// Drop a device from this orbit. Its key stops being trusted at once.
-    DeviceRemove { name: String },
+    DeviceRemove {
+        name: String,
+    },
     /// Round-trip a mesh stream to one device and time it.
-    DevicePing { device: String },
+    DevicePing {
+        device: String,
+    },
 
     // ---- power and presence -------------------------------------------------
     /// Wake a sleeping device: `ast device wake <name>`.
@@ -203,7 +275,9 @@ pub enum Request {
     /// question — who is going to send the packet, that it was sent, and then
     /// whether the device turned up — each a [`Response::Wake`] as it
     /// happens, ending in one that is `done`.
-    DeviceWake { name: String },
+    DeviceWake {
+        name: String,
+    },
     /// Broadcast a magic packet for `mac` on this device's own LAN.
     ///
     /// Daemon-to-daemon, and the reason wake is an orbit operation at all: a
@@ -232,14 +306,18 @@ pub enum Request {
     // device that holds the bytes — reached by name, either because the user
     // typed `--device`, or because a consumer's daemon put the frame in a
     // [`Request::Proxy`] envelope aimed at the device an attach named.
-
     /// Make a new block volume on this device: a sparse raw image and the
     /// bookkeeping that goes with it.
-    VolumeCreate { name: String, size_bytes: u64 },
+    VolumeCreate {
+        name: String,
+        size_bytes: u64,
+    },
     /// This device's block volumes, with their sizes and leases.
     VolumeList,
     /// Delete a block volume and its bytes. Refused while it is leased.
-    VolumeRemove { name: String },
+    VolumeRemove {
+        name: String,
+    },
     /// Take or renew the single-writer lease, at a new epoch, and start (or
     /// restart) the NBD export that serves it.
     ///
@@ -265,9 +343,16 @@ pub enum Request {
     ///
     /// Refused, in the same words a stale consumer gets, when the lease has
     /// moved on: same holder and same epoch, or nothing.
-    VolumeReconnect { volume: String, holder: String, epoch: u64 },
+    VolumeReconnect {
+        volume: String,
+        holder: String,
+        epoch: u64,
+    },
     /// Hand the lease back and stop the export.
-    VolumeRelease { volume: String, holder: String },
+    VolumeRelease {
+        volume: String,
+        holder: String,
+    },
 
     // ---- secrets ------------------------------------------------------------
     // Public operations are orbit-scoped. `secret_source_*` are the narrow
@@ -280,17 +365,58 @@ pub enum Request {
         source_device: Option<String>,
     },
     SecretList,
-    SecretRemove { name: String },
-    SecretRotate { name: String, value: SecretValue },
+    SecretRemove {
+        name: String,
+    },
+    SecretRotate {
+        name: String,
+        value: SecretValue,
+    },
     SecretSourceList,
     /// Replicate metadata only. This frame can never carry material.
-    SecretSourceSync { secret: Secret },
-    SecretSourcePut { secret: Secret, value: SecretValue },
-    SecretSourceRemove { id: crate::secret::SecretId },
+    SecretSourceSync {
+        secret: Secret,
+    },
+    SecretSourcePut {
+        secret: Secret,
+        value: SecretValue,
+    },
+    SecretSourceRemove {
+        id: crate::secret::SecretId,
+    },
+    /// Make one outbound request on a guest's behalf, from the device whose
+    /// store holds the value.
+    ///
+    /// The narrowest frame in the protocol and the only one that causes a
+    /// daemon to talk to the internet. It arrives with the credential header
+    /// blanked; the source resolves `handle`, fills the blank, opens the
+    /// connection and answers with what came back. Plaintext exists on this
+    /// device, inside this call, and nowhere else — not in the reply, not in
+    /// the caller, not on disk.
+    ///
+    /// `handle` is version- *and* revision-pinned, so a rotation that landed
+    /// between the caller selecting it and this frame arriving is refused
+    /// here rather than redeemed against whatever bytes the store now holds.
+    SecretSourceEgress {
+        /// The value to redeem, version- and revision-pinned. `None` is a
+        /// request to a bound authority that carried no credential: the
+        /// source device still makes the call — so that one instance's
+        /// traffic to one API always leaves from one address — but resolves
+        /// nothing and fills nothing.
+        handle: Option<crate::secret::Handle>,
+        request: Box<EgressRequest>,
+    },
     SecretSourceRotate {
         id: crate::secret::SecretId,
         version: u64,
         updated_at: u64,
+        /// The revision the orbit minted for this rotation, the same one for
+        /// every source.  It is required rather than defaulted: a rotation
+        /// that left a source's value commitment untouched while advancing
+        /// its version is exactly the ambiguity the commitment exists to
+        /// prevent, so an older peer's frame must fail to parse, not be
+        /// silently accepted.
+        revision: crate::secret::ValueRevision,
         value: SecretValue,
     },
 
@@ -322,29 +448,49 @@ pub enum Request {
     /// — the file list, their allocated bytes, and the base image's content
     /// address — so the target can be asked whether it could take it before
     /// the instance is taken out of service.
-    MoveOffer { name: String },
+    MoveOffer {
+        name: String,
+    },
     /// Ask a device whether it could take this instance: same architecture,
     /// a backend it can actually run, an image reference that means
     /// something here. Read-only.
-    MoveProbe { manifest: Box<MoveManifest> },
+    MoveProbe {
+        manifest: Box<MoveManifest>,
+    },
     /// Fence an instance for a move: mark it `moving`, refuse `up`, and
     /// answer with the manifest as it stands now.
     ///
     /// From here until a commit or an abort, this device holds the only
     /// bootable copy and will not boot it.
-    MovePrepare { name: String, to_device: String, epoch: u64 },
+    MovePrepare {
+        name: String,
+        to_device: String,
+        epoch: u64,
+    },
     /// The bytes are all here and verified: adopt them. The staging
     /// directory becomes the instance directory and the row is written with
     /// this device supplying cpu, at `epoch`.
-    MoveCommitTarget { manifest: Box<MoveManifest>, epoch: u64 },
+    MoveCommitTarget {
+        manifest: Box<MoveManifest>,
+        epoch: u64,
+    },
     /// The target has acked: drop the row and the bytes.
-    MoveCommitSource { name: String, epoch: u64 },
+    MoveCommitSource {
+        name: String,
+        epoch: u64,
+    },
     /// The move did not happen. Clear the fence; this row stays
     /// authoritative.
-    MoveAbortSource { name: String, epoch: u64 },
+    MoveAbortSource {
+        name: String,
+        epoch: u64,
+    },
     /// The move did not happen. Delete the staging directory, which is the
     /// only place the half-transferred bytes ever were.
-    MoveAbortTarget { name: String, epoch: u64 },
+    MoveAbortTarget {
+        name: String,
+        epoch: u64,
+    },
 }
 
 impl Request {
@@ -382,14 +528,16 @@ impl Request {
             | Request::SnapshotRestore { name, .. }
             | Request::SnapshotRemove { name, .. }
             | Request::Logs { name, .. }
+            // Binding a secret is an instance command: `ast attach dev
+            // --secret anthropic` resolves `dev` across the orbit like every
+            // other, and the binding is written on whichever device holds it.
+            | Request::AttachSecret { name, .. }
+            | Request::DetachSecret { name, .. }
             | Request::SshEndpoint { name } => Some(name),
 
             // The handshake, and the two views of the registry. A list is
             // about every instance, which is not one instance.
-            Request::Ping
-            | Request::Create { .. }
-            | Request::List
-            | Request::ListOrbit => None,
+            Request::Ping | Request::Create { .. } | Request::List | Request::ListOrbit => None,
 
             // About the orbit and the devices in it.
             Request::Proxy { .. }
@@ -431,7 +579,8 @@ impl Request {
             | Request::SecretSourceSync { .. }
             | Request::SecretSourcePut { .. }
             | Request::SecretSourceRemove { .. }
-            | Request::SecretSourceRotate { .. } => None,
+            | Request::SecretSourceRotate { .. }
+            | Request::SecretSourceEgress { .. } => None,
 
             // Every step of a cpu-part swap names one device on purpose and
             // is aimed at it. Half of them go to a device that does *not*
@@ -490,36 +639,58 @@ pub enum Response {
     /// A daemon older than this variant answers `Ping` with plain `Ok`, so
     /// the *absence* of a version is itself the mismatch signal — which is
     /// what makes this a backward-compatible change rather than a break.
-    Pong { version: String },
+    Pong {
+        version: String,
+    },
 
     // ---- instances -----------------------------------------------------------
-    Instance { instance: Instance },
+    Instance {
+        instance: Instance,
+    },
     /// Reply to [`Request::List`]: one device's shard.
-    Instances { instances: Vec<Instance> },
+    Instances {
+        instances: Vec<Instance>,
+    },
     /// Reply to [`Request::ListOrbit`]: the orbit registry, assembled from
     /// every shard that answered plus the cached rows of those that did not.
-    Orbit { rows: Vec<OrbitRow> },
+    Orbit {
+        rows: Vec<OrbitRow>,
+    },
 
     // ---- snapshots -----------------------------------------------------------
-    Snapshots { snapshots: Vec<Snapshot> },
+    Snapshots {
+        snapshots: Vec<Snapshot>,
+    },
 
     // ---- the console, and the way in -----------------------------------------
     /// Reply to [`Request::Logs`]. `truncated` says whether older lines were
     /// left behind, so the CLI can offer `--lines` rather than imply the
     /// guest has been quiet.
-    Log { text: String, truncated: bool },
+    Log {
+        text: String,
+        truncated: bool,
+    },
     /// Reply to [`Request::SshEndpoint`]: a loopback address `ssh` can be
     /// pointed at right now, and the key file that opens the guest. Whose cpu
     /// is running the guest changes neither field's meaning, which is the
     /// point — both are paths and ports on the machine `ast` is running on.
-    SshEndpoint { host: String, port: u16, identity: String },
+    SshEndpoint {
+        host: String,
+        port: u16,
+        identity: String,
+    },
 
     // ---- the mesh ----------------------------------------------------------
     /// Reply to [`Request::Devices`].
-    Devices { devices: Vec<DeviceStatus> },
+    Devices {
+        devices: Vec<DeviceStatus>,
+    },
     /// The pasteable ticket minted by [`Request::DeviceInvite`], and how long
     /// it stays good for.
-    Ticket { ticket: String, expires_in_secs: u64 },
+    Ticket {
+        ticket: String,
+        expires_in_secs: u64,
+    },
     /// The six digits to compare, and who is on the other end.
     ///
     /// Sent by both halves of pairing, and always followed by the daemon
@@ -531,7 +702,9 @@ pub enum Response {
         device_id: String,
     },
     /// A peer that is now in this orbit.
-    Paired { device: Device },
+    Paired {
+        device: Device,
+    },
     /// Reply to [`Request::DevicePing`].
     DevicePong {
         device: String,
@@ -554,7 +727,9 @@ pub enum Response {
         done: bool,
     },
     /// Reply to [`Request::DeviceFacts`]: where this device sits on the wire.
-    WakeFacts { facts: WakeFacts },
+    WakeFacts {
+        facts: WakeFacts,
+    },
     /// Reply to [`Request::DeviceCheck`]: `ast device check`, as a table.
     WakeCheck {
         device: String,
@@ -565,7 +740,9 @@ pub enum Response {
     /// Reply to [`Request::VolumeList`], [`Request::VolumeCreate`] and
     /// [`Request::VolumeRemove`]: whatever the device now has to say about
     /// the volumes in question.
-    Volumes { volumes: Vec<crate::volume::BlockVolume> },
+    Volumes {
+        volumes: Vec<crate::volume::BlockVolume>,
+    },
     /// Reply to [`Request::VolumeLease`]: the lease was granted, at this
     /// epoch, under this export name.
     ///
@@ -582,7 +759,17 @@ pub enum Response {
     },
 
     // ---- secrets ------------------------------------------------------------
-    Secrets { secrets: Vec<Secret> },
+    Secrets {
+        secrets: Vec<Secret>,
+    },
+    /// Reply to [`Request::SecretSourceEgress`]: what the upstream said.
+    ///
+    /// Boxed because it carries a buffered body and every other variant here
+    /// is a handful of words; without it every response frame in the daemon
+    /// would be sized for this one.
+    Egress {
+        response: Box<EgressResponse>,
+    },
 
     // ---- swapping the cpu part ----------------------------------------------
     /// One line of a move in progress, and whether it was the last one.
@@ -597,7 +784,9 @@ pub enum Response {
     },
     /// Reply to [`Request::MoveOffer`] and [`Request::MovePrepare`]: what a
     /// move of this instance would carry.
-    MoveOffer { manifest: Box<MoveManifest> },
+    MoveOffer {
+        manifest: Box<MoveManifest>,
+    },
     /// Reply to [`Request::MoveProbe`]: whether this device could take the
     /// instance, and what it would have to fetch first.
     MoveProbe {
@@ -614,7 +803,9 @@ pub enum Response {
         needs_base: bool,
     },
 
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 /// Bytes in flight to or from a platform secret store.
@@ -635,8 +826,27 @@ impl SecretValue {
         &self.0
     }
 
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.0
+    /// Take the bytes, leaving this wrapper empty.
+    ///
+    /// The caller owns them from here, and owns wiping them too — which is
+    /// why the one caller that does this ([`crate::rewrite::fill`]'s, on the
+    /// source device) puts them straight into a `Zeroizing`.
+    pub fn into_bytes(mut self) -> Vec<u8> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+/// Wipe material when the wrapper goes.
+///
+/// Honestly, not completely: a `Vec` that grew has left copies behind at its
+/// old addresses, and nothing in safe Rust can reach those. What this does buy
+/// is that the buffer a value was *read into* does not sit in the daemon's
+/// heap until the allocator happens to reuse it, which is the difference
+/// between a core dump taken an hour later holding an API key and not.
+impl Drop for SecretValue {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.0.zeroize();
     }
 }
 
@@ -665,8 +875,7 @@ mod tests {
         let old: Response = serde_json::from_str(r#"{"result":"ok"}"#).unwrap();
         assert!(matches!(old, Response::Ok));
         // What this one sends.
-        let new: Response =
-            serde_json::from_str(r#"{"result":"pong","version":"0.0.2"}"#).unwrap();
+        let new: Response = serde_json::from_str(r#"{"result":"pong","version":"0.0.2"}"#).unwrap();
         assert!(matches!(new, Response::Pong { version } if version == "0.0.2"));
     }
 
@@ -691,11 +900,14 @@ mod tests {
     #[test]
     fn secret_source_operations_never_route_through_the_instance_namespace() {
         let id = crate::secret::SecretId::from_name("api").unwrap();
+        let lineage = crate::secret::ValueRevision::mint();
         let source = crate::secret::SourceDevice {
             device_id: "source-public-key".into(),
             device: "desktop".into(),
             version: 3,
             updated_at: 3,
+            origin: lineage.clone(),
+            revision: lineage,
         };
         let secret = crate::secret::Secret {
             id,
@@ -742,7 +954,13 @@ mod tests {
             r#"{"cmd":"attach_volume","name":"dev","path":"/tank","host":null}"#,
         )
         .unwrap();
-        assert!(matches!(attach, Request::AttachVolume { mount_point: None, .. }));
+        assert!(matches!(
+            attach,
+            Request::AttachVolume {
+                mount_point: None,
+                ..
+            }
+        ));
         // A create from before backends could be chosen means "whatever
         // this device uses", not a parse error.
         let create: Request = serde_json::from_str(
@@ -751,7 +969,9 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(create, Request::Create { backend: None, .. }));
-        let Request::Create { publish, .. } = &create else { unreachable!("a create") };
+        let Request::Create { publish, .. } = &create else {
+            unreachable!("a create")
+        };
         assert!(publish.is_empty(), "a cloud image publishes nothing");
 
         // ...and one from a CLI that has `-p` carries what it asked for.
@@ -761,8 +981,16 @@ mod tests {
                 "publish":[{"host":8080,"guest":80}]}"#,
         )
         .unwrap();
-        let Request::Create { publish, .. } = &published else { unreachable!("a create") };
-        assert_eq!(publish, &[PortForward { host: 8080, guest: 80 }]);
+        let Request::Create { publish, .. } = &published else {
+            unreachable!("a create")
+        };
+        assert_eq!(
+            publish,
+            &[PortForward {
+                host: 8080,
+                guest: 80
+            }]
+        );
     }
 
     /// Banding the variants by area is a merge-conflict measure, and it is
@@ -783,8 +1011,11 @@ mod tests {
             r#"{"cmd":"snapshot_remove","name":"dev","tag":"nightly"}"#
         );
         assert_eq!(
-            serde_json::to_string(&Response::Log { text: "boot".into(), truncated: true })
-                .unwrap(),
+            serde_json::to_string(&Response::Log {
+                text: "boot".into(),
+                truncated: true
+            })
+            .unwrap(),
             r#"{"result":"log","text":"boot","truncated":true}"#
         );
     }
@@ -817,12 +1048,21 @@ mod tests {
     #[test]
     fn every_request_about_one_instance_names_it() {
         let named: Vec<Request> = vec![
-            Request::Up { name: "dev".into(), restart: None },
+            Request::Up {
+                name: "dev".into(),
+                restart: None,
+            },
             Request::Down { name: "dev".into() },
             Request::Remove { name: "dev".into() },
             Request::Status { name: "dev".into() },
-            Request::Rename { name: "dev".into(), new_name: "dev2".into() },
-            Request::MarkConflicted { name: "dev".into(), other_cpu_device: "d".into() },
+            Request::Rename {
+                name: "dev".into(),
+                new_name: "dev2".into(),
+            },
+            Request::MarkConflicted {
+                name: "dev".into(),
+                other_cpu_device: "d".into(),
+            },
             Request::AttachVolume {
                 name: "dev".into(),
                 path: "/t".into(),
@@ -834,11 +1074,24 @@ mod tests {
                 volume: "tank".into(),
                 device: "desktop".into(),
             },
-            Request::Detach { name: "dev".into(), volume: "tank".into(), host: None },
-            Request::Snapshot { name: "dev".into(), tag: "t".into() },
+            Request::Detach {
+                name: "dev".into(),
+                volume: "tank".into(),
+                host: None,
+            },
+            Request::Snapshot {
+                name: "dev".into(),
+                tag: "t".into(),
+            },
             Request::SnapshotList { name: "dev".into() },
-            Request::SnapshotRestore { name: "dev".into(), tag: "t".into() },
-            Request::Logs { name: "dev".into(), lines: 200 },
+            Request::SnapshotRestore {
+                name: "dev".into(),
+                tag: "t".into(),
+            },
+            Request::Logs {
+                name: "dev".into(),
+                lines: 200,
+            },
             Request::SshEndpoint { name: "dev".into() },
         ];
         for req in &named {
@@ -862,9 +1115,19 @@ mod tests {
         // `ast device wake desktop` names a *device*. Reporting it as a
         // subject would send the frame off to be resolved against the
         // instance namespace, where "desktop" means nothing.
-        assert_eq!(Request::DeviceWake { name: "desktop".into() }.subject(), None);
         assert_eq!(
-            Request::WakeBroadcast { mac: "de:ad:be:ef:00:01".into(), lan_id: None }.subject(),
+            Request::DeviceWake {
+                name: "desktop".into()
+            }
+            .subject(),
+            None
+        );
+        assert_eq!(
+            Request::WakeBroadcast {
+                mac: "de:ad:be:ef:00:01".into(),
+                lan_id: None
+            }
+            .subject(),
             None
         );
         assert_eq!(Request::DeviceFacts.subject(), None);
@@ -910,7 +1173,11 @@ mod tests {
         assert_eq!(lease.subject(), None, "a volume is a device's part");
         assert_eq!(Request::VolumeList.subject(), None);
         assert_eq!(
-            Request::VolumeCreate { name: "tank".into(), size_bytes: 1 << 30 }.subject(),
+            Request::VolumeCreate {
+                name: "tank".into(),
+                size_bytes: 1 << 30
+            }
+            .subject(),
             None
         );
 
@@ -931,10 +1198,18 @@ mod tests {
     /// rename is part of the way out.
     #[test]
     fn a_conflict_lets_exactly_the_commands_that_resolve_it_through() {
-        assert!(Request::Rename { name: "d".into(), new_name: "e".into() }.survives_a_conflict());
+        assert!(Request::Rename {
+            name: "d".into(),
+            new_name: "e".into()
+        }
+        .survives_a_conflict());
         assert!(Request::Status { name: "d".into() }.survives_a_conflict());
         assert!(Request::Down { name: "d".into() }.survives_a_conflict());
-        assert!(!Request::Up { name: "d".into(), restart: None }.survives_a_conflict());
+        assert!(!Request::Up {
+            name: "d".into(),
+            restart: None
+        }
+        .survives_a_conflict());
         assert!(!Request::SshEndpoint { name: "d".into() }.survives_a_conflict());
         assert!(!Request::Remove { name: "d".into() }.survives_a_conflict());
     }
@@ -944,7 +1219,10 @@ mod tests {
     /// assembled from.
     #[test]
     fn the_orbit_view_and_a_single_shard_are_distinct_on_the_wire() {
-        assert_eq!(serde_json::to_string(&Request::List).unwrap(), r#"{"cmd":"list"}"#);
+        assert_eq!(
+            serde_json::to_string(&Request::List).unwrap(),
+            r#"{"cmd":"list"}"#
+        );
         assert_eq!(
             serde_json::to_string(&Request::ListOrbit).unwrap(),
             r#"{"cmd":"list_orbit"}"#

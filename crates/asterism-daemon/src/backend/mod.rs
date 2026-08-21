@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
-use asterism_core::hv::{BootReq, Hypervisor, ImageKind, ImageRef, Machine};
+use asterism_core::hv::{BootReq, DiskFormat, Hypervisor, ImageKind, ImageRef, Machine};
 use asterism_core::instance::{Instance, PortForward};
 use asterism_core::{image, paths, seed};
 
@@ -50,20 +50,31 @@ pub fn by_id(id: &str) -> Result<Arc<dyn Hypervisor>> {
     match id {
         qemu::ID => Ok(b.qemu.clone()),
         vz::ID => Ok(b.vz.clone()),
-        other => bail!("no {other:?} backend in this build — there is {} and {}", qemu::ID, vz::ID),
+        other => bail!(
+            "no {other:?} backend in this build — there is {} and {}",
+            qemu::ID,
+            vz::ID
+        ),
     }
 }
 
 /// The capabilities a backend must have for one create request.
 ///
 /// This is intentionally backend-neutral. Image resolution and CLI parsing
-/// turn image kind and published ports into facts here; selection only
-/// compares those facts to [`Hypervisor::caps`]. Directory shares are added
-/// later and are checked at attach time by [`check_can_share`]. Adding another
-/// host OS therefore does not add OS conditionals to creation.
+/// turn image kind, on-disk format and published ports into facts here;
+/// selection only compares those facts to [`Hypervisor::caps`]. Directory
+/// shares are added later and are checked at attach time by
+/// [`check_can_share`]. Adding another host OS therefore does not add OS
+/// conditionals to creation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CreateRequirements {
     image_kind: ImageKind,
+    /// The format the base image's bytes are *actually* in, from
+    /// [`ImageRef::format`]. Every image this store manages is raw by the
+    /// time it can be booted, so this only ever varies for a local file the
+    /// user pointed at — `--image ./mine.qcow2`, which is theirs and is
+    /// never rewritten in place.
+    disk_format: DiskFormat,
     port_forward: bool,
 }
 
@@ -71,6 +82,7 @@ impl CreateRequirements {
     pub fn new(image: &ImageRef, publish: &[PortForward]) -> Self {
         Self {
             image_kind: image.kind,
+            disk_format: image.format,
             port_forward: !publish.is_empty(),
         }
     }
@@ -85,6 +97,21 @@ impl CreateRequirements {
                 hv.id()
             );
         }
+        // The format is a property of the bytes, and a backend either reads
+        // them or does not: Virtualization.framework has no qcow2 at all.
+        // Checked here, before a backend is recorded on the instance, because
+        // an instance pinned to a backend that cannot read its own base image
+        // is one that will never boot and cannot be repointed.
+        if !caps.disk_formats.contains(&self.disk_format) {
+            bail!(
+                "the {} backend cannot read a {} disk, and this base image is one — \
+                 it boots {}, so the image would have to be converted first \
+                 (`qemu-img convert -O raw`)",
+                hv.id(),
+                self.disk_format,
+                readable(caps.disk_formats)
+            );
+        }
         if self.port_forward && !caps.port_forward {
             bail!(
                 "the {} backend gives each guest an address of its own, so there is \
@@ -93,6 +120,19 @@ impl CreateRequirements {
             );
         }
         Ok(())
+    }
+}
+
+/// The disk formats a backend reads, as a phrase a refusal can end on:
+/// "raw", or "raw and qcow2".
+fn readable(formats: &[DiskFormat]) -> String {
+    match formats {
+        [] => "no disk format at all".to_owned(),
+        [only] => only.to_string(),
+        [rest @ .., last] => {
+            let rest: Vec<String> = rest.iter().map(|f| f.to_string()).collect();
+            format!("{} and {last}", rest.join(", "))
+        }
     }
 }
 
@@ -117,8 +157,8 @@ fn select_with(
     }
 
     // VZ is the lightest path on a capable host. Capability mismatches are
-    // ordinary reasons to try QEMU: OCI direct boot and loopback publishing
-    // need facilities VZ does not currently expose.
+    // ordinary reasons to try QEMU: OCI direct boot, loopback publishing and
+    // qcow2 base images all need facilities VZ does not currently expose.
     let mut refusals = Vec::new();
     for id in [vz::ID, qemu::ID] {
         match resolve(id).and_then(|hv| runnable(hv, requirements)) {
@@ -137,10 +177,7 @@ fn select_with(
 /// An explicit `--backend` is forced: its own probe or capability refusal is
 /// returned. The default tries the fastest/lightest capable backend now — VZ
 /// first, then QEMU — and returns both reasons if neither can run the request.
-pub fn select_for(
-    requested: Option<&str>,
-    requirements: CreateRequirements,
-) -> Result<Machine> {
+pub fn select_for(requested: Option<&str>, requirements: CreateRequirements) -> Result<Machine> {
     select_with(requested, requirements, by_id)
 }
 
@@ -210,7 +247,11 @@ pub fn check_can_share(inst: &Instance) -> Result<()> {
 /// here. Create time is where this belongs, for the same reason a volume is
 /// refused at attach — an instance that looks defined and cannot boot is
 /// worse than a command that says no.
-pub fn check_can_boot(hv: &dyn Hypervisor, image: &ImageRef, publish: &[PortForward]) -> Result<()> {
+pub fn check_can_boot(
+    hv: &dyn Hypervisor,
+    image: &ImageRef,
+    publish: &[PortForward],
+) -> Result<()> {
     CreateRequirements::new(image, publish).check(hv)
 }
 
@@ -303,9 +344,14 @@ pub fn boot_req<'a>(inst: &'a Instance, hv: &dyn Hypervisor) -> Result<BootReq<'
         );
     }
 
+    // A bound instance's proxy comes up here, before the seed is written,
+    // because the port it settles on is one of the things the seed has to
+    // say. An instance with no bindings gets an empty config and no listener.
+    let egress = crate::egress::seed_config(inst)?;
+
     // The backend gets to add what its own devices need — for vz, the
     // `/dev/hvc0` console no stock cloud image knows about.
-    seed::ensure(&inst.name, &req.seed, &shares, hv.guest_config())
+    seed::ensure(&inst.name, &req.seed, &shares, hv.guest_config(), &egress)
         .context("building cloud-init seed")?;
     req.shares = shares;
     Ok(req)
@@ -348,7 +394,10 @@ pub(crate) fn alive(pid: u32) -> bool {
 }
 
 pub(crate) fn signal(pid: u32, sig: &str) -> Result<()> {
-    Command::new("kill").arg(sig).arg(pid.to_string()).status()?;
+    Command::new("kill")
+        .arg(sig)
+        .arg(pid.to_string())
+        .status()?;
     Ok(())
 }
 
@@ -376,6 +425,7 @@ mod tests {
         probe_error: Option<&'static str>,
         direct_kernel: bool,
         port_forward: bool,
+        disk_formats: &'static [DiskFormat],
     }
 
     impl Hypervisor for Fake {
@@ -406,7 +456,8 @@ mod tests {
                 foreign_arch: false,
                 direct_kernel: self.direct_kernel,
                 port_forward: self.port_forward,
-                disk_formats: &[],
+                guest_egress: None,
+                disk_formats: self.disk_formats,
             }
         }
 
@@ -431,21 +482,68 @@ mod tests {
         }
     }
 
+    /// A backend that reads raw disks and nothing else, which is VZ's real
+    /// answer and the conservative one for a fake.
     fn fake(
         id: &'static str,
         probe_error: Option<&'static str>,
         direct_kernel: bool,
         port_forward: bool,
     ) -> Arc<dyn Hypervisor> {
-        Arc::new(Fake { id, probe_error, direct_kernel, port_forward })
+        fake_reading(
+            id,
+            probe_error,
+            direct_kernel,
+            port_forward,
+            &[DiskFormat::Raw],
+        )
+    }
+
+    fn fake_reading(
+        id: &'static str,
+        probe_error: Option<&'static str>,
+        direct_kernel: bool,
+        port_forward: bool,
+        disk_formats: &'static [DiskFormat],
+    ) -> Arc<dyn Hypervisor> {
+        Arc::new(Fake {
+            id,
+            probe_error,
+            direct_kernel,
+            port_forward,
+            disk_formats,
+        })
+    }
+
+    /// The two-backend host every selection test runs on.
+    fn host(
+        vz: Arc<dyn Hypervisor>,
+        qemu: Arc<dyn Hypervisor>,
+    ) -> impl Fn(&str) -> Result<Arc<dyn Hypervisor>> {
+        move |id| match id {
+            "vz" => Ok(vz.clone()),
+            "qemu" => Ok(qemu.clone()),
+            other => bail!("unknown backend {other:?}"),
+        }
     }
 
     fn image(kind: ImageKind) -> ImageRef {
         ImageRef {
             name: "test-image".into(),
             path: "/images/test.raw".into(),
-            format: asterism_core::hv::DiskFormat::Raw,
+            format: DiskFormat::Raw,
             kind,
+        }
+    }
+
+    /// The one image the store never converts: a local file the user pointed
+    /// at, booted in the format it is in.
+    fn local_qcow2() -> ImageRef {
+        ImageRef {
+            name: "/home/u/mine.qcow2".into(),
+            path: "/home/u/mine.qcow2".into(),
+            format: DiskFormat::Qcow2,
+            kind: ImageKind::Disk,
         }
     }
 
@@ -461,7 +559,11 @@ mod tests {
 
         let err = grow(&disk, 1).unwrap_err().to_string();
         assert!(err.contains("larger --disk"), "{err}");
-        assert_eq!(std::fs::metadata(&disk).unwrap().len(), 4 << 30, "left alone");
+        assert_eq!(
+            std::fs::metadata(&disk).unwrap().len(),
+            4 << 30,
+            "left alone"
+        );
     }
 
     #[test]
@@ -485,8 +587,14 @@ mod tests {
             format: asterism_core::hv::DiskFormat::Raw,
             kind: ImageKind::OciRootfs,
         };
-        let disk = ImageRef { kind: ImageKind::Disk, ..oci.clone() };
-        let port = [PortForward { host: 8080, guest: 80 }];
+        let disk = ImageRef {
+            kind: ImageKind::Disk,
+            ..oci.clone()
+        };
+        let port = [PortForward {
+            host: 8080,
+            guest: 80,
+        }];
 
         let qemu = by_id("qemu").unwrap();
         assert!(qemu.caps().direct_kernel && qemu.caps().port_forward);
@@ -496,7 +604,10 @@ mod tests {
         assert!(!vz.caps().direct_kernel, "vz wires up EFI only");
         let err = check_can_boot(&*vz, &oci, &[]).unwrap_err().to_string();
         assert!(err.contains("vz"), "{err}");
-        assert!(err.contains("direct kernel"), "the missing capability is named: {err}");
+        assert!(
+            err.contains("direct kernel"),
+            "the missing capability is named: {err}"
+        );
         // ...and a cloud image on vz is exactly as fine as it ever was.
         check_can_boot(&*vz, &disk, &[]).unwrap();
         // Publishing to loopback needs a guest that is reached that way.
@@ -530,14 +641,20 @@ mod tests {
 
         let vz = fake("vz", None, false, false);
         let qemu = fake("qemu", None, true, true);
-        let port = [PortForward { host: 8080, guest: 80 }];
+        let port = [PortForward {
+            host: 8080,
+            guest: 80,
+        }];
         let selected = select_with(None, CreateRequirements::new(&disk, &port), |id| match id {
             "vz" => Ok(vz.clone()),
             "qemu" => Ok(qemu.clone()),
             _ => bail!("unknown backend"),
         })
         .unwrap();
-        assert_eq!(selected.backend, "qemu", "port forwarding is a create requirement");
+        assert_eq!(
+            selected.backend, "qemu",
+            "port forwarding is a create requirement"
+        );
 
         let vz = fake("vz", Some("helper is unsigned"), false, false);
         let qemu = fake("qemu", None, true, true);
@@ -558,8 +675,14 @@ mod tests {
         })
         .expect_err("neither backend is runnable");
         let error = format!("{error:#}");
-        assert!(error.contains("vz") && error.contains("unsigned helper"), "{error}");
-        assert!(error.contains("qemu") && error.contains("qemu missing"), "{error}");
+        assert!(
+            error.contains("vz") && error.contains("unsigned helper"),
+            "{error}"
+        );
+        assert!(
+            error.contains("qemu") && error.contains("qemu missing"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -584,7 +707,110 @@ mod tests {
         assert!(error.contains("explicitly requested vz"), "{error}");
         assert!(error.contains("direct kernel"), "{error}");
 
-        assert!(select_for(Some("nothing-like-this"), CreateRequirements::new(&disk, &[])).is_err());
+        assert!(select_for(
+            Some("nothing-like-this"),
+            CreateRequirements::new(&disk, &[])
+        )
+        .is_err());
+    }
+
+    /// The format of the bytes is a create requirement like any other.
+    ///
+    /// A local `--image ./mine.qcow2` is the one image the store never
+    /// rewrites, and Virtualization.framework cannot read qcow2 at all — so
+    /// on a Mac, where VZ is tried first and probes perfectly well, the
+    /// default has to fall through to QEMU rather than record a backend that
+    /// could never open the instance's own base image. Forcing VZ is refused
+    /// at create, where it can still be acted on.
+    #[test]
+    fn a_local_qcow2_chooses_the_backend_that_reads_it() {
+        // The fakes are shaped like the real backends on that host.
+        assert_eq!(by_id("vz").unwrap().caps().disk_formats, &[DiskFormat::Raw]);
+        assert!(by_id("qemu")
+            .unwrap()
+            .caps()
+            .disk_formats
+            .contains(&DiskFormat::Qcow2));
+
+        let vz = fake("vz", None, false, false);
+        let qemu = fake_reading(
+            "qemu",
+            None,
+            true,
+            true,
+            &[DiskFormat::Raw, DiskFormat::Qcow2],
+        );
+        let qcow2 = local_qcow2();
+
+        let selected = select_with(
+            None,
+            CreateRequirements::new(&qcow2, &[]),
+            host(vz.clone(), qemu.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            selected.backend, "qemu",
+            "the backend that can read the image wins"
+        );
+
+        // ...and a raw image on the same host still goes to VZ, so this is a
+        // fall-through and not a preference that has quietly changed.
+        let raw = image(ImageKind::Disk);
+        let selected = select_with(
+            None,
+            CreateRequirements::new(&raw, &[]),
+            host(vz.clone(), qemu.clone()),
+        )
+        .unwrap();
+        assert_eq!(selected.backend, "vz");
+
+        // Explicit means explicit: VZ refuses, naming the format it cannot
+        // read and the ones it can, instead of being silently swapped out.
+        let error = select_with(
+            Some("vz"),
+            CreateRequirements::new(&qcow2, &[]),
+            host(vz.clone(), qemu.clone()),
+        )
+        .expect_err("vz cannot read qcow2");
+        let error = format!("{error:#}");
+        assert!(error.contains("explicitly requested vz"), "{error}");
+        assert!(
+            error.contains("qcow2"),
+            "the format that was refused: {error}"
+        );
+        assert!(error.contains("raw"), "and the one it does read: {error}");
+
+        // A host where nothing reads the image says so once, with both
+        // reasons, rather than recording a backend and failing at boot.
+        let error = select_with(
+            None,
+            CreateRequirements::new(&qcow2, &[]),
+            host(vz, fake("qemu", None, true, true)),
+        )
+        .expect_err("neither backend reads qcow2");
+        let error = format!("{error:#}");
+        assert!(error.contains("vz") && error.contains("qemu"), "{error}");
+        assert_eq!(
+            error.matches("qcow2").count(),
+            2,
+            "one reason per backend: {error}"
+        );
+    }
+
+    /// The phrase a refusal ends on lists what the backend does read, so a
+    /// user is told what would work rather than only what did not.
+    #[test]
+    fn the_formats_a_backend_reads_are_named_in_its_refusal() {
+        assert_eq!(readable(&[DiskFormat::Raw]), "raw");
+        assert_eq!(
+            readable(&[DiskFormat::Raw, DiskFormat::Qcow2]),
+            "raw and qcow2"
+        );
+        assert_eq!(
+            readable(&[DiskFormat::Raw, DiskFormat::Qcow2, DiskFormat::Asif]),
+            "raw, qcow2 and asif"
+        );
+        assert!(readable(&[]).contains("no disk format"));
     }
 
     /// An instance carries its backend, and that is what runs it — not the
@@ -632,7 +858,10 @@ mod tests {
             assert!(err.contains("vz"), "{err}");
             assert!(err.contains("9p"), "{err}");
         } else {
-            assert!(check_can_share(&inst).is_ok(), "a backend we cannot ask cannot refuse");
+            assert!(
+                check_can_share(&inst).is_ok(),
+                "a backend we cannot ask cannot refuse"
+            );
         }
 
         inst.machine = Machine {
@@ -644,7 +873,10 @@ mod tests {
         assert_eq!(for_instance(&inst).unwrap().id(), "qemu");
 
         inst.machine.backend = "xen".into();
-        let error = for_instance(&inst).err().expect("xen is not available").to_string();
+        let error = for_instance(&inst)
+            .err()
+            .expect("xen is not available")
+            .to_string();
         assert!(error.contains("created for the xen backend"), "{error}");
     }
 }

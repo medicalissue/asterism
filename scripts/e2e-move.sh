@@ -48,15 +48,66 @@ IMAGE="${E2E_IMAGE:-debian:13}"
 MARKER="marker-$$"
 POST="post-$$"
 
+# ---- the processes this test starts ----------------------------------------
+#
+# Everything started here writes down its own pid inside its own
+# ASTERISM_HOME: astd in $home/astd.pid, each guest's qemu in
+# $home/instances/<name>/qemu.pid, each storage daemon in
+# $home/volumes/<name>/nbd-e<epoch>.pid. Those files are what cleanup acts
+# on, so it can only ever reach a process this run started.
+#
+# The alternative — `pkill -f` on the astd path — reaches every astd built
+# from this tree: the one the developer running this test has open on their
+# own ~/.asterism, and any other e2e in this suite running beside it.
+
+# kill_pid <pid> [signal]: bounded and idempotent. A pid that is already
+# gone is success; one that will not take a hint gets ~5s and then -KILL.
+kill_pid() {
+  local pid="$1" sig="${2:--TERM}" _i
+  case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+  kill -0 "$pid" 2>/dev/null || return 0
+  kill "$sig" "$pid" 2>/dev/null || true
+  for _i in $(seq 1 25); do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.2
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+}
+
+# kill_pidfile <path>: whatever a pidfile names, and then the file.
+kill_pidfile() {
+  local f="$1"
+  [ -f "$f" ] || return 0
+  kill_pid "$(cat "$f" 2>/dev/null || true)"
+  rm -f "$f"
+}
+
+# Deliberately no `ast` in here. The socket read in the CLI has no timeout,
+# so `ast down` against a daemon that is wedged blocks this trap forever —
+# and `ast` starts a daemon when the socket does not answer, so a cleanup
+# built out of it can resurrect, and re-boot, the very instances it came to
+# remove. Killing by pid needs no daemon to be well.
 cleanup() {
+  if [ -n "${CLEANED:-}" ]; then return 0; fi
+  CLEANED=1
+  local home f pid
+  # The daemons first: astd is what restarts a guest it notices die, so a
+  # guest killed while its daemon is up can come straight back.
   for home in "$A" "$B" "$C"; do
-    [ -d "$home" ] || continue
-    for inst in "$INST" "$KILL" "$FAIL"; do
-      ASTERISM_HOME="$home" "$AST" down "$inst" >/dev/null 2>&1 || true
-      ASTERISM_HOME="$home" "$AST" rm "$inst" >/dev/null 2>&1 || true
+    kill_pidfile "$home/astd.pid"
+  done
+  # Then what they left running. Both outlive astd by design.
+  for home in "$A" "$B" "$C"; do
+    for f in "$home"/instances/*/qemu.pid; do kill_pidfile "$f"; done
+    for f in "$home"/volumes/*/nbd-e*.pid; do kill_pidfile "$f"; done
+    # A backend that keeps its guest's pid on the handle rather than in a
+    # pidfile of its own — the vz helper on macOS — is written down in the
+    # registry instead. Every pid in that file was put there by a daemon
+    # this run started, so it is the same exact-pid rule by another route.
+    for pid in $(grep -o '"pid":[0-9]*' "$home/state.json" 2>/dev/null | cut -d: -f2 || true); do
+      kill_pid "$pid"
     done
   done
-  pkill -f "$ASTD" 2>/dev/null || true
   rm -rf "$RUN"
 }
 trap cleanup EXIT

@@ -6,8 +6,9 @@
 //! device each of its parts comes from, [`registry`] is the one flat
 //! orbit-wide namespace those instances live in (stored as a shard per
 //! device), [`hv`] is the hypervisor boundary, [`volume`] is the block
-//! storage a device contributes to the pool, and [`protocol`] is the
-//! CLI <-> daemon wire.
+//! storage a device contributes to the pool, [`secret`] and [`rewrite`] are
+//! the secrets data plane's model and its one substitution rule, and
+//! [`protocol`] is the CLI <-> daemon wire.
 
 pub mod cow;
 pub mod hv;
@@ -19,6 +20,7 @@ pub mod paths;
 pub mod power;
 pub mod protocol;
 pub mod registry;
+pub mod rewrite;
 pub mod seed;
 pub mod secret;
 pub mod service;

@@ -10,6 +10,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::hv::{ControlChannel, GuestEndpoint, Handle, ImageKind, Machine};
+use crate::secret::Binding;
 
 /// Lifecycle state of an instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -411,6 +412,19 @@ pub struct Instance {
     /// which is what was true when they were written.
     #[serde(default)]
     pub seed_device: Option<String>,
+    /// Secrets bound to this instance's egress.
+    ///
+    /// A binding is a policy and a stand-in, never a value: the orbit name of
+    /// the secret, the one authority it may be used against, where on a
+    /// request it rides, and the opaque handle this instance's guest was
+    /// given instead of it. That is what makes it safe for this to live in a
+    /// shard that is written to disk, printed by `ast status`, and carried
+    /// whole to another device by a cpu-part move.
+    ///
+    /// Defaulted, so every registry written before secrets had a data plane
+    /// loads as an instance with none — which is what it was.
+    #[serde(default)]
+    pub secrets: Vec<Binding>,
     /// Guest paths of volumes the last cpu-part swap left behind.
     ///
     /// A volume attached over 9p is a same-device part: the hypervisor
@@ -462,6 +476,7 @@ impl Instance {
             move_epoch: 0,
             moving: None,
             seed_device: None,
+            secrets: Vec::new(),
             stranded: Vec::new(),
             legacy_pid: None,
             legacy_ssh_port: None,
@@ -588,6 +603,23 @@ impl Instance {
                 source: v.host.clone(),
                 detail,
                 note,
+            });
+        }
+        for binding in &self.secrets {
+            parts.push(Part {
+                kind: "secret".into(),
+                // The device whose store holds the value, which is where the
+                // value is resolved and the only place it ever exists in the
+                // clear. It is a sourcing fact like any other part's.
+                source: binding.source_device.clone(),
+                detail: format!("{} -> {}", binding.secret, binding.authority),
+                note: Some(format!(
+                    "{} · ${} in the guest, holding {} · bound at v{}",
+                    binding.placement,
+                    binding.env,
+                    binding.guest_handle.hint(),
+                    binding.version
+                )),
             });
         }
         let published: Vec<String> = self.publish.iter().map(|p| p.to_string()).collect();
