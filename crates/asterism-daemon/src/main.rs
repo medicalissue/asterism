@@ -16,6 +16,18 @@
 //! frame over a mesh stream. The user never names a device, because in a pool
 //! of parts there is nothing for them to name.
 //!
+//! # The door, and what is behind it
+//!
+//! Everything local arrives through one unix socket, and the rules that
+//! socket is behind are not in this file: they are in
+//! [`asterism_core::ipc`] (who may connect, where the socket lives, what
+//! makes this process the only daemon on its home) and in [`transport`] (how
+//! a frame is bounded, how long one may take, how many peers may be inside at
+//! once). Both are seams rather than checks, on purpose — a limit enforced
+//! per command is a limit whichever command was added last does not have.
+//! A connection reaches this file only as an [`Admitted`], and an `Admitted`
+//! hands out nothing but a bounded reader and a deadlined writer.
+//!
 //! # What this file is, and what it is not
 //!
 //! This file is the doors and the routing between them, and nothing else. It
@@ -32,14 +44,15 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
+use asterism_core::ipc;
 use asterism_core::orbit::Orbit;
 use asterism_core::protocol::{Request, Response};
 use asterism_core::registry::Shard;
 use asterism_core::{paths, VERSION};
+
+use transport::{Admitted, Framing};
 
 mod backend;
 mod egress;
@@ -51,6 +64,7 @@ mod secret;
 mod snapshot;
 mod ssh;
 mod swap;
+mod transport;
 mod volume;
 mod wake;
 
@@ -79,8 +93,24 @@ impl Node {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Before anything: the signals that mean "stop". Registering one is what
+    // makes it ours — until then the default disposition applies, and for
+    // both of these that is death with nothing tidied up. The socket is
+    // bound early and the mesh takes a moment to come up after it, so a
+    // daemon that only registered when it reached its accept loop had a
+    // window in which a `SIGTERM` left the socket and the pid file behind
+    // for the next daemon to trip over. `ast` sends exactly that `SIGTERM`
+    // when it retires a daemon across an upgrade, and it sends it as soon as
+    // the socket answers — which is inside the window.
+    let mut stop = Stop::listen();
+
     let home = paths::home_dir();
-    std::fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
+    // Everything this daemon remembers is in here, and until now it was
+    // created `0777 & !umask` — which on a default login means every other
+    // user on the machine can list the instance names, watch for a staging
+    // path, and see the socket. `0700`, and tightened if an older astd left
+    // it open. See `asterism_core::ipc`.
+    private_state(&home)?;
 
     // Before anything is served: a cpu-part swap this device was receiving
     // when it died left a staging directory, and this is the "next contact"
@@ -93,30 +123,27 @@ async fn main() -> Result<()> {
         orbit: Arc::new(Mutex::new(Orbit::load(&paths::orbit_path())?)),
     };
 
-    let sock = paths::socket_path();
-    // A leftover socket file from a dead daemon blocks bind; a live daemon
-    // would still be accepting, so probe before unlinking.
-    if sock.exists() {
-        if UnixStream::connect(&sock).await.is_ok() {
-            anyhow::bail!("another astd is already running on {}", sock.display());
-        }
-        std::fs::remove_file(&sock)?;
-    }
-    let listener =
-        UnixListener::bind(&sock).with_context(|| format!("binding {}", sock.display()))?;
+    // The election, the stale-socket sweep and the bind, in that order and
+    // behind one `flock(2)`. What used to be here — probe the socket, unlink
+    // it if nobody answered, bind — could not tell a dead daemon from one
+    // that was about to answer, so ten `ast` commands typed at once started
+    // ten daemons that each unlinked the last one's socket. See
+    // `asterism_core::ipc::Door`.
+    let door = transport::Door::open(&home, &paths::socket_path())?;
+    let sock = door.socket().to_path_buf();
 
     // Now, and not before, this process has proved it is the only daemon on
-    // this home — the bind is the mutex, so nothing here can be tidying up
-    // after a daemon that is still running. Both of these are crash cleanup:
-    // the staging file of a commit that never published, and the marker of a
-    // disk restore that never finished.
+    // this home — the election is the mutex, so nothing here can be tidying
+    // up after a daemon that is still running. Both of these are crash
+    // cleanup: the staging file of a commit that never published, and the
+    // marker of a disk restore that never finished.
     sweep_interrupted_commits();
     converge_restores(&node).await;
 
     // The pid file is how an `ast` newer than this daemon retires it: the
     // socket says something is listening, but only a pid can be acted on.
     let pidfile = paths::daemon_pid_path();
-    std::fs::write(&pidfile, std::process::id().to_string())
+    write_private(&pidfile, std::process::id().to_string().as_bytes())
         .with_context(|| format!("writing {}", pidfile.display()))?;
 
     eprintln!("astd {VERSION}: listening on {}", sock.display());
@@ -184,19 +211,32 @@ async fn main() -> Result<()> {
     persist::resurrect(&node.shard).await;
     persist::supervise(node.shard.clone());
 
+    let slots = door.slots();
     loop {
         tokio::select! {
-            accepted = listener.accept() => {
-                let (stream, _) = accepted?;
+            accepted = door.accept() => {
+                let stream = accepted?;
                 let node = node.clone();
                 let mesh = mesh.clone();
+                let slots = slots.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = serve(stream, node, mesh).await {
-                        eprintln!("astd: connection error: {e:#}");
+                    // Who the peer is and whether there is room for it are
+                    // settled here rather than in the accept loop: both can
+                    // wait, and an accept loop that waits stops draining the
+                    // backlog.
+                    match transport::admit(stream, slots).await {
+                        Ok(Some(conn)) => {
+                            if let Err(e) = serve(conn, node, mesh).await {
+                                eprintln!("astd: connection error: {e:#}");
+                            }
+                        }
+                        // Turned away, and told why on the way out.
+                        Ok(None) => {}
+                        Err(e) => eprintln!("astd: {e:#}"),
                     }
                 });
             }
-            _ = shutdown_signal() => {
+            _ = stop.next() => {
                 let _ = std::fs::remove_file(&sock);
                 let _ = std::fs::remove_file(&pidfile);
                 eprintln!("astd: shutting down");
@@ -204,6 +244,55 @@ async fn main() -> Result<()> {
             }
         }
     }
+}
+
+/// Write a small file `0600`, replacing whatever was there.
+///
+/// `std::fs::write` would leave it `0644`, which is how the pid file used to
+/// come out — a small thing, but the home is private now and a file in it
+/// that is not is a question somebody has to answer later.
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)
+}
+
+/// Make every directory this daemon keeps state in reachable only by the
+/// user running it.
+///
+/// The home, the per-instance directories under it, the volume directory and
+/// the cached guest keys, plus the runtime directory a socket falls back to
+/// when its own path is too long to bind — that last one because it is under
+/// the system temp directory, which on Linux is writable by everybody, and a
+/// socket path derived from a hash is a path anybody can compute.
+///
+/// A directory that was left open is tightened and the fact is logged: an
+/// `$ASTERISM_HOME` from any earlier astd is exactly that, and a daemon that
+/// refused to start until the user ran `chmod` by hand would be a worse
+/// answer to a problem it can simply fix.
+fn private_state(home: &std::path::Path) -> Result<()> {
+    for dir in [
+        home.to_path_buf(),
+        home.join("instances"),
+        home.join("volumes"),
+        home.join("guest-keys"),
+        paths::runtime_dir(),
+    ] {
+        match ipc::private_dir(&dir)? {
+            ipc::Privacy::Tightened { was } => eprintln!(
+                "astd: {} was mode {was:04o} — other users on this machine could read                  it; it is 0700 now",
+                dir.display()
+            ),
+            ipc::Privacy::Already | ipc::Privacy::Created => {}
+        }
+    }
+    Ok(())
 }
 
 /// Settle every instance whose disk restore was interrupted.
@@ -250,20 +339,41 @@ fn sweep_interrupted_commits() {
 }
 
 /// Ctrl-C, or the SIGTERM the CLI sends when it retires a stale daemon.
-/// Both have to clean up the socket and pid file, or the replacement
-/// daemon refuses to bind.
-async fn shutdown_signal() {
-    use tokio::signal::unix::{signal, SignalKind};
-    let mut term = match signal(SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(_) => {
-            let _ = tokio::signal::ctrl_c().await;
-            return;
+///
+/// Both have to clean up the socket and pid file, or the replacement daemon
+/// trips over what this one left. The handlers are installed at the very top
+/// of `main`, before the socket exists, because a signal that arrives before
+/// its handler does is not a shutdown — it is the default disposition, which
+/// is death, and a daemon killed that way leaves both files behind.
+struct Stop {
+    term: Option<tokio::signal::unix::Signal>,
+    int: Option<tokio::signal::unix::Signal>,
+}
+
+impl Stop {
+    fn listen() -> Stop {
+        use tokio::signal::unix::{signal, SignalKind};
+        Stop {
+            term: signal(SignalKind::terminate()).ok(),
+            int: signal(SignalKind::interrupt()).ok(),
         }
-    };
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term.recv() => {}
+    }
+
+    /// Wait for either. A signal this process could not register for never
+    /// arrives here, which is correct: it was never ours to catch.
+    async fn next(&mut self) {
+        match (&mut self.term, &mut self.int) {
+            (Some(term), Some(int)) => {
+                tokio::select! {
+                    _ = term.recv() => {}
+                    _ = int.recv() => {}
+                }
+            }
+            (Some(one), None) | (None, Some(one)) => {
+                one.recv().await;
+            }
+            (None, None) => std::future::pending().await,
+        }
     }
 }
 
@@ -274,9 +384,8 @@ async fn shutdown_signal() {
 /// same reason: it needs something this connection has. Three report as they
 /// go and so need somewhere to send progress; the fourth needs to leave a
 /// listener standing that dies when this socket does.
-async fn serve(stream: UnixStream, node: Node, mesh: Option<Arc<Mesh>>) -> Result<()> {
-    let (read, mut write) = stream.into_split();
-    let mut lines = BufReader::new(read).lines();
+async fn serve(conn: Admitted, node: Node, mesh: Option<Arc<Mesh>>) -> Result<()> {
+    let Admitted { mut frames, mut write, .. } = conn;
 
     // Anything this connection asked us to hold open on its behalf. Today
     // that is the loopback listener behind `ast ssh` on a guest whose cpu is
@@ -284,7 +393,19 @@ async fn serve(stream: UnixStream, node: Node, mesh: Option<Arc<Mesh>>) -> Resul
     // running, so dropping these when the loop ends *is* the teardown.
     let mut splices: Vec<Splice> = Vec::new();
 
-    while let Some(line) = lines.next_line().await? {
+    loop {
+        let line = match frames.next().await? {
+            Framing::Frame(line) => line,
+            Framing::Eof => break,
+            // Not a frame this protocol has room for — too long, too slow,
+            // not utf-8. The peer is told which, once, and the connection
+            // ends: a peer that cannot produce a frame will not produce a
+            // better one by being asked again.
+            Framing::Refused(message) => {
+                write.refuse(&message).await;
+                break;
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -294,7 +415,7 @@ async fn serve(stream: UnixStream, node: Node, mesh: Option<Arc<Mesh>>) -> Resul
             // never heard of. The wording matters: `ast` classifies it and
             // restarts us rather than showing the user a serde error.
             Err(e) => {
-                send(&mut write, &Response::Error { message: format!("bad request: {e}") }).await?;
+                write.send(&Response::Error { message: format!("bad request: {e}") }).await?;
                 continue;
             }
         };
@@ -303,7 +424,7 @@ async fn serve(stream: UnixStream, node: Node, mesh: Option<Arc<Mesh>>) -> Resul
         // code to compare, a verdict to take — so it borrows the connection
         // for as many frames as it needs.
         if let Request::DeviceInvite { .. } | Request::DeviceAdd { .. } = request {
-            let mut io = ClientIo { lines: &mut lines, write: &mut write };
+            let mut io = ClientIo { frames: &mut frames, write: &mut write };
             if let Err(e) = orbit::pair(request, mesh.as_ref(), &mut io).await {
                 io.send(&Response::Error { message: format!("{e:#}") }).await?;
             }
@@ -315,7 +436,7 @@ async fn serve(stream: UnixStream, node: Node, mesh: Option<Arc<Mesh>>) -> Resul
         // machine turned up — so it reports as it goes, which needs the
         // connection the same way pairing does.
         if let Request::DeviceWake { name } = &request {
-            let mut io = ClientIo { lines: &mut lines, write: &mut write };
+            let mut io = ClientIo { frames: &mut frames, write: &mut write };
             let woken = match mesh.as_ref() {
                 Some(mesh) => mesh.wake(name, &mut io).await,
                 None => Err(anyhow::anyhow!("{}", orbit::NO_MESH)),
@@ -330,7 +451,7 @@ async fn serve(stream: UnixStream, node: Node, mesh: Option<Arc<Mesh>>) -> Resul
         // fence, a disk crossing a network, two commits — so it reports as it
         // goes, on the connection that asked, exactly as a wake does.
         if let Request::SetCpu { name, device, down } = &request {
-            let mut io = ClientIo { lines: &mut lines, write: &mut write };
+            let mut io = ClientIo { frames: &mut frames, write: &mut write };
             let moved = swap::run(name, device, *down, &node, mesh.as_ref(), &mut io).await;
             if let Err(e) = moved {
                 io.send(&Response::Error { message: format!("{e:#}") }).await?;
@@ -344,23 +465,13 @@ async fn serve(stream: UnixStream, node: Node, mesh: Option<Arc<Mesh>>) -> Resul
         if let Request::SshEndpoint { name } = &request {
             let (response, splice) = ssh::endpoint(name, &node, mesh.as_ref()).await;
             splices.extend(splice);
-            send(&mut write, &response).await?;
+            write.send(&response).await?;
             continue;
         }
 
         let response = dispatch(request, &node, mesh.as_ref()).await;
-        send(&mut write, &response).await?;
+        write.send(&response).await?;
     }
-    Ok(())
-}
-
-async fn send(
-    write: &mut tokio::net::unix::OwnedWriteHalf,
-    response: &Response,
-) -> Result<()> {
-    let mut out = serde_json::to_vec(response)?;
-    out.push(b'\n');
-    write.write_all(&out).await?;
     Ok(())
 }
 
@@ -432,6 +543,26 @@ async fn route(request: Request, node: &Node, mesh: Option<&Arc<Mesh>>) -> Respo
 /// area in turn, ending at [`instance`], which owns both the shard's own
 /// commands and the refusal for a frame nobody claimed.
 pub(crate) async fn handle(req: Request, node: &Node) -> Response {
+    // The version handshake, before anything that can wait.
+    //
+    // `ast` sends `Ping` in front of every command, so whatever this answer
+    // waits on, every command waits on. The shard is held for the whole of a
+    // boot — `hv.prepare` converting a gigabyte, `hv.boot` on a backend that
+    // has stopped answering — so answering the handshake from behind it made
+    // one stuck guest into a CLI that hangs with nothing on the screen, for
+    // every command, including the ones that would have said what was wrong.
+    //
+    // Nothing in the reply comes from the registry: it is this binary's
+    // version, which is a constant. Reconciling first was a courtesy — a
+    // daemon that has just noticed a dead guest writing that down before it
+    // says it is well — and a courtesy is exactly what `try_lock` is for. It
+    // happens when the registry is free and is skipped when it is not.
+    if matches!(req, Request::Ping) {
+        if let Ok(mut reg) = node.shard.try_lock() {
+            instance::reconcile(&mut reg);
+        }
+        return Response::Pong { version: VERSION.to_owned() };
+    }
     if secret::is_source_request(&req) {
         return secret::serve_source(req).await;
     }
@@ -462,4 +593,61 @@ pub(crate) async fn handle(req: Request, node: &Node) -> Response {
         return snapshot::serve(req, &reg);
     }
     instance::serve(req, &mut reg, &cpu_device).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node_on(home: &std::path::Path) -> Node {
+        Node {
+            shard: Arc::new(Mutex::new(Shard::load(&home.join("state.json")).unwrap())),
+            orbit: Arc::new(Mutex::new(Orbit::load(&home.join("orbit.json")).unwrap())),
+        }
+    }
+
+    /// A stalled backend is a held registry, and the handshake must not be
+    /// behind it.
+    ///
+    /// `up` holds the shard for the whole of a boot — a gigabyte being
+    /// converted, or a hypervisor that has stopped answering — and `ast`
+    /// sends `Ping` in front of every single command. Answering the
+    /// handshake from behind that lock therefore turned one stuck guest into
+    /// a CLI that hangs, with nothing printed, for every command a user could
+    /// try next, including the ones that would have told them what was wrong.
+    ///
+    /// Holding the lock here is exactly what a stalled boot does to it, and
+    /// is the only part of a stall a test needs to reproduce.
+    #[tokio::test]
+    async fn the_handshake_is_answered_while_the_registry_is_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = node_on(tmp.path());
+        let stalled = node.shard.clone().lock_owned().await;
+
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle(Request::Ping, &node),
+        )
+        .await
+        .expect("the handshake waited on the registry");
+        assert!(matches!(answered, Response::Pong { version } if version == VERSION));
+
+        drop(stalled);
+    }
+
+    /// And the courtesy the handshake used to perform still happens when
+    /// there is nothing in the way: a daemon that has just noticed a dead
+    /// guest writes that down before it says it is well. It is a `try_lock`,
+    /// so it is skipped rather than waited for.
+    #[tokio::test]
+    async fn a_free_registry_is_still_reconciled_by_the_handshake() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node = node_on(tmp.path());
+        let answered = handle(Request::Ping, &node).await;
+        assert!(matches!(answered, Response::Pong { .. }));
+        assert!(
+            node.shard.try_lock().is_ok(),
+            "the handshake kept the registry after answering"
+        );
+    }
 }

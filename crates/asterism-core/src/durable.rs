@@ -68,8 +68,13 @@
 //! ### What may be at the staging path
 //!
 //! A staging path is derived from the file being committed, so it is
-//! predictable: `secrets.json.tmp` sits next to `secrets.json` in a directory
-//! anyone on the machine can list. Whatever is already there is therefore
+//! predictable: `secrets.json.tmp` sits next to `secrets.json`. The directory
+//! is `0700` and belongs to this user — [`crate::ipc::private_dir`] is what
+//! makes that true, and `commit` goes through it rather than
+//! `create_dir_all` — so nobody else can put anything at that path. That is
+//! the wall; what follows is the lock behind it, because a `kill -9` leaves
+//! a staging file of our own there and a wall is not an argument about our
+//! own leftovers. Whatever is already there is therefore
 //! *not* something to open — a mode argument is only applied to a file that
 //! `open(2)` creates, and a symlink is followed. Both of those turn "write
 //! the secret to a 0600 file" into "write the secret wherever the file that
@@ -167,7 +172,14 @@ pub fn commit_json_private<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 fn commit_inner(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     faults::check(faults::Point::Create, dir)?;
-    std::fs::create_dir_all(dir)
+    // `create_dir_all` would make it `0777 & !umask`, which on a default
+    // login is `0755` — and this is the directory a staging path sits in.
+    // Every argument below about `O_NOFOLLOW` and `O_EXCL` is about what a
+    // second user on this machine can put at a predictable path; the cheapest
+    // way to have none of it be reachable is for them not to be able to
+    // traverse the directory at all. See [`crate::ipc::private_dir`], which
+    // also tightens what an older astd created.
+    crate::ipc::private_dir(dir)
         .with_context(|| format!("creating {} to hold {}", dir.display(), path.display()))?;
 
     // 1. The new value, whole, and on the device before anything points at it.

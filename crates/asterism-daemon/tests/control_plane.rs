@@ -1,0 +1,356 @@
+//! What the door does when a real `astd` is behind it.
+//!
+//! The unit tests in `transport` and in `asterism_core::ipc` make each rule
+//! true in isolation. These make it true of the shipped binary, which is a
+//! different claim: a limit that is only enforced on a socket a test built by
+//! hand is a limit the daemon does not have. Every test here starts `astd`,
+//! talks to it the way `ast` does — one JSON line in, one JSON line back —
+//! and then asks the question that matters after any refusal, which is
+//! whether the daemon is still serving everybody else.
+//!
+//! `ASTERISM_MESH=local` on every one of them: these are about the local
+//! control plane, and a daemon that publishes itself to a discovery service
+//! in a test is a daemon doing something a test did not ask for.
+
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+use asterism_core::ipc;
+
+/// An `astd` on a home of its own, killed when the test ends.
+struct Daemon {
+    child: Child,
+    home: PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl Daemon {
+    /// Start one on a fresh home and wait until it is answering.
+    fn start() -> Daemon {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let home = dir.path().join("home");
+        Daemon::on(dir, home)
+    }
+
+    /// Start one on a home somebody else prepared — the tests about what a
+    /// previous daemon left behind.
+    fn on(dir: tempfile::TempDir, home: PathBuf) -> Daemon {
+        let daemon = Daemon { child: spawn(&home), home, _dir: dir };
+        daemon.await_socket();
+        daemon
+    }
+
+    fn sock(&self) -> PathBuf {
+        self.home.join("astd.sock")
+    }
+
+    fn await_socket(&self) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if UnixStream::connect(self.sock()).is_ok() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("astd did not come up on {}", self.sock().display());
+    }
+
+    /// One request, one reply, on a connection of its own — which is how
+    /// `ast` asks, and what makes "is it still serving?" a real question.
+    fn ask(&self, line: &str) -> String {
+        let mut stream = UnixStream::connect(self.sock()).expect("connecting to astd");
+        stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+        stream.write_all(line.as_bytes()).unwrap();
+        stream.write_all(b"\n").unwrap();
+        read_line(&mut stream)
+    }
+
+    /// Still there, still answering, still this version.
+    fn assert_serving(&self) {
+        let pong = self.ask(r#"{"cmd":"ping"}"#);
+        assert!(pong.contains("pong"), "astd stopped serving: {pong:?}");
+    }
+
+    fn signal(&self, sig: &str) {
+        Command::new("kill")
+            .args([sig, &self.child.id().to_string()])
+            .status()
+            .expect("kill");
+    }
+
+    fn wait_until_gone(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("astd did not exit");
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn spawn(home: &Path) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_astd"))
+        .env("ASTERISM_HOME", home)
+        .env("ASTERISM_MESH", "local")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("starting astd")
+}
+
+fn read_line(stream: &mut UnixStream) -> String {
+    let mut reply = String::new();
+    BufReader::new(stream).read_line(&mut reply).expect("reading a reply");
+    reply
+}
+
+/// Connect, allowing for the kernel's accept queue being briefly full.
+///
+/// A refused connect on a socket that is bound and being accepted on means
+/// the backlog filled, which is a fact about `kern.ipc.somaxconn` and not
+/// about the daemon.
+fn connect_patiently(sock: &Path) -> UnixStream {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match UnixStream::connect(sock) {
+            Ok(stream) => return stream,
+            Err(e) if Instant::now() >= deadline => panic!("connecting to astd: {e}"),
+            Err(_) => std::thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+fn mode_of(path: &Path) -> u32 {
+    std::fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
+/// The shape of the whole thing, on the binary that ships: state nobody else
+/// can list, behind a socket nobody else can reach.
+#[test]
+fn the_state_directory_and_the_socket_are_private() {
+    let astd = Daemon::start();
+    assert_eq!(mode_of(&astd.home), 0o700, "the home is listable by other users");
+    assert_eq!(mode_of(&astd.sock()), 0o600, "the socket is reachable by other users");
+    for under in ["instances", "volumes", "guest-keys"] {
+        assert_eq!(mode_of(&astd.home.join(under)), 0o700, "{under} is open");
+    }
+    assert_eq!(mode_of(&astd.home.join("astd.pid")), 0o600);
+    assert_eq!(ipc::audit_socket(&astd.sock()).unwrap(), ipc::SocketState::Ready);
+}
+
+/// An `$ASTERISM_HOME` from any earlier astd is `0755`, and refusing to start
+/// on one would refuse to start for every existing user. It is fixed, and
+/// said out loud rather than silently.
+#[test]
+fn a_home_an_older_daemon_left_open_is_tightened_and_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::set_permissions(&home, PermissionsExt::from_mode(0o755)).unwrap();
+
+    let mut astd = Daemon::on(dir, home.clone());
+    assert_eq!(mode_of(&home), 0o700);
+
+    astd.signal("-TERM");
+    astd.wait_until_gone();
+    let mut said = String::new();
+    astd.child.stderr.take().unwrap().read_to_string(&mut said).unwrap();
+    assert!(said.contains("0755"), "the daemon did not say what it found: {said}");
+}
+
+/// The second-daemon race. Six start at once on one home with nothing there
+/// yet; five have to lose, and — the half that matters — losing must not
+/// disturb the one that won. Probe-then-unlink got both of those wrong: the
+/// window between a probe and a bind is wide enough for every one of them to
+/// unlink the socket the last one just bound.
+#[test]
+fn only_one_of_a_storm_of_daemons_takes_the_home() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let mut racers: Vec<Child> = (0..6).map(|_| spawn(&home)).collect();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut lost = 0;
+    while Instant::now() < deadline && lost < 5 {
+        lost = 0;
+        for racer in racers.iter_mut() {
+            if matches!(racer.try_wait(), Ok(Some(_))) {
+                lost += 1;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let mut failures = 0;
+    let mut alive = 0;
+    for racer in racers.iter_mut() {
+        match racer.try_wait() {
+            Ok(Some(status)) => {
+                assert!(!status.success(), "a daemon that lost the home exited as if it won");
+                failures += 1;
+            }
+            _ => alive += 1,
+        }
+    }
+    assert_eq!(alive, 1, "{alive} daemons hold one home");
+    assert_eq!(failures, 5);
+
+    let sock = home.join("astd.sock");
+    let mut stream = UnixStream::connect(&sock).expect("the winner is still listening");
+    stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    stream.write_all(b"{\"cmd\":\"ping\"}\n").unwrap();
+    assert!(read_line(&mut stream).contains("pong"), "the losers took the winner's socket");
+
+    for mut racer in racers {
+        let _ = racer.kill();
+        let _ = racer.wait();
+    }
+}
+
+/// A daemon told to stop takes its socket and its pid file with it, and the
+/// next one starts on a clean home. This is `ast` retiring a daemon across an
+/// upgrade, which happens on every user's machine.
+#[test]
+fn a_daemon_that_is_asked_to_stop_leaves_nothing_behind_for_the_next_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let mut first = Daemon::on(dir, home.clone());
+    first.signal("-TERM");
+    first.wait_until_gone();
+
+    assert!(!home.join("astd.sock").exists(), "the socket was left behind");
+    assert!(!home.join("astd.pid").exists(), "the pid file was left behind");
+
+    let second = Daemon::on(tempfile::tempdir().unwrap(), home);
+    second.assert_serving();
+}
+
+/// A daemon that is killed outright leaves its socket file exactly where it
+/// was. It is stale, and it may not stop the next daemon starting — the
+/// socket is unlinked under the election, and the election itself is released
+/// by the kernel when its holder dies, which is the whole reason it is a lock
+/// and not a file with a pid in it.
+#[test]
+fn a_socket_left_by_a_killed_daemon_does_not_stop_the_next_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let mut killed = Daemon::on(dir, home.clone());
+    killed.signal("-KILL");
+    killed.wait_until_gone();
+
+    assert!(home.join("astd.sock").exists(), "this test is about the leftover socket");
+    assert!(UnixStream::connect(home.join("astd.sock")).is_err(), "and about nobody behind it");
+
+    let next = Daemon::on(tempfile::tempdir().unwrap(), home);
+    next.assert_serving();
+}
+
+/// A peer that starts a line and never ends it must not get to choose how
+/// much memory the daemon holds, and must not take anybody else down with it.
+#[test]
+fn an_oversized_frame_is_refused_in_words_and_the_daemon_keeps_serving() {
+    let astd = Daemon::start();
+    let mut stream = UnixStream::connect(astd.sock()).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+
+    let chunk = vec![b'a'; 64 * 1024];
+    let mut sent = 0usize;
+    // Comfortably past the cap, and never a newline. The write ends either
+    // here or when astd drops its end; both are the daemon doing its job.
+    while sent < ipc::MAX_REQUEST_FRAME + (1 << 20) {
+        if stream.write_all(&chunk).is_err() {
+            break;
+        }
+        sent += chunk.len();
+    }
+    let refusal = read_line(&mut stream);
+    assert!(refusal.contains("without a newline"), "no refusal came back: {refusal:?}");
+    drop(stream);
+
+    astd.assert_serving();
+}
+
+/// A frame that is not JSON is answered and the connection carries on: this
+/// is the arm a newer `ast` lands on when it names a request an older daemon
+/// has never heard of, and `ast` reads the wording to decide whether to
+/// restart the daemon.
+#[test]
+fn a_frame_that_is_not_json_is_answered_and_the_connection_survives_it() {
+    let astd = Daemon::start();
+    let mut stream = UnixStream::connect(astd.sock()).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+    for bad in [r#"{"cmd":"#, r#"{"cmd":"no-such-command"}"#, "not json at all"] {
+        stream.write_all(bad.as_bytes()).unwrap();
+        stream.write_all(b"\n").unwrap();
+        let mut reply = String::new();
+        reader.read_line(&mut reply).unwrap();
+        assert!(reply.contains("bad request"), "{bad} got {reply}");
+    }
+
+    // The same connection, still good for a real request.
+    stream.write_all(b"{\"cmd\":\"ping\"}\n").unwrap();
+    let mut pong = String::new();
+    reader.read_line(&mut pong).unwrap();
+    assert!(pong.contains("pong"), "{pong}");
+}
+
+/// Empty lines are not frames and are not errors — the wire is
+/// line-delimited, and a peer that sends a bare newline has said nothing.
+#[test]
+fn a_blank_line_is_not_a_request() {
+    let astd = Daemon::start();
+    let mut stream = UnixStream::connect(astd.sock()).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    stream.write_all(b"\n   \n{\"cmd\":\"ping\"}\n").unwrap();
+    assert!(read_line(&mut stream).contains("pong"));
+}
+
+/// The connection cap is a cap on what one peer can make the daemon hold, and
+/// a peer that goes past it is turned away with something to read. Slots come
+/// back when connections drop, which is what keeps the cap from being a
+/// one-way door.
+#[test]
+fn connections_past_the_cap_are_turned_away_and_the_slots_come_back() {
+    let astd = Daemon::start();
+    let mut held: Vec<UnixStream> = Vec::new();
+    for n in 0..ipc::MAX_CONNECTIONS {
+        held.push(connect_patiently(&astd.sock()));
+        // Paced, because the kernel's accept queue is smaller than the cap
+        // and is nothing to do with it: `kern.ipc.somaxconn` is 128 on a
+        // stock macOS, so 256 connects in a tight loop are refused by the
+        // backlog before the daemon has been asked anything. What is under
+        // test is what the daemon does once it has them.
+        if n % 32 == 31 {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    // A connection takes its slot when it is admitted, which is on the task
+    // that will serve it rather than in the accept loop. Give those a moment.
+    std::thread::sleep(Duration::from_millis(500));
+
+    let mut over = UnixStream::connect(astd.sock()).expect("the listener still accepts");
+    over.set_read_timeout(Some(ipc::ACCEPT_WAIT + Duration::from_secs(30))).unwrap();
+    let refusal = read_line(&mut over);
+    assert!(refusal.contains("limit"), "a connection past the cap was served: {refusal:?}");
+    drop(over);
+
+    held.clear();
+    std::thread::sleep(Duration::from_millis(500));
+    astd.assert_serving();
+}

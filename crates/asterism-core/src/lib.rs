@@ -9,14 +9,16 @@
 //! hypervisor boundary, [`volume`] is the block
 //! storage a device contributes to the pool, [`secret`] and [`rewrite`] are
 //! the secrets data plane's model and its one substitution rule, and
-//! [`protocol`] is the CLI <-> daemon wire. [`verify`] is the gate every
-//! boot input passes through on its way into the store and out of it again.
+//! [`protocol`] is the CLI <-> daemon wire and [`ipc`] is the door that
+//! wire arrives through. [`verify`] is the gate every boot input passes
+//! through on its way into the store and out of it again.
 
 pub mod cow;
 pub mod durable;
 pub mod hv;
 pub mod image;
 pub mod instance;
+pub mod ipc;
 pub mod oci;
 pub mod orbit;
 pub mod paths;
