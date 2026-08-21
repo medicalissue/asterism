@@ -118,6 +118,17 @@ checked against that release's `SHA256SUMS` before Homebrew is pointed at it.
 The repository's HEAD-only copy is used only for an explicitly requested
 `ASTERISM_REF`.
 
+That local tap is refreshed on every version change, and a stamp file beside
+the formula records which release it was rendered for. Without it, a tap built
+for v0.1.0 would be reused when v0.2.0 is the version being installed, and
+Homebrew — which resolves whatever the formula in the tap says — would
+install v0.1.0 again. A tap with no stamp was not built here; it is a
+published tap, Homebrew keeps it current, and this script does not rewrite it.
+
+Because the formula pins exactly one tag, moving between releases is a
+`brew reinstall` rather than a `brew upgrade`: upgrade refuses to go
+backwards, and a named version has to be reachable from either direction.
+
 ## Cutting a release
 
 ```console
@@ -142,14 +153,22 @@ $ bash scripts/install-test.sh
 Hermetic: it builds a fake release on disk, serves it over `file://`, and
 shims `uname`, `git` and `cargo` where a test needs the machine to be a
 machine it is not. No network, and nothing is written outside one temp
-directory. Twenty-five checks: the default install, an explicit version,
+directory. Twenty-nine checks: the default install, an explicit version,
 a pinned digest, upgrade, downgrade, reinstall, `ASTERISM_FORCE`, uninstall
 and uninstalling twice, a tampered tarball, an unlisted artifact, a missing
 `SHA256SUMS`, an unreachable index, unreachable assets, four unsupported
-hosts, an unwritable prefix, the source escape hatch with and without
-`ASTERISM_REF`, and the Homebrew path with a tampered formula. It also
-asserts the script still passes `sh -n` and `shellcheck`, still names no
-`master` branch, and still has exactly one `sudo` in it.
+hosts, an unwritable prefix, and the source escape hatch with and without
+`ASTERISM_REF`.
+
+The Homebrew path gets its own five: a first install, a no-op re-run, and a
+two-release upgrade and downgrade that assert on the version the tap's
+formula actually pinned rather than on what the script said it would do —
+which is the only way to catch a stale tap quietly serving an old release.
+A published tap is asserted to be left alone, and a tampered formula to be
+refused before Homebrew sees it.
+
+It also asserts the script still passes `sh -n` and `shellcheck`, still names
+no `master` branch, and still has exactly one `sudo` in it.
 
 ## Licensing
 

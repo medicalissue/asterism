@@ -129,16 +129,23 @@ exit 0
 EOF
 chmod +x "${SHIMS}/cargo"
 
-# brew, for the Homebrew path: enough of it to show which formula the
-# installer puts in the tap and which command it hands to Homebrew.
+# brew, for the Homebrew path. Enough of a Homebrew to be a real test: it
+# tracks which tap exists, and what it installs is whatever version the
+# formula in that tap pins — which is the only way a test can catch a stale
+# tap serving an old release.
 cat >"${SHIMS}/brew" <<EOF
 #!/bin/sh
 tapdir="${WORK}/tap"
+formula="\${tapdir}/Formula/asterism.rb"
+installed="${WORK}/brew-installed"
 case "\$1" in
 tap)
-	# No arguments lists taps, and there are none; with one, the tap is not
-	# published, which is the case the local-tap path exists for.
-	[ \$# -eq 1 ] && exit 0
+	# No arguments lists taps; with one, the tap is not published, which is
+	# the case the local-tap path exists for.
+	if [ \$# -eq 1 ]; then
+		[ -d "\$tapdir" ] && printf '%s\n' "medicalissue/asterism"
+		exit 0
+	fi
 	exit 1
 	;;
 untap) exit 0 ;;
@@ -150,15 +157,33 @@ tap-new)
 	printf '%s\n' "\$tapdir"
 	exit 0
 	;;
-list) exit 1 ;;
+list)
+	[ -f "\$installed" ] || exit 1
+	printf 'asterism %s\n' "\$(cat "\$installed")"
+	exit 0
+	;;
 install | reinstall)
 	printf '%s\n' "\$*" >>"${WORK}/brew-args"
+	case " \$* " in
+	*" --HEAD "*)
+		printf 'HEAD' >"\$installed"
+		exit 0
+		;;
+	esac
+	# What Homebrew installs is the version the formula pins, so read it
+	# back out of the stable url rather than being told.
+	v="\$(sed -n 's|.*/tags/v\(.*\)\.tar\.gz.*|\1|p' "\$formula" | head -n 1)"
+	[ -n "\$v" ] || { echo "shim: no stable version in \$formula" >&2; exit 1; }
+	printf '%s' "\$v" >"\$installed"
 	exit 0
 	;;
 esac
 exit 0
 EOF
 chmod +x "${SHIMS}/brew"
+
+brew_installed() { cat "${WORK}/brew-installed"; }
+reset_brew() { rm -rf "${WORK}/tap" "${WORK}/brew-args" "${WORK}/brew-installed"; }
 
 # ---- running the installer -------------------------------------------------
 
@@ -386,7 +411,7 @@ ok "main is built only when it is asked for by name, and is called out when it i
 # ---- 10. the Homebrew path -------------------------------------------------
 
 fresh_prefix brew
-rm -rf "${WORK}/tap" "${WORK}/brew-args"
+reset_brew
 run_install ok ASTERISM_METHOD=brew
 says "fetching file://${FAKE_RELEASES}/v0.1.0/asterism.rb"
 says "sha256 ok:"
@@ -397,14 +422,59 @@ cmp -s "${WORK}/tap/Formula/asterism.rb" "${FAKE_RELEASES}/v0.1.0/asterism.rb" \
 	|| fail "the tap got a formula other than the release's"
 grep -q '^install medicalissue/asterism/asterism$' "${WORK}/brew-args" \
 	|| fail "brew was handed something other than a plain stable install: $(cat "${WORK}/brew-args")"
+[ "$(brew_installed)" = "0.1.0" ] || fail "brew installed $(brew_installed), not 0.1.0"
 ok "the brew path installs the release's rendered formula, not the moving branch"
 
+run_install ok ASTERISM_METHOD=brew
+says "already installed by Homebrew: asterism 0.1.0"
+never_says "brew reinstall"
+ok "re-running the brew path on an up-to-date machine hands Homebrew nothing"
+
+# Two releases, both directions. A local tap built for one release and left
+# alone is the whole bug: Homebrew resolves what the formula in the tap
+# says, so a tap that still holds v0.1.0 installs v0.1.0 no matter which
+# version this script resolved. Each step below asserts on the version the
+# tap's formula actually pinned, not on what the script said it would do.
+fresh_prefix brew-downgrade
+run_install ok ASTERISM_METHOD=brew ASTERISM_VERSION=v0.0.9
+says "the local tap holds v0.1.0 — refreshing it for v0.0.9"
+says "moving 0.1.0 -> 0.0.9"
+says "brew reinstall medicalissue/asterism/asterism"
+cmp -s "${WORK}/tap/Formula/asterism.rb" "${FAKE_RELEASES}/v0.0.9/asterism.rb" \
+	|| fail "the tap still holds the old release's formula"
+[ "$(brew_installed)" = "0.0.9" ] || fail "downgrade left brew on $(brew_installed)"
+ok "the brew path downgrades: the tap is refreshed and Homebrew lands on the older tag"
+
+fresh_prefix brew-upgrade
+run_install ok ASTERISM_METHOD=brew
+says "the local tap holds v0.0.9 — refreshing it for v0.1.0"
+says "moving 0.0.9 -> 0.1.0"
+cmp -s "${WORK}/tap/Formula/asterism.rb" "${FAKE_RELEASES}/v0.1.0/asterism.rb" \
+	|| fail "the tap still holds the old release's formula"
+[ "$(brew_installed)" = "0.1.0" ] || fail "upgrade left brew on $(brew_installed)"
+ok "the brew path upgrades back: a stale tap is refreshed across every version change"
+
+# A published tap is Homebrew's to keep current, and this script does not
+# rewrite one — the stamp is what tells the two apart.
+fresh_prefix brew-published
+reset_brew
+mkdir -p "${WORK}/tap/Formula"
+# A real formula, so Homebrew can resolve it, carrying a line no rendered
+# copy has — if the line survives, the file was not rewritten.
+cp "${FAKE_RELEASES}/v0.1.0/asterism.rb" "${WORK}/tap/Formula/asterism.rb"
+printf '# a published tap, not ours\n' >>"${WORK}/tap/Formula/asterism.rb"
+run_install ok ASTERISM_METHOD=brew
+never_says "refreshing it for"
+never_says "fetching"
+grep -q '^# a published tap, not ours$' "${WORK}/tap/Formula/asterism.rb" \
+	|| fail "a published tap's formula was overwritten"
+ok "a tap this script did not build is left alone"
+
 fresh_prefix brew-tampered
-rm -rf "${WORK}/tap" "${WORK}/brew-args"
-cp -R "${FAKE_RELEASES}/v0.1.0" "${WORK}/brew-tampered-release"
-printf '\n# tampered\n' >>"${WORK}/brew-tampered-release/asterism.rb"
+reset_brew
 mkdir -p "${WORK}/brew-tampered/v0.1.0"
-cp "${WORK}/brew-tampered-release/"* "${WORK}/brew-tampered/v0.1.0/"
+cp "${FAKE_RELEASES}/v0.1.0/"* "${WORK}/brew-tampered/v0.1.0/"
+printf '\n# tampered\n' >>"${WORK}/brew-tampered/v0.1.0/asterism.rb"
 run_install refused ASTERISM_METHOD=brew ASTERISM_BASE_URL="file://${WORK}/brew-tampered"
 says "checksum mismatch on asterism.rb"
 [ ! -e "${WORK}/brew-args" ] || fail "brew was run despite a tampered formula"

@@ -478,9 +478,33 @@ ensure_tap() {
 	fi
 
 	tapdir="$("$brew_bin" --repository "$TAP")"
-	if [ -f "${tapdir}/Formula/asterism.rb" ]; then
+	formula="${tapdir}/Formula/asterism.rb"
+	stamp="${tapdir}/.asterism-local-tap"
+
+	# A formula with no stamp beside it belongs to a published tap, which
+	# Homebrew keeps current. Not ours to rewrite.
+	if [ -f "$formula" ] && [ ! -f "$stamp" ]; then
 		return 0
 	fi
+
+	# The stamp says which release this script rendered the local tap for.
+	# Without it, a tap built for v0.1.0 is reused verbatim when v0.2.0 is
+	# the version being installed — and Homebrew would dutifully install
+	# v0.1.0 again, which is exactly the stale resolution this script
+	# exists to prevent. A ref is never cached: a branch moves.
+	if [ -n "$REF" ]; then
+		want_stamp="head:${REF}"
+	else
+		want_stamp="$version"
+	fi
+	if [ -f "$formula" ] && [ -f "$stamp" ] && [ -z "$REF" ] &&
+		[ "$(cat "$stamp")" = "$want_stamp" ]; then
+		return 0
+	fi
+	if [ -f "$stamp" ]; then
+		say "the local tap holds $(cat "$stamp") — refreshing it for ${want_stamp}"
+	fi
+
 	mkdir -p "${tapdir}/Formula"
 	staged="${TMPDIR_SELF}/asterism.rb"
 
@@ -505,44 +529,65 @@ ensure_tap() {
 			die "could not download SHA256SUMS for ${version}. Refusing to install an unverified formula."
 		fi
 	fi
-	cp "$staged" "${tapdir}/Formula/asterism.rb"
-	say "wrote ${tapdir}/Formula/asterism.rb"
+	cp "$staged" "$formula"
+	printf '%s\n' "$want_stamp" >"$stamp"
+	say "wrote ${formula}"
 }
 
+# QEMU arrives as a formula dependency: Homebrew builds and ships it, we only
+# declare it. Asterism never bundles QEMU.
 install_brew() {
 	brew_bin="$(find_brew)" || no_homebrew
 
 	if [ -n "$REF" ]; then
 		version="$REF"
-		head_flag="--HEAD"
 		say "${REF} is a git ref, not a release — Homebrew gets --HEAD"
 	else
 		version="$(resolve_version)"
-		head_flag=""
+		say "release ${version} through Homebrew"
 	fi
 
-	if "$brew_bin" list --formula --versions asterism >/dev/null 2>&1; then
-		if [ "$FORCE" != "1" ]; then
-			say "already installed by Homebrew: $("$brew_bin" list --formula --versions asterism)"
-			say "run 'brew upgrade ${TAP}/asterism', or re-run with ASTERISM_FORCE=1 to reinstall."
-			return 0
-		fi
-		action="reinstall"
-	else
-		action="install"
-	fi
-
+	# The tap is refreshed before anything is decided, because what Homebrew
+	# resolves is whatever the formula in the tap says. Reading the installed
+	# version first and deciding against a stale formula is how a machine
+	# ends up pinned to whichever release it happened to see first.
 	ensure_tap "$brew_bin" "$version"
 
-	# QEMU arrives as a formula dependency: Homebrew builds and ships it, we
-	# only declare it. Asterism never bundles QEMU.
-	if [ -n "$head_flag" ]; then
-		say "brew ${action} ${head_flag} ${TAP}/asterism"
-		"$brew_bin" "$action" "$head_flag" "${TAP}/asterism"
-	else
-		say "brew ${action} ${TAP}/asterism"
-		"$brew_bin" "$action" "${TAP}/asterism"
+	installed="$("$brew_bin" list --formula --versions asterism 2>/dev/null |
+		head -n 1 | awk '{ print $2 }')"
+
+	if [ -n "$REF" ]; then
+		if [ -n "$installed" ]; then
+			action=reinstall
+		else
+			action=install
+		fi
+		say "brew ${action} --HEAD ${TAP}/asterism"
+		"$brew_bin" "$action" --HEAD "${TAP}/asterism"
+		return 0
 	fi
+
+	if [ -z "$installed" ]; then
+		say "brew install ${TAP}/asterism"
+		"$brew_bin" install "${TAP}/asterism"
+		return 0
+	fi
+
+	if [ "$installed" = "${version#v}" ] && [ "$FORCE" != "1" ]; then
+		say "already installed by Homebrew: asterism ${installed}"
+		say "re-run with ASTERISM_FORCE=1 to reinstall it, or ASTERISM_VERSION to move to another."
+		return 0
+	fi
+
+	if [ "$installed" != "${version#v}" ]; then
+		say "moving ${installed} -> ${version#v}"
+	fi
+	# reinstall, not upgrade: `brew upgrade` refuses to go backwards, and a
+	# named version has to be reachable from either direction. The formula
+	# in the tap pins exactly one tag, so a reinstall lands on that tag
+	# whether it is newer or older than what is there.
+	say "brew reinstall ${TAP}/asterism"
+	"$brew_bin" reinstall "${TAP}/asterism"
 }
 
 # ---- uninstall -------------------------------------------------------------

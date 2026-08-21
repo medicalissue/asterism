@@ -21,8 +21,11 @@ on:
         required: true
         type: string
 
+# Read by default. Only the publish job creates a release, and only that job
+# gets the token that can — a build or a test step has no business being able
+# to write to the repository.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -34,7 +37,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - id: version
         name: Take the version from the tag, and check the tree agrees
@@ -54,8 +57,12 @@ jobs:
           fi
           echo "version=${version}" >>"$GITHUB_OUTPUT"
 
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      # Pinned by digest like the rest, which means the ref no longer names
+      # the toolchain — hence the explicit input.
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch, 2026-08-05
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
 
       - name: Build
         run: cargo build --release --locked --package asterism-cli --package asterism-daemon
@@ -96,7 +103,7 @@ jobs:
           ( cd "dist/${version}" && shasum -a 256 "asterism-${version}-darwin-arm64.tar.gz" asterism.rb >SHA256SUMS )
           cat "dist/${version}/SHA256SUMS"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-${{ steps.version.outputs.version }}
           path: dist/
@@ -110,8 +117,8 @@ jobs:
     needs: build
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-${{ needs.build.outputs.version }}
           path: dist
@@ -175,8 +182,12 @@ jobs:
     needs: [build, verify]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    # The one job that writes anything, and the only one holding a token
+    # that can.
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-${{ needs.build.outputs.version }}
           path: dist
