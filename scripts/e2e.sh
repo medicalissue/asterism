@@ -14,11 +14,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="$HOME/.cargo/bin:$PATH"
 cd "$ROOT"
-cargo build -q
-AST="$ROOT/target/debug/ast"
+# shellcheck source-path=SCRIPTDIR source=lib/harness.sh
+. "$ROOT/scripts/lib/harness.sh"
+harness_begin lifecycle
+harness_binaries "$ROOT"
 
 # Fresh, SHORT home: unix socket paths are capped near 104 bytes.
 export ASTERISM_HOME="/private/tmp/ast-e2e-$$"
+harness_own_home "$ASTERISM_HOME"
 
 # A single-device test has no orbit, so it has no business publishing a
 # throwaway key and this machine's addresses to a public discovery service.
@@ -29,19 +32,27 @@ VOL="$ASTERISM_HOME/e2e-vol"   # dash on purpose: covers systemd \x2d escaping
 MARKER="marker-$$"
 
 cleanup() {
+  # Evidence first: the console log and the daemon log live under the home
+  # this trap is about to delete, and they are the only account of why a
+  # boot did not happen.
+  harness_keep_home "$ASTERISM_HOME" home
   "$AST" down "$INST" >/dev/null 2>&1 || true
   "$AST" rm "$INST" >/dev/null 2>&1 || true
-  pkill -f "$ROOT/target/debug/astd" 2>/dev/null || true
+  # Only what this run started. The `pkill -f` that used to be here matched
+  # every astd built at this path, which on a machine with a second checkout
+  # of this repository is somebody else's daemon and somebody else's guests.
+  harness_reap
   rm -rf "$ASTERISM_HOME"
+  harness_artifacts_note
 }
 trap cleanup EXIT
 
 mkdir -p "$ASTERISM_HOME/images" "$VOL"
 echo "$MARKER" > "$VOL/MARKER.txt"
-# Reuse already-pulled images instead of re-downloading.
-if [ -d "$HOME/.asterism/images" ]; then
-  cp "$HOME/.asterism/images/"*.qcow2 "$ASTERISM_HOME/images/" 2>/dev/null || true
-fi
+# Reuse already-pulled images instead of re-downloading. From the harness's
+# own cache, never from ~/.asterism: that directory belongs to the user's
+# daemon, which may be writing to it right now.
+harness_seed_images "$ASTERISM_HOME"
 
 fail() { echo "E2E FAIL: $*" >&2; exit 1; }
 
@@ -55,11 +66,29 @@ expect() {
   echo "ok: $desc"
 }
 
+# The image comes from the harness cache, filled once by the binary under
+# test if it is not there yet, so only a first run downloads anything. The
+# pull afterwards is what registers the copied file in this home's store; it
+# has nothing left to fetch.
+harness_cache_image "$AST" "$IMAGE" || fail "could not cache $IMAGE"
+harness_seed_images "$ASTERISM_HOME"
 "$AST" pull "$IMAGE" >/dev/null 2>&1 || fail "pull $IMAGE"
 
 expect "create"  "$INST  defined"  "$AST" create "$INST" --image "$IMAGE" --mem 2G --disk 10G
 expect "attach"  "/mnt/ast/e2e-vol" "$AST" attach "$INST" --volume "$VOL"
 expect "up"      "$INST  running"  "$AST" up "$INST"
+
+# Which backend it actually booted on, asserted rather than assumed.
+#
+# The create above names no backend, so the daemon picks — and the two of
+# them boot the same image and pass every other line of this script. What
+# makes the answer qemu here is the attach: a host directory reaches a guest
+# over 9p, which vz cannot share, so a request that needs one falls through
+# to qemu. That is a selection policy, not a coincidence, and this is the
+# line that fails when it changes.
+harness_assert_backend "$AST" "$INST" qemu \
+  || fail "the marker below would be proving something about a different backend"
+echo "ok: the guest is on qemu, which is the backend that can share a directory"
 
 # First boot: sshd can come up before cloud-init has mounted the volumes,
 # so give the marker a bounded retry instead of failing on the race.

@@ -38,9 +38,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="$HOME/.cargo/bin:$PATH"
 cd "$ROOT"
-cargo build -q
-AST="$ROOT/target/debug/ast"
-ASTD="$ROOT/target/debug/astd"
+# shellcheck source-path=SCRIPTDIR source=lib/harness.sh
+. "$ROOT/scripts/lib/harness.sh"
+harness_begin wake
+harness_binaries "$ROOT"
 
 # Fresh, SHORT homes: unix socket paths are capped near 104 bytes, and these
 # are deliberately nowhere near the user's own ~/.asterism.
@@ -71,9 +72,16 @@ cleanup() {
     kill -CONT "$pid" 2>/dev/null || true
     kill -TERM "$pid" 2>/dev/null || true
   done
+  # Evidence before the homes go, whether or not E2E_KEEP was asked for: a
+  # CI run cannot come back later to look at a directory it did not keep.
+  local home
+  for home in "$RUN"/*/; do
+    [ -d "$home" ] && harness_keep_home "$home" "$(basename "$home")"
+  done
   # E2E_KEEP=1 leaves the homes and their logs behind, for when a failure
   # needs reading rather than reproducing.
   [ -n "${E2E_KEEP:-}" ] || rm -rf "$RUN"
+  harness_artifacts_note
 }
 trap cleanup EXIT
 
@@ -287,6 +295,8 @@ if [ "$(uname -s)" = "Darwin" ]; then
 fi
 echo "ok: ast device check reports this device's readiness"
 echo "--- ast device check on this Mac ---"
+# shellcheck disable=SC2001  # a prefix on every line, which parameter
+# expansion cannot do
 sed 's/^/    /' <<<"$CHECK"
 echo "---"
 
@@ -382,6 +392,8 @@ grep -qF "it is the orbit's beacon" <<<"$NOPEER" \
   || fail "the refusal does not point at the beacon that would fix it:"$'\n'"$NOPEER"
 echo "ok: no awake device on $B_NAME's network — said exactly, with the remedy"
 echo "--- the no-peer path ---"
+# shellcheck disable=SC2001  # a prefix on every line, which parameter
+# expansion cannot do
 sed 's/^/    /' <<<"$NOPEER"
 echo "---"
 

@@ -49,6 +49,15 @@ pub struct Settings {
     /// The running daemon's version, or why we could not ask.
     pub daemon: Option<String>,
     pub daemon_error: Option<String>,
+    /// The build the running daemon was compiled from. `None` is a daemon
+    /// too old to say, which is not the same as one that is not running —
+    /// that shows up as `daemon_error`.
+    pub daemon_build: Option<String>,
+    /// The build *this app* was compiled from. It is stamped into
+    /// `asterism-core` at compile time, so it is here without asking anyone,
+    /// and it is here at all because the app and the daemon are shipped
+    /// separately and can silently come apart.
+    pub app_build: String,
     /// `ASTERISM_HOME`, resolved. The state every other row is about.
     pub home: String,
     pub service: Service,
@@ -105,9 +114,9 @@ impl Settings {
     /// Read everything the section shows. `autostart` comes in from the
     /// app, which is the only thing that can ask the plugin holding it.
     pub fn load(autostart: bool) -> Settings {
-        let (daemon, daemon_error) = match client::daemon_version() {
-            Ok(version) => (Some(version), None),
-            Err(e) => (None, Some(format!("{e:#}"))),
+        let (daemon, daemon_build, daemon_error) = match client::daemon_build() {
+            Ok((version, build)) => (Some(version), build, None),
+            Err(e) => (None, None, Some(format!("{e:#}"))),
         };
         Settings {
             autostart,
@@ -115,6 +124,8 @@ impl Settings {
             default_backend: preferred_backend(),
             daemon,
             daemon_error,
+            daemon_build,
+            app_build: asterism_core::BUILD_ID.to_owned(),
             home: paths::home_dir().display().to_string(),
             service: Service::load(),
         }
@@ -135,8 +146,12 @@ impl Settings {
                 }
             }
         }
+        out.push(format!("app build {}", self.app_build));
         match (&self.daemon, &self.daemon_error) {
-            (Some(version), _) => out.push(format!("daemon {version}")),
+            (Some(version), _) => out.push(format!(
+                "daemon {version} build {}",
+                self.daemon_build.as_deref().unwrap_or("unknown")
+            )),
             (None, Some(reason)) => out.push(format!("daemon unavailable — {reason}")),
             (None, None) => out.push("daemon unavailable".to_owned()),
         }
@@ -232,6 +247,8 @@ mod tests {
             default_backend: "qemu".into(),
             daemon: Some("0.0.2".into()),
             daemon_error: None,
+            daemon_build: Some("0.0.2+0123456789ab".into()),
+            app_build: "0.0.2+0123456789ab".into(),
             home: "/tmp/ast-home".into(),
             service: Service {
                 mechanism: "launchd".into(),
@@ -270,13 +287,36 @@ mod tests {
     #[test]
     fn an_unreachable_daemon_says_so_where_the_version_would_be() {
         let mut s = settings();
-        assert!(s.lines().contains(&"daemon 0.0.2".to_owned()));
+        assert!(s
+            .lines()
+            .contains(&"daemon 0.0.2 build 0.0.2+0123456789ab".to_owned()));
 
         s.daemon = None;
         s.daemon_error = Some("astd is not answering".into());
         let lines = s.lines().join("\n");
         assert!(lines.contains("daemon unavailable — astd is not answering"), "{lines}");
         assert!(!lines.contains("daemon 0.0.2"), "{lines}");
+    }
+
+    /// The two builds are separate facts, and each is reported even when the
+    /// other cannot be: the app always knows its own, and a daemon that
+    /// answered without one is old rather than absent.
+    #[test]
+    fn both_builds_are_reported_and_a_missing_one_is_not_a_missing_daemon() {
+        let mut s = settings();
+        let lines = s.lines().join("\n");
+        assert!(lines.contains("app build 0.0.2+0123456789ab"), "{lines}");
+
+        s.daemon_build = None;
+        let lines = s.lines().join("\n");
+        assert!(lines.contains("daemon 0.0.2 build unknown"), "{lines}");
+        // The app still knows its own build; only the daemon's is missing.
+        assert!(lines.contains("app build 0.0.2+0123456789ab"), "{lines}");
+
+        s.daemon = None;
+        s.daemon_error = Some("astd is not answering".into());
+        let lines = s.lines().join("\n");
+        assert!(!lines.contains("build unknown"), "{lines}");
     }
 
     #[test]

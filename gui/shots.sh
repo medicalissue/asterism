@@ -8,6 +8,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="$HOME/.cargo/bin:$PATH"
+# shellcheck source-path=SCRIPTDIR source=../scripts/lib/harness.sh
+. "$ROOT/scripts/lib/harness.sh"
+harness_begin shots
 AST="$ROOT/target/debug/ast"
 ASTD="$ROOT/target/debug/astd"
 APP="$ROOT/gui/target/release/bundle/macos/Asterism.app/Contents/MacOS/asterism-gui"
@@ -23,6 +26,7 @@ mkdir -p "$SHOTS"
 
 start_daemon() {
   local home="$1"
+  harness_own_home "$home"
   ( ASTERISM_HOME="$home" ASTERISM_MESH=local "$ASTD" >>"$home/astd.log" 2>&1 & )
   for _ in $(seq 1 60); do
     ASTERISM_HOME="$home" "$AST" ls --local >/dev/null 2>&1 && return 0
@@ -31,13 +35,27 @@ start_daemon() {
   echo "astd for $home did not come up" >&2; exit 1
 }
 
-pkill -f "$APP" 2>/dev/null || true
+# Every app this script launches, so that closing one is closing ours.
+# `pkill -f "$APP"` used to do it, which also reached a copy of the app the
+# person running this had open for their own reasons.
+APP_PID=
+
+close_app() {
+  [ -n "$APP_PID" ] || return 0
+  harness_stop "$APP_PID"
+  APP_PID=
+}
+
+close_app
 # `--reuse` keeps the daemons `KEEP=1 proof.sh` left running. A restarted
 # daemon comes up on a new endpoint and its peer's cached address is stale,
 # so a Devices table photographed after a cold restart would be a picture of
 # a partition rather than of an orbit.
 if [ "${1:-}" != "--reuse" ]; then
-  pkill -f "$ASTD" 2>/dev/null || true
+  # Only the two scratch homes' daemons. The `pkill -f "$ASTD"` that stood
+  # here stopped every astd built at that path, a developer's own included.
+  harness_reap_home "$A"
+  harness_reap_home "$B"
   sleep 0.5
   start_daemon "$A"
   start_daemon "$B"
@@ -46,11 +64,12 @@ ASTERISM_HOME="$A" "$AST" devices || true
 
 shoot() {
   local theme="$1" section="$2"
-  pkill -f "$APP" 2>/dev/null || true
+  close_app
   sleep 0.6
   ASTERISM_HOME="$A" ASTERISM_AST="$AST" ASTERISM_ASTD="$ASTD" \
     "$APP" --main --section "$section" --theme "$theme" \
     >"$RUN/app-$theme-$section.log" 2>&1 &
+  APP_PID=$!
   # Long enough for the first orbit-wide read to come back, which on an
   # orbit with a device out of touch is the daemon's mesh timeout.
   sleep 13
@@ -65,13 +84,14 @@ for theme in dark light; do
 done
 
 # And the dialog the Instances button opens, in the same skin.
-pkill -f "$APP" 2>/dev/null || true
+close_app
 sleep 0.6
 ASTERISM_HOME="$A" ASTERISM_AST="$AST" ASTERISM_ASTD="$ASTD" \
   "$APP" --new-instance --theme dark >"$RUN/app-dialog.log" 2>&1 &
+APP_PID=$!
 sleep 5
 screencapture -x -R "710,377,500,326" "$SHOTS/dark-new-instance.png"
 echo "  dark new-instance"
-pkill -f "$APP" 2>/dev/null || true
+close_app
 
 echo "shots in $SHOTS"

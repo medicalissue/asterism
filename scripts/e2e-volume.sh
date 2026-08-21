@@ -21,9 +21,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="$HOME/.cargo/bin:$PATH"
 cd "$ROOT"
-cargo build -q
-AST="$ROOT/target/debug/ast"
-ASTD="$ROOT/target/debug/astd"
+# shellcheck source-path=SCRIPTDIR source=lib/harness.sh
+. "$ROOT/scripts/lib/harness.sh"
+harness_begin volume
+harness_binaries "$ROOT"
 
 # Fresh, SHORT homes: unix socket paths are capped near 104 bytes, and a volume
 # adds an export socket and a bridge socket to the pile. Deliberately nowhere
@@ -80,6 +81,11 @@ kill_pidfile() {
 cleanup() {
   if [ -n "${CLEANED:-}" ]; then return 0; fi
   CLEANED=1
+  # Evidence before the homes go: a daemon log and a console log are the
+  # whole account of a failure, and they live in the directory below.
+  for home in "$A" "$B"; do
+    harness_keep_home "$home" "$(basename "$home")"
+  done
   local home f pid
   # The daemons first: astd is what restarts a guest it notices die, so a
   # guest killed while its daemon is up can come straight back.
@@ -99,6 +105,7 @@ cleanup() {
     done
   done
   rm -rf "$RUN"
+  harness_artifacts_note
 }
 trap cleanup EXIT
 
@@ -291,9 +298,10 @@ expect "A can list B's volumes by naming B" "$VOL" \
 
 # ---- 3. an instance on A, attaching B's volume -----------------------------
 
-mkdir -p "$A/images"
-cp "$HOME/.asterism/images/"*.raw "$A/images/" 2>/dev/null || true
-cp "$HOME/.asterism/images/"*.qcow2 "$A/images/" 2>/dev/null || true
+# From the harness's own cache, never ~/.asterism: that one belongs to the
+# user's daemon and may be written to while this is reading it.
+harness_cache_image "$AST" "$IMAGE" || fail "could not cache $IMAGE"
+harness_seed_images "$A"
 ASTERISM_HOME="$A" "$AST" pull "$IMAGE" >/dev/null 2>&1 \
   || fail "no $IMAGE image available for A (pull it once: ast pull $IMAGE)"
 
@@ -579,6 +587,9 @@ if [ -z "$REATTACHED" ]; then
   NEW_LOG="$(tail -c "+$((LOG_AT + 1))" "$A/astd.log" 2>/dev/null || true)"
   BRIDGE_INO_NOW="$(inode_of "$BRIDGE")"
   if [ ! -S "$BRIDGE" ] || [ "$BRIDGE_INO_NOW" = "$BRIDGE_INO" ]; then
+    # Two adjacent quoted strings joined across a line break, which is
+    # concatenation and not the "A"B"C" quoting mistake it resembles.
+    # shellcheck disable=SC2140
     fail "the new astd did not bind its own bridge socket at $BRIDGE"\
 " (inode ${BRIDGE_INO:-none} before the restart, ${BRIDGE_INO_NOW:-none} now):"$'\n'"$NEW_LOG"
   fi

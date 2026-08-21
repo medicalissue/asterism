@@ -246,6 +246,7 @@ name = "asterism-vz"
 version = "0.0.2"
 dependencies = [
  "anyhow",
+ "asterism-core",
  "block2",
  "objc2",
  "objc2-foundation",

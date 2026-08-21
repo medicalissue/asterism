@@ -38,16 +38,18 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="$HOME/.cargo/bin:$PATH"
 cd "$ROOT"
-cargo build -q
+# shellcheck source-path=SCRIPTDIR source=lib/harness.sh
+. "$ROOT/scripts/lib/harness.sh"
+harness_begin keys
+harness_binaries "$ROOT"
 
 # Fresh, SHORT home: unix socket paths are capped near 104 bytes.
 export ASTERISM_HOME="/private/tmp/ast-keys-$$"
 # A single-device test has no orbit, so it has no business publishing a
 # throwaway key and this machine's addresses to a public discovery service.
 export ASTERISM_MESH=local
+harness_own_home "$ASTERISM_HOME"
 BIN="$ASTERISM_HOME/bin"
-AST="$BIN/ast"
-ASTD="$BIN/astd"
 LOG="$ASTERISM_HOME/astd.log"
 IMAGE="${E2E_IMAGE:-debian:13}"
 INST=keys
@@ -57,10 +59,14 @@ fail() { echo "KEYS E2E FAIL: $*" >&2; exit 1; }
 ok() { echo "ok: $*"; }
 
 cleanup() {
+  harness_keep_home "$ASTERISM_HOME" home
   if [ -n "$ASTD_PID" ]; then kill -9 "$ASTD_PID" 2>/dev/null || true; fi
-  # Only ever our own processes: every one of them names this home on its
-  # command line.
-  pkill -9 -f "$ASTERISM_HOME" 2>/dev/null || true
+  # Only what this run started. `pkill -9 -f "$ASTERISM_HOME"` used to stand
+  # here: it matched command lines, so it also reached anything that merely
+  # named this directory — and it reached it with SIGKILL. The daemon writes
+  # down every process it starts; harness_reap stops those.
+  harness_reap
+  harness_artifacts_note
   if [ -n "${KEEP:-}" ]; then
     echo "kept $ASTERISM_HOME for inspection"
   else
@@ -71,11 +77,12 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$ASTERISM_HOME/images" "$BIN"
-cp "$ROOT/target/debug/ast" "$ROOT/target/debug/astd" "$BIN/"
-if [ -d "$HOME/.asterism/images" ]; then
-  cp "$HOME/.asterism/images/"*.qcow2 "$ASTERISM_HOME/images/" 2>/dev/null || true
-  cp "$HOME/.asterism/images/"*.raw "$ASTERISM_HOME/images/" 2>/dev/null || true
-fi
+# Copied into the home rather than run out of target/, so that a rebuild
+# part-way through a long run cannot swap the binary under a live daemon.
+cp "$AST" "$ASTD" "$BIN/"
+AST="$BIN/ast"
+ASTD="$BIN/astd"
+harness_seed_images "$ASTERISM_HOME"
 
 # expect <desc> <needle> <cmd...>: run cmd, require success AND the needle.
 expect() {
@@ -125,6 +132,12 @@ ssh_answers() {
   return 1
 }
 
+# The image comes from the harness cache, filled once by the binary under
+# test if it is not there yet, so only a first run downloads anything. Done
+# before the daemon starts, so nothing lands in a store a running daemon may
+# be reading; the pull further down registers what was copied.
+harness_cache_image "$AST" "$IMAGE" || fail "could not cache $IMAGE"
+harness_seed_images "$ASTERISM_HOME"
 echo "== guest key durability e2e in $ASTERISM_HOME"
 start_astd
 "$AST" pull "$IMAGE" >/dev/null 2>&1 || fail "pull $IMAGE"

@@ -13,9 +13,11 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="$HOME/.cargo/bin:$PATH"
-AST="$ROOT/target/debug/ast"
-ASTD="$ROOT/target/debug/astd"
-GUI="$ROOT/gui/target/debug/asterism-gui"
+# shellcheck source-path=SCRIPTDIR source=../scripts/lib/harness.sh
+. "$ROOT/scripts/lib/harness.sh"
+harness_begin gui
+harness_binaries "$ROOT"
+GUI="${GUI_BIN:-$ROOT/gui/target/debug/asterism-gui}"
 
 RUN="/private/tmp/ast-gui3"
 A="$RUN/a"
@@ -26,8 +28,14 @@ B_NAME="orbit-b"
 # KEEP=1 leaves the two daemons running, so that shots.sh can photograph the
 # orbit this built rather than one reassembled from cold caches.
 cleanup() {
+  harness_keep_home "$A" a
+  harness_keep_home "$B" b
+  harness_artifacts_note
   [ "${KEEP:-}" = "1" ] && return 0
-  pkill -f "$ASTD" 2>/dev/null || true
+  # Only the two daemons this run started. `pkill -f "$ASTD"` reached every
+  # astd built at that path — including a developer's own, running against
+  # their own home, with their own guests under it.
+  harness_reap
 }
 trap cleanup EXIT
 
@@ -49,6 +57,9 @@ done
 
 start_daemon() {
   local home="$1"
+  # Registered before it is started, so that a daemon which comes up and then
+  # wedges is still something the cleanup trap can reach.
+  harness_own_home "$home"
   ( ASTERISM_HOME="$home" ASTERISM_MESH=local "$ASTD" >"$home/astd.log" 2>&1 & )
   for _ in $(seq 1 60); do
     grep -q "on the mesh as" "$home/astd.log" 2>/dev/null && return 0

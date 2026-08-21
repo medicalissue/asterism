@@ -28,9 +28,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="$HOME/.cargo/bin:$PATH"
 cd "$ROOT"
-cargo build -q
-AST="$ROOT/target/debug/ast"
-ASTD="$ROOT/target/debug/astd"
+# shellcheck source-path=SCRIPTDIR source=lib/harness.sh
+. "$ROOT/scripts/lib/harness.sh"
+harness_begin move
+harness_binaries "$ROOT"
 
 # Fresh, SHORT homes: unix socket paths are capped near 104 bytes.
 RUN="/private/tmp/ast-move-$$"
@@ -90,6 +91,11 @@ kill_pidfile() {
 cleanup() {
   if [ -n "${CLEANED:-}" ]; then return 0; fi
   CLEANED=1
+  # Evidence before the homes go: a daemon log and a console log are the
+  # whole account of a failure, and they live in the directory below.
+  for home in "$A" "$B" "$C"; do
+    harness_keep_home "$home" "$(basename "$home")"
+  done
   local home f pid
   # The daemons first: astd is what restarts a guest it notices die, so a
   # guest killed while its daemon is up can come straight back.
@@ -109,6 +115,7 @@ cleanup() {
     done
   done
   rm -rf "$RUN"
+  harness_artifacts_note
 }
 trap cleanup EXIT
 
@@ -232,8 +239,10 @@ echo "ok: A and B are one orbit"
 #
 # Only A gets the image store. B will have to get the base from A.
 
-mkdir -p "$A/images"
-cp "$HOME/.asterism/images/"*.qcow2 "$A/images/" 2>/dev/null || true
+# From the harness's own cache, never ~/.asterism: that one belongs to the
+# user's daemon and may be written to while this is reading it.
+harness_cache_image "$AST" "$IMAGE" || fail "could not cache $IMAGE"
+harness_seed_images "$A"
 ASTERISM_HOME="$A" "$AST" pull "$IMAGE" >/dev/null 2>&1 \
   || fail "no $IMAGE image available for A (pull it once: ast pull $IMAGE)"
 [ -z "$(ls "$B/images" 2>/dev/null || true)" ] \
@@ -495,6 +504,9 @@ MOVE_PID=$!
 # Wait for real bytes to be on the far side, then pull the plug on it.
 staged=
 for _ in $(seq 1 600); do
+  # The glob is the match; `ls` only picks the first of what it expanded to,
+  # and every path here is one this script chose.
+  # shellcheck disable=SC2012
   disk="$(ls "$B"/instances/"$KILL".moving-*/disk.raw 2>/dev/null | head -1 || true)"
   # A disk that cannot be measured yet has not been staged yet: the file is
   # appearing under this loop, so "no answer" is 0 and not a failure.

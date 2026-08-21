@@ -40,12 +40,21 @@ if [ "$(uname -s)" != "Darwin" ]; then
   exit 0
 fi
 
-cargo build -q
+# shellcheck source-path=SCRIPTDIR source=lib/harness.sh
+. "$ROOT/scripts/lib/harness.sh"
+harness_begin vz
+harness_binaries "$ROOT"
 # Builds and signs the helper. Without the entitlement `ast create --backend
 # vz` refuses, which is the first thing this script would trip over.
-"$ROOT/scripts/sign-vz.sh"
-AST="$ROOT/target/debug/ast"
-ASTD="$ROOT/target/debug/astd"
+#
+# Skipped when the binaries under test came from somewhere else: `astd` looks
+# for `astd-vz` beside itself, so signing this tree's helper would prove
+# nothing about theirs — and re-signing a helper somebody shipped is not this
+# script's business. scripts/rc.sh will not select this lane at all unless
+# there is a helper beside the pair it installed.
+if [ -z "${AST_BIN:-}" ]; then
+  "$ROOT/scripts/sign-vz.sh"
+fi
 
 # Fresh, SHORT home: unix socket paths are capped near 104 bytes, and the vz
 # control socket lives under it too.
@@ -148,6 +157,7 @@ stop_pid() {
 }
 
 cleanup() {
+  harness_keep_home "$ASTERISM_HOME" home
   # The product's own path first, so a normal run's cleanup is the graceful
   # one and the signals below have nothing left to do.
   local name pid
@@ -162,6 +172,7 @@ cleanup() {
   pid="$(astd_pid || true)"
   [ -n "$pid" ] && stop_pid "$pid" "astd" || true
   rm -rf "$ASTERISM_HOME"
+  harness_artifacts_note
 }
 trap cleanup EXIT
 
@@ -171,10 +182,9 @@ mkdir -p "$ASTERISM_HOME/images"
 # no-op. Converting a .qcow2 is the one step in this script that still shells
 # out to qemu-img (core/image.rs), which is a property of the image store and
 # not of the vz backend — hence the message on the pull.
-if [ -d "$HOME/.asterism/images" ]; then
-  cp "$HOME/.asterism/images/"*.qcow2 "$ASTERISM_HOME/images/" 2>/dev/null || true
-  cp "$HOME/.asterism/images/"*.raw "$ASTERISM_HOME/images/" 2>/dev/null || true
-fi
+# ...from the harness's own cache, never ~/.asterism: that one belongs to the
+# user's daemon and can be written to while this is reading it.
+harness_seed_images "$ASTERISM_HOME"
 
 fail() { echo "E2E-VZ FAIL: $*" >&2; exit 1; }
 
@@ -217,10 +227,12 @@ boot_seconds() {
   python3 -c "print(f'{$(date +%s.%N) - $started:.1f}')"
 }
 
+harness_cache_image "$AST" "$IMAGE" || fail "could not cache $IMAGE"
+harness_seed_images "$ASTERISM_HOME"
 pull_out="$("$AST" pull "$IMAGE" 2>&1)" || fail \
   "pull $IMAGE:"$'\n'"$pull_out"$'\n'"(a base image that is still qcow2 is converted with qemu-img, \
 which is the image store's dependency, not the vz backend's — put a raw base in \
-$HOME/.asterism/images to run this on a device with no QEMU at all)"
+$(harness_cache_dir)/images to run this on a device with no QEMU at all)"
 
 # ---- the vz instance -------------------------------------------------------
 #
@@ -368,6 +380,8 @@ if [ "$QEMU_COMPARE" != "1" ]; then
   echo "skipped: qemu boot-time comparison — set E2E_VZ_QEMU_COMPARE=1 to run it"
 elif ! qemu_create="$("$AST" create "$REF" --backend qemu --image "$IMAGE" --mem 2G --disk 10G 2>&1)"; then
   echo "skipped: qemu boot-time comparison — this device cannot run the qemu backend:"
+  # shellcheck disable=SC2001  # a prefix on every line, which parameter
+  # expansion cannot do
   sed 's/^/  /' <<<"$qemu_create"
 else
   grep -qF "$REF  defined" <<<"$qemu_create" \

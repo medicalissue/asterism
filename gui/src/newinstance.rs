@@ -140,9 +140,9 @@ const DEFAULT_IMAGE: &str = "debian:13";
 pub fn catalog() -> Vec<Image> {
     image::CATALOG
         .iter()
-        .filter_map(|(alias, _, _)| {
-            let resolved = image::resolve(alias).ok()?;
-            Some(Image { name: (*alias).to_owned(), pulled: resolved.is_pulled() })
+        .filter_map(|entry| {
+            let resolved = image::resolve(entry.alias).ok()?;
+            Some(Image { name: entry.alias.to_owned(), pulled: resolved.is_pulled() })
         })
         .collect()
 }
@@ -456,7 +456,7 @@ mod tests {
     fn the_dropdown_is_the_catalog_ast_images_prints() {
         let found = catalog();
         let names: Vec<&str> = found.iter().map(|i| i.name.as_str()).collect();
-        let want: Vec<&str> = image::CATALOG.iter().map(|(alias, _, _)| *alias).collect();
+        let want: Vec<&str> = image::CATALOG.iter().map(|entry| entry.alias).collect();
         assert_eq!(names, want);
         assert!(names.contains(&DEFAULT_IMAGE), "the form's default is in the catalog");
     }

@@ -127,6 +127,8 @@ mod tests {
                         default_backend: "qemu".into(),
                         daemon: None,
                         daemon_error: None,
+                        daemon_build: None,
+                        app_build: "0.0.2+0123456789ab".into(),
                         home: "/tmp".into(),
                         service: crate::settings::Service {
                             mechanism: "launchd".into(),

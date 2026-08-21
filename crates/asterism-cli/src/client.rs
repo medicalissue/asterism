@@ -215,8 +215,8 @@ fn ensure_current_daemon() -> Result<()> {
 /// if it matches. Spawns a daemon if none is running.
 fn stale_version() -> Result<Option<String>> {
     match send_once(&Request::Ping)? {
-        Response::Pong { version } if version == VERSION => Ok(None),
-        Response::Pong { version } => Ok(Some(version)),
+        Response::Pong { version, .. } if version == VERSION => Ok(None),
+        Response::Pong { version, .. } => Ok(Some(version)),
         // A daemon older than the Pong reply answers Ping with plain Ok.
         // The absence of a version is the mismatch.
         Response::Ok => Ok(Some(format!("older than {VERSION}"))),

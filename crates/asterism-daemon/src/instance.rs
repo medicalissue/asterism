@@ -48,7 +48,12 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
         // `ast` sends it before every command, and a daemon that has just
         // noticed a dead guest should have reconciled that before it says it
         // is well.
-        Request::Ping => return Response::Pong { version: VERSION.to_owned() },
+        Request::Ping => {
+            return Response::Pong {
+                version: VERSION.to_owned(),
+                build_id: Some(asterism_core::BUILD_ID.to_owned()),
+            }
+        }
         Request::List => return Response::Instances { instances: reg.list() },
         Request::Status { name } => {
             return match reg.get(&name) {

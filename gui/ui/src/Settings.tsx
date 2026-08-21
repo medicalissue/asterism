@@ -53,6 +53,11 @@ export function Settings({
           />
         </div>
         <div className="setting-row read-only"><div><strong>Daemon version</strong><p>{model.daemon ?? `Unavailable — ${model.daemon_error ?? 'no response'}`}</p></div><span className={`status-dot ${model.daemon ? 'running' : 'unknown'}`} /></div>
+        {/* Which builds these two actually are. The app and the daemon ship
+            separately, so a version they agree on is not proof they are the
+            same build — and when they are not, this row is the only place
+            that says so. */}
+        <div className="setting-row read-only"><div><strong>Build</strong><p>app {model.app_build}{model.daemon ? ` · daemon ${model.daemon_build ?? 'unknown'}` : ''}</p></div></div>
         <div className="setting-row read-only"><div><strong>Asterism home</strong><p className="mono" title={model.home}>{model.home}</p></div></div>
       </section>
     </div>

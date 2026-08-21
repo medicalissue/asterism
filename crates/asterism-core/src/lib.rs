@@ -40,3 +40,38 @@ pub mod volume;
 /// daemon left running across an upgrade answers newer requests with an
 /// "unknown variant" parse error rather than anything a user could act on.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The exact build this binary came from: `<version>+<source>`, where source
+/// is the commit it was compiled from (suffixed `.dirty` when the worktree
+/// had uncommitted changes), an id the build was handed, or `unknown`.
+///
+/// A version number cannot tell two builds of the same tag apart, and every
+/// build between two tags reports the same one — so "which binary is this"
+/// is a question [`VERSION`] cannot answer and this one can. It is stamped at
+/// compile time by this crate's build script and nothing at runtime can
+/// change it, which is the property that makes it worth asserting on: `ast`,
+/// `astd` and the desktop app all link this crate, so when they report
+/// different ids they really are different builds.
+pub const BUILD_ID: &str = env!("ASTERISM_BUILD_ID");
+
+#[cfg(test)]
+mod build_id_tests {
+    use super::*;
+
+    #[test]
+    fn the_build_id_is_stamped_and_starts_with_the_version() {
+        // The stamp is compile-time, so this is really a test of the build
+        // script: a missing or malformed one has to fail here rather than in
+        // a bug report six weeks later.
+        assert!(
+            BUILD_ID.starts_with(&format!("{VERSION}+")),
+            "build id {BUILD_ID} does not carry version {VERSION}"
+        );
+        let source = &BUILD_ID[VERSION.len() + 1..];
+        assert!(!source.is_empty(), "build id {BUILD_ID} names no source");
+        assert!(
+            source.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+')),
+            "build id {BUILD_ID} is not one word"
+        );
+    }
+}

@@ -350,6 +350,16 @@ fn parse_args() -> anyhow::Result<std::path::PathBuf> {
                 );
                 std::process::exit(0);
             }
+            // The helper is shipped beside `ast` and `astd` and is the one
+            // piece of the set that also has to be code-signed, so "is this
+            // the helper that came with these binaries" is a question worth
+            // being able to ask it directly. Spelled the same way `ast
+            // version` spells it, so one comparison covers all three.
+            "-V" | "--version" => {
+                println!("version   {}", asterism_core::VERSION);
+                println!("build     {}", asterism_core::BUILD_ID);
+                std::process::exit(0);
+            }
             other => anyhow::bail!("unknown argument {other}"),
         }
     }

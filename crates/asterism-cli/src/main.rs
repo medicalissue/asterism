@@ -390,6 +390,18 @@ enum Command {
     Service(ServiceCommand),
     /// Run the device daemon in the foreground.
     Daemon,
+    /// Print exactly which build this is: version, build id, artifact digest.
+    ///
+    /// `ast --version` answers "which release"; this answers "which binary",
+    /// which is the question worth asking when two machines behave
+    /// differently on the same release.
+    Version,
+    /// Everything worth pasting into a bug report, on stdout.
+    ///
+    /// Identity first (what `ast`, `astd` and the desktop app each are), then
+    /// where this device keeps its state and what is running. Nothing here
+    /// contacts another device and nothing here prints a secret.
+    Bugreport,
 }
 
 /// `ast snapshot ...` — taking one, and deleting one.
@@ -684,6 +696,14 @@ fn main() -> Result<()> {
             local_only("daemon", device.as_deref())?;
             let err = exec_daemon();
             return Err(err).context("running astd");
+        }
+        Command::Version => {
+            local_only("version", device.as_deref())?;
+            return print_version();
+        }
+        Command::Bugreport => {
+            local_only("bugreport", device.as_deref())?;
+            return print_bugreport();
         }
     };
 
@@ -1937,8 +1957,8 @@ fn stale_version() -> Result<Option<String>> {
     // every command, a hang here is a hang everywhere, with nothing on the
     // screen to say so.
     match exchange(&Request::Ping, Some(ipc::HANDSHAKE_DEADLINE))? {
-        Response::Pong { version } if version == VERSION => Ok(None),
-        Response::Pong { version } => Ok(Some(version)),
+        Response::Pong { version, .. } if version == VERSION => Ok(None),
+        Response::Pong { version, .. } => Ok(Some(version)),
         // A daemon older than the Pong reply answers Ping with plain Ok.
         // The absence of a version is the mismatch.
         Response::Ok => Ok(Some(format!("older than {VERSION}"))),
@@ -2053,6 +2073,201 @@ fn exec_daemon() -> anyhow::Error {
         Err(e) => return e,
     };
     std::process::Command::new(astd).exec().into()
+}
+
+// ---- identity --------------------------------------------------------------
+//
+// Which release something is, and which *binary* it is, are two questions.
+// A version answers the first; every build between two tags shares it, so it
+// cannot answer the second. `BUILD_ID` is stamped at compile time and does,
+// and the sha256 of the file on disk ties that claim to bytes somebody can
+// check against a published `SHA256SUMS` without trusting the binary's own
+// account of itself.
+//
+// These are printed rather than compared here on purpose. The comparison —
+// that `ast`, `astd` and the app are one build — belongs to whoever is
+// testing a release candidate, and it can only be a real assertion if the
+// binaries report what they are without editorialising.
+
+/// One binary's identity, as far as it can be established from outside it.
+struct Artifact {
+    path: std::path::PathBuf,
+    digest: Option<String>,
+}
+
+impl Artifact {
+    /// Hash a binary if it is there. A missing one is not an error: the
+    /// desktop app is a separate download and most devices do not have it.
+    fn at(path: std::path::PathBuf) -> Option<Artifact> {
+        if !path.exists() {
+            return None;
+        }
+        let digest = verify::Digest::of_file(verify::Algo::Sha256, &path)
+            .ok()
+            .map(|d| d.to_string());
+        Some(Artifact { path, digest })
+    }
+
+    fn digest(&self) -> &str {
+        self.digest.as_deref().unwrap_or("unreadable")
+    }
+}
+
+/// `ast version`: three facts, one per line, in the order they get asked for.
+///
+/// Deliberately not `ast --version`, which stays the one short line a script
+/// and a package manager already parse.
+fn print_version() -> Result<()> {
+    println!("version   {VERSION}");
+    println!("build     {}", asterism_core::BUILD_ID);
+    match std::env::current_exe().ok().and_then(Artifact::at) {
+        Some(a) => println!("artifact  {}  {}", a.digest(), a.path.display()),
+        // current_exe() can fail on a binary that was deleted out from under
+        // itself; that is worth saying rather than papering over.
+        None => println!("artifact  unknown"),
+    }
+    Ok(())
+}
+
+/// The running daemon's `Pong`, without starting one.
+///
+/// `send` would spawn a daemon to answer, which is the last thing a bug
+/// report should do: "is astd running" is one of the facts being collected,
+/// and collecting it must not change it.
+fn running_daemon() -> Option<(String, Option<String>)> {
+    let stream = UnixStream::connect(paths::socket_path()).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+    let mut writer = stream.try_clone().ok()?;
+    // Serialized from the type rather than written out by hand: the wire
+    // spelling of a request is the protocol's business, and a literal here
+    // would be a second copy of it to keep in step.
+    let mut line = serde_json::to_string(&Request::Ping).ok()?;
+    line.push('\n');
+    writer.write_all(line.as_bytes()).ok()?;
+    let mut reply = String::new();
+    BufReader::new(stream).read_line(&mut reply).ok()?;
+    match serde_json::from_str(&reply).ok()? {
+        Response::Pong { version, build_id } => Some((version, build_id)),
+        // A daemon too old to send a `Pong` still answered, which is the
+        // fact that matters: it is running, and it is old.
+        Response::Ok => Some((format!("older than {VERSION}"), None)),
+        _ => None,
+    }
+}
+
+/// Where the desktop app lives once it is installed. One place, because a
+/// macOS app bundle has one place; a report that guessed at several would
+/// have to explain which one it found.
+fn gui_binary() -> std::path::PathBuf {
+    std::path::PathBuf::from("/Applications/Asterism.app/Contents/MacOS/asterism-gui")
+}
+
+/// `ast bugreport`: everything worth pasting, and nothing that needs the
+/// network.
+///
+/// Every section is best-effort. A device with no daemon running, no service
+/// installed and no app has a shorter report, not a failed one — the whole
+/// point is that it still prints when things are broken.
+fn print_bugreport() -> Result<()> {
+    println!("asterism bugreport");
+    println!();
+
+    // Every line here is `key  value`, and no key is a prefix of another —
+    // this section is read by scripts/rc.sh as well as by people, and a
+    // format where "which build is the daemon" needs counting columns is a
+    // format that will be read wrong.
+    println!("[build]");
+    println!("ast-version    {VERSION}");
+    println!("ast-build      {}", asterism_core::BUILD_ID);
+    match std::env::current_exe().ok().and_then(Artifact::at) {
+        Some(a) => println!("ast-file       {}  {}", a.digest(), a.path.display()),
+        None => println!("ast-file       unknown"),
+    }
+    // The astd beside this ast is the one `ast` would start. It is hashed
+    // rather than run: starting a daemon to ask its version would change the
+    // state being reported.
+    match daemon_path().ok().and_then(Artifact::at) {
+        Some(a) => println!("astd-file      {}  {}", a.digest(), a.path.display()),
+        None => println!("astd-file      not found beside ast"),
+    }
+    match running_daemon() {
+        Some((version, Some(build))) => println!("astd-running   {version}  {build}"),
+        // A daemon that answered without a build id is old, which is a
+        // different fact from no daemon at all and gets a different word.
+        Some((version, None)) => println!("astd-running   {version}  build-unknown"),
+        None => println!(
+            "astd-running   none  ({} is not answering)",
+            paths::socket_path().display()
+        ),
+    }
+    match Artifact::at(gui_binary()) {
+        Some(a) => println!("app-file       {}  {}", a.digest(), a.path.display()),
+        None => println!("app-file       not installed"),
+    }
+    println!();
+
+    println!("[device]");
+    // The same source the daemon names this device by, so a report and the
+    // orbit cannot disagree about which machine this is.
+    println!("host           {}", asterism_core::instance::local_host());
+    println!("os             {}", uname_line());
+    println!("arch           {}", std::env::consts::ARCH);
+    println!("home           {}", paths::home_dir().display());
+    println!("socket         {}", paths::socket_path().display());
+    // Named because they change behaviour and are invisible otherwise: a home
+    // pointed elsewhere explains a great many "my instance vanished" reports.
+    println!(
+        "asterism-home  {}",
+        std::env::var("ASTERISM_HOME").unwrap_or_else(|_| "unset".into())
+    );
+    println!(
+        "asterism-mesh  {}",
+        std::env::var("ASTERISM_MESH").unwrap_or_else(|_| "unset".into())
+    );
+    println!();
+
+    println!("[service]");
+    match service::manager() {
+        Ok(manager) => match manager.status() {
+            Ok(state) => println!("{}  {}", manager.mechanism(), state.summary()),
+            Err(e) => println!("{}  could not be read: {e:#}", manager.mechanism()),
+        },
+        Err(e) => println!("no service manager on this device: {e:#}"),
+    }
+    println!();
+
+    println!("[instances]");
+    // This device's own shard, not the orbit: a bug report that went out on
+    // the mesh would hang on a device that is asleep, which is exactly when
+    // somebody is writing one.
+    // `and_then`, not `and`: the argument to `and` is evaluated whether or
+    // not the option is `Some`, and evaluating this one means `send_once`
+    // spawning a daemon — which is precisely what a bug report must not do.
+    match running_daemon().and_then(|_| send_once(&Request::List).ok()) {
+        Some(Response::Instances { instances }) if instances.is_empty() => {
+            println!("none on this device")
+        }
+        Some(Response::Instances { instances }) => {
+            for i in instances {
+                println!("{:<16} {:<9} {:<14} {}", i.name, i.status, i.image_kind, i.id);
+            }
+        }
+        _ => println!("no daemon to ask"),
+    }
+    Ok(())
+}
+
+/// The kernel line, which is how a macOS version gets named in a report
+/// somebody else has to reproduce.
+fn uname_line() -> String {
+    std::process::Command::new("uname")
+        .arg("-sr")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| std::env::consts::OS.to_owned())
 }
 
 // ---- output ----------------------------------------------------------------

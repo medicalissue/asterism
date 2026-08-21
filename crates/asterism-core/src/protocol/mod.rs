@@ -634,13 +634,25 @@ impl Request {
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Response {
     Ok,
-    /// Reply to [`Request::Ping`], carrying the daemon's crate version.
+    /// Reply to [`Request::Ping`], carrying the daemon's crate version and
+    /// the build it was compiled from.
     ///
     /// A daemon older than this variant answers `Ping` with plain `Ok`, so
     /// the *absence* of a version is itself the mismatch signal — which is
-    /// what makes this a backward-compatible change rather than a break.
+    /// what makes this a backward-compatible change rather than a break. The
+    /// build id arrived later still and is optional for the same reason: a
+    /// daemon that predates it sends a `Pong` without one, and `None` means
+    /// "too old to say", never "no build".
+    ///
+    /// Version is what the handshake compares, because a version mismatch is
+    /// what breaks the wire. The build id is not a compatibility signal — it
+    /// is the identity an operator (or a release-candidate run) asserts on
+    /// when the question is whether this daemon is the artifact that was
+    /// shipped.
     Pong {
         version: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        build_id: Option<String>,
     },
 
     // ---- instances -----------------------------------------------------------
@@ -876,7 +888,19 @@ mod tests {
         assert!(matches!(old, Response::Ok));
         // What this one sends.
         let new: Response = serde_json::from_str(r#"{"result":"pong","version":"0.0.2"}"#).unwrap();
-        assert!(matches!(new, Response::Pong { version } if version == "0.0.2"));
+        assert!(matches!(&new, Response::Pong { version, .. } if version == "0.0.2"));
+        // ...and it said nothing about its build, which is not the same as
+        // having none.
+        assert!(matches!(new, Response::Pong { build_id: None, .. }));
+
+        // A daemon new enough to say carries both.
+        let both: Response = serde_json::from_str(
+            r#"{"result":"pong","version":"0.0.2","build_id":"0.0.2+abc123"}"#,
+        )
+        .unwrap();
+        assert!(
+            matches!(both, Response::Pong { build_id: Some(id), .. } if id == "0.0.2+abc123")
+        );
     }
 
     #[test]

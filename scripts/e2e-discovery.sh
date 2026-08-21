@@ -36,9 +36,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="$HOME/.cargo/bin:$PATH"
 cd "$ROOT"
-cargo build -q
-AST="$ROOT/target/debug/ast"
-ASTD="$ROOT/target/debug/astd"
+# shellcheck source-path=SCRIPTDIR source=lib/harness.sh
+. "$ROOT/scripts/lib/harness.sh"
+harness_begin discovery
+harness_binaries "$ROOT"
 
 # Fresh, SHORT homes: unix socket paths are capped near 104 bytes, and these
 # are deliberately nowhere near the user's own ~/.asterism.
@@ -52,10 +53,15 @@ INST="disc-e2e"
 cleanup() {
   for home in "$A" "$B"; do
     [ -d "$home" ] || continue
+    harness_keep_home "$home" "$(basename "$home")"
     ASTERISM_HOME="$home" "$AST" rm "$INST" >/dev/null 2>&1 || true
   done
-  pkill -f "$ASTD" 2>/dev/null || true
+  # Only these two homes' daemons. The `pkill -f "$ASTD"` that used to be
+  # here reached every astd built at that path — a developer's own, running
+  # against their own home, with their own guests under it.
+  harness_reap
   rm -rf "$RUN"
+  harness_artifacts_note
 }
 trap cleanup EXIT
 
@@ -78,6 +84,9 @@ expect() {
 start_daemon() {
   local home="$1"; shift
   mkdir -p "$home"
+  # Registered before it is started, so that a daemon which comes up and then
+  # wedges is still something the cleanup trap can reach.
+  harness_own_home "$home"
   ( ASTERISM_HOME="$home" "$@" "$ASTD" >>"$home/astd.log" 2>&1 & )
   for _ in $(seq 1 300); do
     grep -q "discovery: published" "$home/astd.log" 2>/dev/null && return 0

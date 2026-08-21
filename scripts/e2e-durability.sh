@@ -29,7 +29,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="$HOME/.cargo/bin:$PATH"
 cd "$ROOT"
-cargo build -q
+# shellcheck source-path=SCRIPTDIR source=lib/harness.sh
+. "$ROOT/scripts/lib/harness.sh"
+harness_begin durability
+harness_binaries "$ROOT"
 
 # Fresh, SHORT home: unix socket paths are capped near 104 bytes.
 export ASTERISM_HOME="/private/tmp/ast-dur-$$"
@@ -37,9 +40,8 @@ export ASTERISM_HOME="/private/tmp/ast-dur-$$"
 # A single-device test has no orbit, so it has no business publishing a
 # throwaway key and this machine's addresses to a public discovery service.
 export ASTERISM_MESH=local
+harness_own_home "$ASTERISM_HOME"
 BIN="$ASTERISM_HOME/bin"
-AST="$BIN/ast"
-ASTD="$BIN/astd"
 LOG="$ASTERISM_HOME/astd.log"
 STATE="$ASTERISM_HOME/state.json"
 VOLUMES="$ASTERISM_HOME/volumes.json"
@@ -50,15 +52,19 @@ fail() { echo "E2E FAIL: $*" >&2; echo "--- astd log ---" >&2; tail -60 "$LOG" 2
 ok() { echo "ok: $*"; }
 
 cleanup() {
+  harness_keep_home "$ASTERISM_HOME" home
   if [ -n "$ASTD_PID" ]; then
     kill -9 "$ASTD_PID" 2>/dev/null || true
     # Reaped here, or the shell reports the SIGKILL as a job-control line
     # after the "E2E GREEN" that the reader is meant to end on.
     wait "$ASTD_PID" 2>/dev/null || true
   fi
-  # Only ever our own processes: every one of them names this home on its
-  # command line.
-  pkill -9 -f "$ASTERISM_HOME" 2>/dev/null || true
+  # Only what this run started. `pkill -9 -f "$ASTERISM_HOME"` used to stand
+  # here: it matched command lines, so it also reached anything that merely
+  # named this directory — and it reached it with SIGKILL. The daemon writes
+  # down every process it starts; harness_reap stops those.
+  harness_reap
+  harness_artifacts_note
   if [ -n "${KEEP:-}" ]; then
     echo "kept $ASTERISM_HOME for inspection"
   else
@@ -69,13 +75,12 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$ASTERISM_HOME/images" "$BIN"
-# Copied rather than run from target/: a sibling checkout's `pkill -f
-# target/debug/astd` must not be able to kill this test's daemon.
-cp "$ROOT/target/debug/ast" "$ROOT/target/debug/astd" "$BIN/"
-if [ -d "$HOME/.asterism/images" ]; then
-  cp "$HOME/.asterism/images/"*.qcow2 "$HOME/.asterism/images/"*.raw \
-     "$ASTERISM_HOME/images/" 2>/dev/null || true
-fi
+# Copied into the home rather than run out of target/, so that a rebuild
+# part-way through a long run cannot swap the binary under a live daemon.
+cp "$AST" "$ASTD" "$BIN/"
+AST="$BIN/ast"
+ASTD="$BIN/astd"
+harness_seed_images "$ASTERISM_HOME"
 
 # Started here, not by the CLI: `ast` spawns a daemon with its output on
 # /dev/null, and the recovery reasons in that output are half the point.
@@ -133,13 +138,38 @@ expect() {
 listed() { "$AST" ls 2>&1; }
 logged() { grep -qF "$1" "$LOG"; }
 
+# <needle> [seconds]: the same question, given time to become true.
+#
+# Not every repair happens while astd is starting. The volume book, for one,
+# is read the first time something asks about volumes — so a `logged` fired
+# the instant the pid file appears is asking whether a thing that has not
+# been triggered yet has already been announced. It usually has, which is the
+# worst version of the bug: a suite that passes on a fast machine and fails
+# in CI, for no reason anybody can see in the output.
+logged_soon() {
+  local needle="$1" budget="${2:-15}" _i
+  for _i in $(seq 1 $((budget * 5))); do
+    logged "$needle" && return 0
+    sleep 0.2
+  done
+  return 1
+}
+
 # `python3` is what the tree already assumes for JSON in scripts, and this
 # needs to build a *legacy* shard, which no version of `ast` will write.
 json() { python3 -c "$@"; }
 
 # ---- 1. a kill -9 loses nothing that was committed --------------------------
 
+# The image comes from the harness cache, filled once by the binary under
+# test if it is not there yet, so only a first run downloads anything. Done
+# before the daemon starts, so nothing lands in a store a running daemon may
+# be reading.
+harness_cache_image "$AST" "$IMAGE" || fail "could not cache $IMAGE"
+harness_seed_images "$ASTERISM_HOME"
+
 start_astd
+# Registers the copied file in this home's store; it has nothing left to fetch.
 "$AST" pull "$IMAGE" >/dev/null 2>&1 || fail "pull $IMAGE"
 expect "create one" "one  defined" "$AST" create one --image "$IMAGE" --mem 1G --disk 5G
 expect "create two" "two  defined" "$AST" create two --image "$IMAGE" --mem 1G --disk 5G
@@ -164,7 +194,7 @@ WHOLE="$(wc -c <"$STATE")"
 dd if="$ASTERISM_HOME/whole.json" of="$STATE" bs=1 count=$((WHOLE / 2)) 2>/dev/null
 : >"$LOG"
 start_astd
-logged "last-known-good" || fail "the repair was silent"
+logged_soon "last-known-good" || fail "the repair was silent"
 ok "a torn shard is repaired from its last-known-good copy, out loud"
 OUT="$(listed)"
 grep -qF "one" <<<"$OUT" || fail "the repair lost an instance:"$'\n'"$OUT"
@@ -204,7 +234,7 @@ printf 'half a value' >"$STATE.tmp"
 : >"$LOG"
 start_astd
 [ ! -e "$STATE.tmp" ] || fail "the interrupted commit's staging file was left behind"
-logged "a commit was interrupted before it published" \
+logged_soon "a commit was interrupted before it published" \
   || fail "the sweep was silent about what it swept"
 ok "the staging file an interrupted commit left is swept, and said"
 [ -f "$STATE.bak" ] || fail "the sweep took the last-known-good copy with it"
@@ -307,8 +337,11 @@ WHOLE="$(wc -c <"$VOLUMES")"
 dd if="$ASTERISM_HOME/vol-whole.json" of="$VOLUMES" bs=1 count=$((WHOLE / 2)) 2>/dev/null
 : >"$LOG"
 start_astd
-logged "last-known-good" || fail "a torn volume book was not repaired out loud"
+# The read comes first, and then the assertion about it. Unlike the shard,
+# the volume book is not read at startup — it is read when something asks
+# about volumes, so asking is what makes the repair happen.
 expect "the volume survived" "tank" "$AST" volume ls
+logged_soon "last-known-good" || fail "a torn volume book was not repaired out loud"
 ok "a torn volume book is repaired rather than read as \"this device has no volumes\""
 
 # ---- 8. an interrupted restore converges at the next start ------------------
@@ -326,7 +359,7 @@ printf 'clean' >"$SNAPS/.restoring"
 printf 'half a clone' >"$CLONE"
 : >"$LOG"
 start_astd
-logged "interrupted before it replaced the disk" \
+logged_soon "interrupted before it replaced the disk" \
   || fail "the interrupted restore was not settled at start"
 [ ! -e "$CLONE" ] || fail "the half-made clone was left behind"
 [ ! -e "$SNAPS/.restoring" ] || fail "the snapshot is still pinned by a restore that is over"

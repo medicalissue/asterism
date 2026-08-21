@@ -31,9 +31,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="$HOME/.cargo/bin:$PATH"
 cd "$ROOT"
-cargo build -q
-AST="$ROOT/target/debug/ast"
-ASTD="$ROOT/target/debug/astd"
+# shellcheck source-path=SCRIPTDIR source=lib/harness.sh
+. "$ROOT/scripts/lib/harness.sh"
+harness_begin mesh
+harness_binaries "$ROOT"
 
 # Fresh, SHORT homes: unix socket paths are capped near 104 bytes, and these
 # are deliberately nowhere near the user's own ~/.asterism.
@@ -91,6 +92,11 @@ kill_pidfile() {
 cleanup() {
   if [ -n "${CLEANED:-}" ]; then return 0; fi
   CLEANED=1
+  # Evidence before the homes go: a daemon log and a console log are the
+  # whole account of a failure, and they live in the directory below.
+  for home in "$A" "$B" "$C"; do
+    harness_keep_home "$home" "$(basename "$home")"
+  done
   local home f pid
   # The daemons first: astd is what restarts a guest it notices die, so a
   # guest killed while its daemon is up can come straight back.
@@ -110,6 +116,7 @@ cleanup() {
     done
   done
   rm -rf "$RUN"
+  harness_artifacts_note
 }
 trap cleanup EXIT
 
@@ -332,8 +339,10 @@ echo "ok: ast ping — $PING"
 # pipes it over a mesh stream to B's daemon, and B's daemon connects that to
 # the guest's forwarded ssh port. Neither `ast` nor the user names a device.
 
-mkdir -p "$B/images"
-cp "$HOME/.asterism/images/"*.qcow2 "$B/images/" 2>/dev/null || true
+# From the harness's own cache, never ~/.asterism: that one belongs to the
+# user's daemon and may be written to while this is reading it.
+harness_cache_image "$AST" "$IMAGE" || fail "could not cache $IMAGE"
+harness_seed_images "$B"
 ASTERISM_HOME="$B" "$AST" pull "$IMAGE" >/dev/null 2>&1 \
   || fail "no $IMAGE image available for B (pull it once: ast pull $IMAGE)"
 

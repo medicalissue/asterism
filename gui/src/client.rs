@@ -86,15 +86,17 @@ pub fn devices() -> Result<Vec<DeviceStatus>> {
     }
 }
 
-/// The running daemon's version.
+/// The running daemon's version, and the build it was compiled from.
 ///
 /// A daemon older than the `Pong` variant answers `Ping` with a plain `Ok`,
 /// so the absence of a version is itself the answer: it is old, and saying
-/// so beats printing nothing.
-pub fn daemon_version() -> Result<String> {
+/// so beats printing nothing. The build id arrived later than `Pong` did, so
+/// `None` there says the same thing about a narrower gap — the daemon is
+/// running and cannot tell us which build it is.
+pub fn daemon_build() -> Result<(String, Option<String>)> {
     match send(&Request::Ping)? {
-        Response::Pong { version } => Ok(version),
-        Response::Ok => Ok("older than 0.0.2".to_owned()),
+        Response::Pong { version, build_id } => Ok((version, build_id)),
+        Response::Ok => Ok(("older than 0.0.2".to_owned(), None)),
         Response::Error { message } => bail!(message),
         other => bail!("unexpected reply from astd: {other:?}"),
     }
