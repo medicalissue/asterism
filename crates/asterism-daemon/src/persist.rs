@@ -192,8 +192,12 @@ pub async fn resurrect(registry: &Arc<Mutex<Shard>>) {
         // guest is sitting there retrying a socket nothing is behind.
         if alive(&inst) {
             eprintln!(
-                "astd: {name} was already running (pid {}) and kept running",
-                inst.pid().unwrap_or(0)
+                "astd: {name} was already running ({}) and kept running",
+                inst.handle
+                    .as_ref()
+                    .and_then(|h| h.owned())
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "no process of its own".into())
             );
             crate::volume::reattach(&inst).await;
             continue;
@@ -367,18 +371,45 @@ fn boot_again(reg: &mut Shard, inst: &Instance) -> anyhow::Result<Instance> {
 }
 
 /// A killed guest leaves its control socket behind; the next boot binds
-/// the same path. Removing it is crash cleanup, not policy — the process
-/// that owned it has already been confirmed dead.
+/// the same path. Removing it is crash cleanup, not policy.
+///
+/// Two things have to be true before the unlink, and only one of them is
+/// about the process. The instance has already been found not running, so
+/// whatever this daemon recorded is gone. But "the process I recorded is
+/// gone" and "nothing is behind this socket" are different claims, and it
+/// is the second one that makes the unlink safe: unlinking a socket a live
+/// helper is still bound to removes the only thing stopping the next helper
+/// binding the same path, and then two guests are running on one `disk.raw`.
+///
+/// So the socket is asked. A connection that is accepted means something is
+/// bound and listening, whoever it is, and the file stays — the vz backend's
+/// `await_helper_exit` is written to wait exactly that out. A refused
+/// connection is the file outliving its process, which is what this is for.
 fn clear_stale_control(inst: &Instance) {
-    if let Some(handle) = &inst.handle {
-        let path = handle.ctl.path();
-        if path.exists() {
-            let _ = std::fs::remove_file(path);
-        }
+    let Some(handle) = &inst.handle else { return };
+    let path = handle.ctl.path();
+    if !path.exists() {
+        return;
     }
+    if std::os::unix::net::UnixStream::connect(path).is_ok() {
+        eprintln!(
+            "astd: {} is down but something is still listening on {} — leaving it, \
+             the next boot waits for it to go",
+            inst.name,
+            path.display()
+        );
+        return;
+    }
+    let _ = std::fs::remove_file(path);
 }
 
 /// A handle reloaded from the registry is never assumed valid.
+///
+/// "Valid" now means more than "the number is in the process table": every
+/// backend's `state` resolves the handle's recorded identity
+/// ([`asterism_core::proc::ProcId`]) before it believes anything, so a pid
+/// that has been handed to somebody else reads as a stopped guest rather
+/// than as a live one to keep supervising — and, later, to signal.
 fn alive(inst: &Instance) -> bool {
     inst.handle.as_ref().is_some_and(|handle| {
         backend::for_handle(&handle.backend)
@@ -465,6 +496,67 @@ mod tests {
         note_died(&name);
         forget(&name);
         assert!(take_due(Instant::now() + Duration::from_secs(600)).is_empty());
+    }
+
+    // ---- crash cleanup ------------------------------------------------------
+
+    fn stopped_instance_with_ctl(ctl: &std::path::Path) -> Instance {
+        let mut inst: Instance = serde_json::from_str(
+            r#"{"id":"i","name":"dev","cpu_device":"laptop","status":"stopped",
+                "created_at":0,"volumes":[],
+                "machine":{"backend":"vz","machine_type":"virt","cpu":"host","hv_version":"t"}}"#,
+        )
+        .unwrap();
+        inst.handle = Some(asterism_core::hv::Handle {
+            backend: "vz".into(),
+            pid: None,
+            proc: None,
+            ctl: asterism_core::hv::ControlChannel::Rpc { path: ctl.to_owned() },
+            endpoint: asterism_core::hv::GuestEndpoint::GuestAddr {
+                addr: "192.168.64.3".parse().unwrap(),
+            },
+            started_at: 0,
+        });
+        inst
+    }
+
+    /// A helper that was SIGKILLed leaves its socket file behind and the
+    /// next boot has to bind that path. Nothing is listening on it, so the
+    /// file goes.
+    #[test]
+    fn a_socket_nothing_is_behind_is_cleared() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("vz.sock");
+        // A plain file at the socket's path: exists, refuses connections —
+        // which is exactly what an unlinked-and-recreated leftover looks
+        // like to anyone trying to use it.
+        std::fs::write(&sock, b"").unwrap();
+        clear_stale_control(&stopped_instance_with_ctl(&sock));
+        assert!(!sock.exists(), "a socket with nothing behind it is crash litter");
+    }
+
+    /// The case that makes the check worth making. A helper spends the
+    /// guest's whole shutdown budget inside the framework's forced stop
+    /// without draining its control queue — bound and accepting, answering
+    /// nothing — and reads as not running for the length of it. Unlinking
+    /// its socket would let the next boot bind the same path, and then two
+    /// guests are writing to one `disk.raw`.
+    #[test]
+    fn a_socket_something_is_still_listening_on_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("busy.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+
+        clear_stale_control(&stopped_instance_with_ctl(&sock));
+        assert!(sock.exists(), "a live listener's socket is not ours to remove");
+        drop(listener);
+    }
+
+    /// Nothing there at all: the ordinary case, and not an error.
+    #[test]
+    fn a_socket_that_was_already_gone_is_not_a_problem() {
+        let dir = tempfile::tempdir().unwrap();
+        clear_stale_control(&stopped_instance_with_ctl(&dir.path().join("absent.sock")));
     }
 
     /// The supervisor reads the policy off the instance now. An instance

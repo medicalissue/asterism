@@ -34,6 +34,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::durable::{self, Loaded};
 use crate::instance::now_unix;
+use crate::proc::ProcId;
+
+/// The program that serves a block volume's NBD export. Named here because
+/// it is what a lease's recorded process must turn out to be running before
+/// this daemon will believe the lease.
+pub const EXPORT_BIN: &str = "qemu-storage-daemon";
 
 /// Who holds a volume's single writer slot, and at what epoch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,12 +58,23 @@ pub struct Lease {
     pub granted_at: u64,
     /// NBD export name this grant is being served under: `<volume>-e<epoch>`.
     pub export: String,
-    /// The `qemu-storage-daemon` serving it, when one is running. Tracked the
-    /// way the vz helper is tracked — a pid plus a socket that answers —
-    /// because it is the same kind of thing: a process this daemon started
-    /// and is responsible for stopping.
+    /// The `qemu-storage-daemon` serving it, when one is running. Kept for
+    /// what reads it and cannot act on it; nothing signals it — see
+    /// [`Lease::proc`].
     #[serde(default)]
     pub pid: Option<u32>,
+    /// Proof of *which* process that pid is.
+    ///
+    /// Tracked the way a guest's helper is tracked, and for the same reason:
+    /// it is a process this daemon started, is responsible for stopping, and
+    /// will meet again only after writing it down — which means only after
+    /// its pid has stopped being evidence of anything. Absent on leases
+    /// written before identities existed; the daemon adopts those at startup
+    /// where it safely can, and treats the rest as an export that is simply
+    /// not running (which is recoverable: the export is restarted at the
+    /// same epoch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proc: Option<ProcId>,
 }
 
 /// One block volume on this device.
@@ -210,6 +227,7 @@ impl Store {
             granted_at: now_unix(),
             export,
             pid: None,
+            proc: None,
         });
         Ok(vol.clone())
     }
@@ -243,13 +261,39 @@ impl Store {
         Ok(vol.clone())
     }
 
-    /// Record which process is serving the current lease.
-    pub fn set_export_pid(&mut self, name: &str, pid: Option<u32>) -> Result<()> {
+    /// Record which process is serving the current lease, and what proves it
+    /// is that process.
+    pub fn set_export_proc(&mut self, name: &str, proc: Option<ProcId>) -> Result<()> {
         let vol = self.volumes.get_mut(name).with_context(|| no_such(name))?;
         if let Some(lease) = vol.lease.as_mut() {
-            lease.pid = pid;
+            lease.pid = proc.as_ref().map(|p| p.pid);
+            lease.proc = proc;
         }
         Ok(())
+    }
+
+    /// Give a pre-identity lease an identity, once, if the process it names
+    /// can be proven to be its export.
+    ///
+    /// The volume half of the startup migration
+    /// (`asterism_core::proc::ProcId::adopt`). Failing is cheap here in a way
+    /// it is not for a guest: an export that cannot be proven is treated as
+    /// not running and started again at the *same* epoch, which is the same
+    /// recovery a provider that restarted already gets.
+    pub fn adopt_export(&mut self, name: &str) -> std::result::Result<Option<ProcId>, String> {
+        let vol = self.volumes.get_mut(name).ok_or_else(|| no_such(name))?;
+        let Some(lease) = vol.lease.as_mut() else {
+            return Ok(None);
+        };
+        if lease.proc.is_some() {
+            return Ok(None);
+        }
+        let Some(pid) = lease.pid else {
+            return Ok(None);
+        };
+        let proc = ProcId::adopt(pid, lease.granted_at, &[EXPORT_BIN])?;
+        lease.proc = Some(proc.clone());
+        Ok(Some(proc))
     }
 
     /// Give the lease back. Only the holder may; anyone else is told who has
@@ -509,7 +553,8 @@ mod tests {
         let mut s = Store::load(&path).unwrap();
         s.create("tank", 5 << 30).unwrap();
         s.lease("tank", "dev", "laptop").unwrap();
-        s.set_export_pid("tank", Some(4242)).unwrap();
+        s.set_export_proc("tank", Some(ProcId { pid: 4242, started_us: 7, exec: None }))
+            .unwrap();
         s.save().unwrap();
 
         let back = Store::load(&path).unwrap();
@@ -518,7 +563,10 @@ mod tests {
         assert_eq!(vol.epoch, 1);
         let lease = vol.lease.as_ref().unwrap();
         assert_eq!(lease.holder, "dev");
+        // Both halves survive: the bare pid for anything older reading this
+        // file, and the identity that is the only thing signals are gated on.
         assert_eq!(lease.pid, Some(4242));
+        assert_eq!(lease.proc.as_ref().map(|p| p.started_us), Some(7));
         assert_eq!(lease.export, "tank-e1");
     }
 

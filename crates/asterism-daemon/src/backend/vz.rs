@@ -22,9 +22,10 @@
 //! `VZVirtualMachine` dies with the process that created it. In-process
 //! would mean every `astd` restart or upgrade killed every running guest,
 //! and would put `com.apple.security.virtualization` on the whole daemon.
-//! Out-of-process keeps `Handle::pid` meaningful, keeps the entitlement on
-//! a ~1 MB binary, and makes "is it still running?" a question asked down a
-//! socket rather than something the daemon has to remember.
+//! Out-of-process gives the guest a process of its own to be identified by
+//! ([`Handle::proc`]), keeps the entitlement on a ~1 MB binary, and makes
+//! "is it still running?" a question asked down a socket rather than
+//! something the daemon has to remember.
 //!
 //! ## What VZ makes different from QEMU
 //!
@@ -49,12 +50,12 @@ use asterism_core::hv::{
     BootReq, Caps, ControlChannel, DiskFormat, DiskSpec, GuestEndpoint, Handle, Hypervisor,
     Prepared, Ready, RunState, SnapshotId,
 };
-use asterism_core::instance::now_unix;
+use asterism_core::proc::{ProcId, Signal};
 use asterism_core::snapshot::{self, Snapshot};
 use asterism_core::{cow, paths, tools};
 use asterism_vz::{Command as VzCommand, Config, Disk as VzDisk, Reply, StopReason};
 
-use super::{alive, grow, signal, wait_gone};
+use super::{alive, grow, owned};
 
 pub const ID: &str = "vz";
 
@@ -130,7 +131,7 @@ runcmd:
 #[derive(Default)]
 pub struct Vz {
     probed: OnceLock<Probe>,
-    /// Helpers that have told us their guest lost a disk, by pid.
+    /// Helpers that have told us their guest lost a disk.
     ///
     /// Two jobs, and the second is why this is a set rather than a log
     /// line. The first is not turning one dead volume into a page of
@@ -138,14 +139,15 @@ pub struct Vz {
     /// seconds. The second is answering a question `info` stops being able
     /// to answer — a helper taking its guest down spends up to ten seconds
     /// inside the framework's forced stop with nothing draining its control
-    /// queue, and a pid that is still alive must not read back as a healthy
-    /// guest for the length of it.
+    /// queue, and a helper that is still alive must not read back as a
+    /// healthy guest for the length of it.
     ///
-    /// Keyed by pid rather than by instance, because the pid is what the
-    /// failed path has: it identifies the exact helper that said so, and it
-    /// expires on its own — a pid that is not alive is stopped before this
-    /// is ever consulted.
-    lost_disks: Mutex<HashSet<u32>>,
+    /// Keyed by the helper's identity rather than by instance, because that
+    /// is what the failed path has: it names the exact helper that said so.
+    /// A *pid* would not do — this daemon can outlive many helpers, and a
+    /// number handed back out would make a fresh helper inherit a dead one's
+    /// verdict and read as stopped from its first tick.
+    lost_disks: Mutex<HashSet<ProcId>>,
 }
 
 /// What this host can tell us about running VZ guests, worked out once.
@@ -230,8 +232,8 @@ impl Vz {
     /// human reading `vz-helper.log` to find out that a volume server went
     /// away. Worth *remembering* because the helper is about to stop
     /// answering — see [`Vz::lost_a_disk`].
-    fn report_lost_disk(&self, pid: u32, instance: &str, lost: &asterism_vz::StorageError) {
-        if self.lost_disks_mut().insert(pid) {
+    fn report_lost_disk(&self, proc: &ProcId, instance: &str, lost: &asterism_vz::StorageError) {
+        if self.lost_disks_mut().insert(proc.clone()) {
             eprintln!("astd: {instance} lost a disk and is going down — {lost}");
         }
     }
@@ -239,11 +241,11 @@ impl Vz {
     /// Has this helper already told us its guest lost a disk?
     ///
     /// The one thing that makes a silent control socket mean something.
-    fn lost_a_disk(&self, pid: u32) -> bool {
-        self.lost_disks_mut().contains(&pid)
+    fn lost_a_disk(&self, proc: &ProcId) -> bool {
+        self.lost_disks_mut().contains(proc)
     }
 
-    fn lost_disks_mut(&self) -> std::sync::MutexGuard<'_, HashSet<u32>> {
+    fn lost_disks_mut(&self) -> std::sync::MutexGuard<'_, HashSet<ProcId>> {
         // A poisoned lock here would mean a panic inside this bookkeeping,
         // and the worst taking it anyway can cost is a repeated log line.
         // Refusing it would cost a guest being called healthy.
@@ -457,22 +459,31 @@ impl Hypervisor for Vz {
             .spawn()
             .with_context(|| format!("spawning {}", p.helper.display()))?;
         let pid = child.id();
+        // Captured before anything else is done with the child, while it is
+        // still provably the process this backend just spawned. Everything
+        // the daemon may later do to this helper — up to SIGKILL, possibly
+        // days from now and across a daemon restart — is authorised by this.
+        let proc = ProcId::capture(pid).with_context(|| {
+            format!(
+                "the vz helper exited immediately — {}:\n{}",
+                log_path.display(),
+                tail(&log_path, 20)
+            )
+        });
         reap_in_background(child);
+        let proc = proc?;
 
-        match wait_for_guest(&config.ctl, pid, &log_path) {
-            Ok(addr) => Ok(Handle {
-                backend: ID.to_owned(),
-                pid: Some(pid),
-                ctl: ControlChannel::Rpc { path: config.ctl },
-                endpoint: GuestEndpoint::GuestAddr { addr },
-                started_at: now_unix(),
-            }),
+        match wait_for_guest(&config.ctl, &proc, &log_path) {
+            Ok(addr) => Ok(Handle::owning(
+                ID,
+                proc,
+                ControlChannel::Rpc { path: config.ctl },
+                GuestEndpoint::GuestAddr { addr },
+            )),
             Err(e) => {
                 // A half-started guest is nobody's idea of running. Take
                 // the helper with us so the next `up` starts clean.
-                if alive(pid) {
-                    let _ = signal(pid, "-KILL");
-                }
+                let _ = proc.signal(Signal::Kill);
                 let _ = std::fs::remove_file(&config.ctl);
                 Err(e)
             }
@@ -482,15 +493,20 @@ impl Hypervisor for Vz {
     /// Ask the guest to power down, and let the helper's delegate say
     /// whether it did.
     ///
-    /// This is `system_powerdown` and `kill -0` in one round trip: the
+    /// This is `system_powerdown` and a liveness check in one round trip: the
     /// helper answers when `guestDidStopVirtualMachine:` has fired (or when
     /// it has escalated to `stopWithCompletionHandler:`), so a clean stop is
     /// something we are *told*, not something inferred from a process going
     /// away. The signals are still here for the case the socket cannot
     /// carry the request at all.
     fn stop(&self, h: &Handle, deadline: Duration) -> Result<()> {
-        let Some(pid) = h.pid else {
-            bail!("handle for a {} guest carries no pid", h.backend);
+        let Some(proc) = owned(h) else {
+            // Nothing here is provably this guest's helper, so nothing here
+            // may be signalled — and the socket is not asked either. A
+            // control socket outlives the process that bound it, and a
+            // `stop` sent down one belonging to a process we cannot name is
+            // not a stop of anything we own.
+            return Ok(());
         };
         // Most of the budget belongs to the guest; the rest to the signals.
         let graceful = deadline.mul_f32(0.75);
@@ -514,7 +530,7 @@ impl Hypervisor for Vz {
                         "astd: the vz guest did not stop cleanly after {seconds:.1}s — {reason}"
                     );
                 }
-                if wait_gone(pid, deadline - graceful) {
+                if proc.wait_gone(deadline - graceful) {
                     return Ok(());
                 }
             }
@@ -524,29 +540,32 @@ impl Hypervisor for Vz {
             // case the signals below are no-ops and this is a success) or
             // it is wedged badly enough that only a signal will do.
             Err(e) => {
-                if !alive(pid) {
+                if !proc.alive() {
                     return Ok(());
                 }
                 eprintln!("astd: vz control socket did not answer ({e:#}) — signalling");
             }
         }
-        signal(pid, "-TERM")?;
-        if wait_gone(pid, Duration::from_secs(5)) {
+        if !proc.signal(Signal::Term)? {
             return Ok(());
         }
-        signal(pid, "-KILL")?;
+        if proc.wait_gone(Duration::from_secs(5)) {
+            return Ok(());
+        }
+        proc.signal(Signal::Kill)?;
         Ok(())
     }
 
     /// The power cord: the helper dies, and the guest dies with it. That
-    /// equivalence is the reason `Handle::pid` is meaningful for this
-    /// backend at all.
+    /// equivalence is the reason a process identity means anything for this
+    /// backend at all — killing the helper *is* killing the guest, which is
+    /// why the helper has to be the right process before anything is sent.
     fn kill(&self, h: &Handle) -> Result<()> {
-        let Some(pid) = h.pid else {
-            bail!("handle for a {} guest carries no pid", h.backend);
+        let Some(proc) = owned(h) else {
+            return Ok(());
         };
-        signal(pid, "-KILL")?;
-        wait_gone(pid, Duration::from_secs(2));
+        proc.signal(Signal::Kill)?;
+        proc.wait_gone(Duration::from_secs(2));
         let _ = std::fs::remove_file(h.ctl.path());
         Ok(())
     }
@@ -555,10 +574,16 @@ impl Hypervisor for Vz {
     /// restart, an upgrade, or a host reboot.
     ///
     /// The socket is authoritative, and it answers with the helper's own
-    /// pid: a helper that died and had its pid reused by something else
-    /// cannot fake that. Only when nothing answers does this fall back to
-    /// asking whether the pid is alive, which covers a helper that was
-    /// SIGKILLed and left its socket file behind.
+    /// pid: a socket that outlived its helper answers nothing at all, and a
+    /// *different* helper answering names itself. Only when nothing answers
+    /// does this fall back to the recorded process identity, which covers a
+    /// helper that was SIGKILLed and left its socket file behind.
+    ///
+    /// Neither half trusts a bare number. The reply's pid is only accepted
+    /// when it is the pid of the process this handle owns *and* that process
+    /// is still the one that was recorded ([`ProcId`]) — otherwise a helper
+    /// whose pid had been handed back out to something else that happened to
+    /// bind this path would read as our guest.
     ///
     /// A guest that has lost a disk for good is `Stopped` here even though
     /// its helper is still up: the helper is in the middle of taking it
@@ -589,16 +614,23 @@ impl Hypervisor for Vz {
     /// itself, and it is the only window in which nothing answering and
     /// nothing wrong are different things.
     fn state(&self, h: &Handle) -> Result<RunState> {
+        // A handle that owns nothing owns nothing on the socket either: the
+        // path is a file, and a file outlives whoever bound it. Asked every
+        // few seconds by the supervisor, so this reads the identity without
+        // the log line `owned` would write.
+        let Some(proc) = h.proc.as_ref().filter(|_| alive(h)) else {
+            return Ok(RunState::Stopped);
+        };
         match self.info(h, Duration::from_secs(2)) {
             Ok(info) => {
-                let ours = h.pid.is_none_or(|pid| pid == info.pid);
+                let ours = info.pid == proc.pid;
                 match &info.storage_error {
                     // Whatever state a helper puts beside a lost disk, the
                     // guest is on its way out. Only for *our* helper: a
                     // socket answering with another pid is another
                     // instance's, and its troubles are not ours to report.
                     Some(lost) if ours => {
-                        self.report_lost_disk(info.pid, &info.instance, lost);
+                        self.report_lost_disk(proc, &info.instance, lost);
                         Ok(RunState::Stopped)
                     }
                     _ => Ok(match ours && info.state.is_live() {
@@ -607,17 +639,18 @@ impl Hypervisor for Vz {
                     }),
                 }
             }
-            // Nothing answered, so the pid is all there is to go on — and
-            // what it settles is narrower than it looks.
+            // Nothing answered, so the recorded process is all there is to
+            // go on — and what it settles is narrower than it looks.
             Err(_) => {
-                let Some(pid) = h.pid.filter(|pid| alive(*pid)) else {
-                    // No pid, or one nothing is holding: the helper is gone
-                    // and the guest with it. A helper that was SIGKILLed
-                    // and left its socket file behind lands here too, which
-                    // is what this fallback was always for.
+                if !proc.alive() {
+                    // Gone, or a number that now belongs to somebody else:
+                    // either way the helper is gone and the guest with it. A
+                    // helper that was SIGKILLed and left its socket file
+                    // behind lands here too, which is what this fallback was
+                    // always for.
                     return Ok(RunState::Stopped);
-                };
-                Ok(match self.lost_a_disk(pid) {
+                }
+                Ok(match self.lost_a_disk(proc) {
                     // Told, then silent: this is the forced stop it started
                     // when the disk went, not a guest anyone can use.
                     true => RunState::Stopped,
@@ -698,13 +731,13 @@ fn await_helper_exit(ctl: &Path, budget: Duration) {
 /// all", which fails fast and quotes the helper's own log; the second is
 /// "has the guest finished booting", which is slow by nature and is the
 /// wait a user experiences as `ast up`.
-fn wait_for_guest(ctl: &Path, pid: u32, log: &Path) -> Result<IpAddr> {
+fn wait_for_guest(ctl: &Path, proc: &ProcId, log: &Path) -> Result<IpAddr> {
     let started = Instant::now();
     let helper_deadline = started + HELPER_TIMEOUT;
     let deadline = started + BOOT_TIMEOUT;
     let mut seen_helper = false;
     loop {
-        if !alive(pid) {
+        if !proc.alive() {
             bail!(
                 "the vz helper exited before its guest came up — {}:\n{}",
                 log.display(),
@@ -765,12 +798,12 @@ fn wait_for_guest(ctl: &Path, pid: u32, log: &Path) -> Result<IpAddr> {
 /// Wait for a helper on a thread of its own, so a guest that has gone does
 /// not leave a zombie behind.
 ///
-/// Not tidiness: `alive()` is `kill -0`, and a zombie answers it. Unreaped,
-/// a helper that exited would go on looking alive for as long as `astd`
-/// ran, and `state()` would report a stopped guest as running — which is
-/// exactly the mistake this backend exists to avoid. QEMU never needed
-/// this because it double-forks itself; a helper that did would take its
-/// pid with it, and the pid is what `Handle` is built on.
+/// This used to be load-bearing: `alive()` was `kill -0`, a zombie answers
+/// it, and an unreaped helper would have gone on reading as a running guest
+/// for as long as `astd` did. [`ProcId`] reads the kernel's own process
+/// state and calls a zombie gone, so liveness no longer depends on this. It
+/// stays because a process table slot held for the life of the daemon is
+/// still a leak, and because the child handle has to go somewhere.
 fn reap_in_background(mut child: std::process::Child) {
     std::thread::spawn(move || {
         let _ = child.wait();
@@ -1165,12 +1198,16 @@ mod tests {
         assert!(!is_entitled(&dir.path().join("absent")));
     }
 
+    /// A handle that owns no process: nothing to take down, and nothing
+    /// running. This used to be an error; it is now simply the truth, and
+    /// the truth every path that cannot prove ownership falls back to.
     #[test]
-    fn a_handle_with_no_pid_cannot_be_stopped_or_killed() {
+    fn a_handle_that_owns_no_process_is_stopped_and_stays_unsignalled() {
         let hv = Vz::new();
         let h = Handle {
             backend: ID.into(),
             pid: None,
+            proc: None,
             ctl: ControlChannel::Rpc {
                 path: "/tmp/nothing-here.sock".into(),
             },
@@ -1179,8 +1216,8 @@ mod tests {
             },
             started_at: 0,
         };
-        assert!(hv.stop(&h, Duration::from_millis(1)).is_err());
-        assert!(hv.kill(&h).is_err());
+        assert!(hv.stop(&h, Duration::from_millis(1)).is_ok());
+        assert!(hv.kill(&h).is_ok());
         // ...and with nothing answering its socket, it is not running,
         // which is what `reconcile` needs to know after a restart.
         assert_eq!(hv.state(&h).unwrap(), RunState::Stopped);
@@ -1211,7 +1248,7 @@ mod tests {
     }
 
     /// This process's own pid, so the handle and the reply agree and the
-    /// `alive(pid)` fallback would answer *running* — which is what makes
+    /// liveness fallback would answer *running* — which is what makes
     /// these tests about `info` rather than about liveness.
     fn helper_info(
         state: asterism_vz::State,
@@ -1230,10 +1267,17 @@ mod tests {
         }
     }
 
+    /// A handle owning this test process, which is the live helper these
+    /// tests stand in for.
     fn handle_on(sock: &Path) -> Handle {
+        owning(sock, Some(ProcId::capture(std::process::id()).unwrap()))
+    }
+
+    fn owning(sock: &Path, proc: Option<ProcId>) -> Handle {
         Handle {
             backend: ID.into(),
-            pid: Some(std::process::id()),
+            pid: proc.as_ref().map(|p| p.pid),
+            proc,
             ctl: ControlChannel::Rpc {
                 path: sock.to_owned(),
             },
@@ -1322,7 +1366,7 @@ mod tests {
             "the answer that says the disk is gone"
         );
         assert!(
-            alive(h.pid.unwrap()),
+            h.owned().unwrap().alive(),
             "and the helper is still very much up"
         );
         assert_eq!(
@@ -1353,9 +1397,9 @@ mod tests {
         assert_eq!(hv.state(&handle_on(&absent)).unwrap(), RunState::Running);
     }
 
-    /// The case the pid fallback was always for: a helper that was killed
-    /// leaves its socket file behind, and a dead pid settles it whatever
-    /// the socket does.
+    /// The case the identity fallback was always for: a helper that was
+    /// killed leaves its socket file behind, and a process that is gone
+    /// settles it whatever the socket does.
     #[test]
     fn a_dead_helper_is_stopped_whatever_its_socket_is_doing() {
         let dir = tempfile::tempdir().unwrap();
@@ -1363,19 +1407,70 @@ mod tests {
         fake_helper_going_quiet(&sock, helper_info(asterism_vz::State::Running, None), 0);
         let hv = Vz::new();
 
-        let mut h = handle_on(&sock);
-        h.pid = Some(dead_pid());
-        assert!(!alive(h.pid.unwrap()), "the pid really is nobody's");
+        let dead = ProcId { pid: dead_pid(), started_us: 1, exec: None };
+        let h = owning(&sock, Some(dead.clone()));
+        assert!(!dead.alive(), "the pid really is nobody's");
         assert_eq!(hv.state(&h).unwrap(), RunState::Stopped);
 
-        // ...and a handle carrying no pid has nothing to fall back on.
-        h.pid = None;
+        // ...and a handle owning nothing has nothing to fall back on.
+        assert_eq!(hv.state(&owning(&sock, None)).unwrap(), RunState::Stopped);
+    }
+
+    /// The same silent socket, but the recorded pid has been handed to a
+    /// live process that is not our helper. `kill -0` says running; the
+    /// identity says the helper is gone, which is the only answer that
+    /// keeps `stop` from signalling a stranger.
+    #[test]
+    fn a_recycled_helper_pid_is_stopped_and_is_never_signalled() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("recycled.sock");
+        fake_helper_going_quiet(&sock, helper_info(asterism_vz::State::Running, None), 0);
+        let hv = Vz::new();
+
+        let mut sleeper = Command::new("sleep").arg("30").spawn().unwrap();
+        let real = ProcId::capture(sleeper.id()).unwrap();
+        let stale = ProcId { started_us: real.started_us - 1, ..real.clone() };
+        let h = owning(&sock, Some(stale));
+
         assert_eq!(hv.state(&h).unwrap(), RunState::Stopped);
+        // Down succeeds — there is nothing of this guest left to take down —
+        // and the process wearing its number is not touched.
+        assert!(hv.stop(&h, Duration::from_millis(10)).is_ok());
+        assert!(hv.kill(&h).is_ok());
+        assert!(real.alive(), "the process that owns that pid is untouched");
+
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+    }
+
+    /// A helper answering with a pid that is not the one on the handle is a
+    /// *different* helper — the instance was restarted while this daemon was
+    /// away, and this handle is stale. Its socket answering healthily must
+    /// not make the stale handle look alive.
+    #[test]
+    fn a_helper_restart_leaves_the_old_handle_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("restarted.sock");
+        // The replacement helper answers with its own pid, not ours.
+        fake_helper(
+            &sock,
+            asterism_vz::Info {
+                pid: std::process::id() + 1,
+                ..helper_info(asterism_vz::State::Running, None)
+            },
+        );
+        assert_eq!(
+            Vz::new().state(&handle_on(&sock)).unwrap(),
+            RunState::Stopped,
+            "somebody else's helper is not this handle's guest"
+        );
     }
 
     /// One helper going quiet says nothing about another. The memory is
-    /// keyed by pid, so it cannot leak between guests — and a live helper
-    /// still answering is read from its answer, never from the memory.
+    /// keyed by identity, so it cannot leak between guests — nor from a
+    /// dead helper to a fresh one that inherited its pid — and a live
+    /// helper still answering is read from its answer, never from the
+    /// memory.
     #[test]
     fn a_lost_disk_is_remembered_against_one_helper_not_all_of_them() {
         let dir = tempfile::tempdir().unwrap();
@@ -1394,10 +1489,10 @@ mod tests {
         let mut sleeper = Command::new("sleep").arg("30").spawn().unwrap();
         let other = dir.path().join("other.sock");
         fake_helper_going_quiet(&other, helper_info(asterism_vz::State::Running, None), 0);
-        let mut elsewhere = handle_on(&other);
-        elsewhere.pid = Some(sleeper.id());
+        let second = ProcId::capture(sleeper.id()).unwrap();
+        let elsewhere = owning(&other, Some(second.clone()));
         assert!(
-            alive(sleeper.id()),
+            second.alive(),
             "the second helper stands in for one that is up"
         );
         assert_eq!(
@@ -1442,7 +1537,10 @@ mod tests {
             helper_info(asterism_vz::State::Error, Some(lost_disk())),
         );
         let h = handle_on(&lost);
-        assert!(alive(h.pid.unwrap()), "the helper answering has not exited");
+        assert!(
+            h.owned().unwrap().alive(),
+            "the helper answering has not exited"
+        );
         assert_eq!(
             hv.state(&h).unwrap(),
             RunState::Stopped,
@@ -1486,9 +1584,8 @@ mod tests {
             },
         );
 
-        let err = wait_for_guest(&sock, std::process::id(), &log)
-            .unwrap_err()
-            .to_string();
+        let me = ProcId::capture(std::process::id()).unwrap();
+        let err = wait_for_guest(&sock, &me, &log).unwrap_err().to_string();
         assert!(err.contains("stopped while booting"), "{err}");
         assert!(err.contains("nbd+unix:///team%2Fdata"), "{err}");
         assert!(err.contains("Connection reset by peer"), "{err}");
@@ -1533,17 +1630,10 @@ mod tests {
     #[test]
     fn unoffered_capabilities_refuse_by_name() {
         let hv = Vz::new();
-        let h = Handle {
-            backend: ID.into(),
-            pid: Some(1),
-            ctl: ControlChannel::Rpc {
-                path: "/tmp/x.sock".into(),
-            },
-            endpoint: GuestEndpoint::GuestAddr {
-                addr: "192.168.64.3".parse().unwrap(),
-            },
-            started_at: 0,
-        };
+        let h = owning(
+            Path::new("/tmp/x.sock"),
+            Some(ProcId { pid: 1, started_us: 1, exec: None }),
+        );
         let err = hv.snapshot(&h, "t").unwrap_err().to_string();
         assert!(err.contains("vz"), "{err}");
     }

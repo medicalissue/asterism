@@ -501,6 +501,12 @@ impl Instance {
         self.handle = Some(Handle {
             backend: "qemu".to_owned(),
             pid: Some(pid),
+            // No identity: this record predates them, and one is never
+            // invented from a number. The daemon adopts it at startup if the
+            // process at that pid can be proven to be the guest's
+            // (`backend::adopt_identities`), and until then nothing signals
+            // it.
+            proc: None,
             ctl: ControlChannel::Qmp { path: crate::paths::qmp_socket_path(&self.name) },
             endpoint: GuestEndpoint::HostForward { ssh_port },
             started_at: self.created_at,

@@ -45,11 +45,12 @@ use asterism_core::hv::{
     GuestEndpoint, Handle, Hypervisor, ImageKind, Prepared, Ready, RunState, ShareKind, SnapshotId,
 };
 use asterism_core::instance::{now_unix, PortForward};
+use asterism_core::proc::{ProcId, Signal};
 use asterism_core::snapshot::{self, Snapshot};
 use asterism_core::tools::{output, run, tool};
 use asterism_core::{cow, image, oci, paths};
 
-use super::{alive, grow, qmp, signal, wait_gone};
+use super::{alive, grow, owned, qmp};
 
 pub const ID: &str = "qemu";
 
@@ -483,14 +484,20 @@ impl Hypervisor for Qemu {
             .trim()
             .parse()
             .context("unparseable qemu pidfile")?;
+        // Captured now, while the process is known to be the one `run` just
+        // started. This is the only moment at which that is knowable, and
+        // everything the daemon later does to this guest — including SIGKILL
+        // — is authorised by what is captured here.
+        let proc = ProcId::capture(pid).with_context(|| {
+            format!("qemu wrote pid {pid} to its pidfile and was gone before it could be recorded")
+        })?;
 
-        Ok(Handle {
-            backend: ID.to_owned(),
-            pid: Some(pid),
-            ctl: ControlChannel::Qmp { path: qmp },
-            endpoint: GuestEndpoint::HostForward { ssh_port },
-            started_at: now_unix(),
-        })
+        Ok(Handle::owning(
+            ID,
+            proc,
+            ControlChannel::Qmp { path: qmp },
+            GuestEndpoint::HostForward { ssh_port },
+        ))
     }
 
     /// Ask the guest to power down cleanly via QMP (ACPI power button); a
@@ -501,34 +508,43 @@ impl Hypervisor for Qemu {
     /// The QMP socket comes off the handle. It used to be rebuilt from the
     /// instance name, which quietly made "the control channel" a naming
     /// convention every future backend would have had to honour.
+    ///
+    /// Every escalation here is gated on [`ProcId`]: a handle whose process
+    /// cannot be proven to be this guest's has nothing for SIGTERM to reach,
+    /// and the guest it named is by definition already gone. Saying so and
+    /// returning is the whole of the safe behaviour — the alternative, which
+    /// this used to do, is aiming SIGKILL at a recycled pid.
     fn stop(&self, h: &Handle, deadline: Duration) -> Result<()> {
-        let Some(pid) = h.pid else {
-            bail!("handle for a {} guest carries no pid", h.backend);
+        let Some(proc) = owned(h) else {
+            return Ok(());
         };
         // Most of the budget goes to the guest; the rest to SIGTERM before
         // SIGKILL. At the default 40s that is the historical 30s then 10s.
         let graceful = deadline.mul_f32(0.75);
-        if powerdown(h.ctl.path()).is_ok() && wait_gone(pid, graceful) {
+        if powerdown(h.ctl.path()).is_ok() && proc.wait_gone(graceful) {
             return Ok(());
         }
-        signal(pid, "-TERM")?;
-        if wait_gone(pid, deadline - graceful) {
+        if !proc.signal(Signal::Term)? {
             return Ok(());
         }
-        signal(pid, "-KILL")?;
+        if proc.wait_gone(deadline - graceful) {
+            return Ok(());
+        }
+        proc.signal(Signal::Kill)?;
         Ok(())
     }
 
     fn kill(&self, h: &Handle) -> Result<()> {
-        let Some(pid) = h.pid else {
-            bail!("handle for a {} guest carries no pid", h.backend);
-        };
         qmp::forget(h.ctl.path());
-        signal(pid, "-KILL")
+        let Some(proc) = owned(h) else {
+            return Ok(());
+        };
+        proc.signal(Signal::Kill)?;
+        Ok(())
     }
 
     fn state(&self, h: &Handle) -> Result<RunState> {
-        Ok(match h.pid.map(alive).unwrap_or(false) {
+        Ok(match alive(h) {
             true => RunState::Running,
             false => RunState::Stopped,
         })
@@ -1812,15 +1828,7 @@ mod tests {
     #[test]
     fn unoffered_capabilities_refuse_by_name() {
         let hv = Qemu::new();
-        let h = Handle {
-            backend: ID.into(),
-            pid: Some(1),
-            ctl: ControlChannel::Qmp {
-                path: "/tmp/x.sock".into(),
-            },
-            endpoint: GuestEndpoint::HostForward { ssh_port: 22 },
-            started_at: 0,
-        };
+        let h = handle(Some(ProcId { pid: 1, started_us: 1, exec: None }));
         let err = hv.snapshot(&h, "t").unwrap_err().to_string();
         assert!(err.contains("qemu"), "{err}");
         assert!(hv
@@ -1828,21 +1836,94 @@ mod tests {
             .is_err());
     }
 
-    #[test]
-    fn a_handle_with_no_pid_cannot_be_stopped() {
-        let hv = Qemu::new();
-        let h = Handle {
+    /// A handle built the way one arrives off disk.
+    fn handle(proc: Option<ProcId>) -> Handle {
+        Handle {
             backend: ID.into(),
-            pid: None,
+            pid: proc.as_ref().map(|p| p.pid),
+            proc,
             ctl: ControlChannel::Qmp {
                 path: "/tmp/x.sock".into(),
             },
             endpoint: GuestEndpoint::HostForward { ssh_port: 22 },
             started_at: 0,
-        };
-        assert!(hv.stop(&h, Duration::from_millis(1)).is_err());
-        assert!(hv.kill(&h).is_err());
-        // ...and it is not running, which is what reconcile needs to know.
+        }
+    }
+
+    /// A pid nothing is holding: a child that has already been waited for.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        let _ = child.wait();
+        pid
+    }
+
+    /// The `pid: None` case, which used to be an error and is now the plain
+    /// truth: there is no process here, so there is nothing to take down and
+    /// nothing is running.
+    #[test]
+    fn a_handle_that_owns_no_process_is_stopped_and_stays_unsignalled() {
+        let hv = Qemu::new();
+        let h = handle(None);
+        assert!(hv.stop(&h, Duration::from_millis(1)).is_ok());
+        assert!(hv.kill(&h).is_ok());
         assert_eq!(hv.state(&h).unwrap(), RunState::Stopped);
+    }
+
+    /// The whole point of the pack. A registry written by an older daemon
+    /// carries a bare pid, that pid has since been handed to something else,
+    /// and `ast down` used to answer by SIGKILLing it.
+    #[test]
+    fn a_pre_identity_handle_is_stopped_and_never_signalled() {
+        let hv = Qemu::new();
+        // Our own pid stands in for the recycled one: definitely alive, and
+        // definitely not a guest. `kill -0` — the old test — says running.
+        let json = format!(
+            r#"{{"backend":"qemu","pid":{},
+                 "ctl":{{"kind":"qmp","path":"/tmp/x.sock"}},
+                 "endpoint":{{"kind":"host_forward","ssh_port":22}},
+                 "started_at":0}}"#,
+            std::process::id()
+        );
+        let h: Handle = serde_json::from_str(&json).unwrap();
+        assert_eq!(hv.state(&h).unwrap(), RunState::Stopped);
+        // And the test process is still here to assert it.
+        assert!(hv.stop(&h, Duration::from_millis(1)).is_ok());
+        assert!(hv.kill(&h).is_ok());
+        assert!(ProcId::capture(std::process::id()).unwrap().alive());
+    }
+
+    /// A handle whose pid has been recycled: same number, a process that
+    /// started later. Nothing may be signalled and nothing is running.
+    #[test]
+    fn a_recycled_pid_is_stopped_and_refuses_the_signals() {
+        let hv = Qemu::new();
+        let mut sleeper = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let real = ProcId::capture(sleeper.id()).unwrap();
+        let stale = ProcId { started_us: real.started_us - 1, ..real.clone() };
+        let h = handle(Some(stale));
+
+        assert_eq!(hv.state(&h).unwrap(), RunState::Stopped);
+        // Down succeeds — there is nothing of this guest left to take down —
+        // and the process wearing its number is not touched. Before this,
+        // `stop` sent it SIGTERM and then SIGKILL.
+        assert!(hv.stop(&h, Duration::from_millis(10)).is_ok());
+        assert!(hv.kill(&h).is_ok());
+        assert!(real.alive(), "the process that owns that pid is untouched");
+
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+    }
+
+    /// Crash cleanup: the guest is gone, so every path is a no-op that
+    /// succeeds. This is what `persist::boot_again` runs into.
+    #[test]
+    fn a_dead_guest_is_stopped_and_stopping_it_again_succeeds() {
+        let hv = Qemu::new();
+        let pid = dead_pid();
+        let h = handle(Some(ProcId { pid, started_us: 1, exec: None }));
+        assert_eq!(hv.state(&h).unwrap(), RunState::Stopped);
+        assert!(hv.stop(&h, Duration::from_millis(10)).is_ok());
+        assert!(hv.kill(&h).is_ok());
     }
 }

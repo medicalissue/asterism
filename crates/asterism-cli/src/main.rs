@@ -26,6 +26,7 @@ use clap::{Parser, Subcommand};
 
 use asterism_core::hv::ImageKind;
 use asterism_core::instance::{now_unix, Instance, PortForward, Restart, Shape};
+use asterism_core::proc::{ProcId, Signal};
 use asterism_core::protocol::{self, Request, Response};
 use asterism_core::registry::OrbitRow;
 use asterism_core::{cow, image, oci, paths, service, snapshot, verify, VERSION};
@@ -1835,17 +1836,17 @@ fn stale_version() -> Result<Option<String>> {
 
 /// Stop the daemon that is running and start ours in its place.
 fn retire_stale_daemon() -> Result<()> {
-    let pid = daemon_pid().context(
+    let daemon = daemon_proc().context(
         "cannot tell which process is serving the astd socket, so it cannot be \
          restarted — stop astd by hand and try again",
     )?;
 
-    signal(pid, "-TERM");
-    if !wait_until_gone(pid, Duration::from_secs(10)) {
+    daemon.signal(Signal::Term)?;
+    if !daemon.wait_gone(Duration::from_secs(10)) {
         // A daemon that will not take a hint. It holds the socket, so the
         // replacement cannot bind until it is gone.
-        signal(pid, "-KILL");
-        wait_until_gone(pid, Duration::from_secs(5));
+        daemon.signal(Signal::Kill)?;
+        daemon.wait_gone(Duration::from_secs(5));
     }
     // A hard-killed daemon leaves both of these behind; astd tolerates a
     // stale socket file, but the pid file would mislead the next restart.
@@ -1856,25 +1857,40 @@ fn retire_stale_daemon() -> Result<()> {
     Ok(())
 }
 
-/// Which process is serving the socket.
+/// Which process is serving the socket, proven well enough to signal.
 ///
-/// The pid file is the answer for any daemon new enough to write one. A
-/// daemon from before it existed is still findable, because the socket it
-/// holds open is a file with exactly one listener — and asking about that
-/// specific path can never turn up somebody else's daemon, which matters
-/// when several `ASTERISM_HOME`s are in play on one machine.
-fn daemon_pid() -> Option<u32> {
-    let pidfile = paths::daemon_pid_path();
-    if let Some(pid) = std::fs::read_to_string(&pidfile)
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())
-    {
-        if alive(pid) {
-            return Some(pid);
+/// Two sources, and the order is about evidence rather than convenience.
+/// `lsof` on the socket *is* the proof: a unix socket path has exactly one
+/// listener, so whatever holds this one is by construction the daemon for
+/// this `ASTERISM_HOME` and no other. The pid file is a claim — a number a
+/// previous daemon wrote and did not get to remove — and a hard-killed
+/// daemon leaves one behind for a pid the kernel is free to hand to
+/// anything. So the pid file is only believed when the process it names
+/// turns out to be running an `astd`, which is what stops `ast daemon
+/// restart` from SIGKILLing a stranger on a machine that rebooted.
+fn daemon_proc() -> Option<ProcId> {
+    if let Some(pid) = pid_holding(&paths::socket_path()) {
+        if let Ok(proc) = ProcId::capture(pid) {
+            return Some(proc);
         }
     }
-    pid_holding(&paths::socket_path())
+    let pid = std::fs::read_to_string(paths::daemon_pid_path())
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())?;
+    // `lsof` may simply not be installed, which is the case this fallback is
+    // really for. The claimed pid still has to look like a daemon: no
+    // `started_at` to compare against, so the executable is the whole test.
+    match ProcId::adopt(pid, u64::MAX, &[DAEMON_BIN]) {
+        Ok(proc) => Some(proc),
+        Err(why) => {
+            eprintln!("ast: ignoring the pid in {}: {why}", paths::daemon_pid_path().display());
+            None
+        }
+    }
 }
+
+/// The daemon binary, as the pid file's claim is checked against it.
+const DAEMON_BIN: &str = "astd";
 
 fn pid_holding(sock: &std::path::Path) -> Option<u32> {
     let out = std::process::Command::new("lsof")
@@ -1887,34 +1903,6 @@ fn pid_holding(sock: &std::path::Path) -> Option<u32> {
         .split(|b| *b == b'\n')
         .filter_map(|l| String::from_utf8_lossy(l).trim().parse::<u32>().ok())
         .find(|pid| *pid != std::process::id())
-}
-
-fn alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn signal(pid: u32, sig: &str) {
-    let _ = std::process::Command::new("kill")
-        .arg(sig)
-        .arg(pid.to_string())
-        .output();
-}
-
-fn wait_until_gone(pid: u32, budget: Duration) -> bool {
-    let deadline = std::time::Instant::now() + budget;
-    loop {
-        if !alive(pid) {
-            return true;
-        }
-        if std::time::Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
 }
 
 /// Send a request whose whole answer is "it worked" or why it didn't.

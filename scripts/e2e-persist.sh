@@ -40,12 +40,14 @@ LABEL=com.asterism.astd
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 ASTD_PID=
 WE_INSTALLED=
+BYSTANDER=
 
 fail() { echo "E2E FAIL: $*" >&2; exit 1; }
 ok() { echo "ok: $*"; }
 
 cleanup() {
   if [ -n "$WE_INSTALLED" ]; then "$AST" service uninstall >/dev/null 2>&1 || true; fi
+  if [ -n "$BYSTANDER" ]; then kill -9 "$BYSTANDER" 2>/dev/null || true; fi
   if [ -n "$ASTD_PID" ]; then kill -9 "$ASTD_PID" 2>/dev/null || true; fi
   # Only ever our own processes: every one of them names this home on its
   # command line.
@@ -219,6 +221,75 @@ logged "was running when this device last had a daemon" \
   || fail "astd did not report a resurrection:"$'\n'"$(cat "$LOG")"
 ok "the daemon log: $(grep -m1 'last had a daemon' "$LOG")"
 expect "guest answers after the reboot" "risen" "$AST" ssh "$INST" -- "echo risen"
+
+# ---- 2b. a registry from a daemon that only knew pids ----------------------
+#
+# Handles used to carry a bare pid, and a pid stops being evidence the
+# moment the daemon that wrote it is gone. Both halves of the fix are
+# exercised here against a real guest:
+#
+#   the pid is still the guest's  -> it is adopted, and nothing is rebooted
+#   the pid is somebody else's    -> it is refused, and nobody is signalled
+#
+# `handle.proc` is stripped from the registry to produce exactly the record
+# an older daemon would have left behind.
+strip_identity() {
+  python3 - "$ASTERISM_HOME/state.json" "$INST" "$@" <<'STRIP'
+import json, sys
+path, name = sys.argv[1], sys.argv[2]
+pid = int(sys.argv[3]) if len(sys.argv) > 3 else None
+state = json.load(open(path))
+handle = state[name]["handle"]
+handle.pop("proc", None)
+if pid is not None:
+    handle["pid"] = pid
+json.dump(state, open(path, "w"), indent=2)
+STRIP
+}
+
+echo "== a registry that names its guest by pid alone"
+stop_astd
+strip_identity
+if grep -q '"proc"' "$ASTERISM_HOME/state.json"; then
+  fail "the identity did not come out of the registry"
+fi
+start_astd
+waited_for "the daemon adopts a live guest it can only name by pid" 20 \
+  logged "adopting pid $PID3"
+[ "$(guest_pid)" = "$PID3" ] || fail "the guest was rebooted instead of adopted (now $(guest_pid))"
+ok "the guest kept running as pid $PID3 — no reboot, no second qemu on its disk"
+expect "and it still answers" "adopted" "$AST" ssh "$INST" -- "echo adopted"
+grep -q '"proc"' "$ASTERISM_HOME/state.json" \
+  || fail "the adopted identity was not written back to the registry"
+ok "the registry names it by identity now, not by number"
+
+echo "== a registry whose pid has been handed to something else"
+stop_astd
+kill -9 "$PID3" 2>/dev/null || true
+sleep 1
+dead "$PID3" || fail "qemu $PID3 survived kill -9"
+# A bystander, standing in for whatever the kernel gave that number to
+# next. It is nothing like a guest, and the old code would have SIGTERMed
+# and then SIGKILLed it on the way to restarting the instance.
+sleep 600 &
+BYSTANDER=$!
+strip_identity "$BYSTANDER"
+ok "the registry now claims $INST is running as pid $BYSTANDER"
+
+start_astd
+PID4="$(wait_new_pid "$BYSTANDER" 90)" || fail "astd did not resurrect $INST"
+kill -0 "$BYSTANDER" 2>/dev/null \
+  || fail "astd killed pid $BYSTANDER — a recycled pid was signalled"
+ok "the bystander at pid $BYSTANDER is untouched"
+logged "cannot be proven to be its guest" \
+  || fail "astd did not say why it refused the pid:"$'\n'"$(cat "$LOG")"
+ok "the daemon log: $(grep -m1 'cannot be proven to be its guest' "$LOG")"
+ok "and $INST was resurrected as pid $PID4"
+kill -9 "$BYSTANDER" 2>/dev/null || true
+wait "$BYSTANDER" 2>/dev/null || true
+BYSTANDER=
+PID3="$PID4"
+expect "guest answers after the refusal" "unharmed" "$AST" ssh "$INST" -- "echo unharmed"
 
 # ---- a deliberate down is not a crash --------------------------------------
 expect "down" "$INST  stopped" "$AST" down "$INST"

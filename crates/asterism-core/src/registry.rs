@@ -39,6 +39,7 @@ use crate::instance::{
     self, now_unix, Conflict, Instance, Moving, Policy, PortForward, Restart, Shape, Status,
     Volume,
 };
+use crate::proc::ProcId;
 use crate::secret::Binding;
 
 /// The shard file format this build writes.
@@ -301,6 +302,34 @@ impl Shard {
         inst.status = Status::Running;
         inst.handle = Some(handle);
         Ok(inst.clone())
+    }
+
+    /// Fill in the ownership identity of an already-recorded handle.
+    ///
+    /// Deliberately narrower than [`Shard::set_running`]: the only field it
+    /// can touch is [`Handle::proc`], and only where the handle has none. It
+    /// exists for one caller — the daemon's startup migration for registries
+    /// written before identities did — and a mutation that could rewrite the
+    /// rest of a live guest's handle would be a much bigger thing to hand
+    /// out for that.
+    pub fn adopt_handle_identity(&mut self, name: &str, proc: ProcId) -> Result<()> {
+        let inst = self.get_mut(name)?;
+        let Some(handle) = inst.handle.as_mut() else {
+            bail!("instance {name:?} has no handle to adopt a process for");
+        };
+        if handle.proc.is_some() {
+            return Ok(());
+        }
+        if handle.pid != Some(proc.pid) {
+            bail!(
+                "instance {name:?} records pid {:?}, so an identity for pid {} is not \
+                 its guest",
+                handle.pid,
+                proc.pid
+            );
+        }
+        handle.proc = Some(proc);
+        Ok(())
     }
 
     /// Set what happens when this instance's guest dies.
@@ -616,6 +645,7 @@ mod tests {
         Handle {
             backend: "qemu".into(),
             pid: Some(pid),
+            proc: Some(ProcId { pid, started_us: 1_700_000_000_000_000, exec: None }),
             ctl: ControlChannel::Qmp { path: "/tmp/qmp.sock".into() },
             endpoint: GuestEndpoint::HostForward { ssh_port },
             started_at: 1_700_000_000,

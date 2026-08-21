@@ -21,6 +21,7 @@ pub mod oci;
 pub mod orbit;
 pub mod paths;
 pub mod power;
+pub mod proc;
 pub mod protocol;
 pub mod registry;
 pub mod rewrite;

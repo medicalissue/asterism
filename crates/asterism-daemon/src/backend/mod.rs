@@ -12,14 +12,13 @@
 //! instance never silently changes hypervisor underneath its disks.
 
 use std::path::Path;
-use std::process::Command;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
-use asterism_core::hv::{BootReq, DiskFormat, Hypervisor, ImageKind, ImageRef, Machine};
+use asterism_core::hv::{BootReq, DiskFormat, Handle, Hypervisor, ImageKind, ImageRef, Machine};
 use asterism_core::instance::{Instance, PortForward};
+use asterism_core::proc::{Ownership, ProcId};
 use asterism_core::{image, paths, seed};
 
 pub mod qemu;
@@ -411,40 +410,289 @@ pub(crate) fn grow(disk: &Path, disk_gib: u64) -> Result<()> {
     Ok(())
 }
 
-/// Is the process holding this guest still there?
-pub(crate) fn alive(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
+// ---- process identity ------------------------------------------------------
+//
+// A backend's guest is a process that outlives the daemon, so the daemon
+// writes it down and picks it up again after a restart. What it writes down
+// is a `ProcId`, not a pid: see `asterism_core::proc` for why the difference
+// is the whole of this seam's safety.
 
-pub(crate) fn signal(pid: u32, sig: &str) -> Result<()> {
-    Command::new("kill")
-        .arg(sig)
-        .arg(pid.to_string())
-        .status()?;
-    Ok(())
-}
+/// Executables a `qemu` handle may legitimately be holding. A family rather
+/// than a path, so upgrading qemu under a running guest does not orphan it.
+const QEMU_EXECS: &[&str] = &["qemu-system-*"];
 
-/// Poll until the process is gone, or the budget runs out.
-pub(crate) fn wait_gone(pid: u32, budget: Duration) -> bool {
-    let deadline = std::time::Instant::now() + budget;
-    loop {
-        if !alive(pid) {
-            return true;
-        }
-        if std::time::Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(100));
+/// The vz helper. Matched by name because the daemon may have been upgraded
+/// (and its helper moved) while the guest kept running.
+const VZ_EXECS: &[&str] = &[asterism_vz::HELPER_BIN];
+
+/// Which executables a handle for this backend may be holding, or `None` for
+/// a backend with no process of its own.
+fn execs_for(backend: &str) -> Option<&'static [&'static str]> {
+    match backend {
+        qemu::ID => Some(QEMU_EXECS),
+        vz::ID => Some(VZ_EXECS),
+        _ => None,
     }
+}
+
+/// Give every pre-identity handle in the registry an identity, once.
+///
+/// The explicit migration for records written before [`ProcId`] existed.
+/// Runs at daemon startup, before `persist::resurrect`, so every path after
+/// it is looking at handles that either carry proof or carry nothing.
+///
+/// Adoption is deliberately conservative ([`ProcId::adopt`]): the process
+/// must still be there, must not have started after the handle that names
+/// it, and must be running one of the executables this backend spawns. A
+/// handle that fails all that keeps its bare pid, reads as stopped, and gets
+/// resurrected — which is the safe direction. The unsafe direction is
+/// believing a stranger's pid is a guest and later signalling it.
+///
+/// Returns whether anything changed and the registry needs saving.
+pub fn adopt_identities(reg: &mut asterism_core::registry::Shard) -> bool {
+    use asterism_core::instance::Status;
+
+    let stale: Vec<Instance> = reg
+        .list()
+        .into_iter()
+        .filter(|i| i.status == Status::Running)
+        .filter(|i| i.handle.as_ref().is_some_and(|h| h.proc.is_none() && h.pid.is_some()))
+        .collect();
+
+    let mut changed = false;
+    for inst in stale {
+        let handle = inst.handle.as_ref().expect("filtered on a handle");
+        let pid = handle.pid.expect("filtered on a pid");
+        let Some(execs) = execs_for(&handle.backend) else {
+            continue;
+        };
+        match ProcId::adopt(pid, handle.started_at, execs) {
+            Ok(proc) => {
+                eprintln!(
+                    "astd: {} was recorded before process identities existed — adopting {proc}",
+                    inst.name
+                );
+                if reg.adopt_handle_identity(&inst.name, proc).is_ok() {
+                    changed = true;
+                }
+            }
+            // Not an error: the overwhelmingly common case is a guest that
+            // is simply no longer there. Said out loud anyway, because the
+            // other case — a pid that now belongs to something else — is
+            // exactly the near-miss a human would want to know about.
+            Err(why) => eprintln!(
+                "astd: {}'s recorded pid {pid} cannot be proven to be its guest ({why}) — \
+                 treating it as stopped",
+                inst.name
+            ),
+        }
+    }
+    changed
+}
+
+/// The process behind a handle, or nothing.
+///
+/// Every backend goes through this rather than reaching for `h.pid`, and
+/// what it returns is the *only* thing this daemon will signal.
+///
+/// `None` answers three situations a caller has to treat identically: the
+/// backend has no process of its own, the process is gone, and the pid on
+/// the handle now belongs to somebody else. All three mean the same to
+/// `stop` and `kill` — there is nothing here it is safe to touch, and the
+/// guest this handle named is not running, which is what the caller was
+/// asking for. Only the third is worth a line, and only because a near-miss
+/// with SIGKILL is something a human should be able to find afterwards.
+pub(crate) fn owned(h: &Handle) -> Option<&ProcId> {
+    let proc = h.proc.as_ref()?;
+    match proc.check() {
+        Ownership::Ours => Some(proc),
+        Ownership::Gone => None,
+        // Two different facts, one answer, and the answer is the safe one:
+        // a process we cannot name is a process we do not signal. They are
+        // told apart in the log because only one of them is alarming.
+        Ownership::Foreign(why) => {
+            eprintln!(
+                "astd: the {} guest recorded at {proc} is not that process any more \
+                 ({why}) — nothing will be signalled",
+                h.backend
+            );
+            None
+        }
+        Ownership::Unknown(why) => {
+            eprintln!(
+                "astd: cannot confirm the {} guest at {proc} ({why}) — leaving it alone",
+                h.backend
+            );
+            None
+        }
+    }
+}
+
+/// Liveness without the log line, for the paths that ask every few seconds.
+pub(crate) fn alive(h: &Handle) -> bool {
+    h.proc.as_ref().is_some_and(|p| p.alive())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    // ---- the startup migration ---------------------------------------------
+
+    mod adoption {
+        use super::*;
+        use asterism_core::hv::{ControlChannel, GuestEndpoint};
+        use asterism_core::instance::{now_unix, Shape, Status};
+        use asterism_core::registry::Shard;
+
+        fn shard() -> (tempfile::TempDir, Shard) {
+            let dir = tempfile::tempdir().unwrap();
+            let shard = Shard::load(&dir.path().join("state.json")).unwrap();
+            (dir, shard)
+        }
+
+        fn machine(backend: &str) -> Machine {
+            Machine {
+                backend: backend.into(),
+                machine_type: "virt".into(),
+                cpu: "host".into(),
+                hv_version: "test".into(),
+            }
+        }
+
+        /// An instance recorded running by a daemon that predates process
+        /// identities: a bare pid on the handle and nothing behind it.
+        fn pre_identity(reg: &mut Shard, name: &str, backend: &str, pid: u32) {
+            reg.create(name, "laptop", "debian:13", Shape::default(), machine(backend))
+                .unwrap();
+            reg.set_running(
+                name,
+                Handle {
+                    backend: backend.into(),
+                    pid: Some(pid),
+                    proc: None,
+                    ctl: ControlChannel::Qmp { path: "/tmp/x.sock".into() },
+                    endpoint: GuestEndpoint::HostForward { ssh_port: 22 },
+                    started_at: now_unix(),
+                },
+            )
+            .unwrap();
+        }
+
+        /// The daemon has restarted under a live guest, and the guest's
+        /// process is still there running what it should be. That process
+        /// gets a real identity and nothing is booted twice.
+        #[test]
+        fn a_live_guest_survives_the_daemon_that_could_not_name_it() {
+            let (_dir, mut reg) = shard();
+            // `sleep` stands in for the helper: a real process, running a
+            // known binary, started just now.
+            let mut sleeper = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+            pre_identity(&mut reg, "live", vz::ID, sleeper.id());
+
+            // Adoption is gated on the executable, so the test asks for the
+            // one this process actually is.
+            let handle = reg.get("live").unwrap().handle.clone().unwrap();
+            let proc = ProcId::adopt(sleeper.id(), handle.started_at, &["sleep"]).unwrap();
+            reg.adopt_handle_identity("live", proc).unwrap();
+
+            let adopted = reg.get("live").unwrap().handle.as_ref().unwrap();
+            assert!(adopted.owned().is_some(), "the guest was adopted");
+            assert!(adopted.owned().unwrap().alive());
+            assert_eq!(adopted.pid, Some(sleeper.id()), "the pid is left where it was");
+
+            let _ = sleeper.kill();
+            let _ = sleeper.wait();
+        }
+
+        /// The real thing, through the entry point the daemon calls: the
+        /// recorded pid is alive and is emphatically not a guest, so it is
+        /// refused and the instance keeps a handle that owns nothing.
+        #[test]
+        fn a_recycled_pid_is_refused_and_leaves_the_handle_owning_nothing() {
+            let (_dir, mut reg) = shard();
+            // This test process: alive, and running neither qemu nor the vz
+            // helper. `kill -0` — what the old code asked — says running.
+            pre_identity(&mut reg, "stale", qemu::ID, std::process::id());
+
+            assert!(!adopt_identities(&mut reg), "nothing was adopted");
+            let handle = reg.get("stale").unwrap().handle.as_ref().unwrap();
+            assert_eq!(handle.owned(), None);
+            assert!(!alive(handle), "and it does not read as running");
+            // The record is otherwise untouched: resurrection, not deletion,
+            // is what happens to it next.
+            assert_eq!(handle.pid, Some(std::process::id()));
+            assert_eq!(reg.get("stale").unwrap().status, Status::Running);
+        }
+
+        /// A pid whose process is simply gone — the host rebooted, or the
+        /// guest died while the daemon was down. Nothing to adopt, no noise
+        /// beyond a line, and the supervisor takes it from there.
+        #[test]
+        fn a_dead_pid_is_left_alone() {
+            let (_dir, mut reg) = shard();
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            let pid = child.id();
+            child.wait().unwrap();
+            pre_identity(&mut reg, "gone", qemu::ID, pid);
+
+            assert!(!adopt_identities(&mut reg));
+            assert_eq!(reg.get("gone").unwrap().handle.as_ref().unwrap().owned(), None);
+        }
+
+        /// Idempotent, and only ever additive: a handle that already owns a
+        /// process is not re-adopted, and the identity it has is not
+        /// replaced by one derived from its number.
+        #[test]
+        fn a_handle_that_already_owns_a_process_is_left_exactly_as_it_was() {
+            let (_dir, mut reg) = shard();
+            let mut sleeper = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+            let real = ProcId::capture(sleeper.id()).unwrap();
+            pre_identity(&mut reg, "known", qemu::ID, sleeper.id());
+            reg.adopt_handle_identity("known", real.clone()).unwrap();
+
+            assert!(!adopt_identities(&mut reg), "nothing left to adopt");
+            let other = ProcId { started_us: real.started_us + 1, ..real.clone() };
+            reg.adopt_handle_identity("known", other).unwrap();
+            assert_eq!(
+                reg.get("known").unwrap().handle.as_ref().unwrap().owned(),
+                Some(&real),
+                "an identity is written once"
+            );
+
+            let _ = sleeper.kill();
+            let _ = sleeper.wait();
+        }
+
+        /// A stopped instance has no guest to adopt, whatever a leftover
+        /// record says.
+        #[test]
+        fn only_running_instances_are_adopted() {
+            let (_dir, mut reg) = shard();
+            let mut sleeper = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+            pre_identity(&mut reg, "down", qemu::ID, sleeper.id());
+            reg.set_stopped("down").unwrap();
+
+            assert!(!adopt_identities(&mut reg));
+            assert!(reg.get("down").unwrap().handle.is_none());
+
+            let _ = sleeper.kill();
+            let _ = sleeper.wait();
+        }
+
+        /// Which executables each backend will believe. Getting this list
+        /// wrong in either direction is a bug with teeth: too narrow orphans
+        /// a live guest, too wide adopts a stranger.
+        #[test]
+        fn each_backend_names_the_programs_it_spawns() {
+            assert_eq!(execs_for(qemu::ID), Some(QEMU_EXECS));
+            assert_eq!(execs_for(vz::ID), Some(VZ_EXECS));
+            assert_eq!(execs_for("chv"), None);
+            assert_eq!(VZ_EXECS, &["astd-vz"]);
+        }
+    }
+
     use asterism_core::hv::{Caps, Handle, Prepared, Ready, RunState};
 
     struct Fake {

@@ -16,6 +16,7 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::instance::Instance;
+use crate::proc::ProcId;
 use crate::seed::Share;
 use crate::snapshot::Snapshot;
 
@@ -236,12 +237,60 @@ pub struct Handle {
     /// Backend that owns this guest — the id it was booted with.
     pub backend: String,
     /// `None` for a backend with no child process of its own.
+    ///
+    /// Kept for what reads it and cannot act on it: `ast status`, and any
+    /// daemon older than [`Handle::proc`] that finds this record. Nothing
+    /// signals it — see that field.
     #[serde(default)]
     pub pid: Option<u32>,
+    /// Proof of *which* process that pid is.
+    ///
+    /// A pid on its own is a number the kernel re-issues, and this handle is
+    /// written to disk precisely so it can be picked up after the daemon,
+    /// and possibly the host, has restarted. Every liveness check and every
+    /// signal goes through this ([`ProcId`]); a handle without one is a
+    /// handle whose guest cannot be proven to exist, and is treated as
+    /// stopped rather than signalled.
+    ///
+    /// Absent on records written before identities existed — the daemon
+    /// mints one for them at startup where it safely can
+    /// ([`ProcId::adopt`]) — and absent on a backend with no process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proc: Option<ProcId>,
     pub ctl: ControlChannel,
     pub endpoint: GuestEndpoint,
     /// Unix seconds, matching `Instance::created_at`.
     pub started_at: u64,
+}
+
+impl Handle {
+    /// A handle for a backend whose guest is a process of its own, built
+    /// from that process's proven identity.
+    pub fn owning(
+        backend: &str,
+        proc: ProcId,
+        ctl: ControlChannel,
+        endpoint: GuestEndpoint,
+    ) -> Handle {
+        Handle {
+            backend: backend.to_owned(),
+            pid: Some(proc.pid),
+            proc: Some(proc),
+            ctl,
+            endpoint,
+            started_at: crate::instance::now_unix(),
+        }
+    }
+
+    /// The process this handle owns, if ownership was ever proven.
+    ///
+    /// The only way to reach a signal from a handle. `None` means one of two
+    /// things — the backend has no process, or this record predates
+    /// identities and its pid could not be adopted — and callers must treat
+    /// both the same way: there is nothing here it is safe to touch.
+    pub fn owned(&self) -> Option<&ProcId> {
+        self.proc.as_ref()
+    }
 }
 
 /// Liveness of a handle reloaded from the registry. A handle is never
@@ -523,6 +572,7 @@ pub trait Hypervisor: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proc::ProcId;
 
     #[test]
     fn ssh_targets_come_from_the_endpoint_not_the_backend() {
@@ -540,6 +590,7 @@ mod tests {
         let h = Handle {
             backend: "qemu".into(),
             pid: Some(4242),
+            proc: Some(ProcId { pid: 4242, started_us: 1_700_000_000_000_000, exec: None }),
             ctl: ControlChannel::Qmp { path: "/tmp/qmp.sock".into() },
             endpoint: GuestEndpoint::HostForward { ssh_port: 22022 },
             started_at: 1_700_000_000,
@@ -548,6 +599,24 @@ mod tests {
         assert_eq!(h, serde_json::from_str::<Handle>(&json).unwrap());
         // The control path is data on the handle, not a naming convention.
         assert!(json.contains("/tmp/qmp.sock"));
+        // The bare pid stays on the wire beside the identity, so a daemon or
+        // CLI older than identities still reads a handle this one wrote.
+        assert!(json.contains("\"pid\":4242"), "{json}");
+    }
+
+    /// The compatibility direction that matters most: a registry written
+    /// before identities existed still loads, and the handle it produces
+    /// owns nothing — which is what keeps every signal path off it until the
+    /// daemon has adopted the process on purpose.
+    #[test]
+    fn a_handle_written_before_identities_loads_and_owns_nothing() {
+        let json = r#"{"backend":"qemu","pid":4242,
+            "ctl":{"kind":"qmp","path":"/tmp/qmp.sock"},
+            "endpoint":{"kind":"host_forward","ssh_port":22022},
+            "started_at":1700000000}"#;
+        let h: Handle = serde_json::from_str(json).unwrap();
+        assert_eq!(h.pid, Some(4242));
+        assert_eq!(h.owned(), None, "a pid is not an identity");
     }
 
     #[test]

@@ -63,12 +63,12 @@ use tokio::sync::Mutex;
 
 use asterism_core::hv::{DiskSpec, Hypervisor};
 use asterism_core::instance::{Instance, Volume};
+use asterism_core::proc::{ProcId, Signal};
 use asterism_core::protocol::{Request, Response};
 use asterism_core::tools::{run, tool};
 use asterism_core::volume::{self, BlockVolume, Store};
 use asterism_core::paths;
 
-use crate::backend;
 use crate::mesh::{Mesh, Splice};
 use crate::Node;
 
@@ -211,11 +211,11 @@ async fn grant(name: &str, holder: &str, holder_device: &str) -> Result<Response
     store.save()?;
 
     if let Some(old) = previous {
-        stop_export(name, old.epoch, old.pid);
+        stop_export(name, old.epoch, old.proc.as_ref());
     }
     let lease = vol.lease.clone().expect("a grant leaves a lease");
-    let pid = start_export(&vol, lease.epoch, &lease.export)?;
-    store.set_export_pid(name, Some(pid))?;
+    let proc = start_export(&vol, lease.epoch, &lease.export)?;
+    store.set_export_proc(name, Some(proc))?;
     store.save()?;
 
     Ok(Response::VolumeLease {
@@ -242,9 +242,9 @@ async fn resume(name: &str, holder: &str, epoch: u64) -> Result<Response> {
     let lease = vol.lease.clone().expect("reconnect checked the lease");
 
     let socket = paths::volume_export_socket(name, lease.epoch);
-    if !export_alive(lease.pid, &socket) {
-        let pid = start_export(&vol, lease.epoch, &lease.export)?;
-        store.set_export_pid(name, Some(pid))?;
+    if !export_alive(lease.proc.as_ref(), &socket) {
+        let proc = start_export(&vol, lease.epoch, &lease.export)?;
+        store.set_export_proc(name, Some(proc))?;
         store.save()?;
     }
     Ok(Response::VolumeLease {
@@ -262,7 +262,7 @@ async fn release(name: &str, holder: &str) -> Result<Response> {
     let released = store.release(name, holder)?;
     store.save()?;
     if let Some(lease) = released {
-        stop_export(name, lease.epoch, lease.pid);
+        stop_export(name, lease.epoch, lease.proc.as_ref());
     }
     Ok(Response::Volumes { volumes: vec![store.get(name)?.clone()] })
 }
@@ -297,9 +297,9 @@ pub async fn open_export(
     // Restarting it at the *same* epoch is safe, because the epoch is what
     // decides who may write and it has not moved.
     let socket = paths::volume_export_socket(volume, lease.epoch);
-    if !export_alive(lease.pid, &socket) {
-        let pid = start_export(&vol, lease.epoch, &lease.export)?;
-        store.set_export_pid(volume, Some(pid))?;
+    if !export_alive(lease.proc.as_ref(), &socket) {
+        let proc = start_export(&vol, lease.epoch, &lease.export)?;
+        store.set_export_proc(volume, Some(proc))?;
         store.save()?;
     }
     drop(store);
@@ -309,14 +309,56 @@ pub async fn open_export(
         .with_context(|| format!("connecting to the export for volume {volume:?}"))
 }
 
+/// Give every pre-identity lease on this device an identity, once.
+///
+/// The volume half of the startup migration, run beside
+/// [`crate::backend::adopt_identities`] and for the same reason: a lease
+/// written by an older daemon names its storage daemon by pid alone, and a
+/// pid that has outlived a daemon restart is not evidence of anything.
+///
+/// A lease that cannot be adopted is left with no identity, which reads as
+/// an export that is not running — and that is a state this plane already
+/// recovers from by starting the export again at the *same* epoch, so
+/// nothing is fenced and no consumer notices.
+pub async fn adopt_export_identities() {
+    let Ok(plane) = plane() else { return };
+    let mut store = plane.store.lock().await;
+    let mut changed = false;
+    for vol in store.list() {
+        match store.adopt_export(&vol.name) {
+            Ok(Some(proc)) => {
+                eprintln!(
+                    "astd: volume {:?} was exported before process identities existed — \
+                     adopting {proc}",
+                    vol.name
+                );
+                changed = true;
+            }
+            Ok(None) => {}
+            Err(why) => eprintln!(
+                "astd: volume {:?}'s recorded export cannot be proven to still be running \
+                 ({why}) — it will be started again when something asks for it",
+                vol.name
+            ),
+        }
+    }
+    if changed {
+        if let Err(e) = store.save() {
+            eprintln!("astd: saving volumes after adopting export identities: {e:#}");
+        }
+    }
+}
+
 // ---- qemu-storage-daemon ---------------------------------------------------
 
 /// Start the storage daemon for one epoch's export.
 ///
-/// Tracked exactly the way the vz helper is: a pidfile it writes at startup,
-/// and a socket that answers. Neither alone is enough — a pid can be recycled
-/// and a socket file outlives the process that bound it — so liveness is both.
-fn start_export(vol: &BlockVolume, epoch: u64, export: &str) -> Result<u32> {
+/// Tracked exactly the way the vz helper is: an identity captured from the
+/// pidfile it writes at startup, and a socket that answers. Neither alone is
+/// enough — a socket file outlives the process that bound it, and a pid on
+/// its own proves nothing at all once this daemon has restarted — so
+/// liveness is both.
+fn start_export(vol: &BlockVolume, epoch: u64, export: &str) -> Result<ProcId> {
     let qsd = tool("qemu-storage-daemon").context(
         "qemu-storage-daemon is what serves a block volume, and it is not installed \
          on this device (it ships with qemu)",
@@ -361,11 +403,21 @@ fn start_export(vol: &BlockVolume, epoch: u64, export: &str) -> Result<u32> {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    std::fs::read_to_string(&pidfile)
+    let pid: u32 = std::fs::read_to_string(&pidfile)
         .context("qemu-storage-daemon did not write its pidfile")?
         .trim()
         .parse()
-        .context("unparseable qemu-storage-daemon pidfile")
+        .context("unparseable qemu-storage-daemon pidfile")?;
+    // Captured while the process is still known to be the one just started.
+    // Everything later done to this export — including the SIGKILL that ends
+    // a revoked lease — is authorised by this and nothing else.
+    ProcId::capture(pid).with_context(|| {
+        format!(
+            "qemu-storage-daemon wrote pid {pid} for volume {:?} and was gone before it \
+             could be recorded",
+            vol.name
+        )
+    })
 }
 
 /// Stop an export and take its socket with it.
@@ -373,11 +425,22 @@ fn start_export(vol: &BlockVolume, epoch: u64, export: &str) -> Result<u32> {
 /// The unlink is the revocation: `qemu-storage-daemon` leaves its socket file
 /// behind when it dies, and a socket file that outlives its export is a thing
 /// a fenced consumer could keep knocking at forever.
-fn stop_export(name: &str, epoch: u64, pid: Option<u32>) {
-    if let Some(pid) = pid {
-        let _ = backend::signal(pid, "-TERM");
-        if !backend::wait_gone(pid, Duration::from_secs(5)) {
-            let _ = backend::signal(pid, "-KILL");
+///
+/// The signals go only to a process this daemon can still prove is the
+/// export it started ([`ProcId`]). A lease whose recorded process cannot be
+/// proven gets the unlink and nothing else: whatever is at that pid now, it
+/// is not this export, and a revocation is not worth a stranger's SIGKILL.
+fn stop_export(name: &str, epoch: u64, proc: Option<&ProcId>) {
+    if let Some(proc) = proc {
+        match proc.signal(Signal::Term) {
+            Ok(true) => {
+                if !proc.wait_gone(Duration::from_secs(5)) {
+                    let _ = proc.signal(Signal::Kill);
+                }
+            }
+            // Already gone: the unlink below is the rest of the revocation.
+            Ok(false) => {}
+            Err(e) => eprintln!("astd: not stopping the export for volume {name:?}: {e:#}"),
         }
     }
     let _ = std::fs::remove_file(paths::volume_export_socket(name, epoch));
@@ -385,11 +448,11 @@ fn stop_export(name: &str, epoch: u64, pid: Option<u32>) {
 }
 
 /// Is the export for this lease still being served?
-fn export_alive(pid: Option<u32>, socket: &Path) -> bool {
-    match pid {
-        Some(pid) => backend::alive(pid) && socket.exists(),
-        None => false,
-    }
+///
+/// Both halves, and neither is redundant: a socket file outlives whoever
+/// bound it, and a recorded process may since have become somebody else's.
+fn export_alive(proc: Option<&ProcId>, socket: &Path) -> bool {
+    proc.is_some_and(|p| p.alive()) && socket.exists()
 }
 
 // ---- the consumer's half ---------------------------------------------------
@@ -848,15 +911,61 @@ mod tests {
     fn an_export_is_alive_only_when_both_halves_are() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("nbd-e1.sock");
-        assert!(!export_alive(None, &socket), "no pid, nothing running");
+        let me = ProcId::capture(std::process::id()).unwrap();
+
+        assert!(!export_alive(None, &socket), "nothing recorded, nothing running");
         std::fs::write(&socket, b"").unwrap();
-        assert!(!export_alive(Some(1), &socket) || backend::alive(1));
         // Our own process is certainly alive, and the file is there.
-        assert!(export_alive(Some(std::process::id()), &socket));
+        assert!(export_alive(Some(&me), &socket));
         std::fs::remove_file(&socket).unwrap();
         assert!(
-            !export_alive(Some(std::process::id()), &socket),
-            "a live pid with no socket is not an export"
+            !export_alive(Some(&me), &socket),
+            "a live process with no socket is not an export"
         );
+    }
+
+    /// The provider's half of the recycled-pid problem. A lease written
+    /// before identities existed names a storage daemon by number; that
+    /// number has since been handed to something else, and revoking the
+    /// lease used to mean SIGTERM then SIGKILL to whatever holds it.
+    #[test]
+    fn a_recycled_export_pid_is_neither_believed_nor_signalled() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("nbd-e1.sock");
+        std::fs::write(&socket, b"").unwrap();
+
+        let mut sleeper = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let real = ProcId::capture(sleeper.id()).unwrap();
+        let stale = ProcId { started_us: real.started_us - 1, ..real.clone() };
+
+        assert!(!export_alive(Some(&stale), &socket), "not our export any more");
+        // Revocation still runs — the unlink of the lease's own socket is
+        // the fence, and it does not depend on any process — but the
+        // stranger holding the number is left alone.
+        stop_export("tank", 1, Some(&stale));
+        assert!(real.alive(), "nobody else was killed to close the door");
+
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+    }
+
+    /// A lease from an older daemon carries a pid and no identity, and that
+    /// is not evidence of anything: the export reads as not running, which
+    /// this plane recovers from by starting it again at the same epoch.
+    #[test]
+    fn a_pre_identity_lease_is_not_believed() {
+        let json = format!(
+            r#"{{"holder":"dev","holder_device":"laptop","epoch":1,"granted_at":0,
+                 "export":"tank-e1","pid":{}}}"#,
+            std::process::id()
+        );
+        let lease: volume::Lease = serde_json::from_str(&json).unwrap();
+        assert_eq!(lease.pid, Some(std::process::id()));
+        assert_eq!(lease.proc, None, "a pid is not an identity");
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("nbd-e1.sock");
+        std::fs::write(&socket, b"").unwrap();
+        assert!(!export_alive(lease.proc.as_ref(), &socket));
     }
 }

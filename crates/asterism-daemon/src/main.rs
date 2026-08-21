@@ -164,6 +164,21 @@ async fn main() -> Result<()> {
     // holds a process-wide handle rather than taking one as an argument.
     swap::init(mesh.clone());
 
+    // Records written before a process could be identified only carry a pid,
+    // and a pid is not evidence. This gives the ones whose process can still
+    // be proven a real identity, and everything after it — resurrection, the
+    // supervisor, every stop — deals only in proof. Before `resurrect`,
+    // because resurrect is the first thing that acts on liveness.
+    {
+        let mut reg = node.shard.lock().await;
+        if backend::adopt_identities(&mut reg) {
+            if let Err(e) = reg.save() {
+                eprintln!("astd: saving the registry after adopting process identities: {e:#}");
+            }
+        }
+    }
+    volume::adopt_export_identities().await;
+
     // What this device was running, it runs again — before the first
     // request is served, and then continuously (see `persist`).
     persist::resurrect(&node.shard).await;
