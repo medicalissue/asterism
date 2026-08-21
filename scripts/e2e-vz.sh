@@ -279,6 +279,92 @@ expect_eventually "logs show cloud-init finishing" "cloud-init status: done" \
 # the guest is usable from the transcript, not just visible in it.
 expect_eventually "logs show a login prompt" "login:" "$AST" logs "$INST"
 
+# ---- the guest agent, which is how the guest was found ---------------------
+#
+# The endpoint used to be inferred: a candidate out of /var/db/dhcpd_leases,
+# proved by whatever answered on port 22. Now the guest is asked, over an
+# authenticated channel on its own virtio socket, and the lease hunt is only
+# the fallback. These assertions are about which of the two actually
+# happened on this boot — a fallback that silently took over would otherwise
+# look exactly like success.
+
+HELPER_LOG="$ASTERISM_HOME/instances/$INST/vz-helper.log"
+
+helper_log_has() {
+  local desc="$1" pattern="$2"
+  grep -qE "$pattern" "$HELPER_LOG" \
+    || fail "$desc: no /$pattern/ in:"$'\n'"$(cat "$HELPER_LOG")"
+  echo "ok: $desc"
+}
+
+# Waits, because the guest agent and the ssh prober race by design and the
+# assertions below are about both of them having finished.
+helper_log_eventually() {
+  local desc="$1" pattern="$2" _i
+  for _i in $(seq 1 30); do
+    if grep -qE "$pattern" "$HELPER_LOG"; then
+      echo "ok: $desc"
+      return 0
+    fi
+    sleep 1
+  done
+  fail "$desc: no /$pattern/ within 30s in:"$'\n'"$(cat "$HELPER_LOG")"
+}
+
+helper_log_has "the guest agent answered on vsock" \
+  "guest agent answered on vsock port 1023 after [0-9.]+s"
+helper_log_has "over a negotiated protocol version" "over protocol v[0-9]+"
+helper_log_has "and the endpoint came from the guest itself" \
+  "is at 192\\.168\\.[0-9.]+ after [0-9.]+s — the guest said so"
+
+# Both paths run on every boot, so both timings are in this log — which
+# makes the comparison a measurement rather than a claim. The agent binds
+# its port from cloud-init's earliest stage; sshd is reachable only once it
+# has host keys and has finished starting.
+helper_log_eventually "the ssh banner path also finished, for comparison" \
+  "answered at 192\\.168\\.[0-9.]+ after [0-9.]+s — SSH-"
+AGENT_AT="$(sed -n 's/.* is at [0-9.]* after \([0-9.]*\)s — the guest said so.*/\1/p' "$HELPER_LOG" | head -1)"
+SSH_AT="$(sed -n 's/.* answered at [0-9.]* after \([0-9.]*\)s — SSH-.*/\1/p' "$HELPER_LOG" | head -1)"
+[ -n "$AGENT_AT" ] && [ -n "$SSH_AT" ] || fail "could not read both timings from $HELPER_LOG"
+echo "ok: guest found by its agent at ${AGENT_AT}s, by an ssh banner at ${SSH_AT}s"
+python3 -c "import sys; sys.exit(0 if $AGENT_AT <= $SSH_AT else 1)" \
+  || fail "the guest agent (${AGENT_AT}s) was slower than the ssh banner (${SSH_AT}s), \
+which is the thing it replaces"
+
+# ---- authentication, on the real channel -----------------------------------
+#
+# The handshake exists so that what answers on the port is the guest this
+# seed built. Give the guest a key that is not this instance's and the
+# helper must refuse it by name — and must go on serving the guest, because
+# a control channel it cannot trust is not a reason to take somebody's agent
+# down.
+
+"$AST" ssh "$INST" -- \
+  "sudo cp /etc/asterism/agent.key /tmp/agent.key.real \
+   && printf '%s\n' $(printf 'ab%.0s' $(seq 1 32)) | sudo tee /etc/asterism/agent.key >/dev/null \
+   && sudo systemctl restart asterism-guest.service" >/dev/null 2>&1 \
+  || fail "could not give the guest a wrong key"
+helper_log_eventually "a guest with the wrong key is refused, by name" \
+  "did not prove it holds this instance.s key"
+expect "and the guest is still reachable while it is refused" "$MARKER" \
+  "$AST" ssh "$INST" -- "cat $PROOF"
+
+"$AST" ssh "$INST" -- \
+  "sudo cp /tmp/agent.key.real /etc/asterism/agent.key \
+   && sudo systemctl restart asterism-guest.service" >/dev/null 2>&1 \
+  || fail "could not put the guest's real key back"
+# The helper reconnects on its own, on a backoff that has grown while it was
+# being refused; a *second* session line is the proof that it did.
+sessions=0
+for _ in $(seq 1 60); do
+  sessions="$(grep -cE "guest agent (re)?answered on vsock port 1023" "$HELPER_LOG" || true)"
+  [ "$sessions" -ge 2 ] && break
+  sleep 1
+done
+[ "$sessions" -ge 2 ] \
+  || fail "the session did not come back once the key did:"$'\n'"$(cat "$HELPER_LOG")"
+echo "ok: and the session comes back on its own once the key does"
+
 # ---- the guest outlives its daemon -----------------------------------------
 #
 # VZVirtualMachine dies with the process that made it, which is exactly why
@@ -324,6 +410,11 @@ expect "list"     "clean"                 "$AST" snapshots "$INST"
 
 expect "up again" "$INST  running" "$AST" up "$INST"
 track_running "$INST"
+# Every boot, not just the first: the helper's log is written fresh per boot,
+# so this is the second boot's own agent session. Readiness that only worked
+# once would be indistinguishable from readiness that works, without this.
+helper_log_has "the second boot was found by its agent too" \
+  "is at 192\\.168\\.[0-9.]+ after [0-9.]+s — the guest said so"
 expect "the proof survived the reboot" "$MARKER" "$AST" ssh "$INST" -- "cat $PROOF"
 "$AST" ssh "$INST" -- "echo diverged | sudo tee $PROOF >/dev/null && sync" \
   >/dev/null 2>&1 || fail "diverging the guest"

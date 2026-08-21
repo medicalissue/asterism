@@ -24,6 +24,11 @@ path = "src/helper/main.rs"
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The guest agent handshake is HMAC-SHA256, because the guest half of it is
+# Python and `hmac`/`hashlib` are what a stock cloud image has. sha2 was
+# already compiled in this tree behind asterism-core's content addresses, so
+# this costs the signed helper no build time and no new third-party code.
+sha2 = "0.11"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
@@ -79,6 +84,8 @@ features = [
     "VZVirtioConsoleDeviceSerialPortConfiguration",
     "VZVirtioEntropyDeviceConfiguration",
     "VZVirtioNetworkDeviceConfiguration",
+    "VZVirtioSocketConnection",
+    "VZVirtioSocketDevice",
     "VZVirtioSocketDeviceConfiguration",
     "VZVirtioTraditionalMemoryBalloonDeviceConfiguration",
     "VZVirtualMachine",

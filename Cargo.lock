@@ -252,6 +252,7 @@ dependencies = [
  "objc2-virtualization",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 

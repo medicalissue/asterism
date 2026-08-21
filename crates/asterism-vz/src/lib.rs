@@ -52,6 +52,8 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+pub mod guest;
+
 /// Name of the helper binary, as `astd` looks for it and as `codesign`
 /// signs it.
 pub const HELPER_BIN: &str = "astd-vz";
@@ -99,9 +101,22 @@ pub struct Config {
     pub extra_disks: Vec<Disk>,
     pub cpus: u32,
     pub mem_mib: u32,
-    /// Pinned, because it is the only key into `/var/db/dhcpd_leases` — a
-    /// random MAC means no way to learn the guest's address at all.
+    /// Pinned, because it is the fallback discovery path's only key into
+    /// `/var/db/dhcpd_leases` — a random MAC means no way to guess the
+    /// guest's address when the guest cannot be asked for it.
     pub mac: String,
+    /// The per-instance key the guest agent is authenticated with
+    /// ([`guest::Key`]), as a path rather than as the bytes: this file is
+    /// written next to the guest's disk and read by whoever looks at what a
+    /// running instance was configured with, and a secret does not belong
+    /// in it.
+    ///
+    /// `None` for a guest booted by a daemon older than the agent, and for
+    /// one whose seed could not carry a key. The helper then has no
+    /// authenticated channel and falls back to hunting the guest on the
+    /// NAT, exactly as it did before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_key: Option<PathBuf>,
 }
 
 /// One additional disk to put in front of the guest.
@@ -167,6 +182,20 @@ pub enum Command {
     /// daemon's `kill()` reaches for SIGKILL instead when even this cannot
     /// be delivered.
     Kill,
+    /// Ask the guest to flush its page cache, and answer when it has.
+    ///
+    /// A barrier, not a request: when this returns, what the guest had
+    /// written is on the disk this host is holding. The one thing a
+    /// hypervisor cannot do for a guest, and the reason a snapshot of a
+    /// running guest's disk used to be a snapshot of whatever happened to
+    /// have been flushed.
+    ///
+    /// Needs the guest agent. A helper with no session says so rather than
+    /// answering a barrier it did not raise.
+    Sync {
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
 }
 
 /// One line of answer.
@@ -177,6 +206,10 @@ pub enum Reply {
     /// The guest is down and the helper is about to exit.
     Stopped {
         reason: StopReason,
+        seconds: f64,
+    },
+    /// The guest's `sync(2)` returned, and this is how long it took.
+    Synced {
         seconds: f64,
     },
     Error {
@@ -195,13 +228,43 @@ pub struct Info {
     pub pid: u32,
     pub state: State,
     pub mac: String,
-    /// Learned from the DHCP lease file and *proved* by an ssh banner, so
-    /// `Some` means something answered on port 22 at that address.
+    /// Where the guest is, once that is known rather than guessed.
+    ///
+    /// Normally the guest's own answer, over the authenticated vsock
+    /// channel ([`guest`]) — the guest is the only thing that knows this,
+    /// and now it is asked. Where there is no agent to ask, it falls back
+    /// to what it always was: a DHCP lease candidate proved by an ssh
+    /// banner. [`Info::endpoint_via`] says which.
     #[serde(default)]
     pub guest_ip: Option<IpAddr>,
+    /// How the address beside it was learned.
+    ///
+    /// Additive, so an older daemon reading a newer helper's `info` simply
+    /// does not see it. Absent also means "a helper from before there was
+    /// an agent", which is the same thing as [`Discovery::Ssh`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_via: Option<Discovery>,
+    /// The guest agent's own account of itself, while a session is open.
+    ///
+    /// Boxed: it is the largest thing here by some way, it is `None` on
+    /// every reply that is not an `info`, and `Reply` is passed around by
+    /// value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<Box<AgentInfo>>,
+    /// Why there is no session, when the helper knows why.
+    ///
+    /// A guest with no agent at all leaves this empty and is not an error:
+    /// it is an older seed, and the fallback carries it. A guest whose
+    /// agent refused the handshake, or speaks a version this helper does
+    /// not, says so here — that is a thing a human has to be told rather
+    /// than a slow boot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_error: Option<String>,
     /// Unix seconds when the VM was started.
     pub started_at: u64,
-    /// Seconds from `startWithCompletionHandler` to the guest's ssh banner.
+    /// Seconds from `startWithCompletionHandler` to the guest being found:
+    /// the agent's first authenticated answer carrying an address, or the
+    /// ssh banner where there is no agent.
     #[serde(default)]
     pub boot_secs: Option<f64>,
     pub console: PathBuf,
@@ -243,6 +306,50 @@ impl std::fmt::Display for StorageError {
             self.uri, self.message
         )
     }
+}
+
+/// How a guest's address came to be known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Discovery {
+    /// The guest said so, over the authenticated vsock channel. One guest
+    /// at the other end of one device, and it holds this instance's key.
+    Agent,
+    /// A `/var/db/dhcpd_leases` candidate that answered with an ssh banner.
+    /// Inference, and what this backend did before there was an agent.
+    Ssh,
+}
+
+impl std::fmt::Display for Discovery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Discovery::Agent => f.write_str("the guest agent"),
+            Discovery::Ssh => f.write_str("an ssh banner"),
+        }
+    }
+}
+
+/// The guest agent, as the helper's open session sees it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentInfo {
+    /// The protocol version the two ends settled on.
+    pub version: u32,
+    /// What the agent calls itself, e.g. `asterism-guest/1`.
+    #[serde(default)]
+    pub agent: String,
+    #[serde(default)]
+    pub hostname: String,
+    /// Fresh per boot, so a reconnect and a reboot are different events.
+    #[serde(default)]
+    pub boot_id: String,
+    #[serde(default)]
+    pub kernel: String,
+    /// Unix seconds when this session was opened.
+    pub since: u64,
+    /// The last answer to `status`, which is the health of the guest as the
+    /// guest sees it rather than as the framework does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<guest::Status>,
 }
 
 /// `VZVirtualMachineState`, as far as anyone outside the helper cares.
@@ -331,6 +438,23 @@ pub fn info(sock: &std::path::Path, timeout: Duration) -> Result<Info> {
     }
 }
 
+/// [`call`], asking the guest for a file sync barrier.
+///
+/// Returns how long the guest spent in `sync(2)`. An error here means the
+/// barrier was *not* raised — there is no agent, or it did not answer — and
+/// a caller that was about to do something to the disk must treat it as
+/// such rather than carrying on.
+pub fn sync(sock: &std::path::Path, timeout: Duration) -> Result<f64> {
+    let asked = Command::Sync {
+        timeout_secs: Some(timeout.as_secs()),
+    };
+    match call(sock, &asked, timeout + Duration::from_secs(5))? {
+        Reply::Synced { seconds } => Ok(seconds),
+        Reply::Error { message } => bail!("{message}"),
+        other => bail!("the vz helper answered sync with {other:?}"),
+    }
+}
+
 /// A stable, locally-administered MAC for an instance.
 ///
 /// Derived rather than stored, so it survives losing every file but the
@@ -397,6 +521,7 @@ mod tests {
             cpus: 2,
             mem_mib: 2048,
             mac: mac_for("dev"),
+            agent_key: Some("/i/dev/agent.key".into()),
         };
         config.write(&path).unwrap();
         assert_eq!(Config::read(&path).unwrap(), config);
@@ -480,6 +605,22 @@ mod tests {
             reply,
             r#"{"reply":"stopped","reason":{"kind":"guest_stopped"},"seconds":3.5}"#
         );
+
+        // The barrier, both ways. A helper old enough not to know `sync`
+        // answers a `Reply::Error` rather than failing to parse the line,
+        // which is what makes asking one safe.
+        assert_eq!(
+            serde_json::to_string(&Command::Sync { timeout_secs: Some(20) }).unwrap(),
+            r#"{"cmd":"sync","timeout_secs":20}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Command>(r#"{"cmd":"sync"}"#).unwrap(),
+            Command::Sync { timeout_secs: None }
+        );
+        assert_eq!(
+            serde_json::to_string(&Reply::Synced { seconds: 0.125 }).unwrap(),
+            r#"{"reply":"synced","seconds":0.125}"#
+        );
     }
 
     /// The shape every reader of this protocol depends on, in both
@@ -501,6 +642,9 @@ mod tests {
             state: State::Running,
             mac: mac_for("dev"),
             guest_ip: Some("192.168.64.7".parse().unwrap()),
+            endpoint_via: None,
+            agent: None,
+            agent_error: None,
             started_at: 1_700_000_000,
             boot_secs: Some(4.25),
             console: "/i/dev/console.log".into(),

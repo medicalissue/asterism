@@ -376,8 +376,12 @@ pub fn boot_req<'a>(inst: &'a Instance, hv: &dyn Hypervisor) -> Result<BootReq<'
     let egress = crate::egress::seed_config(inst)?;
 
     // The backend gets to add what its own devices need — for vz, the
-    // `/dev/hvc0` console no stock cloud image knows about.
-    seed::ensure(&inst.name, &req.seed, &shares, hv.guest_config(), &egress)
+    // `/dev/hvc0` console no stock cloud image knows about, and the agent
+    // that answers on the guest's virtio socket.
+    let guest_config = hv
+        .guest_config(inst)
+        .with_context(|| format!("preparing what the {} backend puts in a guest", hv.id()))?;
+    seed::ensure(&inst.name, &req.seed, &shares, &guest_config, &egress)
         .context("building cloud-init seed")?;
     req.shares = shares;
     Ok(req)

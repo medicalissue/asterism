@@ -21,10 +21,17 @@
 //! ## Shape
 //!
 //! ```text
-//! main thread   VZ + the run loop it must never stop pumping
-//! ctl threads   accept() and JSON, handing commands to the main thread
-//! prober thread lease file + ssh banner, because connect() blocks
+//! main thread    VZ + the run loop it must never stop pumping
+//! ctl threads    accept() and JSON, handing commands to the main thread
+//! agent thread   the guest's own answers, over vsock — readiness, its
+//!                address, health, a sync barrier, a stop it can act on
+//! prober thread  lease file + ssh banner, for a guest with no agent
 //! ```
+//!
+//! The agent is the authority on where the guest is and whether it is up
+//! (`asterism_vz::guest`); the prober is what is left when a guest was
+//! built from a seed that carries no agent, and it is inference — see that
+//! module's header for why that was never good enough.
 //!
 //! ## The helper can end its own guest
 //!
@@ -36,6 +43,8 @@
 //! asks the guest to power down and then pulls the cord, which is the death
 //! `astd`'s supervisor already knows how to act on.
 
+#[cfg(target_os = "macos")]
+mod agent;
 #[cfg(target_os = "macos")]
 mod ctl;
 #[cfg(target_os = "macos")]
@@ -60,7 +69,8 @@ fn main() -> anyhow::Result<()> {
 
     use anyhow::Context;
 
-    use asterism_vz::{Command, Config, Info, Reply, State, StopReason};
+    use asterism_vz::guest::Key;
+    use asterism_vz::{Command, Config, Discovery, Info, Reply, State, StopReason};
 
     /// What the address prober has managed to prove about the guest.
     #[derive(Default)]
@@ -98,10 +108,29 @@ fn main() -> anyhow::Result<()> {
         config.mac
     );
 
-    // The guest's address, hunted on a thread of its own. Both halves of
-    // the hunt block — reading the lease file and, much worse, connecting
-    // to a candidate that is not there — and blocking the main thread
-    // starves the queue the VM is bound to (spike landmine 9).
+    // The key this guest's agent is authenticated with. Absent for a guest
+    // booted by a daemon from before there were agents, and for one whose
+    // key file has gone: both mean the same thing here — nothing to
+    // authenticate with, so nothing to talk to, and the hunt below is what
+    // is left.
+    let agent_key = match config.agent_key.as_deref() {
+        None => None,
+        Some(path) => match Key::read(path) {
+            Ok(key) => key,
+            Err(e) => {
+                eprintln!("astd-vz: {}: {e:#} — no guest agent", config.instance);
+                None
+            }
+        },
+    };
+    let mut agent = agent::Agent::default();
+    let mut reconnect = Reconnect::new();
+
+    // The guest's address, hunted on a thread of its own — the fallback for
+    // a guest with no agent to ask. Both halves of the hunt block — reading
+    // the lease file and, much worse, connecting to a candidate that is not
+    // there — and blocking the main thread starves the queue the VM is
+    // bound to (spike landmine 9).
     let found = Arc::new(Mutex::new(Discovered::default()));
     {
         let (found, mac, host) = (found.clone(), config.mac.clone(), config.instance.clone());
@@ -128,16 +157,34 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
-    let info = |state: State| -> Info {
-        let slot = found.lock().unwrap();
+    // What `info` answers with, given everything this process knows. Not a
+    // closure: `agent` is attached and detached by the run loop below, and
+    // a closure holding a borrow of it would stop that.
+    let info = |state: State, agent: &agent::Agent| -> Info {
+        let (agent_info, agent_error) = agent.reported();
+        // The guest's own answer, where there is one. It is not a better
+        // guess than the lease file's — it is not a guess: one guest is at
+        // the other end of one virtio socket, and it holds this instance's
+        // key.
+        let (guest_ip, endpoint_via, boot_secs) = match agent.endpoint() {
+            Some((addr, secs)) => (Some(addr), Some(Discovery::Agent), Some(secs)),
+            None => {
+                let slot = found.lock().unwrap();
+                let via = slot.ip.map(|_| Discovery::Ssh);
+                (slot.ip, via, slot.boot_secs)
+            }
+        };
         Info {
             instance: config.instance.clone(),
             pid: std::process::id(),
             state,
             mac: config.mac.clone(),
-            guest_ip: slot.ip,
+            guest_ip,
+            endpoint_via,
+            agent: agent_info.map(Box::new),
+            agent_error,
             started_at,
-            boot_secs: slot.boot_secs,
+            boot_secs,
             console: config.console.clone(),
             // The *reason* for the state beside it: `machine.state()`
             // already refuses to call a guest with a dead disk live, and
@@ -159,12 +206,27 @@ fn main() -> anyhow::Result<()> {
     let reason: StopReason = 'run: loop {
         vm::pump(Duration::from_millis(100));
 
+        if let Some(key) = agent_key.as_ref() {
+            keep_session(&machine, &mut agent, key, &config.instance, t0, &mut reconnect);
+        }
+
         while let Ok(job) = jobs_rx.try_recv() {
             match job.command {
                 Command::Info => {
                     let _ = job
                         .reply
-                        .send(Reply::Info(info(unsafe { machine.state() })));
+                        .send(Reply::Info(info(unsafe { machine.state() }, &agent)));
+                }
+                // A barrier the guest raises, or a named refusal. Never
+                // silently "done": the caller is about to do something to
+                // a disk on the strength of this answer.
+                Command::Sync { timeout_secs } => {
+                    let budget = Duration::from_secs(timeout_secs.unwrap_or(30));
+                    let reply = match sync_guest(&agent, budget) {
+                        Ok(seconds) => Reply::Synced { seconds },
+                        Err(message) => Reply::Error { message },
+                    };
+                    let _ = job.reply.send(reply);
                 }
                 // `stop` and `kill` both answer with the outcome and then
                 // end the process: the VM cannot outlive it, so a helper
@@ -172,7 +234,7 @@ fn main() -> anyhow::Result<()> {
                 Command::Stop { timeout_secs } => {
                     let budget = Duration::from_secs(timeout_secs.unwrap_or(30));
                     let asked = Instant::now();
-                    let stopped = unsafe { machine.graceful_stop(budget) };
+                    let stopped = stop_guest(&machine, &agent, budget, &config.instance);
                     // A guest that was already on its way out because a disk
                     // went did not "ignore ACPI"; say what actually happened.
                     let reason = exit_reason(machine.signals.storage_failure(), Some(stopped));
@@ -235,6 +297,12 @@ fn main() -> anyhow::Result<()> {
                         "astd-vz: {} would not power down after losing a disk — forcing it",
                         config.instance
                     );
+                    // One last barrier on the disks it has *not* lost. The
+                    // agent is a process of its own and answers whatever
+                    // systemd is doing; a guest wedged on the dead device
+                    // simply does not answer in time, which is why this has
+                    // a budget and takes it no further.
+                    flush(&agent, LOST_DISK_FLUSH, &config.instance);
                     unsafe { machine.force_stop() };
                     break 'run exit_reason(Some(failure), machine.signals.reason());
                 }
@@ -255,6 +323,246 @@ fn main() -> anyhow::Result<()> {
         )
     );
     Ok(())
+}
+
+/// Where the helper is in its attempts to have a session with the guest's
+/// agent.
+#[cfg(target_os = "macos")]
+struct Reconnect {
+    /// When it is worth asking for a connection again.
+    next: std::time::Instant,
+    /// How long to wait after the next failure.
+    gap: std::time::Duration,
+    /// When the session that is currently attached was attached, which is
+    /// how a session that worked and then ended is told apart from one that
+    /// never worked at all.
+    attached: Option<std::time::Instant>,
+    /// A guest with no virtio socket device is said once, not every turn.
+    said_no_vsock: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl Reconnect {
+    fn new() -> Self {
+        Reconnect {
+            next: std::time::Instant::now(),
+            gap: FIRST_CONNECT_GAP,
+            attached: None,
+            said_no_vsock: false,
+        }
+    }
+}
+
+/// Keep a session with the guest agent open, without ever waiting for one.
+///
+/// Called on every turn of the run loop and returns immediately: VZ's
+/// connect is asked for on one turn and collected on another, because
+/// nothing may hold this thread — the guest runs on it, and the control
+/// socket's jobs are drained on it.
+///
+/// The whole retry policy, in one place:
+///
+/// * **While a guest has never answered**, ask again every
+///   [`FIRST_CONNECT_GAP`]. This is a guest booting: its agent binds the
+///   port somewhere in the middle of that, and every moment between then
+///   and noticing is a moment `ast up` spends waiting.
+/// * **A session that ran and ended** is a guest that rebooted or an agent
+///   that was restarted. There is something to talk to again, so ask at
+///   once.
+/// * **A session that ended about as fast as it opened** is a refused
+///   handshake or a version neither side shares. The guest is answering
+///   exactly as it means to, so back off to [`SETTLED_CONNECT_GAP`] rather
+///   than spinning against it — and keep the reason, which is what `info`
+///   reports and what a boot falling back to the lease hunt says out loud.
+#[cfg(target_os = "macos")]
+fn keep_session(
+    machine: &vm::Machine,
+    agent: &mut agent::Agent,
+    key: &asterism_vz::guest::Key,
+    instance: &str,
+    t0: std::time::Instant,
+    state: &mut Reconnect,
+) {
+    use std::time::Instant;
+
+    if agent.live() {
+        return;
+    }
+    // A session that has just ended. Let go of the connection it ran on,
+    // and work out how soon to open another.
+    if let Some(since) = state.attached.take() {
+        agent.detach();
+        unsafe { machine.close_agent() };
+        state.gap = match since.elapsed() >= STABLE_SESSION {
+            true => FIRST_CONNECT_GAP,
+            false => (state.gap * 2).min(SETTLED_CONNECT_GAP),
+        };
+        state.next = Instant::now() + state.gap;
+    }
+    match unsafe { machine.take_connect() } {
+        Some(Ok(fd)) => {
+            agent.attach(fd, key.clone(), instance.to_owned(), t0);
+            state.attached = Some(Instant::now());
+        }
+        Some(Err(_)) => {
+            // Not logged: "nothing is listening yet" is what a booting guest
+            // looks like, and it is the answer to every attempt until the
+            // agent binds the port. The *session* logs when it opens, and
+            // when it fails for a reason worth having.
+            state.next = Instant::now() + state.gap;
+            if agent.ever_connected() {
+                state.gap = (state.gap * 2).min(SETTLED_CONNECT_GAP);
+            }
+        }
+        None if !machine.connect_in_flight() && Instant::now() >= state.next => {
+            if let Err(e) = unsafe { machine.start_connect(asterism_vz::guest::PORT) } {
+                // No socket device to ask on: nothing here will ever be
+                // different, so say it once and leave the guest to the
+                // fallback.
+                if !state.said_no_vsock {
+                    state.said_no_vsock = true;
+                    eprintln!("astd-vz: {instance}: {e:#}");
+                }
+                state.next = Instant::now() + SETTLED_CONNECT_GAP;
+            }
+        }
+        // Still in flight, or not time to ask again.
+        None => {}
+    }
+}
+
+/// How often a guest that has never answered is asked again. Held flat
+/// rather than doubled — see the run loop.
+#[cfg(target_os = "macos")]
+const FIRST_CONNECT_GAP: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// How long a session has to last before it counts as having worked. A
+/// handshake that is going to be refused is refused in milliseconds.
+#[cfg(target_os = "macos")]
+const STABLE_SESSION: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The gap once a session has already opened and gone. A guest whose agent
+/// refused this helper, or dropped a session, is not fixed by asking again
+/// quickly.
+#[cfg(target_os = "macos")]
+const SETTLED_CONNECT_GAP: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How long the agent gets to accept a stop before ACPI is tried instead.
+/// It answers before it acts, so this is a round trip and not a shutdown.
+#[cfg(target_os = "macos")]
+const AGENT_STOP_ACK: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long a barrier before the cord comes out may take.
+#[cfg(target_os = "macos")]
+const STOP_FLUSH: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The same, when a disk has already been lost. Shorter: a guest may be
+/// wedged in the kernel on the device that went, and waiting longer buys
+/// nothing.
+#[cfg(target_os = "macos")]
+const LOST_DISK_FLUSH: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Take the guest down, best path first.
+///
+/// 1. **The guest agent.** A request that reaches a process, which runs
+///    `systemctl poweroff` — deterministic where ACPI is a button the guest
+///    is free to have no handler for.
+/// 2. **ACPI**, for a guest with no agent, or one whose agent could not act.
+/// 3. **The cord**, with a file sync barrier in front of it, so what the
+///    guest had written is on the disk rather than in a page cache that is
+///    about to stop existing.
+///
+/// Every wait pumps the run loop rather than sleeping on it: the guest is
+/// running on this queue, and a guest that cannot make progress cannot shut
+/// down either (spike landmine 9).
+#[cfg(target_os = "macos")]
+fn stop_guest(
+    machine: &vm::Machine,
+    agent: &agent::Agent,
+    budget: std::time::Duration,
+    instance: &str,
+) -> asterism_vz::StopReason {
+    use std::time::{Duration, Instant};
+
+    // A guest that powered itself off between the request arriving and us
+    // acting on it is a clean stop, not a failure.
+    if let Some(reason) = machine.signals.reason() {
+        return reason;
+    }
+    let deadline = Instant::now() + budget;
+
+    // A guest with no session is the ordinary case for an older seed, and
+    // exactly why the two paths below are still here — so there is nothing
+    // to say about `request_stop` failing, only about a guest that has an
+    // agent and would not use it.
+    let mut asked = false;
+    if let Ok(pending) = agent.request_stop() {
+        match await_agent(pending, AGENT_STOP_ACK) {
+            Ok(()) => asked = true,
+            Err(why) => {
+                eprintln!("astd-vz: {instance}: the guest agent would not take a stop: {why}")
+            }
+        }
+    }
+    if !asked {
+        asked = unsafe { machine.request_stop() };
+    }
+    if asked {
+        while !machine.signals.stopped() && Instant::now() < deadline {
+            vm::pump(Duration::from_millis(100));
+        }
+        if let Some(reason) = machine.signals.reason() {
+            return reason;
+        }
+    }
+    flush(agent, STOP_FLUSH, instance);
+    unsafe { machine.force_stop() }
+}
+
+/// Ask the guest to flush, and say what came of it.
+///
+/// Never fatal: a guest with no agent, or one too far gone to answer, is
+/// the case a forced stop is for. What it must not do is happen silently —
+/// "the cord came out and nothing was flushed" is the whole explanation for
+/// a filesystem that comes back needing a check.
+#[cfg(target_os = "macos")]
+fn flush(agent: &agent::Agent, budget: std::time::Duration, instance: &str) {
+    match sync_guest(agent, budget) {
+        Ok(seconds) => {
+            eprintln!("astd-vz: {instance}: the guest flushed its disks in {seconds:.2}s")
+        }
+        Err(why) => eprintln!(
+            "astd-vz: {instance}: no file sync barrier before the forced stop — {why}"
+        ),
+    }
+}
+
+/// One `sync(2)` inside the guest, in seconds.
+#[cfg(target_os = "macos")]
+fn sync_guest(agent: &agent::Agent, budget: std::time::Duration) -> Result<f64, String> {
+    let pending = agent.request_sync()?;
+    await_agent(pending, budget).map(|ms| ms / 1000.0)
+}
+
+/// Wait for the guest agent without stopping the guest.
+#[cfg(target_os = "macos")]
+fn await_agent<T>(
+    pending: agent::Pending<T>,
+    budget: std::time::Duration,
+) -> Result<T, String> {
+    let until = std::time::Instant::now() + budget;
+    loop {
+        if let Some(answer) = pending.taken() {
+            return answer;
+        }
+        if std::time::Instant::now() >= until {
+            return Err(format!(
+                "the guest agent did not answer within {}s",
+                budget.as_secs()
+            ));
+        }
+        vm::pump(std::time::Duration::from_millis(25));
+    }
 }
 
 /// How long the guest gets to power itself off after a disk it is using has

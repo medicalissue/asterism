@@ -58,6 +58,17 @@ pub fn vz_socket_path(name: &str) -> PathBuf {
     short_socket(instance_dir(name).join("vz.sock"))
 }
 
+/// The key one instance's guest agent is authenticated with.
+///
+/// Beside the guest's own disk, because that is what it belongs to: it is
+/// minted when the instance's seed is first built and read again on every
+/// boot, by the daemon (to put in the seed) and by the helper (to prove
+/// itself to the guest). Removed with the instance, like everything else in
+/// here.
+pub fn guest_agent_key_path(name: &str) -> PathBuf {
+    instance_dir(name).join("agent.key")
+}
+
 // ---- block volumes ---------------------------------------------------------
 //
 // A volume is a part this device supplies to the pool, so it lives beside the

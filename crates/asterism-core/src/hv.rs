@@ -484,17 +484,24 @@ pub trait Hypervisor: Send + Sync {
     ///
     /// Empty for a backend whose devices a stock cloud image already knows
     /// about, which is the normal case and the default. It exists for the
-    /// one thing that is genuinely a property of the *hypervisor* rather
-    /// than of the image: Virtualization.framework's only serial device is
-    /// a virtio console at `/dev/hvc0`, and no cloud image's kernel cmdline
-    /// mentions it (BACKENDS.md §4, "What pull time cannot fix"), so the vz
-    /// backend has the guest put back what the image is missing.
+    /// things that are genuinely a property of the *hypervisor* rather than
+    /// of the image: Virtualization.framework's only serial device is a
+    /// virtio console at `/dev/hvc0` and no cloud image's kernel cmdline
+    /// mentions it (BACKENDS.md §4, "What pull time cannot fix"), and its
+    /// guests carry a virtio socket device whose other end has to be put
+    /// there by the seed.
+    ///
+    /// Takes the instance because that second thing is per-instance: the
+    /// guest agent's key is minted once per guest and belongs to that guest
+    /// alone. Returns a `Result` for the same reason — minting it touches
+    /// the disk, and a seed that cannot carry a key is a thing to say
+    /// rather than a guest that silently has no control channel.
     ///
     /// Backend-neutral callers reach this through the trait rather than
     /// asking which backend they hold, for the same reason they gate on
     /// [`Caps`] rather than on [`Hypervisor::id`].
-    fn guest_config(&self) -> &'static str {
-        ""
+    fn guest_config(&self, _inst: &Instance) -> Result<String> {
+        Ok(String::new())
     }
 
     /// Create anything missing on disk: root overlay, firmware vars.
@@ -675,7 +682,19 @@ mod tests {
         assert!(Bare.disk_snapshot_list(&prep).is_err());
         // A backend whose guests need nothing added says nothing, and the
         // seed builder folds that in as no change at all.
-        assert_eq!(Bare.guest_config(), "");
+        let inst = Instance::new(
+            "dev",
+            "laptop",
+            "debian:13",
+            crate::instance::Shape { cpus: 2, mem_mib: 2048, disk_gib: 20 },
+            Machine {
+                backend: "bare".into(),
+                machine_type: "t".into(),
+                cpu: "host".into(),
+                hv_version: "1".into(),
+            },
+        );
+        assert_eq!(Bare.guest_config(&inst).unwrap(), "");
     }
 
     #[test]

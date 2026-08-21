@@ -19,8 +19,9 @@
 //! guest (spike landmine 9 — a starved main queue stops answering ACPI
 //! shutdown altogether).
 
-use std::cell::Cell;
-use std::os::unix::io::AsRawFd;
+use std::cell::{Cell, RefCell};
+use std::ffi::c_int;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -45,9 +46,10 @@ use objc2_virtualization::{
     VZNetworkDeviceConfiguration, VZSerialPortConfiguration, VZSocketDeviceConfiguration,
     VZStorageDeviceConfiguration, VZVirtioBlockDeviceConfiguration,
     VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioEntropyDeviceConfiguration,
-    VZVirtioNetworkDeviceConfiguration, VZVirtioSocketDeviceConfiguration,
-    VZVirtioTraditionalMemoryBalloonDeviceConfiguration, VZVirtualMachine,
-    VZVirtualMachineConfiguration, VZVirtualMachineDelegate, VZVirtualMachineState,
+    VZVirtioNetworkDeviceConfiguration, VZVirtioSocketConnection, VZVirtioSocketDevice,
+    VZVirtioSocketDeviceConfiguration, VZVirtioTraditionalMemoryBalloonDeviceConfiguration,
+    VZVirtualMachine, VZVirtualMachineConfiguration, VZVirtualMachineDelegate,
+    VZVirtualMachineState,
 };
 
 use asterism_vz::{Config, Disk, State, StopReason, StorageError};
@@ -356,8 +358,39 @@ pub struct Machine {
     /// serial attachment's file handles, so the `File`s have to live as
     /// long as the VM does.
     _console_files: Vec<std::fs::File>,
+    /// The guest's virtio socket device, taken off the running VM once.
+    ///
+    /// `socketDevices` is a property of the *machine*, not of the
+    /// configuration, so it only exists after `init`. Held because every
+    /// connect goes through it, and dropping it would mean asking the VM
+    /// for it again on every attempt.
+    socket_device: Option<Retained<VZVirtioSocketDevice>>,
+    /// A connect that has been asked for and not yet answered.
+    ///
+    /// VZ's connect is asynchronous and its completion block arrives on
+    /// this queue, so the run loop asks for one and picks the answer up on
+    /// a later turn ([`Machine::take_connect`]) rather than pumping in
+    /// place for it. Pumping in place would be *safe* — the guest keeps
+    /// running — but nothing would be draining the control socket's jobs
+    /// for the length of it, and a daemon asking `info` during a boot would
+    /// time out.
+    connecting: RefCell<Option<Rc<RefCell<Option<Connected>>>>>,
+    /// The connection a session is running on, kept alive for exactly as
+    /// long as that session is.
+    ///
+    /// VZ closes the connection's descriptor when this object is released.
+    /// The session thread works on a *duplicate* of it, so the socket
+    /// itself would survive — but holding the object is what keeps the
+    /// framework's own accounting honest, and dropping it is how a session
+    /// that has ended is actually torn down.
+    connection: RefCell<Option<Retained<VZVirtioSocketConnection>>>,
     pub signals: Rc<Signals>,
 }
+
+/// What a completed connect leaves behind: the framework's connection
+/// object, which must stay on this queue, and a descriptor of our own,
+/// which need not.
+type Connected = Result<(Retained<VZVirtioSocketConnection>, RawFd), String>;
 
 /// Translate the config into a validated `VZVirtualMachineConfiguration`.
 ///
@@ -518,11 +551,11 @@ unsafe fn build_config(
     vm_config.setSerialPorts(&NSArray::from_retained_slice(&serials));
 
     // ---- vsock ---------------------------------------------------------
-    // Present but unused: this is the control channel a guest agent will
-    // use, and the answer to the lease-file guesswork the address prober
-    // does today (spike landmine 8's "better:"). Attaching the device now
-    // costs nothing, needs no guest cooperation, and means the plumbing is
-    // already in every guest by the time there is an agent to talk to.
+    // The guest's control channel: point-to-point, on no network, and the
+    // answer to the lease-file guesswork the address prober does (spike
+    // landmine 8's "better:"). The agent at the other end of it is put
+    // there by the seed; see `asterism_vz::guest`. A guest that has no
+    // agent simply never answers on the port, which costs it nothing.
     let vsock: Vec<Retained<VZSocketDeviceConfiguration>> = vec![Retained::into_super(
         VZVirtioSocketDeviceConfiguration::new(),
     )];
@@ -629,11 +662,28 @@ pub unsafe fn start(config: &Config) -> Result<Machine> {
         bail!("startWithCompletionHandler failed: {why}");
     }
 
+    // `socketDevices` is on the machine rather than on the configuration,
+    // so this is the first moment it exists. One device was configured, so
+    // there is one here; a guest built by some future path without one gets
+    // `None` and the fallback discovery, rather than a panic.
+    let socket_device = vm
+        .socketDevices()
+        .to_vec()
+        .into_iter()
+        .find_map(|device| device.downcast::<VZVirtioSocketDevice>().ok())
+        .or_else(|| {
+            eprintln!("astd-vz: this guest has no virtio socket device — no guest agent");
+            None
+        });
+
     Ok(Machine {
         vm,
         _delegate: delegate,
         _nbd_delegates: nbd_delegates,
         _console_files: console_files,
+        socket_device,
+        connecting: RefCell::new(None),
+        connection: RefCell::new(None),
         signals,
     })
 }
@@ -705,30 +755,94 @@ impl Machine {
         }
     }
 
-    /// ACPI shutdown request, then the forced stop if the guest will not
-    /// take it. The framework's equivalent of QMP `system_powerdown`
-    /// followed by SIGKILL — and, unlike killing a process, the answer here
-    /// comes back through the delegate, so the caller learns *how* the
-    /// guest went down.
+    /// Ask for a connection to the guest agent's port.
+    ///
+    /// Returns as soon as VZ has taken the request; the answer arrives on
+    /// this queue and is picked up by [`Machine::take_connect`]. A guest
+    /// with no agent listening is the ordinary case while one boots — that
+    /// is an error to retry, not one to report.
     ///
     /// # Safety
     /// Main thread only.
-    pub unsafe fn graceful_stop(&self, budget: Duration) -> StopReason {
-        // Already gone: a guest that powered itself off between the request
-        // arriving and us acting on it is a clean stop, not a failure.
-        if let Some(reason) = self.signals.reason() {
-            return reason;
+    pub unsafe fn start_connect(&self, port: u32) -> Result<()> {
+        let device = self
+            .socket_device
+            .as_ref()
+            .ok_or_else(|| anyhow!("this guest has no virtio socket device"))?;
+        if self.connecting.borrow().is_some() {
+            bail!("a connect to vsock port {port} is already in flight");
         }
-        if self.request_stop() {
-            let until = Instant::now() + budget;
-            while !self.signals.stopped() && Instant::now() < until {
-                pump(Duration::from_millis(100));
-            }
-            if let Some(reason) = self.signals.reason() {
-                return reason;
-            }
+        if self.connection.borrow().is_some() {
+            bail!("this guest already has an agent connection open");
         }
-        self.force_stop()
+
+        // Filled by the completion block, which VZ delivers on this same
+        // queue — so `Rc` and `RefCell` are enough, as they are for the
+        // start handler above.
+        let slot: Rc<RefCell<Option<Connected>>> = Rc::default();
+        let handler = {
+            let slot = slot.clone();
+            RcBlock::new(move |conn: *mut VZVirtioSocketConnection, err: *mut NSError| {
+                let outcome = match unsafe { err.as_ref() } {
+                    Some(err) => Err(err.localizedDescription().to_string()),
+                    None => match unsafe { Retained::retain(conn) } {
+                        None => Err("VZ reported neither a connection nor an error".to_owned()),
+                        Some(conn) => {
+                            // Duped rather than borrowed: VZ closes its own
+                            // descriptor when this object is released, and
+                            // the session thread must not be reading a
+                            // descriptor somebody else can close.
+                            match unsafe { dup(conn.fileDescriptor()) } {
+                                -1 => Err(
+                                    "could not duplicate the connection's descriptor".to_owned(),
+                                ),
+                                fd => Ok((conn, fd)),
+                            }
+                        }
+                    },
+                };
+                *slot.borrow_mut() = Some(outcome);
+            })
+        };
+        device.connectToPort_completionHandler(port, &handler);
+        *self.connecting.borrow_mut() = Some(slot);
+        Ok(())
+    }
+
+    /// The answer to that connect, once VZ has given one.
+    ///
+    /// `None` while it is still in flight, and `None` when none was asked
+    /// for. The descriptor in an `Ok` belongs to the caller; the connection
+    /// object behind it is kept here until [`Machine::close_agent`].
+    ///
+    /// # Safety
+    /// Main thread only.
+    pub unsafe fn take_connect(&self) -> Option<Result<RawFd>> {
+        let slot = self.connecting.borrow().clone()?;
+        let outcome = slot.borrow_mut().take()?;
+        *self.connecting.borrow_mut() = None;
+        Some(match outcome {
+            Err(why) => Err(anyhow!("connecting to the guest agent: {why}")),
+            Ok((conn, fd)) => {
+                *self.connection.borrow_mut() = Some(conn);
+                Ok(fd)
+            }
+        })
+    }
+
+    /// Has a connect been asked for and not yet answered?
+    pub fn connect_in_flight(&self) -> bool {
+        self.connecting.borrow().is_some()
+    }
+
+    /// Release the connection a finished session was running on.
+    ///
+    /// # Safety
+    /// Main thread only.
+    pub unsafe fn close_agent(&self) {
+        if let Some(conn) = self.connection.borrow_mut().take() {
+            conn.close();
+        }
     }
 
     /// `stopWithCompletionHandler:` — the power cord.
@@ -751,6 +865,13 @@ impl Machine {
         }
         StopReason::Forced
     }
+}
+
+// `dup(2)`, declared here rather than taking on `libc` for one symbol — the
+// same call `main.rs` makes for `setsid` and `asterism_core::cow` makes for
+// `clonefile`.
+extern "C" {
+    fn dup(fd: c_int) -> c_int;
 }
 
 #[cfg(test)]

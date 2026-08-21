@@ -50,10 +50,12 @@ use asterism_core::hv::{
     BootReq, Caps, ControlChannel, DiskFormat, DiskSpec, GuestEndpoint, Handle, Hypervisor,
     Prepared, Ready, RunState, SnapshotId,
 };
+use asterism_core::instance::Instance;
 use asterism_core::proc::{ProcId, Signal};
 use asterism_core::snapshot::{self, Snapshot};
 use asterism_core::{cow, paths, tools};
-use asterism_vz::{Command as VzCommand, Config, Disk as VzDisk, Reply, StopReason};
+use asterism_vz::guest;
+use asterism_vz::{Command as VzCommand, Config, Disk as VzDisk, Discovery, Reply, StopReason};
 
 use super::{alive, grow, owned};
 
@@ -376,8 +378,18 @@ impl Hypervisor for Vz {
         }
     }
 
-    fn guest_config(&self) -> &'static str {
-        GUEST_CONFIG
+    /// The console fix every vz guest needs, plus the agent that answers on
+    /// its virtio socket.
+    ///
+    /// The key is minted here, on the way into the seed, and read again by
+    /// the helper at boot — so `ast up` on an instance that has never had
+    /// one is what gives it one. It is stable after that: the seed's
+    /// fingerprint covers everything in here, and a key that moved would
+    /// reissue the seed and make the guest redo its first boot.
+    fn guest_config(&self, inst: &Instance) -> Result<String> {
+        let key = guest::Key::ensure(&paths::guest_agent_key_path(&inst.name))
+            .with_context(|| format!("minting {:?}'s guest agent key", inst.name))?;
+        Ok(format!("{GUEST_CONFIG}{}", guest::cloud_config(&key)))
     }
 
     /// Idempotent, and the disk it settles on is the disk every other
@@ -411,17 +423,20 @@ impl Hypervisor for Vz {
         })
     }
 
-    /// Start the helper, then wait until the guest is *found*.
+    /// Start the helper, then wait until the guest says where it is.
     ///
     /// QEMU's `boot` can return the moment the process daemonizes, because
     /// its endpoint — a forwarded loopback port — is known before the guest
-    /// exists. A vz guest has its own address on macOS's NAT, and the only
-    /// public record of it is `bootpd`'s lease file, which yields candidates
-    /// rather than an answer (VZ-SPIKE-NOTES landmine 8). So the endpoint is
-    /// not knowable until something answers on port 22, and this returns
-    /// when it has. `ast up` on vz therefore takes as long as the guest
-    /// takes to boot — and hands back a `GuestEndpoint` that is already
-    /// proven rather than one `ast ssh` has to wait on.
+    /// exists. A vz guest has its own address on macOS's NAT and nothing
+    /// outside the guest knows it, so `boot` waits to be told: the guest's
+    /// agent answers on the virtio socket and names its own address
+    /// (`asterism_vz::guest`). A guest with no agent falls back to what
+    /// this did before — a `bootpd` lease candidate proved by an ssh banner
+    /// (VZ-SPIKE-NOTES landmine 8), which is inference and slower.
+    ///
+    /// Either way `ast up` on vz takes as long as the guest takes to come
+    /// up, and hands back a `GuestEndpoint` that is already known good
+    /// rather than one `ast ssh` has to wait on.
     fn boot(&self, req: &BootReq, prep: &Prepared) -> Result<Handle> {
         let p = self.probed()?;
         let inst = req.instance;
@@ -455,6 +470,14 @@ impl Hypervisor for Vz {
             cpus: inst.shape.cpus,
             mem_mib: inst.shape.mem_mib,
             mac: asterism_vz::mac_for(&inst.name),
+            // The key, not the bytes: `vz.json` is what a human reads to
+            // find out what a running guest was built from, and a secret
+            // does not belong in it. Only named when it is actually there —
+            // an instance whose seed predates the agent has no key file,
+            // and telling the helper to look for one would be a boot that
+            // complains instead of one that falls back.
+            agent_key: Some(paths::guest_agent_key_path(&inst.name))
+                .filter(|path| path.exists()),
         };
         let config_path = req.dir.join("vz.json");
         config.write(&config_path)?;
@@ -493,7 +516,7 @@ impl Hypervisor for Vz {
         reap_in_background(child);
         let proc = proc?;
 
-        match wait_for_guest(&config.ctl, &proc, &log_path) {
+        match wait_for_guest(&config.ctl, &proc, &log_path, &inst.name) {
             Ok(addr) => Ok(Handle::owning(
                 ID,
                 proc,
@@ -815,11 +838,15 @@ fn take_down_over_the_socket(h: &Handle, command: VzCommand, budget: Duration) -
 /// all", which fails fast and quotes the helper's own log; the second is
 /// "has the guest finished booting", which is slow by nature and is the
 /// wait a user experiences as `ast up`.
-fn wait_for_guest(ctl: &Path, proc: &ProcId, log: &Path) -> Result<IpAddr> {
+fn wait_for_guest(ctl: &Path, proc: &ProcId, log: &Path, instance: &str) -> Result<IpAddr> {
     let started = Instant::now();
     let helper_deadline = started + HELPER_TIMEOUT;
     let deadline = started + BOOT_TIMEOUT;
     let mut seen_helper = false;
+    // Said once, whatever the boot goes on to do: a guest whose agent
+    // refused the helper, or speaks a protocol it does not, boots on the
+    // fallback and must not do so silently.
+    let mut said_agent_trouble = false;
     loop {
         if !proc.alive() {
             bail!(
@@ -831,7 +858,27 @@ fn wait_for_guest(ctl: &Path, proc: &ProcId, log: &Path) -> Result<IpAddr> {
         match asterism_vz::info(ctl, Duration::from_secs(2)) {
             Ok(info) => {
                 seen_helper = true;
+                if let Some(trouble) = info.agent_error.as_deref() {
+                    if !said_agent_trouble {
+                        said_agent_trouble = true;
+                        eprintln!(
+                            "astd: {instance}: the guest agent is not usable, so this boot \
+                             falls back to finding the guest on the NAT — {trouble}"
+                        );
+                    }
+                }
                 if let Some(addr) = info.guest_ip {
+                    if matches!(info.endpoint_via, Some(Discovery::Ssh) | None) {
+                        // Worth a line because it is the slower, weaker
+                        // path: an address out of the lease file that
+                        // something answered on. A guest that keeps landing
+                        // here has no agent, and that is a thing to fix.
+                        eprintln!(
+                            "astd: {instance} was found at {addr} by an ssh banner rather \
+                             than by asking it — this guest has no agent on vsock port {}",
+                            guest::PORT
+                        );
+                    }
                     return Ok(addr);
                 }
                 if !info.state.is_live() {
@@ -870,8 +917,10 @@ fn wait_for_guest(ctl: &Path, proc: &ProcId, log: &Path) -> Result<IpAddr> {
         }
         if Instant::now() >= deadline {
             bail!(
-                "the vz guest did not answer on port 22 within {}s — its console is {}",
+                "the vz guest never said where it is within {}s — neither its agent on \
+                 vsock port {} nor an ssh banner on the NAT — its console is {}",
                 BOOT_TIMEOUT.as_secs(),
+                guest::PORT,
                 log.with_file_name("console.log").display()
             );
         }
@@ -1208,6 +1257,41 @@ mod tests {
         }
     }
 
+    /// What a vz guest actually gets: the console fix and the agent, as one
+    /// document the seed builder can fold into its own half.
+    ///
+    /// `Vz::guest_config` is exactly this concatenation with a key minted
+    /// on the way past; it is spelled out here rather than called because
+    /// minting one writes into `ASTERISM_HOME`, which is process-wide and
+    /// shared with every other test in this binary.
+    #[test]
+    fn the_guest_config_carries_the_agent_and_still_merges_into_a_seed() {
+        let key = guest::Key::parse(&"7c".repeat(32)).unwrap();
+        let config = format!("{GUEST_CONFIG}{}", guest::cloud_config(&key));
+        // The check a backend is held to, run here rather than at boot.
+        asterism_core::seed::mergeable(&config).expect("a seed can carry this");
+
+        assert!(config.contains(&key.hex()), "the guest is given the key");
+        assert!(
+            config.contains("asterism-guest.service"),
+            "and something to keep the agent running"
+        );
+        // Two `bootcmd:` keys, one from each half. The seed builder merges
+        // by key, so this is legal — and it is what makes adding the agent
+        // an addition rather than a rewrite of the console fix.
+        assert_eq!(
+            config.lines().filter(|l| *l == "bootcmd:").count(),
+            2,
+            "{config}"
+        );
+        for line in config.lines() {
+            assert!(
+                line.starts_with(' ') || line.contains(':') || line.is_empty(),
+                "unindented non-key line in the guest config: {line:?}"
+            );
+        }
+    }
+
     #[test]
     fn raw_and_nbd_extra_disks_reach_the_helper_config() {
         let raw = DiskSpec::File {
@@ -1344,6 +1428,9 @@ mod tests {
             state,
             mac: asterism_vz::mac_for("vzdisky"),
             guest_ip: Some("192.168.64.3".parse().unwrap()),
+            endpoint_via: Some(Discovery::Agent),
+            agent: None,
+            agent_error: None,
             started_at: 1,
             boot_secs: Some(4.0),
             console: "/i/vzdisky/console.log".into(),
@@ -1720,7 +1807,9 @@ mod tests {
         );
 
         let me = ProcId::capture(std::process::id()).unwrap();
-        let err = wait_for_guest(&sock, &me, &log).unwrap_err().to_string();
+        let err = wait_for_guest(&sock, &me, &log, "vzdisky")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("stopped while booting"), "{err}");
         assert!(err.contains("nbd+unix:///team%2Fdata"), "{err}");
         assert!(err.contains("Connection reset by peer"), "{err}");
