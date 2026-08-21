@@ -41,6 +41,7 @@ PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 ASTD_PID=
 WE_INSTALLED=
 BYSTANDER=
+FOREIGN=
 
 fail() { echo "E2E FAIL: $*" >&2; exit 1; }
 ok() { echo "ok: $*"; }
@@ -48,6 +49,7 @@ ok() { echo "ok: $*"; }
 cleanup() {
   if [ -n "$WE_INSTALLED" ]; then "$AST" service uninstall >/dev/null 2>&1 || true; fi
   if [ -n "$BYSTANDER" ]; then kill -9 "$BYSTANDER" 2>/dev/null || true; fi
+  if [ -n "$FOREIGN" ]; then kill -9 "$FOREIGN" 2>/dev/null || true; fi
   if [ -n "$ASTD_PID" ]; then kill -9 "$ASTD_PID" 2>/dev/null || true; fi
   # Only ever our own processes: every one of them names this home on its
   # command line.
@@ -233,16 +235,23 @@ expect "guest answers after the reboot" "risen" "$AST" ssh "$INST" -- "echo rise
 #
 # `handle.proc` is stripped from the registry to produce exactly the record
 # an older daemon would have left behind.
+# strip_identity [pid [started_at]]
 strip_identity() {
   python3 - "$ASTERISM_HOME/state.json" "$INST" "$@" <<'STRIP'
 import json, sys
 path, name = sys.argv[1], sys.argv[2]
 pid = int(sys.argv[3]) if len(sys.argv) > 3 else None
+started_at = int(sys.argv[4]) if len(sys.argv) > 4 else None
 state = json.load(open(path))
-handle = state[name]["handle"]
+# The shard file is versioned; a registry written before it was is the bare
+# map. Either shape, the rows are what this is here to edit.
+rows = state["instances"] if "instances" in state else state
+handle = rows[name]["handle"]
 handle.pop("proc", None)
 if pid is not None:
     handle["pid"] = pid
+if started_at is not None:
+    handle["started_at"] = started_at
 json.dump(state, open(path, "w"), indent=2)
 STRIP
 }
@@ -290,6 +299,51 @@ wait "$BYSTANDER" 2>/dev/null || true
 BYSTANDER=
 PID3="$PID4"
 expect "guest answers after the refusal" "unharmed" "$AST" ssh "$INST" -- "echo unharmed"
+
+echo "== a registry whose pid belongs to somebody else's qemu"
+#
+# The bystander above is a `sleep`, and refusing that only proves the
+# executable is checked. This is the case the executable cannot save us from:
+# a real `qemu-system-*`, alive, running the same program the guest runs, and
+# started *inside* any window a timestamp comparison would allow — the handle
+# is backdated so the foreign qemu began thirty seconds after it.
+#
+# What tells them apart is that this qemu was started for something else, and
+# says so on its own command line: it is not serving this instance's monitor
+# and it is not holding this instance's pidfile.
+stop_astd
+kill -9 "$PID3" 2>/dev/null || true
+sleep 1
+dead "$PID3" || fail "qemu $PID3 survived kill -9"
+
+FOREIGN_SOCK="$ASTERISM_HOME/not-ours.sock"
+qemu-system-aarch64 -machine none -display none -S -nodefaults \
+  -qmp "unix:$FOREIGN_SOCK,server,nowait" &
+FOREIGN=$!
+for _ in $(seq 1 50); do [ -S "$FOREIGN_SOCK" ] && break; sleep 0.2; done
+kill -0 "$FOREIGN" 2>/dev/null || fail "the stand-in qemu did not start"
+ok "somebody else's qemu is running as pid $FOREIGN"
+
+# Backdated: the foreign qemu started ~30s after the handle claims its guest
+# did, which is well inside the slack a start-time check allows.
+strip_identity "$FOREIGN" "$(( $(date +%s) - 30 ))"
+ok "the registry now claims $INST is running as pid $FOREIGN"
+
+start_astd
+PID5="$(wait_new_pid "$FOREIGN" 90)" || fail "astd did not resurrect $INST"
+kill -0 "$FOREIGN" 2>/dev/null \
+  || fail "astd killed pid $FOREIGN — a foreign qemu was adopted and signalled"
+ok "the foreign qemu at pid $FOREIGN is untouched"
+logged "was not started for this instance" \
+  || fail "astd did not refuse it on instance-bound evidence:"$'\n'"$(cat "$LOG")"
+ok "the daemon log: $(grep -m1 'was not started for this instance' "$LOG")"
+ok "and $INST was resurrected as pid $PID5"
+kill -9 "$FOREIGN" 2>/dev/null || true
+wait "$FOREIGN" 2>/dev/null || true
+FOREIGN=
+rm -f "$FOREIGN_SOCK"
+PID3="$PID5"
+expect "guest answers after the second refusal" "still-here" "$AST" ssh "$INST" -- "echo still-here"
 
 # ---- a deliberate down is not a crash --------------------------------------
 expect "down" "$INST  stopped" "$AST" down "$INST"

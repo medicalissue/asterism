@@ -18,7 +18,7 @@ use anyhow::{bail, Context, Result};
 
 use asterism_core::hv::{BootReq, DiskFormat, Handle, Hypervisor, ImageKind, ImageRef, Machine};
 use asterism_core::instance::{Instance, PortForward};
-use asterism_core::proc::{Ownership, ProcId};
+use asterism_core::proc::{Evidence, Ownership, ProcId};
 use asterism_core::{image, paths, seed};
 
 pub mod qemu;
@@ -435,18 +435,53 @@ fn execs_for(backend: &str) -> Option<&'static [&'static str]> {
     }
 }
 
+/// Paths that belong to this one instance, and that its backend puts on its
+/// guest's command line.
+///
+/// This is what an adoption is allowed to rest on ([`Evidence`]), so it is
+/// worth saying what each of these is and why a stranger cannot be holding
+/// one. Every path here lives inside `~/.asterism/instances/<name>/` and
+/// names a file, not a directory — `…/instances/dev/qmp.sock` is not a
+/// prefix of `…/instances/dev2/qmp.sock`, which is the trap a directory
+/// would have walked into.
+///
+/// * **qemu** is given `-qmp unix:<ctl>,server,nowait` and
+///   `-pidfile <dir>/qemu.pid`. The first is the control socket this handle
+///   already records, so a qemu carrying it is by construction the qemu
+///   serving this instance's monitor.
+/// * **the vz helper** is given `--config <dir>/vz.json`, the file that
+///   tells it which disk to attach and which socket to bind. A helper
+///   carrying it was started to run this instance and no other.
+fn instance_evidence(inst: &Instance, h: &Handle) -> Vec<std::path::PathBuf> {
+    let dir = paths::instance_dir(&inst.name);
+    let mut names = vec![h.ctl.path().to_owned()];
+    match h.backend.as_str() {
+        qemu::ID => names.push(dir.join("qemu.pid")),
+        vz::ID => names.push(dir.join("vz.json")),
+        _ => {}
+    }
+    names
+}
+
 /// Give every pre-identity handle in the registry an identity, once.
 ///
 /// The explicit migration for records written before [`ProcId`] existed.
 /// Runs at daemon startup, before `persist::resurrect`, so every path after
 /// it is looking at handles that either carry proof or carry nothing.
 ///
-/// Adoption is deliberately conservative ([`ProcId::adopt`]): the process
-/// must still be there, must not have started after the handle that names
-/// it, and must be running one of the executables this backend spawns. A
-/// handle that fails all that keeps its bare pid, reads as stopped, and gets
-/// resurrected — which is the safe direction. The unsafe direction is
-/// believing a stranger's pid is a guest and later signalling it.
+/// What adoption rests on is [`instance_evidence`] — a path only this
+/// instance's own process would be carrying — and never on a pid being
+/// alive, running a program of the right family, or having started at
+/// roughly the right time. Those three are all satisfied at once by an
+/// unrelated `qemu-system-aarch64` that something else started half a minute
+/// after this handle was written, and adopting one would hand `stop` and
+/// `kill` a stranger to aim at.
+///
+/// A handle that cannot produce the evidence keeps its bare pid and is never
+/// signalled through. It is not thereby declared dead: `state` can still
+/// *observe* it through the instance's own control channel
+/// ([`observed_running`]), which is what stops a guest nobody can name from
+/// being restarted on top of itself.
 ///
 /// Returns whether anything changed and the registry needs saving.
 pub fn adopt_identities(reg: &mut asterism_core::registry::Shard) -> bool {
@@ -466,7 +501,9 @@ pub fn adopt_identities(reg: &mut asterism_core::registry::Shard) -> bool {
         let Some(execs) = execs_for(&handle.backend) else {
             continue;
         };
-        match ProcId::adopt(pid, handle.started_at, execs) {
+        let names = instance_evidence(&inst, handle);
+        let names: Vec<&Path> = names.iter().map(std::path::PathBuf::as_path).collect();
+        match ProcId::adopt(pid, handle.started_at, &Evidence { exec: execs, names: &names }) {
             Ok(proc) => {
                 eprintln!(
                     "astd: {} was recorded before process identities existed — adopting {proc}",
@@ -482,7 +519,7 @@ pub fn adopt_identities(reg: &mut asterism_core::registry::Shard) -> bool {
             // exactly the near-miss a human would want to know about.
             Err(why) => eprintln!(
                 "astd: {}'s recorded pid {pid} cannot be proven to be its guest ({why}) — \
-                 treating it as stopped",
+                 nothing will be signalled through that handle",
                 inst.name
             ),
         }
@@ -533,6 +570,37 @@ pub(crate) fn alive(h: &Handle) -> bool {
     h.proc.as_ref().is_some_and(|p| p.alive())
 }
 
+/// Is this guest running, whether or not anything may be done to it?
+///
+/// A different question from [`owned`], with a different answer and a
+/// different kind of evidence behind it, and keeping the two apart is the
+/// point.
+///
+/// `owned` asks what may be *signalled*, so nothing but a proven process
+/// will do. This asks whether the guest is still there, and for that the
+/// instance's own control socket is enough: the path belongs to this
+/// instance, something is listening on it, and connecting costs the guest
+/// nothing. It does not say *which* process — which is exactly why it can
+/// never authorise a signal, and exactly why it is safe to believe from a
+/// handle that carries only a pid.
+///
+/// This is what a handle written before identities existed falls back to
+/// when it cannot be adopted. Without it such a handle would read as
+/// stopped, and `reconcile` and the supervisor between them would try to
+/// boot a second guest on top of a first one that is alive and serving.
+pub(crate) fn observed_running(h: &Handle) -> bool {
+    if alive(h) {
+        return true;
+    }
+    // Only for a handle with no proof to fall back from. A handle that owns
+    // a process has already been answered by that process, and a socket
+    // outliving it must not overrule that.
+    if h.proc.is_some() || h.pid.is_none() {
+        return false;
+    }
+    std::os::unix::net::UnixStream::connect(h.ctl.path()).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,21 +648,27 @@ mod tests {
             .unwrap();
         }
 
-        /// The daemon has restarted under a live guest, and the guest's
-        /// process is still there running what it should be. That process
-        /// gets a real identity and nothing is booted twice.
+        /// The daemon has restarted under a live guest whose process really
+        /// is holding this instance's own control socket. That is what an
+        /// adoption rests on, and it is enough: the guest gets a real
+        /// identity and nothing is booted twice.
         #[test]
-        fn a_live_guest_survives_the_daemon_that_could_not_name_it() {
+        fn a_live_guest_holding_its_own_socket_is_adopted() {
             let (_dir, mut reg) = shard();
-            // `sleep` stands in for the helper: a real process, running a
-            // known binary, started just now.
-            let mut sleeper = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+            let ctl = paths::qmp_socket_path("live");
+            // `sleep` stands in for the helper, holding the path a real one
+            // would have been given on its command line.
+            let mut sleeper =
+                std::process::Command::new("sleep").arg("30").arg(&ctl).spawn().unwrap();
             pre_identity(&mut reg, "live", vz::ID, sleeper.id());
 
-            // Adoption is gated on the executable, so the test asks for the
-            // one this process actually is.
             let handle = reg.get("live").unwrap().handle.clone().unwrap();
-            let proc = ProcId::adopt(sleeper.id(), handle.started_at, &["sleep"]).unwrap();
+            let proc = ProcId::adopt(
+                sleeper.id(),
+                handle.started_at,
+                &Evidence { exec: &["sleep"], names: &[&ctl] },
+            )
+            .unwrap();
             reg.adopt_handle_identity("live", proc).unwrap();
 
             let adopted = reg.get("live").unwrap().handle.as_ref().unwrap();
@@ -604,6 +678,81 @@ mod tests {
 
             let _ = sleeper.kill();
             let _ = sleeper.wait();
+        }
+
+        /// The rejection this pack was resubmitted for, at the seam the
+        /// daemon actually calls.
+        ///
+        /// A real `qemu-system-*` is running, it is alive, and it started
+        /// half a minute after the legacy handle was written — well inside
+        /// any window a timestamp comparison would allow. What it is not is
+        /// this instance's guest, and nothing but the instance's own paths
+        /// can tell the difference.
+        #[test]
+        fn a_foreign_guest_process_started_after_the_handle_is_not_adopted() {
+            let (_dir, mut reg) = shard();
+            // Somebody else's instance, and a process holding its socket.
+            let theirs = paths::qmp_socket_path("theirs");
+            let mut foreign =
+                std::process::Command::new("sleep").arg("30").arg(&theirs).spawn().unwrap();
+
+            pre_identity(&mut reg, "ours", qemu::ID, foreign.id());
+            // Backdate the handle so the foreign process started 30s after
+            // it, which is what a recycled pid looks like.
+            let handle = reg.get("ours").unwrap().handle.clone().unwrap();
+            assert!(
+                ProcId::adopt(
+                    foreign.id(),
+                    handle.started_at.saturating_sub(30),
+                    &Evidence {
+                        exec: &["sleep"],
+                        names: &[&paths::qmp_socket_path("ours")],
+                    },
+                )
+                .is_err(),
+                "a process holding another instance's socket is not this instance's guest"
+            );
+
+            // Through the daemon's own entry point: nothing is adopted, the
+            // handle is left owning nothing, and the foreign process lives.
+            assert!(!adopt_identities(&mut reg));
+            let handle = reg.get("ours").unwrap().handle.clone().unwrap();
+            assert_eq!(handle.owned(), None);
+            assert!(owned(&handle).is_none(), "and so there is nothing to signal");
+            assert!(
+                ProcId::capture(foreign.id()).unwrap().alive(),
+                "the foreign process is untouched"
+            );
+
+            let _ = foreign.kill();
+            let _ = foreign.wait();
+        }
+
+        /// A handle nobody could adopt is not thereby a dead guest. Its own
+        /// control socket still answers for it — enough to keep the
+        /// supervisor from booting a second guest on top of the first, and
+        /// deliberately not enough to signal anything.
+        #[test]
+        fn an_unadoptable_handle_can_still_be_observed_but_never_signalled() {
+            let dir = tempfile::tempdir().unwrap();
+            let ctl = dir.path().join("qmp.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&ctl).unwrap();
+
+            let handle = Handle {
+                backend: qemu::ID.into(),
+                pid: Some(std::process::id()),
+                proc: None,
+                ctl: ControlChannel::Qmp { path: ctl.clone() },
+                endpoint: GuestEndpoint::HostForward { ssh_port: 22 },
+                started_at: now_unix(),
+            };
+            assert!(observed_running(&handle), "something is serving this instance");
+            assert!(owned(&handle).is_none(), "and nothing may be sent to it");
+
+            // The listener going is the guest going.
+            drop(listener);
+            std::fs::remove_file(&ctl).unwrap();
+            assert!(!observed_running(&handle));
         }
 
         /// The real thing, through the entry point the daemon calls: the
@@ -629,6 +778,11 @@ mod tests {
         /// A pid whose process is simply gone — the host rebooted, or the
         /// guest died while the daemon was down. Nothing to adopt, no noise
         /// beyond a line, and the supervisor takes it from there.
+        ///
+        /// Note the handle in these has a `/tmp/x.sock` control path that no
+        /// process is holding, so none of them can be adopted on evidence
+        /// either — which is the point: only the one test that arranges real
+        /// evidence gets an identity.
         #[test]
         fn a_dead_pid_is_left_alone() {
             let (_dir, mut reg) = shard();
@@ -690,6 +844,34 @@ mod tests {
             assert_eq!(execs_for(vz::ID), Some(VZ_EXECS));
             assert_eq!(execs_for("chv"), None);
             assert_eq!(VZ_EXECS, &["astd-vz"]);
+        }
+
+        /// And what each backend offers as proof. Every path is inside the
+        /// instance's own directory and names a file: a directory would have
+        /// made `dev` a prefix of `dev2`.
+        #[test]
+        fn each_backend_names_paths_only_its_own_guest_would_carry() {
+            let dir = paths::instance_dir("dev");
+            for (backend, expected) in
+                [(qemu::ID, dir.join("qemu.pid")), (vz::ID, dir.join("vz.json"))]
+            {
+                let h = Handle {
+                    backend: backend.into(),
+                    pid: Some(1),
+                    proc: None,
+                    ctl: ControlChannel::Qmp { path: paths::qmp_socket_path("dev") },
+                    endpoint: GuestEndpoint::HostForward { ssh_port: 22 },
+                    started_at: 0,
+                };
+                let inst = Instance::new("dev", "laptop", "debian:13", Shape::default(), machine(backend));
+                let names = instance_evidence(&inst, &h);
+                assert!(names.contains(&paths::qmp_socket_path("dev")), "{backend}: {names:?}");
+                assert!(names.contains(&expected), "{backend}: {names:?}");
+                for name in &names {
+                    assert!(name.starts_with(&dir), "{name:?} is not this instance's");
+                    assert!(name.extension().is_some(), "{name:?} is a directory, not a file");
+                }
+            }
         }
     }
 

@@ -59,6 +59,12 @@ use super::{alive, grow, owned};
 
 pub const ID: &str = "vz";
 
+/// How long the framework's own hard stop gets when there is no signal
+/// behind it. `kill` is the power cord and has to stay quick: a helper that
+/// will not take this is one a human has to be told about, not one to wait
+/// out.
+const HARD_STOP: Duration = Duration::from_secs(5);
+
 /// Oldest macOS this backend will run on.
 ///
 /// 14 rather than 13 (which is where `VZEFIBootLoader` landed) because it
@@ -236,6 +242,20 @@ impl Vz {
         if self.lost_disks_mut().insert(proc.clone()) {
             eprintln!("astd: {instance} lost a disk and is going down — {lost}");
         }
+    }
+
+    /// Is a helper answering on this handle's socket, and is it the one the
+    /// handle names?
+    ///
+    /// The observation a handle with no proven process falls back to. The
+    /// socket path belongs to one instance, and a helper answers it with its
+    /// own pid — so a reply carrying the recorded pid says the guest is
+    /// still up. It says nothing about what may be done to that process,
+    /// which is why it lives here and not in [`Hypervisor::stop`].
+    fn answers_for(&self, h: &Handle) -> bool {
+        let Some(pid) = h.pid else { return false };
+        self.info(h, Duration::from_secs(2))
+            .is_ok_and(|info| info.pid == pid && info.state.is_live())
     }
 
     /// Has this helper already told us its guest lost a disk?
@@ -502,11 +522,15 @@ impl Hypervisor for Vz {
     fn stop(&self, h: &Handle, deadline: Duration) -> Result<()> {
         let Some(proc) = owned(h) else {
             // Nothing here is provably this guest's helper, so nothing here
-            // may be signalled — and the socket is not asked either. A
-            // control socket outlives the process that bound it, and a
-            // `stop` sent down one belonging to a process we cannot name is
-            // not a stop of anything we own.
-            return Ok(());
+            // may be signalled. The socket still can be: it belongs to this
+            // instance, and a helper answering on it takes its *own* guest
+            // down. That is the whole of what is left, and it either works
+            // or is reported — never quietly reported as a stop.
+            return take_down_over_the_socket(
+                h,
+                VzCommand::Stop { timeout_secs: Some(deadline.mul_f32(0.75).as_secs()) },
+                deadline,
+            );
         };
         // Most of the budget belongs to the guest; the rest to the signals.
         let graceful = deadline.mul_f32(0.75);
@@ -562,7 +586,10 @@ impl Hypervisor for Vz {
     /// why the helper has to be the right process before anything is sent.
     fn kill(&self, h: &Handle) -> Result<()> {
         let Some(proc) = owned(h) else {
-            return Ok(());
+            // SIGKILL needs a process this daemon can name. The framework's
+            // own hard stop does not — it is a request down this instance's
+            // socket, answered by the helper that owns the guest.
+            return take_down_over_the_socket(h, VzCommand::Kill, HARD_STOP);
         };
         proc.signal(Signal::Kill)?;
         proc.wait_gone(Duration::from_secs(2));
@@ -614,12 +641,16 @@ impl Hypervisor for Vz {
     /// itself, and it is the only window in which nothing answering and
     /// nothing wrong are different things.
     fn state(&self, h: &Handle) -> Result<RunState> {
-        // A handle that owns nothing owns nothing on the socket either: the
-        // path is a file, and a file outlives whoever bound it. Asked every
-        // few seconds by the supervisor, so this reads the identity without
-        // the log line `owned` would write.
+        // A handle with no proven process cannot be answered by an identity,
+        // but it can still be answered — by the socket, which belongs to
+        // this instance and which a helper answers with its own pid. That is
+        // enough to know the guest is there and deliberately not enough to
+        // signal it: see `backend::observed_running`.
         let Some(proc) = h.proc.as_ref().filter(|_| alive(h)) else {
-            return Ok(RunState::Stopped);
+            return Ok(match self.answers_for(h) {
+                true => RunState::Running,
+                false => RunState::Stopped,
+            });
         };
         match self.info(h, Duration::from_secs(2)) {
             Ok(info) => {
@@ -723,6 +754,59 @@ fn await_helper_exit(ctl: &Path, budget: Duration) {
         ctl.display(),
         budget.as_secs()
     );
+}
+
+/// Take a guest down over its own control socket, with no signal behind it.
+///
+/// The path for a handle written before identities existed that could not be
+/// adopted. The socket is instance-bound — it is this instance's path, and a
+/// helper answering on it is the process that owns this instance's guest —
+/// so asking it to stop is a request aimed at exactly one guest. What is
+/// missing is the escalation: no SIGTERM, no SIGKILL, because there is no
+/// process this daemon can prove is the one to send them to.
+///
+/// A helper that will not go therefore has to be reported rather than
+/// assumed gone. The registry saying stopped over a guest still writing to
+/// its disk is the state the next boot corrupts.
+fn take_down_over_the_socket(h: &Handle, command: VzCommand, budget: Duration) -> Result<()> {
+    let ctl = h.ctl.path();
+    if !ctl.exists() {
+        // No socket and no provable process: nothing of this guest is left.
+        return Ok(());
+    }
+    // Everything here fits inside the caller's budget, including the wait
+    // for an answer. The owned path can afford to overrun it because it has
+    // SIGKILL behind it; this one has nothing behind it, so a caller that
+    // said forty seconds gets an answer in forty seconds.
+    let round_trip = budget.max(Duration::from_millis(100));
+    match asterism_vz::call(ctl, &command, round_trip) {
+        Ok(Reply::Stopped { reason, seconds }) => {
+            if !matches!(reason, StopReason::GuestStopped) {
+                eprintln!("astd: the vz guest did not stop cleanly after {seconds:.1}s — {reason}");
+            }
+        }
+        Ok(other) => eprintln!("astd: vz helper answered {command:?} with {other:?}"),
+        // Nothing on the socket at all: the helper is gone, and with it the
+        // guest — that equivalence is what this backend is built on.
+        Err(_) if !ctl.exists() => return Ok(()),
+        Err(e) => eprintln!("astd: vz control socket did not answer ({e:#})"),
+    }
+    // Proven by the socket falling silent, which is the same evidence the
+    // request was sent on.
+    let until = Instant::now() + round_trip;
+    while Instant::now() < until {
+        if asterism_vz::info(ctl, round_trip).is_err() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    bail!(
+        "this guest's helper is still answering on {} and nothing proves which process \
+         it is, so it cannot be signalled. It was recorded at pid {}. Check that pid is \
+         really the helper and stop it by hand.",
+        ctl.display(),
+        h.pid.map(|p| p.to_string()).unwrap_or_else(|| "none".into())
+    )
 }
 
 /// Wait for the helper to come up and for its guest to answer on port 22.
@@ -1433,14 +1517,65 @@ mod tests {
         let h = owning(&sock, Some(stale));
 
         assert_eq!(hv.state(&h).unwrap(), RunState::Stopped);
-        // Down succeeds — there is nothing of this guest left to take down —
-        // and the process wearing its number is not touched.
-        assert!(hv.stop(&h, Duration::from_millis(10)).is_ok());
-        assert!(hv.kill(&h).is_ok());
+        // Down reaches for the socket, which is instance-bound, and never
+        // for the pid, which is not ours. The process wearing that number is
+        // untouched either way — before this it was SIGTERMed and SIGKILLed.
+        let _ = hv.stop(&h, Duration::from_millis(10));
         assert!(real.alive(), "the process that owns that pid is untouched");
 
         let _ = sleeper.kill();
         let _ = sleeper.wait();
+    }
+
+    /// The other half of that: a handle nobody can prove owns anything is
+    /// still taken down through its own control socket, and a helper that
+    /// answers goes. No signal is involved at any point.
+    #[test]
+    fn an_unprovable_handle_is_taken_down_over_its_own_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let hv = Vz::new();
+
+        // Nothing bound at all: nothing of this guest is left, and saying so
+        // is not a failure.
+        let absent = dir.path().join("absent.sock");
+        assert!(hv.stop(&owning(&absent, None), Duration::from_millis(50)).is_ok());
+        assert!(hv.kill(&owning(&absent, None)).is_ok());
+
+        // A helper that answers `stop` the way a real one does. It is asked,
+        // it says the guest powered off, and its socket is gone afterwards —
+        // which is the evidence the takedown worked.
+        let sock = dir.path().join("obliging.sock");
+        obliging_helper(&sock);
+        let h = owning(&sock, None);
+        assert_eq!(hv.state(&h).unwrap(), RunState::Stopped, "no live info reply");
+        assert!(hv.stop(&h, Duration::from_millis(500)).is_ok());
+    }
+
+    /// A helper that answers one `stop` with a clean shutdown and then takes
+    /// its socket with it, exactly as `astd-vz` does on the way out.
+    fn obliging_helper(sock: &Path) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::os::unix::net::UnixListener::bind(sock).unwrap();
+        let path = sock.to_owned();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let Ok(reading) = stream.try_clone() else { continue };
+                let mut asked = String::new();
+                if BufReader::new(reading).read_line(&mut asked).is_err() {
+                    continue;
+                }
+                let mut said = serde_json::to_string(&Reply::Stopped {
+                    reason: StopReason::GuestStopped,
+                    seconds: 0.2,
+                })
+                .unwrap();
+                said.push('\n');
+                let _ = stream.write_all(said.as_bytes());
+                break;
+            }
+            let _ = std::fs::remove_file(&path);
+        });
     }
 
     /// A helper answering with a pid that is not the one on the handle is a

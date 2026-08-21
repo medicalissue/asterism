@@ -1836,10 +1836,18 @@ fn stale_version() -> Result<Option<String>> {
 
 /// Stop the daemon that is running and start ours in its place.
 fn retire_stale_daemon() -> Result<()> {
-    let daemon = daemon_proc().context(
-        "cannot tell which process is serving the astd socket, so it cannot be \
-         restarted — stop astd by hand and try again",
-    )?;
+    let daemon = daemon_proc().with_context(|| {
+        // The pid file is not proof, so it is not acted on — but it is the
+        // one thing this can hand a human who now has to do it themselves.
+        let claimed = std::fs::read_to_string(paths::daemon_pid_path())
+            .ok()
+            .map(|s| format!(" It last wrote pid {} to {}.", s.trim(), paths::daemon_pid_path().display()))
+            .unwrap_or_default();
+        format!(
+            "cannot tell which process is serving the astd socket, so it will not be \
+             signalled — stop astd by hand and try again.{claimed}"
+        )
+    })?;
 
     daemon.signal(Signal::Term)?;
     if !daemon.wait_gone(Duration::from_secs(10)) {
@@ -1859,38 +1867,23 @@ fn retire_stale_daemon() -> Result<()> {
 
 /// Which process is serving the socket, proven well enough to signal.
 ///
-/// Two sources, and the order is about evidence rather than convenience.
-/// `lsof` on the socket *is* the proof: a unix socket path has exactly one
-/// listener, so whatever holds this one is by construction the daemon for
-/// this `ASTERISM_HOME` and no other. The pid file is a claim — a number a
-/// previous daemon wrote and did not get to remove — and a hard-killed
-/// daemon leaves one behind for a pid the kernel is free to hand to
-/// anything. So the pid file is only believed when the process it names
-/// turns out to be running an `astd`, which is what stops `ast daemon
-/// restart` from SIGKILLing a stranger on a machine that rebooted.
+/// One source, and it is the only one that is evidence. A unix socket path
+/// has exactly one listener, so whatever holds this one is by construction
+/// the daemon for this `ASTERISM_HOME` and no other — asking about that
+/// specific path can never turn up somebody else's.
+///
+/// The pid file used to be consulted first and is now not consulted at all,
+/// because it is a claim rather than evidence: `astd` writes it and a
+/// hard-killed daemon does not get to remove it, so what it names on a
+/// machine that has rebooted since is whatever the kernel handed that number
+/// to next. `astd` is started with no arguments, so unlike a guest's qemu
+/// there is nothing on its command line tying a candidate to this home
+/// either. With nothing able to prove it, the number is not something to
+/// send SIGTERM to; the caller says so and stops.
 fn daemon_proc() -> Option<ProcId> {
-    if let Some(pid) = pid_holding(&paths::socket_path()) {
-        if let Ok(proc) = ProcId::capture(pid) {
-            return Some(proc);
-        }
-    }
-    let pid = std::fs::read_to_string(paths::daemon_pid_path())
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok())?;
-    // `lsof` may simply not be installed, which is the case this fallback is
-    // really for. The claimed pid still has to look like a daemon: no
-    // `started_at` to compare against, so the executable is the whole test.
-    match ProcId::adopt(pid, u64::MAX, &[DAEMON_BIN]) {
-        Ok(proc) => Some(proc),
-        Err(why) => {
-            eprintln!("ast: ignoring the pid in {}: {why}", paths::daemon_pid_path().display());
-            None
-        }
-    }
+    let pid = pid_holding(&paths::socket_path())?;
+    ProcId::capture(pid).ok()
 }
-
-/// The daemon binary, as the pid file's claim is checked against it.
-const DAEMON_BIN: &str = "astd";
 
 fn pid_holding(sock: &std::path::Path) -> Option<u32> {
     let out = std::process::Command::new("lsof")

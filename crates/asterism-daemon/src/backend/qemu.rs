@@ -50,7 +50,7 @@ use asterism_core::snapshot::{self, Snapshot};
 use asterism_core::tools::{output, run, tool};
 use asterism_core::{cow, image, oci, paths};
 
-use super::{alive, grow, owned, qmp};
+use super::{grow, observed_running, owned, qmp};
 
 pub const ID: &str = "qemu";
 
@@ -500,7 +500,8 @@ impl Hypervisor for Qemu {
         ))
     }
 
-    /// Ask the guest to power down cleanly via QMP (ACPI power button); a
+
+/// Ask the guest to power down cleanly via QMP (ACPI power button); a
     /// killed QEMU is a yanked power cord — the overlay needs journal
     /// recovery on the next boot and recent guest writes are lost. Only if
     /// the guest ignores the request do we escalate to SIGTERM/SIGKILL.
@@ -515,12 +516,12 @@ impl Hypervisor for Qemu {
     /// returning is the whole of the safe behaviour — the alternative, which
     /// this used to do, is aiming SIGKILL at a recycled pid.
     fn stop(&self, h: &Handle, deadline: Duration) -> Result<()> {
-        let Some(proc) = owned(h) else {
-            return Ok(());
-        };
         // Most of the budget goes to the guest; the rest to SIGTERM before
         // SIGKILL. At the default 40s that is the historical 30s then 10s.
         let graceful = deadline.mul_f32(0.75);
+        let Some(proc) = owned(h) else {
+            return powerdown_only(h, graceful);
+        };
         if powerdown(h.ctl.path()).is_ok() && proc.wait_gone(graceful) {
             return Ok(());
         }
@@ -535,16 +536,21 @@ impl Hypervisor for Qemu {
     }
 
     fn kill(&self, h: &Handle) -> Result<()> {
-        qmp::forget(h.ctl.path());
         let Some(proc) = owned(h) else {
-            return Ok(());
+            // The power cord is a signal, and a signal needs a process this
+            // daemon can name. What is left is the monitor, which is not a
+            // hard stop — and saying so beats pretending the guest is down.
+            let asked = powerdown_only(h, Duration::from_secs(5));
+            qmp::forget(h.ctl.path());
+            return asked;
         };
+        qmp::forget(h.ctl.path());
         proc.signal(Signal::Kill)?;
         Ok(())
     }
 
     fn state(&self, h: &Handle) -> Result<RunState> {
-        Ok(match alive(h) {
+        Ok(match observed_running(h) {
             true => RunState::Running,
             false => RunState::Stopped,
         })
@@ -793,6 +799,40 @@ fn netdev_arg(ssh_port: u16, publish: &[PortForward]) -> String {
 }
 
 // ---- QMP -------------------------------------------------------------------
+
+/// Take a guest down using only what is instance-bound: its own monitor.
+///
+/// The path for a handle this daemon cannot prove owns any process — one
+/// written before identities existed whose evidence has since gone. There is
+/// nothing here it may signal, and the monitor is not a substitute: ACPI is
+/// a request the guest is free to ignore, and there is no escalation behind
+/// it.
+///
+/// So this either works or says it did not, and the difference matters. A
+/// silent `Ok` would leave the registry saying stopped over a guest still
+/// writing to its disk, which is the state the next boot would corrupt.
+fn powerdown_only(h: &Handle, budget: Duration) -> Result<()> {
+    let ctl = h.ctl.path();
+    if powerdown(ctl).is_err() && !ctl.exists() {
+        // No monitor and no process: there is nothing here at all, which is
+        // what the caller wanted.
+        return Ok(());
+    }
+    let deadline = std::time::Instant::now() + budget;
+    while std::time::Instant::now() < deadline {
+        if !observed_running(h) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    bail!(
+        "this guest is still running and nothing proves which process it is, so it \
+         cannot be signalled. Its monitor is {}; it was recorded at pid {}. Check that \
+         pid is really the guest and stop it by hand.",
+        ctl.display(),
+        h.pid.map(|p| p.to_string()).unwrap_or_else(|| "none".into())
+    )
+}
 
 /// Press the guest's ACPI power button.
 ///

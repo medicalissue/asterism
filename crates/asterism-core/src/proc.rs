@@ -149,19 +149,81 @@ impl std::fmt::Display for Signal {
     }
 }
 
-/// How far after a recorded `started_at` a process may have started and
-/// still be believed to be the one that was recorded.
+/// What ties a running process to the instance whose handle names it.
 ///
-/// One-directional, and that is the point. A handle's `started_at` is
-/// written *after* the process is up — for vz, after the guest has booted,
-/// which can be minutes — so a genuine process may have started well before
-/// it. A recycled pid cannot: it belongs to a process that started after the
-/// original died, which is after the handle was written. The slack absorbs
-/// clock jitter between the kernel's stamp and `now_unix()`, nothing more.
+/// The thing [`ProcId::adopt`] rests on, and the reason it can rest on
+/// anything at all. Every other test adoption makes is satisfiable by
+/// coincidence: pids repeat, `qemu-system-aarch64` is a program many things
+/// start, and "began at roughly the right time" is a window, not a
+/// fingerprint. This is not satisfiable by coincidence, because these paths
+/// belong to one instance on one device — its own control socket, its own
+/// pidfile, its own config — and a process that did not exist to serve that
+/// instance has no reason to be carrying one on its command line.
+///
+/// `names` is where the authority comes from; `exec` only narrows what may
+/// be considered. Supplying no names is not a lax adoption, it is a refused
+/// one.
+#[derive(Debug, Clone, Copy)]
+pub struct Evidence<'a> {
+    /// Executable file names a candidate may be running. A family rather
+    /// than a path — `qemu-system-*` — so upgrading qemu under a running
+    /// guest does not orphan it.
+    pub exec: &'a [&'a str],
+    /// Paths that belong to this instance alone. At least one must appear on
+    /// the candidate's own command line.
+    pub names: &'a [&'a Path],
+}
+
+impl Evidence<'_> {
+    /// The path this command line was carrying, if it was carrying one.
+    ///
+    /// Substring rather than equality because the paths arrive decorated:
+    /// qemu is given `unix:/…/qmp.sock,server,nowait` and `file:/…/console.log`,
+    /// and the decoration is qemu's business rather than something to
+    /// enumerate here. What makes that safe is that these are full paths to
+    /// named files — `/…/instances/dev/qmp.sock` is not a prefix of
+    /// `/…/instances/dev2/qmp.sock`, which a bare directory would have been.
+    fn found_in<'a>(&'a self, argv: &[String]) -> Option<&'a Path> {
+        self.names.iter().copied().find(|name| {
+            name.to_str()
+                .is_some_and(|name| argv.iter().any(|arg| arg.contains(name)))
+        })
+    }
+
+    fn describe(&self) -> String {
+        self.names
+            .iter()
+            .map(|n| n.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// How far after a recorded `started_at` a process may have started and
+/// still be *considered* for adoption.
+///
+/// A refusal, never a reason. Nothing is ever adopted because it passed
+/// this — see [`Evidence`] for what adoption actually rests on. It is here
+/// only to throw out the obvious impostor early: a handle's `started_at` is
+/// written after the process is up (for vz, after the guest has booted,
+/// which can be minutes), so a genuine process may have started well before
+/// it, and one that started well *after* it cannot be the process the
+/// handle was written about. The slack absorbs clock jitter between the
+/// kernel's stamp and `now_unix()`, nothing more.
 const ADOPT_SLACK_SECS: u64 = 60;
 
 impl ProcId {
-    /// Capture the identity of a running process.
+    /// Capture the identity of a running process the caller already knows
+    /// is the right one.
+    ///
+    /// The contract is in that sentence and it is not checkable here: this
+    /// takes a pid and writes down what the kernel says about it, so the
+    /// authority it creates is exactly the authority the caller already had.
+    /// Every use in this tree is one of two things — a process this daemon
+    /// has just spawned and is holding the child handle for, or the one
+    /// process holding a unix socket that only this device's daemon binds.
+    /// Anything less than that is [`ProcId::adopt`]'s job, and adopt asks
+    /// for evidence for a reason.
     ///
     /// Fails if there is no such process, or if it is a zombie — neither is
     /// something worth writing down as a running guest.
@@ -185,17 +247,37 @@ impl ProcId {
 
     /// Mint an identity for a pid recorded before identities existed.
     ///
-    /// The explicit half of the migration: a `pid` on disk is not evidence,
-    /// so it is only believed when the process at that number passes three
-    /// tests — it is not a zombie, it did not start after the handle that
-    /// names it was written, and it is running a program the caller expects.
-    /// Anything else reads as gone, which is the safe direction: a guest
-    /// wrongly believed dead is restarted, a guest wrongly believed alive is
-    /// a SIGKILL aimed at a stranger.
+    /// The explicit half of the migration, and the one place in this module
+    /// where authority is created out of something other than having started
+    /// the process. What it is created out of matters enormously, so it is
+    /// worth being precise about what does *not* count.
     ///
-    /// `expect` is matched against the executable's file name, not its full
-    /// path, so upgrading qemu under a running guest does not orphan it.
-    pub fn adopt(pid: u32, started_at: u64, expect: &[&str]) -> std::result::Result<ProcId, String> {
+    /// A pid does not. Nor does a pid that is alive, nor one running a
+    /// program of the right family, nor one whose start time falls in a
+    /// plausible window — nor all three together. Every one of those is
+    /// satisfied by an unrelated `qemu-system-aarch64` that some other tool
+    /// started thirty seconds after this handle was written, and adopting
+    /// that would hand `stop` and `kill` a stranger to aim at. They are
+    /// refusals: each can throw a candidate out, none can let one in.
+    ///
+    /// What lets one in is [`Evidence`]: something only this instance's own
+    /// process could be carrying. A refusal to supply any is a refusal to
+    /// adopt — there is no argument list that mints authority from a number.
+    pub fn adopt(
+        pid: u32,
+        started_at: u64,
+        evidence: &Evidence,
+    ) -> std::result::Result<ProcId, String> {
+        // First, because it is a bug in the caller rather than a fact about
+        // the process, and because the whole point of this function is that
+        // it cannot be reached without evidence.
+        if evidence.names.is_empty() {
+            return Err(format!(
+                "refusing to adopt pid {pid}: nothing was offered that only this \
+                 instance's own process could be carrying"
+            ));
+        }
+
         let probe = match look(pid) {
             Look::Found(probe) => probe,
             Look::NoSuchProcess => return Err(format!("no process {pid}")),
@@ -220,13 +302,30 @@ impl ProcId {
                  be adopted"
             ));
         };
-        if !matches_any(exec, expect) {
+        if !matches_any(exec, evidence.exec) {
             return Err(format!(
                 "process {pid} is running {}, not {}",
                 exec.display(),
-                expect.join(" or ")
+                evidence.exec.join(" or ")
             ));
         }
+
+        // The evidence itself, and the only line here that can answer yes.
+        let Some(argv) = argv(pid) else {
+            return Err(format!(
+                "this host will not say what pid {pid} was started with, so nothing \
+                 ties it to this instance"
+            ));
+        };
+        if evidence.found_in(&argv).is_none() {
+            return Err(format!(
+                "pid {pid} is a {} that was not started for this instance — its command \
+                 line names none of {}",
+                exec.file_name().and_then(|n| n.to_str()).unwrap_or("process"),
+                evidence.describe()
+            ));
+        }
+
         Ok(ProcId {
             pid,
             started_us: probe.started_us,
@@ -400,6 +499,83 @@ fn exists(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// The command line a process was started with.
+///
+/// `None` where the host would not say, which is a refusal to adopt rather
+/// than a licence to skip the check.
+#[cfg(target_os = "macos")]
+fn argv(pid: u32) -> Option<Vec<String>> {
+    // The buffer has to be big enough for the whole block in one call —
+    // `KERN_PROCARGS2` will not report the size it needs — and the kernel
+    // publishes its own ceiling for exactly this.
+    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+    let mut argmax: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    // SAFETY: the out-pointer and its length describe the same `c_int`.
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            2,
+            &mut argmax as *mut _ as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+        || argmax <= 0
+    {
+        return None;
+    }
+
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let mut buf = vec![0u8; argmax as usize];
+    let mut size = buf.len();
+    // SAFETY: the out-pointer and its length describe the same allocation,
+    // and `size` is updated to what was written.
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return None;
+    }
+    buf.truncate(size);
+    procargs2(&buf)
+}
+
+/// Pull the argument vector out of a `KERN_PROCARGS2` block.
+///
+/// The layout is `argc`, then the executable path, then padding, then `argc`
+/// NUL-terminated arguments, then the environment. Split out from the
+/// syscall so the parsing can be tested against a block this process did not
+/// have to arrange to exist — and so the environment, which follows the
+/// arguments in the same block, is provably not searched: a variable a user
+/// exported is not evidence of anything.
+#[cfg(target_os = "macos")]
+fn procargs2(buf: &[u8]) -> Option<Vec<String>> {
+    let argc = u32::from_ne_bytes(buf.get(..4)?.try_into().ok()?) as usize;
+    let rest = buf.get(4..)?;
+    // The executable path, then however many NULs pad it out to alignment.
+    let mut at = rest.iter().position(|b| *b == 0)?;
+    while rest.get(at) == Some(&0) {
+        at += 1;
+    }
+    let mut args = Vec::with_capacity(argc.min(64));
+    for _ in 0..argc {
+        let Some(tail) = rest.get(at..) else { break };
+        let end = at + tail.iter().position(|b| *b == 0).unwrap_or(tail.len());
+        args.push(String::from_utf8_lossy(&rest[at..end]).into_owned());
+        at = end + 1;
+    }
+    Some(args)
+}
+
 #[cfg(target_os = "macos")]
 fn look(pid: u32) -> Look {
     use std::os::unix::ffi::OsStringExt;
@@ -466,6 +642,18 @@ fn look(pid: u32) -> Look {
         zombie: info.pbi_status == libc::SZOMB,
         exec,
     })
+}
+
+/// The command line a process was started with. See the macOS twin.
+#[cfg(not(target_os = "macos"))]
+fn argv(pid: u32) -> Option<Vec<String>> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    Some(
+        raw.split(|b| *b == 0)
+            .filter(|arg| !arg.is_empty())
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect(),
+    )
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -704,39 +892,174 @@ mod tests {
     fn an_undescribable_process_is_never_written_down() {
         // The real path: pid 0 is not a process any of this can name.
         assert!(ProcId::capture(0).is_err());
-        assert!(ProcId::adopt(0, crate::instance::now_unix(), &["anything"]).is_err());
+        let ctl = PathBuf::from("/tmp/asterism-adopt-test/instances/dev/qmp.sock");
+        assert!(ProcId::adopt(
+            0,
+            crate::instance::now_unix(),
+            &Evidence { exec: &["anything"], names: &[&ctl] }
+        )
+        .is_err());
     }
 
     // ---- adoption ----------------------------------------------------------
+    //
+    // Adoption is the one place authority is minted from something other
+    // than having started the process, so these are about what is and is not
+    // allowed to mint it.
+
+    /// A process holding a path, the way a guest's qemu holds its monitor:
+    /// on its own command line, where the kernel recorded it.
+    fn holder(path: &Path) -> std::process::Child {
+        Command::new("sleep").arg("30").arg(path).spawn().unwrap()
+    }
+
+    fn evidence<'a>(exec: &'a [&'a str], names: &'a [&'a Path]) -> Evidence<'a> {
+        Evidence { exec, names }
+    }
 
     #[test]
-    fn adoption_takes_a_live_process_running_what_was_expected() {
-        let mut child = sleeper();
+    fn adoption_takes_a_process_carrying_something_only_this_instance_owns() {
+        let ctl = PathBuf::from("/tmp/asterism-adopt-test/instances/dev/qmp.sock");
+        let mut child = holder(&ctl);
         let now = crate::instance::now_unix();
-        let adopted = ProcId::adopt(child.id(), now, &["sleep"]).unwrap();
+
+        let adopted =
+            ProcId::adopt(child.id(), now, &evidence(&["sleep"], &[&ctl])).unwrap();
         assert_eq!(adopted.pid, child.id());
         assert!(adopted.alive());
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// The regression this whole gate exists for.
+    ///
+    /// Everything a pre-identity handle can say about its guest is satisfied
+    /// here by a process that is not it: the pid matches (it is the pid we
+    /// are adopting), the executable is the right family, and it started
+    /// half a minute after the handle was written — inside any slack a
+    /// timestamp comparison could reasonably allow. Before instance-bound
+    /// evidence, that was enough to adopt, and adopting it is what would
+    /// have pointed `stop` and `kill` at somebody else's VM.
+    #[test]
+    fn a_foreign_qemu_started_after_the_handle_is_neither_adopted_nor_killable() {
+        // What the handle recorded, and where its guest's monitor was.
+        let ours = PathBuf::from("/tmp/asterism-adopt-test/instances/ours/qmp.sock");
+        let legacy_started_at = crate::instance::now_unix();
+
+        // Somebody else's qemu, started 30s later, serving its own instance.
+        // `sleep` stands in for the binary; the executable family is checked
+        // separately and is not what this test turns on.
+        let theirs = PathBuf::from("/tmp/asterism-adopt-test/instances/theirs/qmp.sock");
+        let mut foreign = holder(&theirs);
+        let started_30s_later = legacy_started_at + 30;
+
+        let why = ProcId::adopt(
+            foreign.id(),
+            started_30s_later,
+            &evidence(&["sleep"], &[&ours]),
+        )
+        .unwrap_err();
+        assert!(
+            why.contains("not started for this instance"),
+            "the timestamp window must not be what decides this: {why}"
+        );
+
+        // ...and having refused to adopt it, there is no identity to signal
+        // it with. The only way to reach `signal` is to have been handed a
+        // `ProcId`, and adoption is the only way a migration can produce one.
+        let real = ProcId::capture(foreign.id()).unwrap();
+        assert!(real.alive(), "the foreign qemu is untouched");
+
+        // Even a hand-built identity naming that pid does not help if it is
+        // not the process that was recorded: the number is the only thing it
+        // shares, and that is not what `signal` checks.
+        let forged = ProcId { started_us: real.started_us - 1, ..real.clone() };
+        assert!(forged.signal(Signal::Kill).is_err());
+        assert!(real.alive(), "still untouched");
+
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+    }
+
+    /// The same shape for the vz helper: a second helper, started for
+    /// another instance, half a minute after this handle was written.
+    #[test]
+    fn a_foreign_vz_helper_started_after_the_handle_is_not_adopted() {
+        let ours = PathBuf::from("/tmp/asterism-adopt-test/instances/ours/vz.json");
+        let theirs = PathBuf::from("/tmp/asterism-adopt-test/instances/theirs/vz.json");
+        let mut foreign = holder(&theirs);
+
+        let why = ProcId::adopt(
+            foreign.id(),
+            crate::instance::now_unix() + 30,
+            &evidence(&["sleep"], &[&ours]),
+        )
+        .unwrap_err();
+        assert!(why.contains("not started for this instance"), "{why}");
+
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+    }
+
+    /// One instance's name being a prefix of another's is the trap a
+    /// directory-shaped needle would fall into. These are files.
+    #[test]
+    fn a_neighbouring_instance_is_not_this_one() {
+        let ours = PathBuf::from("/tmp/asterism-adopt-test/instances/dev/qmp.sock");
+        let neighbour = PathBuf::from("/tmp/asterism-adopt-test/instances/dev2/qmp.sock");
+        let mut foreign = holder(&neighbour);
+
+        assert!(ProcId::adopt(
+            foreign.id(),
+            crate::instance::now_unix(),
+            &evidence(&["sleep"], &[&ours])
+        )
+        .is_err());
+
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+    }
+
+    /// Offering no evidence is not a lax adoption. It is a refused one, and
+    /// it is refused before the process is even looked at — so no caller can
+    /// reach authority by having nothing to say.
+    #[test]
+    fn adoption_without_evidence_is_refused_outright() {
+        let mut child = sleeper();
+        let why = ProcId::adopt(
+            child.id(),
+            crate::instance::now_unix(),
+            &evidence(&["sleep"], &[]),
+        )
+        .unwrap_err();
+        assert!(why.contains("refusing to adopt"), "{why}");
         let _ = child.kill();
         let _ = child.wait();
     }
 
     #[test]
     fn adoption_refuses_a_process_running_something_else() {
-        let mut child = sleeper();
+        let ctl = PathBuf::from("/tmp/asterism-adopt-test/instances/dev/qmp.sock");
+        let mut child = holder(&ctl);
         let now = crate::instance::now_unix();
-        let why = ProcId::adopt(child.id(), now, &["qemu-system-*"]).unwrap_err();
+        let why =
+            ProcId::adopt(child.id(), now, &evidence(&["qemu-system-*"], &[&ctl])).unwrap_err();
         assert!(why.contains("sleep"), "{why}");
         let _ = child.kill();
         let _ = child.wait();
     }
 
     /// The recycled-pid case as it actually arrives: the handle is old, the
-    /// process at that number is new.
+    /// process at that number is new. Refused early, and refused for a
+    /// reason that is a refusal rather than a licence.
     #[test]
     fn adoption_refuses_a_process_that_started_after_the_handle() {
-        let mut child = sleeper();
+        let ctl = PathBuf::from("/tmp/asterism-adopt-test/instances/dev/qmp.sock");
+        let mut child = holder(&ctl);
         let long_ago = crate::instance::now_unix() - 3600;
-        let why = ProcId::adopt(child.id(), long_ago, &["sleep"]).unwrap_err();
+        let why =
+            ProcId::adopt(child.id(), long_ago, &evidence(&["sleep"], &[&ctl])).unwrap_err();
         assert!(why.contains("different process"), "{why}");
         let _ = child.kill();
         let _ = child.wait();
@@ -744,7 +1067,32 @@ mod tests {
 
     #[test]
     fn adoption_refuses_a_pid_with_nothing_behind_it() {
-        assert!(ProcId::adopt(0, crate::instance::now_unix(), &["sleep"]).is_err());
+        let ctl = PathBuf::from("/tmp/asterism-adopt-test/instances/dev/qmp.sock");
+        assert!(
+            ProcId::adopt(0, crate::instance::now_unix(), &evidence(&["sleep"], &[&ctl])).is_err()
+        );
+    }
+
+    /// The command line is read from the kernel, and only the arguments are
+    /// read: the environment sits in the same block on macOS, and a variable
+    /// somebody exported is not evidence of anything.
+    #[test]
+    fn a_command_line_is_read_from_the_kernel_and_the_environment_is_not() {
+        let me = argv(std::process::id()).expect("this host names its own command line");
+        assert!(!me.is_empty(), "argv is never empty");
+        assert!(
+            me[0].contains("asterism_core"),
+            "the first argument is this test binary: {me:?}"
+        );
+
+        let marker = "ASTERISM_PROC_TEST_MARKER";
+        std::env::set_var(marker, "/tmp/asterism-adopt-test/instances/dev/qmp.sock");
+        let mine = argv(std::process::id()).unwrap();
+        std::env::remove_var(marker);
+        assert!(
+            !mine.iter().any(|arg| arg.contains(marker)),
+            "the environment must not reach the argument list: {mine:?}"
+        );
     }
 
     #[test]

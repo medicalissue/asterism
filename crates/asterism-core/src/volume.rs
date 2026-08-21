@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::durable::{self, Loaded};
 use crate::instance::now_unix;
-use crate::proc::ProcId;
+use crate::proc::{Evidence as ProcEvidence, ProcId};
 
 /// The program that serves a block volume's NBD export. Named here because
 /// it is what a lease's recorded process must turn out to be running before
@@ -291,7 +291,21 @@ impl Store {
         let Some(pid) = lease.pid else {
             return Ok(None);
         };
-        let proc = ProcId::adopt(pid, lease.granted_at, &[EXPORT_BIN])?;
+        // Both paths carry the volume's name *and* the lease's epoch, and
+        // both are on the storage daemon's own command line — `--pidfile`
+        // and the unix address it serves the export on. A storage daemon
+        // started for anything else cannot be holding either, which is what
+        // makes this adoption rest on something a coincidence cannot supply.
+        let pidfile = crate::paths::volume_export_pid(name, lease.epoch);
+        let socket = crate::paths::volume_export_socket(name, lease.epoch);
+        let proc = ProcId::adopt(
+            pid,
+            lease.granted_at,
+            &ProcEvidence {
+                exec: &[EXPORT_BIN],
+                names: &[&pidfile, &socket],
+            },
+        )?;
         lease.proc = Some(proc.clone());
         Ok(Some(proc))
     }
