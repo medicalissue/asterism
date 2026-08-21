@@ -25,7 +25,6 @@ export const SettingsIcon = (props: Props) => (
 export const PlayIcon = (props: Props) => <Icon {...props}><path d="m5.5 3.5 7 4.5-7 4.5v-9Z"/></Icon>;
 export const StopIcon = (props: Props) => <Icon {...props}><rect x="4" y="4" width="8" height="8" rx="1.2"/></Icon>;
 export const TerminalIcon = (props: Props) => <Icon {...props}><rect x="2" y="2.5" width="12" height="11" rx="1.5"/><path d="m4.5 6 2 2-2 2M8.5 10h3"/></Icon>;
-export const LayersIcon = (props: Props) => <Icon {...props}><path d="m8 2 6 3-6 3-6-3 6-3Z"/><path d="m2 8 6 3 6-3M2 11l6 3 6-3"/></Icon>;
 export const LinkIcon = (props: Props) => <Icon {...props}><path d="M6.5 9.5 9.5 6.5M5.7 11.9l-1 .1a2.7 2.7 0 0 1 0-5.4h2M10.3 4.1l1-.1a2.7 2.7 0 0 1 0 5.4h-2"/></Icon>;
 export const PlusIcon = (props: Props) => <Icon {...props}><path d="M8 3v10M3 8h10"/></Icon>;
 export const RefreshIcon = (props: Props) => <Icon {...props}><path d="M13 6a5 5 0 1 0 .1 3M13 2v4H9"/></Icon>;

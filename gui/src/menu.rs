@@ -19,7 +19,7 @@ use tauri::AppHandle;
 use asterism_core::instance::{Instance, Status};
 
 use crate::client::{self, Tags};
-use crate::instances;
+use crate::instances::Gates;
 
 pub use crate::action::{Action, WEBSITE};
 
@@ -37,6 +37,14 @@ const NEW_INSTANCE: &str = "New Instance…";
 pub struct Row {
     pub name: String,
     pub status: Status,
+    /// What this instance will answer. Resolved by [`Gates`], which is also
+    /// where the window's table reads them: a menu and a table that
+    /// disagreed about when a snapshot is allowed would be two products.
+    ///
+    /// The menu lists this device's own shard, so `live` is true — but an
+    /// instance in conflict or mid-move is still a thing this device holds,
+    /// and the daemon refuses most of what a menu offers on one.
+    pub gates: Gates,
     /// The tags on its disk, or why we could not list them. Kept as a
     /// `Result` because "no snapshots" and "we could not look" are
     /// different things to tell somebody.
@@ -48,18 +56,9 @@ impl Row {
         Row {
             name: instance.name.clone(),
             status: instance.status,
+            gates: Gates::of(instance, true),
             snapshots,
         }
-    }
-
-    /// Which of Up / Down is clickable, whether a terminal is worth
-    /// offering, and whether the disk may be touched at all.
-    ///
-    /// All four come out of [`crate::instances`], which is also where the
-    /// window's table reads them. A menu and a table that disagreed about
-    /// when a snapshot is allowed would be two products.
-    fn can(&self, gate: fn(Status) -> bool) -> bool {
-        gate(self.status)
     }
 
     /// A filled circle is a guest that is up, an empty one a disk that
@@ -149,16 +148,21 @@ impl MenuModel {
             }
             Fleet::Instances(rows) => {
                 for row in rows {
+                    let name = &row.name;
+                    let disk = row.gates.can_snapshot;
                     out.push(format!("[submenu] {}", row.title()));
-                    let up = row.can(instances::can_start);
-                    let down = row.can(instances::can_stop);
-                    let shell = row.can(instances::can_shell);
-                    let disk = row.can(instances::can_touch_disk);
-                    out.push(item(1, &Action::Up(row.name.clone()), "Up", up));
-                    out.push(item(1, &Action::Down(row.name.clone()), "Down", down));
-                    out.push(item(1, &Action::Terminal(row.name.clone()), "Open Terminal", shell));
+                    let up = Action::Up { name: name.clone(), restart: None };
+                    out.push(item(1, &up, "Up", row.gates.can_start));
+                    out.push(item(1, &Action::Down(name.clone()), "Down", row.gates.can_stop));
+                    out.push(item(
+                        1,
+                        &Action::Terminal(name.clone()),
+                        "Open Terminal",
+                        row.gates.can_shell,
+                    ));
                     out.push("  [submenu] Snapshots".to_owned());
-                    out.push(item(2, &Action::Snapshot(row.name.clone()), "Take snapshot", disk));
+                    let take = Action::Snapshot { name: name.clone(), tag: None };
+                    out.push(item(2, &take, "Take snapshot", disk));
                     out.push("    [separator]".to_owned());
                     match &row.snapshots {
                         Err(reason) => out.push(format!(
@@ -170,14 +174,19 @@ impl MenuModel {
                         }
                         Ok(tags) => {
                             for tag in tags {
-                                let action = Action::Restore {
-                                    name: row.name.clone(),
-                                    tag: tag.clone(),
-                                };
-                                out.push(item(2, &action, &format!("Restore {tag}"), disk));
+                                let action =
+                                    Action::Restore { name: name.clone(), tag: tag.clone() };
+                                out.push(item(2, &action, &format!("Restore {tag}…"), disk));
                             }
                         }
                     }
+                    out.push("  [separator]".to_owned());
+                    out.push(item(
+                        1,
+                        &Action::Remove(name.clone()),
+                        "Remove…",
+                        row.gates.can_remove,
+                    ));
                 }
             }
         }
@@ -238,17 +247,20 @@ pub fn build(app: &AppHandle, model: &MenuModel) -> tauri::Result<Menu<tauri::Wr
 
 fn instance_submenu(app: &AppHandle, row: &Row) -> tauri::Result<tauri::menu::Submenu<tauri::Wry>> {
     let name = &row.name;
-    let disk = row.can(instances::can_touch_disk);
-    let up = clickable(app, &Action::Up(name.clone()), "Up", row.can(instances::can_start))?;
-    let down = clickable(app, &Action::Down(name.clone()), "Down", row.can(instances::can_stop))?;
-    let term = clickable(
-        app,
-        &Action::Terminal(name.clone()),
-        "Open Terminal",
-        row.can(instances::can_shell),
-    )?;
+    let disk = row.gates.can_snapshot;
+    let up = Action::Up { name: name.clone(), restart: None };
+    let up = clickable(app, &up, "Up", row.gates.can_start)?;
+    let down = clickable(app, &Action::Down(name.clone()), "Down", row.gates.can_stop)?;
+    let term =
+        clickable(app, &Action::Terminal(name.clone()), "Open Terminal", row.gates.can_shell)?;
+    // Removing is a typed confirmation, which a menu cannot ask for. The
+    // item opens the window on this instance with the dialog up; the ellipsis
+    // is the macOS convention for exactly that, and so is the separator that
+    // keeps it away from the verbs that just happen.
+    let remove = clickable(app, &Action::Remove(name.clone()), "Remove…", row.gates.can_remove)?;
 
-    let take = clickable(app, &Action::Snapshot(name.clone()), "Take snapshot", disk)?;
+    let take = Action::Snapshot { name: name.clone(), tag: None };
+    let take = clickable(app, &take, "Take snapshot", disk)?;
     let mut snapshots = SubmenuBuilder::new(app, "Snapshots").item(&take).separator();
     match &row.snapshots {
         Err(reason) => {
@@ -262,7 +274,7 @@ fn instance_submenu(app: &AppHandle, row: &Row) -> tauri::Result<tauri::menu::Su
         Ok(tags) => {
             for tag in tags {
                 let action = Action::Restore { name: name.clone(), tag: tag.clone() };
-                let item = clickable(app, &action, &format!("Restore {tag}"), disk)?;
+                let item = clickable(app, &action, &format!("Restore {tag}…"), disk)?;
                 snapshots = snapshots.item(&item);
             }
         }
@@ -273,6 +285,8 @@ fn instance_submenu(app: &AppHandle, row: &Row) -> tauri::Result<tauri::menu::Su
         .item(&down)
         .item(&term)
         .item(&snapshots.build()?)
+        .separator()
+        .item(&remove)
         .build()
 }
 
@@ -389,7 +403,9 @@ mod tests {
             "  [submenu] Snapshots".to_owned(),
             "    [snap:dev] Take snapshot  (disabled)".to_owned(),
             "    [separator]".to_owned(),
-            "    [restore:dev:nightly] Restore nightly  (disabled)".to_owned(),
+            "    [restore:dev:nightly] Restore nightly…  (disabled)".to_owned(),
+            "  [separator]".to_owned(),
+            "  [rm:dev] Remove…  (disabled)".to_owned(),
         ]);
         want.extend(tail(false));
         assert_eq!(model.lines(), want);
@@ -407,10 +423,30 @@ mod tests {
             "  [submenu] Snapshots".to_owned(),
             "    [snap:dev] Take snapshot  (enabled)".to_owned(),
             "    [separator]".to_owned(),
-            "    [restore:dev:nightly] Restore nightly  (enabled)".to_owned(),
+            "    [restore:dev:nightly] Restore nightly…  (enabled)".to_owned(),
+            "  [separator]".to_owned(),
+            "  [rm:dev] Remove…  (enabled)".to_owned(),
         ]);
         want.extend(tail(false));
         assert_eq!(model.lines(), want);
+    }
+
+    /// Removing is offered from the menu, but a menu click never does it:
+    /// it opens the window on the instance with the typed confirmation up.
+    /// The same holds for every Restore item.
+    #[test]
+    fn the_menus_destructive_items_are_routes_and_not_work() {
+        for id in ["rm:dev", "restore:dev:nightly"] {
+            let action = Action::parse(id).expect("an action");
+            assert!(action.confirmation().is_some(), "{id} would mutate from a menu click");
+            assert!(crate::mainwindow::Route::of(&action).is_some(), "{id} has nowhere to go");
+        }
+        // Everything else in an instance submenu just happens.
+        for id in ["up:dev", "down:dev", "term:dev", "snap:dev"] {
+            let action = Action::parse(id).expect("an action");
+            assert!(action.confirmation().is_none(), "{id} would need a dialog");
+            assert!(crate::mainwindow::Route::of(&action).is_none(), "{id} is not a route");
+        }
     }
 
     /// The daemon refuses `Snapshot` and `SnapshotRestore` on anything
@@ -426,7 +462,7 @@ mod tests {
                 "{status} must offer a snapshot:\n{lines}"
             );
             assert!(
-                lines.contains("[restore:dev:nightly] Restore nightly  (enabled)"),
+                lines.contains("[restore:dev:nightly] Restore nightly…  (enabled)"),
                 "{status} must offer a restore:\n{lines}"
             );
         }
@@ -481,6 +517,7 @@ mod tests {
         ]);
         let lines = model.lines().join("\n");
         assert!(lines.contains("[up:dev]") && lines.contains("[up:build]"));
+        assert!(lines.contains("[rm:dev]") && lines.contains("[rm:build]"));
         assert!(lines.contains("[restore:build:v1]"));
         assert!(!lines.contains("[restore:dev:"), "dev has no snapshots to restore");
     }
@@ -585,9 +622,9 @@ mod tests {
             assert!(!action.describe().is_empty());
             seen += 1;
         }
-        // main, new, up/down/term/snap ×2, one restore, autostart, website,
-        // quit.
-        assert_eq!(seen, 14);
+        // main, new, up/down/term/snap/rm ×2, one restore, autostart,
+        // website, quit.
+        assert_eq!(seen, 16);
     }
 
     #[test]
@@ -601,5 +638,6 @@ mod tests {
             Action::parse("restore:dev:v1.2_a"),
             Some(Action::Restore { name: "dev".into(), tag: "v1.2_a".into() })
         );
+        assert_eq!(Action::parse("rm:dev"), Some(Action::Remove("dev".into())));
     }
 }

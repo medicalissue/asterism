@@ -1,21 +1,28 @@
-//! The two things this app asks the system to do that have no library
-//! call behind them: open a Terminal window on an instance, and put a
-//! question on the screen.
+//! The one thing this app asks the system to do that has no library call
+//! behind it: open a Terminal window on an instance.
 //!
-//! Both go out through `osascript`, and both cross the same two quoting
-//! boundaries — AppleScript string literal, then, for the Terminal, shell
-//! word — so the escaping is written once, here, and tested.
+//! It goes out through `osascript`, and it crosses two quoting boundaries —
+//! AppleScript string literal, then shell word — so the escaping is written
+//! once, here, and tested.
 //!
-//! ## Why not `tauri-plugin-dialog`
+//! ## Where the confirmations went
 //!
-//! It was the first thing tried, and on this app it does not work. With
+//! Two dialog mechanisms were tried here and neither is what the
+//! destructive actions need.
+//!
+//! `tauri-plugin-dialog` was first, and on this app it does not work. With
 //! no parent window to attach to, `rfd` falls back to
 //! `CFUserNotificationDisplayAlert`, which in an Accessory-policy process
 //! returns the *default* response without ever drawing anything: the
 //! confirmation silently answered "yes" and the restore went ahead. A
-//! confirmation that cannot fail closed is worse than none, so the plugin
-//! went and `display dialog` — which blocks, needs no Automation
-//! permission, and answers with the button that was pressed — stayed.
+//! confirmation that cannot fail closed is worse than none.
+//!
+//! `display dialog` replaced it and does draw, but it is a yes/no box: it
+//! cannot ask somebody to type an instance's name, and a snapshot restore
+//! and an instance removal both need exactly that. So the confirmations now
+//! live in the main window as `ConfirmDialog`, and the token they collect is
+//! checked in Rust by `crate::perform` — which is also what makes `--click
+//! rm:dev` harmless without `--confirm dev`.
 
 use std::ffi::OsStr;
 use std::path::Path;
@@ -25,11 +32,6 @@ use anyhow::{bail, Context, Result};
 
 use crate::client;
 
-/// How long a question stays on screen before it answers itself with "no".
-/// A dialog nobody is there to answer should not park a thread and a
-/// window forever.
-const ANSWER_WITHIN: u32 = 120;
-
 /// Open a Terminal.app window running `ast ssh <name>`.
 ///
 /// An app launched from Finder has a `PATH` with no `~/.cargo/bin` in it,
@@ -38,44 +40,6 @@ const ANSWER_WITHIN: u32 = 120;
 pub fn open_terminal(name: &str) -> Result<()> {
     let command = ssh_command(&client::ast_path(), name, std::env::var_os("ASTERISM_HOME"));
     run(&tell_terminal(&command)).map(drop)
-}
-
-/// Ask a yes/no question. `ok` is the label of the button that means yes;
-/// the other button is Cancel, and it is the default, because the only
-/// thing we ask about is destructive.
-///
-/// Anything that is not an unambiguous press of `ok` — Cancel, the escape
-/// key, the timeout, a broken `osascript` — is a no.
-pub fn confirm(title: &str, message: &str, ok: &str) -> Result<bool> {
-    let script = format!(
-        // `tell me to activate` is what brings the dialog in front of
-        // whatever the user was looking at; without it a menu bar app's
-        // question can open behind the window it is about.
-        "tell me to activate\n\
-         display dialog {} with title {} buttons {{\"Cancel\", {}}} \
-         default button \"Cancel\" with icon caution giving up after {ANSWER_WITHIN}",
-        applescript_string(message),
-        applescript_string(title),
-        applescript_string(ok),
-    );
-    match run(&script) {
-        Ok(out) => Ok(pressed(&String::from_utf8_lossy(&out.stdout), ok)),
-        // Pressing a button literally named Cancel is how AppleScript
-        // spells "the user said no": error -128, and not a failure.
-        Err(e) if e.to_string().contains("-128") => Ok(false),
-        Err(e) => Err(e),
-    }
-}
-
-/// Did `display dialog`'s answer say that `ok` was pressed? Its output is
-/// `button returned:Restore` — or `button returned:, gave up:true` when
-/// nobody was there, which is a no.
-fn pressed(stdout: &str, ok: &str) -> bool {
-    stdout
-        .trim()
-        .split(", ")
-        .filter_map(|field| field.split_once(':'))
-        .any(|(key, value)| key == "button returned" && value == ok)
 }
 
 /// The shell line Terminal will run.
@@ -204,27 +168,4 @@ mod tests {
         assert!(script.ends_with("end tell"));
     }
 
-    /// Verbatim `display dialog` output, from osascript 2.7 on macOS 15.
-    #[test]
-    fn only_the_ok_button_is_a_yes() {
-        assert!(pressed("button returned:Restore", "Restore"));
-        assert!(!pressed("button returned:Cancel", "Restore"));
-        // Nobody answered: the dialog gave up on its own.
-        assert!(!pressed("button returned:, gave up:true", "Restore"));
-        assert!(!pressed("", "Restore"), "silence is not consent");
-        assert!(!pressed("button returned:Restore later", "Restore"));
-    }
-
-    #[test]
-    fn the_question_names_the_instance_and_defaults_to_cancel() {
-        // Built the same way `confirm` builds it, without running it.
-        let script = format!(
-            "display dialog {} with title {} buttons {{\"Cancel\", {}}} default button \"Cancel\"",
-            applescript_string("Restore web to nightly?"),
-            applescript_string("Restore snapshot"),
-            applescript_string("Restore"),
-        );
-        assert!(script.contains(r#""Restore web to nightly?""#), "{script}");
-        assert!(script.contains(r#"default button "Cancel""#), "{script}");
-    }
 }

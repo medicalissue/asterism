@@ -1,14 +1,15 @@
 // The Rust side, as seen from the webview.
 //
-// Fourteen commands and three events, which is the whole surface. The types
+// Twenty commands and four events, which is the whole surface. The types
 // here mirror `src/newinstance.rs`, `src/instances.rs`, `src/devices.rs` and
 // `src/settings.rs`; the field names are snake_case because the shapes
 // crossing this boundary are the daemon's own structs, and renaming them on
 // the way through would be one more thing to keep in step.
 //
 // Nothing here decides anything. Which buttons a row offers, whether a
-// backend may be chosen, why a name will not do: all of it is decided in
-// Rust, against the daemon's own rules, and arrives as data.
+// backend may be chosen, why a name or a snapshot tag will not do, what an
+// action in flight is called, whether a typed word is the right one: all of
+// it is decided in Rust, against the daemon's own rules, and arrives as data.
 
 import {invoke} from '@tauri-apps/api/core';
 import {listen} from '@tauri-apps/api/event';
@@ -101,28 +102,50 @@ export function windowLabel(): string {
 // ---- the main window: Instances --------------------------------------------
 
 export interface InstanceRow {
+  id: string;
   name: string;
   /** `running`, `stopped`, `defined`, or `unknown` when its device is out
       of touch. */
   status: string;
+  /** What the registry last recorded, when `status` is `unknown`. */
+  last_status: string | null;
   live: boolean;
   cpu_device: string;
   backend: string;
   shape: string;
   image: string;
-  volumes: AttachedVolume[];
+  created_at: number;
+  /** `always` or `never`. */
+  policy_restart: string;
+  policy_max_attempts: number;
+  /** What that policy actually promises. Written in Rust; see
+      `instances::policy_sentence` for why it is not written here. */
+  policy_sentence: string;
+  /** Everything the instance is assembled from, in the daemon's own order
+      and wording. This is the parts table. */
+  parts: PartRow[];
+  conflict: {other_cpu_device: string; found_at: number} | null;
+  moving: {to_device: string; epoch: number; started_at: number} | null;
+  move_epoch: number;
+  // The gates. Eight booleans, all decided in `src/instances.rs`; no
+  // component below may recompute one from `status` or `live`.
   can_start: boolean;
   can_stop: boolean;
   can_shell: boolean;
+  can_read_logs: boolean;
+  can_read_snapshots: boolean;
   can_snapshot: boolean;
+  can_rename: boolean;
+  can_remove: boolean;
 }
 
-export interface AttachedVolume {
+export interface PartRow {
+  /** `cpu/ram`, `disk`, `volume`, `secret`, `network`, `gpu`. */
   kind: string;
-  name: string;
-  source_device: string;
-  guest_path: string;
-  size: string;
+  /** The device supplying it, or `-` when nothing does. */
+  source: string;
+  detail: string;
+  note: string | null;
 }
 
 /** A section that either has rows or has a reason it has none. */
@@ -137,10 +160,34 @@ export function loadInstances(): Promise<Instances> {
   return invoke<Instances>('instances');
 }
 
-/** The tags on one instance's disk, read when the popover opens. */
-export function loadSnapshots(name: string): Promise<string[]> {
-  if (browserPreview) return Promise.resolve(name === 'night-shift' ? ['clean-install', 'tools-ready'] : []);
-  return invoke<string[]>('snapshots', {name});
+export interface SnapshotRow {
+  id: string;
+  tag: string;
+  size: string;
+  /** `YYYY-MM-DD HH:MM:SS`, as the daemon formats it. */
+  date: string;
+}
+
+/**
+ * The snapshots on one instance's disk, read when the detail pane asks
+ * rather than on every poll. Rejects with the daemon's own words; an empty
+ * list means the disk has none, and the two must not look alike.
+ */
+export function loadSnapshots(name: string): Promise<SnapshotRow[]> {
+  if (browserPreview) return Promise.resolve(name === 'night-shift' ? PREVIEW_SNAPSHOTS : []);
+  return invoke<SnapshotRow[]>('snapshots', {name});
+}
+
+/** Why this snapshot name will not do, or null. `asterism-core`'s rule. */
+export function snapshotTagError(tag: string): Promise<string | null> {
+  if (browserPreview) return Promise.resolve(/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(tag) ? null : 'Use letters, digits, hyphens, underscores, and periods. The first character must be a letter or digit.');
+  return invoke<string | null>('snapshot_tag_error', {tag});
+}
+
+/** The name a Take snapshot dialog opens on: the tray's and the CLI's. */
+export function defaultSnapshotTag(): Promise<string> {
+  if (browserPreview) return Promise.resolve('snap-20260822T090000Z');
+  return invoke<string>('default_snapshot_tag');
 }
 
 export interface ConsoleTail {
@@ -205,6 +252,31 @@ export type Pairing =
 
 export const PAIRING = 'main://pairing';
 export const WAKE = 'main://wake';
+export const ROUTE = 'main://route';
+
+/**
+ * Where something outside the window asked it to go: the tray's Restore and
+ * Remove items, which never mutate from a menu click.
+ *
+ * Two ways in, because a route can be decided before there is a window to
+ * tell. A window that is starting takes the queued one on mount
+ * ({@link takeRoute}); one that was already up is told ({@link onRoute}).
+ */
+export interface Route {
+  section: string;
+  instance: string | null;
+  /** `restore:<tag>`, `snapshot-delete:<tag>`, or `remove`. */
+  intent: string | null;
+}
+
+export function takeRoute(): Promise<Route | null> {
+  if (browserPreview) return Promise.resolve(null);
+  return invoke<Route | null>('take_route');
+}
+
+export function onRoute(handler: (route: Route) => void) {
+  return listen<Route>(ROUTE, event => handler(event.payload));
+}
 
 /** `invite`, or `add:<ticket>`. */
 export function pairStart(spec: string): Promise<void> {
@@ -267,14 +339,36 @@ export function setDefaultBackend(id: string): Promise<void> {
 /**
  * Perform one action, by the id the tray uses for the same verb.
  *
- * `up:<name>`, `down:<name>`, `term:<name>`, `snap:<name>`,
- * `restore:<name>:<tag>`, `autostart`, `service:install`,
- * `service:uninstall`, `new`. Rust parses these; the strings are built here
- * only because an id is how the boundary is crossed.
+ * `up:<name>`, `up:<name>:always`, `up:<name>:never`, `down:<name>`,
+ * `term:<name>`, `rename:<name>:<new>`, `rm:<name>`, `snap:<name>`,
+ * `snap:<name>:<tag>`, `restore:<name>:<tag>`, `snaprm:<name>:<tag>`,
+ * `autostart`, `service:install`, `service:uninstall`, `new`. Rust parses
+ * these; the strings are built here only because an id is how the boundary
+ * is crossed.
+ *
+ * `confirmation` is the word typed into a destructive dialog. Rust checks
+ * it — a restore, a snapshot delete or a removal without the exact tag or
+ * name sends no frame. Rejects with the daemon's own sentence.
  */
-export function act(id: string): Promise<void> {
+export function act(id: string, confirmation?: string): Promise<void> {
   if (browserPreview) return Promise.resolve();
-  return invoke<void>('act', {id});
+  return invoke<void>('act', {id, confirmation: confirmation ?? null});
+}
+
+/** What one action is called, and what it is about. Rust's vocabulary. */
+export interface ActionLabel {
+  /** `Starting`, `Removing`… null when it is over before a frame is drawn. */
+  verb: string | null;
+  subject: string | null;
+  /** The long form, as the log and the status row say it. */
+  what: string;
+  /** The exact word a confirmation dialog has to collect, or null. */
+  confirmation: string | null;
+}
+
+export function actionLabel(id: string): Promise<ActionLabel> {
+  if (browserPreview) return Promise.resolve({verb: 'Working', subject: null, what: id, confirmation: null});
+  return invoke<ActionLabel>('action_label', {id});
 }
 
 /** Put text on the pasteboard. */
@@ -297,17 +391,44 @@ const PREVIEW_FORM: Form = {
   taken_error: null,
 };
 
+const PREVIEW_SNAPSHOTS: SnapshotRow[] = [
+  {id: '1', tag: 'clean-install', size: '412 MiB', date: '2026-08-14 11:02:31Z'},
+  {id: '2', tag: 'tools-ready', size: '1.1 GiB', date: '2026-08-19 08:40:07Z'},
+];
+
 const PREVIEW_INSTANCES: Instances = {fleet: {kind: 'rows', rows: [
   {
-    name: 'night-shift', status: 'running', live: true, cpu_device: 'desk-mini',
-    backend: 'vz', shape: '4 CPU · 8 GB', image: 'ubuntu-24.04',
-    volumes: [{kind: 'block', name: 'agent-work', source_device: 'nas', guest_path: '/dev/vdb', size: '100 GB'}],
-    can_start: false, can_stop: true, can_shell: true, can_snapshot: false,
+    id: 'c0ffee', name: 'night-shift', status: 'running', last_status: null, live: true,
+    cpu_device: 'desk-mini', backend: 'vz', shape: '4 CPU · 8 GB · 60 GB',
+    image: 'ubuntu-24.04', created_at: 1_755_000_000,
+    policy_restart: 'always', policy_max_attempts: 3,
+    policy_sentence: 'If it was running, astd restarts it after an unexpected stop or device reboot, up to 3 attempts. Stop remains stopped.',
+    parts: [
+      {kind: 'cpu/ram', source: 'desk-mini', detail: '4 cores · 8192 MiB', note: null},
+      {kind: 'disk', source: 'desk-mini', detail: '60 GiB · ubuntu-24.04', note: 'follows cpu'},
+      {kind: 'volume', source: 'nas', detail: 'agent-work (100 GB) -> a disk in the guest', note: 'nbd over the mesh · lease epoch 12'},
+      {kind: 'network', source: 'desk-mini', detail: 'user-mode NAT · 127.0.0.1:8080 -> :80', note: 'exit default: same as cpu'},
+      {kind: 'gpu', source: '-', detail: 'none', note: null},
+    ],
+    conflict: null, moving: null, move_epoch: 0,
+    can_start: false, can_stop: true, can_shell: true, can_read_logs: true,
+    can_read_snapshots: true, can_snapshot: false, can_rename: false, can_remove: false,
   },
   {
-    name: 'build-cache', status: 'stopped', live: true, cpu_device: 'studio',
-    backend: 'qemu', shape: '2 CPU · 4 GB', image: 'debian-13', volumes: [],
-    can_start: true, can_stop: false, can_shell: false, can_snapshot: true,
+    id: 'decaf', name: 'build-cache', status: 'stopped', last_status: null, live: true,
+    cpu_device: 'studio', backend: 'qemu', shape: '2 CPU · 4 GB · 20 GB',
+    image: 'debian-13', created_at: 1_754_000_000,
+    policy_restart: 'never', policy_max_attempts: 3,
+    policy_sentence: 'Asterism starts it only when you ask.',
+    parts: [
+      {kind: 'cpu/ram', source: 'studio', detail: '2 cores · 4096 MiB', note: null},
+      {kind: 'disk', source: 'studio', detail: '20 GiB · debian-13', note: 'follows cpu'},
+      {kind: 'network', source: 'studio', detail: 'user-mode NAT', note: 'exit default: same as cpu'},
+      {kind: 'gpu', source: '-', detail: 'none', note: null},
+    ],
+    conflict: null, moving: null, move_epoch: 0,
+    can_start: true, can_stop: false, can_shell: false, can_read_logs: true,
+    can_read_snapshots: true, can_snapshot: true, can_rename: true, can_remove: true,
   },
 ]}};
 

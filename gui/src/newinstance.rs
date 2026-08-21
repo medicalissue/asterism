@@ -140,9 +140,9 @@ const DEFAULT_IMAGE: &str = "debian:13";
 pub fn catalog() -> Vec<Image> {
     image::CATALOG
         .iter()
-        .filter_map(|(alias, _, _)| {
-            let resolved = image::resolve(alias).ok()?;
-            Some(Image { name: (*alias).to_owned(), pulled: resolved.is_pulled() })
+        .filter_map(|entry| {
+            let resolved = image::resolve(entry.alias).ok()?;
+            Some(Image { name: entry.alias.to_owned(), pulled: resolved.is_pulled() })
         })
         .collect()
 }
@@ -332,7 +332,9 @@ fn run(wanted: &Wanted, progress: Progress) -> Result<()> {
 
     if wanted.start {
         progress(&format!("Booting {}. First boot runs cloud-init.", wanted.name));
-        client::up(&wanted.name)?;
+        // No policy named: `ast up` with no flag, which keeps whatever the
+        // instance was created with rather than deciding for it here.
+        client::up(&wanted.name, None)?;
     }
     Ok(())
 }
@@ -456,7 +458,7 @@ mod tests {
     fn the_dropdown_is_the_catalog_ast_images_prints() {
         let found = catalog();
         let names: Vec<&str> = found.iter().map(|i| i.name.as_str()).collect();
-        let want: Vec<&str> = image::CATALOG.iter().map(|(alias, _, _)| *alias).collect();
+        let want: Vec<&str> = image::CATALOG.iter().map(|entry| entry.alias).collect();
         assert_eq!(names, want);
         assert!(names.contains(&DEFAULT_IMAGE), "the form's default is in the catalog");
     }

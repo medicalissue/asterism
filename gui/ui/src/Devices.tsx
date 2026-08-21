@@ -135,7 +135,6 @@ function DeviceDetail({row, waking, onWake}: {row: DeviceRow; waking: boolean; o
         <Fact label="Device ID" value={row.short_id} mono />
         <Fact label="Current path" value={row.path || 'not connected'} />
         <Fact label="Wake on LAN" value={row.wakeable ? 'available' : 'not configured'} />
-        <Fact label="Trust" value="verified orbit peer" />
       </div>
       <section className="detail-section">
         <div className="section-heading"><span>Presence</span><small>live daemon probe</small></div>

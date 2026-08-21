@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
-# Photograph the built app: three sections, two schemes.
+# Photograph the built app: every section and dialog, in both schemes.
 #
 # Runs the binary inside Asterism.app rather than a cargo build, against the
 # scratch orbit proof.sh leaves behind, and never ~/.asterism. The appearance
 # comes from `--theme`, so the machine's own setting is not touched.
+#
+# The dialogs are opened by `--instance <name> --intent <spec>`, which queues
+# the same route a tray click queues. Nothing here drives a pointer, and no
+# picture is of a state the app cannot reach on its own.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -15,8 +19,15 @@ RUN="/private/tmp/ast-gui3"
 A="$RUN/a"
 B="$RUN/b"
 SHOTS="${SHOTS:-$ROOT/gui/shots}"
-# The window is 760x480 and opens centred on a 1920x1080 display.
-RECT="${RECT:-580,248,760,480}"
+# The main window is 1080x700 (`mainwindow.rs`) and opens centred, so this is
+# where it lands on a 1920x1080 display — measured, not computed: macOS
+# centres on the visible frame, which the menu bar and the Dock both shrink.
+# Any other display wants RECT set. To re-measure: run the app with `--main`,
+# `screencapture -x /tmp/full.png`, and read the window's top-left corner off
+# it.
+RECT="${RECT:-420,138,1080,700}"
+# The instance proof.sh leaves behind on A, and the snapshot it leaves on it.
+INSTANCE="${INSTANCE:-gui-a}"
 
 mkdir -p "$SHOTS"
 [ -x "$APP" ] || { echo "no built app at $APP" >&2; exit 1; }
@@ -44,24 +55,29 @@ if [ "${1:-}" != "--reuse" ]; then
 fi
 ASTERISM_HOME="$A" "$AST" devices || true
 
+# One picture: open the window as asked, wait for the first orbit-wide read,
+# and photograph the rect the window is in.
 shoot() {
-  local theme="$1" section="$2"
+  local name="$1"; shift
   pkill -f "$APP" 2>/dev/null || true
   sleep 0.6
   ASTERISM_HOME="$A" ASTERISM_AST="$AST" ASTERISM_ASTD="$ASTD" \
-    "$APP" --main --section "$section" --theme "$theme" \
-    >"$RUN/app-$theme-$section.log" 2>&1 &
+    "$APP" --main "$@" >"$RUN/app-$name.log" 2>&1 &
   # Long enough for the first orbit-wide read to come back, which on an
   # orbit with a device out of touch is the daemon's mesh timeout.
   sleep 13
-  screencapture -x -R "$RECT" "$SHOTS/$theme-$section.png"
-  echo "  $theme $section"
+  screencapture -x -R "$RECT" "$SHOTS/$name.png"
+  echo "  $name"
 }
 
 for theme in dark light; do
-  for section in instances devices settings; do
-    shoot "$theme" "$section"
-  done
+  # The Instances pane is the instance controller now: lifecycle policy,
+  # rename/remove, snapshots, the parts table and the fence states.
+  shoot "$theme-instances-control" --section instances --theme "$theme"
+  shoot "$theme-snapshots" --section instances --instance "$INSTANCE" --intent snapshots --theme "$theme"
+  shoot "$theme-remove-confirm" --section instances --instance "$INSTANCE" --intent remove --theme "$theme"
+  shoot "$theme-devices" --section devices --theme "$theme"
+  shoot "$theme-settings" --section settings --theme "$theme"
 done
 
 # And the dialog the Instances button opens, in the same skin.
@@ -70,7 +86,9 @@ sleep 0.6
 ASTERISM_HOME="$A" ASTERISM_AST="$AST" ASTERISM_ASTD="$ASTD" \
   "$APP" --new-instance --theme dark >"$RUN/app-dialog.log" 2>&1 &
 sleep 5
-screencapture -x -R "710,377,500,326" "$SHOTS/dark-new-instance.png"
+# The New Instance window is 760x640 (`window.rs`), centred on the same
+# display and by the same rule.
+screencapture -x -R "580,168,760,640" "$SHOTS/dark-new-instance.png"
 echo "  dark new-instance"
 pkill -f "$APP" 2>/dev/null || true
 

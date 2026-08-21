@@ -4,10 +4,11 @@ import {Button} from '@astryxdesign/core/Button';
 import type {
   Devices as DeviceModel,
   Instances as InstanceModel,
+  Route,
   Settings as SettingsModel,
   Volumes as VolumeModel,
 } from './bridge';
-import {act, loadDevices, loadInstances, loadSettings, loadVolumes} from './bridge';
+import {act, actionLabel, loadDevices, loadInstances, loadSettings, loadVolumes, onRoute, takeRoute} from './bridge';
 import {Devices} from './Devices';
 import {Instances} from './Instances';
 import {Settings} from './Settings';
@@ -37,10 +38,18 @@ export function Shell() {
   const [volumes, setVolumes] = useState<VolumeModel | null>(null);
   const [settings, setSettings] = useState<SettingsModel | null>(null);
   const [notice, setNotice] = useState<{text: string; bad: boolean}>({text: '', bad: false});
+  // Which instances this window has an action in flight on, and what Rust
+  // calls each one. Local state, cleared on the response; the daemon's
+  // answer and the next poll are the truth.
+  const [pending, setPending] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState(false);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [intent, setIntent] = useState<string | null>(null);
   const reading = useRef(false);
 
   const say = useCallback((text: string, bad = false) => setNotice({text, bad}), []);
+  // Stable, so the pane's route effect does not re-run on every poll tick.
+  const intentDone = useCallback(() => setIntent(null), []);
 
   const refresh = useCallback(() => {
     if (reading.current) return;
@@ -67,22 +76,58 @@ export function Shell() {
     return () => clearInterval(timer);
   }, [busy, refresh]);
 
-  const run = useCallback((id: string, description: string) => {
-    setBusy(true);
-    say(`${description}…`);
-    act(id).then(
-      () => {
-        setBusy(false);
-        say(`${description} complete.`);
-        refresh();
-      },
-      (error: unknown) => {
-        setBusy(false);
+  // Where the tray asked this window to go. Two ways in, because a route can
+  // be decided before there is a window to tell: a window that is starting
+  // takes the queued one here, and one that was already up is sent an event.
+  useEffect(() => {
+    const go = (route: Route) => {
+      const asked = SECTIONS.find(candidate => candidate === route.section);
+      if (asked) setSection(asked);
+      if (route.instance) setSelected(route.instance);
+      setIntent(route.intent);
+    };
+    takeRoute().then(route => route && go(route), () => {});
+    const listening = onRoute(go);
+    return () => {
+      listening.then(stop => stop(), () => {});
+    };
+  }, []);
+
+  /**
+   * Do one action and say how it went.
+   *
+   * Rejects with the daemon's own sentence, because the dialogs need it:
+   * a refusal keeps the dialog open with the reason under the field rather
+   * than closing on a change that did not happen.
+   */
+  const run = useCallback(
+    async (id: string, confirmation?: string) => {
+      // What to call it, from Rust. In process and off the socket, so the
+      // window is not keeping a second list of verbs beside `Action`'s.
+      const label = await actionLabel(id);
+      const subject = label.subject;
+      if (subject && label.verb) setPending(was => ({...was, [subject]: label.verb as string}));
+      setBusy(true);
+      say(`${label.what}…`);
+      try {
+        await act(id, confirmation);
+        say(`${label.what} — done.`);
+      } catch (error) {
         say(String(error), true);
+        throw error;
+      } finally {
+        if (subject) {
+          setPending(was => {
+            const {[subject]: _gone, ...rest} = was;
+            return rest;
+          });
+        }
+        setBusy(false);
         refresh();
-      },
-    );
-  }, [refresh, say]);
+      }
+    },
+    [refresh, say],
+  );
 
   const counts: Partial<Record<Section, number>> = {};
   if (instances?.fleet.kind === 'rows') counts.instances = instances.fleet.rows.length;
@@ -133,16 +178,26 @@ export function Shell() {
           {section === 'instances' ? (
             <Button
               label="New instance"
-              size="sm"
+              size="md"
               variant="primary"
               icon={<PlusIcon />}
-              onClick={() => run('new', 'Opening New Instance')}
+              onClick={() => { void run('new').catch(() => {}); }}
             />
           ) : null}
         </header>
 
         <div className="workspace-body">
-          {section === 'instances' ? <Instances model={instances} onAct={run} busy={busy} /> : null}
+          {section === 'instances' ? (
+            <Instances
+              model={instances}
+              onAct={run}
+              pending={pending}
+              intent={intent}
+              onIntentDone={intentDone}
+              selected={selected}
+              onSelect={setSelected}
+            />
+          ) : null}
           {section === 'devices' ? <Devices model={devices} onSay={say} refresh={refresh} /> : null}
           {section === 'volumes' ? <Volumes model={volumes} /> : null}
           {section === 'settings' ? (
@@ -152,7 +207,12 @@ export function Shell() {
 
         <footer className="status-bar" data-bad={notice.bad}>
           <span className="status-dot" data-state={notice.bad ? 'error' : busy ? 'busy' : 'idle'} />
-          <span>{notice.text || (busy ? 'Working…' : 'Up to date')}</span>
+          {/* Two live regions, both always in the tree. A failure is an
+              alert and gets read at once; progress and success are a status
+              and wait their turn. Swapping the role on one node would leave
+              a screen reader announcing whichever it saw first. */}
+          <span role="status">{notice.bad ? '' : notice.text || (busy ? 'Working…' : 'Up to date')}</span>
+          <span role="alert">{notice.bad ? notice.text : ''}</span>
           <span className="status-spacer" />
           <button className="text-action" onClick={refresh}>Refresh</button>
         </footer>

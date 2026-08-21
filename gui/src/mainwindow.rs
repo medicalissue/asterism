@@ -1,9 +1,15 @@
 //! The main window: a sidebar, a pane, and the commands the pane calls.
 //!
-//! The tray is still the fastest way to start something. This is the other
-//! thing a fleet needs — somewhere to look at all of it, add a device, and
-//! see how this machine is set up — and it is one window with three
-//! sections rather than a second app.
+//! The tray is still the fastest way to start something that is reversible.
+//! This is the other thing a fleet needs — somewhere to look at all of it,
+//! control an instance's whole life, add a device, and see how this machine
+//! is set up — and it is one window with four sections rather than a second
+//! app.
+//!
+//! It is also where every question gets asked. A menu item cannot collect a
+//! typed instance name, so the tray's Restore and Remove items do not do
+//! their work: they route here (see [`Route`]) with the instance selected
+//! and the matching dialog open.
 //!
 //! ## What the webview is allowed to be
 //!
@@ -20,6 +26,12 @@
 //! window and an item in that menu are the same piece of work reached by two
 //! routes, which is what keeps the second surface from growing a second
 //! backend.
+//!
+//! The one thing that is decided here rather than by the daemon is who may
+//! ask twice at once: `crate::Busy` refuses a second mutation on an instance
+//! this app already has one in flight on, before a frame is written. It is a
+//! double-click guard in front of the daemon's lock, not a replacement for
+//! it.
 //!
 //! Pairing and waking are the exception, and only because they are
 //! conversations: the daemon answers with several lines and, for a pairing,
@@ -48,6 +60,8 @@ pub const LABEL: &str = "main";
 pub const PAIRING: &str = "main://pairing";
 /// One line of a wake in progress.
 pub const WAKE: &str = "main://wake";
+/// Where the window should take the user, when something outside it asked.
+pub const ROUTE: &str = "main://route";
 
 /// Comfortable rather than roomy: six instance rows and the section header
 /// fit without scrolling, and the whole thing still sits on a laptop screen
@@ -174,6 +188,86 @@ pub fn open(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+// ---- routes ----------------------------------------------------------------
+//
+// The tray's Restore and Remove items do not mutate anything: they bring
+// the window forward with the instance selected and the right confirmation
+// dialog open, because a menu click carries no typed word and those two
+// need one.
+//
+// Which makes the delivery the interesting part. A route decided before the
+// window exists has nobody to send an event to, and a route emitted the
+// instant after `build()` returns arrives before React has a listener. So it
+// is queued first and read two ways: a window that is already up is told,
+// and a window that is starting takes it on mount.
+
+/// Where the window was asked to go.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Route {
+    /// Which section to show. Only `instances` has intents so far, but the
+    /// field is the general one: a route is a place, not a verb.
+    pub section: String,
+    pub instance: Option<String>,
+    /// `restore:<tag>` or `remove`. `None` is "just show me this".
+    pub intent: Option<String>,
+}
+
+impl Route {
+    /// The route a tray click should take instead of doing the work, or
+    /// `None` for the items that simply do theirs.
+    ///
+    /// It keys off [`Action::confirmation`] rather than off a list of
+    /// verbs: the actions that need a typed word are exactly the actions a
+    /// menu cannot finish, and stating that once means a fourth one cannot
+    /// be added to the tray without a dialog behind it.
+    pub fn of(action: &Action) -> Option<Route> {
+        action.confirmation()?;
+        let intent = match action {
+            Action::Restore { tag, .. } => format!("restore:{tag}"),
+            Action::SnapshotRemove { tag, .. } => format!("snapshot-delete:{tag}"),
+            Action::Remove(_) => "remove".to_owned(),
+            _ => return None,
+        };
+        Some(Route {
+            section: Section::Instances.id().to_owned(),
+            instance: action.subject().map(str::to_owned),
+            intent: Some(intent),
+        })
+    }
+}
+
+/// A route decided before the window that will read it exists.
+static QUEUED: Mutex<Option<Route>> = Mutex::new(None);
+
+/// Leave a route for the next window to mount. What `--instance` does, and
+/// the first half of what [`route`] does.
+pub fn queue(route: Route) {
+    *QUEUED.lock().unwrap_or_else(|e| e.into_inner()) = Some(route);
+}
+
+/// Send the window somewhere, opening it if it is not up.
+///
+/// Queue, then open, then — only if there was already a window — emit. A
+/// fresh window drains the queue itself at mount, and clearing it here for
+/// an existing one is what stops a stale route surfacing the next time the
+/// window is closed and opened again.
+pub fn route(app: &AppHandle, route: Route) -> anyhow::Result<()> {
+    let already_open = app.get_webview_window(LABEL).is_some();
+    queue(route.clone());
+    open_from_anywhere(app)?;
+    if already_open {
+        emit(app, ROUTE, &route);
+        *QUEUED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+    Ok(())
+}
+
+/// The route the window was opened for, if any. Read once, on mount.
+#[tauri::command]
+pub(crate) fn take_route() -> Option<Route> {
+    QUEUED.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
 /// [`open`], from whichever thread is holding the handle.
 pub fn open_from_anywhere(app: &AppHandle) -> anyhow::Result<()> {
     let handle = app.clone();
@@ -232,38 +326,146 @@ pub(crate) async fn console_tail(name: String, lines: u32) -> Result<ConsoleTail
     .await?
 }
 
-/// The tags on one instance's disk, read when the Snapshots popover opens
+/// One snapshot, as the detail pane's table draws it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct SnapshotRow {
+    pub id: String,
+    pub tag: String,
+    pub size: String,
+    pub date: String,
+}
+
+impl SnapshotRow {
+    fn of(snapshot: &asterism_core::snapshot::Snapshot) -> SnapshotRow {
+        SnapshotRow {
+            id: snapshot.id.clone(),
+            tag: snapshot.tag.clone(),
+            size: snapshot.size.clone(),
+            date: snapshot.date.clone(),
+        }
+    }
+}
+
+/// The snapshots on one instance's disk, read when the detail pane asks
 /// rather than on every poll: listing them costs the daemon a `qemu-img`
 /// per instance, and the tray's cache is shared with this
-/// ([`client::snapshot_tags`]).
+/// ([`client::snapshot_rows`]).
+///
+/// Whole rows, not tags. The tray derives its tags from the same listing,
+/// so the table's date and size columns cost nothing beyond what the menu
+/// was already paying for.
 #[tauri::command]
-pub(crate) async fn snapshots(name: String) -> Result<Vec<String>, String> {
-    blocking(move || {
-        client::snapshot_tags(std::slice::from_ref(&name))
-            .remove(&name)
-            .unwrap_or_else(|| Err("astd did not answer about this instance".to_owned()))
+pub(crate) async fn snapshots(name: String) -> Result<Vec<SnapshotRow>, String> {
+    blocking(move || snapshot_listing(&name)).await?
+}
+
+fn snapshot_listing(name: &str) -> Result<Vec<SnapshotRow>, String> {
+    client::snapshot_rows(std::slice::from_ref(&name.to_owned()))
+        .remove(name)
+        .unwrap_or_else(|| Err("astd did not answer about this instance".to_owned()))
+        .map(|rows| rows.iter().map(SnapshotRow::of).collect())
+}
+
+/// Why this snapshot name will not do, or `None`.
+///
+/// `asterism-core`'s own rule, run in process, because the tag becomes a
+/// file name and `qemu-img` argv on the other side. A second regular
+/// expression in TypeScript would be a second rule.
+#[tauri::command]
+pub(crate) fn snapshot_tag_error(tag: String) -> Option<String> {
+    asterism_core::snapshot::validate_tag(&tag).err().map(|_| {
+        "Use letters, digits, hyphens, underscores, and periods. The first character \
+         must be a letter or digit."
+            .to_owned()
     })
-    .await?
+}
+
+/// The name a Take snapshot dialog opens with: the same one the tray and
+/// the CLI use when nobody names one.
+#[tauri::command]
+pub(crate) fn default_snapshot_tag() -> String {
+    asterism_core::snapshot::timestamped_tag()
+}
+
+/// One instance's snapshot table as text, for `--dump-snapshots`. The same
+/// listing the pane renders, so a proof cannot assert on a table other than
+/// the one on screen.
+pub fn snapshot_lines(name: &str) -> Vec<String> {
+    let mut out = vec![format!("snapshots {name}")];
+    match snapshot_listing(name) {
+        Err(reason) => out.push(format!("unavailable {reason}")),
+        Ok(rows) if rows.is_empty() => out.push("empty".to_owned()),
+        Ok(rows) => {
+            for row in rows {
+                out.push(format!(
+                    "snapshot {:<24} size={:<12} date={}",
+                    row.tag, row.size, row.date
+                ));
+            }
+        }
+    }
+    out
 }
 
 // ---- doing -----------------------------------------------------------------
 
 /// Perform one [`Action`], by id. The same ids the tray uses and the same
 /// work behind them, so `--click up:dev` exercises this button.
+///
+/// `confirmation` is the word typed into a destructive dialog. It is
+/// checked in `perform` rather than here, and rather than in the webview:
+/// the check has to hold for `--click` too, and a guard the proof can walk
+/// around is not a guard.
 #[tauri::command]
-pub(crate) async fn act(app: AppHandle, id: String) -> Result<(), String> {
+pub(crate) async fn act(
+    app: AppHandle,
+    id: String,
+    confirmation: Option<String>,
+) -> Result<(), String> {
     let Some(action) = Action::parse(&id) else {
         return Err(format!("{id:?} is not an action"));
     };
-    let what = action.describe();
     let handle = app.clone();
     // `perform` reports its own outcome to the log and to Notification
-    // Center, and ends by refreshing the tray. What comes back here is
-    // whether the pane should say something too.
-    match blocking(move || crate::perform(&handle, &action)).await? {
-        true => Ok(()),
-        false => Err(format!("{what} failed — see the notification")),
-    }
+    // Center, and ends by refreshing the tray. What comes back here is the
+    // daemon's own sentence, which the pane shows rather than sending the
+    // user off to read the notification.
+    blocking(move || crate::perform(&handle, &action, confirmation.as_deref())).await?
+}
+
+/// What to call one action while it is happening.
+///
+/// The window puts a present-tense label on the row it is working on, and
+/// this is where that vocabulary lives — beside `Action::describe`, which
+/// the log and the notification use. Two lists of verbs, one in Rust and one
+/// in TypeScript, is how a rename ends up announced as a restart.
+///
+/// In process and off the socket, like `name_error`: it costs a function
+/// call, so the pane can ask before it dispatches.
+#[derive(serde::Serialize)]
+pub(crate) struct Label {
+    /// `Starting`, `Removing`… `None` for the things that are over before a
+    /// frame is drawn.
+    verb: Option<&'static str>,
+    /// The instance the row belongs to.
+    subject: Option<String>,
+    /// The long form, as the log and the status row say it.
+    what: String,
+    /// The exact word a confirmation dialog has to collect, or `None`.
+    confirmation: Option<String>,
+}
+
+#[tauri::command]
+pub(crate) fn action_label(id: String) -> Result<Label, String> {
+    let Some(action) = Action::parse(&id) else {
+        return Err(format!("{id:?} is not an action"));
+    };
+    Ok(Label {
+        verb: action.verb(),
+        subject: action.subject().map(str::to_owned),
+        what: action.describe(),
+        confirmation: action.confirmation().map(str::to_owned),
+    })
 }
 
 /// Put text on the pasteboard, so a ticket can be carried to the other
@@ -396,6 +598,47 @@ mod tests {
     use super::*;
 
     use std::sync::Arc;
+
+    /// A tray click on something that cannot be undone is a route, and the
+    /// route says everything the window needs to put the right dialog up.
+    #[test]
+    fn a_destructive_tray_item_becomes_a_place_rather_than_a_frame() {
+        let route = Route::of(&Action::Remove("dev".into())).expect("a route");
+        assert_eq!(route.section, "instances");
+        assert_eq!(route.instance.as_deref(), Some("dev"));
+        assert_eq!(route.intent.as_deref(), Some("remove"));
+
+        let route = Route::of(&Action::Restore { name: "dev".into(), tag: "t1".into() })
+            .expect("a route");
+        assert_eq!(route.instance.as_deref(), Some("dev"));
+        assert_eq!(route.intent.as_deref(), Some("restore:t1"));
+
+        let route = Route::of(&Action::SnapshotRemove { name: "dev".into(), tag: "t1".into() })
+            .expect("a route");
+        assert_eq!(route.intent.as_deref(), Some("snapshot-delete:t1"));
+
+        // And the reversible verbs stay work rather than becoming routes.
+        for action in [
+            Action::Up { name: "dev".into(), restart: None },
+            Action::Down("dev".into()),
+            Action::Terminal("dev".into()),
+            Action::Snapshot { name: "dev".into(), tag: None },
+            Action::OpenMain,
+        ] {
+            assert_eq!(Route::of(&action), None, "{}", action.id());
+        }
+    }
+
+    /// A window that is already up is told and the queue is cleared; one
+    /// that is starting takes it on mount. What must not happen is both, or
+    /// a route surviving to surprise the next window that opens.
+    #[test]
+    fn a_queued_route_is_taken_once() {
+        let route = Route::of(&Action::Remove("dev".into())).expect("a route");
+        *QUEUED.lock().unwrap() = Some(route.clone());
+        assert_eq!(take_route(), Some(route));
+        assert_eq!(take_route(), None, "the queue was drained");
+    }
 
     /// A pairing thread parked on the six digits, and the handle a click
     /// would reach it through. The wait runs on a thread because that is

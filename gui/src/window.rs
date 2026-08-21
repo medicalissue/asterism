@@ -169,7 +169,7 @@ pub(crate) async fn create(app: AppHandle, wanted: Wanted) -> Result<(), String>
 /// Everything both windows may ask for, in one list.
 ///
 /// Tauri takes a single `invoke_handler`, so the three commands above and
-/// the eleven in [`crate::mainwindow`] are named together here — which is
+/// the seventeen in [`crate::mainwindow`] are named together here — which is
 /// also the only place to read what the whole webview surface is.
 pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static {
     use crate::mainwindow as main;
@@ -184,8 +184,12 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         main::settings_rows,
         main::volume_rows,
         main::snapshots,
+        main::snapshot_tag_error,
+        main::default_snapshot_tag,
         main::console_tail,
+        main::take_route,
         // ... and what its buttons do.
+        main::action_label,
         main::act,
         main::copy,
         main::set_default_backend,

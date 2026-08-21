@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
-use asterism_core::instance::{Instance, Shape};
+use asterism_core::instance::{Instance, Restart, Shape};
 use asterism_core::orbit::DeviceStatus;
 use asterism_core::paths;
 use asterism_core::protocol::{Request, Response};
@@ -48,6 +48,17 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// `List`; on an orbit view it is a stopwatch that goes off before the
 /// answer arrives and reports a working daemon as unreachable.
 const ORBIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long they may block on one it has to do work for.
+///
+/// A boot waits for a guest to come up, a stop waits for one to go down, and
+/// a snapshot or a removal waits on a disk. The daemon has its own deadlines
+/// for all of those — the longest is a 180-second boot — and this one is
+/// past them on purpose: the refusal a user reads should be the daemon
+/// saying what went wrong, not this client giving up on a request that is
+/// still being served. Reporting a stop as failed while the guest is
+/// shutting down cleanly is the worst of both, because the next poll then
+/// contradicts it.
+const WORK_TIMEOUT: Duration = Duration::from_secs(240);
 /// Minimum gap between two attempts to start `astd` ourselves.
 const SPAWN_COOLDOWN: Duration = Duration::from_secs(15);
 
@@ -124,20 +135,46 @@ fn create_request(name: &str, image: &str, shape: Shape, backend: Option<&str>) 
 }
 
 /// Boot an instance.
-pub fn up(name: &str) -> Result<()> {
-    expect_done(&Request::Up { name: name.to_owned(), restart: None })
+///
+/// `restart` of `None` is `ast up` with no flag: keep whatever policy the
+/// instance already has. Naming one records it, which is the only way the
+/// current wire has of changing a policy — hence the split Start control
+/// rather than a toggle on a stopped instance.
+pub fn up(name: &str, restart: Option<Restart>) -> Result<()> {
+    expect_work(&Request::Up { name: name.to_owned(), restart })
 }
 
 /// Shut an instance down.
 pub fn down(name: &str) -> Result<()> {
-    expect_done(&Request::Down { name: name.to_owned() })
+    expect_work(&Request::Down { name: name.to_owned() })
+}
+
+/// Give an instance a different name. The one command a conflicted
+/// instance answers, because it is the only one that ends the conflict.
+pub fn rename(name: &str, new_name: &str) -> Result<()> {
+    expect_work(&Request::Rename {
+        name: name.to_owned(),
+        new_name: new_name.to_owned(),
+    })
+}
+
+/// Delete an instance: its record, its root disk, its snapshots and its
+/// local files.
+///
+/// The daemon tries to hand back every block-volume lease on the way out.
+/// An offline provider can keep a stale one, and the removal still goes
+/// ahead — so nothing above this may promise that every lease was released.
+pub fn remove(name: &str) -> Result<()> {
+    let done = expect_work(&Request::Remove { name: name.to_owned() });
+    forget_snapshots();
+    done
 }
 
 /// Take a disk snapshot. The daemon refuses this on a running instance;
 /// the menu greys the item out for the same reason, but the daemon is the
 /// one that decides.
 pub fn snapshot(name: &str, tag: &str) -> Result<()> {
-    let done = expect_done(&Request::Snapshot {
+    let done = expect_work(&Request::Snapshot {
         name: name.to_owned(),
         tag: tag.to_owned(),
     });
@@ -145,9 +182,20 @@ pub fn snapshot(name: &str, tag: &str) -> Result<()> {
     done
 }
 
-/// Roll a stopped instance's disk back to a snapshot.
+/// Roll a stopped instance's disk back to a snapshot. The snapshot itself
+/// is kept; what is discarded is everything written since it was taken.
 pub fn snapshot_restore(name: &str, tag: &str) -> Result<()> {
-    let done = expect_done(&Request::SnapshotRestore {
+    let done = expect_work(&Request::SnapshotRestore {
+        name: name.to_owned(),
+        tag: tag.to_owned(),
+    });
+    forget_snapshots();
+    done
+}
+
+/// Delete one snapshot. The live disk is untouched.
+pub fn snapshot_remove(name: &str, tag: &str) -> Result<()> {
+    let done = expect_work(&Request::SnapshotRemove {
         name: name.to_owned(),
         tag: tag.to_owned(),
     });
@@ -176,9 +224,8 @@ pub fn volumes() -> Result<Vec<BlockVolume>> {
     }
 }
 
-/// Every snapshot on one instance's disk. Private because the menu wants
-/// tags rather than rows, and wants them cached — [`snapshot_tags`] is the
-/// way in.
+/// Every snapshot on one instance's disk, straight off the wire. The
+/// cached way in is [`snapshot_rows`]; this is what fills the cache.
 fn snapshots(name: &str) -> Result<Vec<Snapshot>> {
     match send(&Request::SnapshotList { name: name.to_owned() })? {
         Response::Snapshots { snapshots } => Ok(snapshots),
@@ -199,57 +246,86 @@ fn snapshots(name: &str) -> Result<Vec<Snapshot>> {
 /// How long a listing is allowed to be believed.
 const SNAPSHOT_TTL: Duration = Duration::from_secs(30);
 
-/// The tags on one instance's disk, or why we could not find out. The
+/// The snapshots on one instance's disk, or why we could not find out. The
 /// failure is kept rather than swallowed: "snapshots unavailable" is a
 /// truthful menu line, an empty list is a lie.
+pub type Listing = std::result::Result<Vec<Snapshot>, String>;
+/// The same answer, reduced to the tags the menu draws.
 pub type Tags = std::result::Result<Vec<String>, String>;
 
 struct SnapshotCache {
     at: Instant,
-    tags: HashMap<String, Tags>,
+    listings: HashMap<String, Listing>,
 }
 
 static SNAPSHOTS: Mutex<Option<SnapshotCache>> = Mutex::new(None);
 
-/// Snapshot tags for each of `names`, refreshing the cache when it has
-/// aged out or when it has never heard of one of the instances (an
+/// Whole snapshot rows for each of `names`, refreshing the cache when it
+/// has aged out or when it has never heard of one of the instances (an
 /// instance that just appeared must not show an empty Snapshots menu).
-pub fn snapshot_tags(names: &[String]) -> HashMap<String, Tags> {
+///
+/// Whole rows rather than tags, because there is one cache and two readers
+/// wanting different amounts of it: the window's table shows a tag, a date
+/// and a size, and the tray shows a tag. Caching the smaller answer would
+/// mean the table paying the daemon's `qemu-img` a second time for columns
+/// the first listing already had.
+pub fn snapshot_rows(names: &[String]) -> HashMap<String, Listing> {
     // The lock is held across the requests on purpose: two poll ticks
     // racing to refresh the same listing would double the cost of the
     // thing this cache exists to make cheap.
     let mut cache = SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner());
     let stale = match cache.as_ref() {
-        Some(c) => c.at.elapsed() >= SNAPSHOT_TTL || names.iter().any(|n| !c.tags.contains_key(n)),
+        Some(c) => {
+            c.at.elapsed() >= SNAPSHOT_TTL || names.iter().any(|n| !c.listings.contains_key(n))
+        }
         None => true,
     };
     if stale {
-        let tags = names.iter().map(|n| (n.clone(), list_tags(n))).collect();
-        *cache = Some(SnapshotCache { at: Instant::now(), tags });
+        let listings = names.iter().map(|n| (n.clone(), list_snapshots(n))).collect();
+        *cache = Some(SnapshotCache { at: Instant::now(), listings });
     }
     let fresh = cache.as_ref().expect("filled just above");
     names
         .iter()
-        .filter_map(|n| fresh.tags.get(n).map(|t| (n.clone(), t.clone())))
+        .filter_map(|n| fresh.listings.get(n).map(|l| (n.clone(), l.clone())))
         .collect()
 }
 
-/// Force the next [`snapshot_tags`] to ask the daemon again.
+/// Snapshot tags for each of `names`, derived from the same cached rows.
+pub fn snapshot_tags(names: &[String]) -> HashMap<String, Tags> {
+    snapshot_rows(names).into_iter().map(|(name, listing)| (name, tags_of(listing))).collect()
+}
+
+/// The tags out of one listing, or the reason there are none to give.
+pub fn tags_of(listing: Listing) -> Tags {
+    listing.map(|snaps| snaps.into_iter().map(|s| s.tag).collect())
+}
+
+/// Force the next listing to ask the daemon again. Called after every
+/// snapshot mutation, and after a removal, whether or not it worked: a take
+/// that failed halfway can still have left a snapshot behind.
 fn forget_snapshots() {
     *SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
-fn list_tags(name: &str) -> Tags {
-    snapshots(name)
-        .map(|snaps| snaps.into_iter().map(|s| s.tag).collect())
-        .map_err(|e| format!("{e:#}"))
+fn list_snapshots(name: &str) -> Listing {
+    snapshots(name).map_err(|e| format!("{e:#}"))
 }
 
 /// Requests whose whole answer is "it worked", or why it did not. `Up` and
 /// `Down` answer with the changed instance; the next poll picks the new
 /// state up, so the body is not needed here.
 fn expect_done(request: &Request) -> Result<()> {
-    match send(request)? {
+    finished(send(request)?)
+}
+
+/// The same, on the deadline for a request the daemon has to do work for.
+fn expect_work(request: &Request) -> Result<()> {
+    finished(send_with(request, WORK_TIMEOUT)?)
+}
+
+fn finished(response: Response) -> Result<()> {
+    match response {
         Response::Ok | Response::Instance { .. } => Ok(()),
         Response::Error { message } => bail!(message),
         other => bail!("unexpected reply from astd: {other:?}"),
@@ -517,14 +593,58 @@ mod tests {
         assert_eq!(req.subject(), None);
     }
 
+    fn snap(tag: &str) -> Snapshot {
+        Snapshot {
+            id: "1".into(),
+            tag: tag.into(),
+            size: "1.2 MiB".into(),
+            date: "2026-08-22 09:00:00Z".into(),
+        }
+    }
+
+    /// One listing, two readers. The tray wants tags and the window's table
+    /// wants the whole row, and paying the daemon's `qemu-img` twice for
+    /// that would be the cache not doing its job.
+    #[test]
+    fn the_tray_tags_are_derived_from_the_rows_the_table_shows() {
+        let rows = vec![snap("clean-install"), snap("tools-ready")];
+        assert_eq!(tags_of(Ok(rows)).unwrap(), ["clean-install", "tools-ready"]);
+
+        // And a failure stays a failure rather than flattening into "none".
+        let boom = tags_of(Err("qemu-img not found".to_owned()));
+        assert_eq!(boom.unwrap_err(), "qemu-img not found");
+    }
+
+    /// Every snapshot mutation drops the cache, whether it worked or not:
+    /// a take that failed halfway can still have left a snapshot behind,
+    /// and a table that kept showing the old listing would be wrong in the
+    /// one case the user is owed an instant answer.
+    #[test]
+    fn changing_the_disk_ourselves_drops_the_listing() {
+        *SNAPSHOTS.lock().unwrap() = Some(SnapshotCache {
+            at: Instant::now(),
+            listings: HashMap::from([("dev".to_owned(), Ok(vec![snap("t1")]))]),
+        });
+        assert!(SNAPSHOTS.lock().unwrap().is_some());
+        forget_snapshots();
+        assert!(SNAPSHOTS.lock().unwrap().is_none(), "the listing outlived the mutation");
+    }
+
     /// The half of [`expect_done`] that does not need a socket: which
     /// replies the window may treat as "it worked".
     fn reply_to_done(line: &str) -> Result<()> {
-        match serde_json::from_str(line)? {
-            Response::Ok | Response::Instance { .. } => Ok(()),
-            Response::Error { message } => bail!(message),
-            other => bail!("unexpected reply from astd: {other:?}"),
-        }
+        finished(serde_json::from_str(line)?)
+    }
+
+    /// A request the daemon has to do work for waits past the daemon's own
+    /// longest deadline, so that the sentence a user reads is the daemon
+    /// saying what went wrong rather than this client giving up on a stop
+    /// that was still running.
+    #[test]
+    fn a_request_that_does_work_outlasts_the_daemons_own_deadlines() {
+        // The daemon's longest is a 180-second boot (`backend::vz`).
+        assert!(WORK_TIMEOUT > Duration::from_secs(180), "{WORK_TIMEOUT:?}");
+        assert!(WORK_TIMEOUT > ORBIT_TIMEOUT && ORBIT_TIMEOUT > IO_TIMEOUT);
     }
 
     #[test]

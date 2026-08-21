@@ -35,20 +35,44 @@ const LOG: &str = "gui.log";
 /// A notification body is a banner, not a transcript.
 const BODY_WIDTH: usize = 200;
 
-/// Record how an action went, and tell the user if it went badly. Returns
-/// `true` when it succeeded, which is what callers use to decide whether
-/// to bother refreshing the menu.
-pub fn report<T>(app: &AppHandle, action: &str, result: anyhow::Result<T>) -> bool {
+/// Record how an action went, tell the user if it went badly, and hand the
+/// reason back.
+///
+/// The reason is the daemon's own formatted message, and it goes three
+/// places from here: the log, the notification banner, and — through this
+/// return — the window that asked. A pane that said "failed, see the
+/// notification" would be sending the user to another surface to read a
+/// sentence this one already has.
+pub fn report<T>(app: &AppHandle, action: &str, result: anyhow::Result<T>) -> Result<(), String> {
     match result {
         Ok(_) => {
             log(&format!("ok   {action}"));
-            true
+            Ok(())
         }
         Err(e) => {
-            failed(app, action, &format!("{e:#}"));
-            false
+            let reason = reason(&e);
+            failed(app, action, &reason);
+            Err(reason)
         }
     }
+}
+
+/// A failure as one string, with every layer of context the daemon and the
+/// client wrapped around it.
+///
+/// `{:#}` and not `{}`: the plain form prints only the outermost context,
+/// which on this client is almost always "starting dev" — true, and not the
+/// half anybody needs. The alternate form keeps the daemon's own sentence,
+/// which is the half that says why.
+pub fn reason(error: &anyhow::Error) -> String {
+    format!("{error:#}")
+}
+
+/// An action that was not attempted, and why. No notification: nothing
+/// happened, nothing failed, and a banner about a frame that was never sent
+/// would be noise about a guard doing its job.
+pub fn skipped(action: &str, why: &str) {
+    log(&format!("skip {action}: {why}"));
 }
 
 /// An action that did not happen, and why.
@@ -154,6 +178,22 @@ mod tests {
         assert_eq!(stamp(0), "1970-01-01T00:00:00Z");
         assert_eq!(stamp(1_700_000_000), "2023-11-14T22:13:20Z");
         assert_eq!(stamp(1_709_164_800), "2024-02-29T00:00:00Z");
+    }
+
+    /// What the window's status row ends up showing. The daemon's refusal
+    /// has to survive the trip: a pane that said "failed — see the
+    /// notification" would be sending the user to another surface to read a
+    /// sentence this one already had.
+    #[test]
+    fn a_failure_keeps_the_daemons_own_sentence() {
+        let daemon = anyhow::anyhow!(
+            "instance \"gui-a\" is running — stop it before renaming it"
+        );
+        let wrapped = daemon.context("renaming gui-a");
+        let said = reason(&wrapped);
+        assert!(said.contains("stop it before renaming it"), "{said}");
+        assert!(said.contains("renaming gui-a"), "{said}");
+        assert!(!said.contains("see the notification"), "{said}");
     }
 
     #[test]

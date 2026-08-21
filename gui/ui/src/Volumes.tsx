@@ -8,12 +8,13 @@ export function Volumes({model}: {model: Model | null}) {
   }
   const rows = model.inventory.rows;
   if (rows.length === 0) {
+    // Neutral truth, and nothing else. Sending the reader to the CLI implied
+    // this window will never do it, and a Create button here would imply it
+    // already can; volume mutation is a later slice.
     return (
       <div className="zero-state">
         <VolumesIcon />
-        <strong>No block volumes on this device</strong>
-        <p>Create and attach volumes with the CLI. The Control Center only shows capabilities the daemon exposes safely here.</p>
-        <code>ast volume create data --size 20G</code>
+        <strong>No block volumes on this device.</strong>
       </div>
     );
   }

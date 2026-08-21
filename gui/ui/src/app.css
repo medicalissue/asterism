@@ -254,10 +254,112 @@
   .create-status[data-bad='true'] { color: var(--app-red); }
   .create-actions { display: flex; flex: 0 0 auto; gap: 7px; }
 
+  /* ---- instance control ---------------------------------------------- */
+
+  .action-strip { flex-wrap: wrap; row-gap: 7px; }
+  .strip-spacer { flex: 1; min-width: 0; }
+  /* Every control in the strip clears 32px, and the strip wraps rather than
+     overlapping or scrolling sideways at the 820px minimum width. */
+  .action-strip button { min-height: 32px; }
+  .split-control { display: inline-flex; align-items: stretch; }
+  .split-control > *:first-child button, .split-control > button:first-child { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+  .split-control > *:last-child button, .split-control > button:last-child { margin-left: 1px; padding-left: 6px; padding-right: 6px; border-top-left-radius: 0; border-bottom-left-radius: 0; }
+  .gate-reason { max-width: 340px; color: var(--color-text-secondary); font-size: 11px; line-height: 1.4; }
+  .gate-reason.row-note { display: block; padding: 8px 11px; border-top: var(--hairline); }
+
+  .alert-band { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; margin-top: 18px; padding: 10px 13px; border: var(--hairline); border-radius: 9px; background: var(--app-subtle); }
+  .alert-band strong { font-size: 12px; font-weight: 580; }
+  .alert-band span { color: var(--color-text-secondary); font-size: 11px; }
+  .alert-band button { margin-left: auto; }
+  /* Red stays reserved for destructive actions and failures; a conflict is
+     neither, so it is marked by weight and a hairline rather than colour. */
+  .alert-band.conflict { border-color: var(--color-border-emphasized); }
+
+  .policy-row { display: grid; grid-template-columns: auto auto minmax(0, 1fr); align-items: baseline; gap: 6px 10px; margin-top: 22px; padding: 11px 13px; border: var(--hairline); border-radius: 9px; }
+  .policy-label { color: var(--color-text-secondary); font-size: 10px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; }
+  .policy-row strong { font-size: 12px; font-weight: 580; }
+  .policy-row p { min-width: 0; color: var(--color-text-secondary); font-size: 11px; line-height: 1.45; }
+
+  .parts-table { overflow: hidden; border: var(--hairline); border-radius: 8px; }
+  .parts-head, .parts-row { display: grid; grid-template-columns: 88px 118px minmax(0, 1.25fr) minmax(0, 1fr); align-items: baseline; gap: 12px; padding: 9px 11px; }
+  .snapshot-head, .snapshot-row { display: grid; grid-template-columns: minmax(0, 1fr) 148px 60px 100px; align-items: center; gap: 12px; padding: 7px 11px; }
+  .parts-head, .snapshot-head { border-bottom: var(--hairline); background: var(--app-subtle); color: var(--color-text-secondary); font-size: 10px; font-weight: 600; }
+  .parts-row, .snapshot-row { border-bottom: var(--hairline); color: var(--color-text-secondary); font-size: 11px; line-height: 1.45; }
+  .parts-row:last-child, .snapshot-row:last-child { border-bottom: 0; }
+  .parts-row > span, .snapshot-row > span { min-width: 0; overflow-wrap: anywhere; }
+  .part-kind { color: var(--color-text-primary); font-weight: 560; }
+  .snapshot-row { min-height: 48px; }
+  .snapshot-row strong { color: var(--color-text-primary); font-size: 12px; font-weight: 550; }
+  .snapshot-actions { display: flex; justify-content: flex-end; gap: 4px; }
+  .snapshot-row.skeleton span { height: 10px; border-radius: 3px; background: var(--app-hover); }
+  .listing-error { display: flex; align-items: center; gap: 10px; }
+  .text-action.inline { font-size: 12px; text-decoration: underline; }
+
+  .detail-disclosure { margin-top: 24px; }
+  .detail-disclosure summary { color: var(--color-text-secondary); cursor: default; font-size: 11px; font-weight: 600; }
+  .detail-disclosure dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 24px; margin: 12px 0 0; }
+  .detail-disclosure dt { color: var(--color-text-secondary); font-size: 10px; font-weight: 600; }
+  .detail-disclosure dd { margin: 3px 0 0; overflow-wrap: anywhere; font-size: 11px; }
+
+  /* The window's own controls are plain elements rather than Astryx ones,
+     so they are given the same focus ring rather than left to whatever the
+     webview draws by default. Keyboard-only: `:focus-visible`, so a pointer
+     click does not leave a ring behind it. */
+  .nav-item:focus-visible,
+  .instance-row:focus-visible,
+  .device-row:focus-visible,
+  .text-action:focus-visible,
+  .icon-text-action:focus-visible,
+  .detail-disclosure summary:focus-visible {
+    outline: var(--focus-outline-width, 2px) var(--focus-outline-style, solid) var(--focus-outline-color, currentColor);
+    outline-offset: 2px;
+  }
+
+  .visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+
+  /* ---- dialogs --------------------------------------------------------- */
+
+  /* Fixed, not absolute: a modal that only covered the pane it was
+     opened from would leave the sidebar and the status bar clickable
+     behind it. Neither window scrolls at the document level. */
+  .dialog-scrim { position: fixed; z-index: 40; inset: 0; display: grid; place-items: center; padding: 24px; background: light-dark(rgba(20, 20, 24, .22), rgba(0, 0, 0, .46)); }
+  .confirm-dialog, .form-dialog { display: flex; width: min(430px, 100%); max-height: 100%; flex-direction: column; gap: 12px; overflow: auto; padding: 22px; border: var(--hairline); border-radius: 11px; outline: 0; background: var(--color-background-surface); box-shadow: 0 14px 40px light-dark(rgba(0,0,0,.14), rgba(0,0,0,.44)); animation: dialog-in var(--duration-fast) ease-out; }
+  @keyframes dialog-in { from { transform: translateY(6px); opacity: .7; } }
+  .dialog-body { color: var(--color-text-secondary); font-size: 12px; line-height: 1.5; }
+  .dialog-field { display: flex; flex-direction: column; gap: 6px; }
+  .dialog-field > span { color: var(--color-text-secondary); font-size: 11px; }
+  .dialog-field input { width: 100%; height: 34px; padding: 0 10px; border: var(--hairline); border-radius: 7px; outline: 0; background: var(--app-canvas); color: var(--color-text-primary); user-select: text; }
+  .dialog-field input:focus-visible { border-color: var(--color-accent); box-shadow: 0 0 0 2px var(--app-selected); }
+  .dialog-field input[aria-invalid='true'] { border-color: var(--app-red); }
+  .dialog-helper { min-height: 15px; color: var(--color-text-secondary); font-size: 11px; line-height: 1.4; }
+  .dialog-helper[role='alert'] { color: var(--app-red); }
+  .dialog-error { color: var(--app-red); font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
+  .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 2px; }
+
+  /* A window set to reduce motion gets none: the sheets and dialogs still
+     appear, they just stop arriving from somewhere. */
+  @media (prefers-reduced-motion: reduce) {
+    .connection-sheet, .pair-sheet, .confirm-dialog, .form-dialog { animation: none; }
+    .spinner { animation-duration: 2.4s; }
+  }
+
   @media (max-width: 900px) {
     .control-center { grid-template-columns: 170px minmax(0, 1fr); }
     .split-view { grid-template-columns: 290px minmax(0, 1fr); }
     .instance-detail, .device-detail { padding: 22px; }
     .facts-grid { grid-template-columns: 1fr; }
+    /* At the 820px minimum there is not enough width for four columns of
+       anything, so both tables stack instead of overflowing the pane. The
+       header rows stay in the accessibility tree — a stacked row is still a
+       row, and its cells still have names. */
+    .parts-head, .snapshot-head { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+    .parts-row { grid-template-columns: 84px minmax(0, 1fr); gap: 3px 9px; }
+    .parts-row > span:first-child { grid-row: 1 / span 3; }
+    .parts-row > span:nth-child(2)::before { content: 'from '; }
+    .snapshot-row { grid-template-columns: minmax(0, 1fr) auto; gap: 2px 9px; }
+    .snapshot-row > span:nth-child(-n+3) { grid-column: 1; }
+    .snapshot-actions { grid-column: 2; grid-row: 1 / span 3; align-self: center; }
+    .policy-row { grid-template-columns: auto minmax(0, 1fr); }
+    .policy-row p { grid-column: 1 / -1; }
   }
 }

@@ -149,14 +149,21 @@ need "a row names the device supplying its cpu" "cpu=$A_NAME" "$INSTANCES"
 need "and the other device's" "cpu=$B_NAME" "$INSTANCES"
 [ "$(grep -o 'cpu=[a-z0-9-]*' <<<"$INSTANCES" | sort -u | wc -l | tr -d ' ')" = "2" ] \
   || fail "the two rows do not come from two devices:"$'\n'"$INSTANCES"
-need "a stopped row offers Up and a snapshot" \
-  "actions up=enabled down=disabled terminal=disabled snapshots=enabled" "$INSTANCES"
+need "a stopped row offers every verb the daemon would answer" \
+  "actions up=enabled down=disabled terminal=disabled logs=enabled snapshot-list=enabled \
+snapshot=enabled rename=enabled remove=enabled" "$INSTANCES"
+need "a row carries the restart policy the pane reads" "policy restart=always max-attempts=" "$INSTANCES"
+need "and the move fence, which is what makes a row read-only" "move-epoch 0" "$INSTANCES"
 
-# The same two rows from the other device: one orbit, one namespace.
-FROM_B="$(gui "$B" --dump-main instances)"
-need "B's window shows A's instance too" "instance gui-a" "$FROM_B"
-need "B's window shows its own" "instance gui-b" "$FROM_B"
-ok "both windows show one orbit rather than one shard"
+# The parts table is `Instance::parts()` carried through whole. Published
+# ports live on the network row, which is why the window has no separate
+# "ports not exposed yet" block to remove a second time.
+need "the parts table names the cpu part and the device supplying it" \
+  "part cpu/ram  source=$A_NAME" "$INSTANCES"
+need "and the disk" "part disk     source=$A_NAME" "$INSTANCES"
+need "and the network row, which is where published ports appear" \
+  "part network  source=$A_NAME" "$INSTANCES"
+need "and the other device's cpu part" "part cpu/ram  source=$B_NAME" "$INSTANCES"
 
 # ---- 4. the Settings section ------------------------------------------------
 
@@ -173,22 +180,185 @@ need "the login item is reported" "start-at-login" "$SETTINGS"
 [ ! -e "$HOME/Library/LaunchAgents/com.asterism.astd.plist" ] \
   || echo "note: an astd service was already installed on this machine; nothing here changed it"
 
-# ---- 5. a row action, through the window's own command path ----------------
+# ---- 5. the restart policy, through the split Start control -----------------
 #
 # `--click` is the id a row button posts, parsed by the same `Action::parse`
 # and run by the same `perform`. Nothing about this path is the tray's.
+#
+# The scratch disk is a 1 MiB qcow2 with nothing on it, so a boot is expected
+# to fail. What is asserted is the half that does not depend on a guest: the
+# daemon records the policy before it tries to start anything, which is what
+# makes the Start menu the only way the current wire has of changing one.
 
-gui "$A" --click "up:gui-a" >"$A/up.out" 2>&1 || true
-grep -qE "(ok|FAIL) *starting gui-a" "$A/up.out" \
-  || fail "the window's Up button did not reach the daemon:"$'\n'"$(cat "$A/up.out")"
-ok "the window's Up button runs the tray's action"
+policy_of() {
+  gui "$1" --dump-main instances | awk "/^instance +$2 /{found=1} found&&/^  policy /{print;exit}"
+}
 
-# ---- 6. the whole window, one dump ------------------------------------------
+gui "$A" --click "up:gui-a:never" >"$A/up-never.out" 2>&1 || true
+grep -qE "(ok|FAIL) *starting gui-a once" "$A/up-never.out" \
+  || fail "Start once did not reach the daemon:"$'\n'"$(cat "$A/up-never.out")"
+need "Start once records restart: never" "restart=never" "$(policy_of "$A" gui-a)"
+
+gui "$A" --click "up:gui-a" >"$A/up-plain.out" 2>&1 || true
+grep -qE "(ok|FAIL) *starting gui-a" "$A/up-plain.out" \
+  || fail "the plain Start did not reach the daemon:"$'\n'"$(cat "$A/up-plain.out")"
+need "a plain Start preserves the recorded policy" "restart=never" "$(policy_of "$A" gui-a)"
+
+gui "$A" --click "up:gui-a:always" >"$A/up-always.out" 2>&1 || true
+need "Start and keep running records restart: always" "restart=always" "$(policy_of "$A" gui-a)"
+
+# ---- 6. the gates on a running guest, and the way out of them ---------------
+#
+# `up:gui-a:always` above left a booted guest, so the half of the gate matrix
+# that needs one can be asserted here rather than only in the unit tests:
+# a running instance offers Stop and a terminal, and refuses a rename, a
+# snapshot and a removal — in the daemon's own words, reaching this caller
+# unchanged rather than as "see the notification".
+
+RUNNING="$(gui "$A" --dump-main instances)"
+grep -qE "^instance +gui-a +running" <<<"$RUNNING" \
+  || fail "gui-a did not reach a running guest:"$'\n'"$RUNNING"
+need "a running row offers Stop and a terminal and nothing that rewrites a disk" \
+  "actions up=disabled down=enabled terminal=enabled logs=enabled snapshot-list=enabled \
+snapshot=disabled rename=disabled remove=disabled" "$RUNNING"
+
+gui "$A" --click "rename:gui-a:gui-z" >"$A/rename-running.out" 2>&1 || true
+need "a running rename is refused in the daemon's own sentence" \
+  "FAIL renaming gui-a to gui-z: instance \"gui-a\" is running" "$(cat "$A/rename-running.out")"
+need "and the instance keeps its name" "instance gui-a" "$(gui "$A" --dump-main instances)"
+
+gui "$A" --click "snap:gui-a:while-up" >"$A/snap-running.out" 2>&1 || true
+grep -q "FAIL snapshotting gui-a as while-up" "$A/snap-running.out" \
+  || fail "a snapshot of a running guest was not refused:"$'\n'"$(cat "$A/snap-running.out")"
+ok "a running snapshot is refused, and the refusal is the daemon's"
+
+gui "$A" --click "rm:gui-a" --confirm "gui-a" >"$A/rm-running.out" 2>&1 || true
+need "and so is a removal, even with the exact word typed" \
+  "FAIL removing gui-a" "$(cat "$A/rm-running.out")"
+need "the instance is still there" "instance gui-a" "$(gui "$A" --dump-main instances)"
+
+gui "$A" --click "down:gui-a" >"$A/down.out" 2>&1 \
+  || fail "the Stop button failed:"$'\n'"$(cat "$A/down.out")"
+need "Stop acts immediately, with nothing to confirm" "ok   stopping gui-a" "$(cat "$A/down.out")"
+
+# ---- 6b. rename, on both orbit views ----------------------------------------
+
+gui "$A" --click "rename:gui-a:gui-z" >"$A/rename.out" 2>&1 \
+  || fail "the Rename dialog's action failed:"$'\n'"$(cat "$A/rename.out")"
+need "the rename is logged by its own name" "ok   renaming gui-a to gui-z" "$(cat "$A/rename.out")"
+
+RENAMED="$(gui "$A" --dump-main instances)"
+need "A's window shows the new name" "instance gui-z" "$RENAMED"
+grep -qE "^instance +gui-a " <<<"$RENAMED" && fail "the old name is still in A's view:"$'\n'"$RENAMED"
+need "and B sees it too — one orbit, one namespace" "instance gui-z" "$(gui "$B" --dump-main instances)"
+ok "the rename landed on both orbit views"
+
+# ---- 7. snapshots, and the words that have to be typed ----------------------
+
+need "an instance with no snapshots says so rather than showing nothing" \
+  "empty" "$(gui "$A" --dump-snapshots gui-z)"
+
+gui "$A" --click "snap:gui-z:t1" >"$A/snap.out" 2>&1 \
+  || fail "the Take snapshot dialog's action failed:"$'\n'"$(cat "$A/snap.out")"
+SNAPS="$(gui "$A" --dump-snapshots gui-z)"
+echo "$SNAPS"
+need "the snapshot table names the tag" "snapshot t1" "$SNAPS"
+# `0 B` is the true size of a qcow2 internal snapshot — it stores no guest
+# RAM and no copied blocks — so what is asserted is that both columns are the
+# daemon's own values rather than that either is non-zero.
+grep -qE 'size=.+date=[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}' <<<"$SNAPS" \
+  || fail "the snapshot table has no size and date columns:"$'\n'"$SNAPS"
+ok "the snapshot table carries the daemon's own size and date"
+
+# The disk as it stands now. A skipped restore must not touch it.
+disk_of() { find "$1/instances/$2" -name '*.qcow2' -o -name 'disk*' 2>/dev/null | head -1; }
+DISK_PATH="$(disk_of "$A" gui-z)"
+[ -n "$DISK_PATH" ] || fail "could not find gui-z's disk under $A/instances/gui-z"
+BEFORE="$(shasum -a 256 "$DISK_PATH" | cut -d' ' -f1)"
+
+gui "$A" --click "restore:gui-z:t1" >"$A/restore-none.out" 2>&1 || true
+need "a restore with no typed word sends nothing" \
+  "skip restoring gui-z to t1: confirmation missing or did not match" \
+  "$(cat "$A/restore-none.out")"
+gui "$A" --click "restore:gui-z:t1" --confirm "t2" >"$A/restore-wrong.out" 2>&1 || true
+need "and neither does one with the wrong word" \
+  "skip restoring gui-z to t1: confirmation missing or did not match" \
+  "$(cat "$A/restore-wrong.out")"
+[ "$(shasum -a 256 "$DISK_PATH" | cut -d' ' -f1)" = "$BEFORE" ] \
+  || fail "a skipped restore changed the disk"
+ok "a skipped restore left the disk exactly as it was"
+
+gui "$A" --click "restore:gui-z:t1" --confirm "t1" >"$A/restore.out" 2>&1 \
+  || fail "the confirmed restore failed:"$'\n'"$(cat "$A/restore.out")"
+need "the confirmed restore ran" "ok   restoring gui-z to t1" "$(cat "$A/restore.out")"
+need "and the snapshot is kept, not consumed" "snapshot t1" "$(gui "$A" --dump-snapshots gui-z)"
+
+gui "$A" --click "snaprm:gui-z:t1" >"$A/snaprm-none.out" 2>&1 || true
+need "a snapshot delete with no typed word sends nothing" \
+  "skip deleting gui-z's snapshot t1: confirmation missing or did not match" \
+  "$(cat "$A/snaprm-none.out")"
+need "and the snapshot is still there" "snapshot t1" "$(gui "$A" --dump-snapshots gui-z)"
+
+gui "$A" --click "snaprm:gui-z:t1" --confirm "t1" >"$A/snaprm.out" 2>&1 \
+  || fail "the confirmed snapshot delete failed:"$'\n'"$(cat "$A/snaprm.out")"
+need "the snapshot is gone" "empty" "$(gui "$A" --dump-snapshots gui-z)"
+
+# A non-destructive action must not accept a token either: a confirmation on
+# a Stop is a habit that teaches people to type past the ones that matter.
+gui "$A" --click "down:gui-z" --confirm "gui-z" >"$A/down-token.out" 2>&1 || true
+need "a token on something that never asks for one is refused" \
+  "skip stopping gui-z: unexpected confirmation" "$(cat "$A/down-token.out")"
+
+# ---- 8. removal -------------------------------------------------------------
+
+gui "$A" --click "rm:gui-z" >"$A/rm-none.out" 2>&1 || true
+need "a removal with no typed word sends nothing" \
+  "skip removing gui-z: confirmation missing or did not match" "$(cat "$A/rm-none.out")"
+gui "$A" --click "rm:gui-z" --confirm "gui-a" >"$A/rm-wrong.out" 2>&1 || true
+need "and neither does one with the wrong word" \
+  "skip removing gui-z: confirmation missing or did not match" "$(cat "$A/rm-wrong.out")"
+need "the instance is still there" "instance gui-z" "$(gui "$A" --dump-main instances)"
+need "and the skip is in the log a user would read afterwards" \
+  "skip removing gui-z" "$(cat "$A/gui.log")"
+
+gui "$A" --click "rm:gui-z" --confirm "gui-z" >"$A/rm.out" 2>&1 \
+  || fail "the confirmed removal failed:"$'\n'"$(cat "$A/rm.out")"
+GONE="$(gui "$A" --dump-main instances)"
+grep -qE "^instance +gui-z " <<<"$GONE" && fail "gui-z survived its removal:"$'\n'"$GONE"
+grep -qE "^instance +gui-z " <<<"$(gui "$B" --dump-main instances)" \
+  && fail "gui-z is still in B's view of the orbit"
+[ ! -d "$A/instances/gui-z" ] || fail "gui-z's instance directory is still on disk"
+# Block-volume bytes are deliberately not asserted deleted: the daemon tries
+# to release leases and an offline provider can keep a stale one, which is
+# why the dialog does not promise otherwise either.
+ok "the confirmed removal took the instance off both orbit views and off the disk"
+
+# A second action on one instance, while the first is in flight, is refused
+# in `crate::Busy` before a frame is written. It is a race, so it is proved
+# by the deterministic unit test rather than by two racing processes here:
+# `cargo test --manifest-path gui/Cargo.toml a_second_action_on_one_instance`.
+
+# ---- 9. the whole window, one dump ------------------------------------------
 
 ALL="$(gui "$A" --dump-main)"
 for head in "section instances" "section devices" "section settings"; do
   need "the whole-window dump has $head" "$head" "$ALL"
 done
+
+# ---- 10. an orbit worth photographing ---------------------------------------
+#
+# `KEEP=1 proof.sh && shots.sh --reuse` photographs whatever this leaves
+# behind, and section 8 deliberately deleted A's only instance. Put one back,
+# with a snapshot on it, so the pictures are of a fleet rather than of a
+# half-empty pane.
+
+WANTED='{"name":"gui-a","image":"'"$DISK"'","cpus":2,"mem_gib":1,"disk_gib":1,
+         "backend":"qemu","start":false}'
+gui "$A" --create-via-window "$WANTED" >"$A/recreate.out" 2>&1 \
+  || fail "rebuilding gui-a failed:"$'\n'"$(cat "$A/recreate.out")"
+gui "$A" --click "snap:gui-a:before-upgrade" >"$A/snap2.out" 2>&1 \
+  || fail "snapshotting the rebuilt gui-a failed:"$'\n'"$(cat "$A/snap2.out")"
+ok "left a two-device orbit with a snapshot on it for shots.sh"
 
 echo
 echo "GUI3 PROOF OK"
