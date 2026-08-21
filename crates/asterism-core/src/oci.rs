@@ -61,10 +61,10 @@ use std::process::{Command, Stdio};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
-use crate::durable;
 use crate::image::host_arch;
 use crate::paths;
 use crate::tools::{output, run, tool};
+use crate::verify::{self, Algo, Depth, Digest, Pinned, Source};
 
 /// Where a bare `nginx` comes from.
 pub const DEFAULT_REGISTRY: &str = "docker.io";
@@ -85,22 +85,40 @@ pub const GUEST_INIT: &str = "sbin/asterism-init";
 /// The kernel cmdline `init=` the backend must pass.
 pub const INIT_PATH: &str = "/sbin/asterism-init";
 
-/// Guest kernel and initrd per host architecture: `(arch, kernel, initrd)`.
+/// Guest kernel and initrd per host architecture.
 ///
 /// Ubuntu publishes the cloud image's kernel and initrd as loose files next
 /// to the image itself. Pinned to the release the catalog already carries, so
 /// a device is not running a kernel nobody chose.
-pub const KERNELS: &[(&str, &str, &str)] = &[
-    (
-        "aarch64",
-        "https://cloud-images.ubuntu.com/releases/noble/release/unpacked/ubuntu-24.04-server-cloudimg-arm64-vmlinuz-generic",
-        "https://cloud-images.ubuntu.com/releases/noble/release/unpacked/ubuntu-24.04-server-cloudimg-arm64-initrd-generic",
-    ),
-    (
-        "x86_64",
-        "https://cloud-images.ubuntu.com/releases/noble/release/unpacked/ubuntu-24.04-server-cloudimg-amd64-vmlinuz-generic",
-        "https://cloud-images.ubuntu.com/releases/noble/release/unpacked/ubuntu-24.04-server-cloudimg-amd64-initrd-generic",
-    ),
+pub struct GuestKernel {
+    pub arch: &'static str,
+    pub kernel: Pinned,
+    pub initrd: Pinned,
+}
+
+pub const KERNELS: &[GuestKernel] = &[
+    GuestKernel {
+        arch: "aarch64",
+        kernel: Pinned {
+            url: "https://cloud-images.ubuntu.com/releases/noble/release/unpacked/ubuntu-24.04-server-cloudimg-arm64-vmlinuz-generic",
+            digest: None,
+        },
+        initrd: Pinned {
+            url: "https://cloud-images.ubuntu.com/releases/noble/release/unpacked/ubuntu-24.04-server-cloudimg-arm64-initrd-generic",
+            digest: None,
+        },
+    },
+    GuestKernel {
+        arch: "x86_64",
+        kernel: Pinned {
+            url: "https://cloud-images.ubuntu.com/releases/noble/release/unpacked/ubuntu-24.04-server-cloudimg-amd64-vmlinuz-generic",
+            digest: None,
+        },
+        initrd: Pinned {
+            url: "https://cloud-images.ubuntu.com/releases/noble/release/unpacked/ubuntu-24.04-server-cloudimg-amd64-initrd-generic",
+            digest: None,
+        },
+    },
 ];
 
 /// The platform an image has to offer, in registry vocabulary.
@@ -442,7 +460,12 @@ pub fn pull(reference: &Reference, progress: bool) -> Result<Pulled> {
     let (digest, manifest) = registry.manifest()?;
 
     let image = image_path(&digest);
-    if image.exists() {
+    // Already built here — but "a file with the right name exists" is what
+    // the store said before it verified anything. Confirm it is the image
+    // that was adopted; if it is not, or if an older Asterism built it and
+    // left no record of what it was, fall through and build it again. A
+    // rebuild is minutes; booting bytes nobody can account for is worse.
+    if image.exists() && verify::check(&image, Depth::from_env()).is_ok() {
         let config = stored_config(reference).unwrap_or_default();
         write_pointer(reference, &digest)?;
         return Ok(Pulled { digest, image, config, built: false });
@@ -467,6 +490,11 @@ pub fn pull(reference: &Reference, progress: bool) -> Result<Pulled> {
     std::fs::create_dir_all(&root)?;
     let built = (|| -> Result<()> {
         let mut tree = Tree::default();
+        // Everything this filesystem was made of, recorded so that "what is
+        // in this image" has an answer that does not need the registry to
+        // still be serving the tag. Each of these was verified as it was
+        // fetched; this is the receipt.
+        let mut parents = vec![digest.clone(), config_digest.to_owned()];
         for (i, layer) in layers.iter().enumerate() {
             let digest = layer["digest"].as_str().context("layer has no digest")?;
             if progress {
@@ -475,9 +503,10 @@ pub fn pull(reference: &Reference, progress: bool) -> Result<Pulled> {
             let blob = registry.blob(digest, progress)?;
             unpack_layer(&blob, &root, &mut tree)
                 .with_context(|| format!("unpacking layer {digest}"))?;
+            parents.push(digest.to_owned());
         }
         furnish(&root, &config, &mut tree)?;
-        build_ext4(&root, &tree, &image, &digest)
+        build_ext4(&root, &tree, &image, &digest, reference, parents)
     })();
     let _ = std::fs::remove_dir_all(&stage);
     built?;
@@ -494,11 +523,73 @@ fn write_pointer(reference: &Reference, digest: &str) -> Result<()> {
     Ok(())
 }
 
+/// Where a registry's bytes actually come from.
+///
+/// `curl` in production, and something else in a test — which is the only
+/// way "the mirror served a different layer than the manifest named" becomes
+/// a case that can be written down and run on a machine with no network. The
+/// verification this file does is the whole point of it, so it has to be
+/// testable without asking Docker Hub to misbehave.
+trait Transport: Send + Sync {
+    /// A document, as text.
+    fn get(&self, url: &str, accept: Option<&str>, token: Option<&str>) -> Result<String>;
+    /// A blob, into a file, optionally with a progress bar.
+    fn fetch(&self, url: &str, token: Option<&str>, dest: &Path, progress: bool) -> Result<()>;
+}
+
+/// The real one.
+struct Curl {
+    curl: PathBuf,
+}
+
+impl Curl {
+    fn args(&self, token: Option<&str>) -> Command {
+        let mut cmd = Command::new(&self.curl);
+        cmd.args(["-sS", "--fail", "-L"]);
+        if let Some(token) = token {
+            cmd.arg("-H").arg(format!("Authorization: Bearer {token}"));
+        }
+        cmd
+    }
+}
+
+impl Transport for Curl {
+    fn get(&self, url: &str, accept: Option<&str>, token: Option<&str>) -> Result<String> {
+        let mut cmd = self.args(token);
+        if let Some(accept) = accept {
+            cmd.arg("-H").arg(format!("Accept: {accept}"));
+        }
+        output(cmd.arg(url))
+    }
+
+    fn fetch(&self, url: &str, token: Option<&str>, dest: &Path, progress: bool) -> Result<()> {
+        let mut cmd = self.args(token);
+        if progress {
+            cmd.arg("--progress-bar");
+        }
+        let status = cmd
+            .arg("-o")
+            .arg(dest)
+            .arg(url)
+            .status()
+            .context("running curl")?;
+        if !status.success() {
+            let _ = std::fs::remove_file(dest);
+            bail!("downloading {url}");
+        }
+        Ok(())
+    }
+}
+
 /// One registry, one repository, one anonymous pull token.
 struct Registry<'a> {
     reference: &'a Reference,
     token: Option<String>,
-    curl: PathBuf,
+    transport: Box<dyn Transport>,
+    /// Where verified blobs are cached. A field rather than a call to
+    /// [`oci_dir`] so a test can give this a directory of its own without
+    /// touching a process-wide `ASTERISM_HOME` that its neighbours share.
+    blobs: PathBuf,
 }
 
 const MANIFEST_TYPES: &str = "application/vnd.oci.image.index.v1+json, \
@@ -521,7 +612,9 @@ impl<'a> Registry<'a> {
             "https://{host}/token?service={service}&scope=repository:{}:pull",
             reference.repository
         );
-        let token = output(Command::new(&curl).args(["-sS", "--fail", "-L", &url]))
+        let transport = Curl { curl };
+        let token = transport
+            .get(&url, None, None)
             .ok()
             .and_then(|body| serde_json::from_str::<Value>(&body).ok())
             .and_then(|v| {
@@ -530,19 +623,35 @@ impl<'a> Registry<'a> {
                     .or_else(|| v["access_token"].as_str())
                     .map(str::to_owned)
             });
-        Ok(Registry { reference, token, curl })
+        Ok(Registry {
+            reference,
+            token,
+            transport: Box::new(transport),
+            blobs: oci_dir().join("blobs"),
+        })
     }
 
     fn get(&self, url: &str, accept: Option<&str>) -> Result<String> {
-        let mut cmd = Command::new(&self.curl);
-        cmd.args(["-sS", "--fail", "-L"]);
-        if let Some(token) = &self.token {
-            cmd.arg("-H").arg(format!("Authorization: Bearer {token}"));
-        }
-        if let Some(accept) = accept {
-            cmd.arg("-H").arg(format!("Accept: {accept}"));
-        }
-        output(cmd.arg(url))
+        self.transport.get(url, accept, self.token.as_deref())
+    }
+
+    /// A document the registry named by digest, checked against that digest
+    /// before anything reads it.
+    ///
+    /// A manifest is the root of the whole image: every layer digest, and the
+    /// config digest, are only as trustworthy as the document they are listed
+    /// in. Verifying it is what turns the rest of the pull into a chain
+    /// rather than a sequence of independent hopes.
+    fn get_by_digest(&self, url: &str, accept: Option<&str>, digest: &str) -> Result<String> {
+        // Parsed before the request, not after: a digest whose algorithm we
+        // cannot compute means this image cannot be verified here at all, and
+        // saying so before spending the network is the honest order.
+        let want = Digest::parse(digest).with_context(|| {
+            format!("{} names its manifest with a digest Asterism cannot check", self.reference)
+        })?;
+        let body = self.get(url, accept)?;
+        want.verify_bytes(body.as_bytes(), &format!("the manifest for {}", self.reference))?;
+        Ok(body)
     }
 
     /// The manifest for this host's platform, and the digest it is known by.
@@ -557,14 +666,18 @@ impl<'a> Registry<'a> {
             self.reference.repository,
             self.reference.reference()
         );
-        let body = self.get(&url, Some(MANIFEST_TYPES)).with_context(|| {
-            format!("no image {} on {}", self.reference, self.reference.registry)
-        })?;
+        // Asking by digest is the one case where the caller already knows
+        // what the bytes must be, so it is checked here rather than trusted.
+        let body = match &self.reference.version {
+            Version::Digest(d) => self.get_by_digest(&url, Some(MANIFEST_TYPES), d),
+            Version::Tag(_) => self.get(&url, Some(MANIFEST_TYPES)),
+        }
+        .with_context(|| format!("no image {} on {}", self.reference, self.reference.registry))?;
         let doc: Value = serde_json::from_str(&body).context("unreadable image manifest")?;
 
         let Some(list) = doc["manifests"].as_array() else {
-            // A single-platform manifest: its digest is the one we asked by,
-            // when that was a digest, or the content's own hash otherwise.
+            // A single-platform manifest: its digest is the one we asked by
+            // (and just verified), or the content's own hash otherwise.
             let digest = match &self.reference.version {
                 Version::Digest(d) => d.clone(),
                 Version::Tag(_) => sha256_hex(body.as_bytes()),
@@ -601,18 +714,28 @@ impl<'a> Registry<'a> {
             self.reference.repository,
             digest
         );
-        let body = self.get(&url, Some(MANIFEST_TYPES))?;
+        // The index said this digest; the registry has to serve those bytes
+        // and not another platform's, another tag's, or a mirror's idea of
+        // them. Without this the architecture check above is advice.
+        let body = self.get_by_digest(&url, Some(MANIFEST_TYPES), digest)?;
         Ok((digest.to_owned(), serde_json::from_str(&body)?))
     }
 
     /// A blob, cached by its own digest. Blobs are immutable and shared
     /// between images, so this is the layer cache too.
     fn blob(&self, digest: &str, progress: bool) -> Result<PathBuf> {
-        let dir = oci_dir().join("blobs");
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join(digest.replace(':', "-"));
+        // Before the directory is even made: a blob whose algorithm we
+        // cannot compute is an unverifiable source, and this refuses it
+        // ahead of any mutation of the store.
+        let want = Digest::parse(digest).with_context(|| {
+            format!("{} lists a blob Asterism cannot verify", self.reference)
+        })?;
+        std::fs::create_dir_all(&self.blobs)?;
+        let path = self.blobs.join(digest.replace(':', "-"));
         if path.exists() {
-            return Ok(path);
+            return cached_blob(&path, &want).with_context(|| {
+                format!("reusing the cached blob {digest}")
+            });
         }
         let part = path.with_extension("part");
         let url = format!(
@@ -621,57 +744,75 @@ impl<'a> Registry<'a> {
             self.reference.repository,
             digest
         );
-        let mut cmd = Command::new(&self.curl);
-        cmd.args(["-sS", "--fail", "-L"]);
-        if progress {
-            cmd.arg("--progress-bar");
-        }
-        if let Some(token) = &self.token {
-            cmd.arg("-H").arg(format!("Authorization: Bearer {token}"));
-        }
-        let status = cmd
-            .arg("-o")
-            .arg(&part)
-            .arg(&url)
-            .status()
-            .context("running curl")?;
-        if !status.success() {
-            let _ = std::fs::remove_file(&part);
-            bail!("downloading {digest} from {}", self.reference.registry);
-        }
-        // Forced down and then renamed: a blob is addressed by its digest,
-        // and a digest-named file that is half a blob is a lie every later
-        // pull would believe.
-        durable::publish_file(&part, &path)?;
+        let _ = std::fs::remove_file(&part);
+        self.transport
+            .fetch(&url, self.token.as_deref(), &part, progress)
+            .with_context(|| {
+                format!("downloading {digest} from {}", self.reference.registry)
+            })?;
+        // The registry named these bytes; this is where that claim is
+        // settled. A truncated transfer and a substituted layer are the same
+        // failure here, and neither takes the cache's name — and adoption
+        // forces the bytes down before that name exists, because a
+        // digest-named file that is half a blob is a lie every later pull
+        // would believe.
+        verify::adopt(
+            &part,
+            &path,
+            Some(&want),
+            Source::new("blob", &format!("{}/{}", self.reference, digest)),
+        )?;
         Ok(path)
     }
 }
 
-/// Content hash of a manifest we were handed by tag. `shasum` rather than a
-/// crate: it is one hash of one small document, on a path that has already
-/// spawned curl.
-fn sha256_hex(bytes: &[u8]) -> String {
-    use std::io::Write;
-    let hashed = (|| -> Result<String> {
-        let sha = tool("shasum").or_else(|_| tool("sha256sum"))?;
-        let args: &[&str] = if sha.ends_with("shasum") { &["-a", "256"] } else { &[] };
-        let mut child = Command::new(sha)
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()?;
-        child.stdin.take().context("no stdin")?.write_all(bytes)?;
-        let out = child.wait_with_output()?;
-        let text = String::from_utf8_lossy(&out.stdout).into_owned();
-        Ok(text.split_whitespace().next().unwrap_or_default().to_owned())
-    })()
-    .unwrap_or_default();
-    match hashed.len() {
-        64 => format!("sha256:{hashed}"),
-        // Naming the image after nothing would collide; fall back to a hash
-        // of the bytes that cannot.
-        _ => format!("fnv:{:016x}", crate::instance::fnv1a(&String::from_utf8_lossy(bytes))),
+/// A blob already in the cache, confirmed to still be the blob it is named
+/// after.
+///
+/// The filename asserts a digest, and a filename is not evidence. A blob
+/// adopted by this Asterism has a provenance record and costs a stat to
+/// confirm; one left by an older version has none, so it is hashed against
+/// its own name and either adopted properly or thrown away. Throwing it away
+/// is the right end for it: the next line re-downloads it, and the
+/// alternative is unpacking bytes nobody can vouch for into something a
+/// machine boots.
+fn cached_blob(path: &Path, want: &Digest) -> Result<PathBuf> {
+    // A blob that was adopted here has a record and costs a stat to confirm;
+    // one left by an older Asterism has none and is hashed against its own
+    // name. Either way a failure ends the same: the file is deleted. A blob
+    // is immutable, content-addressed and re-downloadable, so a bad one has
+    // no value at all — and leaving it would make every retry hit the same
+    // poison, which is the difference between a pull that heals itself and
+    // one a user has to go and fix with `rm`.
+    let sound = match verify::provenance(path) {
+        Some(_) => verify::check(path, Depth::from_env()),
+        None => want.verify_file(path, "it").map(|()| {
+            // Unaccounted but genuine: adopt it properly so the next pull is
+            // a stat rather than another full hash.
+            let _ = verify::record(path, path, Source::new("blob", &want.to_string()));
+        }),
+    };
+    if let Err(e) = sound {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(verify::provenance_path(path));
+        return Err(e).context(format!(
+            "the cached copy of {want} is not that blob — it has been corrupted or \
+             tampered with, so it was deleted. Run the pull again to fetch it afresh."
+        ));
     }
+    Ok(path.to_path_buf())
+}
+
+/// Content hash of a manifest we were handed by tag — the digest the image
+/// is then named and addressed by.
+///
+/// In-process rather than through `shasum`: this value decides which file on
+/// disk an image *is*, and the subprocess version had a fallback for hosts
+/// with no `shasum` that quietly produced a non-cryptographic hash. A
+/// forgeable content address is worse than no content address, because
+/// everything downstream treats it as one.
+fn sha256_hex(bytes: &[u8]) -> String {
+    Digest::of_bytes(Algo::Sha256, bytes).to_string()
 }
 
 // ---- unpacking -------------------------------------------------------------
@@ -900,7 +1041,12 @@ fn furnish(root: &Path, config: &Config, tree: &mut Tree) -> Result<()> {
 fn busybox_binary() -> Result<PathBuf> {
     let cached = oci_dir().join(format!("busybox-{}", host_arch()));
     if cached.exists() {
-        return Ok(cached);
+        // Same reasoning as a built image: a cached copy that cannot be
+        // accounted for is lifted again rather than trusted.
+        if verify::check(&cached, Depth::from_env()).is_ok() {
+            return Ok(cached);
+        }
+        let _ = std::fs::remove_file(&cached);
     }
     let reference = parse(BUSYBOX_IMAGE).expect("the busybox reference is a constant");
     let registry = Registry::open(&reference)?;
@@ -922,8 +1068,14 @@ fn busybox_binary() -> Result<PathBuf> {
             bail!("{BUSYBOX_IMAGE} no longer ships /bin/busybox");
         }
         std::fs::create_dir_all(cached.parent().expect("cache has a directory"))?;
-        std::fs::copy(&from, &cached)?;
-        set_mode(&cached, 0o755)
+        // This binary becomes pid 1's shell inside every OCI instance on this
+        // device, so it gets the same treatment as an image: adopted out of a
+        // staged name with a record of where it came from, rather than copied
+        // straight into the cache where an interrupted lift would leave half
+        // an interpreter behind.
+        set_mode(&from, 0o755)?;
+        verify::adopt(&from, &cached, None, Source::new("busybox", BUSYBOX_IMAGE))?;
+        Ok(())
     })();
     let _ = std::fs::remove_dir_all(&stage);
     lifted?;
@@ -1069,7 +1221,14 @@ fn sh_quote(s: &str) -> String {
 /// mean booting a helper guest to run `mkfs` for us. It copies the *host's*
 /// ownership, which a non-root unpack got wrong by construction, so a single
 /// `debugfs` pass replays what the layers actually said.
-fn build_ext4(root: &Path, tree: &Tree, image: &Path, digest: &str) -> Result<()> {
+fn build_ext4(
+    root: &Path,
+    tree: &Tree,
+    image: &Path,
+    digest: &str,
+    reference: &Reference,
+    parents: Vec<String>,
+) -> Result<()> {
     let mke2fs = e2fs_tool("mke2fs")?;
     let part = image.with_extension("raw.part");
     let _ = std::fs::remove_file(&part);
@@ -1094,7 +1253,18 @@ fn build_ext4(root: &Path, tree: &Tree, image: &Path, digest: &str) -> Result<()
     .with_context(|| format!("building an ext4 filesystem for {digest}"))?;
 
     apply_ownership(tree, &part)?;
-    durable::publish_file(&part, image)?;
+    // No upstream ever published a digest for this file — `mke2fs` made it
+    // out of layers that were each verified on the way in. So it is addressed
+    // by our own hash, with the manifest, config and layer digests it came
+    // out of recorded beside it. That is what makes it accountable at boot,
+    // and what stops a half-built image (the `.part` above) from ever being
+    // mistaken for a finished one.
+    verify::adopt(
+        &part,
+        image,
+        None,
+        Source::new("oci-rootfs", &reference.canonical()).derived_from(parents),
+    )?;
     Ok(())
 }
 
@@ -1179,6 +1349,10 @@ pub fn kernel_paths() -> (PathBuf, PathBuf) {
 ///
 /// Read-only, so the daemon can ask without downloading: fetching is the
 /// CLI's job at `ast pull`, in the foreground where the user can see it.
+///
+/// Verified here rather than only at fetch time, because this is the last
+/// thing that happens before a hypervisor is handed a kernel image and told
+/// to execute it. Nothing else in the boot path looks at these two files.
 pub fn kernel() -> Result<(PathBuf, PathBuf)> {
     let (kernel, initrd) = kernel_paths();
     if !kernel.exists() || !initrd.exists() {
@@ -1187,30 +1361,50 @@ pub fn kernel() -> Result<(PathBuf, PathBuf)> {
              own, so one is fetched once: ast pull <image>"
         );
     }
+    let depth = Depth::from_env();
+    verify::check(&kernel, depth).context("the guest kernel this device fetched")?;
+    verify::check(&initrd, depth).context("the guest initrd this device fetched")?;
     Ok((kernel, initrd))
 }
 
 /// Fetch the guest kernel if this device has not got one. Idempotent.
+///
+/// A file that is present but cannot be accounted for is re-fetched rather
+/// than kept: this is the one artifact on the device whose bytes the host
+/// hands straight to a hypervisor's kernel loader.
 pub fn ensure_kernel(fetch: impl Fn(&str, &Path) -> Result<()>) -> Result<bool> {
     let (kernel, initrd) = kernel_paths();
-    if kernel.exists() && initrd.exists() {
-        return Ok(false);
-    }
     let arch = host_arch();
-    let (_, kernel_url, initrd_url) = KERNELS
+    let pinned = KERNELS
         .iter()
-        .find(|(a, _, _)| *a == arch)
+        .find(|k| k.arch == arch)
         .with_context(|| format!("no guest kernel published for {arch}"))?;
     std::fs::create_dir_all(kernel.parent().expect("the kernel has a directory"))?;
-    for (url, dest) in [(kernel_url, &kernel), (initrd_url, &initrd)] {
+
+    let mut fetched = false;
+    for (want, dest, kind) in [
+        (&pinned.kernel, &kernel, "kernel"),
+        (&pinned.initrd, &initrd, "initrd"),
+    ] {
+        // Parsed before anything is fetched or removed, so a digest this
+        // build cannot compute refuses the whole operation with the store
+        // exactly as it was.
+        let expected = want.expected(&format!("the guest {kind}"))?;
         if dest.exists() {
-            continue;
+            if verify::check(dest, Depth::from_env()).is_ok() {
+                continue;
+            }
+            let _ = std::fs::remove_file(dest);
+            let _ = std::fs::remove_file(verify::provenance_path(dest));
         }
         let part = dest.with_extension("part");
-        fetch(url, &part).with_context(|| format!("fetching the guest kernel from {url}"))?;
-        durable::publish_file(&part, dest)?;
+        let _ = std::fs::remove_file(&part);
+        fetch(want.url, &part)
+            .with_context(|| format!("fetching the guest {kind} from {}", want.url))?;
+        verify::adopt(&part, dest, expected.as_ref(), Source::new(kind, want.url))?;
+        fetched = true;
     }
-    Ok(true)
+    Ok(fetched)
 }
 
 #[cfg(test)]
@@ -1409,15 +1603,328 @@ mod tests {
         assert_eq!(sh_quote("it's"), r"'it'\''s'");
     }
 
+
+    // ---- verification ------------------------------------------------------
+    //
+    // Everything below runs against a registry made of a `BTreeMap`, so
+    // "the mirror served the wrong bytes" is a line of test setup rather
+    // than a thing that has to be arranged with a real one. The blob cache
+    // is a tempdir per test, which is why none of this touches
+    // `ASTERISM_HOME` and none of it races its neighbours.
+
+    use std::collections::BTreeMap as Map;
+    use std::sync::Mutex;
+
+    /// A registry that serves exactly what it is told to, including the
+    /// wrong thing.
+    #[derive(Default)]
+    struct Fake {
+        docs: Map<String, String>,
+        blobs: Map<String, Vec<u8>>,
+        /// Every url asked for, so a test can prove a cached blob was
+        /// served without going to the network.
+        asked: Mutex<Vec<String>>,
+    }
+
+    impl Fake {
+        fn doc(mut self, path: &str, body: &str) -> Fake {
+            self.docs.insert(path.to_owned(), body.to_owned());
+            self
+        }
+
+        fn blob(mut self, digest: &str, bytes: &[u8]) -> Fake {
+            self.blobs.insert(digest.to_owned(), bytes.to_vec());
+            self
+        }
+
+        /// The tail of a url, which is all this fake keys on.
+        fn key(url: &str) -> String {
+            url.rsplit_once("/v2/").map(|(_, r)| r.to_owned()).unwrap_or_else(|| url.to_owned())
+        }
+    }
+
+    impl Transport for Fake {
+        fn get(&self, url: &str, _accept: Option<&str>, _token: Option<&str>) -> Result<String> {
+            self.asked.lock().unwrap().push(url.to_owned());
+            let key = Fake::key(url);
+            self.docs
+                .get(&key)
+                .cloned()
+                .with_context(|| format!("404 for {key}"))
+        }
+
+        fn fetch(&self, url: &str, _token: Option<&str>, dest: &Path, _p: bool) -> Result<()> {
+            self.asked.lock().unwrap().push(url.to_owned());
+            let key = Fake::key(url);
+            let digest = key.rsplit('/').next().unwrap_or_default();
+            let bytes = self
+                .blobs
+                .get(digest)
+                .with_context(|| format!("404 for blob {digest}"))?;
+            std::fs::write(dest, bytes)?;
+            Ok(())
+        }
+    }
+
+    fn sha(bytes: &[u8]) -> String {
+        Digest::of_bytes(Algo::Sha256, bytes).to_string()
+    }
+
+    struct Harness {
+        _dir: tempfile::TempDir,
+        blobs: PathBuf,
+    }
+
+    impl Harness {
+        fn new() -> Harness {
+            let dir = tempfile::tempdir().unwrap();
+            let blobs = dir.path().join("blobs");
+            Harness { _dir: dir, blobs }
+        }
+
+        fn registry<'a>(&self, reference: &'a Reference, fake: Fake) -> Registry<'a> {
+            Registry {
+                reference,
+                token: None,
+                transport: Box::new(fake),
+                blobs: self.blobs.clone(),
+            }
+        }
+    }
+
+    /// A layer blob is fetched by its digest, so bytes that hash to anything
+    /// else are a substitution — and a substituted layer is arbitrary code
+    /// in a filesystem a machine is about to boot.
+    #[test]
+    fn a_layer_that_is_not_what_the_manifest_named_never_reaches_the_cache() {
+        let reference = r("nginx");
+        let h = Harness::new();
+        let honest = b"the layer the manifest named";
+        let digest = sha(honest);
+        let fake = Fake::default().blob(&digest, b"a completely different layer");
+        let registry = h.registry(&reference, fake);
+
+        let err = format!("{:#}", registry.blob(&digest, false).unwrap_err());
+        assert!(err.contains("does not match its published digest"), "{err}");
+        let cached = h.blobs.join(digest.replace(':', "-"));
+        assert!(!cached.exists(), "the substituted layer must not take the cache's name");
+        assert!(!cached.with_extension("part").exists(), "nor be left to be resumed");
+    }
+
+    /// The config blob decides what pid 1 runs, and it travels the same way
+    /// a layer does — so it gets caught by the same check.
+    #[test]
+    fn a_config_blob_is_verified_like_any_other() {
+        let reference = r("nginx");
+        let h = Harness::new();
+        let config = br#"{"config":{"Entrypoint":["/bin/true"]}}"#;
+        let digest = sha(config);
+
+        let good = h.registry(&reference, Fake::default().blob(&digest, config));
+        let path = good.blob(&digest, false).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), config);
+
+        let h2 = Harness::new();
+        let swapped = br#"{"config":{"Entrypoint":["/bin/somebody-elses-idea"]}}"#;
+        let bad = h2.registry(&reference, Fake::default().blob(&digest, swapped));
+        assert!(bad.blob(&digest, false).is_err());
+    }
+
+    /// A blob whose algorithm this build cannot compute is not a weaker
+    /// check, it is no check — so it is refused, and refused before the
+    /// store has been touched at all.
+    #[test]
+    fn a_blob_named_with_an_algorithm_we_cannot_compute_is_refused_before_any_write() {
+        let reference = r("nginx");
+        let h = Harness::new();
+        let registry = h.registry(&reference, Fake::default());
+        let err = registry
+            .blob("md5:d41d8cd98f00b204e9800998ecf8427e", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot verify"), "{err}");
+        assert!(!h.blobs.exists(), "not even the cache directory was created");
+    }
+
+    /// A cache written by an older Asterism has no provenance beside it. It
+    /// is not trusted on the strength of its filename: it is hashed, and it
+    /// is either adopted properly or deleted.
+    #[test]
+    fn a_cache_from_before_provenance_is_hashed_before_it_is_reused() {
+        let reference = r("nginx");
+        let bytes = b"a layer somebody pulled last year";
+        let digest = sha(bytes);
+
+        let h = Harness::new();
+        std::fs::create_dir_all(&h.blobs).unwrap();
+        let cached = h.blobs.join(digest.replace(':', "-"));
+        std::fs::write(&cached, bytes).unwrap();
+        let registry = h.registry(&reference, Fake::default());
+        assert_eq!(registry.blob(&digest, false).unwrap(), cached);
+        assert!(
+            verify::provenance(&cached).is_some(),
+            "an unaccounted blob that checks out is adopted, not merely allowed"
+        );
+
+        // And the same file poisoned: same name, different bytes.
+        let h2 = Harness::new();
+        std::fs::create_dir_all(&h2.blobs).unwrap();
+        let poisoned = h2.blobs.join(digest.replace(':', "-"));
+        std::fs::write(&poisoned, b"a layer somebody else substituted").unwrap();
+        let registry = h2.registry(&reference, Fake::default());
+        let err = format!("{:#}", registry.blob(&digest, false).unwrap_err());
+        assert!(err.contains("corrupted or tampered with"), "{err}");
+        assert!(!poisoned.exists(), "a poisoned blob is deleted, not left to be hit again");
+    }
+
+    /// A cache poisoned *after* Asterism adopted it — the provenance record
+    /// is there and the bytes no longer agree with it.
+    #[test]
+    fn a_blob_poisoned_after_adoption_is_caught_on_reuse() {
+        let reference = r("nginx");
+        let bytes = b"the real layer";
+        let digest = sha(bytes);
+        let h = Harness::new();
+        let registry = h.registry(&reference, Fake::default().blob(&digest, bytes));
+        let path = registry.blob(&digest, false).unwrap();
+
+        std::fs::write(&path, b"tampered with, at a different length").unwrap();
+        let err = format!("{:#}", registry.blob(&digest, false).unwrap_err());
+        assert!(err.contains("truncated or replaced") || err.contains("has changed"), "{err}");
+    }
+
+    /// Offline reuse: a blob that was verified when it was fetched is served
+    /// out of the cache without a single request. A registry that has gone
+    /// away, or a laptop on a train, still boots what it already has.
+    #[test]
+    fn a_verified_blob_is_reused_without_touching_the_network() {
+        let reference = r("nginx");
+        let bytes = b"a layer, fetched once";
+        let digest = sha(bytes);
+        let h = Harness::new();
+        h.registry(&reference, Fake::default().blob(&digest, bytes))
+            .blob(&digest, false)
+            .unwrap();
+
+        // A transport with nothing in it: any request at all is a failure.
+        let offline = Fake::default();
+        let registry = h.registry(&reference, offline);
+        let path = registry.blob(&digest, false).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    /// Pulling by digest is a promise about the bytes, and the registry has
+    /// to keep it. Without this check the digest in `nginx@sha256:...` is
+    /// decoration.
+    #[test]
+    fn a_manifest_asked_for_by_digest_must_be_that_manifest() {
+        let honest = r#"{"config":{"digest":"sha256:aa"},"layers":[]}"#;
+        let digest = sha(honest.as_bytes());
+        let reference = r(&format!("nginx@{digest}"));
+        let h = Harness::new();
+
+        let good = Fake::default().doc(&format!("library/nginx/manifests/{digest}"), honest);
+        let (got, _) = h.registry(&reference, good).manifest().unwrap();
+        assert_eq!(got, digest);
+
+        let liar = Fake::default().doc(
+            &format!("library/nginx/manifests/{digest}"),
+            r#"{"config":{"digest":"sha256:bb"},"layers":[]}"#,
+        );
+        let err = h.registry(&reference, liar).manifest().unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("does not match its digest"), "{text}");
+    }
+
+    /// An index names a digest per platform; the manifest served for that
+    /// entry has to be the one it named. Otherwise the architecture choice
+    /// below is advice rather than a decision.
+    #[test]
+    fn an_index_entry_must_serve_the_manifest_it_named() {
+        let reference = r("nginx");
+        let platform = r#"{"config":{"digest":"sha256:cc"},"layers":[]}"#;
+        let digest = sha(platform.as_bytes());
+        let index = format!(
+            r#"{{"manifests":[{{"digest":"{digest}","platform":{{"os":"linux","architecture":"{}"}}}}]}}"#,
+            platform_arch()
+        );
+        let h = Harness::new();
+
+        let good = Fake::default()
+            .doc("library/nginx/manifests/latest", &index)
+            .doc(&format!("library/nginx/manifests/{digest}"), platform);
+        let (got, doc) = h.registry(&reference, good).manifest().unwrap();
+        assert_eq!(got, digest);
+        assert_eq!(doc["config"]["digest"], "sha256:cc");
+
+        let liar = Fake::default()
+            .doc("library/nginx/manifests/latest", &index)
+            .doc(
+                &format!("library/nginx/manifests/{digest}"),
+                r#"{"config":{"digest":"sha256:dd"},"layers":[]}"#,
+            );
+        let text = format!("{:#}", h.registry(&reference, liar).manifest().unwrap_err());
+        assert!(text.contains("does not match its digest"), "{text}");
+    }
+
+    /// An image with no build for this machine says so, and names what it
+    /// does publish. Booting somebody else's architecture is a guest that
+    /// sits at a blank console, which is the least diagnosable failure
+    /// there is.
+    #[test]
+    fn an_image_with_no_build_for_this_architecture_is_refused_by_name() {
+        let reference = r("nginx");
+        let other = if platform_arch() == "arm64" { "amd64" } else { "arm64" };
+        let index = format!(
+            r#"{{"manifests":[
+                {{"digest":"sha256:{}","platform":{{"os":"linux","architecture":"{other}"}}}},
+                {{"digest":"sha256:{}","platform":{{"os":"linux","architecture":"riscv64"}}}}
+            ]}}"#,
+            "1".repeat(64),
+            "2".repeat(64)
+        );
+        let h = Harness::new();
+        let fake = Fake::default().doc("library/nginx/manifests/latest", &index);
+        let text = format!("{:#}", h.registry(&reference, fake).manifest().unwrap_err());
+        assert!(text.contains(&format!("no linux/{}", platform_arch())), "{text}");
+        assert!(text.contains(other), "the error has to say what it does publish: {text}");
+        assert!(text.contains("riscv64"), "{text}");
+    }
+
+    /// A tagged single-platform manifest has no digest of its own to check
+    /// against, so the image is named by the hash of what was served — which
+    /// has to be a real hash, computed here, and not something that can fall
+    /// back to a non-cryptographic one on a host with no `shasum`.
+    #[test]
+    fn a_tagged_manifest_is_addressed_by_its_own_content() {
+        let body = r#"{"config":{"digest":"sha256:ee"},"layers":[]}"#;
+        let reference = r("nginx");
+        let h = Harness::new();
+        let fake = Fake::default().doc("library/nginx/manifests/latest", body);
+        let (digest, _) = h.registry(&reference, fake).manifest().unwrap();
+        assert_eq!(digest, sha(body.as_bytes()));
+        assert!(digest.starts_with("sha256:"), "never a fallback hash: {digest}");
+        assert_eq!(Digest::parse(&digest).unwrap().hex().len(), 64);
+    }
+
     /// Every architecture the catalog serves has a kernel to boot OCI images
     /// with, and both files come off the same release.
     #[test]
     fn every_architecture_has_a_pinned_kernel() {
-        for (arch, kernel, initrd) in KERNELS {
-            assert!(kernel.starts_with("https://"), "{arch}");
-            assert!(initrd.starts_with("https://"), "{arch}");
-            assert!(kernel.contains("24.04") && initrd.contains("24.04"), "{arch}");
+        for k in KERNELS {
+            assert!(k.kernel.url.starts_with("https://"), "{}", k.arch);
+            assert!(k.initrd.url.starts_with("https://"), "{}", k.arch);
+            assert!(
+                k.kernel.url.contains("24.04") && k.initrd.url.contains("24.04"),
+                "{}",
+                k.arch
+            );
+            // A pin nobody can compute would refuse every OCI boot on that
+            // architecture, and it would do it at `ast pull` on a user's
+            // machine rather than here. Check the table can be read.
+            k.kernel.expected("the guest kernel").unwrap();
+            k.initrd.expected("the guest initrd").unwrap();
         }
-        assert!(KERNELS.iter().any(|(a, _, _)| *a == host_arch()));
+        assert!(KERNELS.iter().any(|k| k.arch == host_arch()));
     }
 }

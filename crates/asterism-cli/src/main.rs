@@ -28,7 +28,7 @@ use asterism_core::hv::ImageKind;
 use asterism_core::instance::{now_unix, Instance, PortForward, Restart, Shape};
 use asterism_core::protocol::{self, Request, Response};
 use asterism_core::registry::OrbitRow;
-use asterism_core::{cow, image, oci, paths, service, snapshot, VERSION};
+use asterism_core::{cow, image, oci, paths, service, snapshot, verify, VERSION};
 
 #[derive(Parser)]
 #[command(
@@ -210,11 +210,26 @@ enum Command {
     ///
     /// This device's image store: the aliases it knows and what is already
     /// on its disk. Every device has its own.
-    Images,
+    Images {
+        /// Re-hash every image in the store and report what no longer
+        /// matches what was pulled.
+        ///
+        /// A boot checks size and mtime and only re-hashes when one of them
+        /// has moved, because a base image is a gigabyte and `ast up` should
+        /// not spend a second on it. This is the thorough version: it reads
+        /// every byte, so it catches a file that was rewritten in place with
+        /// its size and timestamp put back.
+        #[arg(long)]
+        verify: bool,
+    },
     /// Download an image into this device's store.
     Pull {
         /// The image to download: an alias, an https:// url, a path, or an
         /// OCI/Docker reference.
+        ///
+        /// A url or a path may carry a digest, written as a fragment:
+        /// `https://mirror/x.qcow2#sha256:<hex>`. The download is then
+        /// refused unless it hashes to exactly that.
         image: String,
     },
     /// Attach a part to an instance: a volume, or a secret.
@@ -624,9 +639,9 @@ fn main() -> Result<()> {
             return restore_snapshot(&name, &tag, device.as_deref())
         }
         // The image store is per device, so both of these are about this one.
-        Command::Images => {
+        Command::Images { verify } => {
             local_only("images", device.as_deref())?;
-            return print_images();
+            return print_images(verify);
         }
         Command::Pull { image } => {
             local_only("pull", device.as_deref())?;
@@ -1083,19 +1098,40 @@ fn ensure_pulled(reference: &str) -> Result<String> {
     if let Some(image) = &resolved.oci {
         return pull_oci(image);
     }
-    if resolved.path.exists() {
-        return Ok(resolved.name);
-    }
+    // Before anything that could delete a file: a local image is the user's,
+    // and the only thing that happens to it here is that its identity is
+    // written down, in the store, so a boot can tell whether the file they
+    // pointed at is still the file they pointed at.
     let (Some(url), Some(staging)) = (&resolved.url, &resolved.staging) else {
-        return Ok(resolved.name); // local file, used in place
+        resolved.record_local()?;
+        return Ok(resolved.name);
     };
+
+    if resolved.path.exists() {
+        // Present is not the same as sound. A store that was corrupted since
+        // the last pull should be repaired by the command whose whole job is
+        // to make the image available, not discovered at the next `ast up`.
+        // Safe to delete because everything reaching this line is a file
+        // this store downloaded and can download again.
+        if let Err(e) = resolved.verify_bootable() {
+            eprintln!("{}: {e:#}", resolved.name);
+            eprintln!("re-pulling it");
+            resolved.discard();
+        } else {
+            return Ok(resolved.name);
+        }
+    }
 
     if !staging.exists() {
         if let Some(dir) = staging.parent() {
             std::fs::create_dir_all(dir)?;
         }
         let part = staging.with_extension("qcow2.part");
+        let _ = std::fs::remove_file(&part);
         eprintln!("pulling {} ({})", resolved.name, url);
+        if let Some(want) = &resolved.expected {
+            eprintln!("it must hash to {want}");
+        }
         let status = std::process::Command::new("curl")
             .arg("--location")
             .arg("--fail")
@@ -1109,10 +1145,18 @@ fn ensure_pulled(reference: &str) -> Result<String> {
             let _ = std::fs::remove_file(&part);
             bail!("download failed for {url}");
         }
-        // A base image that everything on this device clones from is worth
-        // forcing down before it takes its final name: half a cloud image
-        // under the name of a whole one is a boot failure with no clue in it.
-        asterism_core::durable::publish_file(&part, staging)?;
+        // Verified here, before the download can be mistaken for a resumable
+        // one: a `.part` left behind by a poisoned mirror would otherwise be
+        // skipped by the `!staging.exists()` above on the next run. Adoption
+        // is also where it is forced down before it takes its final name —
+        // half a cloud image under the name of a whole one is a boot failure
+        // with no clue in it.
+        verify::adopt(
+            &part,
+            staging,
+            resolved.expected.as_ref(),
+            verify::Source::new("download", url),
+        )?;
     }
 
     // Converting an image already in the store is how a cache written by an
@@ -1204,26 +1248,69 @@ fn download(url: &str, dest: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn print_images() -> Result<()> {
+fn print_images(full: bool) -> Result<()> {
+    let depth = if full { verify::Depth::Full } else { verify::Depth::Quick };
+    let mut unsound = 0usize;
+    // `PULLED` answers two questions at once, because they are the same
+    // question to the person reading it: is it here, and can it be booted.
     println!("{:<14} {:<8} SOURCE ({})", "NAME", "PULLED", image::host_arch());
-    for (alias, _, _) in image::CATALOG {
-        let r = image::resolve(alias)?;
+    for entry in image::CATALOG {
+        let r = image::resolve(entry.alias)?;
         // An image pulled by an older Asterism is still on this device even
         // though it has not been converted yet, and saying "-" would send
         // the user off to re-download something they already have.
-        let pulled = if r.is_pulled() { "yes" } else { "-" };
-        println!("{:<14} {:<8} {}", alias, pulled, r.url.as_deref().unwrap_or("-"));
+        let pulled = match r.is_pulled() {
+            false => "-".to_owned(),
+            true => match verify_row(&r.path, &r.record, depth) {
+                Ok(()) => "yes".to_owned(),
+                Err(e) => {
+                    unsound += 1;
+                    eprintln!("{}: {e:#}", entry.alias);
+                    "BAD".to_owned()
+                }
+            },
+        };
+        println!("{:<14} {:<8} {}", entry.alias, pulled, r.url.as_deref().unwrap_or("-"));
     }
     // Container images are not a catalog — the catalog is Docker Hub — but
     // the ones this device has built are as real as any row above, and
     // nothing else would tell the user what is taking up the space.
     for reference in oci::built()? {
-        println!("{:<14} {:<8} {}", short_image(&reference), "yes", reference);
+        let state = match image::resolve(&reference)
+            .and_then(|r| verify_row(&r.path, &r.record, depth))
+        {
+            Ok(()) => "yes".to_owned(),
+            Err(e) => {
+                unsound += 1;
+                eprintln!("{reference}: {e:#}");
+                "BAD".to_owned()
+            }
+        };
+        println!("{:<14} {:<8} {}", short_image(&reference), state, reference);
+    }
+    if unsound > 0 {
+        println!(
+            "\n{unsound} image(s) marked BAD: the bytes on disk are not the ones that were \
+             pulled.\nThey will be refused at boot. `ast pull <name>` replaces one."
+        );
     }
     println!("\nalso accepted: an https:// url, a path to a local qcow2 or raw image, or");
     println!("an OCI/Docker reference — `nginx`, `ghcr.io/owner/app:v1` — booted as a");
     println!("microVM from the image's own filesystem (ast create web --image nginx -p 8080:80)");
+    println!("a url or path may pin its bytes: --image https://mirror/x.qcow2#sha256:<hex>");
     Ok(())
+}
+
+/// One row's verdict: is what is on disk still what was pulled?
+///
+/// An image only half-migrated by an older Asterism — the qcow2 is there and
+/// the raw is not — has nothing to check yet, and saying so is not a
+/// complaint about it.
+fn verify_row(path: &std::path::Path, record: &std::path::Path, depth: verify::Depth) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    verify::check_recorded(path, record, depth)
 }
 
 // ---- volumes ---------------------------------------------------------------

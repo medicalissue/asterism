@@ -8,6 +8,10 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+# The content address for bytes Asterism produces itself: a converted base
+# image and a built OCI rootfs are about a gigabyte each and get hashed on
+# adoption, which blake3 does in about a second.
+blake3.workspace = true
 hostname.workspace = true
 # Bodies crossing the mesh are base64 in the frame rather than a JSON array
 # of numbers, which is a 4x expansion against a transport with a hard frame
@@ -25,6 +29,13 @@ http = "1"
 libc = "0.2"
 serde.workspace = true
 serde_json.workspace = true
+# Every boot input is verified against a content address before it is adopted
+# (`verify`). Registries publish sha256 (and, rarely, sha512), so the check
+# has to be able to compute those and not something adjacent. Already
+# compiled in this tree behind ed25519-dalek, so it costs no build time — and
+# it replaces shelling out to `shasum`, which was not present on every host
+# and fell back to a non-cryptographic hash when it was missing.
+sha2 = "0.11"
 tar.workspace = true
 uuid.workspace = true
 # Secret material passes through this crate's types on its way to and from a

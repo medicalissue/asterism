@@ -271,6 +271,27 @@ pub fn image_ref(reference: &str) -> Result<ImageRef> {
     })
 }
 
+/// The same, plus writing down what a local file currently is.
+///
+/// Used where an instance is being *created*: the identity of a file the
+/// user pointed at has to be captured at the moment they point at it, so
+/// that the boot gate has something to compare against. Recording it is
+/// best-effort — a `--image` that names a file on a disk this daemon cannot
+/// write next to is still a legitimate instance, and the boot gate will say
+/// so plainly when it comes to it rather than failing the create.
+pub fn image_ref_recording(reference: &str) -> Result<ImageRef> {
+    let resolved = image::resolve(reference)?;
+    if let Err(e) = resolved.record_local() {
+        eprintln!("astd: could not record what {} is: {e:#}", resolved.name);
+    }
+    Ok(ImageRef {
+        kind: resolved.kind(),
+        name: resolved.name,
+        path: resolved.path,
+        format: resolved.format,
+    })
+}
+
 /// The same, having first made sure the base image is in the format an
 /// instance can actually be built from.
 ///
@@ -285,6 +306,12 @@ fn materialised_image_ref(reference: &str) -> Result<ImageRef> {
     if resolved.materialise()? {
         eprintln!("astd: converted {} to a raw base image", resolved.name);
     }
+    // The last gate before a hypervisor is handed a path, and the reason
+    // every other check in `verify` is worth having: an image is verified
+    // when it is pulled, and then it sits in a store for weeks. This is
+    // where "still the image that was pulled" is established, for a cloud
+    // image, an OCI rootfs and a file the user pointed at alike.
+    resolved.verify_bootable()?;
     Ok(ImageRef {
         kind: resolved.kind(),
         name: resolved.name,

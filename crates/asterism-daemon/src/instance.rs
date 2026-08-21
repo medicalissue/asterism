@@ -59,7 +59,10 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
         // explicit choice is forced; the default probes VZ first and falls
         // back to QEMU when VZ is unavailable or lacks a required capability.
         Request::Create { name, image, shape, backend: requested, publish } => {
-            backend::image_ref(&image).and_then(|r| {
+            // `_recording` rather than plain `image_ref`: a local file is
+            // never adopted into the store, so the moment the user names it
+            // is the only chance to write down what it was.
+            backend::image_ref_recording(&image).and_then(|r| {
                 let requirements = backend::CreateRequirements::new(&r, &publish);
                 let machine = backend::select_for(requested.as_deref(), requirements)?;
                 reg.create(&name, cpu_device, &r.name, shape, machine)?;

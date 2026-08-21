@@ -9,7 +9,8 @@
 //! hypervisor boundary, [`volume`] is the block
 //! storage a device contributes to the pool, [`secret`] and [`rewrite`] are
 //! the secrets data plane's model and its one substitution rule, and
-//! [`protocol`] is the CLI <-> daemon wire.
+//! [`protocol`] is the CLI <-> daemon wire. [`verify`] is the gate every
+//! boot input passes through on its way into the store and out of it again.
 
 pub mod cow;
 pub mod durable;
@@ -28,6 +29,7 @@ pub mod secret;
 pub mod service;
 pub mod snapshot;
 pub mod tools;
+pub mod verify;
 pub mod volume;
 
 /// Version of the `astd`/`ast` pair this binary was built from. The CLI and
