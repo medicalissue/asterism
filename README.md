@@ -86,6 +86,37 @@ State lives in `~/.asterism` (override with `ASTERISM_HOME`).
 Workspace: `asterism-core` · `asterism-daemon` (`astd`) ·
 `asterism-cli` (`ast`) · `asterism-mesh`.
 
+### Proving a release
+
+`cargo test` proves the source. It does not prove the release, and the
+gap between them is where release bugs live — a tarball missing a
+binary, a helper that lost its signature on the way through `tar`, two
+binaries from two different builds packed together.
+
+```console
+$ scripts/rc.sh          # build the artifact, install it, operate it
+$ scripts/rc.sh --all    # ...and every suite this machine can run
+$ scripts/rc.sh --list   # the suites, and what each one needs
+```
+
+It builds the exact tarball a publish would upload, checks it against
+its own `SHA256SUMS`, installs it with the script users pipe into `sh`,
+and runs the suites against **that** pair rather than `target/debug`.
+The bare form is what CI runs on every pull request; `--all` adds the
+lanes that need a hypervisor or a network, which a GitHub runner has
+not got. Nothing it does touches `~/.asterism` or a daemon that was
+already running.
+
+Which build a binary is, is a question a version number cannot answer:
+
+```console
+$ ast version     # version, immutable build id, and the sha256 of the file
+$ ast bugreport   # that, plus this device's state — what to paste into an issue
+```
+
+`ast`, `astd` and the desktop app all report the same id when they are
+one build, and `scripts/rc.sh identity` is the assertion that they are.
+
 ## The mesh, and what it publishes
 
 Paired devices find each other by public key, so an orbit works when the

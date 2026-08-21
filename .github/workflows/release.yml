@@ -66,7 +66,13 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
 
+      # The build id is stamped into the binaries at compile time and is what
+      # ties `ast`, `astd` and the desktop app to one build. Naming the commit
+      # here is what makes a published artifact traceable to a source
+      # revision without trusting a tag that can be moved.
       - name: Build
+        env:
+          ASTERISM_BUILD_ID: ${{ github.sha }}
         run: |
           cargo build --release --locked \
             --package asterism-cli --package asterism-daemon --package asterism-vz
@@ -224,6 +230,27 @@ jobs:
 
       - name: The installer's own suite, against a fake release
         run: bash scripts/install-test.sh
+
+      # Is what was just packed the thing that was built, and is it one build?
+      # The digest checks below prove the bytes came through intact; this
+      # proves they were one build to begin with — a tarball assembled from
+      # two of them passes every digest check there is.
+      - name: The release candidate's identity gate
+        run: bash scripts/rc.sh --artifact dist --version "${{ needs.build.outputs.version }}" identity
+
+      - name: The build id names the commit this was built from
+        run: |
+          set -eu
+          version="${{ needs.build.outputs.version }}"
+          prefix="${RUNNER_TEMP}/id-prefix"
+          ASTERISM_YES=1 ASTERISM_PREFIX="$prefix" \
+            ASTERISM_BASE_URL="file://${PWD}/dist" ASTERISM_VERSION="$version" \
+            sh packaging/install.sh >/dev/null
+          got="$("${prefix}/bin/ast" version | sed -n 's/^build  *//p')"
+          echo "build id: ${got}"
+          want="${version#v}+${{ github.sha }}"
+          [ "$got" = "$want" ] || { echo "expected ${want}" >&2; exit 1; }
+          ASTERISM_YES=1 ASTERISM_PREFIX="$prefix" sh packaging/install.sh --uninstall >/dev/null
 
       - name: Install the exact artifacts this run built
         run: |

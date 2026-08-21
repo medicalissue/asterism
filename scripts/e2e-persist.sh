@@ -22,7 +22,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="$HOME/.cargo/bin:$PATH"
 cd "$ROOT"
-cargo build -q
+# shellcheck source-path=SCRIPTDIR source=lib/harness.sh
+. "$ROOT/scripts/lib/harness.sh"
+harness_begin persist
+harness_binaries "$ROOT"
 
 # Fresh, SHORT home: unix socket paths are capped near 104 bytes.
 export ASTERISM_HOME="/private/tmp/ast-persist-$$"
@@ -30,9 +33,8 @@ export ASTERISM_HOME="/private/tmp/ast-persist-$$"
 # A single-device test has no orbit, so it has no business publishing a
 # throwaway key and this machine's addresses to a public discovery service.
 export ASTERISM_MESH=local
+harness_own_home "$ASTERISM_HOME"
 BIN="$ASTERISM_HOME/bin"
-AST="$BIN/ast"
-ASTD="$BIN/astd"
 LOG="$ASTERISM_HOME/astd.log"
 IMAGE="${E2E_IMAGE:-debian:13}"
 INST=persist
@@ -47,13 +49,17 @@ fail() { echo "E2E FAIL: $*" >&2; exit 1; }
 ok() { echo "ok: $*"; }
 
 cleanup() {
+  harness_keep_home "$ASTERISM_HOME" home
   if [ -n "$WE_INSTALLED" ]; then "$AST" service uninstall >/dev/null 2>&1 || true; fi
   if [ -n "$BYSTANDER" ]; then kill -9 "$BYSTANDER" 2>/dev/null || true; fi
   if [ -n "$FOREIGN" ]; then kill -9 "$FOREIGN" 2>/dev/null || true; fi
   if [ -n "$ASTD_PID" ]; then kill -9 "$ASTD_PID" 2>/dev/null || true; fi
-  # Only ever our own processes: every one of them names this home on its
-  # command line.
-  pkill -9 -f "$ASTERISM_HOME" 2>/dev/null || true
+  # Only what this run started. `pkill -9 -f "$ASTERISM_HOME"` used to stand
+  # here: it matched command lines, so it also reached anything that merely
+  # named this directory — and it reached it with SIGKILL. The daemon writes
+  # down every process it starts; harness_reap stops those.
+  harness_reap
+  harness_artifacts_note
   if [ -n "${KEEP:-}" ]; then
     echo "kept $ASTERISM_HOME for inspection"
   else
@@ -64,16 +70,23 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$ASTERISM_HOME/images" "$BIN"
-cp "$ROOT/target/debug/ast" "$ROOT/target/debug/astd" "$BIN/"
-if [ -d "$HOME/.asterism/images" ]; then
-  cp "$HOME/.asterism/images/"*.qcow2 "$ASTERISM_HOME/images/" 2>/dev/null || true
-fi
+# Copied into the home rather than run out of target/, so that a rebuild
+# part-way through a long run cannot swap the binary under a live daemon.
+cp "$AST" "$ASTD" "$BIN/"
+AST="$BIN/ast"
+ASTD="$BIN/astd"
+harness_seed_images "$ASTERISM_HOME"
 
 # The service half of this test writes to the real ~/Library/LaunchAgents.
 # Anything already there is the user's, and this test does not get to
 # touch it.
 if [ -e "$PLIST" ]; then
-  fail "$PLIST already exists — refusing to disturb it"
+  # Not a failure: this machine has Asterism installed as a service, which is
+  # the supported configuration and not a broken one. What this suite needs
+  # is a machine where it can install and remove that plist without touching
+  # anybody's — so it steps aside rather than reporting red on a healthy
+  # tree, and says which file is in the way.
+  harness_skip "$PLIST already exists, and this suite installs and removes that exact file"
 fi
 
 # expect <desc> <needle> <cmd...>: run cmd, require success AND the needle
@@ -153,6 +166,12 @@ waited_for() {
 
 logged() { grep -qF "$1" "$LOG"; }
 
+# The image comes from the harness cache, filled once by the binary under
+# test if it is not there yet, so only a first run downloads anything. Done
+# before the daemon starts, so nothing lands in a store a running daemon may
+# be reading; the pull further down registers what was copied.
+harness_cache_image "$AST" "$IMAGE" || fail "could not cache $IMAGE"
+harness_seed_images "$ASTERISM_HOME"
 echo "== persistence e2e in $ASTERISM_HOME"
 start_astd
 "$AST" pull "$IMAGE" >/dev/null 2>&1 || fail "pull $IMAGE"
@@ -419,6 +438,8 @@ if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
   fail "launchd still has $LABEL loaded after uninstall"
 fi
 expect "status after uninstall" "not installed" "$AST" service status
+# A tilde in a message is a tilde, not a path this script is about to use.
+# shellcheck disable=SC2088
 ok "~/Library/LaunchAgents is clean"
 
 echo "E2E PERSIST GREEN ($IMAGE)"

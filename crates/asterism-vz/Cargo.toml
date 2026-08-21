@@ -22,6 +22,11 @@ path = "src/helper/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+# For one constant: the build id every binary in this tree reports, stamped
+# in one place so that `ast`, `astd` and this helper cannot disagree about
+# which build they are without that being a real finding. Already compiled
+# in this workspace — `astd`, which spawns this helper, links it.
+asterism-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # The guest agent handshake is HMAC-SHA256, because the guest half of it is

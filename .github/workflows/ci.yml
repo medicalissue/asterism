@@ -49,13 +49,23 @@ jobs:
           sh -n packaging/install.sh
           sh -n scripts/render-formula.sh
           shellcheck -s sh packaging/install.sh scripts/render-formula.sh
-          shellcheck scripts/install-test.sh
-          # sign-vz.sh is the only thing standing between a build and an
-          # entitled helper: when it fails, vz is not broken loudly, it is
-          # simply unavailable. It is bash, not sh — it builds a codesign
-          # argument list in an array.
-          bash -n scripts/sign-vz.sh
-          shellcheck scripts/sign-vz.sh
+          # Every operational script, not just the installer's. These are what
+          # decide whether a release ships, and a suite with a quoting bug in
+          # its cleanup is a suite that reports green while leaving processes
+          # behind. -x follows the `.` into scripts/lib/harness.sh, which is
+          # where all of them get their process handling.
+          #
+          # The sweep is what covers sign-vz.sh, and that one matters more
+          # than its size suggests: it is the only thing standing between a
+          # build and an entitled helper, and when it fails vz is not broken
+          # loudly, it is simply unavailable.
+          for f in scripts/*.sh scripts/lib/*.sh gui/*.sh; do
+            bash -n "$f"
+          done
+          shellcheck -x scripts/*.sh scripts/lib/*.sh gui/*.sh
+
+      - name: The harness's own suite
+        run: bash scripts/harness-test.sh
 
       - name: The installer's test suite
         run: bash scripts/install-test.sh
@@ -66,3 +76,47 @@ jobs:
           ./scripts/render-formula.sh v0.0.0 0000000000000000000000000000000000000000000000000000000000000000 >/tmp/asterism.rb
           ruby -c /tmp/asterism.rb
           ruby -c packaging/asterism.rb
+
+  # The release candidate: build the artifact users would receive, install it
+  # with the script they would run, and prove that what got installed is one
+  # build of the thing that was published.
+  #
+  # Only the suites that need nothing of the machine run here. Everything
+  # that boots a guest needs a hypervisor, and a GitHub macOS runner is
+  # itself a VM with no nested virtualisation — so those lanes are run by a
+  # person, with the same command: `scripts/rc.sh --all`.
+  rc:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      # The desktop app's crate does not compile without its built frontend
+      # (`tauri::generate_context!` reads gui/ui/dist while it expands), so
+      # this is what lets the `unit` suite include the app's tests rather
+      # than report that it skipped them.
+      - name: Build the desktop app's frontend
+        run: |
+          set -eu
+          npm --prefix gui/ui ci
+          npm --prefix gui/ui run build
+
+      # The build id is stamped at compile time and is what the identity gate
+      # compares across binaries. Naming the commit here makes a CI run's
+      # artifacts traceable to it without a git checkout in hand.
+      - name: Run the suites that need nothing of the machine
+        env:
+          ASTERISM_BUILD_ID: ${{ github.sha }}
+        run: bash scripts/rc.sh --out "${RUNNER_TEMP}/rc"
+
+      # Whatever the suites kept, whether they passed or not: a green run's
+      # bug report is how the format itself stays reviewed.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rc-evidence
+          path: ${{ runner.temp }}/rc.evidence
+          if-no-files-found: ignore

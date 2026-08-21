@@ -248,6 +248,8 @@ export interface Settings {
   default_backend: string;
   daemon: string | null;
   daemon_error: string | null;
+  daemon_build: string | null;
+  app_build: string;
   home: string;
   service: Service;
 }
@@ -328,6 +330,8 @@ const PREVIEW_SETTINGS: Settings = {
   default_backend: 'vz',
   daemon: '0.0.2',
   daemon_error: null,
+  daemon_build: '0.0.2+0123456789ab',
+  app_build: '0.0.2+0123456789ab',
   home: '~/.asterism',
   service: {mechanism: 'LaunchAgent', summary: 'Running for this user', installed: true, unit: 'run.asterism.astd'},
 };

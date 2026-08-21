@@ -19,36 +19,53 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="$HOME/.cargo/bin:$PATH"
 cd "$ROOT"
-cargo build -q
-AST="$ROOT/target/debug/ast"
+# shellcheck source-path=SCRIPTDIR source=lib/harness.sh
+. "$ROOT/scripts/lib/harness.sh"
+harness_begin oci
+harness_binaries "$ROOT"
 
 # Fresh, SHORT home: unix socket paths are capped near 104 bytes.
 export ASTERISM_HOME="/private/tmp/ast-oci-$$"
+harness_own_home "$ASTERISM_HOME"
 PORT="${E2E_PORT:-8080}"
 WEB=oci-web
 ONESHOT=oci-once
-
-cleanup() {
-  "$AST" down "$WEB" >/dev/null 2>&1 || true
-  "$AST" down "$ONESHOT" >/dev/null 2>&1 || true
-  "$AST" rm "$WEB" >/dev/null 2>&1 || true
-  "$AST" rm "$ONESHOT" >/dev/null 2>&1 || true
-  pkill -f "$ROOT/target/debug/astd" 2>/dev/null || true
-  rm -rf "$ASTERISM_HOME"
-}
-trap cleanup EXIT
 
 mkdir -p "$ASTERISM_HOME/images"
 # Reuse an already-built store instead of re-pulling half of Docker Hub. The
 # guest kernel and the blob cache are the expensive parts; the ext4 images
 # rebuild in under a second from cached blobs.
-CACHE="${E2E_IMAGE_CACHE:-$HOME/.asterism/images}"
+# The harness's own cache, never ~/.asterism: that one belongs to the user's
+# daemon and may be written to while this is reading it.
+CACHE="${E2E_IMAGE_CACHE:-$(harness_cache_dir)/images}"
 if [ -d "$CACHE" ]; then
   cp -R "$CACHE/kernel" "$ASTERISM_HOME/images/" 2>/dev/null || true
   cp -R "$CACHE/oci" "$ASTERISM_HOME/images/" 2>/dev/null || true
   cp "$CACHE/"oci-*.raw "$ASTERISM_HOME/images/" 2>/dev/null || true
   cp "$CACHE/"oci-*.json "$ASTERISM_HOME/images/" 2>/dev/null || true
 fi
+
+cleanup() {
+  harness_keep_home "$ASTERISM_HOME" home
+  # Fill the cache on the way out, so that the next run starts from the store
+  # this one built. The read at the top is the other half; without this the
+  # cache is a directory that is only ever copied *from*, and every run
+  # re-pulls half of Docker Hub.
+  if [ -d "$ASTERISM_HOME/images" ]; then
+    mkdir -p "$CACHE"
+    cp -R "$ASTERISM_HOME/images/." "$CACHE/" 2>/dev/null || true
+  fi
+  "$AST" down "$WEB" >/dev/null 2>&1 || true
+  "$AST" down "$ONESHOT" >/dev/null 2>&1 || true
+  "$AST" rm "$WEB" >/dev/null 2>&1 || true
+  "$AST" rm "$ONESHOT" >/dev/null 2>&1 || true
+  # Only what this run started. The `pkill -f` that used to be here matched
+  # every astd built at this path, including a second checkout's.
+  harness_reap
+  rm -rf "$ASTERISM_HOME"
+  harness_artifacts_note
+}
+trap cleanup EXIT
 
 fail() { echo "E2E FAIL: $*" >&2; exit 1; }
 

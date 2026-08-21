@@ -191,6 +191,7 @@ impl MenuModel {
         out.push("[separator]".to_owned());
         out.push(item(0, &Action::Quit, "Quit Asterism", true));
         out.push(format!("[disabled] {}", version()));
+        out.push(format!("[disabled] {}", build_line()));
         out
     }
 }
@@ -233,6 +234,7 @@ pub fn build(app: &AppHandle, model: &MenuModel) -> tauri::Result<Menu<tauri::Wr
         .separator()
         .item(&quit)
         .item(&disabled(app, "version", &version())?)
+        .item(&disabled(app, "build", &build_line())?)
         .build()
 }
 
@@ -313,6 +315,18 @@ fn version() -> String {
     format!("Asterism {}", env!("CARGO_PKG_VERSION"))
 }
 
+/// Which build this app is, spelled the same way `ast version` spells it.
+///
+/// A version number is the same for every build between two tags, so it
+/// cannot answer "is the app the same build as the daemon it is talking to"
+/// — and the app is a separate download from the CLI, so they really do come
+/// apart. The id is stamped into `asterism-core` at compile time, and every
+/// binary in the tree links it, which is what makes the two comparable at a
+/// glance.
+fn build_line() -> String {
+    format!("build {}", asterism_core::BUILD_ID)
+}
+
 /// Daemon errors are context-chained and can run long; a menu item is not
 /// the place to discover that.
 fn ellipsize(s: &str, width: usize) -> String {
@@ -374,6 +388,7 @@ mod tests {
             "[separator]".to_owned(),
             "[quit] Quit Asterism  (enabled)".to_owned(),
             format!("[disabled] Asterism {}", env!("CARGO_PKG_VERSION")),
+            format!("[disabled] build {}", asterism_core::BUILD_ID),
         ]
     }
 
@@ -545,10 +560,20 @@ mod tests {
     }
 
     #[test]
-    fn the_version_is_the_last_line() {
-        let last = fleet(vec![]).lines().last().unwrap().clone();
-        assert_eq!(last, format!("[disabled] Asterism {}", env!("CARGO_PKG_VERSION")));
-        assert!(last.starts_with("[disabled]"), "the version is not clickable");
+    fn the_version_and_the_build_are_the_last_two_lines() {
+        let lines = fleet(vec![]).lines();
+        let tail = &lines[lines.len() - 2..];
+        assert_eq!(tail[0], format!("[disabled] Asterism {}", env!("CARGO_PKG_VERSION")));
+        assert_eq!(tail[1], format!("[disabled] build {}", asterism_core::BUILD_ID));
+        assert!(tail.iter().all(|l| l.starts_with("[disabled]")), "identity is not clickable");
+    }
+
+    #[test]
+    fn the_build_id_names_a_source_and_not_just_a_version() {
+        // The point of the line: it says something the version line cannot.
+        let build = build_line();
+        assert!(build.starts_with("build "), "{build}");
+        assert!(build.contains('+'), "{build} carries no source");
     }
 
     #[test]
