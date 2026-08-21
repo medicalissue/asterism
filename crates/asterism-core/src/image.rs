@@ -338,7 +338,17 @@ mod tests {
         assert_eq!(r.kind(), ImageKind::OciRootfs);
         assert!(r.url.is_none(), "an image is pulled from a registry, not downloaded");
         assert!(r.staging.is_none());
-        assert!(!r.is_pulled(), "nothing is in this test's store");
+
+        // Whether `nginx` is *pulled* is a fact about whichever store this
+        // machine happens to have, not about resolving: on a device that has
+        // really pulled one the honest answer is yes. The half of
+        // `oci_resolved` worth pinning here is the other one — a reference
+        // nothing has built names a path that cannot exist — so ask it about a
+        // digest no registry ever served.
+        let unbuilt = resolve(&format!("nginx@sha256:{}", "0".repeat(64))).unwrap();
+        assert_eq!(unbuilt.kind(), ImageKind::OciRootfs);
+        assert!(unbuilt.url.is_none());
+        assert!(!unbuilt.is_pulled(), "nothing has been built for that digest");
 
         assert_eq!(
             resolve("docker.io/library/nginx:latest").unwrap().name,
