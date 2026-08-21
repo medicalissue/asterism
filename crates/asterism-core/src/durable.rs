@@ -48,9 +48,9 @@
 //!
 //! ### Crash windows, enumerated
 //!
-//! A commit is: write the temp file, sync it, link the live file to `.bak`,
-//! rename, sync the directory. Cut power at any point and the directory
-//! holds one of:
+//! A commit is: create the temp file fresh, write it, sync it, link the live
+//! file to `.bak`, rename, sync the directory. Cut power at any point and the
+//! directory holds one of:
 //!
 //! | after            | live file | `.bak`  | recovery                       |
 //! |------------------|-----------|---------|--------------------------------|
@@ -64,6 +64,21 @@
 //! rename are both made durable by the *same* trailing directory sync, so a
 //! crash between them can lose the link — leaving the new value live and no
 //! backup, which is a state with no ambiguity in it.
+//!
+//! ### What may be at the staging path
+//!
+//! A staging path is derived from the file being committed, so it is
+//! predictable: `secrets.json.tmp` sits next to `secrets.json` in a directory
+//! anyone on the machine can list. Whatever is already there is therefore
+//! *not* something to open — a mode argument is only applied to a file that
+//! `open(2)` creates, and a symlink is followed. Both of those turn "write
+//! the secret to a 0600 file" into "write the secret wherever the file that
+//! is already there points, at whatever permissions it already has".
+//!
+//! So the staging file is created with `O_CREAT | O_EXCL | O_NOFOLLOW`, and
+//! an occupied path is cleared with `unlink(2)` — which removes a symlink
+//! itself and never its target — before a bounded number of retries. See
+//! [`create_fresh`], which is where the whole of that argument lives.
 //!
 //! ### Fault injection
 //!
@@ -119,8 +134,14 @@ pub fn commit(path: &Path, bytes: &[u8]) -> Result<()> {
 /// [`commit`], with the file created `0600` from the first byte.
 ///
 /// For anything a second user on this machine must not read: the secret
-/// catalog, a cached guest key. Setting the mode after the write would leave
-/// a window, so it is passed to `open(2)`.
+/// catalog, a cached guest key, an instance's egress CA key.
+///
+/// Two things make that true rather than merely intended. The mode is passed
+/// to `open(2)` rather than set afterwards, so there is no window in which
+/// the file exists and is readable. And the file is one this call *created* —
+/// see [`create_fresh`] — because a mode argument does nothing at all for a
+/// path that already exists, which is how a predictable staging path turns
+/// into a secret in somebody else's file.
 pub fn commit_private(path: &Path, bytes: &[u8]) -> Result<()> {
     commit_inner(path, bytes, Some(0o600))
 }
@@ -158,7 +179,7 @@ fn commit_inner(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<()> {
     //    A failure here is not fatal: it costs the safety net, not the
     //    commit, and refusing to save because the *previous* save cannot be
     //    copied would be the tail wagging the dog.
-    if let Err(e) = keep_backup(path) {
+    if let Err(e) = keep_backup(path, mode) {
         eprintln!(
             "asterism: could not keep a last-known-good copy of {}: {e} — \
              committing anyway",
@@ -181,23 +202,91 @@ fn commit_inner(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<()> {
 
 /// Write `bytes` to `path` and force them to the device.
 fn write_forced(path: &Path, bytes: &[u8], mode: Option<u32>) -> io::Result<()> {
-    faults::check_io(faults::Point::Create, path)?;
-    let mut open = OpenOptions::new();
-    open.create(true).truncate(true).write(true);
-    #[cfg(unix)]
-    if let Some(mode) = mode {
-        use std::os::unix::fs::OpenOptionsExt;
-        open.mode(mode);
-    }
-    #[cfg(not(unix))]
-    let _ = mode;
-    let mut file = open.open(path)?;
+    let mut file = create_fresh(path, mode)?;
 
     faults::check_io(faults::Point::Write, path)?;
     file.write_all(bytes)?;
 
     faults::check_io(faults::Point::SyncFile, path)?;
     full_sync(&file)
+}
+
+/// How many times a commit will clear an occupied staging path before it
+/// gives up. Three, because the only legitimate occupant is the leftover of
+/// one interrupted commit: anything that keeps reappearing is something else,
+/// and racing it forever would be the wrong answer.
+const STAGING_ATTEMPTS: usize = 3;
+
+/// Open the staging file, and only ever a *new* one, at exactly `mode`.
+///
+/// `O_CREAT | O_EXCL | O_NOFOLLOW`: create it or do not open anything. This
+/// is the whole of the file's security, and each half of it matters.
+///
+/// **`O_EXCL`, because a mode is only applied to a file that is created.**
+/// `open(O_CREAT)` on a path that already exists ignores the mode argument
+/// entirely and hands back the existing file with the permissions it already
+/// had. A staging path is predictable — `secrets.json.tmp`, next to a
+/// world-readable directory — so "create it 0600" written that way means
+/// "0600 if nobody got there first", and a `0666` file left by a crash, or
+/// put there on purpose, is a file that a secret gets written into and
+/// anyone on the machine can read.
+///
+/// **`O_NOFOLLOW` (and `O_EXCL`, which refuses a symlink of its own accord),
+/// because otherwise the bytes go somewhere else.** A symlink at the staging
+/// path means `write_all` writes *through* it, to whatever it points at. The
+/// rename afterwards moves the link, not the target, so the commit succeeds,
+/// the state file looks right, and the secret is sitting in a file the
+/// attacker chose.
+///
+/// An occupied path is cleared with `unlink(2)`, which removes a symlink
+/// itself and never what it points at, and the create is retried. That is
+/// also what keeps a `kill -9` recoverable: the staging file an interrupted
+/// commit left behind is exactly this case, and the next commit clears it and
+/// carries on rather than refusing until someone sweeps by hand.
+fn create_fresh(path: &Path, mode: Option<u32>) -> io::Result<File> {
+    for _ in 0..STAGING_ATTEMPTS {
+        faults::check_io(faults::Point::Create, path)?;
+        let mut open = OpenOptions::new();
+        open.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // Not `umask`'s business what a private file is: the mode is on
+            // the open, and umask can only take bits away from it.
+            open.mode(mode.unwrap_or(0o644));
+            open.custom_flags(libc::O_NOFOLLOW);
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        match open.open(path) {
+            Ok(file) => return Ok(file),
+            // Something is already there — a leftover, a symlink, anything.
+            // `O_EXCL` reports a symlink as `EEXIST` on both platforms this
+            // runs on, but `O_NOFOLLOW`'s own `ELOOP` is the same answer and
+            // is accepted here rather than left to depend on which flag the
+            // kernel checks first.
+            Err(e)
+                if e.kind() == io::ErrorKind::AlreadyExists
+                    || e.raw_os_error() == Some(libc::ELOOP) => {}
+            Err(e) => return Err(e),
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            // A directory at the staging path, or one this user cannot
+            // unlink. Not something to keep trying.
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "{} keeps being re-created between clearing it and staging into it. \
+             Asterism will not write into a file it did not create — remove \
+             whatever is doing that before running this again.",
+            path.display()
+        ),
+    ))
 }
 
 /// Link the live file to its `.bak`, so the value about to be replaced is
@@ -207,20 +296,63 @@ fn write_forced(path: &Path, bytes: &[u8], mode: Option<u32>) -> io::Result<()> 
 /// file's size, and it cannot itself run out of disk halfway. Filesystems
 /// that will not link (or a `.bak` that is somehow a directory) fall back to
 /// a copy, and a first-ever commit has nothing to keep.
-fn keep_backup(live: &Path) -> io::Result<()> {
-    if !live.exists() {
-        return Ok(());
+fn keep_backup(live: &Path, mode: Option<u32>) -> io::Result<()> {
+    // `symlink_metadata`, not `exists`: the question is what is at this path,
+    // not what it leads to.
+    let meta = match std::fs::symlink_metadata(live) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if meta.file_type().is_symlink() {
+        // Following it would copy somebody else's file and call the copy this
+        // device's last-known-good state. The commit below replaces the link
+        // itself, so the only thing lost by refusing here is the safety net
+        // for one commit — and the caller says so out loud.
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is a symlink, not this device's state file", live.display()),
+        ));
     }
     faults::check_io(faults::Point::Backup, live)?;
     let bak = backup_path(live);
+    // Unlinked first, which removes a symlink sitting there rather than
+    // following it, and which `link(2)` needs anyway: it refuses a
+    // destination that exists.
     match std::fs::remove_file(&bak) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
     match std::fs::hard_link(live, &bak) {
+        // A link shares the inode, and therefore the mode: a backup of a
+        // 0600 file cannot come out any more readable than the file.
         Ok(()) => Ok(()),
-        Err(_) => std::fs::copy(live, &bak).map(|_| ()),
+        // A filesystem that will not link. `fs::copy` is the obvious
+        // fallback and the wrong one — it creates the destination at the
+        // default mode and fixes it afterwards, which for a secret is a
+        // window where the copy is world-readable. This creates it at the
+        // right mode instead.
+        Err(_) => {
+            let bytes = std::fs::read(live)?;
+            let mut copy = create_fresh(&bak, mode.or(Some(meta_mode(&meta))))?;
+            copy.write_all(&bytes)?;
+            full_sync(&copy)
+        }
+    }
+}
+
+/// The permission bits of a file this device already committed.
+fn meta_mode(meta: &std::fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o777
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        0o644
     }
 }
 
@@ -235,7 +367,7 @@ fn keep_backup(live: &Path) -> io::Result<()> {
 pub fn publish_file(part: &Path, dest: &Path) -> Result<()> {
     // Opened read-only purely to flush it: whoever wrote it has closed it,
     // and a closed file is not a flushed one.
-    match File::open(part) {
+    match open_no_follow(part) {
         Ok(file) => {
             faults::check_io(faults::Point::SyncFile, part)?;
             full_sync(&file).with_context(|| format!("flushing {}", part.display()))?;
@@ -282,6 +414,22 @@ pub fn publish_rename(from: &Path, to: &Path) -> Result<()> {
         sync_dir(source_dir).with_context(|| format!("flushing {}", source_dir.display()))?;
     }
     Ok(())
+}
+
+/// Open a file for reading, refusing a symlink.
+///
+/// What is being published here was built under a name this process chose. A
+/// symlink at that name is not our staging file, and publishing it would put
+/// a link where the caller asked for the bytes.
+fn open_no_follow(path: &Path) -> io::Result<File> {
+    let mut open = OpenOptions::new();
+    open.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open.custom_flags(libc::O_NOFOLLOW);
+    }
+    open.open(path)
 }
 
 /// Force every file in a tree, and then the directories themselves.
@@ -953,6 +1101,192 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "and it was created that way, not chmod'd after");
         }
+    }
+
+    // ---- what may be sitting at the staging path ---------------------------
+    //
+    // A staging path is predictable and it is next to a directory anyone on
+    // the machine can list. Everything below is what happens when something
+    // is already there, and each of these is a way a secret used to escape.
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        // Not `metadata`: the question is what is at this path.
+        std::fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    const SECRET: &[u8] = b"{\"token\":\"NEVER-READABLE-BY-ANYONE-ELSE\"}";
+
+    /// A `0666` file at the staging path — the leftover of a crash, or one
+    /// put there on purpose. `open(O_CREAT)` would hand it back *with its
+    /// existing permissions*, mode argument ignored, and the secret would be
+    /// written into a world-readable file.
+    #[cfg(unix)]
+    #[test]
+    fn a_permissive_file_at_the_staging_path_cannot_leak_a_private_commit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.json");
+        let tmp = tmp_path(&path);
+
+        std::fs::write(&tmp, b"planted").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert_eq!(mode_of(&tmp), 0o666, "the trap is set");
+
+        commit_private(&path, SECRET).unwrap();
+
+        assert_eq!(mode_of(&path), 0o600, "the committed secret is private");
+        assert_eq!(std::fs::read(&path).unwrap(), SECRET);
+        assert!(!tmp.exists(), "and the planted file is gone, not written into");
+    }
+
+    /// The same trap on the *public* commit path. Nothing secret is at stake
+    /// here, but adopting a file this process did not create means adopting
+    /// whatever permissions it came with.
+    #[cfg(unix)]
+    #[test]
+    fn a_permissive_file_at_the_staging_path_does_not_set_a_public_commits_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let tmp = tmp_path(&path);
+        std::fs::write(&tmp, b"planted").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        commit(&path, b"committed").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"committed");
+        assert_eq!(mode_of(&path) & 0o022, 0, "not group- or world-writable");
+    }
+
+    /// A symlink at the staging path. `open` would follow it and `write_all`
+    /// would put the secret in the file it points at; the rename afterwards
+    /// moves the *link*, so the commit looks entirely successful.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_at_the_staging_path_is_not_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.json");
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"victim").unwrap();
+        std::os::unix::fs::symlink(&victim, tmp_path(&path)).unwrap();
+
+        commit_private(&path, SECRET).unwrap();
+
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"victim",
+            "the secret was written through the symlink"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), SECRET);
+        assert_eq!(mode_of(&path), 0o600);
+        assert!(
+            std::fs::symlink_metadata(tmp_path(&path)).is_err(),
+            "the symlink was unlinked, not followed"
+        );
+    }
+
+    /// A symlink at the *live* path. The commit must replace the link itself
+    /// — `rename(2)` never follows its destination — and must not have gone
+    /// looking through it to make a backup on the way.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_at_the_live_path_is_replaced_rather_than_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.json");
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"victim").unwrap();
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+
+        commit_private(&path, SECRET).unwrap();
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"victim", "the victim was overwritten");
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(meta.file_type().is_file(), "the link was replaced by a real file");
+        assert_eq!(std::fs::read(&path).unwrap(), SECRET);
+        assert_eq!(mode_of(&path), 0o600);
+        // And nothing followed the link on the way past: hard-linking the
+        // "previous value" would have made the victim's inode reachable as
+        // this device's last-known-good state.
+        let bak = backup_path(&path);
+        if bak.exists() {
+            assert_ne!(std::fs::read(&bak).unwrap(), b"victim", "the backup is the victim");
+        }
+    }
+
+    /// A symlink at the backup path. The last-known-good copy is made by
+    /// unlinking whatever is there and linking afresh, so this ends up as a
+    /// real file and the victim is untouched.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_at_the_backup_path_is_not_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.json");
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"victim").unwrap();
+
+        commit_private(&path, b"first").unwrap();
+        std::os::unix::fs::symlink(&victim, backup_path(&path)).unwrap();
+        commit_private(&path, SECRET).unwrap();
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"victim", "the victim was overwritten");
+        let bak = backup_path(&path);
+        assert!(std::fs::symlink_metadata(&bak).unwrap().file_type().is_file());
+        assert_eq!(std::fs::read(&bak).unwrap(), b"first");
+        assert_eq!(mode_of(&bak), 0o600, "a private file's backup is private too");
+    }
+
+    /// A directory at the staging path cannot be cleared, and must be a
+    /// refusal rather than a loop.
+    #[test]
+    fn a_directory_at_the_staging_path_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::create_dir_all(tmp_path(&path)).unwrap();
+        let err = commit(&path, b"committed").unwrap_err();
+        assert!(format!("{err:#}").contains("staging"), "{err:#}");
+        assert!(!path.exists(), "and nothing was published");
+    }
+
+    /// The other side of clearing an occupied staging path: the leftover of
+    /// an interrupted commit must not block the retry. This is the same
+    /// requirement as `a_crash_before_the_rename_converges_on_the_old_value`,
+    /// asserted without the sweep — a daemon that crashed and came back has
+    /// to be able to commit before it next sweeps anything.
+    #[test]
+    fn the_leftover_of_an_interrupted_commit_does_not_block_the_next_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        commit(&path, b"first").unwrap();
+
+        let armed =
+            faults::arm("leftover", Point::Rename, "state.json", io::ErrorKind::Other);
+        assert!(commit(&path, b"second").is_err());
+        drop(armed);
+        assert!(tmp_path(&path).exists(), "the interrupted commit left its staging file");
+
+        // No sweep in between: the commit clears it itself.
+        commit(&path, b"third").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"third");
+        assert!(!tmp_path(&path).exists());
+    }
+
+    /// Publishing bytes somebody else built has the same rule: a symlink at
+    /// the staging name is not the staging file.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_part_is_not_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.raw");
+        std::fs::write(&victim, b"victim").unwrap();
+        let part = dir.path().join("image.raw.part");
+        std::os::unix::fs::symlink(&victim, &part).unwrap();
+        let dest = dir.path().join("image.raw");
+
+        assert!(publish_file(&part, &dest).is_err());
+        assert!(!dest.exists(), "a symlink was not published as the image");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"victim");
     }
 
     #[test]

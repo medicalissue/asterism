@@ -11,7 +11,9 @@
 #      next start, out loud, and written back healthy
 #   3. a torn state.json with a torn backup is REFUSED — the daemon does not
 #      start on an empty registry and quietly forget this device's instances
-#   4. the staging file an interrupted commit leaves is swept at start
+#   4. the staging file an interrupted commit leaves is swept at start, and
+#      whatever is at a staging path — a symlink, a world-readable plant —
+#      is cleared rather than opened
 #   5. a shard written by a pre-envelope Asterism migrates on read
 #   6. a state file from a NEWER Asterism is refused as a downgrade rather
 #      than parsed as best it can be
@@ -207,6 +209,49 @@ logged "a commit was interrupted before it published" \
 ok "the staging file an interrupted commit left is swept, and said"
 [ -f "$STATE.bak" ] || fail "the sweep took the last-known-good copy with it"
 ok "and the last-known-good copy is not swept with it"
+
+# ---- 4b. what is already at the staging path is not opened -----------------
+
+# The staging path is predictable and sits in a directory anyone on this
+# machine can list. A symlink there would make the daemon write this device's
+# state into whatever it points at, and the rename afterwards would move the
+# link — so the commit would look entirely successful.
+#
+# Planted with the daemon ALREADY RUNNING, deliberately: the startup sweep
+# would otherwise clear it, and the sweep is not what is being tested here.
+# What is being tested is the open that stages the next commit.
+kill_astd
+start_astd
+VICTIM="$ASTERISM_HOME/victim.txt"
+printf 'victim' >"$VICTIM"
+ln -s "$VICTIM" "$STATE.tmp"
+# `create` commits the shard, which is the write that would have gone through
+# the link.
+expect "a commit with a symlink in the way" "three  defined" \
+  "$AST" create three --image "$IMAGE" --mem 1G --disk 5G
+[ "$(cat "$VICTIM")" = "victim" ] || fail "the shard was written through the symlink"
+if [ -L "$STATE" ]; then fail "the state file is a symlink"; fi
+if [ -L "$STATE.tmp" ]; then fail "the symlink is still at the staging path"; fi
+OUT="$(listed)"
+grep -qF "three" <<<"$OUT" || fail "the commit did not land:"$'\n'"$OUT"
+ok "a symlink at the staging path is cleared, not written through"
+"$AST" rm three >/dev/null 2>&1 || true
+
+# A world-readable file left at the staging path must not become the mode of
+# what is committed: `open(O_CREAT)` on an existing path ignores the mode it
+# is given and hands back the file with the permissions it already had.
+# Planted with the daemon running, for the same reason as above.
+printf 'planted' >"$STATE.tmp"
+chmod 0666 "$STATE.tmp"
+expect "a commit with a planted file in the way" "four  defined" \
+  "$AST" create four --image "$IMAGE" --mem 1G --disk 5G
+MODE="$(stat -f '%Lp' "$STATE")"
+case "$MODE" in
+  *[2367]) fail "the committed shard is group- or world-writable (mode $MODE)" ;;
+esac
+if grep -qF "planted" "$STATE"; then fail "the planted file became the shard"; fi
+ok "a permissive file at the staging path is cleared, not adopted (mode $MODE)"
+"$AST" rm four >/dev/null 2>&1 || true
 
 # ---- 5. a pre-envelope shard migrates on read ------------------------------
 

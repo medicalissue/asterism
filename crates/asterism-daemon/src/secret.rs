@@ -1290,6 +1290,51 @@ mod tests {
         }
     }
 
+    /// The catalog through its own API, with the staging path already
+    /// occupied by a world-readable file — a crash leftover, or something a
+    /// second user on this machine put there. The metadata names every
+    /// authority this device holds a credential for, and it must come out
+    /// 0600 whatever was sitting in the way.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_staging_file_cannot_make_the_catalog_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.json");
+        let tmp = asterism_core::durable::tmp_path(&path);
+        std::fs::write(&tmp, b"planted").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let lineage = ValueRevision::mint();
+        let plane = local_plane(&path, "laptop", MemoryStore::default());
+        plane.put(secret(1, vec![source("laptop", 1, &lineage)]), &value(b"v1")).unwrap();
+
+        let mode = std::fs::symlink_metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the planted mode was adopted");
+        assert!(!tmp.exists(), "and the planted file is gone, not written into");
+    }
+
+    /// The same path with a symlink in the way. Following it would put the
+    /// catalog wherever the link pointed, and the rename afterwards would
+    /// hide that it happened.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_staging_path_cannot_redirect_the_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.json");
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"victim").unwrap();
+        std::os::unix::fs::symlink(&victim, asterism_core::durable::tmp_path(&path)).unwrap();
+
+        let lineage = ValueRevision::mint();
+        let plane = local_plane(&path, "laptop", MemoryStore::default());
+        plane.put(secret(1, vec![source("laptop", 1, &lineage)]), &value(b"v1")).unwrap();
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"victim", "the catalog went to the victim");
+        let catalog = Catalog::load(&path).unwrap();
+        assert_eq!(catalog.secrets.len(), 1);
+    }
+
     #[test]
     fn plaintext_never_enters_the_metadata_file() {
         let dir = tempfile::tempdir().unwrap();
