@@ -280,10 +280,10 @@ echo "ok: roadmap direct/<=5ms SLO refused the relay before either device mutate
 sudo ip -n "$DEV_A" link set etha up
 sudo ip -n "$DEV_B" link set ethb up
 sleep 2
-sudo ip -n "$DEV_A" link set wifi101 down
-sudo ip -n "$DEV_B" link set wifi102 down
 sudo ip -n "$DEV_A" route del default
 sudo ip -n "$DEV_B" route del default
+sudo ip -n "$DEV_A" link set wifi101 down
+sudo ip -n "$DEV_B" link set wifi102 down
 sudo iptables -I FORWARD 1 -s 198.18.77.0/24 -o "$UPLINK" \
   -m comment --comment "$TAG-outage" -j REJECT
 WAN_RULE=1
