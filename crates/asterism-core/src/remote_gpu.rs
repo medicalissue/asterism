@@ -709,7 +709,7 @@ impl Provider {
                         "provider could not reserve launch result memory",
                     )
                 })?;
-                for (a, b) in lhs_bytes.chunks_exact(4).zip(rhs_bytes.chunks_exact(4)) {
+                for (a, b) in lhs_bytes.chunks(4).zip(rhs_bytes.chunks(4)) {
                     let a = f32::from_le_bytes(a.try_into().expect("four-byte chunk"));
                     let b = f32::from_le_bytes(b.try_into().expect("four-byte chunk"));
                     result.extend_from_slice(&(a + b).to_le_bytes());
@@ -1177,7 +1177,7 @@ mod tests {
             panic!("read returns data")
         };
         let values = data
-            .chunks_exact(4)
+            .chunks(4)
             .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
             .collect::<Vec<_>>();
         assert_eq!(values, vec![6.0, 2.0, 6.0]);

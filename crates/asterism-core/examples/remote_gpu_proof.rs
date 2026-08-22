@@ -408,7 +408,7 @@ fn decode_f32(bytes: &[u8]) -> Result<Vec<f32>> {
         bail!("provider returned {} bytes for f32 memory", bytes.len());
     }
     Ok(bytes
-        .chunks_exact(4)
+        .chunks(4)
         .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
         .collect())
 }
