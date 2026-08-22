@@ -641,11 +641,19 @@ mod tests {
         use asterism_core::hv::{ControlChannel, GuestEndpoint};
         use asterism_core::instance::{now_unix, Shape, Status};
         use asterism_core::registry::Shard;
+        use std::io::Read;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        use std::process::Stdio;
 
         /// A process that remains alive while its argv carries an
-        /// instance-owned socket path.  The shell keeps the path as a plain
-        /// argument; its short-lived `sleep` child receives only a valid
-        /// duration, which works with both BSD and GNU `sleep`.
+        /// instance-owned socket path.
+        ///
+        /// The shell writes a byte across a socket only after it has exec'd
+        /// and parsed the script, then blocks on its piped stdin. Waiting for
+        /// that byte closes the fork-to-exec race without guessing how long
+        /// the host needs, and avoids spawning a second process just to keep
+        /// the fixture alive.
         struct SocketArgFixture {
             child: Child,
             exec: String,
@@ -653,20 +661,49 @@ mod tests {
 
         impl SocketArgFixture {
             fn spawn(socket: &Path) -> Self {
+                const READY: &[u8] = b"ready\n";
+
+                let (mut ready, child_ready) = UnixStream::pair().unwrap();
+                ready
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let child_ready: OwnedFd = child_ready.into();
                 let child = Command::new("/bin/sh")
                     .args([
                         "-c",
-                        "while :; do sleep 1; done",
+                        "printf 'ready\\n'; IFS= read -r _",
                         "asterism-adoption-fixture",
                     ])
                     .arg(socket)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::from(child_ready))
                     .spawn()
                     .unwrap();
+                let mut fixture = Self {
+                    child,
+                    exec: String::new(),
+                };
+
+                let mut observed = [0; READY.len()];
+                ready.read_exact(&mut observed).unwrap_or_else(|error| {
+                    panic!(
+                        "adoption fixture {} did not report exec readiness: {error}",
+                        fixture.child.id()
+                    )
+                });
+                assert_eq!(
+                    observed,
+                    READY,
+                    "adoption fixture {} sent an invalid readiness marker",
+                    fixture.child.id()
+                );
+
                 // `/bin/sh` is an alias on some hosts (notably to `dash` on
                 // Linux). Adoption intentionally compares the executable
-                // identity exactly, so make this fixture expect what the
-                // kernel reports rather than weakening that product check.
-                let exec = ProcId::capture(child.id())
+                // identity exactly. Read what the kernel reports only after
+                // the child itself proved exec and argv readiness rather than
+                // weakening that product check.
+                fixture.exec = ProcId::capture(fixture.child.id())
                     .unwrap()
                     .exec
                     .expect("the fixture executable should be readable")
@@ -674,7 +711,7 @@ mod tests {
                     .and_then(|name| name.to_str())
                     .expect("the fixture executable should have a UTF-8 name")
                     .to_owned();
-                Self { child, exec }
+                fixture
             }
 
             fn id(&self) -> u32 {
