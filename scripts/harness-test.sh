@@ -180,6 +180,21 @@ ASTERISM_TEST_CACHE="$empty" harness_seed_images "$WORK/seed2" \
 [ -d "$WORK/seed2/images" ] || fail "seeding did not make the image directory"
 ok "an empty cache seeds nothing and fails nothing"
 
+# Direct invocations do not share a machine-global diagnostics directory.
+# The release-candidate runner overrides this deliberately so its suites are
+# collected together; without that override, each shell owns its own path.
+default_one="$(env -u ASTERISM_TEST_ARTIFACTS bash -c \
+  '. scripts/lib/harness.sh; harness_artifacts_dir')"
+default_two="$(env -u ASTERISM_TEST_ARTIFACTS bash -c \
+  '. scripts/lib/harness.sh; harness_artifacts_dir')"
+[ "$default_one" != "$default_two" ] \
+  || fail "two direct runs would share diagnostics at $default_one"
+case "$default_one" in
+  *asterism-harness-artifacts-[0-9]*) ;;
+  *) fail "the default diagnostics path is not run-owned: $default_one" ;;
+esac
+ok "direct runs get separate diagnostics directories"
+
 # ---- 9. evidence is copied out before the home it lives in goes --------------
 
 mkdir -p "$home/instances/one"

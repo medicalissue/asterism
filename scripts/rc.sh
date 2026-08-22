@@ -187,12 +187,21 @@ esac
 TARBALL="asterism-${VERSION}-${TARGET}.tar.gz"
 
 # Short, because a unix socket path under a suite's home is capped near 104
-# bytes and every one of them starts here.
-RUN="${OUT:-/private/tmp/ast-rc-$$}"
+# bytes and every one of them starts here. More importantly, cleanup may
+# remove this directory, so it must be one this process created. An existing
+# --out is rejected rather than treated as harness-owned data.
+if [ -n "$OUT" ]; then
+  RUN="$OUT"
+  [ ! -e "$RUN" ] || fail "--out must not already exist: $RUN"
+  [ ! -e "$RUN.evidence" ] || fail "evidence path must not already exist: $RUN.evidence"
+  mkdir "$RUN" || fail "could not create --out directory: $RUN"
+else
+  RUN="$(mktemp -d "${TMPDIR:-/tmp}/ast-rc.XXXXXX")" \
+    || fail "could not create the run directory"
+fi
 PREFIX="$RUN/prefix"
 EVIDENCE="$RUN/evidence"
 
-harness_begin rc
 # Every suite writes its diagnostics under this run rather than under a
 # global default, so one directory holds the whole story and CI can upload it
 # as one artifact.
@@ -201,6 +210,7 @@ export ASTERISM_TEST_ARTIFACTS="$EVIDENCE"
 # between runs on purpose: a base image is a gigabyte and re-downloading it
 # per suite is what makes people stop running these.
 export ASTERISM_TEST_CACHE="${ASTERISM_TEST_CACHE:-$HOME/.cache/asterism-harness}"
+harness_begin rc
 
 cleanup() {
   # The prefix is put back the way an uninstall would leave it, because a
@@ -226,7 +236,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$RUN" "$EVIDENCE"
 # Registered in this shell, not inside the suite: a suite runs down a pipe
 # into `tee`, which is a subshell, and a pid registered there would be
 # forgotten by the time the cleanup trap runs.
