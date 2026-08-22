@@ -7,29 +7,31 @@ set -eu
 helper=crates/asterism-hyperv/src/windows.rs
 daemon=crates/asterism-daemon/src/backend/hyperv.rs
 
+# Git for Windows ships grep but not ripgrep. Spell Rust identifier boundaries
+# with POSIX character classes so a longer lookalike cannot satisfy the gate.
 for symbol in \
   HcsCreateComputeSystem HcsOpenComputeSystem HcsStartComputeSystem \
   HcsShutDownComputeSystem HcsTerminateComputeSystem HcsSaveComputeSystem \
   HcnCreateNetwork HcnCreateEndpoint CreateVirtualDisk AttachVirtualDisk \
   AF_HYPERV SOCKADDR_HV HV_PROTOCOL_RAW
 do
-  rg -q "\\b${symbol}\\b" "$helper" || {
+  grep -Eq "(^|[^[:alnum:]_])${symbol}([^[:alnum:]_]|$)" "$helper" || {
     echo "native Hyper-V helper is missing direct API seam ${symbol}" >&2
     exit 1
   }
 done
 
-if rg -n -i '\b(qemu|whpx|powershell|pwsh|wmic\.exe)\b' "$helper"; then
+if grep -Eni '(^|[^[:alnum:]_])(qemu|whpx|powershell|pwsh|wmic\.exe)([^[:alnum:]_]|$)' "$helper"; then
   echo "native Hyper-V helper contains a forbidden wrapper/runtime path" >&2
   exit 1
 fi
 
-if rg -n 'windows_sys|Hcs[A-Z]|Hcn[A-Z]|CreateVirtualDisk|AF_HYPERV|SOCKADDR_HV' "$daemon"; then
+if grep -En 'windows_sys|Hcs[A-Z]|Hcn[A-Z]|CreateVirtualDisk|AF_HYPERV|SOCKADDR_HV' "$daemon"; then
   echo "Windows implementation details leaked above the helper protocol" >&2
   exit 1
 fi
 
-rg -q 'ShouldTerminateOnLastHandleClosed.*false' crates/asterism-hyperv/src/lib.rs || {
+grep -Eq '"ShouldTerminateOnLastHandleClosed"[[:space:]]*:[[:space:]]*false' crates/asterism-hyperv/src/lib.rs || {
   echo "durable HCS ownership flag is not pinned in the protocol document" >&2
   exit 1
 }
