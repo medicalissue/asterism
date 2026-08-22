@@ -263,7 +263,8 @@ fn a_move_refuses_a_mutated_adopted_base_before_fencing_the_source() {
         state_before,
         "the refused move changed the source shard"
     );
-    let Response::Instance { instance } = astd.ask_request(&Request::Status { name: "dev".into() })
+    let Response::Instance { instance, .. } =
+        astd.ask_request(&Request::Status { name: "dev".into() })
     else {
         panic!("the source row could not be read after refusal");
     };

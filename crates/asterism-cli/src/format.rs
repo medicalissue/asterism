@@ -10,6 +10,7 @@
 //!
 //! Anything only one command prints lives with that command instead.
 
+use asterism_core::hv::GuestHealth;
 use asterism_core::instance::{now_unix, Instance, Restart};
 use asterism_core::paths;
 use asterism_core::registry::OrbitRow;
@@ -79,7 +80,7 @@ pub(crate) fn print_table(rows: &[OrbitRow]) {
 
 /// `ast status`: the instance, then the parts it is assembled from and where
 /// in the pool each of them is sourced.
-pub(crate) fn print_detail(inst: &Instance) {
+pub(crate) fn print_detail(inst: &Instance, guest_health: Option<&GuestHealth>) {
     println!("name:    {}", inst.name);
     println!("id:      {}", inst.id);
     println!("status:  {}", inst.status);
@@ -134,6 +135,10 @@ pub(crate) fn print_detail(inst: &Instance) {
         );
     }
 
+    for line in guest_health_lines(guest_health) {
+        println!("{line}");
+    }
+
     // Every row names the device the part comes from. Most of them name the
     // same device, and say why: the disk follows the cpu because that is the
     // cheapest place for it, not because that device owns the instance.
@@ -144,6 +149,57 @@ pub(crate) fn print_detail(inst: &Instance) {
     for p in &parts {
         let note = p.note.as_ref().map(|n| format!("  ({n})")).unwrap_or_default();
         println!("  {:<kind$}  {:<source$}  {}{note}", p.kind, p.source, p.detail);
+    }
+}
+
+/// The agent health summary belongs between the instance's own facts and its
+/// assembled parts: it is a fresh guest observation, neither a durable
+/// property of the instance nor one of its allocated resources.
+fn guest_health_lines(health: Option<&GuestHealth>) -> Vec<String> {
+    let Some(health) = health else { return Vec::new() };
+
+    let mut guest = Vec::new();
+    if !health.addrs.is_empty() {
+        guest.push(health.addrs.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "));
+    }
+    guest.push(format!("up {}", duration(health.uptime_secs)));
+    guest.push(match health.ssh {
+        true => "ssh listening".into(),
+        false => "ssh not listening".into(),
+    });
+    if !health.cloud_init.is_empty() {
+        guest.push(format!("cloud-init {}", health.cloud_init));
+    }
+
+    let mut resources = Vec::new();
+    if let Some(load1) = health.load1 {
+        resources.push(format!("load {load1:.2}"));
+    }
+    if let Some(mem) = health.mem_available_kib {
+        resources.push(format!("memory {} available", kib(mem)));
+    }
+
+    let mut lines = vec![format!("guest:   {}", guest.join(" · "))];
+    if !resources.is_empty() {
+        lines.push(format!("health:  {}", resources.join(" · ")));
+    }
+    lines
+}
+
+fn duration(secs: f64) -> String {
+    let secs = secs.max(0.0) as u64;
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3_599 => format!("{}m", secs / 60),
+        3_600..=86_399 => format!("{}h", secs / 3_600),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
+fn kib(value: u64) -> String {
+    match value {
+        0..=1_023 => format!("{value} KiB"),
+        _ => format!("{} MiB", value / 1_024),
     }
 }
 
@@ -225,5 +281,24 @@ mod tests {
         assert_eq!(age(now - 86_400), "1d");
         // A clock that went backwards is not a negative age.
         assert_eq!(age(now + 500), "0s");
+    }
+
+    #[test]
+    fn guest_health_is_compact_and_only_printed_when_reported() {
+        assert!(guest_health_lines(None).is_empty());
+        assert_eq!(
+            guest_health_lines(Some(&GuestHealth {
+                addrs: vec!["192.168.64.7".parse().unwrap()],
+                uptime_secs: 125.9,
+                ssh: true,
+                cloud_init: "done".into(),
+                load1: Some(0.42),
+                mem_available_kib: Some(1_572_864),
+            })),
+            vec![
+                "guest:   192.168.64.7 · up 2m · ssh listening · cloud-init done",
+                "health:  load 0.42 · memory 1536 MiB available",
+            ]
+        );
     }
 }

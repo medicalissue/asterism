@@ -47,8 +47,8 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use asterism_core::hv::{
-    BootReq, Caps, ControlChannel, DiskFormat, DiskSpec, GuestEndpoint, Handle, Hypervisor,
-    Prepared, Ready, RunState, SnapshotId,
+    BootReq, Caps, ControlChannel, DiskFormat, DiskSpec, GuestEndpoint, GuestHealth, Handle,
+    Hypervisor, Prepared, Ready, RunState, SnapshotId,
 };
 use asterism_core::instance::Instance;
 use asterism_core::proc::{ProcId, Signal};
@@ -736,6 +736,22 @@ impl Hypervisor for Vz {
                 })
             }
         }
+    }
+
+    fn guest_health(&self, h: &Handle) -> Result<Option<GuestHealth>> {
+        let info = self.info(h, Duration::from_secs(2))?;
+        Ok(info
+            .agent
+            .as_deref()
+            .and_then(|agent| agent.status.as_ref())
+            .map(|status| GuestHealth {
+                addrs: status.addrs.clone(),
+                uptime_secs: status.uptime_secs,
+                ssh: status.ssh,
+                cloud_init: status.cloud_init.clone(),
+                load1: status.load1,
+                mem_available_kib: status.mem_available_kib,
+            }))
     }
 
     // ---- disk snapshots ----------------------------------------------------
@@ -1536,6 +1552,42 @@ mod tests {
             console: "/i/vzdisky/console.log".into(),
             storage_error: lost,
         }
+    }
+
+    #[test]
+    fn guest_health_is_taken_from_the_authenticated_agent_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("health.sock");
+        let mut info = helper_info(asterism_vz::State::Running, None);
+        info.agent = Some(Box::new(asterism_vz::AgentInfo {
+            version: 1,
+            agent: "asterism-guest/1".into(),
+            hostname: "dev".into(),
+            boot_id: "boot".into(),
+            kernel: "6.8".into(),
+            since: 1,
+            status: Some(guest::Status {
+                addrs: vec!["192.168.64.7".parse().unwrap()],
+                uptime_secs: 125.9,
+                ssh: true,
+                cloud_init: "done".into(),
+                load1: Some(0.42),
+                mem_available_kib: Some(1_572_864),
+            }),
+        }));
+        fake_helper(&sock, info);
+
+        assert_eq!(
+            Vz::new().guest_health(&handle_on(&sock)).unwrap(),
+            Some(GuestHealth {
+                addrs: vec!["192.168.64.7".parse().unwrap()],
+                uptime_secs: 125.9,
+                ssh: true,
+                cloud_init: "done".into(),
+                load1: Some(0.42),
+                mem_available_kib: Some(1_572_864),
+            })
+        );
     }
 
     /// A handle owning this test process, which is the live helper these

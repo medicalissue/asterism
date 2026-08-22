@@ -164,7 +164,7 @@ pub(crate) fn attachment(cmd: Attachment, device: Option<&str>) -> Result<()> {
 
     match client::ask(&request, device)? {
         Response::Ok => Ok(()),
-        Response::Instance { instance } => {
+        Response::Instance { instance, .. } => {
             match &request {
                 Request::Detach { volume, .. } => {
                     println!("{}  {volume} detached", instance.name)

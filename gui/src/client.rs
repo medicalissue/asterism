@@ -542,6 +542,7 @@ mod tests {
         // new row up, so the body is not needed here and not an error.
         let inst = serde_json::to_string(&Response::Instance {
             instance: Instance::new("dev", "here", "debian:13", Shape::default(), machine()),
+            guest_health: None,
         })
         .unwrap();
         assert!(reply_to_done(&inst).is_ok());

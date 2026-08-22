@@ -27,7 +27,7 @@ use anyhow::{Context, Result};
 
 use asterism_core::compat;
 use asterism_core::durable;
-use asterism_core::hv::{ImageKind, RunState, STOP_DEADLINE};
+use asterism_core::hv::{GuestHealth, ImageKind, RunState, STOP_DEADLINE};
 use asterism_core::instance::{local_host, Instance, Policy, Status};
 use asterism_core::protocol::{Request, Response};
 use asterism_core::registry::{self, Shard};
@@ -70,9 +70,7 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
         }
         Request::Status { name } => {
             return match reg.get(&name) {
-                Ok(instance) => Response::Instance {
-                    instance: instance.clone(),
-                },
+                Ok(instance) => status_response(instance.clone()),
                 Err(e) => Response::Error {
                     message: format!("{e:#}"),
                 },
@@ -241,12 +239,41 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
                     message: format!("saving registry: {e:#}"),
                 };
             }
-            Response::Instance { instance }
+            Response::Instance {
+                instance,
+                guest_health: None,
+            }
         }
         Err(e) => Response::Error {
             message: format!("{e:#}"),
         },
     }
+}
+
+/// Make a status response from the recorded row plus a fresh, optional guest
+/// observation. The registry is deliberately not changed: agent health is a
+/// sample, while its rows are durable instance configuration and lifecycle.
+fn status_response(instance: Instance) -> Response {
+    let guest_health = instance
+        .handle
+        .as_ref()
+        .and_then(guest_health)
+        .map(Box::new);
+    Response::Instance {
+        instance,
+        guest_health,
+    }
+}
+
+/// Ask the backend that owns this handle, rather than selecting on a host or
+/// backend name here. A failed status poll is absence of a guest observation,
+/// not evidence that a still-running instance has died.
+fn guest_health(handle: &asterism_core::hv::Handle) -> Option<GuestHealth> {
+    backend::for_handle(&handle.backend)
+        .ok()?
+        .guest_health(handle)
+        .ok()
+        .flatten()
 }
 
 /// What a request that no area of this daemon claims is told.

@@ -829,7 +829,10 @@ pub fn commit_target(
         .adopt(adopted)
         .and_then(|inst| reg.save().map(|()| inst))
     {
-        Ok(instance) => Response::Instance { instance },
+        Ok(instance) => Response::Instance {
+            instance,
+            guest_health: None,
+        },
         Err(e) => error(e),
     }
 }
@@ -1251,7 +1254,7 @@ fn expect_ok(response: Response) -> Result<()> {
 
 fn expect_instance(response: Response) -> Result<Instance> {
     match response {
-        Response::Instance { instance } => Ok(instance),
+        Response::Instance { instance, .. } => Ok(instance),
         Response::Error { message } => bail!(message),
         other => bail!("unexpected answer: {other:?}"),
     }

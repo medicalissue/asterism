@@ -934,7 +934,7 @@ impl Mesh {
             let (mesh, device, name) = (self.clone(), peer.name.clone(), name.to_owned());
             asking.spawn(async move {
                 let found = match mesh.proxy(&device, Request::Status { name }).await {
-                    Ok(Response::Instance { instance }) => Some(instance),
+                    Ok(Response::Instance { instance, .. }) => Some(instance),
                     _ => None,
                 };
                 (device, found)
@@ -1033,7 +1033,7 @@ impl Mesh {
             )
             .await?
         {
-            Response::Instance { instance } => {
+            Response::Instance { instance, .. } => {
                 if instance.endpoint().is_none() {
                     bail!("instance {name:?} is not running — `ast up {name}` first");
                 }
@@ -1892,7 +1892,7 @@ async fn serve_splice(
     )
     .await
     {
-        Response::Instance { instance } => instance
+        Response::Instance { instance, .. } => instance
             .endpoint()
             .map(|e| e.ssh_target())
             .ok_or_else(|| anyhow!("instance {name:?} is not running — `ast up {name}` first")),

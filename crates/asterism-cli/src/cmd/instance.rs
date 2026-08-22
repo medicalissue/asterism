@@ -230,7 +230,9 @@ pub(crate) fn run(cmd: Commands, device: Option<&str>) -> Result<()> {
         Commands::Status { name } => {
             let request = Request::Status { name };
             match client::ask(&request, device)? {
-                Response::Instance { instance } => format::print_detail(&instance),
+                Response::Instance { instance, guest_health } => {
+                    format::print_detail(&instance, guest_health.as_deref())
+                }
                 Response::Ok => {}
                 _ => return Err(client::unexpected(&request)),
             }
@@ -259,7 +261,7 @@ pub(crate) fn run(cmd: Commands, device: Option<&str>) -> Result<()> {
 fn changed(request: &Request, device: Option<&str>) -> Result<Option<Instance>> {
     match client::ask(request, device)? {
         Response::Ok => Ok(None),
-        Response::Instance { instance } => Ok(Some(instance)),
+        Response::Instance { instance, .. } => Ok(Some(instance)),
         _ => Err(client::unexpected(request)),
     }
 }
@@ -345,7 +347,7 @@ fn ssh(name: &str, command: &[String]) -> Result<()> {
 /// waiting for a banner that is never coming. What the user wanted is one of
 /// the two things named here: the console, or the port.
 fn refuse_ssh_to_an_oci_guest(name: &str) -> Result<()> {
-    let Ok(Response::Instance { instance }) =
+    let Ok(Response::Instance { instance, .. }) =
         client::send(&Request::Status { name: name.into() })
     else {
         return Ok(()); // no such instance: let the endpoint request say so
