@@ -72,7 +72,9 @@ limactl shell kvmhost -- bash -lc "
   scripts/e2e-volume.sh
 " 2>&1 | tee "$EVIDENCE/volume-4g.log"
 
-limactl shell kvmhost -- cargo clean --target-dir "$VM_RUN/target" \
-  2>&1 | tee "$EVIDENCE/cargo-clean.log"
+limactl shell kvmhost -- bash -lc "
+  cd '$VM_RUN'
+  cargo clean --target-dir '$VM_RUN/target'
+" 2>&1 | tee "$EVIDENCE/cargo-clean.log"
 
 echo "LIMA RECOVERY E2E GREEN"
