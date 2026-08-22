@@ -2048,10 +2048,12 @@ mod tests {
             .spawn()
             .unwrap();
         let real = ProcId::capture(sleeper.id()).unwrap();
-        let stale = ProcId {
-            started_us: real.started_us - 1,
-            ..real.clone()
-        };
+        let mut stale = real.clone();
+        if let Some(ticks) = stale.started_ticks.as_mut() {
+            *ticks -= 1;
+        } else {
+            stale.started_us -= 1;
+        }
 
         assert!(
             !export_alive(Some(&stale), &socket),

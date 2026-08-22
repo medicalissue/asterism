@@ -96,6 +96,18 @@ pub struct Egress {
     pub handles: Vec<(String, String)>,
 }
 
+/// Backend-neutral and backend-supplied facts that determine one NoCloud
+/// seed. Keeping these together means adding a new seed artifact does not
+/// widen the seed builder's call boundary.
+pub struct Input<'a> {
+    pub shares: &'a [Share],
+    pub share_kind: Option<ShareKind>,
+    pub extra: &'a str,
+    pub network_config: Option<&'a str>,
+    pub egress: &'a Egress,
+    pub bootstrap: &'a Bootstrap,
+}
+
 impl Egress {
     pub fn is_empty(&self) -> bool {
         self.handles.is_empty()
@@ -126,31 +138,34 @@ pub fn shares(inst: &Instance) -> Vec<Share> {
 /// `extra` is cloud-config the *backend* needs in the guest — see
 /// [`crate::hv::Hypervisor::guest_config`]. It is appended verbatim, so it
 /// arrives in the guest exactly as the backend wrote it.
+/// `network_config`, when present, is an opaque NoCloud `network-config`
+/// document supplied by the backend. It is a separate seed file because
+/// cloud-init must apply networking before user-data commands can run.
 ///
 /// `bootstrap` is the instance's profiles ([`crate::profile`]), and it rides
 /// the same mechanism for the same reason: bump a profile's version and the
 /// fingerprint moves, so a guest that has been up for a month applies the
 /// new work at its next boot rather than staying at whatever it was built
 /// with.
-pub fn ensure(
-    name: &str,
-    seed: &Path,
-    shares: &[Share],
-    share_kind: Option<ShareKind>,
-    extra: &str,
-    egress: &Egress,
-    bootstrap: &Bootstrap,
-) -> Result<()> {
-    if !shares.is_empty() && share_kind.is_none() {
+pub fn ensure(name: &str, seed: &Path, input: Input<'_>) -> Result<()> {
+    if !input.shares.is_empty() && input.share_kind.is_none() {
         bail!("cannot build mount units without a directory-share transport");
     }
     let stamp_path = seed.with_file_name("seed.stamp");
-    let stamp = fingerprint(name, shares, share_kind, extra, egress, bootstrap);
+    let stamp = fingerprint_with_network(
+        name,
+        input.shares,
+        input.share_kind,
+        input.extra,
+        input.network_config,
+        input.egress,
+        input.bootstrap,
+    );
     let current = std::fs::read_to_string(&stamp_path).unwrap_or_default();
     if seed.exists() && current.trim() == stamp {
         return Ok(());
     }
-    build(name, seed, shares, share_kind, extra, egress, bootstrap)?;
+    build(name, seed, &input)?;
     std::fs::write(&stamp_path, &stamp)?;
     Ok(())
 }
@@ -220,18 +235,37 @@ fn fingerprint(
     format!("{:016x}", instance::fnv1a(&material))
 }
 
-/// Guests get an `ast` user carrying the dedicated Asterism key plus any
-/// keys already in ~/.ssh, so both `ast ssh` and plain ssh work.
-fn build(
+fn fingerprint_with_network(
     name: &str,
-    seed: &Path,
     shares: &[Share],
     share_kind: Option<ShareKind>,
     extra: &str,
+    network_config: Option<&str>,
     egress: &Egress,
     bootstrap: &Bootstrap,
-) -> Result<()> {
-    let stamp = fingerprint(name, shares, share_kind, extra, egress, bootstrap);
+) -> String {
+    let base = fingerprint(name, shares, share_kind, extra, egress, bootstrap);
+    let Some(network_config) = network_config else {
+        return base;
+    };
+    format!(
+        "{:016x}",
+        instance::fnv1a(&format!("{base}\nnetwork-config\n{network_config}"))
+    )
+}
+
+/// Guests get an `ast` user carrying the dedicated Asterism key plus any
+/// keys already in ~/.ssh, so both `ast ssh` and plain ssh work.
+fn build(name: &str, seed: &Path, input: &Input<'_>) -> Result<()> {
+    let stamp = fingerprint_with_network(
+        name,
+        input.shares,
+        input.share_kind,
+        input.extra,
+        input.network_config,
+        input.egress,
+        input.bootstrap,
+    );
     let mut keys = vec![ensure_asterism_key()?];
     if let Ok(home) = std::env::var("HOME") {
         if let Ok(entries) = std::fs::read_dir(PathBuf::from(home).join(".ssh")) {
@@ -252,8 +286,13 @@ fn build(
     // merged key by key rather than concatenated. A key that cannot be
     // merged says so instead of quietly losing one side.
     let config = merge(
-        &asterism_config(shares, share_kind, egress, bootstrap),
-        extra,
+        &asterism_config(
+            input.shares,
+            input.share_kind,
+            input.egress,
+            input.bootstrap,
+        ),
+        input.extra,
     )
     .with_context(|| format!("building the seed for {name:?}"))?;
 
@@ -276,6 +315,9 @@ fn build(
     std::fs::create_dir_all(&stage)?;
     std::fs::write(stage.join("user-data"), user_data)?;
     std::fs::write(stage.join("meta-data"), meta_data)?;
+    if let Some(network_config) = input.network_config {
+        std::fs::write(stage.join("network-config"), network_config)?;
+    }
 
     let _ = std::fs::remove_file(seed);
     if cfg!(target_os = "macos") {
@@ -401,7 +443,11 @@ const HOSTKEY_UNIT: &str = "\x20 - path: /usr/local/sbin/asterism-hostkeys\n\
      \x20   content: |\n\
      \x20     [Unit]\n\
      \x20     Description=Asterism: regenerate missing ssh host keys\n\
-     \x20     Before=ssh.service sshd.service ssh.socket sshd.socket\n\
+     \x20     # Socket units start before basic.target. This service is enabled\n\
+     \x20     # under multi-user.target, so ordering it before those sockets\n\
+     \x20     # forms a cycle and leaves SSH unavailable. Ordering before the\n\
+     \x20     # service is sufficient: socket activation starts that service.\n\
+     \x20     Before=ssh.service sshd.service\n\
      \x20     [Service]\n\
      \x20     Type=oneshot\n\
      \x20     RemainAfterExit=yes\n\
@@ -968,6 +1014,10 @@ mod tests {
         assert!(!bare.contains("9p"), "{bare}");
         // The unit runs before anything would want to use a host key.
         assert!(bare.contains("Before=ssh.service sshd.service"));
+        assert!(
+            !bare.contains("Before=ssh.service sshd.service ssh.socket sshd.socket"),
+            "a multi-user service ordered before socket units forms a boot cycle: {bare}"
+        );
     }
 
     #[test]
@@ -1339,6 +1389,40 @@ mod tests {
         assert_ne!(
             bound,
             fingerprint("dev", &[], None, "", &reminted, &Bootstrap::default())
+        );
+    }
+
+    #[test]
+    fn backend_network_config_moves_the_seed_fingerprint() {
+        let bare = fingerprint_with_network(
+            "dev",
+            &[],
+            None,
+            "",
+            None,
+            &Egress::default(),
+            &Bootstrap::default(),
+        );
+        let configured = fingerprint_with_network(
+            "dev",
+            &[],
+            None,
+            "",
+            Some("version: 2\nethernets: {}\n"),
+            &Egress::default(),
+            &Bootstrap::default(),
+        );
+        assert_ne!(bare, configured);
+        assert_eq!(
+            bare,
+            fingerprint(
+                "dev",
+                &[],
+                None,
+                "",
+                &Egress::default(),
+                &Bootstrap::default()
+            )
         );
     }
 
