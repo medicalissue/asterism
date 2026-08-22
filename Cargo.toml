@@ -5,6 +5,7 @@ members = [
     "crates/asterism-daemon",
     "crates/asterism-cli",
     "crates/asterism-mesh",
+    "crates/asterism-coordinator",
     "crates/asterism-vz",
 ]
 
