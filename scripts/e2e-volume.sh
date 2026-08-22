@@ -488,8 +488,9 @@ echo "ok: the bytes landed on B — the marker is in its image file (${USED}K us
 # /dev/zero it cannot be represented as a sparse hole by the provider.  Hash it
 # before and after an unmount/remount, and require the provider's raw image to
 # have allocated at least the payload size.  Stopping the guest completes this
-# NBD session, after which status must report its payload byte count and
-# throughput.
+# NBD session, after which the daemon's structured part event must report its
+# payload byte count and throughput. Live status intentionally omits runtime
+# observations once an instance is stopped.
 TRANSFER_PROOF="$(in_guest "sudo mount $VOLUME_DEV /data && \
   yes asterism-orbit-e2e | head -c $TRANSFER_BYTES | \
     sudo tee /data/asterism-4g.bin >/dev/null; \
@@ -525,25 +526,26 @@ expect "the instance stops" "$INST  stopped" env ASTERISM_HOME="$A" "$AST" down 
 echo "ok: stopping the guest took the bridge down with it"
 
 # Transfer telemetry is deliberately session-scoped. Capture the completed
-# four-GiB bridge now, before a later boot starts a new session whose counters
-# correctly begin at zero.
-TRANSFER_STATUS=""
+# four-GiB bridge event now, before a later boot starts a new session whose
+# counters correctly begin at zero.
+TRANSFER_EVENT=""
 TRANSFERRED=""
 for _ in $(seq 1 100); do
-  TRANSFER_STATUS="$(ASTERISM_HOME="$A" "$AST" status "$INST" 2>&1 || true)"
-  TRANSFERRED="$(sed -n 's/.*transferred (\([0-9][0-9]*\) bytes).*/\1/p' \
-    <<<"$TRANSFER_STATUS" | head -1)"
+  TRANSFER_EVENT="$(grep "remote_part instance=\"$INST\".*bytes=" "$A/astd.log" \
+    2>/dev/null | tail -1 || true)"
+  TRANSFERRED="$(sed -n 's/.* bytes=\([0-9][0-9]*\) .*/\1/p' <<<"$TRANSFER_EVENT")"
   if [ -n "$TRANSFERRED" ] && [ "$TRANSFERRED" -ge "$TRANSFER_BYTES" ]; then
     break
   fi
   sleep 0.2
 done
 [ -n "$TRANSFERRED" ] && [ "$TRANSFERRED" -ge "$TRANSFER_BYTES" ] \
-  || fail "the completed bridge session did not account for the real $TRANSFER_BYTES-byte transfer (got ${TRANSFERRED:-none}):"$'\n'"$TRANSFER_STATUS"
-grep -qE "direct .* [0-9]+\.[0-9]ms RTT .* MiB/s" <<<"$TRANSFER_STATUS" \
-  || fail "the completed four-GiB bridge session did not report path, RTT and throughput:"$'\n'"$TRANSFER_STATUS"
-printf '%s\n' "$TRANSFER_STATUS" >"$A/transfer-status.txt"
-echo "ok: the completed bridge session measured at least $TRANSFER_BYTES bytes and its throughput"
+  || fail "the completed bridge event did not account for the real $TRANSFER_BYTES-byte transfer (got ${TRANSFERRED:-none}):"$'\n'"$TRANSFER_EVENT"
+grep -qE 'state=degraded path=direct bytes=[0-9]+ throughput_Bps=[1-9][0-9]* transition=' \
+  <<<"$TRANSFER_EVENT" \
+  || fail "the completed four-GiB bridge event did not report path, throughput and transition:"$'\n'"$TRANSFER_EVENT"
+printf '%s\n' "$TRANSFER_EVENT" >"$A/transfer-status.txt"
+echo "ok: the completed bridge event measured at least $TRANSFER_BYTES bytes and its throughput"
 
 # The lease survives a stop: it belongs to the attachment, not to the boot.
 [ "$(holder_now)" = "$INST" ] || fail "stopping the guest gave the lease away"
