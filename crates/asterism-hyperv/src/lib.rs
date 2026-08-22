@@ -458,7 +458,10 @@ mod tests {
             hcn_running: true,
         };
         let error = host.require_supported().unwrap_err().to_string();
-        assert!(error.contains("reinstall the complete Windows artifact"), "{error}");
+        assert!(
+            error.contains("reinstall the complete Windows artifact"),
+            "{error}"
+        );
     }
 
     #[test]
