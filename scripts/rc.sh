@@ -462,8 +462,10 @@ can_run() {
     any) return 0 ;;
     vm) have_vm ;;
     # The helper is macOS-only, and so is everything that needs it. Whether
-    # the *artifact* carries one is a separate question, answered where the
-    # suite is run rather than here: the lane still runs, against the tree.
+    # the *artifact* carries a usable one is a separate question, and it is
+    # not answered by stepping aside: on a Mac the lane runs, and the gate
+    # where it runs fails the release if the installed helper is absent,
+    # from another build, or unsigned. Nothing here falls back to the tree.
     helper) have_vm ;;
     net) have_net ;;
     # The desktop app is built by the tauri CLI rather than by this run, so
