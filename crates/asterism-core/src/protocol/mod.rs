@@ -1269,7 +1269,10 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(create, Request::Create { backend: None, .. }));
-        let Request::Create { publish, profiles, .. } = &create else {
+        let Request::Create {
+            publish, profiles, ..
+        } = &create
+        else {
             unreachable!("a create")
         };
         assert!(publish.is_empty(), "a cloud image publishes nothing");
@@ -1415,8 +1418,11 @@ mod tests {
         // Changing an instance's profiles is about that instance, so it
         // resolves across the orbit like every other instance command.
         assert_eq!(
-            Request::SetProfiles { name: "dev".into(), profiles: vec!["claude".into()] }
-                .subject(),
+            Request::SetProfiles {
+                name: "dev".into(),
+                profiles: vec!["claude".into()]
+            }
+            .subject(),
             Some("dev")
         );
         assert_eq!(Request::List.subject(), None);

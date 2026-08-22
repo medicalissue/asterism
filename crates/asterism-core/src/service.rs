@@ -233,7 +233,9 @@ mod imp {
     use super::{home, run, test_label, Manager, Report, Spec, State, LABEL};
 
     pub fn manager() -> Result<Box<dyn Manager>> {
-        Ok(Box::new(Launchd { label: test_label()?.unwrap_or_else(|| LABEL.to_owned()) }))
+        Ok(Box::new(Launchd {
+            label: test_label()?.unwrap_or_else(|| LABEL.to_owned()),
+        }))
     }
 
     pub struct Launchd {
@@ -530,7 +532,8 @@ mod imp {
     use super::{home, run, test_label, Manager, Report, Spec, State};
 
     pub fn manager() -> Result<Box<dyn Manager>> {
-        let unit = test_label()?.map_or_else(|| UNIT.to_owned(), |label| format!("{label}.service"));
+        let unit =
+            test_label()?.map_or_else(|| UNIT.to_owned(), |label| format!("{label}.service"));
         Ok(Box::new(Systemd { unit }))
     }
 
@@ -660,19 +663,21 @@ mod imp {
                 state.notes.push("systemctl is not on PATH".into());
                 return Ok(state);
             }
-            let (_, enabled) = run(std::process::Command::new("systemctl")
-                .args(["--user", "is-enabled", &self.unit]))?;
+            let (_, enabled) = run(std::process::Command::new("systemctl").args([
+                "--user",
+                "is-enabled",
+                &self.unit,
+            ]))?;
             state.loaded = enabled.trim() == "enabled";
-            let (_, props) = run(std::process::Command::new("systemctl")
-                .args([
-                    "--user",
-                    "show",
-                    &self.unit,
-                    "-p",
-                    "MainPID",
-                    "-p",
-                    "ActiveState",
-                ]))?;
+            let (_, props) = run(std::process::Command::new("systemctl").args([
+                "--user",
+                "show",
+                &self.unit,
+                "-p",
+                "MainPID",
+                "-p",
+                "ActiveState",
+            ]))?;
             for line in props.lines() {
                 if let Some(v) = line.strip_prefix("MainPID=") {
                     state.pid = v.trim().parse().ok().filter(|p| *p != 0);

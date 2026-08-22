@@ -150,9 +150,7 @@ pub fn ensure(
     if seed.exists() && current.trim() == stamp {
         return Ok(());
     }
-    build(
-        name, seed, shares, share_kind, extra, egress, bootstrap, &stamp,
-    )?;
+    build(name, seed, shares, share_kind, extra, egress, bootstrap)?;
     std::fs::write(&stamp_path, &stamp)?;
     Ok(())
 }
@@ -232,8 +230,8 @@ fn build(
     extra: &str,
     egress: &Egress,
     bootstrap: &Bootstrap,
-    stamp: &str,
 ) -> Result<()> {
+    let stamp = fingerprint(name, shares, share_kind, extra, egress, bootstrap);
     let mut keys = vec![ensure_asterism_key()?];
     if let Ok(home) = std::env::var("HOME") {
         if let Ok(entries) = std::fs::read_dir(PathBuf::from(home).join(".ssh")) {
@@ -257,7 +255,7 @@ fn build(
         &asterism_config(shares, share_kind, egress, bootstrap),
         extra,
     )
-        .with_context(|| format!("building the seed for {name:?}"))?;
+    .with_context(|| format!("building the seed for {name:?}"))?;
 
     let user_data = format!(
         "#cloud-config\n\
@@ -328,10 +326,36 @@ fn asterism_config(
     out.push_str(&egress_files(egress));
     out.push_str(&bootstrap_files(bootstrap));
     out.push_str("runcmd:\n");
-    out.push_str(HOSTKEY_RUNCMD);
-    out.push_str(&mount_runcmd(shares, share_kind));
-    out.push_str(&egress_runcmd(egress));
-    out.push_str(&bootstrap_runcmd(bootstrap));
+    out.push_str(&isolated_runcmd(HOSTKEY_RUNCMD));
+    out.push_str(&isolated_runcmd(&mount_runcmd(shares, share_kind)));
+    out.push_str(&isolated_runcmd(&egress_runcmd(egress)));
+    out.push_str(&isolated_runcmd(&bootstrap_runcmd(bootstrap)));
+    out
+}
+
+/// Keep one cloud-init shell fragment from terminating the entries after it.
+///
+/// `runcmd` looks like a YAML list of separate commands, but cloud-init writes
+/// every block scalar into one `/bin/sh` script. An `exit` in an earlier item
+/// therefore exits the combined script unless each item gets its own shell.
+/// Every fragment Asterism contributes crosses this boundary, including ones
+/// that do not exit today, so a later edit cannot silently recreate the same
+/// ordering bug.
+fn isolated_runcmd(entry: &str) -> String {
+    if entry.is_empty() {
+        return String::new();
+    }
+    let (header, body) = entry
+        .split_once('\n')
+        .expect("an Asterism runcmd entry has a YAML header");
+    debug_assert_eq!(header.trim(), "- |");
+    let indent = &header[..header.len() - header.trim_start().len()];
+    let shell_indent = format!("{indent}  ");
+    let mut out = format!("{header}\n{shell_indent}(\n{body}");
+    if !body.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!("{shell_indent})\n"));
     out
 }
 
@@ -931,8 +955,10 @@ mod tests {
         assert!(boot.contains("[ -d /var/lib/cloud/instance ] || exit 0"));
         assert!(boot.contains("ssh-keygen -A"));
         // The `sync` is the belt: runcmd is cloud-final, so cloud-init has
-        // already written this guest's host keys by the time it runs.
-        assert!(bare.trim_end().ends_with("sync"), "{bare}");
+        // already written this guest's host keys by the time it runs. The
+        // fragment closes its isolation subshell after it.
+        let runcmd = compiled_runcmd(&bare);
+        assert!(runcmd.contains("\nsync\n)\n"), "{runcmd}");
         // No 9p anywhere near a guest that was not given a directory.
         assert!(!bare.contains("9p"), "{bare}");
         // The unit runs before anything would want to use a host key.
@@ -1074,6 +1100,68 @@ mod tests {
             .contains("final_message: \"ours\""));
     }
 
+    /// cloud-init does not execute block-scalar `runcmd` items separately:
+    /// it concatenates them into one script. The egress fragment ends in
+    /// `exit 0`, so it used to prevent the bootstrap item after it from ever
+    /// enabling its unit. Exercise that exact ordering rule as shell, not as
+    /// a string-position assertion.
+    #[test]
+    fn an_earlier_runcmd_exit_cannot_end_the_later_fragment() {
+        let first = isolated_runcmd(" - |\n   printf 'first\\n' >>\"$1\"\n   exit 0\n");
+        let second = isolated_runcmd(" - |\n   printf 'second\\n' >>\"$1\"\n");
+        let config = format!("runcmd:\n{first}{second}");
+        let script = compiled_runcmd(&config);
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("order");
+        let ran = Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .arg("cloud-init-runcmd")
+            .arg(&marker)
+            .output()
+            .unwrap();
+        assert!(
+            ran.status.success(),
+            "the compiled runcmd failed: {}\n{script}",
+            String::from_utf8_lossy(&ran.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "first\nsecond\n");
+
+        // And the production ordering is the one this proves: egress, with
+        // its early exit, precedes the profile unit start in the same script.
+        let bootstrap = Bootstrap::resolve(&["claude".to_owned()]).unwrap();
+        let actual = compiled_runcmd(&asterism_config(&[], None, &egress(), &bootstrap));
+        let egress = actual.find("# BEGIN asterism egress").unwrap();
+        let exit = actual[egress..].find("exit 0").unwrap() + egress;
+        let bootstrap = actual
+            .find("systemctl enable asterism-bootstrap.service")
+            .unwrap();
+        assert!(egress < exit && exit < bootstrap, "{actual}");
+        assert!(actual[exit..bootstrap].contains("\n)\n"), "{actual}");
+    }
+
+    /// Reproduce the one part of cloud-init's `runcmd` compiler this module
+    /// relies on: block-scalar list items become consecutive shell text.
+    fn compiled_runcmd(config: &str) -> String {
+        let block = blocks(config)
+            .into_iter()
+            .find(|block| block.key == "runcmd")
+            .expect("runcmd block");
+        let mut out = String::new();
+        let mut scalar = false;
+        for line in block.entries {
+            if line == "- |" {
+                scalar = true;
+            } else if line.starts_with("- ") {
+                scalar = false;
+            } else if scalar {
+                out.push_str(line.strip_prefix("  ").unwrap_or(&line));
+                out.push('\n');
+            }
+        }
+        out
+    }
+
     /// The whole user-data as a guest receives it, with a backend's half
     /// merged in — the thing that actually has to be YAML.
     ///
@@ -1174,14 +1262,9 @@ mod tests {
     #[test]
     fn the_script_a_bound_guest_runs_is_shell_a_guest_can_actually_run() {
         let config = asterism_config(&[], None, &egress(), &Bootstrap::default());
-        // Pull the runcmd entry back out of the cloud-config, undoing the
-        // block scalar's indentation, which is what cloud-init hands `sh`.
-        let script: String = config
-            .lines()
-            .skip_while(|line| !line.trim_start().starts_with("for cert in"))
-            .take_while(|line| !line.trim_start().starts_with("- |"))
-            .map(|line| format!("{}\n", line.strip_prefix("   ").unwrap_or(line)))
-            .collect();
+        // Pull every runcmd entry back out the way cloud-init compiles it:
+        // consecutive shell text, including each fragment's isolation.
+        let script = compiled_runcmd(&config);
         assert!(script.contains("BEGIN asterism egress"), "{script}");
 
         // 1. A heredoc's terminator has to be at column zero, and nothing in
@@ -1224,25 +1307,11 @@ mod tests {
             &Egress::default(),
             &Bootstrap::default(),
         );
-        let bound = fingerprint(
-            "dev",
-            &[],
-            None,
-            "",
-            &egress(),
-            &Bootstrap::default(),
-        );
+        let bound = fingerprint("dev", &[], None, "", &egress(), &Bootstrap::default());
         assert_ne!(none, bound);
         assert_eq!(
             bound,
-            fingerprint(
-                "dev",
-                &[],
-                None,
-                "",
-                &egress(),
-                &Bootstrap::default()
-            )
+            fingerprint("dev", &[], None, "", &egress(), &Bootstrap::default())
         );
 
         // The port is in it: a proxy that came back somewhere else is a guest
@@ -1326,7 +1395,9 @@ mod tests {
             let mut back = String::new();
             for line in body.lines() {
                 // The block ends at the first line that is not part of it.
-                let Some(rest) = line.strip_prefix("\x20     ") else { break };
+                let Some(rest) = line.strip_prefix("\x20     ") else {
+                    break;
+                };
                 back.push_str(rest);
                 back.push('\n');
             }
@@ -1406,12 +1477,8 @@ mod tests {
                 None,
                 "",
                 &Egress::default(),
-                &Bootstrap::resolve(&[
-                    "base".to_owned(),
-                    "node".to_owned(),
-                    "claude".to_owned()
-                ])
-                .unwrap()
+                &Bootstrap::resolve(&["base".to_owned(), "node".to_owned(), "claude".to_owned()])
+                    .unwrap()
             )
         );
     }

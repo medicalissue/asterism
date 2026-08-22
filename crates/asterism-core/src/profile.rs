@@ -130,7 +130,11 @@ pub fn resolve(names: &[String]) -> Result<Vec<&'static Profile>> {
         let Some(profile) = get(name) else {
             bail!(
                 "no bootstrap profile called {name:?} — Asterism ships {}",
-                CATALOG.iter().map(|p| p.name).collect::<Vec<_>>().join(", ")
+                CATALOG
+                    .iter()
+                    .map(|p| p.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
         };
         // A `requires` naming something absent would be a bug in this file,
@@ -158,7 +162,9 @@ pub struct Bootstrap {
 impl Bootstrap {
     /// Resolve an instance's recorded profile names.
     pub fn resolve(names: &[String]) -> Result<Self> {
-        Ok(Bootstrap { profiles: resolve(names)? })
+        Ok(Bootstrap {
+            profiles: resolve(names)?,
+        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -194,18 +200,42 @@ impl Bootstrap {
             return Vec::new();
         }
         let mut out = vec![
-            ("/etc/asterism/bootstrap.stamp".to_owned(), "0644", format!("{}\n", self.stamp())),
-            ("/usr/local/lib/asterism/pkg".to_owned(), "0755", PKG.to_owned()),
-            ("/usr/local/sbin/asterism-bootstrap".to_owned(), "0755", DRIVER.to_owned()),
-            ("/usr/local/sbin/asterism-check".to_owned(), "0755", self.check_script()),
-            ("/etc/systemd/system/asterism-bootstrap.service".to_owned(), "0644", UNIT.to_owned()),
+            (
+                "/etc/asterism/bootstrap.stamp".to_owned(),
+                "0644",
+                format!("{}\n", self.stamp()),
+            ),
+            (
+                "/usr/local/lib/asterism/pkg".to_owned(),
+                "0755",
+                PKG.to_owned(),
+            ),
+            (
+                "/usr/local/sbin/asterism-bootstrap".to_owned(),
+                "0755",
+                DRIVER.to_owned(),
+            ),
+            (
+                "/usr/local/sbin/asterism-check".to_owned(),
+                "0755",
+                self.check_script(),
+            ),
+            (
+                "/etc/systemd/system/asterism-bootstrap.service".to_owned(),
+                "0644",
+                UNIT.to_owned(),
+            ),
         ];
         for (i, profile) in self.profiles.iter().enumerate() {
             for file in profile.files {
                 out.push((file.path.to_owned(), file.mode, file.content.to_owned()));
             }
             out.push((
-                format!("/usr/local/lib/asterism/bootstrap.d/{:02}-{}", (i + 1) * 10, profile.name),
+                format!(
+                    "/usr/local/lib/asterism/bootstrap.d/{:02}-{}",
+                    (i + 1) * 10,
+                    profile.name
+                ),
                 "0755",
                 profile.apply_script(),
             ));
@@ -408,7 +438,11 @@ const NODE: Profile = Profile {
     version: 1,
     summary: "Node.js and npm from the distribution, the runtime both agent CLIs need",
     requires: &["base"],
-    packages: &[Packages { apt: "nodejs npm", dnf: "nodejs npm", apk: "nodejs npm" }],
+    packages: &[Packages {
+        apt: "nodejs npm",
+        dnf: "nodejs npm",
+        apk: "nodejs npm",
+    }],
     files: &[],
     steps: &[
         "major=$(node --version 2>/dev/null | sed 's/^v//; s/\\..*//')\n\
@@ -694,11 +728,20 @@ mod tests {
         for (i, profile) in CATALOG.iter().enumerate() {
             for required in profile.requires {
                 let at = CATALOG.iter().position(|p| p.name == *required);
-                let at = at.unwrap_or_else(|| panic!("{} requires unknown {required:?}", profile.name));
-                assert!(at < i, "{} requires {required:?}, which is applied after it", profile.name);
+                let at =
+                    at.unwrap_or_else(|| panic!("{} requires unknown {required:?}", profile.name));
+                assert!(
+                    at < i,
+                    "{} requires {required:?}, which is applied after it",
+                    profile.name
+                );
             }
             assert!(profile.version > 0, "{} has no version", profile.name);
-            assert!(!profile.checks.is_empty(), "{} promises nothing checkable", profile.name);
+            assert!(
+                !profile.checks.is_empty(),
+                "{} promises nothing checkable",
+                profile.name
+            );
         }
     }
 
@@ -719,8 +762,13 @@ mod tests {
 
     #[test]
     fn an_unknown_profile_is_refused_with_the_catalog() {
-        let err = Bootstrap::resolve(&names(&["cladue"])).unwrap_err().to_string();
-        assert!(err.contains("no bootstrap profile called \"cladue\""), "{err}");
+        let err = Bootstrap::resolve(&names(&["cladue"]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no bootstrap profile called \"cladue\""),
+            "{err}"
+        );
         assert!(err.contains("base, node, claude, codex"), "{err}");
         // Nothing asked for is nothing to apply, and that is not an error.
         assert!(Bootstrap::resolve(&[]).unwrap().is_empty());
@@ -796,9 +844,15 @@ mod tests {
     fn a_profile_script_installs_on_every_package_manager() {
         let script = BASE.apply_script();
         assert!(script.starts_with("#!/bin/sh\n"), "{script}");
-        assert!(script.contains("/usr/local/lib/asterism/pkg 'git tmux"), "{script}");
+        assert!(
+            script.contains("/usr/local/lib/asterism/pkg 'git tmux"),
+            "{script}"
+        );
         // Three quoted arguments on that line, one per manager.
-        let line = script.lines().find(|l| l.starts_with("/usr/local/lib/asterism/pkg")).unwrap();
+        let line = script
+            .lines()
+            .find(|l| l.starts_with("/usr/local/lib/asterism/pkg"))
+            .unwrap();
         assert_eq!(line.matches('\'').count(), 6, "{line}");
         assert!(PKG.contains("apt-get install"));
         assert!(PKG.contains("dnf install"));
@@ -816,15 +870,26 @@ mod tests {
     #[test]
     fn generated_shell_survives_an_apostrophe() {
         assert_eq!(quote("it's fine"), "'it'\\''s fine'");
-        let script = Bootstrap::resolve(&names(&["claude", "codex"])).unwrap().check_script();
-        for line in script.lines().filter(|l| l.starts_with("check ") || l.starts_with("section ")) {
+        let script = Bootstrap::resolve(&names(&["claude", "codex"]))
+            .unwrap()
+            .check_script();
+        for line in script
+            .lines()
+            .filter(|l| l.starts_with("check ") || l.starts_with("section "))
+        {
             let out = std::process::Command::new("/bin/sh")
                 .arg("-c")
-                .arg(format!("check() {{ echo $#; }}; section() {{ echo $#; }}; {line}"))
+                .arg(format!(
+                    "check() {{ echo $#; }}; section() {{ echo $#; }}; {line}"
+                ))
                 .output()
                 .expect("running /bin/sh");
             let argc = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-            let want = if line.starts_with("section ") { "1" } else { "3" };
+            let want = if line.starts_with("section ") {
+                "1"
+            } else {
+                "3"
+            };
             assert_eq!(argc, want, "{line}");
         }
     }
@@ -838,9 +903,15 @@ mod tests {
         let resolved = Bootstrap::resolve(&names(&["claude", "codex"])).unwrap();
         let script = resolved.check_script();
         for profile in resolved.profiles() {
-            assert!(script.contains(&format!("section '{}'", profile.name)), "{script}");
+            assert!(
+                script.contains(&format!("section '{}'", profile.name)),
+                "{script}"
+            );
             for check in profile.checks {
-                assert!(script.contains(&format!("check '{}'", check.what)), "{script}");
+                assert!(
+                    script.contains(&format!("check '{}'", check.what)),
+                    "{script}"
+                );
             }
         }
         assert!(script.contains(&format!("want='{}'", resolved.stamp())));
@@ -851,7 +922,9 @@ mod tests {
         // it is broken.
         assert!(script.contains("systemctl status asterism-bootstrap"));
         // Nothing a profile did not ask for: no codex line without codex.
-        let claude_only = Bootstrap::resolve(&names(&["claude"])).unwrap().check_script();
+        let claude_only = Bootstrap::resolve(&names(&["claude"]))
+            .unwrap()
+            .check_script();
         assert!(!claude_only.contains("check 'codex'"), "{claude_only}");
     }
 
@@ -880,7 +953,12 @@ mod tests {
                 .spawn()
                 .expect("running /bin/sh");
             use std::io::Write;
-            child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(script.as_bytes())
+                .unwrap();
             let out = child.wait_with_output().unwrap();
             assert!(
                 out.status.success(),

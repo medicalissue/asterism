@@ -795,7 +795,9 @@ fn main() -> Result<()> {
         }
         // `--check` is not a request at all: the answer is inside the guest,
         // and the way in is the one `ast ssh` already uses.
-        Command::Profile { name, check: true, .. } => {
+        Command::Profile {
+            name, check: true, ..
+        } => {
             local_only("profile --check", device.as_deref())?;
             return check_profiles(&name);
         }
@@ -2026,7 +2028,10 @@ fn print_snapshots(name: &str, device: Option<&str>) -> Result<()> {
 fn print_profiles() -> Result<()> {
     println!("{:<8} {:<8} WHAT IT ADDS", "PROFILE", "VERSION");
     for profile in asterism_core::profile::CATALOG {
-        println!("{:<8} {:<8} {}", profile.name, profile.version, profile.summary);
+        println!(
+            "{:<8} {:<8} {}",
+            profile.name, profile.version, profile.summary
+        );
         if !profile.requires.is_empty() {
             println!("{:<17} with: {}", "", profile.requires.join(", "));
         }
@@ -2069,7 +2074,11 @@ fn print_profile_state(inst: &Instance) {
     // and the user should see the three they are getting.
     let resolved = asterism_core::profile::resolve(&inst.profiles);
     let names = match &resolved {
-        Ok(profiles) => profiles.iter().map(|p| p.name).collect::<Vec<_>>().join(" "),
+        Ok(profiles) => profiles
+            .iter()
+            .map(|p| p.name)
+            .collect::<Vec<_>>()
+            .join(" "),
         // A name this binary does not know is a downgrade, not a typo: the
         // instance was created by a newer Asterism. It is printed as it was
         // recorded, because that is the fact, and the boot that would refuse
@@ -2088,7 +2097,10 @@ fn print_profile_state(inst: &Instance) {
         ),
         _ => println!("applied at the next boot: ast up {}", inst.name),
     }
-    println!("what the guest actually has: ast profile {} --check", inst.name);
+    println!(
+        "what the guest actually has: ast profile {} --check",
+        inst.name
+    );
 }
 
 /// `ast profile <instance> --check` — ask the guest.
@@ -2113,7 +2125,13 @@ fn check_profiles(name: &str) -> Result<()> {
     // From here the guest answers for itself, and its exit status is this
     // command's: a failed check is a failed command, which is what a script
     // that runs this after a boot needs it to be.
-    ssh(name, &["sudo".to_owned(), "/usr/local/sbin/asterism-check".to_owned()])
+    ssh(
+        name,
+        &[
+            "sudo".to_owned(),
+            "/usr/local/sbin/asterism-check".to_owned(),
+        ],
+    )
 }
 
 // ---- logs ------------------------------------------------------------------

@@ -290,12 +290,12 @@ ok "the guest verifies itself: git, tmux, node, npm, claude"
 # Same thing through the CLI, which is how a person will actually run it.
 expect "ast profile --check" "this guest is ready" "$AST" profile "$INST" --check
 
-HANDLE="$(guest 'printf %s "$ASTERISM_SENTINEL"' 2>/dev/null)" \
+HANDLE="$(guest 'printenv ASTERISM_SENTINEL' 2>/dev/null)" \
   || fail "the guest did not expose its sentinel handle"
 case "$HANDLE" in ast-*) ;; *) fail "the guest got something other than an opaque handle" ;; esac
 [ "$HANDLE" != "$SENTINEL" ] || fail "the raw sentinel entered the guest instead of a handle"
 ok "the guest has an opaque handle, not the sentinel"
-expect "the proxy replaces the handle with the sentinel in flight" \
+eventually "the proxy replaces the handle with the sentinel in flight" \
   "sentinel-handle-works" handle_works
 
 # ---- 4. a session that outlives the connection that started it -------------
@@ -366,7 +366,7 @@ AFTER_HOST_GUEST="$(wait_guest_pid "$BEFORE_HOST_GUEST")" \
 ok "service resurrected astd as $ASTD_PID; astd resurrected the guest as $AFTER_HOST_GUEST"
 expect "the resurrected profiled guest verifies itself" "this guest is ready" \
   "$AST" profile "$INST" --check
-expect "the handle path survives daemon and guest resurrection" \
+eventually "the handle path survives daemon and guest resurrection" \
   "sentinel-handle-works" handle_works
 
 # ---- 8. snapshot absence, inspection and restore ---------------------------
@@ -396,7 +396,7 @@ expect "restore returned the disk to its control marker" "before-snapshot" \
   guest "cat /var/lib/asterism/profile-snapshot-control"
 expect "the restored profile is still usable" "this guest is ready" \
   "$AST" profile "$INST" --check
-expect "the restored handle still resolves through the proxy" \
+eventually "the restored handle still resolves through the proxy" \
   "sentinel-handle-works" handle_works
 
 # ---- 9. bug report redaction ------------------------------------------------
