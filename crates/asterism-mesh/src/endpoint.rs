@@ -569,6 +569,19 @@ impl MeshConnection {
         fallback
     }
 
+    /// The selected path and its transport RTT estimate.
+    ///
+    /// Unlike [`Self::path`], this does not invent a fallback before iroh has
+    /// selected a transmission path: an RTT only means something for the path
+    /// carrying the bytes whose acknowledgements produced it.
+    pub fn selected_path_rtt(&self) -> Option<(PathKind, Duration)> {
+        let paths = self.conn.paths();
+        paths
+            .iter()
+            .find(|path| path.is_selected())
+            .map(|path| (kind_of(path.remote_addr()), path.rtt()))
+    }
+
     /// Opens a new bidirectional stream to the peer.
     ///
     /// iroh, like QUIC generally, does not tell the peer a stream exists until

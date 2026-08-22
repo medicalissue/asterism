@@ -412,6 +412,86 @@ pub struct Mesh {
     pending: Arc<Mutex<Option<mpsc::Sender<MeshConnection>>>>,
     /// One connection per peer, kept warm. Keyed by device id.
     conns: Mutex<HashMap<String, MeshConnection>>,
+    /// Last measured reachability for each peer. This is observation, not
+    /// identity or placement state, and deliberately dies with the daemon.
+    telemetry: Mutex<HashMap<String, PeerTelemetry>>,
+}
+
+/// The current measured link to a peer, shared with remote-part health.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinkObservation {
+    pub path: Option<PathKind>,
+    pub rtt_micros: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PeerTelemetry {
+    online: bool,
+    path: Option<PathKind>,
+    rtt_micros: Option<u64>,
+    transition_reason: Option<String>,
+    recovery_result: Option<String>,
+    observed_at: u64,
+    /// A recovered connection commonly starts on a relay and upgrades to a
+    /// direct path on its first warm probe. Preserve the recovery across that
+    /// one settling observation; later path changes are real transitions.
+    settling_recovery: bool,
+}
+
+impl PeerTelemetry {
+    /// Fold a successful probe into the last observation. Warm probes update
+    /// the numbers without erasing the transition which made the link
+    /// interesting; a recovery or selected-path change replaces it.
+    fn success(&mut self, path: Option<PathKind>, rtt: Duration, reason: &str) {
+        let first = self.observed_at == 0;
+        let recovered = !first && !self.online;
+        // A daemon restart forgets this in-memory observation, but discovery
+        // recovering an absent or stale address is still a recovery. Do not
+        // relabel it as a plain first connection just because the observer is
+        // new.
+        let recovered_address = matches!(
+            reason,
+            "stale_address_recovered_by_discovery" | "address_recovered_by_discovery"
+        );
+        let path_changed = self.online && self.path.is_some() && self.path != path;
+
+        self.online = true;
+        self.path = path;
+        self.rtt_micros = Some(rtt.as_micros().min(u64::MAX as u128) as u64);
+        self.observed_at = asterism_core::instance::now_unix();
+
+        if recovered || recovered_address {
+            self.transition_reason = Some(reason.to_owned());
+            self.recovery_result = Some("recovered".into());
+            self.settling_recovery = true;
+        } else if first {
+            self.transition_reason = Some(reason.to_owned());
+            self.recovery_result = Some("connected".into());
+            self.settling_recovery = false;
+        } else if path_changed {
+            if !self.settling_recovery {
+                self.transition_reason = Some("selected_path_changed".into());
+                self.recovery_result = Some("healthy".into());
+            }
+            self.settling_recovery = false;
+        } else {
+            self.settling_recovery = false;
+        }
+    }
+
+    fn failure(&mut self, reason: &str) {
+        self.online = false;
+        self.path = None;
+        self.rtt_micros = None;
+        self.transition_reason = Some(reason.to_owned());
+        self.recovery_result = Some("failed".into());
+        self.observed_at = asterism_core::instance::now_unix();
+    }
+}
+
+struct Dialed {
+    connection: MeshConnection,
+    reason: &'static str,
 }
 
 impl Mesh {
@@ -432,6 +512,7 @@ impl Mesh {
             orbit: node.orbit.clone(),
             pending: Arc::new(Mutex::new(None)),
             conns: Mutex::new(HashMap::new()),
+            telemetry: Mutex::new(HashMap::new()),
         });
 
         tokio::spawn(accept_loop(mesh.clone(), node));
@@ -486,16 +567,26 @@ impl Mesh {
             online: true,
             // A device does not reach itself over a path.
             path: "-".into(),
+            rtt_micros: None,
+            transition_reason: None,
+            recovery_result: None,
             is_self: true,
         }];
-        rows.extend(peers.iter().zip(seen).map(|(peer, path)| DeviceStatus {
-            name: peer.name.clone(),
-            device_id: peer.device_id.clone(),
-            online: path.is_some(),
-            // Whatever the live connection says, and a dash when there is no
-            // connection to ask.
-            path: path_word(path.flatten()),
-            is_self: false,
+        let telemetry = self.telemetry.lock().await;
+        rows.extend(peers.iter().zip(seen).map(|(peer, path)| {
+            let observed = telemetry.get(&peer.device_id);
+            DeviceStatus {
+                name: peer.name.clone(),
+                device_id: peer.device_id.clone(),
+                online: path.is_some(),
+                // Whatever the live connection says, and a dash when there is no
+                // connection to ask.
+                path: path_word(path.flatten()),
+                rtt_micros: observed.and_then(|o| o.rtt_micros),
+                transition_reason: observed.and_then(|o| o.transition_reason.clone()),
+                recovery_result: observed.and_then(|o| o.recovery_result.clone()),
+                is_self: false,
+            }
         }));
         rows
     }
@@ -1090,14 +1181,13 @@ impl Mesh {
     /// one frame back that says yes or why not, and then a pipe. The fence is
     /// checked on the far side, where the lease is, because a check on this
     /// side would be a check by the party it is meant to constrain.
-    pub async fn volume_splice(
+    pub async fn open_volume_splice(
         self: &Arc<Self>,
         device: &str,
         volume: &str,
         holder: &str,
         epoch: u64,
-        local: tokio::net::UnixStream,
-    ) -> Result<()> {
+    ) -> Result<(asterism_mesh::MeshStream, LinkObservation)> {
         let peer = self.device(device).await?;
         let connection = self
             .live_connection(&peer)
@@ -1121,7 +1211,12 @@ impl Mesh {
             MeshReply::Incompatible { message, .. } => bail!(message),
             other => bail!("device {device:?} would not serve volume {volume:?}: {other:?}"),
         }
-        pump(local, stream).await
+        let selected = connection.selected_path_rtt();
+        let observation = LinkObservation {
+            path: selected.map(|(path, _)| path).or_else(|| connection.path()),
+            rtt_micros: selected.map(|(_, rtt)| rtt.as_micros().min(u64::MAX as u128) as u64),
+        };
+        Ok((stream, observation))
     }
 
     // ---- moving an instance's cpu part --------------------------------------
@@ -1502,11 +1597,76 @@ impl Mesh {
     /// has just answered a ping has an open path — but it is representable, so
     /// it is spelled rather than unwrapped.
     async fn probe_path(&self, name: &str) -> Option<Option<PathKind>> {
+        self.measure_link(name).await.map(|observed| observed.path)
+    }
+
+    /// Actively measure whether a peer still answers and which selected path
+    /// carries its bytes. Remote-part status uses this so an idle guest does
+    /// not keep reporting a provider as healthy until its next disk write.
+    pub(crate) async fn measure_link(&self, name: &str) -> Option<LinkObservation> {
         let device = self.device(name).await.ok()?;
         match tokio::time::timeout(PROBE_TIMEOUT, self.live_connection(&device)).await {
-            Ok(Ok(connection)) => Some(connection.path()),
-            _ => None,
+            Ok(Ok(connection)) => {
+                let selected = connection.selected_path_rtt();
+                let measured_rtt =
+                    selected.map(|(_, rtt)| rtt.as_micros().min(u64::MAX as u128) as u64);
+                let observed_rtt = self
+                    .telemetry
+                    .lock()
+                    .await
+                    .get(&device.device_id)
+                    .and_then(|observed| observed.rtt_micros);
+                Some(LinkObservation {
+                    path: selected.map(|(path, _)| path).or_else(|| connection.path()),
+                    rtt_micros: measured_rtt.or(observed_rtt),
+                })
+            }
+            _ => {
+                self.observe_failure(&device.device_id, "probe_timeout_or_failure")
+                    .await;
+                None
+            }
         }
+    }
+
+    /// The most recent measured path to a peer. It performs no network I/O;
+    /// callers use it immediately after a volume control request has already
+    /// proved the link and populated the observation.
+    pub(crate) async fn link_observation(&self, name: &str) -> Option<LinkObservation> {
+        let device = self.device(name).await.ok()?;
+        self.telemetry
+            .lock()
+            .await
+            .get(&device.device_id)
+            .filter(|o| o.online)
+            .map(|o| LinkObservation {
+                path: o.path,
+                rtt_micros: o.rtt_micros,
+            })
+    }
+
+    async fn observe_success(
+        &self,
+        device_id: &str,
+        connection: &MeshConnection,
+        rtt: Duration,
+        reason: &str,
+    ) {
+        self.telemetry
+            .lock()
+            .await
+            .entry(device_id.to_owned())
+            .or_default()
+            .success(connection.path(), rtt, reason);
+    }
+
+    async fn observe_failure(&self, device_id: &str, reason: &str) {
+        self.telemetry
+            .lock()
+            .await
+            .entry(device_id.to_owned())
+            .or_default()
+            .failure(reason);
     }
 
     /// A connection to `device` that has just proved it is answering.
@@ -1520,26 +1680,52 @@ impl Mesh {
     async fn live_connection(&self, device: &Device) -> Result<MeshConnection> {
         let cached = self.conns.lock().await.get(&device.device_id).cloned();
         if let Some(cached) = cached {
+            let started = Instant::now();
             if let Ok(Ok(MeshReply::Pong { .. })) =
                 tokio::time::timeout(PROBE_TIMEOUT, ask(&cached, &MeshRequest::Ping)).await
             {
+                self.observe_success(
+                    &device.device_id,
+                    &cached,
+                    started.elapsed(),
+                    "cached_connection",
+                )
+                .await;
                 return Ok(cached);
             }
             self.conns.lock().await.remove(&device.device_id);
+            self.observe_failure(&device.device_id, "cached_connection_lost")
+                .await;
         }
 
-        let connection = self.dial(device).await?;
-        tokio::time::timeout(PROBE_TIMEOUT, ask(&connection, &MeshRequest::Ping))
+        let Dialed { connection, reason } = match self.dial(device).await {
+            Ok(dialed) => dialed,
+            Err(e) => {
+                self.observe_failure(&device.device_id, "dial_failed").await;
+                return Err(e);
+            }
+        };
+        let started = Instant::now();
+        let answered = tokio::time::timeout(PROBE_TIMEOUT, ask(&connection, &MeshRequest::Ping))
             .await
             .map_err(|_| {
                 anyhow!(
                     "device {:?} answered the dial but not the mesh",
                     device.name
                 )
-            })?
-            // A device that refuses us closes the connection here, and its
-            // reason ("not in this orbit") is the useful half of the message.
-            .with_context(|| format!("could not reach device {:?}", device.name))?;
+            })
+            .and_then(|answer| {
+                // A device that refuses us closes the connection here, and
+                // its reason ("not in this orbit") is the useful half.
+                answer.with_context(|| format!("could not reach device {:?}", device.name))
+            });
+        if let Err(e) = answered {
+            self.observe_failure(&device.device_id, "dial_answered_but_mesh_failed")
+                .await;
+            return Err(e);
+        }
+        self.observe_success(&device.device_id, &connection, started.elapsed(), reason)
+            .await;
 
         self.conns
             .lock()
@@ -1569,32 +1755,67 @@ impl Mesh {
     /// enough ([`hint_is_stale`]) that waiting out a dial timeout on it is the
     /// likelier outcome, in which case discovery goes first and the hint is
     /// the fallback.
-    async fn dial(&self, device: &Device) -> Result<MeshConnection> {
+    async fn dial(&self, device: &Device) -> Result<Dialed> {
         let by_hint = endpoint_addr(device)?;
         let has_hints = !by_hint.is_empty();
         let discovery = self.endpoint.mode() == MeshMode::Discovery;
 
         if !discovery {
-            return self.dial_addr(device, by_hint).await;
+            return self
+                .dial_addr(device, by_hint)
+                .await
+                .map(|connection| Dialed {
+                    connection,
+                    reason: "stored_address",
+                });
         }
 
         let peer = DeviceId::from_public_key(by_hint.id);
         if !has_hints || hint_is_stale(device) {
             match self.dial_discovered(device, peer).await {
-                Ok(conn) => return Ok(conn),
+                Ok(connection) => {
+                    return Ok(Dialed {
+                        connection,
+                        reason: if has_hints {
+                            "stale_address_recovered_by_discovery"
+                        } else {
+                            "address_recovered_by_discovery"
+                        },
+                    })
+                }
                 Err(e) if !has_hints => return Err(e),
-                Err(_) => return self.dial_addr(device, by_hint).await,
+                Err(_) => {
+                    return self
+                        .dial_addr(device, by_hint)
+                        .await
+                        .map(|connection| Dialed {
+                            connection,
+                            reason: "stored_address_after_discovery_failure",
+                        })
+                }
             }
         }
 
         match self.dial_addr(device, by_hint).await {
-            Ok(conn) => Ok(conn),
-            Err(stored) => self.dial_discovered(device, peer).await.map_err(|found| {
-                // Both messages matter: the first says the address on file did
-                // not answer, the second says nobody knows a better one. Only
-                // together do they mean "offline".
-                anyhow!("{stored:#}; and discovery had no fresher address for it either: {found:#}")
+            Ok(connection) => Ok(Dialed {
+                connection,
+                reason: "stored_address",
             }),
+            Err(stored) => self
+                .dial_discovered(device, peer)
+                .await
+                .map(|connection| Dialed {
+                    connection,
+                    reason: "stale_address_recovered_by_discovery",
+                })
+                .map_err(|found| {
+                    // Both messages matter: the first says the address on file did
+                    // not answer, the second says nobody knows a better one. Only
+                    // together do they mean "offline".
+                    anyhow!(
+                        "{stored:#}; and discovery had no fresher address for it either: {found:#}"
+                    )
+                }),
         }
     }
 
@@ -1820,7 +2041,7 @@ async fn splice_to_guest(
         MeshReply::Incompatible { message, .. } => bail!(message),
         other => bail!("device {device:?} would not splice: {other:?}"),
     }
-    pump(tcp, stream).await
+    pump(tcp, stream).await.map(|_| ())
 }
 
 /// Copies bytes both ways between a local connection and a mesh stream until
@@ -1834,14 +2055,40 @@ async fn splice_to_guest(
 /// Generic over the local side because there are two of them now — a TCP
 /// socket for ssh, a unix socket for a volume — and the splice is the same
 /// piece of plumbing either way.
-pub(crate) async fn pump<L>(local: L, stream: asterism_mesh::MeshStream) -> Result<()>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TransferStats {
+    pub sent_bytes: u64,
+    pub received_bytes: u64,
+    pub elapsed: Duration,
+}
+
+impl TransferStats {
+    pub fn total_bytes(self) -> u64 {
+        self.sent_bytes.saturating_add(self.received_bytes)
+    }
+
+    pub fn bytes_per_second(self) -> Option<u64> {
+        let nanos = self.elapsed.as_nanos();
+        (nanos > 0 && self.total_bytes() > 0).then(|| {
+            ((self.total_bytes() as u128 * 1_000_000_000) / nanos).min(u64::MAX as u128) as u64
+        })
+    }
+}
+
+pub(crate) async fn pump<L>(local: L, stream: asterism_mesh::MeshStream) -> Result<TransferStats>
 where
     L: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
 {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let (mut local_read, mut local_write) = tokio::io::split(local);
     let (mut send, mut recv) = stream.into_parts();
+    let sent_bytes = Arc::new(AtomicU64::new(0));
+    let received_bytes = Arc::new(AtomicU64::new(0));
+    let sent = sent_bytes.clone();
+    let received = received_bytes.clone();
+    let started = Instant::now();
 
     let up = async move {
         let mut buf = vec![0u8; 64 * 1024];
@@ -1851,6 +2098,7 @@ where
                 break;
             }
             send.write_all(&buf[..n]).await?;
+            sent.fetch_add(n as u64, Ordering::Relaxed);
         }
         let _ = send.finish();
         Ok::<(), anyhow::Error>(())
@@ -1862,6 +2110,7 @@ where
                 break;
             }
             local_write.write_all(&buf[..n]).await?;
+            received.fetch_add(n as u64, Ordering::Relaxed);
         }
         let _ = local_write.shutdown().await;
         Ok::<(), anyhow::Error>(())
@@ -1873,7 +2122,12 @@ where
     tokio::select! {
         r = up => r,
         r = down => r,
-    }
+    }?;
+    Ok(TransferStats {
+        sent_bytes: sent_bytes.load(Ordering::Relaxed),
+        received_bytes: received_bytes.load(Ordering::Relaxed),
+        elapsed: started.elapsed(),
+    })
 }
 
 /// The far end of a splice: connect to the guest and become a pipe.
@@ -1918,7 +2172,7 @@ async fn serve_splice(
         .await
         .with_context(|| format!("connecting to {name:?}'s guest on {host}:{port}"))?;
     write_frame(&mut stream.send, &MeshReply::SpliceReady).await?;
-    pump(tcp, stream).await
+    pump(tcp, stream).await.map(|_| ())
 }
 
 /// The provider's end of a volume splice: check the lease, then become a pipe.
@@ -1946,7 +2200,7 @@ async fn serve_volume_splice(
         }
     };
     write_frame(&mut stream.send, &MeshReply::SpliceReady).await?;
-    pump(export, stream).await
+    pump(export, stream).await.map(|_| ())
 }
 
 // ---- moving an instance's bytes ---------------------------------------------
@@ -3022,6 +3276,122 @@ mod tests {
         assert_eq!(path_word(Some(PathKind::Direct)), "direct");
         assert_eq!(path_word(Some(PathKind::Relay)), "relay");
         assert_eq!(path_word(None), "-");
+    }
+
+    #[test]
+    fn peer_recovery_keeps_the_reason_and_measures_the_new_path() {
+        let mut observed = PeerTelemetry::default();
+        observed.success(
+            Some(PathKind::Direct),
+            Duration::from_micros(800),
+            "stored_address",
+        );
+        assert!(observed.online);
+        assert_eq!(observed.recovery_result.as_deref(), Some("connected"));
+        assert_eq!(observed.rtt_micros, Some(800));
+
+        observed.failure("cached_connection_lost");
+        assert!(!observed.online);
+        assert_eq!(observed.recovery_result.as_deref(), Some("failed"));
+
+        observed.success(
+            Some(PathKind::Relay),
+            Duration::from_millis(21),
+            "stale_address_recovered_by_discovery",
+        );
+        assert!(observed.online);
+        assert_eq!(observed.path, Some(PathKind::Relay));
+        assert_eq!(observed.rtt_micros, Some(21_000));
+        assert_eq!(observed.recovery_result.as_deref(), Some("recovered"));
+        assert_eq!(
+            observed.transition_reason.as_deref(),
+            Some("stale_address_recovered_by_discovery")
+        );
+
+        // A routine liveness probe refreshes RTT without erasing the recovery
+        // which explains why this peer is reachable again.
+        observed.success(
+            Some(PathKind::Relay),
+            Duration::from_millis(19),
+            "cached_connection",
+        );
+        assert_eq!(observed.rtt_micros, Some(19_000));
+        assert_eq!(observed.recovery_result.as_deref(), Some("recovered"));
+
+        observed.success(
+            Some(PathKind::Direct),
+            Duration::from_millis(2),
+            "cached_connection",
+        );
+        assert_eq!(observed.path, Some(PathKind::Direct));
+        assert_eq!(
+            observed.transition_reason.as_deref(),
+            Some("selected_path_changed")
+        );
+        assert_eq!(observed.recovery_result.as_deref(), Some("healthy"));
+    }
+
+    #[test]
+    fn discovery_recovery_is_not_hidden_by_an_observer_restart() {
+        let mut observed = PeerTelemetry::default();
+        observed.success(
+            Some(PathKind::Relay),
+            Duration::from_millis(18),
+            "stale_address_recovered_by_discovery",
+        );
+
+        assert!(observed.online);
+        assert_eq!(observed.rtt_micros, Some(18_000));
+        assert_eq!(observed.recovery_result.as_deref(), Some("recovered"));
+        assert_eq!(
+            observed.transition_reason.as_deref(),
+            Some("stale_address_recovered_by_discovery")
+        );
+
+        // Discovery often establishes a relay path first and hole punching
+        // selects direct milliseconds later. That is one recovery settling,
+        // not a reason to hide the recovery before a user can observe it.
+        observed.success(
+            Some(PathKind::Direct),
+            Duration::from_millis(2),
+            "cached_connection",
+        );
+        assert_eq!(observed.path, Some(PathKind::Direct));
+        assert_eq!(observed.recovery_result.as_deref(), Some("recovered"));
+        assert_eq!(
+            observed.transition_reason.as_deref(),
+            Some("stale_address_recovered_by_discovery")
+        );
+
+        // Once settled, a later roam is its own path transition.
+        observed.success(
+            Some(PathKind::Relay),
+            Duration::from_millis(20),
+            "cached_connection",
+        );
+        assert_eq!(observed.recovery_result.as_deref(), Some("healthy"));
+        assert_eq!(
+            observed.transition_reason.as_deref(),
+            Some("selected_path_changed")
+        );
+    }
+
+    #[test]
+    fn transfer_throughput_is_derived_from_measured_bytes_and_time() {
+        let stats = TransferStats {
+            sent_bytes: 3 << 30,
+            received_bytes: 1 << 30,
+            elapsed: Duration::from_secs(16),
+        };
+        assert_eq!(stats.total_bytes(), 4 << 30);
+        assert_eq!(stats.bytes_per_second(), Some(256 << 20));
+
+        let empty = TransferStats {
+            sent_bytes: 0,
+            received_bytes: 0,
+            elapsed: Duration::from_secs(1),
+        };
+        assert_eq!(empty.bytes_per_second(), None);
     }
 
     /// A frame exactly as it appeared on the wire before the wire had a
