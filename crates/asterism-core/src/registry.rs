@@ -917,6 +917,7 @@ mod tests {
                     to_device: "desktop".into(),
                     epoch: 1,
                     started_at: now_unix(),
+                    live: false,
                 }),
             )
             .unwrap();

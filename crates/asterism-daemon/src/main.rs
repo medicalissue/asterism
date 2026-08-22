@@ -137,13 +137,6 @@ async fn main() -> Result<()> {
         eprintln!("astd: {note}");
     }
 
-    // Now that this build has been established as one that may touch this
-    // home: a cpu-part swap this device was receiving when it died left a
-    // staging directory, and this is the "next contact" that clears it. It
-    // was never bootable and no shard row ever pointed at it, so there is
-    // nothing to consult first.
-    swap::sweep_staging();
-
     let node = Node {
         shard: Arc::new(Mutex::new(Shard::load(&paths::state_path())?)),
         orbit: Arc::new(Mutex::new(Orbit::load(&paths::orbit_path())?)),
@@ -158,6 +151,17 @@ async fn main() -> Result<()> {
     // `asterism_core::ipc::Door`.
     let door = transport::Door::open(&home, &paths::socket_path())?;
     let sock = door.socket().to_path_buf();
+
+    // Authority WALs are outside both staging and live trees. Reconcile them
+    // after winning the daemon election and before generic staging cleanup:
+    // Committing is completed, Prepared is durably aborted, and only then
+    // may an unreferenced staging tree be swept.
+    {
+        let device = node.device_name().await;
+        let mut reg = node.shard.lock().await;
+        swap::reconcile_target_startup(&mut reg, &device);
+    }
+    swap::sweep_staging();
 
     // Now, and not before, this process has proved it is the only daemon on
     // this home — the election is the mutex, so nothing here can be tidying
@@ -232,6 +236,10 @@ async fn main() -> Result<()> {
         }
     }
     volume::adopt_export_identities().await;
+
+    if let Some(mesh) = &mesh {
+        swap::reconcile_source_startup(&node, mesh).await;
+    }
 
     // What this device was running, it runs again — before the first
     // request is served, and then continuously (see `persist`).

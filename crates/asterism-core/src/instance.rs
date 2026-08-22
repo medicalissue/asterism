@@ -434,6 +434,13 @@ pub struct Moving {
     pub epoch: u64,
     /// When the fence went up, Unix seconds.
     pub started_at: u64,
+    /// The source guest may still exist at a backend migration boundary.
+    ///
+    /// A daemon restart must not treat that guest like an ordinary running
+    /// instance: authority is settled with the target transaction before the
+    /// guest may be resumed or resurrected.
+    #[serde(default)]
+    pub live: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

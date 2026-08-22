@@ -78,6 +78,32 @@ pub fn qmp_socket_path(name: &str) -> PathBuf {
     short_socket(instance_dir(name).join("qmp.sock"))
 }
 
+/// QMP socket inside an explicitly selected instance directory.
+///
+/// Live migration starts the incoming guest in an unlisted staging
+/// directory; the ordinary name-derived directory does not exist until the
+/// authority commit renames staging into place.
+pub fn qmp_socket_in(dir: &std::path::Path) -> PathBuf {
+    short_socket(dir.join("qmp.sock"))
+}
+
+/// Backend migration socket inside an explicitly selected staging directory.
+///
+/// Migration staging names are longer than ordinary instance names and can
+/// cross the platform's Unix-socket path limit even when the live instance
+/// would not. Keep that host detail behind the same short-path seam as every
+/// other control socket.
+pub fn migration_socket_in(dir: &std::path::Path) -> PathBuf {
+    short_socket(dir.join(".live-migration.sock"))
+}
+
+/// Source-side socket that turns a backend migration stream into a mesh
+/// stream. It is process plumbing, not instance state, and is removed when
+/// the splice ends.
+pub fn migration_source_socket_path(name: &str, epoch: u64) -> PathBuf {
+    short_socket(home_dir().join(format!(".live-out-{name}-{epoch}.sock")))
+}
+
 /// Control socket of the `astd-vz` helper holding one instance's guest.
 ///
 /// The same shape as the QMP path and for the same reason: it is a socket,

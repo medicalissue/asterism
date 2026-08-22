@@ -33,6 +33,7 @@
 //! after that point is identical: the same clone of the same raw base, the
 //! same snapshots, the same QMP socket, the same shutdown.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -228,6 +229,13 @@ impl Probe {
 /// to change for a foreign-arch guest.
 const CPU_MODEL: &str = "host";
 
+thread_local! {
+    /// Set only around the synchronous `migrate_in -> boot` call. Backends
+    /// are stateless; this keeps the public trait narrow while allowing the
+    /// ordinary launch path to add QEMU's incoming boundary for one call.
+    static INCOMING: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
 impl Hypervisor for Qemu {
     fn id(&self) -> &'static str {
         ID
@@ -253,7 +261,7 @@ impl Hypervisor for Qemu {
             disk_snapshot: true,
             // QEMU can live-migrate, but this backend does not implement
             // migrate_out/in yet, and Caps describes what is offered.
-            live_migration: false,
+            live_migration: true,
             disk_hotplug: false,
             shared_dir,
             nbd_disks: true,
@@ -382,7 +390,7 @@ impl Hypervisor for Qemu {
         let ssh_port = free_port()?;
         let pidfile = req.dir.join("qemu.pid");
         let _ = std::fs::remove_file(&pidfile);
-        let qmp = paths::qmp_socket_path(&inst.name);
+        let qmp = paths::qmp_socket_in(&req.dir);
         // A guest that died leaves its socket path behind and the next one
         // binds it. Any connection still held to the old one belongs to a
         // process that is gone.
@@ -475,6 +483,12 @@ impl Hypervisor for Qemu {
             .arg("-pidfile")
             .arg(&pidfile);
 
+        INCOMING.with(|incoming| {
+            if let Some(uri) = incoming.borrow().as_deref() {
+                cmd.arg("-incoming").arg(uri);
+            }
+        });
+
         for share in &req.shares {
             // mapped-xattr keeps guest ownership and permissions in host
             // xattrs, so a guest chown never has to become a host chown
@@ -563,6 +577,121 @@ impl Hypervisor for Qemu {
             true => RunState::Running,
             false => RunState::Stopped,
         })
+    }
+
+    fn migrate_out(&self, h: &Handle, to: asterism_core::hv::MigrationTarget) -> Result<()> {
+        use serde_json::{json, Value};
+        use std::time::{Duration, Instant};
+
+        let conn = qmp::on(h.ctl.path())?;
+        conn.execute(
+            "migrate-set-capabilities",
+            json!({ "capabilities": [
+                { "capability": "pause-before-switchover", "state": true }
+            ]}),
+        )?;
+        conn.execute("migrate", json!({ "uri": to.url, "blk": true }))?;
+        let deadline = Instant::now() + Duration::from_secs(15 * 60);
+        loop {
+            let state = conn.execute("query-migrate", Value::Null)?;
+            match state
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+            {
+                "pre-switchover" => return Ok(()),
+                "failed" | "cancelled" => {
+                    let error = state
+                        .get("error-desc")
+                        .and_then(Value::as_str)
+                        .unwrap_or("QEMU cancelled the migration");
+                    bail!("live migration failed: {error}");
+                }
+                _ if Instant::now() >= deadline => {
+                    let _ = conn.execute("migrate_cancel", Value::Null);
+                    bail!("live migration did not converge within 15 minutes");
+                }
+                _ => std::thread::sleep(Duration::from_millis(100)),
+            }
+        }
+    }
+
+    fn migrate_in(
+        &self,
+        req: &BootReq,
+        from: asterism_core::hv::MigrationSource,
+    ) -> Result<Handle> {
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                INCOMING.with(|slot| *slot.borrow_mut() = None);
+            }
+        }
+        INCOMING.with(|slot| *slot.borrow_mut() = Some(from.url));
+        let _clear = Clear;
+        let prep = self.prepare(req)?;
+        self.boot(req, &prep)
+    }
+
+    fn migration_commit(&self, h: &Handle) -> Result<()> {
+        use serde_json::{json, Value};
+        use std::time::{Duration, Instant};
+
+        let conn = qmp::on(h.ctl.path())?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut continued = false;
+        loop {
+            let state = conn.execute("query-migrate", Value::Null)?;
+            match state
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+            {
+                "completed" | "postmigrate" => return Ok(()),
+                "failed" | "cancelled" => bail!("QEMU refused the migration commit: {state}"),
+                "pre-switchover" if !continued => {
+                    conn.execute("migrate-continue", json!({ "state": "pre-switchover" }))?;
+                    continued = true;
+                }
+                _ if Instant::now() >= deadline => {
+                    bail!("QEMU did not complete migration switchover within 30 seconds")
+                }
+                _ => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+
+    fn migration_abort(&self, h: &Handle) -> Result<()> {
+        use serde_json::Value;
+        use std::time::{Duration, Instant};
+
+        let conn = qmp::on(h.ctl.path())?;
+        let mut status = conn.execute("query-migrate", Value::Null)?;
+        if !matches!(
+            status.get("status").and_then(Value::as_str),
+            Some("none" | "cancelled" | "failed")
+        ) {
+            conn.execute("migrate_cancel", Value::Null)?;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                status = conn.execute("query-migrate", Value::Null)?;
+                if matches!(
+                    status.get("status").and_then(Value::as_str),
+                    Some("none" | "cancelled" | "failed")
+                ) {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    bail!("QEMU did not cancel live migration within 30 seconds");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        let run = conn.execute("query-status", Value::Null)?;
+        if run.get("running").and_then(Value::as_bool) == Some(false) {
+            conn.execute("cont", Value::Null)?;
+        }
+        Ok(())
     }
 
     // ---- disk snapshots ----------------------------------------------------
@@ -1871,17 +2000,18 @@ mod tests {
     /// The capability table is what the daemon gates on, so the shape of it
     /// matters more than any single flag.
     #[test]
-    fn qemu_offers_disk_snapshots_but_not_live_ones() {
+    fn qemu_offers_disk_snapshots_and_precopy_migration_but_not_live_snapshots() {
         let caps = Qemu::new().caps();
         assert!(caps.disk_snapshot);
         assert!(!caps.live_snapshot);
+        assert!(caps.live_migration);
         assert!(caps.disk_formats.contains(&DiskFormat::Qcow2));
     }
 
     /// The trait's default impls must stay reachable for what this backend
     /// does not offer, and must name the backend when they refuse.
     #[test]
-    fn unoffered_capabilities_refuse_by_name() {
+    fn unoffered_snapshot_capability_refuses_by_name() {
         let hv = Qemu::new();
         let h = handle(Some(ProcId {
             pid: 1,
@@ -1890,9 +2020,6 @@ mod tests {
         }));
         let err = hv.snapshot(&h, "t").unwrap_err().to_string();
         assert!(err.contains("qemu"), "{err}");
-        assert!(hv
-            .migrate_out(&h, asterism_core::hv::MigrationTarget { url: "x".into() })
-            .is_err());
     }
 
     /// A handle built the way one arrives off disk.

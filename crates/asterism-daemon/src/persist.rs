@@ -185,7 +185,7 @@ pub async fn resurrect(registry: &Arc<Mutex<Shard>>) {
     let recorded: Vec<Instance> = reg
         .list()
         .into_iter()
-        .filter(|i| i.status == Status::Running)
+        .filter(|i| i.status == Status::Running && i.moving.is_none())
         .collect();
     if recorded.is_empty() {
         return;
@@ -258,6 +258,9 @@ async fn tick(registry: &Arc<Mutex<Shard>>, guard: &mut SleepGuard) {
         if inst.status != Status::Running {
             continue;
         }
+        if inst.moving.is_some() {
+            continue;
+        }
         if alive(&inst) {
             note_alive(&inst.name);
         } else {
@@ -303,6 +306,10 @@ fn restart(reg: &mut Shard, name: &str) -> bool {
         forget(name);
         return false;
     };
+    if inst.moving.is_some() {
+        forget(name);
+        return false;
+    }
     // It may have been started by hand while the backoff was running.
     if inst.status == Status::Running && alive(&inst) {
         return false;
