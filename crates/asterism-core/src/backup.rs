@@ -9,7 +9,7 @@
 //!
 //! Host plumbing and credentials never enter the recipe. Seeds, agent keys,
 //! process handles, sockets, logs and the egress directory are deliberately
-//! absent. Attached volumes and secrets survive only as public rebind
+//! absent. Attached volumes, secrets and GPUs survive only as public rebind
 //! requirements: restore never silently reconnects an external part from a
 //! different orbit.
 
@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::durable;
 use crate::instance::{Instance, Status, VolumeKind};
+use crate::remote_gpu::GpuAttachment;
 use crate::secret::Placement;
 
 pub const FORMAT_VERSION: u32 = 1;
@@ -64,6 +65,10 @@ pub struct RebindRequirements {
     pub volumes: Vec<VolumeRebind>,
     #[serde(default)]
     pub secrets: Vec<SecretRebind>,
+    /// Token-free description of the remote GPU that must be placed and
+    /// leased again in the destination orbit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<GpuAttachment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,6 +208,7 @@ pub fn export(
     portable.volumes.clear();
     portable.secrets.clear();
     portable.stranded.clear();
+    portable.gpu = None;
 
     let manifest = Manifest {
         version: FORMAT_VERSION,
@@ -321,6 +327,7 @@ fn requirements(instance: &Instance) -> RebindRequirements {
                 source_device: secret.source_device.clone(),
             })
             .collect(),
+        gpu: instance.gpu.clone(),
     }
 }
 
@@ -645,6 +652,14 @@ mod tests {
         let mut inst = instance("dev");
         inst.volumes
             .push(Volume::dir("/private/data", "old-device", None));
+        inst.gpu = Some(GpuAttachment {
+            provider_device: "gpu-box".into(),
+            provider_device_id: "a".repeat(64),
+            provider_gpu_uuid: "GPU-01234567".into(),
+            memory_bytes: 8 << 30,
+            provider_generation: 9,
+            attached_at: 100,
+        });
         let first = export(&inst, &source, &backup, None).unwrap();
         assert_eq!(first.data_chunks, 4);
         assert!(
@@ -661,6 +676,11 @@ mod tests {
         assert!(!text.contains("seed.iso"));
         assert!(manifest.instance.volumes.is_empty());
         assert_eq!(manifest.rebind.volumes.len(), 1);
+        assert!(manifest.instance.gpu.is_none());
+        assert_eq!(
+            manifest.rebind.gpu.as_ref().unwrap().provider_gpu_uuid,
+            "GPU-01234567"
+        );
         assert!(manifest.files.iter().any(|file| {
             file.chunks
                 .iter()
