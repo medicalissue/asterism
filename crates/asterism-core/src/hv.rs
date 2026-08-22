@@ -318,10 +318,55 @@ pub enum RunState {
 // ---- capability and identity ----------------------------------------------
 
 /// Kind of host-directory sharing a backend offers.
+///
+/// Carried through to the guest: the seed writes a `.mount` unit per share
+/// and that unit has to name the transport the backend actually built. So
+/// this is not just a label to gate on — everything the guest side of a
+/// share differs by hangs off it, and [`crate::seed`] asks rather than
+/// assumes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShareKind {
     Virtiofs,
     NinePfs,
+}
+
+impl ShareKind {
+    /// The name the transport goes by — in a mount unit's `Type=`, in
+    /// `/proc/filesystems`, and to a human reading a refusal.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ShareKind::Virtiofs => "virtiofs",
+            ShareKind::NinePfs => "9p",
+        }
+    }
+
+    /// `Options=` for that unit. Empty where the defaults are right:
+    /// virtiofs needs none, and an empty `Options=` line is not the same
+    /// as no line at all, so the seed omits it.
+    pub fn mount_options(self) -> &'static str {
+        match self {
+            ShareKind::Virtiofs => "",
+            ShareKind::NinePfs => "trans=virtio,version=9p2000.L,msize=262144,access=client",
+        }
+    }
+
+    /// Kernel modules the guest needs loaded for it.
+    ///
+    /// Normally autoloaded off the device's modalias; naming them is cheap
+    /// insurance for images that do not. `virtiofs` pulls `fuse` in as a
+    /// dependency, so it is the only one that has to be asked for.
+    pub fn modules(self) -> &'static [&'static str] {
+        match self {
+            ShareKind::Virtiofs => &["virtiofs"],
+            ShareKind::NinePfs => &["9p", "9pnet_virtio"],
+        }
+    }
+}
+
+impl std::fmt::Display for ShareKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// How a guest reaches a listener the daemon put up for it, and — the part
