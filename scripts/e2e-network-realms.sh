@@ -92,6 +92,23 @@ cleanup() {
   fi
   kill_daemon "$A"
   kill_daemon "$B"
+  # `sudo ... &` leaves a shell job which waits for the namespaced daemon.
+  # SIGSTOP/SIGCONT targets the daemon's pidfile identity, not that wrapper;
+  # reap any wrapper which remained stopped rather than leaking a task-owned
+  # process after its namespace and archived binary are removed.
+  for pid in "${DAEMONS[@]}"; do
+    if jobs -p | grep -qx "$pid"; then
+      sudo kill -CONT "$pid" 2>/dev/null || true
+      sudo kill -TERM "$pid" 2>/dev/null || true
+    fi
+  done
+  sleep 0.1
+  for pid in "${DAEMONS[@]}"; do
+    if jobs -p | grep -qx "$pid"; then
+      sudo kill -KILL "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+  done
   if [ "$WAN_RULE" = 1 ]; then
     sudo iptables -D FORWARD -s 198.18.77.0/24 -o "$UPLINK" \
       -m comment --comment "$TAG-outage" -j REJECT

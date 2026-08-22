@@ -767,9 +767,10 @@ pub fn bring_up(inst: &Instance, hv: &dyn Hypervisor) -> Result<Raised> {
     // Called from inside `block_in_place`, which is what makes blocking on
     // the runtime here legal: the worker thread has already been handed back.
     tokio::runtime::Handle::current().block_on(async {
-        // Measure every provider before taking the first lease.  Doing this
-        // inside `raise_all`'s per-volume loop would let a later unsuitable
-        // provider refuse the boot only after earlier lease epochs moved.
+        // Validate every provider before taking the first renewed lease.
+        // Doing this inside `raise_all`'s per-volume loop would let a later
+        // unsuitable provider refuse the boot only after earlier lease epochs
+        // moved.
         preflight_all(&blocks).await?;
         match raise_all(&name, &blocks).await {
             Ok(disks) => Ok(disks),
@@ -781,11 +782,17 @@ pub fn bring_up(inst: &Instance, hv: &dyn Hypervisor) -> Result<Raised> {
     })
 }
 
-/// Prove that every remote block device has a launch-quality data path before
-/// any boot-side mutation begins.
+/// Prove that every established remote block device still has a measurable
+/// direct path before any boot-side mutation begins.
+///
+/// The direct/<=5ms placement SLO was enforced when `attach` created this
+/// holder/provider/lease context. A reboot renews that same context; applying
+/// the placement threshold again after sustained I/O would confuse temporary
+/// queueing with a changed placement and strand the current holder. A path
+/// which has actually fallen back to a relay is still refused here.
 async fn preflight_all(blocks: &[Volume]) -> Result<()> {
     for volume in blocks {
-        preflight_remote_volume(&volume.host)
+        preflight_existing_remote_volume(&volume.host)
             .await
             .with_context(|| format!("leasing volume {}:{}", volume.host, volume.path))?;
     }
@@ -800,10 +807,27 @@ async fn preflight_all(blocks: &[Volume]) -> Result<()> {
 /// path or measured RTT is also a refusal: guessing would turn an SLO into a
 /// label.
 pub async fn preflight_remote_volume(device: &str) -> Result<()> {
-    let plane = plane()?;
-    if device == plane.node.device_name().await {
+    if device == plane()?.node.device_name().await {
         return Ok(());
     }
+    let observation = measure_remote_volume_link(device).await?;
+    admit_remote_volume_link(device, &observation)
+}
+
+/// Validate continuity for an attachment whose provider and holder were
+/// already admitted. The path must remain direct and measurable, but a busy
+/// established volume is not a new placement decision and is not rejected on
+/// a transient RTT sample.
+async fn preflight_existing_remote_volume(device: &str) -> Result<()> {
+    if device == plane()?.node.device_name().await {
+        return Ok(());
+    }
+    let observation = measure_remote_volume_link(device).await?;
+    resume_remote_volume_link(device, &observation)
+}
+
+async fn measure_remote_volume_link(device: &str) -> Result<mesh::LinkObservation> {
+    let plane = plane()?;
     let mesh = plane
         .mesh
         .as_ref()
@@ -812,7 +836,7 @@ pub async fn preflight_remote_volume(device: &str) -> Result<()> {
         .measure_link(device)
         .await
         .ok_or_else(|| anyhow!("{UNREACHABLE}: {device}"))?;
-    admit_remote_volume_link(device, &observation)
+    Ok(observation)
 }
 
 fn admit_remote_volume_link(device: &str, observation: &mesh::LinkObservation) -> Result<()> {
@@ -843,6 +867,28 @@ fn admit_remote_volume_link(device: &str, observation: &mesh::LinkObservation) -
              {:.1}ms; at most {}ms is required",
             rtt as f64 / 1_000.0,
             REMOTE_VOLUME_MAX_RTT.as_millis()
+        );
+    }
+    Ok(())
+}
+
+fn resume_remote_volume_link(device: &str, observation: &mesh::LinkObservation) -> Result<()> {
+    let path = observation.path.ok_or_else(|| {
+        anyhow!(
+            "remote volume resume on {device} refused before mutation: the selected path is \
+             not measurable; an existing remote volume still requires a direct path"
+        )
+    })?;
+    if path != PathKind::Direct {
+        bail!(
+            "remote volume resume on {device} refused before mutation: selected path is \
+             {path}; an existing remote volume still requires a direct path"
+        );
+    }
+    if observation.rtt_micros.is_none() {
+        bail!(
+            "remote volume resume on {device} refused before mutation: direct-path RTT is \
+             not measurable"
         );
     }
     Ok(())
@@ -1433,6 +1479,48 @@ mod tests {
             },
         ] {
             let error = admit_remote_volume_link("provider", &unmeasured)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("not measurable"), "{error}");
+        }
+    }
+
+    #[test]
+    fn an_existing_lease_requires_direct_continuity_but_not_readmission() {
+        let busy_direct = mesh::LinkObservation {
+            path: Some(PathKind::Direct),
+            rtt_micros: Some(REMOTE_VOLUME_MAX_RTT.as_micros() as u64 + 50_000),
+        };
+        assert!(
+            admit_remote_volume_link("provider", &busy_direct).is_err(),
+            "a new placement must still enforce the <=5ms SLO"
+        );
+        assert!(
+            resume_remote_volume_link("provider", &busy_direct).is_ok(),
+            "a transient RTT sample must not strand an existing holder"
+        );
+
+        let relay = mesh::LinkObservation {
+            path: Some(PathKind::Relay),
+            rtt_micros: Some(100),
+        };
+        let error = resume_remote_volume_link("provider", &relay)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("refused before mutation"), "{error}");
+        assert!(error.contains("selected path is relay"), "{error}");
+
+        for unmeasured in [
+            mesh::LinkObservation {
+                path: None,
+                rtt_micros: Some(100),
+            },
+            mesh::LinkObservation {
+                path: Some(PathKind::Direct),
+                rtt_micros: None,
+            },
+        ] {
+            let error = resume_remote_volume_link("provider", &unmeasured)
                 .unwrap_err()
                 .to_string();
             assert!(error.contains("not measurable"), "{error}");
