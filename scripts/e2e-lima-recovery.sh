@@ -57,6 +57,7 @@ limactl shell kvmhost -- bash -lc "
   cd '$VM_RUN'
   export AST_BIN='$VM_RUN/target/debug/ast'
   export ASTD_BIN='$VM_RUN/target/debug/astd'
+  export ASTERISM_TEST_ARTIFACTS='$VM_RUN/artifacts'
   scripts/e2e-network-realms.sh
 " 2>&1 | tee "$EVIDENCE/network-realms.log"
 
