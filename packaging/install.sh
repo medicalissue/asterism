@@ -11,8 +11,11 @@
 # branch unless you name one, never runs sudo without printing the command
 # and asking, and never installs a byte it has not checksummed.
 #
-# This is the CLI: `ast` and the `astd` daemon it starts. The desktop app is
-# a separate DMG — see https://asterism.run/download.
+# This is the CLI: `ast`, the `astd` daemon it starts, and `astd-vz`, the
+# code-signed helper that owns Virtualization.framework guests — without it
+# on the machine, `--backend vz` has nothing to run and Asterism falls back
+# to QEMU. The desktop app is a separate DMG — see
+# https://asterism.run/download.
 #
 # Environment:
 #   ASTERISM_VERSION=v0.1.0   install exactly this tag (default: latest release)
@@ -144,6 +147,45 @@ ensure_writable_prefix() {
 		die "${PREFIX}/bin is not writable by $(id -un). This script does not install as root; set ASTERISM_PREFIX to somewhere you own."
 }
 
+# Put one binary in place: staged beside its destination and renamed, so an
+# upgrade never leaves a half-written binary where a working one used to be
+# — and so replacing a running `astd` is a rename, not a truncation.
+place() {
+	# $1 file to install, $2 name under bin/
+	staged="${PREFIX}/bin/.${2}.new.$$"
+	cp "$1" "$staged"
+	chmod 755 "$staged"
+	mv -f "$staged" "${PREFIX}/bin/${2}"
+	say "installed ${PREFIX}/bin/${2}"
+}
+
+# macOS marks a file a *browser* downloaded with com.apple.quarantine, and
+# tar hands that mark to every file it extracts. Gatekeeper then assesses
+# what execs, and an ad-hoc signature does not pass an assessment — so the
+# one binary that must be signed to work at all, `astd-vz`, is the one that
+# gets killed at exec.
+#
+# In practice nothing reaches here marked: this script re-fetches the
+# archive with curl or wget, and neither carries the flag onto the file it
+# writes, even when ASTERISM_BASE_URL points at a directory someone
+# downloaded by hand. This runs anyway, so that a working helper is
+# something this script guarantees rather than something it inherits from
+# how curl happens to write files.
+#
+# The flag records "these bytes came from the internet and nobody checked
+# them". By this point they have been checked, against a digest published
+# under an immutable tag — which is a stronger claim than the flag makes. So
+# it goes, out loud, and only from files this script wrote.
+unquarantine() {
+	[ "$(uname -s)" = "Darwin" ] || return 0
+	have xattr || return 0
+	for f in "$@"; do
+		xattr -p com.apple.quarantine "$f" >/dev/null 2>&1 || continue
+		xattr -d com.apple.quarantine "$f" >/dev/null 2>&1 || continue
+		say "cleared the quarantine flag macOS put on ${f} — its digest was checked above"
+	done
+}
+
 # ---- what machine is this --------------------------------------------------
 
 # Binary releases exist for exactly the targets named here. Anything else is
@@ -203,6 +245,43 @@ write_receipt() {
 		printf 'files=%s\n' "$*"
 	} >"$r"
 	say "wrote ${r}"
+}
+
+# Is everything the receipt names still on the machine?
+#
+# "Already installed" is a claim about the machine, not about the receipt.
+# A binary someone deleted, or one an interrupted upgrade never wrote,
+# leaves the version field saying yes while the prefix says no.
+receipt_complete() {
+	files="$(receipt_field files || true)"
+	[ -n "$files" ] || return 1
+	for rel in $files; do
+		[ -x "${PREFIX}/${rel}" ] || return 1
+	done
+	return 0
+}
+
+# Does the receipt name this file among the ones this script wrote?
+receipt_lists() {
+	files="$(receipt_field files || true)"
+	for rel in $files; do
+		if [ "$rel" = "$1" ]; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+# A move to a build with no helper must take the old helper with it: `astd`
+# spawns whatever `astd-vz` sits beside it, and a helper from another build
+# answers a control protocol this daemon may not speak — so leaving it there
+# is worse than not having one at all. Only ever a helper this script
+# installed; the receipt is what says so.
+drop_stale_helper() {
+	[ -e "${PREFIX}/bin/astd-vz" ] || return 0
+	receipt_lists bin/astd-vz || return 0
+	rm -f "${PREFIX}/bin/astd-vz"
+	say "removed ${PREFIX}/bin/astd-vz — this build ships no helper, and one from another build must not answer for it"
 }
 
 # ---- resolving a version ---------------------------------------------------
@@ -290,8 +369,7 @@ install_release() {
 	say "release ${version} for ${target}"
 
 	installed="$(receipt_field version || true)"
-	if [ "$installed" = "$version" ] && [ "$FORCE" != "1" ] &&
-		[ -x "${PREFIX}/bin/ast" ] && [ -x "${PREFIX}/bin/astd" ]; then
+	if [ "$installed" = "$version" ] && [ "$FORCE" != "1" ] && receipt_complete; then
 		say "already installed: ${version} in ${PREFIX}/bin"
 		say "re-run with ASTERISM_FORCE=1 to reinstall it, or ASTERISM_VERSION to move to another."
 		return 0
@@ -332,24 +410,36 @@ install_release() {
 	for bin in ast astd; do
 		[ -f "${unpack}/${bin}" ] || die "${artifact} has no ${bin} in it. Refusing to install a partial release."
 	done
+	# `astd-vz` is the Virtualization.framework helper, and it is not
+	# required here the way `ast` and `astd` are: this script installs any
+	# tag it is pointed at, and the tarballs cut before the helper shipped
+	# do not contain one. Refusing those would make the current installer
+	# unable to install half the releases it can name. So it is installed
+	# when the release has it, and its absence is said out loud rather than
+	# discovered later as "vz is unavailable on this machine".
+	if [ -f "${unpack}/astd-vz" ]; then
+		vz=1
+	else
+		vz=0
+	fi
 
 	ensure_writable_prefix
-	# Write beside the target and rename, so an upgrade never leaves a
-	# half-written binary where a working one used to be — and so replacing
-	# a running `astd` is a rename, not a truncation.
-	for bin in ast astd; do
-		staged="${PREFIX}/bin/.${bin}.new.$$"
-		cp "${unpack}/${bin}" "$staged"
-		chmod 755 "$staged"
-		mv -f "$staged" "${PREFIX}/bin/${bin}"
-		say "installed ${PREFIX}/bin/${bin}"
-	done
-
-	write_receipt "$version" "$target" release "$got" bin/ast bin/astd
+	place "${unpack}/ast" ast
+	place "${unpack}/astd" astd
+	if [ "$vz" = "1" ]; then
+		place "${unpack}/astd-vz" astd-vz
+		unquarantine "${PREFIX}/bin/ast" "${PREFIX}/bin/astd" "${PREFIX}/bin/astd-vz"
+		write_receipt "$version" "$target" release "$got" bin/ast bin/astd bin/astd-vz
+	else
+		unquarantine "${PREFIX}/bin/ast" "${PREFIX}/bin/astd"
+		drop_stale_helper
+		write_receipt "$version" "$target" release "$got" bin/ast bin/astd
+	fi
 
 	if [ "$installed" != "" ] && [ "$installed" != "$version" ]; then
 		say "upgraded ${installed} -> ${version}"
 	fi
+	note_vz "$vz"
 	note_qemu
 	note_path
 }
@@ -399,17 +489,36 @@ install_source() {
 	(cd "$src" && cargo build --release --locked \
 		--package asterism-cli --package asterism-daemon)
 
-	ensure_writable_prefix
-	# ast finds astd as a sibling, so they install together.
-	for bin in ast astd; do
-		staged="${PREFIX}/bin/.${bin}.new.$$"
-		cp "${src}/target/release/${bin}" "$staged"
-		chmod 755 "$staged"
-		mv -f "$staged" "${PREFIX}/bin/${bin}"
-		say "installed ${PREFIX}/bin/${bin}"
-	done
+	# The vz helper is built by the script in the tree that knows how to
+	# sign it, because building it is not enough: an unsigned helper carries
+	# no virtualization entitlement, and VZ refuses to create a machine in a
+	# process without one. That script is the same one a release build runs,
+	# so a source install lands the same entitled helper a release does.
+	vz=0
+	if [ "$(uname -s)" = "Darwin" ]; then
+		if [ -x "${src}/scripts/sign-vz.sh" ]; then
+			say "building and signing astd-vz, the Virtualization.framework helper"
+			"${src}/scripts/sign-vz.sh" --release ||
+				die "astd-vz could not be built and signed. Nothing was installed."
+			vz=1
+		else
+			say "this tree has no scripts/sign-vz.sh, so no vz helper was built — the qemu backend still works"
+		fi
+	fi
 
-	write_receipt "$ref" "source" source "" bin/ast bin/astd
+	ensure_writable_prefix
+	# ast finds astd as a sibling, and astd finds astd-vz the same way, so
+	# they install together.
+	place "${src}/target/release/ast" ast
+	place "${src}/target/release/astd" astd
+	if [ "$vz" = "1" ]; then
+		place "${src}/target/release/astd-vz" astd-vz
+		write_receipt "$ref" "source" source "" bin/ast bin/astd bin/astd-vz
+	else
+		drop_stale_helper
+		write_receipt "$ref" "source" source "" bin/ast bin/astd
+	fi
+	note_vz "$vz"
 	note_qemu
 	note_path
 }
@@ -687,6 +796,36 @@ uninstall() {
 }
 
 # ---- notes -----------------------------------------------------------------
+
+# What the machine can actually run, said at install time rather than left
+# for `ast create --backend vz` to discover.
+note_vz() {
+	# $1: 1 if a helper was installed
+	[ "$(uname -s)" = "Darwin" ] || return 0
+	if [ "$1" != "1" ]; then
+		say ""
+		if [ "$METHOD" = "release" ]; then
+			say "This release ships no astd-vz, so Virtualization.framework is not"
+			say "available and Asterism will use the QEMU backend. A newer release, or"
+			say "ASTERISM_METHOD=source, builds and signs the helper."
+		else
+			say "No astd-vz was installed, so Virtualization.framework is not"
+			say "available and Asterism will use the QEMU backend."
+		fi
+		return 0
+	fi
+	have codesign || return 0
+	if codesign -d --entitlements - "${PREFIX}/bin/astd-vz" 2>&1 |
+		grep -q 'com.apple.security.virtualization' &&
+		codesign --verify --strict "${PREFIX}/bin/astd-vz" >/dev/null 2>&1; then
+		return 0
+	fi
+	say ""
+	say "astd-vz is installed but its signature does not carry the virtualization"
+	say "entitlement, so Virtualization.framework will refuse it and Asterism will"
+	say "fall back to the QEMU backend. Re-run with ASTERISM_FORCE=1; if it stays"
+	say "this way, the release itself is at fault — please report it."
+}
 
 note_qemu() {
 	have qemu-system-aarch64 && return 0

@@ -40,7 +40,7 @@ ok() {
 # that prints its version tests the placement exactly as well as 40MB of
 # Mach-O would.
 make_release() {
-	local version="$1" target="${2:-darwin-arm64}"
+	local version="$1" target="${2:-darwin-arm64}" helper="${3:-vz}"
 	local dir="${FAKE_RELEASES}/${version}"
 	local stage="${WORK}/stage-${version}-${target}"
 	rm -rf "$stage"
@@ -54,7 +54,18 @@ EOF
 echo "astd ${version#v}"
 EOF
 	chmod +x "${stage}/ast" "${stage}/astd"
-	tar -czf "${dir}/asterism-${version}-${target}.tar.gz" -C "$stage" ast astd
+	# Releases cut before the vz helper existed carry two binaries, and this
+	# script still has to install them — pass `novz` for one of those.
+	local members=(ast astd)
+	if [ "$helper" = vz ]; then
+		cat >"${stage}/astd-vz" <<EOF
+#!/bin/sh
+echo "astd-vz ${version#v}"
+EOF
+		chmod +x "${stage}/astd-vz"
+		members=(ast astd astd-vz)
+	fi
+	tar -czf "${dir}/asterism-${version}-${target}.tar.gz" -C "$stage" "${members[@]}"
 	# A release also publishes the rendered Homebrew formula, and it is
 	# listed in SHA256SUMS like everything else — the installer checks it
 	# before pointing Homebrew at a local tap.
@@ -110,6 +121,11 @@ if [ "\$1" = "clone" ]; then
 		shift
 	done
 	mkdir -p "\$dst/.git"
+	# A clone carries the repository's scripts, and the source path signs
+	# the vz helper with one of them.
+	mkdir -p "\$dst/scripts" "\$dst/crates/asterism-vz"
+	cp "${ROOT}/scripts/sign-vz.sh" "\$dst/scripts/sign-vz.sh"
+	cp "${ROOT}/crates/asterism-vz/vz.entitlements" "\$dst/crates/asterism-vz/vz.entitlements"
 	printf '%s' "\$ref" >"${WORK}/cloned-ref"
 	exit 0
 fi
@@ -123,11 +139,51 @@ cat >"${SHIMS}/cargo" <<EOF
 mkdir -p target/release
 printf '#!/bin/sh\necho "ast source-build"\n' >target/release/ast
 printf '#!/bin/sh\necho "astd source-build"\n' >target/release/astd
-chmod +x target/release/ast target/release/astd
+printf '#!/bin/sh\necho "astd-vz source-build"\n' >target/release/astd-vz
+chmod +x target/release/ast target/release/astd target/release/astd-vz
 printf '%s\n' "\$*" >>"${WORK}/cargo-args"
 exit 0
 EOF
 chmod +x "${SHIMS}/cargo"
+
+# codesign, for the vz helper. Enough of one to answer the three questions
+# asked of it: sign this, does it carry the entitlement, does the signature
+# verify. A path listed in ${WORK}/unsigned answers as an unsigned binary,
+# which is how the "installed but not entitled" branch gets tested without
+# a real Mach-O to mangle.
+cat >"${SHIMS}/codesign" <<EOF
+#!/bin/sh
+mode=sign
+last=""
+for a in "\$@"; do
+	case "\$a" in
+	-d) mode=display ;;
+	--verify) mode=verify ;;
+	esac
+	last="\$a"
+done
+if grep -qxF "\$last" "${WORK}/unsigned" 2>/dev/null; then
+	echo "\${last}: code object is not signed at all" >&2
+	exit 1
+fi
+case "\$mode" in
+display)
+	cat <<'PLIST'
+[Dict]
+	[Key] com.apple.security.network.client
+	[Value]
+		[Bool] true
+	[Key] com.apple.security.virtualization
+	[Value]
+		[Bool] true
+PLIST
+	;;
+verify) ;;
+sign) printf '%s\n' "\$*" >>"${WORK}/codesign-args" ;;
+esac
+exit 0
+EOF
+chmod +x "${SHIMS}/codesign"
 
 # brew, for the Homebrew path. Enough of a Homebrew to be a real test: it
 # keeps more than one tap, remembers what is installed, and what it installs
@@ -271,7 +327,9 @@ installed_version() { "${PREFIX}/bin/ast" --version; }
 receipt() { cat "${PREFIX}/share/asterism/install-receipt.env"; }
 
 mkdir -p "${WORK}/home"
-make_release v0.0.9
+# v0.0.9 stands in for a release cut before the vz helper shipped; v0.1.0
+# and everything after it carries one.
+make_release v0.0.9 darwin-arm64 novz
 make_release v0.1.0
 printf '{"tag_name": "v0.1.0", "name": "v0.1.0"}\n' >"${WORK}/latest.json"
 
@@ -312,6 +370,18 @@ grep -q '^version=v0.1.0$' <<<"$(receipt)" || fail "receipt does not record the 
 grep -q '^method=release$' <<<"$(receipt)" || fail "receipt does not record the method"
 ok "the default install resolves the latest tag and verifies it"
 
+# The helper is the difference between a machine that can run
+# Virtualization.framework guests and one that can only run QEMU, so it is
+# installed, recorded, and the same build as the rest.
+says "installed ${PREFIX}/bin/astd-vz"
+[ -x "${PREFIX}/bin/astd-vz" ] || fail "astd-vz was not installed"
+[ "$("${PREFIX}/bin/astd-vz" --version)" = "astd-vz 0.1.0" ] \
+	|| fail "astd-vz is not the version that was installed: $("${PREFIX}/bin/astd-vz" --version)"
+grep -q '^files=bin/ast bin/astd bin/astd-vz$' <<<"$(receipt)" \
+	|| fail "the receipt does not record the helper:"$'\n'"$(receipt)"
+never_says "does not carry the virtualization"
+ok "the vz helper is installed beside the daemon and recorded in the receipt"
+
 # ---- 3. reinstall is a no-op, and FORCE overrides it -----------------------
 
 run_install ok
@@ -325,6 +395,17 @@ says "sha256 ok:"
 [ "$(installed_version)" = "ast 0.1.0" ] || fail "force reinstall changed the version"
 ok "ASTERISM_FORCE=1 reinstalls the same version"
 
+# An entitled helper is the whole point of shipping one, so a helper that
+# lost its signature is said out loud at install time rather than found by
+# `ast create --backend vz` later.
+fresh_prefix unentitled
+printf '%s\n' "${PREFIX}/bin/astd-vz" >"${WORK}/unsigned"
+run_install ok
+says "does not carry the virtualization"
+says "QEMU backend"
+: >"${WORK}/unsigned"
+ok "a helper whose signature carries no entitlement is called out at install time"
+
 # ---- 4. an explicit version, and upgrading off it --------------------------
 
 fresh_prefix pinned
@@ -332,6 +413,16 @@ run_install ok ASTERISM_VERSION=v0.0.9
 says "release v0.0.9 for darwin-arm64"
 [ "$(installed_version)" = "ast 0.0.9" ] || fail "explicit version was not honoured"
 ok "ASTERISM_VERSION installs exactly that tag"
+
+# A release with no helper in it installs, rather than being refused as a
+# partial release: this script installs any tag it is pointed at, including
+# the ones cut before the helper existed. What it does not do is stay quiet
+# about what that costs.
+[ ! -e "${PREFIX}/bin/astd-vz" ] || fail "a release with no helper installed one anyway"
+says "This release ships no astd-vz"
+grep -q '^files=bin/ast bin/astd$' <<<"$(receipt)" \
+	|| fail "the receipt claims files the release did not carry:"$'\n'"$(receipt)"
+ok "a release cut before the helper existed installs, and says what is missing"
 
 # The pinned digest is the offline-verifiable path: no SHA256SUMS fetched.
 DIGEST="$(sha256_lines "${FAKE_RELEASES}/v0.0.9/asterism-v0.0.9-darwin-arm64.tar.gz" | cut -d' ' -f1)"
@@ -344,12 +435,26 @@ run_install ok
 says "upgraded v0.0.9 -> v0.1.0"
 [ "$(installed_version)" = "ast 0.1.0" ] || fail "upgrade did not replace the binary"
 grep -q '^version=v0.1.0$' <<<"$(receipt)" || fail "upgrade did not update the receipt"
-ok "an upgrade replaces both binaries and rewrites the receipt"
+[ -x "${PREFIX}/bin/astd-vz" ] || fail "the upgrade did not install the helper the new release carries"
+ok "an upgrade replaces every binary, adds one the old release lacked, and rewrites the receipt"
 
-# Downgrading is the same machinery pointed the other way.
+# Downgrading is the same machinery pointed the other way — and it takes the
+# helper with it. `astd` spawns whatever astd-vz sits beside it, so a helper
+# left over from a newer build would be a v0.1.0 helper answering a v0.0.9
+# daemon.
 run_install ok ASTERISM_VERSION=v0.0.9
 [ "$(installed_version)" = "ast 0.0.9" ] || fail "downgrade did not take"
-ok "naming an older tag moves back to it"
+says "removed ${PREFIX}/bin/astd-vz"
+[ ! -e "${PREFIX}/bin/astd-vz" ] || fail "a helper from the newer build survived the downgrade"
+grep -q '^files=bin/ast bin/astd$' <<<"$(receipt)" || fail "the receipt still claims a helper"
+ok "naming an older tag moves back to it, and removes a helper that release never had"
+
+# Re-running on that machine is still a no-op: "already installed" is a
+# claim about the files the receipt names, and it names two here.
+run_install ok ASTERISM_VERSION=v0.0.9
+says "already installed: v0.0.9"
+never_says "downloading"
+ok "a release with no helper is not reinstalled on every run looking for one"
 
 # ---- 5. uninstall ----------------------------------------------------------
 
@@ -359,6 +464,7 @@ run_install ok
 run_install ok -- --uninstall
 [ ! -e "${PREFIX}/bin/ast" ] || fail "ast survived the uninstall"
 [ ! -e "${PREFIX}/bin/astd" ] || fail "astd survived the uninstall"
+[ ! -e "${PREFIX}/bin/astd-vz" ] || fail "astd-vz survived the uninstall"
 [ ! -e "${PREFIX}/share/asterism/install-receipt.env" ] || fail "the receipt survived the uninstall"
 [ -e "${PREFIX}/bin/somebody-elses-tool" ] || fail "uninstall deleted a file it did not install"
 says "left alone"
@@ -388,6 +494,25 @@ cp "${FAKE_RELEASES}/v0.1.0/asterism-v0.1.0-darwin-arm64.tar.gz" \
 run_install refused ASTERISM_VERSION=v0.3.0
 says "SHA256SUMS does not list"
 ok "an artifact missing from SHA256SUMS is refused"
+
+# A tarball that verifies but holds half a release is refused too: a
+# checksum says the bytes are the ones published, not that they are all of
+# them.
+fresh_prefix partial
+mkdir -p "${FAKE_RELEASES}/v0.4.0" "${WORK}/stage-partial"
+printf '#!/bin/sh\necho "ast 0.4.0"\n' >"${WORK}/stage-partial/ast"
+chmod +x "${WORK}/stage-partial/ast"
+tar -czf "${FAKE_RELEASES}/v0.4.0/asterism-v0.4.0-darwin-arm64.tar.gz" \
+	-C "${WORK}/stage-partial" ast
+"${ROOT}/scripts/render-formula.sh" v0.4.0 \
+	0000000000000000000000000000000000000000000000000000000000000000 \
+	>"${FAKE_RELEASES}/v0.4.0/asterism.rb"
+(cd "${FAKE_RELEASES}/v0.4.0" && sha256_lines "asterism-v0.4.0-darwin-arm64.tar.gz" asterism.rb >SHA256SUMS)
+run_install refused ASTERISM_VERSION=v0.4.0
+says "has no astd in it"
+says "Refusing to install a partial release"
+[ ! -e "${PREFIX}/bin/ast" ] || fail "a tarball missing a binary installed the rest of itself"
+ok "a tarball missing one of the binaries is refused before anything is written"
 
 # So is a release with no SHA256SUMS at all.
 fresh_prefix nosums
@@ -438,6 +563,18 @@ grep -q -- "--locked" "${WORK}/cargo-args" || fail "the source build did not pas
 [ "$(installed_version)" = "ast source-build" ] || fail "the source build did not install its binaries"
 grep -q '^method=source$' <<<"$(receipt)" || fail "receipt does not record the source method"
 ok "ASTERISM_METHOD=source builds the release tag, not a branch"
+
+# Building the helper is not enough — an unsigned one carries no
+# virtualization entitlement and VZ will not create a machine in it. The
+# source path therefore runs the tree's own signing script, which is the
+# same one a release build runs.
+says "building and signing astd-vz"
+[ -x "${PREFIX}/bin/astd-vz" ] || fail "the source build installed no vz helper"
+grep -q -- "--entitlements" "${WORK}/codesign-args" \
+	|| fail "the helper was installed without being signed with its entitlements"
+grep -q '^files=bin/ast bin/astd bin/astd-vz$' <<<"$(receipt)" \
+	|| fail "the receipt does not record the helper the source build installed:"$'\n'"$(receipt)"
+ok "a source install signs the vz helper and lands it beside the daemon"
 
 fresh_prefix source-ref
 rm -f "${WORK}/cloned-ref"

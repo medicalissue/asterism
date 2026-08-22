@@ -634,9 +634,16 @@ fn flush_reply() {
     vm::pump(std::time::Duration::from_millis(250));
 }
 
-/// `--config <path>`, and nothing else: everything about the guest is in
-/// the file, where a human can read what a running instance was actually
-/// built from.
+/// `--config <path>`, and nothing else that changes what runs: everything
+/// about the guest is in the file, where a human can read what a running
+/// instance was actually built from.
+///
+/// `--version` is the exception, and it earns its place at the release
+/// boundary rather than here: the helper is shipped in the same tarball as
+/// `ast` and `astd` and must be the same build as both, so whoever is
+/// holding an installed release needs one command that says which build
+/// this file is. It prints the workspace version, which is what the tag
+/// names.
 #[cfg(target_os = "macos")]
 fn parse_args() -> anyhow::Result<std::path::PathBuf> {
     let mut config = None;
@@ -649,12 +656,17 @@ fn parse_args() -> anyhow::Result<std::path::PathBuf> {
                         .ok_or_else(|| anyhow::anyhow!("--config needs a path"))?,
                 ))
             }
+            "-V" | "--version" => {
+                println!("{} {}", asterism_vz::HELPER_BIN, env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             "-h" | "--help" => {
                 println!(
                     "astd-vz --config <vz.json>\n\n\
                      Runs one Asterism instance under Virtualization.framework and \n\
                      serves its control socket. Spawned by astd; not meant to be run\n\
-                     by hand. Must be code-signed: scripts/sign-vz.sh"
+                     by hand. Must be code-signed: scripts/sign-vz.sh\n\n\
+                     --version  the build this helper is, which must match ast and astd"
                 );
                 std::process::exit(0);
             }

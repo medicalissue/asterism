@@ -4,7 +4,7 @@ Two things ship from this repository and they ship separately:
 
 | | what it is | how it is installed |
 |---|---|---|
-| **CLI** | `ast` and the `astd` daemon | `install.sh`, or Homebrew |
+| **CLI** | `ast`, the `astd` daemon, and the code-signed `astd-vz` helper | `install.sh`, or Homebrew |
 | **Desktop app** | the menu bar app in `gui/` | a signed `.dmg`, dragged to Applications |
 
 They are deliberately not one artifact. The CLI is a pair of binaries that
@@ -26,9 +26,8 @@ installer never touches the DMG and the DMG never writes to `~/.local/bin`.
 3. The tarball is checksummed against `SHA256SUMS`, published beside it under
    the same tag. A mismatch, a missing `SHA256SUMS`, or an artifact not listed
    in it is a refusal, and nothing is written.
-4. Both binaries are staged beside their destination and renamed into place,
-   so an interrupted upgrade cannot leave half a binary where a working one
-   was.
+4. Every binary is staged beside its destination and renamed into place, so
+   an interrupted upgrade cannot leave half a binary where a working one was.
 5. A receipt lands in `<prefix>/share/asterism/install-receipt.env` recording
    the version, target, method, digest, and the exact files written.
 
@@ -64,7 +63,7 @@ $ sh install.sh --uninstall
 
 ```
 v0.1.0/
-  asterism-v0.1.0-darwin-arm64.tar.gz   # ast and astd, flat, no directory prefix
+  asterism-v0.1.0-darwin-arm64.tar.gz   # ast, astd, astd-vz — flat, no directory prefix
   asterism.rb                           # the Homebrew formula for this tag
   SHA256SUMS                            # shasum -a 256 of both of the above
   SHA256SUMS.sig                        # when a signing key exists
@@ -73,6 +72,51 @@ v0.1.0/
 The tarball is flat on purpose: the installer unpacks it and expects `ast` and
 `astd` at the top, and refuses a tarball missing either rather than installing
 half a release.
+
+### The vz helper
+
+`astd-vz` is the third binary, and it is the only one that has to be
+code-signed. Virtualization.framework refuses to create a machine in a process
+that does not carry `com.apple.security.virtualization`, and it refuses the
+NBD attachment behind network disks without `com.apple.security.network.client`
+— so an unsigned helper is not a degraded helper, it is one that cannot boot
+anything. `astd` checks both entitlements in `probe()` and declines the vz
+backend in words rather than failing inside the framework later.
+
+`scripts/sign-vz.sh` is the one signing recipe: a developer runs it after every
+`cargo build`, the source and Homebrew install paths run it as they build, and
+the release workflow runs it with `--sign-only` on the stripped release binary.
+`strip` rewrites a binary and so invalidates whatever signature was on it,
+which is why signing is always the last thing done to these bytes.
+
+Both entitlements are unrestricted, so **an ad-hoc signature carrying them is
+enough** — no Apple account is involved, and that is what a release is signed
+with by default. What ad-hoc does not survive is Gatekeeper *assessment*, and
+assessment is triggered by the quarantine flag:
+
+* `curl -fsSL https://asterism.run/install.sh | sh` — neither curl nor wget
+  sets the flag, so nothing installed this way is ever assessed. The helper
+  runs.
+* Downloading the tarball in a **browser** and unpacking it by hand — the
+  archive is quarantined, `tar` hands the flag to every file it extracts, and
+  Gatekeeper kills the helper at `exec`. Not "vz is unavailable": signal 9, and
+  nothing printed. `astd` refuses such a helper in `probe()` rather than let
+  that happen, which is why the message names the flag.
+* Pointing `ASTERISM_BASE_URL` at that same downloaded directory is fine. The
+  installer re-fetches the archive into a workspace of its own, and neither
+  curl nor wget carries the flag onto what they write; it then clears the flag
+  from the binaries it installed anyway, so the guarantee does not rest on that
+  behaviour. Either way nothing is written before the bytes have been checked
+  against the release's `SHA256SUMS` — a stronger statement about them than the
+  flag was making.
+
+Setting `MACOS_SIGN_CERT_P12`, `MACOS_SIGN_CERT_PASSWORD` and
+`MACOS_SIGN_IDENTITY` on the repository moves the release onto a Developer ID
+signature — hardened runtime, trusted timestamp — and then
+`APPLE_NOTARY_KEY_P8`, `APPLE_NOTARY_KEY_ID` and `APPLE_NOTARY_ISSUER_ID`
+notarize the binaries, which is what makes the browser-download path work too.
+A bare Mach-O cannot be stapled, so that ticket is fetched online; the tarball
+stays exactly what it is today either way.
 
 ### Platforms
 

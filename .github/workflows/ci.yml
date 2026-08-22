@@ -50,6 +50,12 @@ jobs:
           sh -n scripts/render-formula.sh
           shellcheck -s sh packaging/install.sh scripts/render-formula.sh
           shellcheck scripts/install-test.sh
+          # sign-vz.sh is the only thing standing between a build and an
+          # entitled helper: when it fails, vz is not broken loudly, it is
+          # simply unavailable. It is bash, not sh — it builds a codesign
+          # argument list in an array.
+          bash -n scripts/sign-vz.sh
+          shellcheck scripts/sign-vz.sh
 
       - name: The installer's test suite
         run: bash scripts/install-test.sh

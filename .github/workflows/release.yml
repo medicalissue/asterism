@@ -5,7 +5,9 @@
 # beside them, and then — before anything is published — installs the exact
 # artifacts it just built with the exact script users run, from a local
 # directory over file://. If that install does not produce a working `ast`
-# reporting the tagged version, nothing is published.
+# reporting the tagged version, and a signed `astd-vz` from the same build
+# carrying the entitlements Virtualization.framework demands, nothing is
+# published.
 #
 # Dry runs: workflow_dispatch builds, checksums and tests, and stops short
 # of publishing. Use it to prove a release candidate before tagging it.
@@ -65,7 +67,103 @@ jobs:
       - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
 
       - name: Build
-        run: cargo build --release --locked --package asterism-cli --package asterism-daemon
+        run: |
+          cargo build --release --locked \
+            --package asterism-cli --package asterism-daemon --package asterism-vz
+
+      # Signing is the last thing done to these bytes, and `strip` rewrites
+      # them — so stripping happens here and signing happens after it.
+      - name: Strip
+        run: strip -x target/release/ast target/release/astd target/release/astd-vz
+
+      # A Developer ID certificate, when the repository has one, lives in a
+      # keychain this job creates and destroys. Without it the helper is
+      # signed ad-hoc, which is all the `curl | sh` install path needs:
+      # nothing that script downloads is quarantined, so Gatekeeper never
+      # assesses it, and both entitlements the helper carries are
+      # unrestricted. What ad-hoc does not survive is a *browser* download
+      # of the tarball off the releases page, which is quarantined and
+      # therefore assessed — that is what the certificate below buys.
+      - name: Import the signing certificate, if there is one
+        id: signing
+        env:
+          CERT_P12: ${{ secrets.MACOS_SIGN_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_SIGN_CERT_PASSWORD }}
+          IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: |
+          set -eu
+          if [ -z "${CERT_P12}" ]; then
+            echo "no MACOS_SIGN_CERT_P12 — astd-vz will be signed ad-hoc"
+            echo "identity=-" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [ -n "${IDENTITY}" ] || { echo "MACOS_SIGN_CERT_P12 is set but MACOS_SIGN_IDENTITY is not" >&2; exit 1; }
+          keychain="${RUNNER_TEMP}/asterism-signing.keychain-db"
+          keychain_pw="$(uuidgen)"
+          security create-keychain -p "$keychain_pw" "$keychain"
+          security set-keychain-settings -lut 900 "$keychain"
+          security unlock-keychain -p "$keychain_pw" "$keychain"
+          printf '%s' "$CERT_P12" | base64 --decode >"${RUNNER_TEMP}/cert.p12"
+          security import "${RUNNER_TEMP}/cert.p12" -k "$keychain" -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign
+          rm -f "${RUNNER_TEMP}/cert.p12"
+          # Without this, codesign stops to ask for the keychain password on
+          # a runner with nobody to ask.
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_pw" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          echo "identity=${IDENTITY}" >>"$GITHUB_OUTPUT"
+
+      - name: Sign
+        env:
+          ASTERISM_SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
+        run: |
+          set -eu
+          # One recipe, and it is the one a developer runs locally: build,
+          # sign with the entitlements, and prove the entitlement is on the
+          # binary afterwards. --sign-only because the build above was
+          # --locked and the strip above must not be undone by a rebuild.
+          scripts/sign-vz.sh --release --sign-only
+          # ast and astd need no entitlement, but a quarantined binary is
+          # assessed whatever it carries — so when there is a real identity,
+          # everything in the tarball is signed with it.
+          if [ "$ASTERISM_SIGN_IDENTITY" != "-" ]; then
+            for bin in ast astd; do
+              codesign --force --sign "$ASTERISM_SIGN_IDENTITY" \
+                --options runtime --timestamp "target/release/${bin}"
+            done
+          fi
+
+      # Notarization is what makes a quarantined binary run on a machine
+      # that has never seen it. A bare Mach-O cannot be stapled — only
+      # bundles, disk images and packages can — so the ticket lives on
+      # Apple's side, keyed to the code directory hash of each binary in the
+      # zip submitted here, and Gatekeeper finds it online. Submitting the
+      # zip is therefore not a detour around the tarball: it is how these
+      # exact bytes get a ticket.
+      - name: Notarize, if there are credentials
+        if: ${{ steps.signing.outputs.identity != '-' }}
+        env:
+          NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          set -eu
+          if [ -z "${NOTARY_KEY_P8}" ]; then
+            echo "signed with a Developer ID but no notary credentials — a browser download will still be blocked" >&2
+            exit 1
+          fi
+          printf '%s' "$NOTARY_KEY_P8" | base64 --decode >"${RUNNER_TEMP}/notary.p8"
+          staging="${RUNNER_TEMP}/notarize"
+          rm -rf "$staging"
+          mkdir -p "$staging"
+          cp target/release/ast target/release/astd target/release/astd-vz "$staging/"
+          ditto -c -k --sequesterRsrc "$staging" "${RUNNER_TEMP}/notarize.zip"
+          xcrun notarytool submit "${RUNNER_TEMP}/notarize.zip" \
+            --key "${RUNNER_TEMP}/notary.p8" \
+            --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER_ID" \
+            --wait
+          rm -rf "${RUNNER_TEMP}/notary.p8" "${RUNNER_TEMP}/notarize.zip" "$staging"
 
       - name: Package
         run: |
@@ -74,12 +172,13 @@ jobs:
           target=darwin-arm64
           dist="dist/${version}"
           mkdir -p "$dist"
-          strip -x target/release/ast target/release/astd
           # COPYFILE_DISABLE keeps macOS tar from smuggling ._ AppleDouble
           # entries into the tarball, which would change the digest for no
-          # reason anyone could see.
+          # reason anyone could see. The code signature is inside the Mach-O
+          # itself, not in an extended attribute, so it travels with the
+          # bytes and survives the round trip.
           COPYFILE_DISABLE=1 tar -czf "${dist}/asterism-${version}-${target}.tar.gz" \
-            -C target/release ast astd
+            -C target/release ast astd astd-vz
 
       - name: Render the tap formula for this tag
         run: |
@@ -150,6 +249,35 @@ jobs:
           [ -x "${prefix}/bin/astd" ] || { echo "astd is not executable" >&2; exit 1; }
           file "${prefix}/bin/astd" | grep -q 'arm64' || { echo "astd is not an arm64 binary" >&2; exit 1; }
 
+          # And astd-vz, the helper that owns every Virtualization.framework
+          # guest. Absent, it is not that vz degrades — `ast create --backend
+          # vz` has nothing to spawn, so the release can only ever run QEMU.
+          # These are the checks astd's own probe() makes before it will use
+          # the backend, made here against the installed artifact.
+          [ -x "${prefix}/bin/astd-vz" ] || { echo "astd-vz was not installed" >&2; exit 1; }
+          file "${prefix}/bin/astd-vz" | grep -q 'arm64' || { echo "astd-vz is not an arm64 binary" >&2; exit 1; }
+
+          # One build, three binaries: a helper from another build would
+          # speak a control protocol this astd does not.
+          got_vz="$("${prefix}/bin/astd-vz" --version)"
+          echo "astd-vz --version: ${got_vz}"
+          [ "$got_vz" = "astd-vz ${version#v}" ] || { echo "expected 'astd-vz ${version#v}'" >&2; exit 1; }
+
+          # The signature has to cover the bytes as installed — tar, the
+          # installer's copy-and-rename, and `strip` are all things that
+          # would have broken it — and it has to carry both entitlements, or
+          # VZ refuses to create the machine.
+          codesign --verify --strict "${prefix}/bin/astd-vz" ||
+            { echo "the signature on the installed astd-vz does not verify" >&2; exit 1; }
+          ents="$(codesign -d --entitlements - "${prefix}/bin/astd-vz" 2>&1)"
+          echo "$ents"
+          for ent in com.apple.security.virtualization com.apple.security.network.client; do
+            case "$ents" in
+              *"$ent"*) ;;
+              *) echo "the installed astd-vz does not carry ${ent}" >&2; exit 1 ;;
+            esac
+          done
+
           # The catalog is compiled in, so this needs no daemon and no
           # network — it is the cheapest proof the binary actually runs.
           "${prefix}/bin/ast" images | grep -q 'debian:13'
@@ -158,9 +286,12 @@ jobs:
           sh packaging/install.sh | tee /tmp/second-run.txt
           grep -q "already installed: ${version}" /tmp/second-run.txt
 
-          # And the machine can be put back the way it was found.
+          # And the machine can be put back the way it was found — every
+          # binary the release put there, the helper included.
           sh packaging/install.sh --uninstall
-          [ ! -e "${prefix}/bin/ast" ] || { echo "uninstall left ast behind" >&2; exit 1; }
+          for bin in ast astd astd-vz; do
+            [ ! -e "${prefix}/bin/${bin}" ] || { echo "uninstall left ${bin} behind" >&2; exit 1; }
+          done
 
       - name: Refuse a tampered artifact
         run: |
@@ -209,6 +340,12 @@ jobs:
             echo
             echo "macOS on Apple silicon. Everything else builds from source:"
             echo "\`ASTERISM_METHOD=source\`."
+            echo
+            echo "The tarball holds \`ast\`, the \`astd\` daemon, and \`astd-vz\` — the"
+            echo "code-signed helper that runs Virtualization.framework guests. Install"
+            echo "it with the command above rather than by unpacking the tarball from a"
+            echo "browser download: macOS quarantines what a browser fetches, and a"
+            echo "quarantined helper is refused before it can start a guest."
             echo
             echo "The desktop app is a separate download."
             echo

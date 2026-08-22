@@ -291,6 +291,28 @@ impl Probe {
             );
         }
         let helper = helper_path()?;
+        // Quarantine comes first because it outranks everything after it: a
+        // quarantined binary is assessed by Gatekeeper before it may
+        // execute at all, and a rejected assessment is a kill at exec — a
+        // helper that dies without saying anything, rather than one VZ
+        // turned down for a reason. Entitlements do not enter into it.
+        //
+        // The flag alone is not the refusal, though. Notarization is what
+        // makes an assessment pass, and a notarized helper — which is what
+        // a release built with a Developer ID is — runs quarantined and
+        // unbothered. So this asks the assessment itself rather than
+        // treating the flag as a verdict.
+        if is_quarantined(&helper) && !gatekeeper_accepts(&helper) {
+            bail!(
+                "macOS has quarantined {} — the flag it puts on a file a browser \
+                 downloaded — and Gatekeeper refuses to let it execute. Nothing this \
+                 helper carries can get past that. Install with the install script, \
+                 which checks the release's digest and clears the flag, or clear it \
+                 here: xattr -d com.apple.quarantine {}",
+                helper.display(),
+                helper.display(),
+            );
+        }
         // The entitlement is the difference between a helper that boots and
         // one that fails deep inside the framework with "Internal
         // Virtualization error". Check it here, where the message can say
@@ -1016,10 +1038,44 @@ fn helper_path() -> Result<PathBuf> {
     }
     tools::tool(asterism_vz::HELPER_BIN).with_context(|| {
         format!(
-            "{} is not installed next to astd — the vz backend cannot run without it",
+            "{} is not installed next to astd — the vz backend cannot run without it. \
+             A release tarball carries it beside ast and astd; an install that predates \
+             it, or one that unpacked only part of it, does not. Reinstall the release, \
+             or build from source, which signs the helper as it builds it.",
             asterism_vz::HELPER_BIN
         )
     })
+}
+
+/// Would Gatekeeper let this binary execute?
+///
+/// Only worth asking of a quarantined file, because only a quarantined file
+/// is assessed. `spctl --assess --type execute` *is* the assessment: it
+/// accepts a notarized binary — what the release workflow produces when the
+/// repository holds a Developer ID certificate — and rejects an ad-hoc
+/// signature, which is what a tarball built without one carries.
+///
+/// A machine with assessment turned off has nothing to say no, and `spctl`
+/// reports that as success, which is the right answer here for the same
+/// reason.
+fn gatekeeper_accepts(bin: &Path) -> bool {
+    Command::new("spctl")
+        .args(["--assess", "--type", "execute"])
+        .arg(bin)
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+/// Is this file carrying macOS's "downloaded from the internet" flag?
+///
+/// `xattr -p` exits non-zero when the attribute is not there, which is the
+/// ordinary case and not an error worth reporting.
+fn is_quarantined(bin: &Path) -> bool {
+    Command::new("xattr")
+        .args(["-p", "com.apple.quarantine"])
+        .arg(bin)
+        .output()
+        .is_ok_and(|out| out.status.success())
 }
 
 /// Does this binary carry both entitlements required by the helper?
@@ -1058,6 +1114,47 @@ fn major(version: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The quarantine flag is the one thing that stops a helper before its
+    /// entitlements are ever consulted, and it is the reason an installed
+    /// release can fail where a source build does not. An unmarked file
+    /// must not be mistaken for a marked one — that would refuse every
+    /// working helper on the machine.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_quarantine_flag_is_read_off_the_file_and_not_guessed() {
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("astd-vz");
+        std::fs::write(&helper, "not really a helper").unwrap();
+
+        assert!(!is_quarantined(&helper));
+
+        let marked = Command::new("xattr")
+            .args(["-w", "com.apple.quarantine", "0081;00000000;Safari;"])
+            .arg(&helper)
+            .status()
+            .is_ok_and(|s| s.success());
+        // Some filesystems carry no extended attributes at all, and a test
+        // that cannot set the flag has nothing to say about reading it.
+        if !marked {
+            return;
+        }
+        assert!(is_quarantined(&helper));
+    }
+
+    /// Gatekeeper is asked rather than assumed, because the flag alone is
+    /// not the verdict: a notarized helper runs quarantined and unbothered,
+    /// and refusing it on the flag would break the very path the release
+    /// workflow's notarization step exists to make work. This file is not a
+    /// Mach-O at all, which is the far end of the same question.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn gatekeeper_rejects_something_it_cannot_vouch_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("astd-vz");
+        std::fs::write(&helper, "not really a helper").unwrap();
+        assert!(!gatekeeper_accepts(&helper));
+    }
 
     use asterism_core::hv::{ImageKind, ImageRef};
     use asterism_core::instance::{local_host, Instance, Shape};

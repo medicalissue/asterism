@@ -37,7 +37,7 @@ class Asterism < Formula
     # `brew style` wants `cargo install *std_cargo_args` here, and this is a
     # deliberate departure: two `cargo install --path` runs would compile the
     # shared dependency graph twice, since each gets its own target directory.
-    # One `cargo build` naming both packages is a single pass. Swap to
+    # One `cargo build` naming every package is a single pass. Swap to
     #
     #   system "cargo", "install", *std_cargo_args(path: "crates/asterism-cli")
     #   system "cargo", "install", *std_cargo_args(path: "crates/asterism-daemon")
@@ -45,15 +45,33 @@ class Asterism < Formula
     # if the tap's CI ever enforces FormulaAudit/Text.
     #
     # --locked: Cargo.lock is committed, so this resolves to exactly the
-    # dependency graph CI tested. Only the two shipped binaries are named;
-    # the library crates come along as their dependencies.
-    system "cargo", "build", "--release", "--locked",
-           "--package", "asterism-cli", "--package", "asterism-daemon"
+    # dependency graph CI tested. Only the shipped binaries are named; the
+    # library crates come along as their dependencies. `asterism-vz` is
+    # named here rather than left to the signing script so that it shares
+    # this one pass — and only on macOS, where its guest is the only thing
+    # it can run.
+    packages = ["--package", "asterism-cli", "--package", "asterism-daemon"]
+    packages += ["--package", "asterism-vz"] if OS.mac?
+    system "cargo", "build", "--release", "--locked", *packages
 
     # `ast` looks for `astd` as a sibling before falling back to PATH, so both
     # belong in the same bin.
     bin.install "target/release/ast"
     bin.install "target/release/astd"
+
+    # `astd` finds `astd-vz` the same way, and without it every guest runs
+    # on QEMU no matter what the machine could do. Building it is not
+    # enough: Virtualization.framework refuses to create a machine in a
+    # process that does not carry com.apple.security.virtualization, and
+    # cargo emits unsigned binaries — so the tree's own signing script signs
+    # what the build above produced, which is the same recipe, and the same
+    # --sign-only invocation, that the release workflow runs. Homebrew
+    # re-signs binaries it relocates with `--preserve-metadata=entitlements`,
+    # so the entitlement survives the trip into the Cellar.
+    return unless OS.mac?
+
+    system "scripts/sign-vz.sh", "--release", "--sign-only"
+    bin.install "target/release/astd-vz"
   end
 
   def caveats
@@ -78,8 +96,10 @@ class Asterism < Formula
     assert_match "ubuntu:24.04", images
     assert_match "debian:13", images
 
-    # The daemon ships alongside the CLI, which is how `ast` finds it.
+    # The daemon ships alongside the CLI, which is how `ast` finds it, and
+    # the vz helper ships alongside the daemon for the same reason.
     assert_predicate bin/"astd", :executable?
+    assert_predicate bin/"astd-vz", :executable? if OS.mac?
 
     # QEMU is a hard runtime dependency, not a suggestion.
     assert_path_exists formula_opt_bin("qemu")/"qemu-img"
