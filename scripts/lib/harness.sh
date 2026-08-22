@@ -258,8 +258,17 @@ harness_binaries() {
     [ -x "$ASTD" ] || { echo "harness: no executable astd beside $AST" >&2; return 1; }
   else
     ( cd "$root" && cargo build -q ) || return 1
-    AST="$root/target/debug/ast"
-    ASTD="$root/target/debug/astd"
+    # Keep the binaries under test paired with the cargo invocation above.
+    # Worktrees commonly share a target cache through CARGO_TARGET_DIR; using
+    # a hard-coded tree-local path after Cargo wrote elsewhere either runs a
+    # stale build or claims the freshly built binaries do not exist.
+    local target_dir="${CARGO_TARGET_DIR:-$root/target}"
+    case "$target_dir" in
+      /*) ;;
+      *) target_dir="$root/$target_dir" ;;
+    esac
+    AST="$target_dir/debug/ast"
+    ASTD="$target_dir/debug/astd"
   fi
   export AST ASTD
 }
