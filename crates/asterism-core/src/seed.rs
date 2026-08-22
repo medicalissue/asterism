@@ -28,7 +28,10 @@ use crate::{instance, paths};
 /// stage, and a unit that regenerates missing host keys at boot.
 /// 4: secrets egress — the per-instance CA, the proxy environment, and the
 /// opaque handles that stand in for values.
-pub const SEED_TEMPLATE_VERSION: u32 = 4;
+/// 5: directory-share transport is part of the seed. A guest moving between
+/// capable backends must replace a 9p unit with a virtiofs unit (or back),
+/// even when the host paths and mount points did not change.
+pub const SEED_TEMPLATE_VERSION: u32 = 5;
 
 /// One locally-hosted volume, resolved into everything the two sides of a
 /// directory share have to agree on.
@@ -118,16 +121,20 @@ pub fn ensure(
     name: &str,
     seed: &Path,
     shares: &[Share],
+    share_kind: Option<ShareKind>,
     extra: &str,
     egress: &Egress,
 ) -> Result<()> {
+    if !shares.is_empty() && share_kind.is_none() {
+        bail!("cannot build mount units without a directory-share transport");
+    }
     let stamp_path = seed.with_file_name("seed.stamp");
-    let stamp = fingerprint(name, shares, extra, egress);
+    let stamp = fingerprint(name, shares, share_kind, extra, egress);
     let current = std::fs::read_to_string(&stamp_path).unwrap_or_default();
     if seed.exists() && current.trim() == stamp {
         return Ok(());
     }
-    build(name, seed, shares, extra, egress, &stamp)?;
+    build(name, seed, shares, share_kind, extra, egress, &stamp)?;
     std::fs::write(&stamp_path, &stamp)?;
     Ok(())
 }
@@ -141,8 +148,21 @@ pub fn ensure(
 /// line, so adding backend cloud-config to this module does not reissue the
 /// seed of every instance that does not use any — a reissued seed carries a
 /// new `instance-id`, which makes a guest run its first-boot work again.
-fn fingerprint(name: &str, shares: &[Share], extra: &str, egress: &Egress) -> String {
+fn fingerprint(
+    name: &str,
+    shares: &[Share],
+    share_kind: Option<ShareKind>,
+    extra: &str,
+    egress: &Egress,
+) -> String {
     let mut material = format!("v{SEED_TEMPLATE_VERSION}\n{name}\n");
+    if !shares.is_empty() {
+        // `ensure` proved this. Keeping the option at the public boundary
+        // lets a guest with no directory shares be built by a backend that
+        // offers none, without inventing a meaningless default transport.
+        material.push_str(share_kind.expect("shares have a transport").as_str());
+        material.push('\n');
+    }
     for share in shares {
         material.push_str(&format!(
             "{}\t{}\t{}\n",
@@ -180,6 +200,7 @@ fn build(
     name: &str,
     seed: &Path,
     shares: &[Share],
+    share_kind: Option<ShareKind>,
     extra: &str,
     egress: &Egress,
     stamp: &str,
@@ -203,7 +224,7 @@ fn build(
     // the backend's half both want `write_files` and `runcmd`, so they are
     // merged key by key rather than concatenated. A key that cannot be
     // merged says so instead of quietly losing one side.
-    let config = merge(&asterism_config(shares, egress), extra)
+    let config = merge(&asterism_config(shares, share_kind, egress), extra)
         .with_context(|| format!("building the seed for {name:?}"))?;
 
     let user_data = format!(
@@ -261,16 +282,20 @@ fn build(
 /// One function because it is one cloud-config: `write_files` and `runcmd`
 /// are written once each, whether or not there are volumes, and merged with
 /// the backend's own half by [`merge`].
-fn asterism_config(shares: &[Share], egress: &Egress) -> String {
+fn asterism_config(
+    shares: &[Share],
+    share_kind: Option<ShareKind>,
+    egress: &Egress,
+) -> String {
     let mut out = String::from("bootcmd:\n");
     out.push_str(HOSTKEY_BOOTCMD);
     out.push_str("write_files:\n");
     out.push_str(HOSTKEY_UNIT);
-    out.push_str(&mount_units(shares));
+    out.push_str(&mount_units(shares, share_kind));
     out.push_str(&egress_files(egress));
     out.push_str("runcmd:\n");
     out.push_str(HOSTKEY_RUNCMD);
-    out.push_str(&mount_runcmd(shares));
+    out.push_str(&mount_runcmd(shares, share_kind));
     out.push_str(&egress_runcmd(egress));
     out
 }
@@ -378,23 +403,26 @@ const HOSTKEY_RUNCMD: &str = "\x20 - |\n\
 /// have become anyway. Enabling them means the mounts come back on every
 /// later boot without cloud-init running again.
 ///
-/// The `9p` transport named here is the one QEMU offers today. A backend
-/// whose `Caps::shared_dir` is virtiofs instead will want a different
-/// `Type=`; that is the next thing to generalize in this file, and it is
-/// deliberately the *only* guest-visible thing left that names a transport.
-fn mount_units(shares: &[Share]) -> String {
+/// The transport is supplied by the selected backend's capability. That
+/// keeps the seed backend-neutral without pretending the two transports use
+/// the same mount syntax.
+fn mount_units(shares: &[Share], share_kind: Option<ShareKind>) -> String {
     if shares.is_empty() {
         return String::new();
     }
-    // The virtio-9p transport module normally autoloads off the device's
-    // modalias; naming it is cheap insurance for images that do not.
-    let mut out = String::from(
-        "\x20 - path: /etc/modules-load.d/asterism-9p.conf\n\
-         \x20   content: |\n\
-         \x20     9p\n\
-         \x20     9pnet_virtio\n",
+    let kind = share_kind.expect("shares have a transport");
+    let mut out = format!(
+        "\x20 - path: /etc/modules-load.d/asterism-{kind}.conf\n\
+         \x20   content: |\n"
     );
+    for module in kind.modules() {
+        out.push_str(&format!("\x20     {module}\n"));
+    }
     for share in shares {
+        let options = match kind.mount_options() {
+            "" => String::new(),
+            value => format!("\x20     Options={value}\n"),
+        };
         out.push_str(&format!(
             "\x20 - path: /etc/systemd/system/{unit}\n\
              \x20   content: |\n\
@@ -403,8 +431,8 @@ fn mount_units(shares: &[Share]) -> String {
              \x20     [Mount]\n\
              \x20     What={tag}\n\
              \x20     Where={where_}\n\
-             \x20     Type=9p\n\
-             \x20     Options=trans=virtio,version=9p2000.L,msize=262144,access=client\n\
+             \x20     Type={kind}\n\
+             {options}\
              \x20     [Install]\n\
              \x20     WantedBy=multi-user.target\n",
             unit = share.unit(),
@@ -568,15 +596,16 @@ fn shell_quote(value: &str) -> String {
 /// later boots, when cloud-init has nothing left to do. A share that will
 /// not mount says so and steps aside: the guest is still a usable machine,
 /// and the unit stays `failed` where systemd can explain it.
-fn mount_runcmd(shares: &[Share]) -> String {
+fn mount_runcmd(shares: &[Share], share_kind: Option<ShareKind>) -> String {
     if shares.is_empty() {
         return String::new();
     }
+    let kind = share_kind.expect("shares have a transport");
     let units: Vec<String> = shares.iter().map(Share::unit).collect();
     format!(
         "\x20 - |\n\
          \x20   systemctl daemon-reload\n\
-         \x20   modprobe 9p 9pnet_virtio 2>/dev/null || true\n\
+         \x20   modprobe {modules} 2>/dev/null || true\n\
          \x20   failed=\n\
          \x20   for unit in {units}; do\n\
          \x20     systemctl enable --now \"$unit\" && continue\n\
@@ -584,10 +613,10 @@ fn mount_runcmd(shares: &[Share]) -> String {
          \x20     echo \"asterism: $unit did not mount\" >&2\n\
          \x20     systemctl --no-pager --full status \"$unit\" >&2 || true\n\
          \x20   done\n\
-         \x20   if [ -n \"$failed\" ] && ! grep -q 9p /proc/filesystems; then\n\
-         \x20     echo \"asterism: this kernel has no 9p filesystem, so host \
+         \x20   if [ -n \"$failed\" ] && ! grep -q {kind} /proc/filesystems; then\n\
+         \x20     echo \"asterism: this kernel has no {kind} filesystem, so host \
          volumes cannot be mounted here — boot an image whose kernel ships \
-         9p and 9pnet_virtio\" >&2\n\
+         {modules}\" >&2\n\
          \x20   fi\n\
          \x20   exit 0\n",
         // Single-quoted for the shell: escaped mount points contain
@@ -600,6 +629,7 @@ fn mount_runcmd(shares: &[Share]) -> String {
             .map(|u| format!("'{u}'"))
             .collect::<Vec<_>>()
             .join(" "),
+        modules = kind.modules().join(" "),
     )
 }
 
@@ -657,7 +687,7 @@ const INDENT: &str = "  ";
 /// claims, or a list that can absorb ours. `build` runs the same check, but
 /// it runs it at boot — this is here so a backend's test can run it now.
 pub fn mergeable(guest_config: &str) -> Result<()> {
-    merge(&asterism_config(&[], &Egress::default()), guest_config).map(|_| ())
+    merge(&asterism_config(&[], None, &Egress::default()), guest_config).map(|_| ())
 }
 
 /// One top-level cloud-config key and what is under it.
@@ -811,7 +841,7 @@ mod tests {
     /// its host keys flushed, and a way back if it lost them anyway.
     #[test]
     fn every_guest_gets_the_host_key_insurance_volumes_or_not() {
-        let bare = asterism_config(&[], &Egress::default());
+        let bare = asterism_config(&[], None, &Egress::default());
         assert!(bare.contains("- path: /etc/systemd/system/asterism-hostkeys.service"));
         assert!(bare.contains("ssh-keygen -A"));
         assert!(bare.contains("systemctl enable asterism-hostkeys.service"));
@@ -837,7 +867,7 @@ mod tests {
             share("/tank/media", "/mnt/ast/media"),
             share("/tank/code", "/srv/code"),
         ];
-        let config = asterism_config(&shares, &Egress::default());
+        let config = asterism_config(&shares, Some(ShareKind::NinePfs), &Egress::default());
         assert!(config.contains("- path: /etc/systemd/system/mnt-ast-media.mount"));
         assert!(config.contains("- path: /etc/systemd/system/srv-code.mount"));
         assert!(config.contains("Where=/mnt/ast/media"));
@@ -854,7 +884,11 @@ mod tests {
 
         // A dash in the mount point becomes `\x2d` in the unit name; the
         // runcmd list must deliver that backslash to systemctl intact.
-        let dashed = asterism_config(&[share("/tank/a", "/mnt/ast/e2e-vol")], &Egress::default());
+        let dashed = asterism_config(
+            &[share("/tank/a", "/mnt/ast/e2e-vol")],
+            Some(ShareKind::NinePfs),
+            &Egress::default(),
+        );
         assert!(dashed.contains(r"- path: /etc/systemd/system/mnt-ast-e2e\x2dvol.mount"));
         assert!(dashed.contains(r"for unit in 'mnt-ast-e2e\x2dvol.mount'; do"));
         // Everything sits under a top-level key, at an indent cloud-init
@@ -874,6 +908,7 @@ mod tests {
     fn both_halves_of_the_config_keep_their_runcmd() {
         let ours = asterism_config(
             &[share("/tank/media", "/mnt/ast/media")],
+            Some(ShareKind::NinePfs),
             &Egress::default(),
         );
         let vz = VZ_LIKE;
@@ -947,7 +982,11 @@ mod tests {
     #[test]
     fn the_assembled_user_data_never_says_the_same_key_twice() {
         let shares = vec![share("/tank/media", "/mnt/ast/media")];
-        let config = merge(&asterism_config(&shares, &Egress::default()), VZ_LIKE).unwrap();
+        let config = merge(
+            &asterism_config(&shares, Some(ShareKind::NinePfs), &Egress::default()),
+            VZ_LIKE,
+        )
+        .unwrap();
         let user_data = format!(
             "#cloud-config\n\
              hostname: dev\n\
@@ -995,7 +1034,7 @@ mod tests {
 
     #[test]
     fn a_seed_carries_the_certificate_and_the_handle_and_nothing_else() {
-        let config = asterism_config(&[], &egress());
+        let config = asterism_config(&[], None, &egress());
         // The certificate, in both places a distribution looks.
         assert!(config.contains("/usr/local/share/ca-certificates/asterism-egress.crt"));
         assert!(config.contains("/etc/pki/ca-trust/source/anchors/asterism-egress.crt"));
@@ -1018,7 +1057,7 @@ mod tests {
 
         // An instance with no bindings gets none of it, and its seed does not
         // move just because this section was added to the file.
-        let bare = asterism_config(&[], &Egress::default());
+        let bare = asterism_config(&[], None, &Egress::default());
         assert!(!bare.contains("asterism-egress"));
     }
 
@@ -1026,7 +1065,7 @@ mod tests {
     /// a YAML block scalar has two ways to be quietly wrong. Both were, once.
     #[test]
     fn the_script_a_bound_guest_runs_is_shell_a_guest_can_actually_run() {
-        let config = asterism_config(&[], &egress());
+        let config = asterism_config(&[], None, &egress());
         // Pull the runcmd entry back out of the cloud-config, undoing the
         // block scalar's indentation, which is what cloud-init hands `sh`.
         let script: String = config
@@ -1069,10 +1108,10 @@ mod tests {
         // A reissued seed carries a new instance-id, which makes a guest redo
         // its first-boot work — so this must move exactly when the guest has
         // something new to be told, and never otherwise.
-        let none = fingerprint("dev", &[], "", &Egress::default());
-        let bound = fingerprint("dev", &[], "", &egress());
+        let none = fingerprint("dev", &[], None, "", &Egress::default());
+        let bound = fingerprint("dev", &[], None, "", &egress());
         assert_ne!(none, bound);
-        assert_eq!(bound, fingerprint("dev", &[], "", &egress()));
+        assert_eq!(bound, fingerprint("dev", &[], None, "", &egress()));
 
         // The port is in it: a proxy that came back somewhere else is a guest
         // that has to be told where.
@@ -1080,7 +1119,7 @@ mod tests {
             proxy: "http://10.0.2.2:39000".into(),
             ..egress()
         };
-        assert_ne!(bound, fingerprint("dev", &[], "", &moved));
+        assert_ne!(bound, fingerprint("dev", &[], None, "", &moved));
 
         // So is the handle: revoking a binding and making a new one must not
         // leave a guest holding the old handle.
@@ -1088,16 +1127,28 @@ mod tests {
             handles: vec![("ANTHROPIC_API_KEY".into(), "sk-ant-ast-YYY".into())],
             ..egress()
         };
-        assert_ne!(bound, fingerprint("dev", &[], "", &reminted));
+        assert_ne!(bound, fingerprint("dev", &[], None, "", &reminted));
     }
 
     #[test]
     fn the_fingerprint_moves_when_the_volumes_do() {
         let bare = Egress::default();
-        let none = fingerprint("dev", &[], "", &bare);
-        let one = fingerprint("dev", &[share("/tank/media", "/mnt/ast/media")], "", &bare);
-        let elsewhere = fingerprint("dev", &[share("/tank/media", "/srv/media")], "", &bare);
-        assert_eq!(none, fingerprint("dev", &[], "", &bare));
+        let none = fingerprint("dev", &[], None, "", &bare);
+        let one = fingerprint(
+            "dev",
+            &[share("/tank/media", "/mnt/ast/media")],
+            Some(ShareKind::NinePfs),
+            "",
+            &bare,
+        );
+        let elsewhere = fingerprint(
+            "dev",
+            &[share("/tank/media", "/srv/media")],
+            Some(ShareKind::NinePfs),
+            "",
+            &bare,
+        );
+        assert_eq!(none, fingerprint("dev", &[], None, "", &bare));
         assert_ne!(none, one);
         assert_ne!(one, elsewhere);
         assert_ne!(
@@ -1105,8 +1156,9 @@ mod tests {
             fingerprint(
                 "other",
                 &[share("/tank/media", "/mnt/ast/media")],
+                Some(ShareKind::NinePfs),
                 "",
-                &bare
+                &bare,
             )
         );
 
@@ -1115,7 +1167,7 @@ mod tests {
         // built for the backend it is actually running on.
         assert_ne!(
             none,
-            fingerprint("dev", &[], "bootcmd:\n - [ sh, -c, x ]\n", &bare)
+            fingerprint("dev", &[], None, "bootcmd:\n - [ sh, -c, x ]\n", &bare)
         );
     }
 
@@ -1164,7 +1216,7 @@ mod tests {
     #[test]
     fn one_bootcmd_entry_cannot_end_the_others() {
         let backend = "bootcmd:\n - |\n   echo the-backends-own-entry\n";
-        let merged = merge(&asterism_config(&[], &Egress::default()), backend).unwrap();
+        let merged = merge(&asterism_config(&[], None, &Egress::default()), backend).unwrap();
 
         // What cloud-init makes of it: the entries, in order, as one
         // script. (Block scalars only — the list form a backend may also
