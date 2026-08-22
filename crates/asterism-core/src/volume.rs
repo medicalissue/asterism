@@ -756,6 +756,79 @@ mod tests {
         );
     }
 
+    /// Mirror the orbit-store confirmation boundary for the lease half of a
+    /// device removal. The first publish has cleared the writer but left it
+    /// in `.bak`; a failure while staging the confirming publish must remain
+    /// retryable after restart, and the retry must make fallback recovery
+    /// preserve the revocation.
+    #[test]
+    fn every_pre_backup_revocation_confirmation_failure_is_retryable() {
+        use durable::faults::Point;
+
+        for (tag, point) in [
+            ("revoke-confirm-create", Point::Create),
+            ("revoke-confirm-write", Point::Write),
+            ("revoke-confirm-sync-file", Point::SyncFile),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("{tag}-volumes.json"));
+            let mut store = Store::load(&path).unwrap();
+            store.create("tank", 1 << 30).unwrap();
+            store.lease("tank", "dev", "laptop").unwrap();
+            store.save().unwrap();
+
+            store.revoke_device("laptop");
+            store.save().unwrap();
+            assert!(store.get("tank").unwrap().lease.is_none(), "{point:?}");
+            assert!(
+                Store::load(&durable::backup_path(&path))
+                    .unwrap()
+                    .get("tank")
+                    .unwrap()
+                    .lease
+                    .is_some(),
+                "fixture must stop between revocation and confirmation at {point:?}"
+            );
+
+            let armed = durable::faults::arm(
+                tag,
+                point,
+                path.display().to_string(),
+                std::io::ErrorKind::Other,
+            );
+            assert!(store.revoke_device_durable("laptop").is_err(), "{point:?}");
+            assert!(store.get("tank").unwrap().lease.is_none(), "{point:?}");
+            assert!(
+                Store::load(&durable::backup_path(&path))
+                    .unwrap()
+                    .get("tank")
+                    .unwrap()
+                    .lease
+                    .is_some(),
+                "the injected failure must precede backup rotation at {point:?}"
+            );
+
+            let mut restarted = Store::load(&path).unwrap();
+            assert!(restarted.get("tank").unwrap().lease.is_none(), "{point:?}");
+            drop(armed);
+
+            assert!(restarted
+                .revoke_device_durable("laptop")
+                .unwrap()
+                .is_empty());
+            std::fs::write(&path, b"{").unwrap();
+            assert!(
+                Store::load(&path)
+                    .unwrap()
+                    .get("tank")
+                    .unwrap()
+                    .lease
+                    .is_none(),
+                "corrupt-live recovery resurrected the lease after {point:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_missing_volume_is_missing_from_this_device_not_from_the_orbit() {
         let s = store();
