@@ -521,7 +521,8 @@ fn a_move_refuses_a_mutated_adopted_base_before_fencing_the_source() {
         state_before,
         "the refused move changed the source shard"
     );
-    let Response::Instance { instance } = astd.ask_request(&Request::Status { name: "dev".into() })
+    let Response::Instance { instance, .. } =
+        astd.ask_request(&Request::Status { name: "dev".into() })
     else {
         panic!("the source row could not be read after refusal");
     };
@@ -631,7 +632,7 @@ fn a_portable_restore_resumes_after_publication_wins_the_crash() {
     };
     assert_eq!(report.id, instance.id);
     assert!(!live.join(".restore-receipt.json").exists());
-    let Response::Instance { instance: held } = astd.ask_request(&Request::Status {
+    let Response::Instance { instance: held, .. } = astd.ask_request(&Request::Status {
         name: "recovered".into(),
     }) else {
         panic!("the recovered row is not in the shard");
