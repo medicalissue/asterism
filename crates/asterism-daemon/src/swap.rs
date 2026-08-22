@@ -73,11 +73,12 @@ use serde::{Deserialize, Serialize};
 
 use asterism_core::cow;
 use asterism_core::durable;
-use asterism_core::hv::ImageRef;
 use asterism_core::instance::{now_unix, Instance, Moving, Status, VolumeKind};
 use asterism_core::paths;
 use asterism_core::protocol::{BaseImage, MoveFile, MoveManifest, Request, Response};
 use asterism_core::registry::Shard;
+use asterism_core::verify::Digest;
+use asterism_core::{image, verify};
 
 use crate::backend;
 use crate::mesh::{ClientIo, Mesh};
@@ -301,7 +302,7 @@ fn base_image(inst: &Instance) -> Result<BaseImage> {
     let Some(reference) = inst.image.clone() else {
         bail!("instance {:?} has no image recorded — there is nothing to move it to", inst.name);
     };
-    let base: ImageRef = match backend::image_ref(&reference) {
+    let base = match image::resolve(&reference) {
         Ok(base) => base,
         // The reference does not resolve *here* either; the manifest says so
         // and the target refuses, rather than this failing in the abstract.
@@ -316,6 +317,14 @@ fn base_image(inst: &Instance) -> Result<BaseImage> {
         len,
         allocated: cow::allocated(&cow::extents(&base.path)?),
         digest: digest_of(&base.path)?,
+        // Read from the record this device adopted the base against, so that
+        // the copy the target adopts can say the same thing about the same
+        // bytes. Nothing here if the source has no record: that base is
+        // already unbootable *here*, and inventing a parent for it would only
+        // move the surprise to the other device.
+        derived_from: verify::provenance(&base.record)
+            .map(|record| record.derived_from)
+            .unwrap_or_default(),
     })
 }
 
@@ -351,6 +360,23 @@ pub fn digest_of(path: &Path) -> Result<String> {
     let digest = hasher.finalize().to_hex().to_string();
     let _ = std::fs::write(&sidecar, format!("{key} {digest}\n"));
     Ok(digest)
+}
+
+/// Read a manifest's content address as the verifier's [`Digest`].
+///
+/// [`digest_of`] writes bare hex and the manifest has always carried it that
+/// way, so the algorithm is not on the wire. It is supplied here, in the one
+/// place that also knows which hash `digest_of` computes — and a peer that
+/// starts naming its algorithm is understood rather than rejected. A digest
+/// this build cannot check is refused before anything is adopted, which is
+/// [`asterism_core::verify::Digest::parse`]'s job and the reason this is not
+/// a `format!` at the call site.
+pub fn wire_digest(digest: &str) -> Result<Digest> {
+    let spelled =
+        if digest.contains(':') { digest.to_owned() } else { format!("blake3:{digest}") };
+    Digest::parse(&spelled).with_context(|| {
+        format!("the base image's content address {digest:?} is not one Asterism can check")
+    })
 }
 
 // ---- the steps, as frames --------------------------------------------------
@@ -648,9 +674,18 @@ pub fn base_wanted(base: &BaseImage) -> Result<bool> {
     Ok(std::fs::metadata(&resolved.path)?.len() != base.len)
 }
 
-/// Where a fetched base image lands on this device.
-pub fn base_path(reference: &str) -> Result<PathBuf> {
-    Ok(backend::image_ref(reference)?.path)
+/// Where a fetched base image lands on this device, and where the provenance
+/// record for it has to go.
+///
+/// Two paths rather than one because they are the same file only for what the
+/// store owns. A reference that names a file the user pointed `--image` at
+/// keeps its record in the store instead of beside the user's bytes, and the
+/// boot gate reads it from there — so a fetch that wrote the record next to
+/// the artifact would leave exactly the unaccountable image this returns two
+/// paths to avoid.
+pub fn base_landing(reference: &str) -> Result<(PathBuf, PathBuf)> {
+    let resolved = image::resolve(reference)?;
+    Ok((resolved.path, resolved.record))
 }
 
 /// Adopt a staged transfer: check it, rename it into place, write the row.
@@ -1110,6 +1145,26 @@ mod tests {
         assert_ne!(staged, paths::instance_dir("dev"));
         // Same parent, so the commit is a rename rather than a copy.
         assert_eq!(staged.parent(), paths::instance_dir("dev").parent());
+    }
+
+    /// The manifest carries bare hex, because that is what [`digest_of`]
+    /// writes and what every build that has ever sent one sends. The
+    /// algorithm is supplied on the way back in — and a peer that starts
+    /// naming its own is understood rather than refused.
+    #[test]
+    fn a_manifest_digest_is_read_as_the_hash_the_manifest_was_written_with() {
+        use asterism_core::verify::Algo;
+
+        let hex = "ab".repeat(32);
+        let parsed = wire_digest(&hex).unwrap();
+        assert_eq!(parsed.algo(), Algo::Blake3, "bare hex is what digest_of computes");
+        assert_eq!(parsed.hex(), hex);
+        assert_eq!(wire_digest(&format!("sha256:{hex}")).unwrap().algo(), Algo::Sha256);
+
+        // And one this build cannot compute is refused here, which is before
+        // a byte of a multi-gigabyte base image has been asked for.
+        let err = format!("{:#}", wire_digest(&format!("md5:{}", "a".repeat(32))).unwrap_err());
+        assert!(err.contains("is not one Asterism can check"), "{err}");
     }
 
     /// The chain in `crate::handle` runs whichever area claims a frame, so a

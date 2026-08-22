@@ -34,6 +34,25 @@ pub struct BaseImage {
     pub allocated: u64,
     /// Content address of its bytes.
     pub digest: String,
+    /// What the source's own provenance record says these bytes were derived
+    /// from — the publisher digest of the cloud image a raw base was
+    /// converted out of, the manifest and layers an OCI rootfs was built
+    /// from.
+    ///
+    /// It travels because the target has to be able to write a provenance
+    /// record of its own, and a record that dropped this would take a
+    /// pinned reference (`debian:13`, whose catalog entry names a published
+    /// sha256) out of service on the target: the boot gate asks not only
+    /// "are these the bytes that were adopted" but "are they the bytes this
+    /// reference asked for", and the second question is answered from here.
+    /// Carrying it is not a new claim — the bytes are proved identical to
+    /// the source's by `digest`, so the source's record is a record of these
+    /// bytes too.
+    ///
+    /// Empty from a peer running a build older than this field, and empty
+    /// for a base that has no record on the source either.
+    #[serde(default)]
+    pub derived_from: Vec<String>,
 }
 
 impl BaseImage {
@@ -42,7 +61,13 @@ impl BaseImage {
     /// disk is a complete file and boots without its base — so this travels
     /// as a fact the target's probe reports rather than as a refusal.
     pub fn absent(reference: String) -> Self {
-        BaseImage { reference, len: 0, allocated: 0, digest: String::new() }
+        BaseImage {
+            reference,
+            len: 0,
+            allocated: 0,
+            digest: String::new(),
+            derived_from: Vec::new(),
+        }
     }
 
     /// What a peer fetch of it would really cost.

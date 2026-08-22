@@ -472,6 +472,24 @@ pub fn adopt(
     expected: Option<&Digest>,
     source: Source<'_>,
 ) -> Result<Provenance> {
+    adopt_recorded(staged, dest, dest, expected, source)
+}
+
+/// The same, for an artifact whose record does not live beside it.
+///
+/// The mirror of [`check_recorded`], and it exists for the same reason: a
+/// reference the store does not own — a file the user pointed `--image` at —
+/// is verified against a record kept in the store, so a path that adopts
+/// bytes for such a reference has to write the record where the boot gate
+/// will look for it rather than next to the bytes. Every ordering guarantee
+/// above is unchanged; only which file the record is keyed on moves.
+pub fn adopt_recorded(
+    staged: &Path,
+    dest: &Path,
+    record_at: &Path,
+    expected: Option<&Digest>,
+    source: Source<'_>,
+) -> Result<Provenance> {
     let meta = std::fs::metadata(staged)
         .with_context(|| format!("adopting {}", staged.display()))?;
     let algo = expected.map(|d| d.algo).unwrap_or(OWN_ALGO);
@@ -505,7 +523,10 @@ pub fn adopt(
     if let Some(dir) = dest.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    write_record(dest, &record)?;
+    if let Some(dir) = record_at.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    write_record(record_at, &record)?;
 
     // Last, and only now: the staged bytes are forced down, the name is
     // created, and the directory entry is forced down after it.
@@ -681,6 +702,29 @@ mod tests {
             Digest::of_bytes(Algo::Sha256, &bytes),
             "the streaming path must agree with the one-shot one across a buffer boundary"
         );
+    }
+
+    /// A reference the store does not own keeps its record in the store,
+    /// and [`check_recorded`] reads it from there — so adoption has to be
+    /// able to put it there too. Writing it beside the artifact instead
+    /// leaves the bytes accounted for in a file nothing will ever consult,
+    /// which reads to the boot gate as no account at all.
+    #[test]
+    fn a_record_can_be_keyed_somewhere_other_than_beside_the_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("x.part");
+        let dest = dir.path().join("elsewhere").join("x.raw");
+        let record_at = dir.path().join("store").join("keyed-on-the-path");
+        write(&staged, b"bytes");
+
+        adopt_recorded(&staged, &dest, &record_at, None, Source::new("local-image", "x"))
+            .unwrap();
+
+        assert!(dest.exists());
+        assert!(provenance_path(&record_at).exists(), "the record went where it was told");
+        assert!(!provenance_path(&dest).exists(), "and not beside the artifact");
+        check_recorded(&dest, &record_at, Depth::Full).unwrap();
+        assert!(check(&dest, Depth::Full).is_err(), "there is nothing beside it to check");
     }
 
     /// A digest we cannot compute is refused when it is read, not when it is

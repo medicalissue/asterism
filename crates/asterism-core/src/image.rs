@@ -1247,6 +1247,60 @@ mod tests {
         assert!(text.contains("ast pull"), "{text}");
     }
 
+    /// What `ast move` leaves behind when it fetches a base image off an
+    /// orbit peer instead of the internet, and what the instance it moved
+    /// needs in order to boot from it.
+    ///
+    /// Both halves are load-bearing, and the peer fetch used to write
+    /// neither. Without a record at all the boot gate refuses an image
+    /// nobody can account for. Without the parents the peer's own record
+    /// named, the *pin* refuses it instead: `debian:13` names the sha256 its
+    /// publisher published, and the raw image converted out of that download
+    /// hashes to something else entirely — `derived_from` is the only thing
+    /// that ties the two together, so it has to cross the wire with the
+    /// bytes.
+    #[test]
+    fn a_base_image_fetched_from_a_peer_boots_and_still_answers_its_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("debian-13.raw");
+        let published = verify::Digest::of_bytes(verify::Algo::Sha256, b"the cloud image");
+        let r = Resolved {
+            name: "debian:13".into(),
+            url: None,
+            record: path.clone(),
+            path,
+            format: DiskFormat::Raw,
+            staging: Some(dir.path().join("debian-13.qcow2")),
+            oci: None,
+            expected: Some(published.clone()),
+        };
+
+        // The target's half of the fetch: bytes proved against the content
+        // address in the move manifest, then adopted with the reference as
+        // their origin and the parents the source's record named.
+        let bytes = vec![9u8; 8192];
+        let staged = dir.path().join("debian-13.raw.moving");
+        std::fs::write(&staged, &bytes).unwrap();
+        let arrived = verify::Digest::of_bytes(verify::OWN_ALGO, &bytes);
+        verify::adopt_recorded(
+            &staged,
+            &r.path,
+            &r.record,
+            Some(&arrived),
+            Source::new("base-image", &r.name).derived_from([published.to_string()]),
+        )
+        .unwrap();
+
+        r.verify_bootable().unwrap();
+
+        // Drop the parents — a manifest that did not carry them, or a source
+        // with no record of its own — and the same verified bytes stop
+        // answering the pin.
+        verify::record(&r.path, &r.record, Source::new("base-image", "debian:13")).unwrap();
+        let text = format!("{:#}", r.verify_bootable().unwrap_err());
+        assert!(text.contains("a different digest than the one asked for"), "{text}");
+    }
+
     /// Migration is lazy: an image that only exists as the qcow2 an older
     /// Asterism pulled still counts as pulled, and converts on first use.
     #[test]

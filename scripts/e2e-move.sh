@@ -286,6 +286,20 @@ grep -qF "base image $IMAGE verified and stored" "$MOVE_OUT" \
   || fail "the fetched base was never verified:"$'\n'"$(cat "$MOVE_OUT")"
 echo "ok: B pulled the base image from A over the mesh and verified it"
 
+# Verified is not the same as adopted. Every boot input has to carry a
+# provenance record, and the peer fetch is the one adoption path that used to
+# write none — leaving an image that passed its digest on arrival and refused
+# to boot a second later.
+BASE_B="$(ls "$B/images/"*.raw 2>/dev/null | head -1)"
+[ -n "$BASE_B" ] || fail "B has no base image after the fetch:"$'\n'"$(ls -la "$B/images" 2>&1)"
+[ -f "$BASE_B.provenance" ] \
+  || fail "the fetched base has no provenance record, so it cannot be booted from"
+grep -q "^kind base-image$" "$BASE_B.provenance" \
+  || fail "the fetched base's record does not say what it is:"$'\n'"$(cat "$BASE_B.provenance")"
+grep -q "^derived-from " "$BASE_B.provenance" \
+  || fail "the record names no parent, so the pin on $IMAGE cannot be answered:"$'\n'"$(cat "$BASE_B.provenance")"
+echo "ok: the fetched base carries a provenance record naming what it came from"
+
 # Progress, not a cursor: bytes have to be reported while they move.
 PROGRESS="$(grep -c " moved$" "$MOVE_OUT" || true)"
 [ "$PROGRESS" -ge 2 ] \

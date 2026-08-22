@@ -52,6 +52,7 @@ use asterism_core::orbit::{self, Device, DeviceStatus, Orbit, WakeFacts};
 use asterism_core::paths;
 use asterism_core::protocol::{MoveManifest, Request, Response};
 use asterism_core::registry::OrbitRow;
+use asterism_core::verify::{self, Source};
 
 use crate::{swap, Node};
 
@@ -1876,7 +1877,11 @@ async fn fetch_base(
         )
         .await?;
 
-    let path = swap::base_path(&base.reference)?;
+    // Both before a byte moves: a digest this build cannot check, or a
+    // reference that does not resolve here, has to refuse the fetch with the
+    // store exactly as it was rather than after a gigabyte has landed in it.
+    let expected = swap::wire_digest(&base.digest)?;
+    let (path, record_at) = swap::base_landing(&base.reference)?;
     let staging = path.with_extension("raw.moving");
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -1904,20 +1909,24 @@ async fn fetch_base(
     receive_into_as(&mut stream.recv, &dir, &leaf, base.cost(), &mut receipt, report)
         .await?;
 
-    // Verify before it becomes the image, so a truncated fetch is a failed
-    // move rather than a base image everything on this device clones from.
-    let got = swap::digest_of(&staging)?;
-    if got != base.digest {
-        let _ = std::fs::remove_file(&staging);
-        bail!(
-            "the base image that arrived from {from_device} addresses {} and should \
-             address {} — refusing to put it in this device's image store",
-            &got[..16.min(got.len())],
-            &base.digest[..16.min(base.digest.len())]
-        );
-    }
-    durable::publish_file(&staging, &path)
-        .with_context(|| format!("putting the fetched base image at {}", path.display()))?;
+    // Adopted, not merely published. [`verify::adopt_recorded`] hashes the
+    // staged file once against the manifest's digest, discards it and leaves
+    // the store untouched if it does not match, commits the provenance record
+    // durably, and only then gives the bytes the name the boot path looks
+    // for. That ordering is the point: this is a peer fetch, so it is the one
+    // adoption path in the tree that could reach the image store, and doing
+    // the digest check by hand and renaming afterwards is exactly how it
+    // used to land a base image nothing could account for — verified on
+    // arrival, unbootable a second later.
+    let source = Source::new("base-image", &base.reference)
+        // The source's parents, on bytes proved identical to the source's.
+        // Without them a reference the catalog pins would adopt cleanly and
+        // still refuse to boot, because a pin is measured against what the
+        // record says the bytes were derived from.
+        .derived_from(base.derived_from.clone());
+    verify::adopt_recorded(&staging, &path, &record_at, Some(&expected), source).with_context(
+        || format!("adopting the base image {} fetched from {from_device}", base.reference),
+    )?;
     report
         .progress(format!("base image {} verified and stored", base.reference), 0)
         .await
