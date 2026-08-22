@@ -22,20 +22,27 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
 use asterism_core::durable;
 use asterism_core::hv::{GuestHealth, ImageKind, RunState, STOP_DEADLINE};
-use asterism_core::instance::{local_host, Instance, Policy, Status};
+use asterism_core::instance::{local_host, Instance, Policy, Restart, Status};
 use asterism_core::profile;
 use asterism_core::protocol::{Request, Response};
 use asterism_core::registry::{self, Shard};
+use asterism_core::volume::{AttachIntent, AttachIntents, ReleaseIntent, ReleaseIntents};
 use asterism_core::{backup, compat};
 use asterism_core::{paths, VERSION};
 
 use crate::mesh::Mesh;
 use crate::{backend, egress, persist, swap, volume, Node};
+
+/// A startup recovery attempt may span more than one provider round trip,
+/// but it may not keep daemon startup hostage indefinitely. Cancellation is
+/// safe because the durable intent remains and the next startup retries it.
+const STORAGE_RECOVERY_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Answer one request against this device's shard.
 ///
@@ -124,32 +131,43 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
         // `--restart` is recorded before the boot, so an instance that comes
         // up and immediately dies is already carrying the policy the user
         // asked for when the supervisor looks at the corpse.
-        Request::Up { name, restart } => match restart {
-            Some(restart) => reg.set_restart(&name, restart).and_then(|_| up(reg, &name)),
-            None => up(reg, &name),
-        },
-        // The bridges go before the guest does: a QEMU that is being asked to
-        // shut down cleanly should find its disks still there, and the local
-        // sockets should be gone by the time it is.
-        Request::Down { name } => {
-            let stopped = down(reg, &name);
-            volume::take_down(&name).await;
-            // The egress proxy exists for a guest, so it goes when the guest
-            // does. Its port is remembered, so the next boot puts it back
-            // where the seed already says it is.
-            egress::stop(&name);
-            stopped
-        }
-        Request::Remove { name } => {
-            // Leases are handed back while we still know what they were.
-            // A device that will not answer does not block the removal — its
-            // volume stays leased to an instance that no longer exists, which
-            // `ast detach` on that device's side is the remedy for, and which
-            // is a great deal better than an instance that cannot be deleted
-            // because a NAS is asleep.
-            if let Ok(inst) = reg.get(&name).cloned() {
+        Request::Up { name, restart } => return attach_response(up(reg, &name, restart)),
+        // A guest being asked to shut down cleanly keeps its disks until the
+        // backend proves it stopped. Only then do its local bridges and egress
+        // proxy go away. A failed stop, including an unresolved launch with no
+        // handle, must preserve every side effect behind that authority row.
+        Request::Down { name } => match down(reg, &name) {
+            Ok(stopped) => {
                 volume::take_down(&name).await;
-                volume::release_all(&inst).await;
+                // The port is remembered, so the next boot puts it back where
+                // the seed already says it is.
+                egress::stop(&name);
+                Ok(stopped)
+            }
+            Err(error) => Err(error),
+        },
+        Request::Remove { name } => {
+            // Leases are handed back while the immutable instance identity
+            // still exists. A sleeping or refusing provider leaves the row
+            // intact; deleting it would strand a lease no same-name
+            // replacement is authorised to release.
+            if let Ok(inst) = reg.get(&name).cloned() {
+                if inst.status == Status::Running {
+                    return attach_response(Err(anyhow::anyhow!(
+                        "instance {name:?} is running — `ast down {name}` first"
+                    )));
+                }
+                if let Some(intent) = &inst.boot_intent_id {
+                    return attach_response(Err(anyhow::anyhow!(
+                        "instance {name:?} has unresolved boot intent {intent}; refusing to remove its authority row"
+                    )));
+                }
+                volume::take_down(&name).await;
+                if let Err(e) = volume::release_all(&inst).await {
+                    return attach_response(Err(e).context(
+                        "instance removal refused until every block-volume lease is released",
+                    ));
+                }
                 // The instance directory goes below, and this instance's CA
                 // private key is in it.
                 egress::stop(&inst.name);
@@ -205,12 +223,34 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             name,
             volume: vol,
             device,
-        } => attach_block(reg, &name, &vol, &device).await,
+        } => {
+            let provider_id = match volume::provider_identity(&device).await {
+                Ok(id) => id,
+                Err(e) => return attach_response(Err(e)),
+            };
+            return attach_response(
+                attach_block_owned(reg, &name, &vol, &device, &provider_id, false).await,
+            );
+        }
+        // Catalog placement is deliberately a separate frame from the
+        // device-qualified legacy attach. It resolves every eligibility
+        // requirement before taking a lease or changing the instance row;
+        // the provider's lease remains the race-safe final fence.
+        Request::AttachStorage {
+            name,
+            volume: vol,
+            owner_device,
+            max_latency_ms,
+        } => {
+            return attach_response(
+                attach_storage(reg, &name, &vol, owner_device.as_deref(), max_latency_ms).await,
+            )
+        }
         Request::Detach {
             name,
             volume: vol,
             host,
-        } => detach(reg, &name, &vol, host.as_deref()).await,
+        } => return attach_response(detach(reg, &name, &vol, host.as_deref()).await),
         // A secret is taken, not merely recorded: the orbit is asked which
         // devices hold it, and a source that cannot serve its current version
         // is a refusal here rather than a guest that boots holding a handle
@@ -286,6 +326,22 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
                 guest_health: None,
             }
         }
+        Err(e) => Response::Error {
+            message: format!("{e:#}"),
+        },
+    }
+}
+
+/// Attach owns its persistence boundary instead of falling through the
+/// generic mutation save below. Its provider lease and consumer row are a
+/// cross-device saga; another unconditional save after the intent was
+/// cleared could turn an already-committed attach into an error response.
+fn attach_response(result: Result<Instance>) -> Response {
+    match result {
+        Ok(instance) => Response::Instance {
+            instance,
+            guest_health: None,
+        },
         Err(e) => Response::Error {
             message: format!("{e:#}"),
         },
@@ -550,11 +606,43 @@ async fn claim(name: &str, node: &Node, mesh: Option<&Arc<Mesh>>) -> Result<()> 
 
 // ---- booting and stopping --------------------------------------------------
 
-pub(crate) fn up(reg: &mut Shard, name: &str) -> Result<Instance> {
+pub(crate) fn up(reg: &mut Shard, name: &str, restart: Option<Restart>) -> Result<Instance> {
     let inst = reg.get(name)?.clone();
+    if let Some(intent) = &inst.boot_intent_id {
+        anyhow::bail!(
+            "instance {name:?} has unresolved boot intent {intent}; refusing a second guest"
+        );
+    }
     if inst.status == Status::Running {
         anyhow::bail!("instance {name:?} is already running");
     }
+    refuse_pending_release(&inst)?;
+
+    // Fence this launch before it can renew one provider epoch or create one
+    // guest process. The marker survives every ambiguous save and makes a
+    // daemon restart refuse a second guest even in the narrow window before
+    // the first one's handle can be recorded.
+    let mut fenced = reg.clone();
+    if let Some(restart) = restart {
+        fenced.set_restart(name, restart)?;
+    }
+    let (_, boot_intent_id) = fenced.begin_boot(name)?;
+    if let Err(first) = fenced.save_confirmed() {
+        let durable = Shard::load(&paths::state_path()).with_context(|| {
+            format!("reloading the launch fence after its commit failed: {first:#}")
+        })?;
+        if durable.get(name)?.boot_intent_id.as_deref() != Some(boot_intent_id.as_str()) {
+            *reg = durable;
+            return Err(first).context("committing the durable guest-launch fence");
+        }
+        durable
+            .save_confirmed()
+            .context("confirming an ambiguously committed guest-launch fence")?;
+        fenced = durable;
+    }
+    *reg = fenced;
+    let inst = reg.get(name)?.clone();
+
     // A cloud-init seed bakes in the guest key of the device that builds it,
     // so whoever builds one is whose key opens that guest from then on.
     // Normally that is settled at the first boot and never moves again; it
@@ -563,37 +651,199 @@ pub(crate) fn up(reg: &mut Shard, name: &str) -> Result<Instance> {
     // so that device is this instance's own cpu device.
     let stamp = paths::instance_dir(name).join("seed.stamp");
     let before = std::fs::read(&stamp).ok();
-    let (handle, leases) = tokio::task::block_in_place(|| -> Result<_> {
+    let raised = match tokio::task::block_in_place(|| -> Result<_> {
         let hv = backend::for_instance(&inst)?;
-        let mut req = backend::boot_req(&inst, &*hv)?;
         // Every boot renews the lease on every block volume this instance
         // holds, at a higher epoch, and raises the local socket the guest's
         // disk arrives on. A volume somebody else has taken in the meantime
         // stops the boot here, saying who has it — which is the whole point
         // of doing it before the hypervisor is asked for anything.
-        let raised = volume::bring_up(&inst, &*hv)?;
-        req.extra_disks = raised.disks;
-        let prep = hv.prepare(&req)?;
-        Ok((hv.boot(&req, &prep)?, raised.leases))
-    })?;
+        volume::bring_up(&inst, &*hv, &boot_intent_id)
+    }) {
+        Ok(raised) => raised,
+        Err(error) => {
+            compensate_boot(reg, &inst, &boot_intent_id)
+                .with_context(|| format!("raising storage for the guest failed ({error:#})"))?;
+            return Err(error);
+        }
+    };
+
     // The epoch this boot was granted, written back onto the instance. The
     // one recorded before was the attach's, and it stopped being true the
     // moment this boot renewed it — which matters to `ast status`, and
     // matters more to the next daemon that has to reconnect this guest's
     // disks without disturbing the guest (`volume::reattach`).
-    for lease in leases {
-        let _ = reg.attach_block(
+    let mut leased = reg.clone();
+    for lease in &raised.leases {
+        leased.attach_block(
             name,
             &lease.volume,
             &lease.device,
             lease.epoch,
             lease.size_bytes,
-        );
+        )?;
     }
-    if inst.seed_device.is_none() || std::fs::read(&stamp).ok() != before {
-        let _ = reg.set_seed_device(name, &inst.cpu_device);
+    if let Err(first) = leased.save_confirmed() {
+        let durable = match Shard::load(&paths::state_path()) {
+            Ok(durable) => durable,
+            Err(reload) => {
+                compensate_boot(reg, &inst, &boot_intent_id).with_context(|| {
+                    format!(
+                        "renewed storage epochs failed to commit and the shard failed to reload ({first:#}; {reload:#})"
+                    )
+                })?;
+                return Err(first).context("committing renewed storage epochs before guest launch");
+            }
+        };
+        if !boot_epochs_match(&durable, name, &boot_intent_id, &raised.leases) {
+            *reg = durable;
+            compensate_boot(reg, &inst, &boot_intent_id).with_context(|| {
+                format!("renewed storage epochs were not durably committed ({first:#})")
+            })?;
+            return Err(first).context("committing renewed storage epochs before guest launch");
+        }
+        if let Err(confirm) = durable.save_confirmed() {
+            *reg = durable;
+            compensate_boot(reg, &inst, &boot_intent_id).with_context(|| {
+                format!("confirming renewed storage epochs failed ({confirm:#})")
+            })?;
+            return Err(confirm).context("confirming renewed storage epochs before guest launch");
+        }
+        leased = durable;
     }
-    reg.set_running(name, handle)
+    *reg = leased;
+
+    // Only now, with the launch fence and every storage epoch confirmed in
+    // both durable shard copies, may the backend create a guest.
+    let boot_inst = reg.get(name)?.clone();
+    let (hv, req, prep) = match tokio::task::block_in_place(|| -> Result<_> {
+        let hv = backend::for_instance(&boot_inst)?;
+        let mut req = backend::boot_req(&boot_inst, &*hv)?;
+        req.extra_disks = raised.disks;
+        let prep = hv.prepare(&req)?;
+        Ok((hv, req, prep))
+    }) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            compensate_boot(reg, &boot_inst, &boot_intent_id)
+                .with_context(|| format!("preparing the backend launch failed ({error:#})"))?;
+            return Err(error);
+        }
+    };
+    let handle = match tokio::task::block_in_place(|| hv.boot(&req, &prep)) {
+        Ok(handle) => handle,
+        Err(error) => {
+            // Crossing into `boot` crosses the process-creation boundary.
+            // QEMU may daemonize successfully and then leave no readable
+            // pidfile; VZ may spawn a helper and then fail to capture its
+            // identity or endpoint. With no exact Handle there is nothing we
+            // can safely signal or use to prove death, so releasing leases or
+            // publishing stopped authority here could admit a second guest.
+            return Err(error).context(format!(
+                "backend launch outcome is ambiguous; durable boot intent {boot_intent_id} remains fenced"
+            ));
+        }
+    };
+
+    let mut running = reg.clone();
+    if boot_inst.seed_device.is_none() || std::fs::read(&stamp).ok() != before {
+        running.set_seed_device(name, &boot_inst.cpu_device)?;
+    }
+    let answer = running.set_running(name, handle.clone())?;
+    if let Err(first) = running.save_confirmed() {
+        let durable = match Shard::load(&paths::state_path()) {
+            Ok(durable) => durable,
+            Err(reload) => {
+                if let Err(stop) = kill_and_prove(&*hv, &handle) {
+                    return Err(first).context(format!(
+                        "committing the running guest handle; the shard also failed to reload ({reload:#}) and shutdown is not proven: {stop:#}"
+                    ));
+                }
+                compensate_boot(reg, &boot_inst, &boot_intent_id).with_context(|| {
+                    format!(
+                        "the uncommitted guest was stopped, but the shard failed to reload ({reload:#})"
+                    )
+                })?;
+                return Err(first)
+                    .context("committing the running guest handle; guest was stopped");
+            }
+        };
+        let exact_running = durable.get(name).is_ok_and(|candidate| {
+            candidate.status == Status::Running
+                && candidate.handle.as_ref() == Some(&handle)
+                && candidate.boot_intent_id.is_none()
+        });
+        if exact_running && durable.save_confirmed().is_ok() {
+            let answer = durable.get(name)?.clone();
+            *reg = durable;
+            return Ok(answer);
+        }
+
+        // Rollback order is the same safety boundary as provider release:
+        // prove process death first, then publish stopped/free authority.
+        if let Err(stop) = kill_and_prove(&*hv, &handle) {
+            *reg = durable;
+            return Err(first).context(format!(
+                "committing the running guest handle; shutdown is not proven and the durable launch fence remains: {stop:#}"
+            ));
+        }
+        *reg = durable;
+        compensate_boot(reg, &boot_inst, &boot_intent_id).with_context(|| {
+            format!("the uncommitted guest was stopped after registry failure ({first:#})")
+        })?;
+        return Err(first).context("committing the running guest handle; guest was stopped");
+    }
+    *reg = running;
+    Ok(answer)
+}
+
+fn boot_epochs_match(reg: &Shard, name: &str, intent_id: &str, leases: &[volume::Leased]) -> bool {
+    reg.get(name).is_ok_and(|instance| {
+        instance.boot_intent_id.as_deref() == Some(intent_id)
+            && leases.iter().all(|leased| {
+                instance.volumes.iter().any(|volume| {
+                    volume.is_block()
+                        && volume.host == leased.device
+                        && volume.path == leased.volume
+                        && volume.epoch == Some(leased.epoch)
+                })
+            })
+    })
+}
+
+fn compensate_boot(reg: &mut Shard, instance: &Instance, boot_intent_id: &str) -> Result<()> {
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current()
+            .block_on(volume::compensate_boot_leases(instance, boot_intent_id))
+    })?;
+    let mut durable = Shard::load(&paths::state_path())?;
+    durable.clear_boot(&instance.name, boot_intent_id)?;
+    durable.set_stopped(&instance.name)?;
+    durable
+        .save_confirmed()
+        .context("clearing the compensated guest-launch fence")?;
+    *reg = durable;
+    Ok(())
+}
+
+fn kill_and_prove(
+    hv: &dyn asterism_core::hv::Hypervisor,
+    handle: &asterism_core::hv::Handle,
+) -> Result<()> {
+    let kill = hv.kill(handle);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if matches!(hv.state(handle), Ok(RunState::Stopped)) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return match kill {
+                Ok(()) => anyhow::bail!("backend still reports the guest running after SIGKILL"),
+                Err(error) => Err(error).context("asking the backend to kill the guest"),
+            };
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn down(reg: &mut Shard, name: &str) -> Result<Instance> {
@@ -619,7 +869,7 @@ pub(crate) fn reconcile(reg: &mut Shard) {
     let stale: Vec<String> = reg
         .list()
         .into_iter()
-        .filter(|i| i.status == Status::Running && !is_running(i))
+        .filter(|i| i.status == Status::Running && i.boot_intent_id.is_none() && !is_running(i))
         .map(|i| i.name)
         .collect();
     if stale.is_empty() {
@@ -648,22 +898,404 @@ fn is_running(inst: &Instance) -> bool {
 
 // ---- volumes on an instance ------------------------------------------------
 
-/// Take a block volume's lease from the device that holds it, and record it
-/// on the instance.
+/// Durably attach a block volume across the provider and consumer.
 ///
-/// The lease first, the registry second: a record written against a lease we
-/// were refused would be an instance that looks configured and cannot boot,
-/// which is the failure `check_can_share` exists to prevent for directories.
-async fn attach_block(reg: &mut Shard, name: &str, vol: &str, device: &str) -> Result<Instance> {
+/// Read-only admission comes first. Before the provider may grant anything,
+/// an independent consumer journal records enough to release an ambiguous
+/// grant. The instance row is then committed twice (live and recovery copy),
+/// and only then is the journal cleared. A registry-save error is resolved by
+/// reloading the durable row: visible means roll forward and acknowledge;
+/// absent means release the provider and roll back before returning failure.
+async fn attach_block_owned(
+    reg: &mut Shard,
+    name: &str,
+    vol: &str,
+    device: &str,
+    provider_device_id: &str,
+    auto_placed: bool,
+) -> Result<Instance> {
     let inst = reg.get(name)?.clone();
+    refuse_running_block_attach(name, inst.status)?;
+    refuse_pending_release(&inst)?;
+    if auto_placed
+        && inst
+            .volumes
+            .iter()
+            .any(|candidate| candidate.is_block() && candidate.path == vol)
+    {
+        anyhow::bail!(
+            "{name:?} already has a block volume called {vol:?}; name its provider explicitly \
+             instead of auto-placing another one"
+        );
+    }
+    if let Some(existing) = existing_block(&inst, vol, device, provider_device_id)? {
+        return Ok(existing);
+    }
     let hv = backend::for_instance(&inst)?;
     volume::check_backend(&*hv)?;
     // Admission precedes the provider-side lease bump and the local registry
     // write.  A relay-only or high-latency placement therefore leaves neither
     // device half-mutated.
     volume::preflight_remote_volume(device).await?;
-    let (epoch, _export, size) = volume::take_lease(vol, device, name).await?;
-    reg.attach_block(name, vol, device, epoch, size)
+
+    let holder_device_id = volume::consumer_device_id()?;
+    let intent = AttachIntent::new(
+        name,
+        &inst.id,
+        vol,
+        device,
+        provider_device_id,
+        &holder_device_id,
+    );
+    let mut intents = AttachIntents::load(&paths::volume_attach_intents_path())?;
+    if let Some(pending) = intents.get(&intent).cloned() {
+        reconcile_one_attach(reg, &mut intents, &pending).await?;
+        if let Some(existing) = existing_block(reg.get(name)?, vol, device, provider_device_id)? {
+            return Ok(existing);
+        }
+    }
+    intents.begin_durable(intent.clone())?;
+
+    let (epoch, _export, size) = match volume::take_lease(
+        vol,
+        device,
+        Some(provider_device_id),
+        name,
+        &inst.id,
+        Some(&intent.intent_id),
+    )
+    .await
+    {
+        Ok(grant) => grant,
+        Err(grant_error) => {
+            let compensated = abort_attach(reg, &mut intents, &intent).await;
+            return match compensated {
+                Ok(()) => Err(grant_error).context("taking the provider lease"),
+                Err(compensation) => Err(grant_error).context(format!(
+                    "taking the provider lease; compensation remains pending: {compensation:#}"
+                )),
+            };
+        }
+    };
+
+    let mut next = reg.clone();
+    let attached = match next.attach_block_owned(
+        name,
+        vol,
+        device,
+        registry::BlockAuthority {
+            provider_device_id: Some(provider_device_id.to_owned()),
+            attach_intent_id: Some(intent.intent_id.clone()),
+        },
+        epoch,
+        size,
+    ) {
+        Ok(instance) => instance,
+        Err(e) => {
+            abort_attach(reg, &mut intents, &intent).await?;
+            return Err(e);
+        }
+    };
+
+    if let Err(first) = next.save_confirmed() {
+        // A trailing directory sync can report failure after the rename is
+        // visible. Reload decides that ambiguity from durable state rather
+        // than from the mutated in-memory row.
+        match Shard::load(&paths::state_path()) {
+            Ok(reloaded) => {
+                *reg = reloaded;
+                if let Some(committed) = exact_block(reg, &intent, epoch) {
+                    // Confirm both the live shard and its recovery copy before
+                    // the independent intent is allowed to disappear.
+                    if reg.save_confirmed().is_ok() {
+                        if let Err(e) = intents.complete_durable(&intent) {
+                            eprintln!(
+                                "astd: volume attach committed, but its intent remains for startup \
+                                 reconciliation: {e:#}"
+                            );
+                        }
+                        return Ok(committed);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("astd: reloading the registry after its attach commit failed: {e:#}")
+            }
+        }
+
+        let compensation = abort_attach(reg, &mut intents, &intent).await;
+        return match compensation {
+            Ok(()) => Err(first).context("committing the consumer volume attachment"),
+            Err(e) => Err(first).context(format!(
+                "committing the consumer volume attachment; compensation remains pending: {e:#}"
+            )),
+        };
+    }
+
+    *reg = next;
+
+    if let Err(e) = intents.complete_durable(&intent) {
+        // The row and provider lease are already mutually consistent and
+        // confirmed in both recovery copies. Returning success is truthful;
+        // startup sees row+intent and idempotently clears the journal.
+        eprintln!(
+            "astd: volume attach committed, but its intent remains for startup \
+             reconciliation: {e:#}"
+        );
+    }
+    Ok(attached)
+}
+
+fn refuse_running_block_attach(name: &str, status: Status) -> Result<()> {
+    if status == Status::Running {
+        anyhow::bail!(
+            "instance {name:?} is running; stop it before attaching block storage so its live \
+             disk cannot be fenced"
+        );
+    }
+    Ok(())
+}
+
+/// A release intent is a durable decision to roll a detach forward. Until it
+/// settles, booting could renew the provider lease between its release and
+/// the consumer-row commit, and another attach could obscure which row the
+/// recovery record owns. Keep both mutations behind the same local fence.
+fn refuse_pending_release(inst: &Instance) -> Result<()> {
+    let pending = ReleaseIntents::load(&paths::volume_release_intents_path())?
+        .list()
+        .into_iter()
+        .find(|intent| intent.instance_id == inst.id);
+    if let Some(intent) = pending {
+        anyhow::bail!(
+            "instance {:?} has a pending detach of {}:{}; retry that detach or restart astd to \
+             reconcile it before booting or attaching storage",
+            inst.name,
+            intent.device,
+            intent.volume
+        );
+    }
+    Ok(())
+}
+
+fn existing_block(
+    inst: &Instance,
+    vol: &str,
+    device: &str,
+    provider_device_id: &str,
+) -> Result<Option<Instance>> {
+    let Some(existing) = inst
+        .volumes
+        .iter()
+        .find(|candidate| candidate.path == vol && candidate.host == device)
+    else {
+        return Ok(None);
+    };
+    if !existing.is_block() {
+        anyhow::bail!(
+            "{device}:{vol} is already attached to {:?} as a directory",
+            inst.name
+        );
+    }
+    match existing.host_id.as_deref() {
+        Some(recorded) if recorded != provider_device_id => anyhow::bail!(
+            "{device}:{vol} now resolves to device id {provider_device_id}, but the attached \
+             storage authority is {recorded}; restore that provider mapping or repair the \
+             authority explicitly"
+        ),
+        None => anyhow::bail!(
+            "{device}:{vol} was attached before immutable storage identities; refusing to bind \
+             the current provider until the original authority is explicitly repaired"
+        ),
+        Some(_) => {}
+    }
+    Ok(Some(inst.clone()))
+}
+
+fn exact_block(reg: &Shard, intent: &AttachIntent, epoch: u64) -> Option<Instance> {
+    let inst = reg.get(&intent.instance).ok()?;
+    if inst.id != intent.instance_id {
+        return None;
+    }
+    inst.volumes
+        .iter()
+        .any(|candidate| {
+            candidate.is_block()
+                && candidate.path == intent.volume
+                && candidate.host == intent.device
+                && candidate.host_id.as_deref() == Some(intent.provider_device_id.as_str())
+                && candidate.attach_intent_id.as_deref() == Some(intent.intent_id.as_str())
+                && candidate.epoch == Some(epoch)
+        })
+        .then(|| inst.clone())
+}
+
+/// Settle an intent left by a crash or a failed cleanup. A matching consumer
+/// row means the registry commit landed, so recovery rolls forward. Without
+/// that row the provider grant is compensated before the intent is cleared.
+async fn reconcile_one_attach(
+    reg: &mut Shard,
+    intents: &mut AttachIntents,
+    intent: &AttachIntent,
+) -> Result<()> {
+    if intent.aborting {
+        return abort_attach(reg, intents, intent).await;
+    }
+    let committed = reg.get(&intent.instance).ok().is_some_and(|inst| {
+        inst.id == intent.instance_id
+            && inst.volumes.iter().any(|candidate| {
+                candidate.is_block()
+                    && candidate.path == intent.volume
+                    && candidate.host == intent.device
+                    && candidate.host_id.as_deref() == Some(intent.provider_device_id.as_str())
+                    && candidate.attach_intent_id.as_deref() == Some(intent.intent_id.as_str())
+            })
+    });
+    if committed {
+        reg.save_confirmed()
+            .context("confirming a recovered consumer volume attachment")?;
+        intents.complete_durable(intent)?;
+        return Ok(());
+    }
+
+    abort_attach(reg, intents, intent).await
+}
+
+async fn abort_attach(
+    reg: &mut Shard,
+    intents: &mut AttachIntents,
+    intent: &AttachIntent,
+) -> Result<()> {
+    // This durable phase is the rollback commit point. If it cannot be
+    // recorded, leave both authorities untouched: startup may still see a
+    // committed consumer row and must then roll forward, which remains safe
+    // only while the provider lease is intact.
+    intents
+        .mark_aborting_durable(intent)
+        .context("recording volume-attach compensation")?;
+    if reg.get(&intent.instance).ok().is_some_and(|inst| {
+        inst.id == intent.instance_id
+            && inst.volumes.iter().any(|candidate| {
+                candidate.is_block()
+                    && candidate.path == intent.volume
+                    && candidate.host == intent.device
+                    && candidate.host_id.as_deref() == Some(intent.provider_device_id.as_str())
+                    && candidate.attach_intent_id.as_deref() == Some(intent.intent_id.as_str())
+            })
+    }) {
+        let mut next = reg.clone();
+        next.detach_volume(&intent.instance, &intent.volume, &intent.device)
+            .context("rolling back the consumer row")?;
+        if let Err(e) = next.save_confirmed() {
+            match Shard::load(&paths::state_path()) {
+                Ok(reloaded) => *reg = reloaded,
+                Err(reload) => anyhow::bail!(
+                    "persisting the compensated consumer registry: {e:#}; reloading it: {reload:#}"
+                ),
+            }
+            if reg.get(&intent.instance).ok().is_some_and(|inst| {
+                inst.id == intent.instance_id
+                    && inst.volumes.iter().any(|candidate| {
+                        candidate.is_block()
+                            && candidate.path == intent.volume
+                            && candidate.host == intent.device
+                            && candidate.attach_intent_id.as_deref()
+                                == Some(intent.intent_id.as_str())
+                    })
+            }) {
+                return Err(e).context(
+                    "consumer rollback is not durably absent; provider lease remains fenced",
+                );
+            }
+        } else {
+            *reg = next;
+        }
+    }
+    volume::compensate_lease(intent)
+        .await
+        .context("releasing the provider lease")?;
+    intents.complete_durable(intent)
+}
+
+/// Reconcile every attach which crossed only part of its two-device saga.
+/// Called after the volume plane exists and before guest resurrection, so an
+/// uncommitted disk can never reach a hypervisor after daemon restart.
+pub(crate) async fn reconcile_pending_attaches(node: &Node) {
+    let mut intents = match AttachIntents::load(&paths::volume_attach_intents_path()) {
+        Ok(intents) => intents,
+        Err(e) => {
+            eprintln!("astd: pending volume attaches are unavailable: {e:#}");
+            return;
+        }
+    };
+    for intent in intents.list() {
+        // Startup has not begun accepting requests yet, but still never hold
+        // the shard mutex over a peer dial: a dead provider must not pin the
+        // registry lock or turn its network timeout into a daemon-wide stall.
+        let mut reg = node.shard.lock().await.clone();
+        match tokio::time::timeout(
+            STORAGE_RECOVERY_DEADLINE,
+            reconcile_one_attach(&mut reg, &mut intents, &intent),
+        )
+        .await
+        {
+            Ok(Ok(())) => eprintln!(
+                "astd: reconciled pending attach of {}:{} to {:?}",
+                intent.device, intent.volume, intent.instance
+            ),
+            Ok(Err(e)) => eprintln!(
+                "astd: pending attach of {}:{} to {:?} remains fenced: {e:#}",
+                intent.device, intent.volume, intent.instance
+            ),
+            Err(_) => eprintln!(
+                "astd: pending attach of {}:{} to {:?} exceeded the {}s recovery deadline and remains fenced",
+                intent.device,
+                intent.volume,
+                intent.instance,
+                STORAGE_RECOVERY_DEADLINE.as_secs()
+            ),
+        }
+        *node.shard.lock().await = reg;
+    }
+}
+
+/// Catalog-driven block attachment. Every read-only placement check precedes
+/// the provider lease, and the instance row is still the final mutation.
+async fn attach_storage(
+    reg: &mut Shard,
+    name: &str,
+    vol: &str,
+    owner_device: Option<&str>,
+    max_latency_ms: Option<u64>,
+) -> Result<Instance> {
+    let inst = reg.get(name)?.clone();
+    let hv = backend::for_instance(&inst)?;
+    volume::check_backend(&*hv)?;
+    let (device, provider_device_id) =
+        volume::place(vol, owner_device, name, max_latency_ms).await?;
+    attach_block_owned(
+        reg,
+        name,
+        vol,
+        &device,
+        &provider_device_id,
+        owner_device.is_none(),
+    )
+    .await
+}
+
+/// Complete catalog placement after the caller has performed the orbit-wide
+/// read without holding the instance shard lock.
+pub(crate) async fn attach_storage_placed(
+    reg: &mut Shard,
+    name: &str,
+    vol: &str,
+    device: &str,
+    provider_device_id: &str,
+    auto_placed: bool,
+) -> Response {
+    attach_response(
+        attach_block_owned(reg, name, vol, device, provider_device_id, auto_placed).await,
+    )
 }
 
 /// Bind an orbit secret to one authority this instance may reach.
@@ -757,13 +1389,202 @@ async fn detach(reg: &mut Shard, name: &str, vol: &str, host: Option<&str>) -> R
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("{host}:{vol} is not attached to {name:?}"))?;
 
-    // The lease goes back before the record does. A provider that will not
-    // answer fails the detach rather than leaving a volume this device has
-    // forgotten and that device still thinks is spoken for.
-    if record.is_block() {
-        volume::give_lease_back(vol, &host, name).await?;
+    if !record.is_block() {
+        let mut next = reg.clone();
+        let (detached, _) = next.detach_volume(name, vol, &host)?;
+        next.save()
+            .context("committing the consumer directory detachment")?;
+        *reg = next;
+        return Ok(detached);
     }
-    reg.detach_volume(name, vol, &host).map(|(inst, _)| inst)
+
+    // A human device name is not authority. Rows written before immutable
+    // provider ids cannot be rebound during detach: the name may now belong
+    // to a replacement device while the original still holds this lease.
+    let provider_device_id = recorded_provider_id(&record, "detach")?.to_owned();
+    let epoch = record
+        .epoch
+        .context("the attached block volume has no lease epoch to release safely")?;
+    let holder_device_id = volume::consumer_device_id()?;
+    let proposed = ReleaseIntent::new(
+        name,
+        &inst.id,
+        vol,
+        &host,
+        &provider_device_id,
+        &holder_device_id,
+        epoch,
+    );
+    let mut intents = ReleaseIntents::load(&paths::volume_release_intents_path())?;
+    let intent = intents.get(&proposed).cloned().unwrap_or(proposed);
+    if intents.contains(&intent) {
+        reconcile_one_release(reg, &mut intents, &intent).await?;
+        if !release_row_matches(reg, &intent) {
+            return reg
+                .get(name)
+                .cloned()
+                .context("the instance disappeared while replaying its volume detach");
+        }
+    }
+
+    intents.begin_durable(intent.clone())?;
+    complete_release(reg, &mut intents, &intent).await?;
+    reg.get(name)
+        .cloned()
+        .context("the instance disappeared while committing its volume detach")
+}
+
+fn release_row_matches(reg: &Shard, intent: &ReleaseIntent) -> bool {
+    reg.get(&intent.instance).ok().is_some_and(|inst| {
+        inst.id == intent.instance_id
+            && inst.volumes.iter().any(|candidate| {
+                candidate.is_block()
+                    && candidate.path == intent.volume
+                    && candidate.host == intent.device
+                    && candidate.host_id.as_deref() == Some(intent.provider_device_id.as_str())
+                    && candidate.epoch == Some(intent.epoch)
+            })
+    })
+}
+
+/// Whether the row otherwise owned by this release lacks or disagrees with
+/// its immutable provider authority. Absence cannot mean "already detached":
+/// a pre-v6 row may still name a lease on the original, now-unreachable
+/// device. Recovery must preserve both row and intent for explicit repair.
+fn release_row_has_ambiguous_authority(reg: &Shard, intent: &ReleaseIntent) -> bool {
+    reg.get(&intent.instance).ok().is_some_and(|inst| {
+        inst.id == intent.instance_id
+            && inst.volumes.iter().any(|candidate| {
+                candidate.is_block()
+                    && candidate.path == intent.volume
+                    && candidate.host == intent.device
+                    && candidate.epoch == Some(intent.epoch)
+                    && candidate.host_id.as_deref() != Some(intent.provider_device_id.as_str())
+            })
+    })
+}
+
+/// Roll a durable detach forward. The provider is released first; only then
+/// may the consumer forget the row. A failed or ambiguous shard commit is
+/// reloaded before returning so in-memory state always follows disk.
+async fn complete_release(
+    reg: &mut Shard,
+    intents: &mut ReleaseIntents,
+    intent: &ReleaseIntent,
+) -> Result<()> {
+    if release_row_has_ambiguous_authority(reg, intent) {
+        anyhow::bail!(
+            "attached volume {}:{} has no matching immutable provider identity; refusing to \
+             forget its consumer row or release intent after possible device-name reuse",
+            intent.device,
+            intent.volume
+        );
+    }
+    if !release_row_matches(reg, intent) {
+        // The live row may be the first half of a confirming write while its
+        // backup still names the released disk. Confirm absence before the
+        // independent journal is allowed to disappear.
+        reg.save_confirmed()
+            .context("confirming a recovered consumer volume detachment")?;
+        intents.complete_durable(intent)?;
+        return Ok(());
+    }
+
+    volume::release_lease(intent)
+        .await
+        .context("releasing the provider lease")?;
+
+    let mut next = reg.clone();
+    next.detach_volume(&intent.instance, &intent.volume, &intent.device)
+        .context("removing the released consumer volume row")?;
+    if let Err(first) = next.save_confirmed() {
+        *reg = Shard::load(&paths::state_path()).with_context(|| {
+            format!("reloading the registry after its detach commit failed: {first:#}")
+        })?;
+        if release_row_has_ambiguous_authority(reg, intent) {
+            return Err(first).context(
+                "the detach commit reloaded a row without the exact provider identity; \
+                 release intent remains pending",
+            );
+        }
+        if release_row_matches(reg, intent) {
+            return Err(first).context(
+                "committing the consumer volume detachment; release intent remains pending",
+            );
+        }
+        reg.save_confirmed()
+            .context("confirming an ambiguously committed volume detachment")?;
+    } else {
+        *reg = next;
+    }
+
+    if let Err(e) = intents.complete_durable(intent) {
+        eprintln!(
+            "astd: volume detach committed, but its intent remains for startup reconciliation: \
+             {e:#}"
+        );
+    }
+    Ok(())
+}
+
+fn recorded_provider_id<'a>(
+    record: &'a asterism_core::instance::Volume,
+    action: &str,
+) -> Result<&'a str> {
+    record.host_id.as_deref().with_context(|| {
+        format!(
+            "cannot {action} legacy block volume {}:{}: it has no immutable provider identity, \
+             so its device name may have been reused; preserving the consumer row and lease authority",
+            record.host, record.path
+        )
+    })
+}
+
+async fn reconcile_one_release(
+    reg: &mut Shard,
+    intents: &mut ReleaseIntents,
+    intent: &ReleaseIntent,
+) -> Result<()> {
+    complete_release(reg, intents, intent).await
+}
+
+/// Re-drive every detach whose provider acknowledgement or consumer commit
+/// was interrupted. This runs before guest resurrection, so a row whose
+/// writer fence was released is removed before it can reach a hypervisor.
+pub(crate) async fn reconcile_pending_releases(node: &Node) {
+    let mut intents = match ReleaseIntents::load(&paths::volume_release_intents_path()) {
+        Ok(intents) => intents,
+        Err(e) => {
+            eprintln!("astd: pending volume releases are unavailable: {e:#}");
+            return;
+        }
+    };
+    for intent in intents.list() {
+        let mut reg = node.shard.lock().await.clone();
+        match tokio::time::timeout(
+            STORAGE_RECOVERY_DEADLINE,
+            reconcile_one_release(&mut reg, &mut intents, &intent),
+        )
+        .await
+        {
+            Ok(Ok(())) => eprintln!(
+                "astd: reconciled pending detach of {}:{} from {:?}",
+                intent.device, intent.volume, intent.instance
+            ),
+            Ok(Err(e)) => eprintln!(
+                "astd: pending detach of {}:{} from {:?} remains fenced: {e:#}",
+                intent.device, intent.volume, intent.instance
+            ),
+            Err(_) => eprintln!(
+                "astd: pending detach of {}:{} from {:?} exceeded the {}s recovery deadline and remains fenced",
+                intent.device,
+                intent.volume,
+                intent.instance,
+                STORAGE_RECOVERY_DEADLINE.as_secs()
+            ),
+        }
+        *node.shard.lock().await = reg;
+    }
 }
 
 /// A volume on this device is about to be handed to a hypervisor, so it has
@@ -855,6 +1676,97 @@ fn tail_of(path: &Path, lines: u32) -> Result<(String, bool)> {
 mod tests {
     use super::*;
 
+    fn test_machine() -> asterism_core::hv::Machine {
+        asterism_core::hv::Machine {
+            backend: "qemu".into(),
+            machine_type: "virt".into(),
+            cpu: "host".into(),
+            hv_version: "test".into(),
+        }
+    }
+
+    /// The normal dead-handle reconciliation path must not turn the missing
+    /// handle inside an ambiguous boot window into stopped authority.
+    #[test]
+    fn reconcile_preserves_a_pending_boot_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut reg = Shard::load(&dir.path().join("state.json")).unwrap();
+        reg.create(
+            "pending",
+            "laptop",
+            "debian:13",
+            asterism_core::instance::Shape::default(),
+            test_machine(),
+        )
+        .unwrap();
+        let (_, intent) = reg.begin_boot("pending").unwrap();
+
+        reconcile(&mut reg);
+
+        let pending = reg.get("pending").unwrap();
+        assert_eq!(pending.status, Status::Running);
+        assert_eq!(pending.boot_intent_id.as_deref(), Some(intent.as_str()));
+    }
+
+    /// A pre-v6 row cannot acquire authority merely because a new device now
+    /// answers to the old provider's human name. Recovery must keep both the
+    /// consumer row and its intent instead of accepting the replacement's
+    /// missing lease as proof that the original writer fence is gone.
+    #[tokio::test]
+    async fn legacy_provider_name_reuse_preserves_release_row_and_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.json");
+        let intents_path = dir.path().join("release.json");
+        let mut reg = Shard::load(&state).unwrap();
+        reg.create(
+            "dev",
+            "laptop",
+            "debian:13",
+            asterism_core::instance::Shape::default(),
+            test_machine(),
+        )
+        .unwrap();
+        reg.attach_block("dev", "tank", "nas", 7, 1 << 30).unwrap();
+        reg.save_confirmed().unwrap();
+        let instance_id = reg.get("dev").unwrap().id.clone();
+        let intent = ReleaseIntent::new(
+            "dev",
+            &instance_id,
+            "tank",
+            "nas",
+            "replacement-device-id",
+            "laptop-id",
+            7,
+        );
+        let mut intents = ReleaseIntents::load(&intents_path).unwrap();
+        intents.begin_durable(intent.clone()).unwrap();
+
+        let error = complete_release(&mut reg, &mut intents, &intent)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("possible device-name reuse"), "{error}");
+        let row = reg.get("dev").unwrap();
+        assert_eq!(row.volumes.len(), 1, "the legacy row was forgotten");
+        assert!(row.volumes[0].host_id.is_none());
+        assert!(
+            ReleaseIntents::load(&intents_path)
+                .unwrap()
+                .contains(&intent),
+            "the ambiguous release intent was cleared"
+        );
+    }
+
+    #[test]
+    fn detach_refuses_a_legacy_provider_before_rebinding_its_name() {
+        let legacy = asterism_core::instance::Volume::block("tank", "nas", 7, 1 << 30);
+        let error = recorded_provider_id(&legacy, "detach")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no immutable provider identity"), "{error}");
+        assert!(error.contains("preserving the consumer row"), "{error}");
+    }
+
     /// A console is the one thing in this protocol whose size the guest
     /// chooses, and it chooses it over months. Reading all of it to answer
     /// `ast logs` put the size of a reply frame — and of the daemon's own
@@ -908,6 +1820,16 @@ mod tests {
             tail_of(&log, 9).unwrap(),
             ("one\ntwo\nthree".to_owned(), false)
         );
+    }
+
+    #[test]
+    fn attaching_block_storage_to_a_running_guest_is_refused_before_a_lease() {
+        let error = refuse_running_block_attach("dev", Status::Running)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("stop it before attaching"), "{error}");
+        assert!(error.contains("cannot be fenced"), "{error}");
+        assert!(refuse_running_block_attach("dev", Status::Stopped).is_ok());
     }
 
     /// Firmware puts whatever it likes on a serial line, and a stray byte

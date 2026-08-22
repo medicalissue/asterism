@@ -53,7 +53,7 @@
 //! under a guest doing nothing wrong. See [`Request::VolumeReconnect`].
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -68,7 +68,9 @@ use asterism_core::paths;
 use asterism_core::proc::{ProcId, Signal};
 use asterism_core::protocol::{Request, Response};
 use asterism_core::tools::{run, tool};
-use asterism_core::volume::{self, BlockVolume, Store};
+use asterism_core::volume::{
+    self, BlockVolume, Catalog, CatalogVolume, Locality, PlacementPolicy, Store, UnreachableStorage,
+};
 use asterism_mesh::PathKind;
 
 use crate::mesh::{self, Mesh, Splice, TransferStats};
@@ -98,6 +100,7 @@ pub const REMOTE_VOLUME_MAX_RTT: Duration = Duration::from_millis(5);
 struct Plane {
     node: Node,
     mesh: Option<Arc<Mesh>>,
+    device_id: String,
     store: Mutex<Store>,
     /// Live bridges, keyed by instance name. Dropping one unbinds its socket
     /// and kills every session on it.
@@ -141,13 +144,48 @@ static PLANE: OnceLock<Plane> = OnceLock::new();
 /// Install this device's volume plane. Called once, from `main`.
 pub fn init(node: Node, mesh: Option<Arc<Mesh>>) -> Result<()> {
     let store = Store::load(&paths::volumes_path()).context("loading this device's volumes")?;
+    sweep_orphan_volume_dirs(&store)?;
+    let device_id = match &mesh {
+        Some(mesh) => mesh.device_id().to_string(),
+        None => asterism_mesh::DeviceIdentity::load(paths::device_key_path())
+            .context("loading this device's immutable storage identity")?
+            .device_id()
+            .to_string(),
+    };
     let _ = PLANE.set(Plane {
         node,
         mesh,
+        device_id,
         store: Mutex::new(store),
         bridges: Mutex::new(HashMap::new()),
         health: Mutex::new(HashMap::new()),
     });
+    Ok(())
+}
+
+/// Finish the byte-deletion half of an acknowledged catalog removal. A
+/// create uses `create_new`, so these directories can never be mistaken for
+/// a fresh volume before startup gets here.
+fn sweep_orphan_volume_dirs(store: &Store) -> Result<()> {
+    let root = paths::home_dir().join("volumes");
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", root.display())),
+    };
+    let known: std::collections::BTreeSet<String> =
+        store.list().into_iter().map(|volume| volume.name).collect();
+    for entry in entries {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !known.contains(&name) && entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(entry.path()).with_context(|| {
+                format!("finishing removal of orphan volume directory {name:?}")
+            })?;
+        }
+    }
     Ok(())
 }
 
@@ -383,6 +421,160 @@ pub fn is_plane_request(req: &Request) -> bool {
     )
 }
 
+/// Requests whose answer is assembled from every storage provider rather
+/// than read from this device's provider store.
+pub fn is_orbit_request(req: &Request) -> bool {
+    matches!(req, Request::VolumeCatalog)
+}
+
+/// Answer the orbit-visible storage read model.
+pub async fn serve_orbit(req: Request, node: &Node, mesh: Option<&Arc<Mesh>>) -> Response {
+    let result = match req {
+        Request::VolumeCatalog => catalog(node, mesh)
+            .await
+            .map(|catalog| Response::VolumeCatalog { catalog }),
+        other => Err(anyhow!("{other:?} is not an orbit storage request")),
+    };
+    reply(result)
+}
+
+/// Assemble every reachable provider into one catalog. Provider rows remain
+/// authoritative; latency and path are observations from this device now.
+pub async fn catalog(node: &Node, mesh: Option<&Arc<Mesh>>) -> Result<Catalog> {
+    let plane = plane()?;
+    let here = node.device_name().await;
+    let here_id = plane.device_id.clone();
+    let local = plane.store.lock().await.list();
+    let mut catalog = Catalog {
+        volumes: local
+            .into_iter()
+            .map(|volume| CatalogVolume {
+                owner_device: here.clone(),
+                owner_device_id: here_id.clone(),
+                locality: Locality::Local,
+                path: "local".into(),
+                latency_micros: Some(0),
+                volume,
+            })
+            .collect(),
+        unreachable: Vec::new(),
+    };
+
+    let Some(mesh) = mesh else {
+        return Ok(catalog);
+    };
+    let peers = node.orbit.lock().await.devices().to_vec();
+    let mut asking = tokio::task::JoinSet::new();
+    for peer in peers {
+        let mesh = mesh.clone();
+        asking.spawn(async move {
+            let route = match mesh.ping(&peer.name).await {
+                Ok(Response::DevicePong { path, millis, .. }) => {
+                    let micros = (millis * 1000.0).round().clamp(0.0, u64::MAX as f64) as u64;
+                    (path, Some(micros))
+                }
+                _ => ("remote".to_owned(), None),
+            };
+            let response = mesh.proxy(&peer.name, Request::VolumeList).await;
+            (peer, route, response)
+        });
+    }
+    while let Some(result) = asking.join_next().await {
+        let Ok((peer, (path, latency_micros), response)) = result else {
+            continue;
+        };
+        match response {
+            Ok(Response::Volumes { volumes }) => {
+                catalog
+                    .volumes
+                    .extend(volumes.into_iter().map(|volume| CatalogVolume {
+                        owner_device: peer.name.clone(),
+                        owner_device_id: peer.device_id.clone(),
+                        locality: Locality::Remote,
+                        path: path.clone(),
+                        latency_micros,
+                        volume,
+                    }));
+            }
+            Ok(Response::Error { message }) => catalog.unreachable.push(UnreachableStorage {
+                device: peer.name,
+                device_id: peer.device_id,
+                reason: message,
+            }),
+            Ok(other) => catalog.unreachable.push(UnreachableStorage {
+                device: peer.name,
+                device_id: peer.device_id,
+                reason: format!("unexpected storage reply {other:?}"),
+            }),
+            Err(error) => catalog.unreachable.push(UnreachableStorage {
+                device: peer.name,
+                device_id: peer.device_id,
+                reason: format!("{error:#}"),
+            }),
+        }
+    }
+    catalog.volumes.sort_by(|a, b| {
+        (&a.volume.name, &a.owner_device_id).cmp(&(&b.volume.name, &b.owner_device_id))
+    });
+    catalog
+        .unreachable
+        .sort_by(|a, b| a.device_id.cmp(&b.device_id));
+    Ok(catalog)
+}
+
+/// Resolve an attach against the catalog before taking a provider lease.
+/// The lease operation below remains the final race-safe single-writer gate.
+pub async fn place(
+    volume: &str,
+    owner_device: Option<&str>,
+    holder: &str,
+    max_latency_ms: Option<u64>,
+) -> Result<(String, String)> {
+    let plane = plane()?;
+    let catalog = catalog(&plane.node, plane.mesh.as_ref()).await?;
+    let max_latency_micros = max_latency_ms
+        .map(|millis| {
+            millis
+                .checked_mul(1000)
+                .context("latency ceiling is too large")
+        })
+        .transpose()?;
+    let selected = catalog.place(
+        volume,
+        owner_device,
+        holder,
+        PlacementPolicy {
+            max_latency_micros,
+            ..PlacementPolicy::default()
+        },
+    )?;
+    Ok((
+        selected.owner_device.clone(),
+        selected.owner_device_id.clone(),
+    ))
+}
+
+/// Resolve a routed device name to the immutable authority identity used by
+/// storage intents and provider leases.
+pub async fn provider_identity(device: &str) -> Result<String> {
+    let plane = plane()?;
+    if device == plane.node.device_name().await {
+        return Ok(plane.device_id.clone());
+    }
+    plane
+        .node
+        .orbit
+        .lock()
+        .await
+        .get(device)
+        .map(|peer| peer.device_id.clone())
+        .with_context(|| format!("no device named {device:?} in this orbit"))
+}
+
+pub fn consumer_device_id() -> Result<String> {
+    Ok(plane()?.device_id.clone())
+}
+
 /// Answer one volume request against this device's own volumes.
 pub async fn serve(req: Request) -> Response {
     reply(serve_for(req, None).await)
@@ -401,11 +593,16 @@ pub async fn serve_authenticated(
     // Refuse an attempted name substitution before consulting the plane. It
     // is both the clearest error and keeps this check independent of volume
     // availability.
-    if let Request::VolumeLease { holder_device, .. } = &req {
-        if holder_device != requester_device {
+    if let Request::VolumeLease {
+        holder_device,
+        holder_device_id,
+        ..
+    } = &req
+    {
+        if holder_device != requester_device || holder_device_id != requester_device_id {
             return reply(Err(anyhow!(
-                "authenticated device {requester_device:?} cannot request a volume lease for \
-                 device {holder_device:?}"
+                "authenticated device {requester_device:?} ({requester_device_id}) cannot request \
+                 a volume lease for device {holder_device:?} ({holder_device_id})"
             )));
         }
     }
@@ -418,7 +615,7 @@ pub async fn serve_authenticated(
         // second observes the missing exact key and cannot grant or resume.
         let membership = plane.node.orbit.lock().await;
         authorize_peer(&membership, requester_device, requester_device_id)?;
-        let response = serve_for(req, Some(requester_device)).await;
+        let response = serve_for(req, Some((requester_device, requester_device_id))).await;
         drop(membership);
         response
     }
@@ -426,7 +623,7 @@ pub async fn serve_authenticated(
     reply(result)
 }
 
-async fn serve_for(req: Request, requester_device: Option<&str>) -> Result<Response> {
+async fn serve_for(req: Request, requester: Option<(&str, &str)>) -> Result<Response> {
     match req {
         Request::VolumeCreate { name, size_bytes } => create(&name, size_bytes).await,
         Request::VolumeList => list().await,
@@ -434,22 +631,55 @@ async fn serve_for(req: Request, requester_device: Option<&str>) -> Result<Respo
         Request::VolumeLease {
             volume,
             holder,
+            holder_id,
             holder_device,
+            holder_device_id,
+            intent_id,
         } => {
+            if holder_id.is_empty() || holder_device_id.is_empty() {
+                bail!("volume lease requires immutable holder and consumer-device identities");
+            }
             grant(
                 &volume,
                 &holder,
-                requester_device.unwrap_or(holder_device.as_str()),
+                &holder_id,
+                requester.map_or(holder_device.as_str(), |(name, _)| name),
+                &holder_device_id,
+                intent_id.as_deref(),
             )
             .await
         }
         Request::VolumeReconnect {
             volume,
             holder,
+            holder_id,
             epoch,
-        } => resume(&volume, &holder, epoch, requester_device).await,
-        Request::VolumeRelease { volume, holder } => {
-            release(&volume, &holder, requester_device).await
+        } => {
+            if holder_id.is_empty() {
+                bail!("volume reconnect requires an immutable holder identity");
+            }
+            resume(&volume, &holder, &holder_id, epoch, requester).await
+        }
+        Request::VolumeRelease {
+            volume,
+            holder,
+            holder_id,
+            epoch,
+            intent_id,
+            release_intent_id: _,
+        } => {
+            if holder_id.is_empty() {
+                bail!("volume release requires an immutable holder identity");
+            }
+            release(
+                &volume,
+                &holder,
+                &holder_id,
+                epoch,
+                intent_id.as_deref(),
+                requester,
+            )
+            .await
         }
         other => Err(anyhow!("{other:?} is not a volume request")),
     }
@@ -481,7 +711,8 @@ fn authorize_peer(orbit: &Orbit, requester_device: &str, requester_device_id: &s
 async fn create(name: &str, size_bytes: u64) -> Result<Response> {
     let plane = plane()?;
     let mut store = plane.store.lock().await;
-    let vol = store.create(name, size_bytes)?;
+    let mut next = store.clone();
+    let vol = next.create(name, size_bytes)?;
 
     // The bytes, then the bookkeeping: a saved record with no image behind it
     // would be a volume that exists until you use it.
@@ -489,8 +720,7 @@ async fn create(name: &str, size_bytes: u64) -> Result<Response> {
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let image = paths::volume_image_path(name);
     let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
+        .create_new(true)
         .write(true)
         .open(&image)
         .with_context(|| format!("creating {}", image.display()))?;
@@ -499,7 +729,25 @@ async fn create(name: &str, size_bytes: u64) -> Result<Response> {
     file.set_len(size_bytes)?;
     drop(file);
 
-    store.save()?;
+    if let Err(error) = next.save_confirmed() {
+        match Store::load(&paths::volumes_path()) {
+            Ok(reloaded) if reloaded.get(name).is_ok() => {
+                *store = reloaded;
+                store
+                    .save_confirmed()
+                    .context("confirming an ambiguously committed volume creation")?;
+                return Ok(Response::Volumes { volumes: vec![vol] });
+            }
+            Ok(reloaded) => *store = reloaded,
+            Err(reload) => {
+                bail!("committing volume creation: {error:#}; reloading it: {reload:#}")
+            }
+        }
+        let _ = std::fs::remove_file(&image);
+        let _ = std::fs::remove_dir(&dir);
+        return Err(error).context("committing volume creation");
+    }
+    *store = next;
     Ok(Response::Volumes { volumes: vec![vol] })
 }
 
@@ -514,8 +762,10 @@ async fn list() -> Result<Response> {
 async fn remove(name: &str) -> Result<Response> {
     let plane = plane()?;
     let mut store = plane.store.lock().await;
-    let vol = store.remove(name)?;
-    store.save()?;
+    let mut next = store.clone();
+    let vol = next.remove(name)?;
+    next.save_confirmed()?;
+    *store = next;
     let dir = paths::volume_dir(name);
     if dir.exists() {
         std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
@@ -530,20 +780,88 @@ async fn remove(name: &str) -> Result<Response> {
 /// leaves a volume whose epoch has moved and whose export is missing, which
 /// the next grant fixes — the failure mode we must not have is an old export
 /// still serving under a lease somebody else now holds.
-async fn grant(name: &str, holder: &str, holder_device: &str) -> Result<Response> {
+async fn grant(
+    name: &str,
+    holder: &str,
+    holder_id: &str,
+    holder_device: &str,
+    holder_device_id: &str,
+    intent_id: Option<&str>,
+) -> Result<Response> {
     let plane = plane()?;
     let mut store = plane.store.lock().await;
     let previous = store.get(name).ok().and_then(|v| v.lease.clone());
-    let vol = store.lease(name, holder, holder_device)?;
-    store.save()?;
-
-    if let Some(old) = previous {
-        stop_export(name, old.epoch, old.proc.as_ref());
-    }
+    let mut next = store.clone();
+    let vol = next.lease_with_intent(
+        name,
+        holder,
+        holder_id,
+        holder_device,
+        holder_device_id,
+        intent_id,
+    )?;
     let lease = vol.lease.clone().expect("a grant leaves a lease");
-    let proc = start_export(&vol, lease.epoch, &lease.export)?;
-    store.set_export_proc(name, Some(proc))?;
-    store.save()?;
+    let replay = previous
+        .as_ref()
+        .is_some_and(|old| old.epoch == lease.epoch && old.intent_id == lease.intent_id);
+    if !replay {
+        if let Some(old) = &previous {
+            // Death is the fence, not unlink. Retire the previous writer
+            // before publishing or acknowledging a new authority epoch.
+            stop_export(name, old)?;
+        }
+    }
+    if let Err(error) = next.save_confirmed() {
+        store.reload().with_context(|| {
+            format!("reloading the volume store after lease commit failed: {error:#}")
+        })?;
+        return Err(error).context("committing the provider lease");
+    }
+    *store = next;
+
+    let socket = paths::volume_export_socket(name, lease.epoch);
+    if !export_alive(lease.proc.as_ref(), &socket) {
+        if lease.export_started && lease.proc.is_none() {
+            bail!(
+                "volume {name:?}'s epoch {} may still have an untracked export; refusing to \
+                 start a second writer",
+                lease.epoch
+            );
+        }
+        let (lease, launch) = prepare_export_start(&mut store, &vol)?;
+        let proc = start_export(&vol, lease.epoch, &lease.export, &launch)?;
+        let mut recorded = store.clone();
+        recorded.set_export_proc(name, Some(proc.clone()))?;
+        if let Err(error) = recorded.save_confirmed() {
+            let unrecorded = volume::Lease {
+                proc: Some(proc.clone()),
+                pid: Some(proc.pid),
+                export_started: true,
+                ..lease.clone()
+            };
+            let stop_error = stop_export(name, &unrecorded).err();
+            store.reload().with_context(|| {
+                format!("reloading the volume store after export commit failed: {error:#}")
+            })?;
+            return match stop_error {
+                Some(stop) => Err(error).context(format!(
+                    "committing the provider export identity; refusing to hide an unproven \
+                     writer shutdown: {stop:#}"
+                )),
+                None => match clear_export_start(&mut store, name) {
+                    Ok(()) => Err(error).context("committing the provider export identity"),
+                    Err(clear) => Err(error).context(format!(
+                        "committing the provider export identity; the process is dead but its \
+                         conservative launch fence could not be cleared: {clear:#}"
+                    )),
+                },
+            };
+        }
+        *store = recorded;
+    }
+
+    let vol = store.get(name)?.clone();
+    let lease = vol.lease.clone().expect("a grant leaves a lease");
 
     Ok(Response::VolumeLease {
         volume: vol.name.clone(),
@@ -567,20 +885,55 @@ async fn grant(name: &str, holder: &str, holder_device: &str) -> Result<Response
 async fn resume(
     name: &str,
     holder: &str,
+    holder_id: &str,
     epoch: u64,
-    requester_device: Option<&str>,
+    requester: Option<(&str, &str)>,
 ) -> Result<Response> {
     let plane = plane()?;
     let mut store = plane.store.lock().await;
-    let vol = store.reconnect(name, holder, epoch)?;
+    let vol = store.reconnect_holder(name, holder, holder_id, epoch)?;
     let lease = vol.lease.clone().expect("reconnect checked the lease");
-    authorize_lease_device(name, &lease, requester_device)?;
+    authorize_lease_device(name, &lease, requester)?;
 
     let socket = paths::volume_export_socket(name, lease.epoch);
     if !export_alive(lease.proc.as_ref(), &socket) {
-        let proc = start_export(&vol, lease.epoch, &lease.export)?;
-        store.set_export_proc(name, Some(proc))?;
-        store.save()?;
+        if lease.export_started && lease.proc.is_none() {
+            bail!(
+                "volume {name:?}'s epoch {} may still have an untracked export; refusing to \
+                 start a second writer",
+                lease.epoch
+            );
+        }
+        let (lease, launch) = prepare_export_start(&mut store, &vol)?;
+        let proc = start_export(&vol, lease.epoch, &lease.export, &launch)?;
+        let mut recorded = store.clone();
+        recorded.set_export_proc(name, Some(proc.clone()))?;
+        if let Err(error) = recorded.save_confirmed() {
+            let unrecorded = volume::Lease {
+                proc: Some(proc.clone()),
+                pid: Some(proc.pid),
+                export_started: true,
+                ..lease.clone()
+            };
+            let stop_error = stop_export(name, &unrecorded).err();
+            store.reload().with_context(|| {
+                format!("reloading the volume store after reconnect commit failed: {error:#}")
+            })?;
+            return match stop_error {
+                Some(stop) => Err(error).context(format!(
+                    "committing the resumed provider export identity; its shutdown is not \
+                     proven: {stop:#}"
+                )),
+                None => match clear_export_start(&mut store, name) {
+                    Ok(()) => Err(error).context("committing the resumed provider export identity"),
+                    Err(clear) => Err(error).context(format!(
+                        "committing the resumed provider export identity; the process is dead \
+                         but its conservative launch fence could not be cleared: {clear:#}"
+                    )),
+                },
+            };
+        }
+        *store = recorded;
     }
     Ok(Response::VolumeLease {
         volume: vol.name.clone(),
@@ -591,21 +944,37 @@ async fn resume(
     })
 }
 
-async fn release(name: &str, holder: &str, requester_device: Option<&str>) -> Result<Response> {
+async fn release(
+    name: &str,
+    holder: &str,
+    holder_id: &str,
+    expected_epoch: Option<u64>,
+    intent_id: Option<&str>,
+    requester: Option<(&str, &str)>,
+) -> Result<Response> {
     let plane = plane()?;
     let mut store = plane.store.lock().await;
     if let Some(lease) = store.get(name)?.lease.as_ref() {
         // Preserve Store::release's useful holder mismatch below.  The device
         // check applies once this request names the actual holder.
-        if lease.holder == holder {
-            authorize_lease_device(name, lease, requester_device)?;
+        if lease.holder_id == holder_id || (lease.holder_id.is_empty() && lease.holder == holder) {
+            authorize_lease_device(name, lease, requester)?;
         }
     }
-    let released = store.release(name, holder)?;
-    store.save()?;
-    if let Some(lease) = released {
-        stop_export(name, lease.epoch, lease.proc.as_ref());
+    let mut next = store.clone();
+    let released = next.release_holder(name, holder, holder_id, intent_id, expected_epoch)?;
+    if let Some(lease) = &released {
+        // Do not publish a free volume until every old NBD client has lost
+        // its server and process death has been observed.
+        stop_export(name, lease)?;
     }
+    if let Err(error) = next.save_confirmed() {
+        store.reload().with_context(|| {
+            format!("reloading the volume store after release commit failed: {error:#}")
+        })?;
+        return Err(error).context("committing the provider lease release");
+    }
+    *store = next;
     Ok(Response::Volumes {
         volumes: vec![store.get(name)?.clone()],
     })
@@ -614,14 +983,20 @@ async fn release(name: &str, holder: &str, requester_device: Option<&str>) -> Re
 fn authorize_lease_device(
     volume: &str,
     lease: &volume::Lease,
-    requester_device: Option<&str>,
+    requester: Option<(&str, &str)>,
 ) -> Result<()> {
-    if let Some(requester) = requester_device {
-        if lease.holder_device != requester {
+    if let Some((requester_name, requester_id)) = requester {
+        let same_device = if lease.holder_device_id.is_empty() {
+            lease.holder_device == requester_name
+        } else {
+            lease.holder_device_id == requester_id
+        };
+        if !same_device {
             bail!(
-                "volume {volume:?} is leased to device {:?}, not authenticated device \
-                 {requester:?}",
-                lease.holder_device
+                "volume {volume:?} is leased to device {:?} ({}), not authenticated device \
+                 {requester_name:?} ({requester_id})",
+                lease.holder_device,
+                lease.holder_device_id,
             );
         }
     }
@@ -660,9 +1035,9 @@ fn remove_device_from_store(
     orbit: &mut Orbit,
     store: &mut Store,
     device: &Device,
-    after_revocation: impl FnOnce(&[(String, volume::Lease)]),
+    before_revocation: impl FnOnce(&[(String, volume::Lease)]) -> Result<()>,
 ) -> Result<Device> {
-    let same_name_replacement = match orbit.by_id(&device.device_id) {
+    match orbit.by_id(&device.device_id) {
         Some(current) if current.name != device.name => bail!(
             "device key {} is currently named {:?}, not {:?}; refusing to substitute one \
              identity in a removal",
@@ -670,27 +1045,24 @@ fn remove_device_from_store(
             current.name,
             device.name
         ),
-        Some(_) => false,
-        None => orbit
-            .get(&device.name)
-            .is_some_and(|current| current.device_id != device.device_id),
+        _ => {}
     };
-    let revoked = if same_name_replacement {
-        // This only confirms an older key is absent. Leases granted to the
-        // replacement after it paired are not authority inherited from the
-        // removed device and must survive its confirmation retry.
-        Vec::new()
-    } else {
-        store.revoke_device_durable(&device.name)?
-    };
-    after_revocation(&revoked);
+    let mut next = store.clone();
+    let revoked = next.revoke_device_authority(&device.name, &device.device_id);
+    // Process death precedes the durable free state. A failed or unprovable
+    // shutdown leaves both membership and the authoritative lease intact.
+    before_revocation(&revoked)?;
+    next.save_confirmed()
+        .context("confirming device lease revocation")?;
+    *store = next;
     orbit.remove_durable(device)
 }
 
-fn stop_revoked_exports(revoked: &[(String, volume::Lease)]) {
+fn stop_revoked_exports(revoked: &[(String, volume::Lease)]) -> Result<()> {
     for (volume, lease) in revoked {
-        stop_export(volume, lease.epoch, lease.proc.as_ref());
+        stop_export(volume, lease)?;
     }
+    Ok(())
 }
 
 /// Connect to the export serving `volume` at `epoch`, on behalf of `holder`.
@@ -703,6 +1075,7 @@ fn stop_revoked_exports(revoked: &[(String, volume::Lease)]) {
 pub async fn open_export(
     volume: &str,
     holder: &str,
+    holder_id: &str,
     epoch: u64,
     requester_device: &str,
     requester_device_id: &str,
@@ -710,6 +1083,7 @@ pub async fn open_export(
     open_export_for(
         volume,
         holder,
+        holder_id,
         epoch,
         requester_device,
         Some(requester_device_id),
@@ -720,6 +1094,7 @@ pub async fn open_export(
 async fn open_export_for(
     volume: &str,
     holder: &str,
+    holder_id: &str,
     epoch: u64,
     requester_device: &str,
     requester_device_id: Option<&str>,
@@ -737,10 +1112,24 @@ async fn open_export_for(
     let Some(lease) = vol.lease.clone() else {
         bail!("volume {volume:?} is not leased to anything — attach it first");
     };
-    if lease.holder != holder {
-        bail!("{}", volume::held_by(volume, &lease));
+    if lease.holder_id.is_empty() {
+        if lease.holder != holder {
+            bail!("{}", volume::held_by(volume, &lease));
+        }
+    } else if lease.holder_id != holder_id {
+        bail!(
+            "volume {volume:?} is leased to immutable instance identity {:?}, not {:?}",
+            lease.holder_id,
+            holder_id
+        );
     }
-    if lease.holder_device != requester_device {
+    let same_consumer = match requester_device_id {
+        Some(requester_id) if !lease.holder_device_id.is_empty() => {
+            lease.holder_device_id == requester_id
+        }
+        _ => lease.holder_device == requester_device,
+    };
+    if !same_consumer {
         bail!(
             "volume {volume:?} is leased to device {:?}, not authenticated device {:?}",
             lease.holder_device,
@@ -757,9 +1146,41 @@ async fn open_export_for(
     // decides who may write and it has not moved.
     let socket = paths::volume_export_socket(volume, lease.epoch);
     if !export_alive(lease.proc.as_ref(), &socket) {
-        let proc = start_export(&vol, lease.epoch, &lease.export)?;
-        store.set_export_proc(volume, Some(proc))?;
-        store.save()?;
+        if lease.export_started && lease.proc.is_none() {
+            bail!(
+                "volume {volume:?}'s epoch {} may still have an untracked export; refusing to \
+                 start a second writer",
+                lease.epoch
+            );
+        }
+        let (lease, launch) = prepare_export_start(&mut store, &vol)?;
+        let proc = start_export(&vol, lease.epoch, &lease.export, &launch)?;
+        let mut recorded = store.clone();
+        recorded.set_export_proc(volume, Some(proc.clone()))?;
+        if let Err(error) = recorded.save_confirmed() {
+            let unrecorded = volume::Lease {
+                proc: Some(proc.clone()),
+                pid: Some(proc.pid),
+                export_started: true,
+                ..lease.clone()
+            };
+            let stop_error = stop_export(volume, &unrecorded).err();
+            store.reload()?;
+            return match stop_error {
+                Some(stop) => Err(error).context(format!(
+                    "committing the restarted export identity; its shutdown is not proven: \
+                     {stop:#}"
+                )),
+                None => match clear_export_start(&mut store, volume) {
+                    Ok(()) => Err(error).context("committing the restarted export identity"),
+                    Err(clear) => Err(error).context(format!(
+                        "committing the restarted export identity; the process is dead but its \
+                         conservative launch fence could not be cleared: {clear:#}"
+                    )),
+                },
+            };
+        }
+        *store = recorded;
     }
     drop(store);
 
@@ -770,6 +1191,79 @@ async fn open_export_for(
     connected
 }
 
+/// Confirm the fail-closed marker before a storage process is spawned.
+fn arm_export_start(store: &mut Store, name: &str) -> Result<volume::Lease> {
+    let mut starting = store.clone();
+    starting.mark_export_starting(name)?;
+    if let Err(error) = starting.save_confirmed() {
+        store.reload().with_context(|| {
+            format!("reloading the volume store after export launch-fence failure: {error:#}")
+        })?;
+        return Err(error).context("committing the export launch fence");
+    }
+    *store = starting;
+    Ok(store
+        .get(name)?
+        .lease
+        .clone()
+        .expect("an export launch fence requires a lease"))
+}
+
+#[derive(Debug)]
+struct ExportStart {
+    qsd: PathBuf,
+    image: PathBuf,
+}
+
+/// Resolve every definitely pre-spawn dependency before publishing the
+/// conservative process-may-run marker. A missing tool or image cannot leave
+/// a false unknown-writer fence behind because no launch is armed yet.
+fn prepare_export_start(
+    store: &mut Store,
+    vol: &BlockVolume,
+) -> Result<(volume::Lease, ExportStart)> {
+    prepare_export_start_with(store, vol, &paths::volume_image_path(&vol.name), tool)
+}
+
+fn prepare_export_start_with(
+    store: &mut Store,
+    vol: &BlockVolume,
+    image: &Path,
+    find_tool: impl FnOnce(&str) -> Result<PathBuf>,
+) -> Result<(volume::Lease, ExportStart)> {
+    let qsd = find_tool("qemu-storage-daemon").context(
+        "qemu-storage-daemon is what serves a block volume, and it is not installed \
+         on this device (it ships with qemu)",
+    )?;
+    if !image.exists() {
+        bail!(
+            "volume {:?} has lost its image at {}",
+            vol.name,
+            image.display()
+        );
+    }
+    let launch = ExportStart {
+        qsd,
+        image: image.to_owned(),
+    };
+    let lease = arm_export_start(store, &vol.name)?;
+    Ok((lease, launch))
+}
+
+/// Clear a launch fence only after `stop_export` proved process death.
+fn clear_export_start(store: &mut Store, name: &str) -> Result<()> {
+    let mut cleared = store.clone();
+    cleared.set_export_proc(name, None)?;
+    if let Err(error) = cleared.save_confirmed() {
+        store.reload().with_context(|| {
+            format!("reloading the volume store after export-fence cleanup failed: {error:#}")
+        })?;
+        return Err(error).context("clearing the stopped export's launch fence");
+    }
+    *store = cleared;
+    Ok(())
+}
+
 /// Give every pre-identity lease on this device an identity, once.
 ///
 /// The volume half of the startup migration, run beside
@@ -777,10 +1271,10 @@ async fn open_export_for(
 /// written by an older daemon names its storage daemon by pid alone, and a
 /// pid that has outlived a daemon restart is not evidence of anything.
 ///
-/// A lease that cannot be adopted is left with no identity, which reads as
-/// an export that is not running — and that is a state this plane already
-/// recovers from by starting the export again at the *same* epoch, so
-/// nothing is fenced and no consumer notices.
+/// A legacy lease that cannot be adopted remains conservatively marked as an
+/// export which may still be running. Reconnect and renewal then refuse to
+/// start or publish another writer until an operator can prove the old one is
+/// dead; absence of modern process identity is not evidence of death.
 pub async fn adopt_export_identities() {
     let Ok(plane) = plane() else { return };
     let mut store = plane.store.lock().await;
@@ -798,13 +1292,13 @@ pub async fn adopt_export_identities() {
             Ok(None) => {}
             Err(why) => eprintln!(
                 "astd: volume {:?}'s recorded export cannot be proven to still be running \
-                 ({why}) — it will be started again when something asks for it",
+                 ({why}) — its writer fence remains closed",
                 vol.name
             ),
         }
     }
     if changed {
-        if let Err(e) = store.save() {
+        if let Err(e) = store.save_confirmed() {
             eprintln!("astd: saving volumes after adopting export identities: {e:#}");
         }
     }
@@ -819,33 +1313,26 @@ pub async fn adopt_export_identities() {
 /// enough — a socket file outlives the process that bound it, and a pid on
 /// its own proves nothing at all once this daemon has restarted — so
 /// liveness is both.
-fn start_export(vol: &BlockVolume, epoch: u64, export: &str) -> Result<ProcId> {
-    let qsd = tool("qemu-storage-daemon").context(
-        "qemu-storage-daemon is what serves a block volume, and it is not installed \
-         on this device (it ships with qemu)",
-    )?;
-    let image = paths::volume_image_path(&vol.name);
-    if !image.exists() {
-        bail!(
-            "volume {:?} has lost its image at {}",
-            vol.name,
-            image.display()
-        );
-    }
+fn start_export(
+    vol: &BlockVolume,
+    epoch: u64,
+    export: &str,
+    launch: &ExportStart,
+) -> Result<ProcId> {
     let socket = paths::volume_export_socket(&vol.name, epoch);
     let pidfile = paths::volume_export_pid(&vol.name, epoch);
     // A socket file left by a killed daemon blocks the bind.
     let _ = std::fs::remove_file(&socket);
     let _ = std::fs::remove_file(&pidfile);
 
-    run(Command::new(&qsd)
+    run(Command::new(&launch.qsd)
         .arg("--daemonize")
         .arg("--pidfile")
         .arg(&pidfile)
         .arg("--blockdev")
         .arg(format!(
             "driver=file,node-name=vol,filename={}",
-            image.display()
+            launch.image.display()
         ))
         .arg("--nbd-server")
         .arg(format!("addr.type=unix,addr.path={}", socket.display()))
@@ -887,29 +1374,61 @@ fn start_export(vol: &BlockVolume, epoch: u64, export: &str) -> Result<ProcId> {
 
 /// Stop an export and take its socket with it.
 ///
-/// The unlink is the revocation: `qemu-storage-daemon` leaves its socket file
-/// behind when it dies, and a socket file that outlives its export is a thing
-/// a fenced consumer could keep knocking at forever.
+/// Process death is the revocation. Only after it is proven are the stale
+/// socket and pidfile removed, because unlinking a Unix socket does not close
+/// clients which were already connected to the old server.
 ///
 /// The signals go only to a process this daemon can still prove is the
 /// export it started ([`ProcId`]). A lease whose recorded process cannot be
-/// proven gets the unlink and nothing else: whatever is at that pid now, it
-/// is not this export, and a revocation is not worth a stranger's SIGKILL.
-fn stop_export(name: &str, epoch: u64, proc: Option<&ProcId>) {
-    if let Some(proc) = proc {
-        match proc.signal(Signal::Term) {
-            Ok(true) => {
+/// proven is not touched and keeps its authority row: whatever is at that pid
+/// now is not safe to signal, while unlinking alone would falsely acknowledge
+/// a revocation without ending old clients.
+fn stop_export(name: &str, lease: &volume::Lease) -> Result<()> {
+    stop_export_at(
+        name,
+        lease,
+        &paths::volume_export_socket(name, lease.epoch),
+        &paths::volume_export_pid(name, lease.epoch),
+    )
+}
+
+fn stop_export_at(name: &str, lease: &volume::Lease, socket: &Path, pidfile: &Path) -> Result<()> {
+    match lease.proc.as_ref() {
+        Some(proc) => {
+            if proc.signal(Signal::Term)? && !proc.wait_gone(Duration::from_secs(5)) {
+                proc.signal(Signal::Kill)?;
                 if !proc.wait_gone(Duration::from_secs(5)) {
-                    let _ = proc.signal(Signal::Kill);
+                    bail!(
+                        "volume {name:?}'s old export {proc} did not die after SIGKILL; the \
+                         writer fence was not advanced"
+                    );
                 }
             }
-            // Already gone: the unlink below is the rest of the revocation.
-            Ok(false) => {}
-            Err(e) => eprintln!("astd: not stopping the export for volume {name:?}: {e:#}"),
+            if !proc.wait_gone(Duration::ZERO) {
+                bail!(
+                    "volume {name:?}'s old export {proc} cannot be proven dead; the writer \
+                     fence was not advanced"
+                );
+            }
         }
+        None if lease.export_started => bail!(
+            "volume {name:?}'s epoch {} may still have an export but has no process identity; \
+             refusing to advance or release its writer fence",
+            lease.epoch
+        ),
+        None => {}
     }
-    let _ = std::fs::remove_file(paths::volume_export_socket(name, epoch));
-    let _ = std::fs::remove_file(paths::volume_export_pid(name, epoch));
+    std::fs::remove_file(socket).or_else(|e| {
+        (e.kind() == std::io::ErrorKind::NotFound)
+            .then_some(())
+            .ok_or(e)
+    })?;
+    std::fs::remove_file(pidfile).or_else(|e| {
+        (e.kind() == std::io::ErrorKind::NotFound)
+            .then_some(())
+            .ok_or(e)
+    })?;
+    Ok(())
 }
 
 /// Is the export for this lease still being served?
@@ -954,7 +1473,7 @@ pub struct Leased {
 /// Called from `up`, inside `block_in_place`, and everything it does is
 /// undone by [`take_down`] — including on its own failure, so a boot that
 /// cannot get one of two volumes does not leave the other half-attached.
-pub fn bring_up(inst: &Instance, hv: &dyn Hypervisor) -> Result<Raised> {
+pub fn bring_up(inst: &Instance, hv: &dyn Hypervisor, boot_intent_id: &str) -> Result<Raised> {
     let blocks: Vec<Volume> = inst
         .volumes
         .iter()
@@ -975,7 +1494,7 @@ pub fn bring_up(inst: &Instance, hv: &dyn Hypervisor) -> Result<Raised> {
         // unsuitable provider refuse the boot only after earlier lease epochs
         // moved.
         preflight_all(&blocks).await?;
-        match raise_all(&name, &blocks).await {
+        match raise_all(inst, &blocks, boot_intent_id).await {
             Ok(disks) => Ok(disks),
             Err(e) => {
                 take_down(&name).await;
@@ -995,6 +1514,13 @@ pub fn bring_up(inst: &Instance, hv: &dyn Hypervisor) -> Result<Raised> {
 /// which has actually fallen back to a relay is still refused here.
 async fn preflight_all(blocks: &[Volume]) -> Result<()> {
     for volume in blocks {
+        if volume.host_id.is_none() {
+            bail!(
+                "volume {}:{} predates immutable provider identities; refusing to route it by a reusable device name until its original provider authority is explicitly repaired",
+                volume.host,
+                volume.path
+            );
+        }
         preflight_existing_remote_volume(&volume.host)
             .await
             .with_context(|| format!("leasing volume {}:{}", volume.host, volume.path))?;
@@ -1149,7 +1675,7 @@ pub async fn reattach(inst: &Instance) {
             );
             continue;
         };
-        match reattach_one(&inst.name, vol, epoch).await {
+        match reattach_one(inst, vol, epoch).await {
             Ok((splice, Ok(_export))) => {
                 mark_healthy(
                     &inst.name,
@@ -1224,7 +1750,7 @@ pub async fn reattach(inst: &Instance) {
 }
 
 async fn reattach_one(
-    instance: &str,
+    instance: &Instance,
     vol: &Volume,
     epoch: u64,
 ) -> Result<(Splice, Result<String>)> {
@@ -1234,56 +1760,108 @@ async fn reattach_one(
     // the local listener from being restored: every later QEMU retry repeats
     // the provider-side epoch check, which is both the safety fence and the
     // path by which a temporarily absent provider recovers.
-    let confirmed = confirm_lease(&vol.path, &vol.host, instance, epoch)
-        .await
-        .with_context(|| format!("reconnecting to volume {}:{}", vol.host, vol.path));
-    let socket = paths::volume_bridge_socket(instance, &vol.host, &vol.path);
-    let splice = bridge(instance, vol, epoch, &socket).await?;
+    let confirmed = confirm_lease(
+        &vol.path,
+        &vol.host,
+        vol.host_id.as_deref(),
+        &instance.name,
+        &instance.id,
+        epoch,
+    )
+    .await
+    .with_context(|| format!("reconnecting to volume {}:{}", vol.host, vol.path));
+    let socket = paths::volume_bridge_socket(&instance.name, &vol.host, &vol.path);
+    let splice = bridge(&instance.name, &instance.id, vol, epoch, &socket).await?;
     Ok((splice, confirmed))
 }
 
 /// Hand back every lease this instance holds — what `ast rm` owes the devices
 /// that were keeping bytes for it.
 ///
-/// Best effort by design: a provider that is asleep must not stop someone
-/// deleting an instance. What that leaves behind is a lease held by a name
-/// nothing answers to any more, and the way out of it is that a lease is
-/// keyed by that *name*: an instance created with it again may take the same
-/// lease (that is what makes every boot a renewal), and detaching then gives
-/// it back. Narrow, and it costs a record rather than a byte of anybody's
-/// data.
-pub async fn release_all(inst: &Instance) {
-    for vol in inst.volumes.iter().filter(|v| v.is_block()) {
-        if let Err(e) = ask(
+/// Every provider must acknowledge its exact volume as free before the
+/// immutable instance row may be deleted. A sleeping or refusing provider
+/// leaves the row intact; otherwise a same-name replacement would have no
+/// authority to release the old identity's lease.
+pub async fn release_all(inst: &Instance) -> Result<()> {
+    // Validate every immutable authority before releasing the first one. A
+    // later legacy row must not leave earlier provider leases released while
+    // the instance removal itself is refused.
+    let blocks: Vec<(&Volume, &str)> = inst
+        .volumes
+        .iter()
+        .filter(|vol| vol.is_block())
+        .map(|vol| {
+            let provider_id = vol.host_id.as_deref().with_context(|| {
+                format!(
+                    "cannot remove {:?}: attached block volume {}:{} has no immutable provider \
+                     identity, so its device name may have been reused; preserving every lease and row",
+                    inst.name, vol.host, vol.path
+                )
+            })?;
+            Ok((vol, provider_id))
+        })
+        .collect::<Result<_>>()?;
+
+    for (vol, provider_id) in blocks {
+        let response = ask_authority(
             &vol.host,
+            Some(provider_id),
             Request::VolumeRelease {
                 volume: vol.path.clone(),
                 holder: inst.name.clone(),
+                holder_id: inst.id.clone(),
+                epoch: vol.epoch,
+                intent_id: None,
+                release_intent_id: None,
             },
         )
         .await
-        {
-            eprintln!(
-                "astd: could not hand {}:{} back ({e:#}) — it stays leased to {:?}",
-                vol.host, vol.path, inst.name
-            );
+        .with_context(|| {
+            format!(
+                "releasing {}:{} before instance removal",
+                vol.host, vol.path
+            )
+        })?;
+        match response {
+            Response::Volumes { volumes }
+                if volumes
+                    .iter()
+                    .any(|candidate| candidate.name == vol.path && candidate.lease.is_none()) => {}
+            Response::Error { message } => bail!(message),
+            other => bail!(
+                "device {:?} did not acknowledge release of volume {:?}: {other:?}",
+                vol.host,
+                vol.path
+            ),
         }
     }
+    Ok(())
 }
 
 /// Take (or renew) the lease on one volume, from the device that holds it.
 ///
 /// This is what `ast attach` calls, and what every boot calls again. The
 /// answer carries the epoch the consumer must present on every splice.
-pub async fn take_lease(volume: &str, device: &str, holder: &str) -> Result<(u64, String, u64)> {
+pub async fn take_lease(
+    volume: &str,
+    device: &str,
+    provider_device_id: Option<&str>,
+    holder: &str,
+    holder_id: &str,
+    intent_id: Option<&str>,
+) -> Result<(u64, String, u64)> {
     let plane = plane()?;
     let holder_device = plane.node.device_name().await;
-    let response = ask(
+    let response = ask_authority(
         device,
+        provider_device_id,
         Request::VolumeLease {
             volume: volume.to_owned(),
             holder: holder.to_owned(),
+            holder_id: holder_id.to_owned(),
             holder_device,
+            holder_device_id: plane.device_id.clone(),
+            intent_id: intent_id.map(str::to_owned),
         },
     )
     .await?;
@@ -1304,12 +1882,21 @@ pub async fn take_lease(volume: &str, device: &str, holder: &str) -> Result<(u64
 ///
 /// What a restarted consumer asks, rather than [`take_lease`]: the guest is
 /// still up and its QEMU will ask for the export name it was booted with.
-async fn confirm_lease(volume: &str, device: &str, holder: &str, epoch: u64) -> Result<String> {
-    match ask(
+pub(crate) async fn confirm_lease(
+    volume: &str,
+    device: &str,
+    provider_device_id: Option<&str>,
+    holder: &str,
+    holder_id: &str,
+    epoch: u64,
+) -> Result<String> {
+    match ask_authority(
         device,
+        provider_device_id,
         Request::VolumeReconnect {
             volume: volume.to_owned(),
             holder: holder.to_owned(),
+            holder_id: holder_id.to_owned(),
             epoch,
         },
     )
@@ -1321,19 +1908,139 @@ async fn confirm_lease(volume: &str, device: &str, holder: &str, epoch: u64) -> 
     }
 }
 
-/// Give one volume's lease back.
-pub async fn give_lease_back(volume: &str, device: &str, holder: &str) -> Result<()> {
-    match ask(
-        device,
+/// Replay the provider half of a durable user detach.
+///
+/// A lost success reply is indistinguishable from a refusal caused by a
+/// later epoch unless the provider is inspected. Only the exact old
+/// holder/device/epoch means the release is still pending; any other state
+/// proves this intent no longer owns a writer fence and lets the consumer row
+/// be removed without touching the newer authority.
+pub async fn release_lease(intent: &asterism_core::volume::ReleaseIntent) -> Result<()> {
+    let response = ask_authority(
+        &intent.device,
+        Some(&intent.provider_device_id),
         Request::VolumeRelease {
-            volume: volume.to_owned(),
-            holder: holder.to_owned(),
+            volume: intent.volume.clone(),
+            holder: intent.instance.clone(),
+            holder_id: intent.instance_id.clone(),
+            epoch: Some(intent.epoch),
+            intent_id: None,
+            release_intent_id: Some(intent.intent_id.clone()),
         },
     )
-    .await?
-    {
-        Response::Error { message } => bail!(message),
-        _ => Ok(()),
+    .await?;
+    match response {
+        Response::Error { message } => {
+            match ask_authority(
+                &intent.device,
+                Some(&intent.provider_device_id),
+                Request::VolumeList,
+            )
+            .await?
+            {
+                Response::Volumes { volumes } => {
+                    let exact_lease_remains = volumes
+                        .iter()
+                        .find(|candidate| candidate.name == intent.volume)
+                        .and_then(|candidate| candidate.lease.as_ref())
+                        .is_some_and(|lease| {
+                            lease.holder_id == intent.instance_id && lease.epoch == intent.epoch
+                        });
+                    if exact_lease_remains {
+                        bail!(message);
+                    }
+                    Ok(())
+                }
+                Response::Error { message: listing } => {
+                    bail!("{message}; checking release state: {listing}")
+                }
+                other => bail!(
+                    "{message}; device {:?} answered release inspection with {other:?}",
+                    intent.device
+                ),
+            }
+        }
+        Response::Volumes { volumes }
+            if volumes
+                .iter()
+                .any(|candidate| candidate.name == intent.volume && candidate.lease.is_none()) =>
+        {
+            Ok(())
+        }
+        other => bail!(
+            "device {:?} did not acknowledge release of volume {:?}: {other:?}",
+            intent.device,
+            intent.volume
+        ),
+    }
+}
+
+/// Compensate a grant whose reply or consumer commit was ambiguous.
+///
+/// A release is idempotent when the volume is free. If it is refused because
+/// another holder owns the current lease, this intent cannot own anything to
+/// release either; confirm that from the provider's authoritative row and
+/// regard compensation as complete. A transport failure or a lease still
+/// held by this instance remains an error, leaving the consumer intent for
+/// startup to retry.
+pub async fn compensate_lease(intent: &asterism_core::volume::AttachIntent) -> Result<()> {
+    let response = ask_authority(
+        &intent.device,
+        Some(&intent.provider_device_id),
+        Request::VolumeRelease {
+            volume: intent.volume.clone(),
+            holder: intent.instance.clone(),
+            holder_id: intent.instance_id.clone(),
+            epoch: None,
+            intent_id: Some(intent.intent_id.clone()),
+            release_intent_id: None,
+        },
+    )
+    .await?;
+    match response {
+        Response::Error { message } => {
+            match ask_authority(
+                &intent.device,
+                Some(&intent.provider_device_id),
+                Request::VolumeList,
+            )
+            .await?
+            {
+                Response::Volumes { volumes } => {
+                    let still_ours = volumes
+                        .iter()
+                        .find(|candidate| candidate.name == intent.volume)
+                        .and_then(|candidate| candidate.lease.as_ref())
+                        .is_some_and(|lease| {
+                            lease.holder_id == intent.instance_id
+                                && lease.intent_id.as_deref() == Some(intent.intent_id.as_str())
+                        });
+                    if still_ours {
+                        bail!(message);
+                    }
+                    Ok(())
+                }
+                Response::Error { message: listing } => {
+                    bail!("{message}; checking compensation state: {listing}")
+                }
+                other => bail!(
+                    "{message}; device {:?} answered compensation inspection with {other:?}",
+                    intent.device
+                ),
+            }
+        }
+        Response::Volumes { volumes }
+            if volumes
+                .iter()
+                .any(|candidate| candidate.name == intent.volume && candidate.lease.is_none()) =>
+        {
+            Ok(())
+        }
+        other => bail!(
+            "device {:?} did not acknowledge compensation for volume {:?}: {other:?}",
+            intent.device,
+            intent.volume
+        ),
     }
 }
 
@@ -1357,6 +2064,26 @@ async fn ask(device: &str, request: Request) -> Result<Response> {
         .with_context(|| format!("{UNREACHABLE}: {device}"))
 }
 
+/// Route by the human name only after proving it still denotes the immutable
+/// provider selected by placement. This closes device-name reuse between a
+/// durable intent/row and a later retry.
+async fn ask_authority(
+    device: &str,
+    expected_device_id: Option<&str>,
+    request: Request,
+) -> Result<Response> {
+    if let Some(expected) = expected_device_id {
+        let actual = provider_identity(device).await?;
+        if actual != expected {
+            bail!(
+                "storage authority {device:?} is now device {actual}, not recorded device \
+                 {expected}; refusing to route the volume operation"
+            );
+        }
+    }
+    ask(device, request).await
+}
+
 /// The backend has to be able to consume an NBD disk. Gated on the
 /// capability, never on which backend it is — except that today exactly one
 /// says yes, and the refusal should say so plainly rather than in the
@@ -1372,24 +2099,31 @@ pub fn check_backend(hv: &dyn Hypervisor) -> Result<()> {
     Ok(())
 }
 
-async fn raise_all(instance: &str, blocks: &[Volume]) -> Result<Raised> {
+async fn raise_all(instance: &Instance, blocks: &[Volume], boot_intent_id: &str) -> Result<Raised> {
     let plane = plane()?;
     // Whatever was bridged for this instance before is gone — a crash
     // supervisor's restart lands here with the dead boot's listeners still in
     // the table, and they own the socket paths this boot is about to bind.
     // Dropping them first is what keeps the unlink on the way out from
     // deleting the new listener's socket.
-    plane.bridges.lock().await.remove(instance);
+    plane.bridges.lock().await.remove(&instance.name);
 
     let mut out = Raised::default();
     let mut raised = Vec::new();
     for vol in blocks {
-        let (epoch, export, size_bytes) = take_lease(&vol.path, &vol.host, instance)
-            .await
-            .with_context(|| format!("leasing volume {}:{}", vol.host, vol.path))?;
-        let socket = paths::volume_bridge_socket(instance, &vol.host, &vol.path);
-        let splice = bridge(instance, vol, epoch, &socket).await?;
-        mark_healthy(instance, vol, "guest_boot", "connected", None, None).await;
+        let (epoch, export, size_bytes) = take_lease(
+            &vol.path,
+            &vol.host,
+            vol.host_id.as_deref(),
+            &instance.name,
+            &instance.id,
+            Some(boot_intent_id),
+        )
+        .await
+        .with_context(|| format!("leasing volume {}:{}", vol.host, vol.path))?;
+        let socket = paths::volume_bridge_socket(&instance.name, &vol.host, &vol.path);
+        let splice = bridge(&instance.name, &instance.id, vol, epoch, &socket).await?;
+        mark_healthy(&instance.name, vol, "guest_boot", "connected", None, None).await;
         raised.push(splice);
         out.disks.push(DiskSpec::NbdUnix {
             socket,
@@ -1407,8 +2141,40 @@ async fn raise_all(instance: &str, blocks: &[Volume]) -> Result<Raised> {
         .bridges
         .lock()
         .await
-        .insert(instance.to_owned(), raised);
+        .insert(instance.name.clone(), raised);
     Ok(out)
+}
+
+/// Revoke every provider lease a failed boot intent could have renewed.
+///
+/// Providers inspect an intent mismatch before treating it as compensated,
+/// so this is safe both for volumes the attempt reached and for later ones it
+/// never touched. A transport failure remains an error and leaves the
+/// consumer's durable boot fence in place.
+pub async fn compensate_boot_leases(instance: &Instance, boot_intent_id: &str) -> Result<()> {
+    let holder_device_id = plane()?.device_id.clone();
+    for vol in instance.volumes.iter().filter(|vol| vol.is_block()) {
+        let provider_device_id = vol.host_id.as_deref().with_context(|| {
+            format!(
+                "volume {}:{} has no immutable provider identity",
+                vol.host, vol.path
+            )
+        })?;
+        let mut intent = asterism_core::volume::AttachIntent::new(
+            &instance.name,
+            &instance.id,
+            &vol.path,
+            &vol.host,
+            provider_device_id,
+            &holder_device_id,
+        );
+        intent.intent_id = boot_intent_id.to_owned();
+        compensate_lease(&intent)
+            .await
+            .with_context(|| format!("compensating boot lease {}:{}", vol.host, vol.path))?;
+    }
+    take_down(&instance.name).await;
+    Ok(())
 }
 
 /// Bind the local socket QEMU will connect to, and splice every connection on
@@ -1417,7 +2183,13 @@ async fn raise_all(instance: &str, blocks: &[Volume]) -> Result<Raised> {
 /// One accept loop per volume, one mesh stream per connection — the same
 /// shape `ast ssh` uses, and for the same reason: past the first frame this
 /// is a pipe, and neither daemon reads what goes through it.
-async fn bridge(instance: &str, vol: &Volume, epoch: u64, socket: &Path) -> Result<Splice> {
+async fn bridge(
+    instance: &str,
+    instance_id: &str,
+    vol: &Volume,
+    epoch: u64,
+    socket: &Path,
+) -> Result<Splice> {
     if let Some(dir) = socket.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -1427,7 +2199,12 @@ async fn bridge(instance: &str, vol: &Volume, epoch: u64, socket: &Path) -> Resu
     let listener = tokio::net::UnixListener::bind(socket)
         .with_context(|| format!("binding {} for volume {}", socket.display(), vol.path))?;
 
-    let (device, volume, holder) = (vol.host.clone(), vol.path.clone(), instance.to_owned());
+    let (device, volume, holder, holder_id) = (
+        vol.host.clone(),
+        vol.path.clone(),
+        instance.to_owned(),
+        instance_id.to_owned(),
+    );
     let socket_path = socket.to_owned();
     let task = tokio::spawn(async move {
         // A JoinSet, so dropping the bridge takes every live NBD session with
@@ -1437,9 +2214,16 @@ async fn bridge(instance: &str, vol: &Volume, epoch: u64, socket: &Path) -> Resu
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
-            let (device, volume, holder) = (device.clone(), volume.clone(), holder.clone());
+            let (device, volume, holder, holder_id) = (
+                device.clone(),
+                volume.clone(),
+                holder.clone(),
+                holder_id.clone(),
+            );
             sessions.spawn(async move {
-                if let Err(e) = splice_one(&device, &volume, &holder, epoch, stream).await {
+                if let Err(e) =
+                    splice_one(&device, &volume, &holder, &holder_id, epoch, stream).await
+                {
                     eprintln!(
                         "astd: volume {device}:{volume} for {holder:?} could not be \
                          served: {e:#}"
@@ -1457,6 +2241,7 @@ async fn splice_one(
     device: &str,
     volume: &str,
     holder: &str,
+    holder_id: &str,
     epoch: u64,
     mut stream: tokio::net::UnixStream,
 ) -> Result<()> {
@@ -1467,7 +2252,8 @@ async fn splice_one(
         // connect the guest's socket to the export socket directly. Same
         // lease, same epoch check, one less hop — `fast and light` is a rule,
         // not a preference (docs/MODEL.md).
-        let mut export = open_export_for(volume, holder, epoch, &local_device, None).await?;
+        let mut export =
+            open_export_for(volume, holder, holder_id, epoch, &local_device, None).await?;
         tokio::io::copy_bidirectional(&mut stream, &mut export).await?;
         return Ok(());
     }
@@ -1476,7 +2262,9 @@ async fn splice_one(
         .as_ref()
         .context("this daemon has no mesh endpoint, so it cannot reach a remote volume")?;
     let vol = Volume::block(volume, device, epoch, 0);
-    let opened = mesh.open_volume_splice(device, volume, holder, epoch).await;
+    let opened = mesh
+        .open_volume_splice(device, volume, holder, holder_id, epoch)
+        .await;
     let (remote, observation) = match opened {
         Ok(opened) => opened,
         Err(e) => {
@@ -1577,6 +2365,8 @@ mod tests {
     use super::*;
 
     use asterism_core::hv::{Caps, DiskFormat};
+    use std::io::Read;
+    use std::os::unix::net::{UnixListener, UnixStream};
 
     /// A backend that says what we tell it to about NBD, so the refusal can
     /// be tested without either real hypervisor being installed.
@@ -1737,6 +2527,8 @@ mod tests {
     #[test]
     fn the_planes_requests_are_told_apart_from_the_shards() {
         assert!(is_plane_request(&Request::VolumeList));
+        assert!(is_orbit_request(&Request::VolumeCatalog));
+        assert!(!is_plane_request(&Request::VolumeCatalog));
         assert!(is_plane_request(&Request::VolumeCreate {
             name: "tank".into(),
             size_bytes: 1
@@ -1744,7 +2536,10 @@ mod tests {
         assert!(is_plane_request(&Request::VolumeLease {
             volume: "tank".into(),
             holder: "dev".into(),
+            holder_id: "instance-id".into(),
             holder_device: "laptop".into(),
+            holder_device_id: "laptop-id".into(),
+            intent_id: Some("intent-id".into()),
         }));
         assert!(!is_plane_request(&Request::List));
         assert!(!is_plane_request(&Request::AttachBlock {
@@ -1752,6 +2547,7 @@ mod tests {
             volume: "tank".into(),
             device: "desktop".into(),
         }));
+        assert!(!is_orbit_request(&Request::VolumeList));
     }
 
     #[tokio::test]
@@ -1760,7 +2556,10 @@ mod tests {
             Request::VolumeLease {
                 volume: "tank".into(),
                 holder: "dev".into(),
+                holder_id: "instance-id".into(),
                 holder_device: "victim".into(),
+                holder_device_id: "victim-key".into(),
+                intent_id: Some("intent-id".into()),
             },
             "attacker",
             "attacker-key",
@@ -1782,16 +2581,20 @@ mod tests {
     fn an_existing_lease_accepts_only_its_authenticated_device() {
         let lease = volume::Lease {
             holder: "dev".into(),
+            holder_id: "instance-id".into(),
             holder_device: "laptop".into(),
+            holder_device_id: "laptop-id".into(),
+            intent_id: Some("intent-id".into()),
             epoch: 1,
             granted_at: 0,
             export: "tank-e1".into(),
             pid: None,
             proc: None,
+            export_started: true,
         };
         assert!(authorize_lease_device("tank", &lease, None).is_ok());
-        assert!(authorize_lease_device("tank", &lease, Some("laptop")).is_ok());
-        let error = authorize_lease_device("tank", &lease, Some("desktop"))
+        assert!(authorize_lease_device("tank", &lease, Some(("laptop", "laptop-id"))).is_ok());
+        let error = authorize_lease_device("tank", &lease, Some(("desktop", "desktop-id")))
             .unwrap_err()
             .to_string();
         assert!(error.contains("leased to device \"laptop\""), "{error}");
@@ -1828,7 +2631,7 @@ mod tests {
         let mut store = Store::load(&volume_path).unwrap();
         store.create("tank", 1 << 30).unwrap();
         let old_epoch = store
-            .lease("tank", "dev", "laptop")
+            .lease_with_intent("tank", "dev", "instance-id", "laptop", "old-key", None)
             .unwrap()
             .lease
             .unwrap()
@@ -1841,7 +2644,7 @@ mod tests {
             volume_path.display().to_string(),
             std::io::ErrorKind::Other,
         );
-        assert!(remove_device_from_store(&mut orbit, &mut store, &old_device, |_| {}).is_err());
+        assert!(remove_device_from_store(&mut orbit, &mut store, &old_device, |_| Ok(())).is_err());
         assert!(orbit.trusts("old-key"));
         assert!(Store::load(&volume_path)
             .unwrap()
@@ -1857,7 +2660,7 @@ mod tests {
             orbit_path.display().to_string(),
             std::io::ErrorKind::Other,
         );
-        assert!(remove_device_from_store(&mut orbit, &mut store, &old_device, |_| {}).is_err());
+        assert!(remove_device_from_store(&mut orbit, &mut store, &old_device, |_| Ok(())).is_err());
         assert!(
             Orbit::load(&orbit_path).unwrap().trusts("old-key"),
             "a failed membership publish rolls membership back"
@@ -1873,7 +2676,7 @@ mod tests {
         );
         drop(orbit_fault);
 
-        remove_device_from_store(&mut orbit, &mut store, &old_device, |_| {}).unwrap();
+        remove_device_from_store(&mut orbit, &mut store, &old_device, |_| Ok(())).unwrap();
         orbit
             .add(asterism_core::orbit::device_now(
                 "laptop",
@@ -1893,7 +2696,9 @@ mod tests {
             store.reconnect("tank", "dev", old_epoch).is_err(),
             "the old writer's epoch has no lease to resume"
         );
-        let next = store.lease("tank", "dev", "laptop").unwrap();
+        let next = store
+            .lease_with_intent("tank", "dev", "instance-id", "laptop", "new-key", None)
+            .unwrap();
         assert_eq!(next.epoch, old_epoch + 1);
     }
 
@@ -1917,9 +2722,20 @@ mod tests {
 
         let mut store = Store::load(&volume_path).unwrap();
         store.create("tank", 1 << 30).unwrap();
-        store.lease("tank", "old-writer", "laptop").unwrap();
+        store
+            .lease_with_intent(
+                "tank",
+                "old-writer",
+                "old-instance",
+                "laptop",
+                "old-key",
+                None,
+            )
+            .unwrap();
         store.save().unwrap();
-        store.revoke_device_durable("laptop").unwrap();
+        store
+            .revoke_device_durable_authority("laptop", "old-key")
+            .unwrap();
         orbit.remove("laptop").unwrap();
         orbit.save().unwrap();
 
@@ -1932,10 +2748,19 @@ mod tests {
             ))
             .unwrap();
         orbit.save().unwrap();
-        let replacement = store.lease("tank", "new-writer", "laptop").unwrap();
+        let replacement = store
+            .lease_with_intent(
+                "tank",
+                "new-writer",
+                "new-instance",
+                "laptop",
+                "new-key",
+                None,
+            )
+            .unwrap();
         store.save().unwrap();
 
-        remove_device_from_store(&mut orbit, &mut store, &old, |_| {}).unwrap();
+        remove_device_from_store(&mut orbit, &mut store, &old, |_| Ok(())).unwrap();
         assert!(orbit.trusts("new-key"));
         assert_eq!(orbit.get("laptop").unwrap().device_id, "new-key");
         assert_eq!(
@@ -1987,7 +2812,9 @@ mod tests {
             inside_tx.send(()).unwrap();
             continue_rx.await.unwrap();
             let mut volumes = granting_store.lock().await;
-            volumes.lease("tank", "dev", "laptop").unwrap();
+            volumes
+                .lease_with_intent("tank", "dev", "instance-id", "laptop", "old-key", None)
+                .unwrap();
             volumes.save().unwrap();
             drop(volumes);
             drop(membership);
@@ -2000,7 +2827,7 @@ mod tests {
             let mut membership = removing_orbit.lock().await;
             let mut volumes = removing_store.lock().await;
             let device = membership.removal_target("laptop").unwrap();
-            remove_device_from_store(&mut membership, &mut volumes, &device, |_| {}).unwrap();
+            remove_device_from_store(&mut membership, &mut volumes, &device, |_| Ok(())).unwrap();
         });
         tokio::task::yield_now().await;
         continue_tx.send(()).unwrap();
@@ -2033,6 +2860,105 @@ mod tests {
         );
     }
 
+    /// Tool and image discovery happen before the durable process-may-run
+    /// transition. Their definite failure therefore leaves no imaginary
+    /// writer, and fixing the dependency reaches the launch boundary on the
+    /// next attempt without manual lease repair.
+    #[test]
+    fn missing_export_dependencies_are_retryable_before_the_launch_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("volumes.json");
+        let image = dir.path().join("disk.raw");
+        let mut store = Store::load(&store_path).unwrap();
+        store.create("tank", 1 << 30).unwrap();
+        store
+            .lease_with_intent("tank", "dev", "instance-id", "laptop", "laptop-id", None)
+            .unwrap();
+        store.save_confirmed().unwrap();
+        let vol = store.get("tank").unwrap().clone();
+
+        let missing_tool = prepare_export_start_with(&mut store, &vol, &image, |_| {
+            Err(anyhow::anyhow!("injected missing qemu-storage-daemon"))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(missing_tool.contains("not installed"), "{missing_tool}");
+        let lease = store.get("tank").unwrap().lease.as_ref().unwrap();
+        assert!(!lease.export_started, "a pre-spawn error armed a writer");
+        assert!(lease.proc.is_none(), "a pre-spawn error invented a process");
+
+        let fake_qsd = dir.path().join("qemu-storage-daemon");
+        let missing_image =
+            prepare_export_start_with(&mut store, &vol, &image, |_| Ok(fake_qsd.clone()))
+                .unwrap_err()
+                .to_string();
+        assert!(missing_image.contains("lost its image"), "{missing_image}");
+        assert!(
+            !store
+                .get("tank")
+                .unwrap()
+                .lease
+                .as_ref()
+                .unwrap()
+                .export_started
+        );
+
+        std::fs::write(&image, b"").unwrap();
+        let (armed, launch) =
+            prepare_export_start_with(&mut store, &vol, &image, |_| Ok(fake_qsd.clone())).unwrap();
+        assert!(armed.export_started, "retry did not reach launch admission");
+        assert!(
+            armed.proc.is_none(),
+            "no process has been spawned in this test"
+        );
+        assert_eq!(launch.qsd, fake_qsd);
+        assert_eq!(launch.image, image);
+
+        // This test deliberately stops at the launch boundary. Since no
+        // process was invoked, clearing the marker is proven-safe and shows
+        // the retry does not leave a permanent fence behind either.
+        clear_export_start(&mut store, "tank").unwrap();
+        assert!(
+            !store
+                .get("tank")
+                .unwrap()
+                .lease
+                .as_ref()
+                .unwrap()
+                .export_started
+        );
+    }
+
+    /// Removal validates the whole set before contacting any provider. A
+    /// pinned first volume must not be released and left dangling in the row
+    /// merely because a later legacy row makes deletion unsafe.
+    #[tokio::test]
+    async fn release_all_fails_on_legacy_authority_before_any_provider_call() {
+        let mut inst: Instance = serde_json::from_str(
+            r#"{"id":"instance-id","name":"dev","cpu_device":"laptop","status":"stopped",
+                "created_at":0,"volumes":[],
+                "machine":{"backend":"qemu","machine_type":"virt","cpu":"host","hv_version":"test"}}"#,
+        )
+        .unwrap();
+        inst.volumes.push(Volume::block_owned(
+            "pinned",
+            "nas",
+            Some("nas-id".into()),
+            4,
+            1 << 30,
+        ));
+        inst.volumes
+            .push(Volume::block("legacy", "old-nas-name", 9, 1 << 30));
+
+        let error = release_all(&inst).await.unwrap_err().to_string();
+        assert!(error.contains("legacy"), "{error}");
+        assert!(error.contains("preserving every lease and row"), "{error}");
+        assert!(
+            !error.contains("volume plane was never started"),
+            "a provider call happened before full preflight: {error}"
+        );
+    }
+
     /// The provider's half of the recycled-pid problem. A lease written
     /// before identities existed names a storage daemon by number; that
     /// number has since been handed to something else, and revoking the
@@ -2057,19 +2983,36 @@ mod tests {
             !export_alive(Some(&stale), &socket),
             "not our export any more"
         );
-        // Revocation still runs — the unlink of the lease's own socket is
-        // the fence, and it does not depend on any process — but the
-        // stranger holding the number is left alone.
-        stop_export("tank", 1, Some(&stale));
+        let stale_pid = stale.pid;
+        let lease = volume::Lease {
+            holder: "dev".into(),
+            holder_id: "instance-id".into(),
+            holder_device: "laptop".into(),
+            holder_device_id: "laptop-id".into(),
+            intent_id: None,
+            epoch: 1,
+            granted_at: 0,
+            export: "tank-e1".into(),
+            pid: Some(stale.pid),
+            proc: Some(stale),
+            export_started: true,
+        };
+        let pidfile = dir.path().join("nbd-e1.pid");
+        std::fs::write(&pidfile, stale_pid.to_string()).unwrap();
+        let error = stop_export_at("tank", &lease, &socket, &pidfile)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("refusing to send"), "{error}");
+        assert!(socket.exists(), "an unproven writer lost its socket name");
+        assert!(pidfile.exists(), "an unproven writer lost its pid evidence");
         assert!(real.alive(), "nobody else was killed to close the door");
 
         let _ = sleeper.kill();
         let _ = sleeper.wait();
     }
 
-    /// A lease from an older daemon carries a pid and no identity, and that
-    /// is not evidence of anything: the export reads as not running, which
-    /// this plane recovers from by starting it again at the same epoch.
+    /// A lease from an older daemon carries a pid and no identity. It reads
+    /// as unproven, not dead, and keeps the writer fence closed.
     #[test]
     fn a_pre_identity_lease_is_not_believed() {
         let json = format!(
@@ -2080,11 +3023,84 @@ mod tests {
         let lease: volume::Lease = serde_json::from_str(&json).unwrap();
         assert_eq!(lease.pid, Some(std::process::id()));
         assert_eq!(lease.proc, None, "a pid is not an identity");
+        assert!(lease.export_started, "legacy authority fails closed");
 
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("nbd-e1.sock");
         std::fs::write(&socket, b"").unwrap();
         assert!(!export_alive(lease.proc.as_ref(), &socket));
+        let pidfile = dir.path().join("nbd-e1.pid");
+        std::fs::write(&pidfile, lease.pid.unwrap().to_string()).unwrap();
+        assert!(stop_export_at("tank", &lease, &socket, &pidfile).is_err());
+        assert!(
+            socket.exists(),
+            "unproven death must not masquerade as revocation"
+        );
+    }
+
+    /// Subprocess half of `revocation_kills_the_server_before_unlinking`.
+    #[test]
+    fn export_process_fixture() {
+        let Ok(socket) = std::env::var("ASTERISM_TEST_EXPORT_SOCKET") else {
+            return;
+        };
+        let listener = UnixListener::bind(socket).unwrap();
+        let (_client, _) = listener.accept().unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    /// A connected Unix client survives unlink, so revocation must terminate
+    /// the serving process first. Exercise that boundary with a real child
+    /// process and a connection opened before the release.
+    #[test]
+    fn revocation_kills_the_server_before_unlinking() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("nbd-e7.sock");
+        let pidfile = dir.path().join("nbd-e7.pid");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("volume::tests::export_process_fixture")
+            .arg("--nocapture")
+            .env("ASTERISM_TEST_EXPORT_SOCKET", &socket)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !socket.exists() {
+            assert!(Instant::now() < deadline, "export fixture did not bind");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut old_client = UnixStream::connect(&socket).unwrap();
+        old_client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let proc = ProcId::capture(child.id()).unwrap();
+        std::fs::write(&pidfile, proc.pid.to_string()).unwrap();
+        let lease = volume::Lease {
+            holder: "dev".into(),
+            holder_id: "instance-id".into(),
+            holder_device: "laptop".into(),
+            holder_device_id: "laptop-id".into(),
+            intent_id: Some("boot-intent".into()),
+            epoch: 7,
+            granted_at: 0,
+            export: "tank-e7".into(),
+            pid: Some(proc.pid),
+            proc: Some(proc.clone()),
+            export_started: true,
+        };
+
+        stop_export_at("tank", &lease, &socket, &pidfile).unwrap();
+        assert!(!proc.alive(), "release acknowledged while its server lived");
+        assert!(!socket.exists(), "dead export socket was not removed");
+        assert!(!pidfile.exists(), "dead export pidfile was not removed");
+        let mut byte = [0u8; 1];
+        match old_client.read(&mut byte) {
+            Ok(0) | Err(_) => {}
+            Ok(n) => panic!("old client read {n} bytes after revocation"),
+        }
+        child.wait().unwrap();
     }
 
     #[test]

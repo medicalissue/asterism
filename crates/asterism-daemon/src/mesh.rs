@@ -207,6 +207,9 @@ enum MeshRequest {
         volume: String,
         /// The instance the bytes are for — the lease holder.
         holder: String,
+        /// Immutable identity of that instance.
+        #[serde(default)]
+        holder_id: String,
         /// The epoch that lease was granted at.
         epoch: u64,
     },
@@ -1439,6 +1442,7 @@ impl Mesh {
         device: &str,
         volume: &str,
         holder: &str,
+        holder_id: &str,
         epoch: u64,
     ) -> Result<(asterism_mesh::MeshStream, LinkObservation)> {
         let peer = self.device(device).await?;
@@ -1452,6 +1456,7 @@ impl Mesh {
             &MeshRequest::VolumeSplice {
                 volume: volume.to_owned(),
                 holder: holder.to_owned(),
+                holder_id: holder_id.to_owned(),
                 epoch,
             },
         )
@@ -2492,6 +2497,7 @@ async fn serve_volume_splice(
     mut stream: asterism_mesh::MeshStream,
     volume: &str,
     holder: &str,
+    holder_id: &str,
     epoch: u64,
     requester_device: &str,
     requester_device_id: &str,
@@ -2499,6 +2505,7 @@ async fn serve_volume_splice(
     let export = match crate::volume::open_export(
         volume,
         holder,
+        holder_id,
         epoch,
         requester_device,
         requester_device_id,
@@ -3271,12 +3278,14 @@ async fn serve_stream(
         MeshRequest::VolumeSplice {
             volume,
             holder,
+            holder_id,
             epoch,
         } => {
             return serve_volume_splice(
                 stream,
                 &volume,
                 &holder,
+                &holder_id,
                 epoch,
                 &requester_device,
                 &requester_device_id,
