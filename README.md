@@ -18,22 +18,195 @@
        alt="Terminal session: ast create agent --image debian:13, ast up agent, ast ssh agent -- uname -a printing the guest kernel, ast down agent, ast snapshot agent clean, ast ls.">
 </p>
 
+Asterism turns a set of devices into an **orbit**: one computer whose CPU,
+memory, storage, secrets, and network reach can come from different places.
+It runs persistent agents in real VMs, keeps each guest isolated behind its
+own kernel and disk, and lets you operate every instance by name from any
+device in the orbit.
+
+No Asterism account or hosted control plane is required. Devices pair
+directly, trust device keys, and communicate over an authenticated, encrypted
+mesh.
+
+## Install
+
 ```console
 $ curl -fsSL https://asterism.run/install.sh | sh
 ```
 
-One tagged release, checksummed against the `SHA256SUMS` published beside it,
-into `~/.local/bin`. Re-running upgrades; `--uninstall` puts the machine back.
-Building it yourself, from a tag or from a branch you name, is
-`ASTERISM_METHOD=source` — see [packaging/README.md](packaging/README.md) for
-that and for the Homebrew tap.
+The installer selects one tagged release, verifies it against the
+`SHA256SUMS` published with that release, and puts `ast` and `astd` in
+`~/.local/bin`. Re-run it to upgrade or pass `--uninstall` to remove the
+installed files. Release binaries currently target macOS on Apple silicon;
+other hosts can build from source:
 
-Installed releases share one signed update channel across the CLI and menu-bar
-app. `ast update check` authenticates its manifest without downloading
-artifacts; `ast update apply --yes` verifies and activates the matching app,
-CLI, daemon, and helper as one build, rolling all of them back if activation
-fails. Homebrew installations remain owned by Homebrew and are directed to
-`brew upgrade asterism`.
+```console
+$ curl -fsSL https://asterism.run/install.sh | ASTERISM_METHOD=source sh
+```
+
+See [packaging/README.md](packaging/README.md) for version pinning, alternate
+prefixes, source refs, Homebrew, and update verification.
+
+## Start an agent
+
+```console
+$ ast images
+$ ast create agent --image debian:13 --cpus 4 --mem 8G --profile codex
+$ ast up agent
+$ ast ssh agent
+$ ast status agent
+```
+
+`ast create` accepts catalog images, pinned cloud-image URLs, local qcow2 or
+raw images, and OCI references such as `nginx` or
+`ghcr.io/owner/app:v1`. Asterism creates a copy-on-write root disk, provisions
+SSH keys with cloud-init, and applies optional bootstrap profiles for tools
+such as git, tmux, Node, Claude Code, and Codex.
+
+On macOS, Asterism uses Virtualization.framework when it satisfies the
+instance's requirements and otherwise uses QEMU with Hypervisor.framework
+acceleration. Pass `--backend vz` or `--backend qemu` to require one and get a
+specific capability refusal when it cannot serve the instance.
+
+Instances can restart after a guest crash or device reboot. Install `astd` as
+the user service that keeps them running:
+
+```console
+$ ast service install
+$ ast up agent --restart always
+$ ast service status
+```
+
+Snapshots, backups, logs, and lifecycle commands use the same instance name:
+
+```console
+$ ast snapshot agent clean
+$ ast snapshots agent
+$ ast restore agent clean
+$ ast backup export agent ~/Backups/agent
+$ ast backup inspect ~/Backups/agent
+$ ast logs agent --follow
+$ ast down agent
+```
+
+## Add devices to an orbit
+
+On the first device, create a single-use invitation:
+
+```console
+desktop$ ast device invite --name desktop
+```
+
+Paste its ticket on the other device:
+
+```console
+laptop$ ast device add <ticket> --name laptop
+```
+
+Both terminals show the same six-digit confirmation code before either device
+is trusted. Pairing needs no coordinator. Once paired:
+
+```console
+$ ast devices
+$ ast ping desktop
+$ ast ls
+```
+
+Instance names form one orbit-wide namespace. `ast create` and `ast rename`
+claim a name across the orbit, and ordinary commands such as `ast up agent`,
+`ast ssh agent`, and `ast status agent` locate it and forward the request to
+the device supplying its CPU. `ast ls` combines every device's registry shard
+into one view and marks the state from an unreachable device as `unknown`.
+The global `--device` option is for device-local administration and debugging,
+not for reaching an instance.
+
+## Assemble instances from parts
+
+An instance is a stable name and identity plus the parts it uses. `ast status`
+shows where those parts come from. Software inside the guest sees ordinary
+local resources even when Asterism carries their operations across the mesh.
+
+- **CPU and memory** come from one device. Move them offline without changing
+  the instance's name or identity; its root disk and snapshots transfer
+  peer-to-peer as part of the move.
+
+  ```console
+  $ ast move agent desktop --down
+  ```
+
+- **Directory shares** expose a directory from the CPU device through 9p on
+  QEMU or virtiofs on VZ.
+
+  ```console
+  $ ast attach agent --volume ~/work --at /workspace
+  ```
+
+- **Block volumes** can live on any device. They are leased to one instance
+  at a time and appear in a QEMU guest as a normal disk such as `/dev/vdb`;
+  the guest does not need to know which device holds the bytes.
+
+  ```console
+  $ ast --device storage volume create data --size 100G
+  $ ast attach agent --volume storage:data
+  ```
+
+- **Secrets** keep their values in a source device's macOS login Keychain. The
+  guest receives an opaque handle, and Asterism exchanges it for the value
+  only on requests to the allowed authority. The value never enters the guest
+  disk or a snapshot; platforms without a credential-store implementation
+  refuse secret storage instead of writing a plaintext fallback.
+
+  ```console
+  $ printf '%s' "$ANTHROPIC_API_KEY" | ast secret create anthropic
+  $ ast attach agent --secret anthropic --to api.anthropic.com
+  ```
+
+Remote block volumes currently require the QEMU backend. Directory shares
+must be on the same device as the instance's CPU and memory.
+
+## Reach guests and devices
+
+`ast ssh <instance>` works from any orbit device. The local daemon resolves
+the name and returns a loopback endpoint whether the guest is local or across
+the mesh, so SSH itself does not need an exposed guest port or a device name.
+
+A paired device can also offer its own user shell. This is disabled by
+default and grants approved peers the full authority of that user account:
+
+```console
+desktop$ ast device shell enable
+laptop$ ast ssh --host desktop
+laptop$ ast ssh --host desktop -- uname -a
+desktop$ ast device shell disable
+```
+
+Read [docs/device-shell.md](docs/device-shell.md) before enabling it; the
+document covers approval scope, audit records, and revocation limits.
+
+## Network and privacy
+
+The default mesh uses n0's public iroh relays and `dns.iroh.link` discovery so
+devices behind different NATs can find each other. Relays see ciphertext, but
+the directory publishes a device's public key and current addresses. It does
+not receive instance metadata.
+
+If the devices already have routes to one another through a LAN, VPN, or
+tailnet, keep discovery and relay traffic local:
+
+```console
+$ ASTERISM_MESH=local astd
+```
+
+This mode uses only peer addresses already on file. Custom relay and discovery
+infrastructure can be selected with `ASTERISM_RELAY_URL`,
+`ASTERISM_PKARR_RELAY`, and `ASTERISM_DNS_ORIGIN`.
+
+## Updates
+
+The CLI and menu-bar app use one signed update channel. An update verifies the
+manifest and matching app, CLI, daemon, and helper before activation, and
+rolls the unit back if activation fails. Homebrew installations remain owned
+by Homebrew.
 
 ```console
 $ ast update status
@@ -42,140 +215,22 @@ $ ast update check
 $ ast update apply --yes
 ```
 
-macOS today. Asterism probes the host when an instance is created and uses
-Virtualization.framework (VZ) when it can satisfy the request, otherwise QEMU.
-Pass `--backend vz` or `--backend qemu` to force one and get its exact probe or
-capability refusal immediately.
+## Roadmap
 
-An agent has to stay up, and your laptop sleeps. That is why you rent
-a VPS: two vCPUs, no GPU, a monthly bill. A better machine already sits
-on your desk. Asterism gives the agent a permanent home there, a real VM
-that stays up when your laptop lid closes and answers from anywhere. The
-agent keeps its own kernel and its own disk, your real computer stays
-yours, and snapshots give you restore points when you want them.
+The next hardware part is a production remote GPU projection that presents
+`/dev/nvidia0` inside a guest; the versioned boundary and current portable
+proof are in [docs/remote-gpu-abi.md](docs/remote-gpu-abi.md).
 
-Asterism assembles one computer from your scattered machines. An
-instance's CPU and RAM anchor on one device; its disk, volumes, and
-eventually its GPU attach from the others over an encrypted mesh. You
-install a daemon on each device and pair them once. Nothing asks you to
-forward a port or install a new OS.
-
-## What works today
-
-Real virtual machines on macOS (native Virtualization.framework when capable,
-otherwise QEMU with Hypervisor.framework acceleration) behind a pluggable
-hypervisor interface: pick an image
-from the catalog (Ubuntu, Debian, Fedora, Alpine) or point at any
-cloud-image URL or local qcow2. Instances get copy-on-write disks,
-cloud-init provisioning with your SSH keys, host-directory passthrough
-(virtio-9p), disk snapshots with restore, console logs, and graceful
-shutdown. `ast` talks to a local `astd` daemon and starts it on demand.
-
-Bootstrap profiles turn a stock cloud image into somewhere an agent can
-work — git and tmux, Node, Claude Code or Codex — applied inside the guest
-and verifiable from outside it. The credential is not part of that: bind a
-secret and the guest gets an opaque handle, while the value stays on the
-device that holds it and never reaches the guest's disk or a snapshot of it.
-
-```
-ast images                    # what you can boot
-ast create dev --image debian:13 --cpus 4 --mem 8G
-ast attach dev --volume ~/work
-ast up dev · ast ssh dev · ast down dev
-ast snapshot dev clean · ast restore dev clean · ast logs dev -f
-ast backup export dev ~/Backups/dev · ast backup inspect ~/Backups/dev · ast backup import ~/Backups/dev
-ast ls · ast status dev · ast rm dev
-
-ast profiles                                    # what a guest can be made into
-ast create agent --image debian:13 --profile claude
-ast attach agent --secret anthropic --to api.anthropic.com
-ast profile agent --check                       # what the guest actually has
-ast bugreport                                   # local state, without secrets or handles
-```
-
-## What's next
-
-The mesh. You pair devices into an **orbit** with one command and a
-six-digit confirmation; after that you can address any device by name
-(`ast --device desktop ls` works today on a shared network). Volumes,
-GPUs, and instance migration ride the same rails next. We keep every
-client in this repository open source and plan to charge for a hosted
-coordination service.
-
-The versioned CUDA-semantic boundary and its runnable two-role fake
-`/dev/nvidia0` proof are documented in
-[docs/remote-gpu-abi.md](docs/remote-gpu-abi.md).
-
-The opt-in device shell, including its full-account authority and revocation
-limits, is documented in [docs/device-shell.md](docs/device-shell.md).
-
-## Building
+## Build from source
 
 ```console
-$ cargo build      # binaries: target/debug/{ast,astd}
+$ cargo build
 $ cargo test
 ```
 
-State lives in `~/.asterism` (override with `ASTERISM_HOME`).
-Workspace: `asterism-core` · `asterism-daemon` (`astd`) ·
-`asterism-cli` (`ast`) · `asterism-mesh`.
+State lives in `~/.asterism`; set `ASTERISM_HOME` to override it. The Rust
+workspace contains `asterism-core`, `asterism-daemon` (`astd`),
+`asterism-cli` (`ast`), `asterism-mesh`, and `asterism-vz`.
 
-### Proving a release
-
-`cargo test` proves the source. It does not prove the release, and the
-gap between them is where release bugs live — a tarball missing a
-binary, a helper that lost its signature on the way through `tar`, two
-binaries from two different builds packed together.
-
-```console
-$ scripts/rc.sh          # build the artifact, install it, operate it
-$ scripts/rc.sh --all    # ...and every suite this machine can run
-$ scripts/rc.sh --list   # the suites, and what each one needs
-```
-
-It builds the exact tarball a publish would upload, checks it against
-its own `SHA256SUMS`, installs it with the script users pipe into `sh`,
-and runs the suites against **that** pair rather than `target/debug`.
-The bare form is what CI runs on every pull request; `--all` adds the
-lanes that need a hypervisor or a network, which a GitHub runner has
-not got. Nothing it does touches `~/.asterism` or a daemon that was
-already running.
-
-Which build a binary is, is a question a version number cannot answer:
-
-```console
-$ ast version     # version, immutable build id, and the sha256 of the file
-$ ast bugreport   # that, plus this device's state — what to paste into an issue
-```
-
-`ast`, `astd` and the desktop app all report the same id when they are
-one build, and `scripts/rc.sh identity` is the assertion that they are.
-
-## The mesh, and what it publishes
-
-Paired devices find each other by public key, so an orbit works when the
-two machines are on different networks with no port forwarded. Reaching
-that far needs relay servers and a directory to look a key up in, and we
-do not run those yet: today the daemon uses **n0's public iroh
-infrastructure** (their relays, and `dns.iroh.link` for lookups). That
-means each device publishes **its public key and its current addresses**
-to a public directory. Relays forward ciphertext they cannot read and
-the directory holds nothing about your instances, but the existence of
-the device, and roughly where it is, is readable by anyone with its key.
-`astd` prints this on startup.
-
-```console
-$ ASTERISM_MESH=local astd     # no relay, no directory, nothing published
-```
-
-`local` reaches peers only at addresses already on file — the mode to use
-if you already have a working route (a tailnet, a VPN, a LAN). To point
-at other servers instead, set `ASTERISM_RELAY_URL`, `ASTERISM_PKARR_RELAY`
-or `ASTERISM_DNS_ORIGIN`; the servers we run will arrive through the same
-seam.
-
----
-
-Early development. Licensed under [MIT](LICENSE-MIT) or
-[Apache-2.0](LICENSE-APACHE), at your option; contributions are accepted
-under the same terms (DCO).
+Licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your
+option. Contributions are accepted under the same terms (DCO).
