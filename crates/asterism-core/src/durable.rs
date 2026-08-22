@@ -164,6 +164,74 @@ pub fn commit_json_private<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     commit_private(path, &bytes)
 }
 
+/// Write a document back in a shape this build understands, keeping the shape
+/// it was in.
+///
+/// The one step every migration goes through, and it exists because an
+/// ordinary [`commit`] is not enough for one. A commit's backup is
+/// best-effort on purpose: if the `.bak` cannot be kept, the commit says so
+/// and proceeds, because refusing to save a new value over a failure to copy
+/// the old one would be the tail wagging the dog. What is lost there is one
+/// revision of a document that is still readable in the same shape.
+///
+/// A migration loses something else. It replaces the only copy of the value
+/// in the only shape the *previous* build can read, so a migration whose
+/// backup went missing is a one-way door — the user upgrades, the new build
+/// rewrites the shard, and there is now nothing on the disk the old build
+/// could be pointed back at. So here the backup is not best-effort: it is
+/// taken first, it is verified after, and a migration that cannot leave one
+/// behind fails instead of succeeding quietly.
+///
+/// `Ok(())` means the new shape is at `path`, durably, and the old shape is at
+/// `<path>.bak`, durably.
+pub fn migrate_json<T: Serialize>(path: &Path, what: &str, value: &T) -> Result<()> {
+    let bak = backup_path(path);
+    let previous = match read_faultily(path) {
+        Ok(bytes) => Some(bytes),
+        // Nothing on disk to preserve. A migration of a document that is not
+        // there is just a first write, and it is not this function's job to
+        // decide that is wrong.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!("reading {} before migrating {what}", path.display())
+            })
+        }
+    };
+
+    if previous.is_some() {
+        keep_backup(path, None).with_context(|| {
+            format!(
+                "keeping the pre-migration copy of {what} at {} — refusing to migrate \
+                 {} without one, because the old shape would then exist nowhere",
+                bak.display(),
+                path.display(),
+            )
+        })?;
+    }
+
+    commit_json(path, value)?;
+
+    // And prove it. `commit` takes its own backup and is entitled to fail at
+    // it; if it did, the link made above was unlinked on the way past and the
+    // old shape is gone. Cheap to check, and the alternative is a promise in
+    // a doc comment.
+    if let Some(previous) = previous {
+        let held = std::fs::read(&bak).ok();
+        if held.as_deref() != Some(previous.as_slice()) {
+            write_forced(&bak, &previous, None).with_context(|| {
+                format!(
+                    "restoring the pre-migration copy of {what} at {}",
+                    bak.display()
+                )
+            })?;
+            let dir = path.parent().unwrap_or_else(|| Path::new("."));
+            sync_dir(dir).with_context(|| format!("flushing {}", dir.display()))?;
+        }
+    }
+    Ok(())
+}
+
 fn commit_inner(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     faults::check(faults::Point::Create, dir)?;
@@ -1024,6 +1092,81 @@ mod tests {
         let loaded: Loaded<Doc> = load_json(&path, "a document").unwrap().unwrap();
         assert_eq!(loaded.value, Doc { n: 7 });
         assert!(loaded.repaired.is_some());
+    }
+
+    // ---- migrations --------------------------------------------------------
+
+    #[test]
+    fn a_migration_leaves_the_pre_migration_value_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("doc.json");
+        // The old shape, whatever it was. Written by hand rather than
+        // committed, because a document that has never been through this
+        // build is exactly what a migration meets.
+        std::fs::write(&path, br#"{"n":1,"shape":"old"}"#).unwrap();
+
+        migrate_json(&path, "a document", &Doc { n: 2 }).unwrap();
+
+        let loaded: Loaded<Doc> = load_json(&path, "a document").unwrap().unwrap();
+        assert_eq!(loaded.value, Doc { n: 2 }, "the new shape is live");
+        assert_eq!(
+            read(&backup_path(&path)),
+            r#"{"n":1,"shape":"old"}"#,
+            "the shape the previous build reads is still on the disk, byte for byte"
+        );
+    }
+
+    /// The difference between this and an ordinary commit, stated as a test.
+    /// `commit` is entitled to lose its backup and say so; a migration is not,
+    /// because what it would lose is the only copy in the only shape the
+    /// build the user is downgrading to can read.
+    #[test]
+    fn a_migration_that_cannot_keep_a_backup_fails_rather_than_proceeding() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nobak.json");
+        std::fs::write(&path, br#"{"n":1,"shape":"old"}"#).unwrap();
+
+        let _armed = faults::arm(
+            "migration-backup",
+            Point::Backup,
+            "nobak.json",
+            io::ErrorKind::PermissionDenied,
+        );
+        let err = migrate_json(&path, "a document", &Doc { n: 2 }).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("pre-migration"), "{text}");
+        assert!(text.contains("would then exist nowhere"), "{text}");
+        // And it did not migrate on the way out: the old shape is still live.
+        assert_eq!(read(&path), r#"{"n":1,"shape":"old"}"#);
+    }
+
+    /// An ordinary commit in the same position proceeds, which is the
+    /// behaviour a migration deliberately does not share.
+    #[test]
+    fn an_ordinary_commit_that_cannot_keep_a_backup_still_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bestefford.json");
+        commit_json(&path, &Doc { n: 1 }).unwrap();
+
+        let _armed = faults::arm(
+            "commit-backup",
+            Point::Backup,
+            "bestefford.json",
+            io::ErrorKind::PermissionDenied,
+        );
+        commit_json(&path, &Doc { n: 2 }).unwrap();
+        let loaded: Loaded<Doc> = load_json(&path, "a document").unwrap().unwrap();
+        assert_eq!(loaded.value, Doc { n: 2 });
+    }
+
+    #[test]
+    fn migrating_a_document_that_is_not_there_is_just_a_first_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fresh.json");
+        migrate_json(&path, "a document", &Doc { n: 1 }).unwrap();
+        let loaded: Loaded<Doc> = load_json(&path, "a document").unwrap().unwrap();
+        assert_eq!(loaded.value, Doc { n: 1 });
+        assert!(!backup_path(&path).exists(), "there was nothing to keep");
     }
 
     #[test]

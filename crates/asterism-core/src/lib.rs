@@ -9,9 +9,11 @@
 //! hypervisor boundary, [`volume`] is the block
 //! storage a device contributes to the pool, [`secret`] and [`rewrite`] are
 //! the secrets data plane's model and its one substitution rule, and
-//! [`protocol`] is the CLI <-> daemon wire. [`verify`] is the gate every
-//! boot input passes through on its way into the store and out of it again.
+//! [`protocol`] is the CLI <-> daemon wire, and [`compat`] is what one build
+//! of that wire will speak to. [`verify`] is the gate every boot input passes
+//! through on its way into the store and out of it again.
 
+pub mod compat;
 pub mod cow;
 pub mod durable;
 pub mod hv;

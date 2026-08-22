@@ -36,6 +36,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
+use asterism_core::compat;
 use asterism_core::orbit::Orbit;
 use asterism_core::protocol::{Request, Response};
 use asterism_core::registry::Shard;
@@ -82,10 +83,21 @@ async fn main() -> Result<()> {
     let home = paths::home_dir();
     std::fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
 
-    // Before anything is served: a cpu-part swap this device was receiving
-    // when it died left a staging directory, and this is the "next contact"
-    // that clears it. It was never bootable and no shard row ever pointed at
-    // it, so there is nothing to consult first.
+    // First, and before anything below it. Every other line in this function
+    // changes something — a staging directory is swept, a restore is
+    // converged, a store is read and written back migrated — and each of them
+    // would meet a newer build's state one file at a time, part-way through a
+    // startup that had already begun. This is the last moment at which a
+    // downgrade costs nothing to refuse. See `asterism_core::compat`.
+    if let Some(note) = compat::stamp_home(&home)? {
+        eprintln!("astd: {note}");
+    }
+
+    // Now that this build has been established as one that may touch this
+    // home: a cpu-part swap this device was receiving when it died left a
+    // staging directory, and this is the "next contact" that clears it. It
+    // was never bootable and no shard row ever pointed at it, so there is
+    // nothing to consult first.
     swap::sweep_staging();
 
     let node = Node {

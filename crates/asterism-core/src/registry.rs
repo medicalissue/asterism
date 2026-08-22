@@ -158,7 +158,18 @@ impl Shard {
         // the same recovery again, and the second time the backup may be the
         // broken file.
         if repaired.is_some() || migrated {
-            if let Err(e) = shard.save() {
+            // A migration goes through `migrate_json` and a repair does not,
+            // and the difference is what each one would lose. A repair is
+            // already reading from the backup, so insisting on keeping one is
+            // insisting on keeping the broken file. A migration rewrites the
+            // only copy in the only shape the previous build can read, so it
+            // fails rather than proceed without one.
+            let written = if migrated {
+                durable::migrate_json(&shard.path, what, &shard.file())
+            } else {
+                shard.save()
+            };
+            if let Err(e) = written {
                 eprintln!("astd: could not write the repaired registry back: {e:#}");
             }
         }
@@ -227,12 +238,13 @@ impl Shard {
     }
 
     pub fn save(&self) -> Result<()> {
-        let file = ShardFile {
-            version: SHARD_VERSION,
-            instances: self.instances.clone(),
-        };
-        durable::commit_json(&self.path, &file)
+        durable::commit_json(&self.path, &self.file())
             .context("committing this device's registry shard")
+    }
+
+    /// This shard in the shape it is written in.
+    fn file(&self) -> ShardFile {
+        ShardFile { version: SHARD_VERSION, instances: self.instances.clone() }
     }
 
     /// Define an instance in this shard, sourcing its cpu and ram from

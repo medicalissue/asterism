@@ -24,6 +24,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
+use asterism_core::compat;
 use asterism_core::hv::ImageKind;
 use asterism_core::instance::{now_unix, Instance, PortForward, Restart, Shape};
 use asterism_core::proc::{ProcId, Signal};
@@ -389,6 +390,17 @@ enum Command {
     Service(ServiceCommand),
     /// Run the device daemon in the foreground.
     Daemon,
+    /// What this build speaks, what it will talk to, and what is on this disk.
+    ///
+    /// The answer to "why did my daemon restart" and "why will these two
+    /// devices not talk", and the table `scripts/e2e-skew.sh` walks — the
+    /// matrix the test covers is generated from the rule the code follows,
+    /// rather than transcribed beside it.
+    Compat {
+        /// Print it as JSON, for a script rather than a person.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// `ast snapshot ...` — taking one, and deleting one.
@@ -683,6 +695,10 @@ fn main() -> Result<()> {
             local_only("daemon", device.as_deref())?;
             let err = exec_daemon();
             return Err(err).context("running astd");
+        }
+        Command::Compat { json } => {
+            local_only("compat", device.as_deref())?;
+            return print_compat(json);
         }
     };
 
@@ -1689,11 +1705,28 @@ fn drain(file: &mut File, out: &mut std::io::Stdout) -> Result<u64> {
 fn send(request: &Request) -> Result<Response> {
     ensure_current_daemon()?;
     let response = send_once(request)?;
-    // Belt and braces: a daemon that was replaced between the handshake and
-    // now still cannot produce a baffling serde error for the user.
+    // The negotiated half of the upgrade. The handshake only proves the
+    // daemon speaks frames from the same window, and a window is two versions
+    // wide on purpose — so a daemon inside it may still not know *this*
+    // command. That is the moment to replace it, and the only one: an upgrade
+    // costs the user their running daemon, and it is worth doing when there
+    // is something they asked for that cannot be served without it.
     if let Response::Error { message } = &response {
         if protocol::is_unknown_variant_error(message) {
-            retire_stale_daemon()?;
+            // Never on the strength of the error alone. A daemon that was
+            // replaced between the handshake and now could be a newer one,
+            // and a newer one refusing a variant means this `ast` is the old
+            // half — retiring it there would be the downgrade the handshake
+            // exists to prevent.
+            let now = handshake()?;
+            if let compat::Verdict::TooNew { theirs, ours } = now.verdict {
+                return Err(compat::too_new(&now.describe(), theirs, ours));
+            }
+            eprintln!(
+                "ast: {} does not know that command — restarting the daemon",
+                now.describe()
+            );
+            replace_daemon()?;
             return send_once(request);
         }
     }
@@ -1784,14 +1817,40 @@ fn wait_for_socket(sock: &std::path::Path) -> Result<UnixStream> {
 
 // ---- version handshake -----------------------------------------------------
 //
-// The wire protocol is a pair of serde enums, so a daemon left running
-// across an upgrade does not fail politely: it rejects the first request
-// carrying a variant it has never heard of, and the user sees
-// `bad request: unknown variant ...`. That is a true statement about
-// nothing the user did. So `ast` asks the daemon its version before
-// trusting it, and retires it if the answer is wrong.
+// The wire protocol is a pair of serde enums, so a daemon left running across
+// an upgrade does not fail politely: it rejects the first request carrying a
+// variant it has never heard of, and the user sees `bad request: unknown
+// variant ...`. That is a true statement about nothing the user did. So `ast`
+// asks the daemon what it speaks before trusting it.
+//
+// What it asks about is the *protocol* version and not the crate version.
+// Comparing crate versions was the same question asked wrong twice: a patch
+// release with an identical wire forced a daemon replacement for nothing, and
+// — worse — the comparison was symmetric, so an older `ast` would SIGTERM a
+// newer `astd` and put itself in its place. That is a downgrade, and the
+// older daemon that replaced it would then meet state at a schema version it
+// does not speak and refuse to start. See `asterism_core::compat`.
 
-/// Once per process: make sure the daemon we are about to talk to is ours.
+/// What the daemon on the socket turned out to be.
+struct Handshake {
+    /// Its crate version, for the sentence a user reads. `None` from a daemon
+    /// too old to report one at all.
+    version: Option<String>,
+    verdict: compat::Verdict,
+}
+
+impl Handshake {
+    /// How to name it in a sentence: `astd 0.0.2`, or the best available.
+    fn describe(&self) -> String {
+        match &self.version {
+            Some(v) => format!("astd {v}"),
+            None => "the astd that is running".to_owned(),
+        }
+    }
+}
+
+/// Once per process: make sure the daemon we are about to talk to speaks our
+/// wire, replacing it if it is old and refusing if it is new.
 fn ensure_current_daemon() -> Result<()> {
     use std::sync::OnceLock;
     static CHECKED: OnceLock<()> = OnceLock::new();
@@ -1799,16 +1858,39 @@ fn ensure_current_daemon() -> Result<()> {
         return Ok(());
     }
 
-    if let Some(found) = stale_version()? {
-        eprintln!(
-            "ast: astd {found} is running, but this is ast {VERSION} — restarting the daemon"
-        );
-        retire_stale_daemon()?;
-        if let Some(still) = stale_version()? {
-            bail!(
-                "astd {still} is still running after a restart, but this is ast {VERSION}. \
-                 Stop it by hand and try again."
+    let found = handshake()?;
+    match found.verdict {
+        // Inside the window. A different crate version here is not this
+        // module's business: two builds that speak the same frames are two
+        // builds that can talk, and replacing one of them would cost a user
+        // their running daemon to change a number they cannot see.
+        compat::Verdict::Speak => {}
+
+        // Newer than us. Never signalled — this is the case the old
+        // crate-version comparison got wrong, and getting it right is mostly
+        // a matter of not acting.
+        compat::Verdict::TooNew { theirs, ours } => {
+            return Err(compat::too_new(&found.describe(), theirs, ours))
+        }
+
+        // Older than our window, or older than the number itself. This build
+        // can restart it, and doing so is the upgrade.
+        compat::Verdict::TooOld { theirs, .. } => {
+            eprintln!(
+                "ast: {} speaks protocol {theirs}, older than the {}..={} this ast {VERSION} \
+                 supports — restarting the daemon",
+                found.describe(),
+                compat::min_supported(),
+                compat::protocol_version(),
             );
+            replace_daemon()?;
+        }
+        compat::Verdict::Unversioned => {
+            eprintln!(
+                "ast: {} predates the protocol version — restarting the daemon",
+                found.describe()
+            );
+            replace_daemon()?;
         }
     }
 
@@ -1816,18 +1898,40 @@ fn ensure_current_daemon() -> Result<()> {
     Ok(())
 }
 
-/// The version of the running daemon if it disagrees with ours, or `None`
-/// if it matches. Spawns a daemon if none is running.
-fn stale_version() -> Result<Option<String>> {
+/// Retire the daemon that is running, and insist the replacement is speakable.
+///
+/// Separate from [`retire_stale_daemon`] because the re-check is the half that
+/// matters: `spawn_daemon` starts the `astd` next to *this* binary, so a
+/// replacement that still will not speak means something on this machine is
+/// serving the socket that `ast` did not start, and the user has to be told
+/// rather than watched in a loop.
+fn replace_daemon() -> Result<()> {
+    retire_stale_daemon()?;
+    let now = handshake()?;
+    if !now.verdict.speakable() {
+        bail!(
+            "{} is still running after a restart, and it does not speak the protocol \
+             this ast {VERSION} does ({}..={}). Stop it by hand and try again.",
+            now.describe(),
+            compat::min_supported(),
+            compat::protocol_version(),
+        );
+    }
+    Ok(())
+}
+
+/// Ask the daemon what it speaks. Spawns one if none is running.
+fn handshake() -> Result<Handshake> {
     match send_once(&Request::Ping)? {
-        Response::Pong { version } if version == VERSION => Ok(None),
-        Response::Pong { version } => Ok(Some(version)),
-        // A daemon older than the Pong reply answers Ping with plain Ok.
-        // The absence of a version is the mismatch.
-        Response::Ok => Ok(Some(format!("older than {VERSION}"))),
-        // Older still, or a build whose Ping means something else entirely.
+        Response::Pong { version, protocol } => {
+            Ok(Handshake { version: Some(version), verdict: compat::negotiate(protocol) })
+        }
+        // A daemon older than the Pong reply answers Ping with plain Ok, and
+        // one older still refuses the variant by name. Neither can be asked
+        // what it speaks, which is itself the answer.
+        Response::Ok => Ok(Handshake { version: None, verdict: compat::Verdict::Unversioned }),
         Response::Error { message } if protocol::is_unknown_variant_error(&message) => {
-            Ok(Some(format!("older than {VERSION}")))
+            Ok(Handshake { version: None, verdict: compat::Verdict::Unversioned })
         }
         Response::Error { message } => bail!(message),
         other => bail!("unexpected reply to ping from astd: {other:?}"),
@@ -1936,6 +2040,87 @@ fn exec_daemon() -> anyhow::Error {
         Err(e) => return e,
     };
     std::process::Command::new(astd).exec().into()
+}
+
+/// `ast compat`: the two numbers a skew is decided on, and what this machine
+/// currently has of each.
+///
+/// Deliberately answerable without a daemon. Half the reason to run this is
+/// that the daemon will not start, and a diagnostic that needs the thing it is
+/// diagnosing is not one.
+fn print_compat(json: bool) -> Result<()> {
+    let table = compat::Compat::current();
+
+    // Best effort, and separately from the table: a daemon that is not running
+    // is not an error here, and neither is one that refuses us — that refusal
+    // is the answer the user came for. The socket is probed rather than
+    // `handshake`ed, because `handshake` spawns a daemon when none is
+    // answering and a question about what is running must not be the thing
+    // that starts it.
+    let running = match UnixStream::connect(paths::socket_path()) {
+        Ok(_) => handshake().ok(),
+        Err(_) => None,
+    };
+    let stamp: Option<compat::HomeStamp> = std::fs::read(compat::stamp_path(&paths::home_dir()))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+
+    if json {
+        let mut out = serde_json::to_value(&table)?;
+        out["daemon"] = match &running {
+            Some(found) => serde_json::json!({
+                "version": found.version,
+                "verdict": found.verdict.word(),
+            }),
+            None => serde_json::Value::Null,
+        };
+        out["home"] = serde_json::to_value(&stamp)?;
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    println!("ast {}  protocol {}", table.asterism, table.protocol);
+    println!(
+        "speaks protocol {}..={} (N-{} through N)",
+        table.min_supported, table.protocol, table.supported_back
+    );
+    println!();
+    println!("state formats this build writes:");
+    for (name, version) in &table.stores {
+        println!("  {name:<10} {version}");
+    }
+    println!();
+    match &running {
+        Some(found) => println!(
+            "daemon:  {} — {}",
+            found.describe(),
+            match found.verdict {
+                compat::Verdict::Speak => "speaks this wire".to_owned(),
+                compat::Verdict::Unversioned =>
+                    "predates the protocol version, so ast would restart it".to_owned(),
+                compat::Verdict::TooOld { theirs, .. } =>
+                    format!("speaks protocol {theirs}, below this window — ast would restart it"),
+                compat::Verdict::TooNew { theirs, .. } => format!(
+                    "speaks protocol {theirs}, newer than this ast — it is left alone, \
+                     and commands will refuse until this ast is upgraded"
+                ),
+            }
+        ),
+        None => println!("daemon:  not running, or not answering"),
+    }
+    match &stamp {
+        Some(stamp) => println!(
+            "home:    {} last written by Asterism {} (protocol {})",
+            paths::home_dir().display(),
+            stamp.asterism,
+            stamp.protocol
+        ),
+        None => println!(
+            "home:    {} has never been written by a build that stamps it",
+            paths::home_dir().display()
+        ),
+    }
+    Ok(())
 }
 
 // ---- output ----------------------------------------------------------------

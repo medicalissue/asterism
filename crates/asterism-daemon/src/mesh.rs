@@ -45,6 +45,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Mutex};
 
+use asterism_core::compat;
 use asterism_core::cow;
 use asterism_core::durable;
 use asterism_core::instance::Instance;
@@ -131,6 +132,29 @@ fn wake_wait() -> Duration {
 }
 
 // ---- wire ------------------------------------------------------------------
+
+/// The opening frame of a mesh stream, with the wire version on it.
+///
+/// A wrapper rather than a field repeated on every variant, because
+/// [`MeshRequest`] and [`MeshReply`] are internally tagged: `#[serde(flatten)]`
+/// puts `protocol` beside `kind` in the same JSON object, so the shape on the
+/// wire is what it always was plus one key. A peer too old to know the key
+/// ignores it, and a peer too old to *send* it arrives as `None` — which is
+/// what makes adding this a compatible change rather than the break it would
+/// be to put a version in front of the frame as a separate word.
+///
+/// Only the *opening* frame carries it. A move's [`MoveFrame`]s and a splice's
+/// bytes follow a frame that has already settled the question, and re-stating
+/// it on every megabyte would be a version on the payload rather than on the
+/// conversation.
+#[derive(Debug, Serialize, Deserialize)]
+struct Versioned<T> {
+    /// `None` from a daemon built before there was a number.
+    #[serde(default)]
+    protocol: Option<u32>,
+    #[serde(flatten)]
+    body: T,
+}
 
 /// What one mesh stream asks for.
 #[derive(Debug, Serialize, Deserialize)]
@@ -237,6 +261,22 @@ enum MoveFrame {
 enum MeshReply {
     Rpc { response: Response },
     Pong,
+    /// This daemon will not serve that frame, and this is what it does speak.
+    ///
+    /// A reply rather than a dropped stream, and that is the whole point of
+    /// it. An unknown `kind` used to make [`serve_stream`] return `Err` and
+    /// close, so the asker saw a connection failure — which on a mesh is
+    /// indistinguishable from a peer that went to sleep. A rolling upgrade is
+    /// made of this exact moment, and "that device is two releases behind" is
+    /// a different thing for a user to do about than "that device is off".
+    Incompatible {
+        /// The oldest wire the refusing daemon will talk to. What it speaks at
+        /// the top of the range is on the envelope already, and repeating the
+        /// name `protocol` inside a `#[serde(flatten)]` would collide with it.
+        min_supported: u32,
+        /// The sentence to print, written by the side that knows why.
+        message: String,
+    },
     /// The last framed message on a stream that is becoming a pipe — an ssh
     /// session, or a volume's NBD connection.
     SpliceReady,
@@ -274,6 +314,37 @@ struct Hello {
     /// and simply leaves the field unknown.
     #[serde(default)]
     wake: WakeFacts,
+    /// What this device speaks, so a pairing that could never serve a command
+    /// is refused while a human is still watching.
+    ///
+    /// Pairing is the one moment in an orbit's life when both devices are
+    /// awake, talking, and being looked at. Discovering the skew here costs a
+    /// sentence; discovering it at the first `ast up` costs a debugging
+    /// session. `None` from a peer that predates the number, which is refused
+    /// for the same reason [`Verdict::Unversioned`] is refused everywhere else.
+    ///
+    /// [`Verdict::Unversioned`]: compat::Verdict::Unversioned
+    #[serde(default)]
+    protocol: Option<u32>,
+}
+
+impl Hello {
+    /// Why this peer cannot be paired with, if it cannot.
+    ///
+    /// Checked on both sides rather than one: each device knows its own
+    /// window, and the two windows do not have to be the same width for the
+    /// answer to be right on both terminals.
+    fn skew(&self) -> Option<String> {
+        let verdict = compat::negotiate(self.protocol);
+        if verdict.speakable() {
+            return None;
+        }
+        Some(format!(
+            "{} would be paired, but {}",
+            self.name,
+            unspeakable_peer(verdict)
+        ))
+    }
 }
 
 /// The joiner's last word, so neither side writes a peer the other rejected.
@@ -951,7 +1022,7 @@ impl Mesh {
             format!("{}: {device}", crate::volume::UNREACHABLE)
         })?;
         let mut stream = connection.open_stream().await?;
-        write_frame(
+        write_opening(
             &mut stream.send,
             &MeshRequest::VolumeSplice {
                 volume: volume.to_owned(),
@@ -960,7 +1031,7 @@ impl Mesh {
             },
         )
         .await?;
-        match read_frame::<MeshReply>(&mut stream.recv).await? {
+        match read_reply(&mut stream.recv).await? {
             MeshReply::SpliceReady => {}
             MeshReply::Rpc { response: Response::Error { message } } => bail!(message),
             other => bail!("device {device:?} would not serve volume {volume:?}: {other:?}"),
@@ -1010,7 +1081,7 @@ impl Mesh {
         let peer = self.device(target).await?;
         let connection = self.live_connection(&peer).await?;
         let mut stream = connection.open_stream().await?;
-        write_frame(
+        write_opening(
             &mut stream.send,
             &MeshRequest::MoveImport {
                 manifest: Box::new(manifest.clone()),
@@ -1022,7 +1093,7 @@ impl Mesh {
         let _ = stream.send.finish();
 
         loop {
-            match read_frame::<MoveFrame>(&mut stream.recv)
+            match read_move_frame(&mut stream.recv)
                 .await
                 .with_context(|| format!("device {target:?} stopped answering mid-transfer"))?
             {
@@ -1162,6 +1233,7 @@ impl Mesh {
             relays,
             error: (!accepted).then(|| "the other device did not confirm the code".to_owned()),
             wake: crate::wake::facts(),
+            protocol: Some(compat::protocol_version()),
         };
 
         let theirs = tokio::time::timeout(
@@ -1217,6 +1289,11 @@ impl Mesh {
             Err(anyhow!("you did not confirm the code"))
         } else if !theirs.accepted {
             Err(anyhow!("{}", theirs.error.as_deref().unwrap_or(REFUSED)))
+        } else if let Some(why) = theirs.skew() {
+            // Before `stage`, so a skewed peer is never written to the orbit
+            // store: a device that is in the store is a device every later
+            // command will try to reach.
+            Err(anyhow!("{why}"))
         } else {
             self.stage(&theirs, peer_id).await
         };
@@ -1249,6 +1326,9 @@ impl Mesh {
         if !theirs.accepted {
             reply.accepted = false;
             reply.error = Some(theirs.error.clone().unwrap_or_else(|| REFUSED.to_owned()));
+        } else if let Some(why) = theirs.skew() {
+            reply.accepted = false;
+            reply.error = Some(why);
         } else if reply.accepted {
             if let Err(e) = self.stage(&theirs, peer_id).await {
                 reply.accepted = false;
@@ -1633,8 +1713,8 @@ async fn splice_to_guest(
     let peer = mesh.device(device).await?;
     let connection = mesh.live_connection(&peer).await?;
     let mut stream = connection.open_stream().await?;
-    write_frame(&mut stream.send, &MeshRequest::SshSplice { name: name.to_owned() }).await?;
-    match read_frame::<MeshReply>(&mut stream.recv).await? {
+    write_opening(&mut stream.send, &MeshRequest::SshSplice { name: name.to_owned() }).await?;
+    match read_reply(&mut stream.recv).await? {
         MeshReply::SpliceReady => {}
         MeshReply::Rpc { response: Response::Error { message } } => bail!(message),
         other => bail!("device {device:?} would not splice: {other:?}"),
@@ -1718,7 +1798,7 @@ async fn serve_splice(
             let refusal = MeshReply::Rpc {
                 response: Response::Error { message: format!("{e:#}") },
             };
-            write_frame(&mut stream.send, &refusal).await?;
+            write_opening(&mut stream.send, &refusal).await?;
             let _ = stream.send.finish();
             return Ok(());
         }
@@ -1727,7 +1807,7 @@ async fn serve_splice(
     let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
         .await
         .with_context(|| format!("connecting to {name:?}'s guest on {host}:{port}"))?;
-    write_frame(&mut stream.send, &MeshReply::SpliceReady).await?;
+    write_opening(&mut stream.send, &MeshReply::SpliceReady).await?;
     pump(tcp, stream).await
 }
 
@@ -1748,12 +1828,12 @@ async fn serve_volume_splice(
             let refusal = MeshReply::Rpc {
                 response: Response::Error { message: format!("{e:#}") },
             };
-            write_frame(&mut stream.send, &refusal).await?;
+            write_opening(&mut stream.send, &refusal).await?;
             let _ = stream.send.finish();
             return Ok(());
         }
     };
-    write_frame(&mut stream.send, &MeshReply::SpliceReady).await?;
+    write_opening(&mut stream.send, &MeshReply::SpliceReady).await?;
     pump(export, stream).await
 }
 
@@ -1819,7 +1899,7 @@ async fn import(
     let peer = mesh.device(from_device).await?;
     let connection = mesh.live_connection(&peer).await?;
     let mut stream = connection.open_stream().await?;
-    write_frame(
+    write_opening(
         &mut stream.send,
         &MeshRequest::MoveExport { name: name.clone(), epoch },
     )
@@ -1886,7 +1966,7 @@ async fn fetch_base(
     let peer = mesh.device(from_device).await?;
     let connection = mesh.live_connection(&peer).await?;
     let mut stream = connection.open_stream().await?;
-    write_frame(
+    write_opening(
         &mut stream.send,
         &MeshRequest::MoveBase { reference: base.reference.clone() },
     )
@@ -1961,7 +2041,7 @@ async fn receive(
     let mut next_report = MOVE_REPORT_EVERY;
 
     loop {
-        match read_frame::<MoveFrame>(recv).await? {
+        match read_move_frame(recv).await? {
             MoveFrame::File { path, len, mode } => {
                 let leaf = rename_to.map(str::to_owned).unwrap_or_else(|| path.clone());
                 let target = safe_join(root, &leaf)?;
@@ -2344,8 +2424,39 @@ async fn serve_peer(connection: MeshConnection, node: Node) {
 
 /// One request frame in, one reply frame out — except a splice, which answers
 /// once and then stops being a request/reply stream at all.
+///
+/// Two things are settled before the frame is looked at, and both of them
+/// answer with a [`MeshReply::Incompatible`] rather than by returning `Err`:
+/// whether the asker's wire is one this daemon speaks, and whether the frame
+/// is one it has heard of. Returning `Err` closes the stream, and a closed
+/// stream reaches the asker as "that device is unreachable" — which during a
+/// rolling upgrade is both untrue and unactionable.
 async fn serve_stream(mut stream: asterism_mesh::MeshStream, node: Node) -> Result<()> {
-    let reply = match read_frame::<MeshRequest>(&mut stream.recv).await? {
+    let opening: Opening<MeshRequest> = read_opening(&mut stream.recv).await?;
+
+    let verdict = compat::negotiate(opening.protocol);
+    if !verdict.speakable() {
+        return refuse(stream, unspeakable_peer(verdict)).await;
+    }
+    let request = match opening.body {
+        Ok(request) => request,
+        // In the window and still unknown, which is the ordinary shape of a
+        // half-upgraded orbit: the window is two versions wide, and the newer
+        // half of it has frames the older half has never seen.
+        Err(why) => {
+            return refuse(
+                stream,
+                format!(
+                    "that device asked for something this one has no frame for ({why}). \
+                     Both are inside the supported window, so this is a command the \
+                     newer half has and the older half does not — upgrade this device."
+                ),
+            )
+            .await
+        }
+    };
+
+    let reply = match request {
         MeshRequest::Ping => MeshReply::Pong,
         MeshRequest::SshSplice { name } => return serve_splice(stream, &node, &name).await,
         MeshRequest::VolumeSplice { volume, holder, epoch } => {
@@ -2398,7 +2509,18 @@ async fn serve_stream(mut stream: asterism_mesh::MeshStream, node: Node) -> Resu
             },
         },
     };
-    write_frame(&mut stream.send, &reply).await?;
+    write_opening(&mut stream.send, &reply).await?;
+    let _ = stream.send.finish();
+    Ok(())
+}
+
+/// Decline a stream in a frame, saying which vintage is declining.
+async fn refuse(mut stream: asterism_mesh::MeshStream, message: String) -> Result<()> {
+    write_opening(
+        &mut stream.send,
+        &MeshReply::Incompatible { min_supported: compat::min_supported(), message },
+    )
+    .await?;
     let _ = stream.send.finish();
     Ok(())
 }
@@ -2406,9 +2528,9 @@ async fn serve_stream(mut stream: asterism_mesh::MeshStream, node: Node) -> Resu
 /// Asks one question on a new stream and reads the answer.
 async fn ask(connection: &MeshConnection, request: &MeshRequest) -> Result<MeshReply> {
     let mut stream = connection.open_stream().await?;
-    write_frame(&mut stream.send, request).await?;
+    write_opening(&mut stream.send, request).await?;
     let _ = stream.send.finish();
-    read_frame(&mut stream.recv).await
+    read_reply(&mut stream.recv).await
 }
 
 // ---- the CLI end of a conversation -----------------------------------------
@@ -2538,6 +2660,110 @@ async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Result<(
     send.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
     send.write_all(&bytes).await?;
     Ok(())
+}
+
+/// Write an opening frame, stamped with what this daemon speaks.
+async fn write_opening<T: Serialize>(send: &mut SendStream, body: &T) -> Result<()> {
+    write_frame(send, &Versioned { protocol: Some(compat::protocol_version()), body }).await
+}
+
+/// What arrived at the top of a stream, whether or not this build knows what
+/// it is.
+///
+/// The version is read before the frame, and separately from it, for the same
+/// reason `durable` reads a document's version before the document: a frame
+/// this daemon cannot parse is exactly the frame whose sender needs to be
+/// told which vintage it is talking to, and a parse that failed cannot say.
+struct Opening<T> {
+    protocol: Option<u32>,
+    /// The frame, or serde's account of why it is not one this build knows.
+    body: Result<T, String>,
+}
+
+async fn read_opening<T: serde::de::DeserializeOwned>(
+    recv: &mut RecvStream,
+) -> Result<Opening<T>> {
+    let raw: serde_json::Value = read_frame(recv).await?;
+    let protocol = raw.get("protocol").and_then(serde_json::Value::as_u64).map(|v| v as u32);
+    let body = serde_json::from_value::<T>(raw).map_err(|e| e.to_string());
+    Ok(Opening { protocol, body })
+}
+
+/// Read a reply, turning the two ways a peer can decline into sentences.
+async fn read_reply(recv: &mut RecvStream) -> Result<MeshReply> {
+    let opening: Opening<MeshReply> = read_opening(recv).await?;
+    match opening.body {
+        Ok(MeshReply::Incompatible { min_supported, message }) => bail!(
+            "{message} (that device speaks Asterism protocol {min_supported}..={}; \
+             this one speaks {}..={})",
+            opening.protocol.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+            compat::min_supported(),
+            compat::protocol_version(),
+        ),
+        Ok(reply) => match compat::negotiate(opening.protocol) {
+            compat::Verdict::Speak => Ok(reply),
+            // It answered rather than refusing, so it thinks it can serve us.
+            // This side disagrees, and the disagreement is the answer: a
+            // reply built by a wire this build does not speak is not a reply
+            // to act on, however well-formed it looks.
+            other => bail!("{}", unspeakable_peer(other)),
+        },
+        Err(why) => bail!("that device sent a reply this build does not understand: {why}"),
+    }
+}
+
+/// The sentence for a peer outside this daemon's window, in either direction.
+fn unspeakable_peer(verdict: compat::Verdict) -> String {
+    match verdict {
+        compat::Verdict::Speak => "that device speaks this wire".to_owned(),
+        compat::Verdict::Unversioned => format!(
+            "that device predates the Asterism protocol version, so it is older than the \
+             {}..={} this one speaks. Upgrade it, or upgrade this device to meet it.",
+            compat::min_supported(),
+            compat::protocol_version(),
+        ),
+        compat::Verdict::TooOld { theirs, min } => format!(
+            "that device speaks Asterism protocol {theirs}, and this one speaks {min}..={}. \
+             It is more than two releases behind; upgrade it.",
+            compat::protocol_version(),
+        ),
+        compat::Verdict::TooNew { theirs, ours } => format!(
+            "that device speaks Asterism protocol {theirs} and this one speaks {ours}. \
+             It is newer; upgrade this device.",
+        ),
+    }
+}
+
+/// Read a frame from a bulk stream — a move's payload — where the far side
+/// may have refused the opening frame instead of starting to send.
+///
+/// A move is the one place the reply to an opening frame is not a
+/// [`MeshReply`]: past the first frame these streams carry [`MoveFrame`]s, so
+/// a peer that declines the move on version grounds sends the one frame shape
+/// the asker is not looking for. Without this, a rolling upgrade caught
+/// mid-move reports `missing field \`frame\`` — a serde message about a
+/// refusal that was perfectly clear when it was written.
+async fn read_move_frame(recv: &mut RecvStream) -> Result<MoveFrame> {
+    let raw: serde_json::Value = read_frame(recv).await?;
+    // `kind` is a reply's tag and `frame` is a move's; nothing has both.
+    if raw.get("kind").is_some() {
+        if let Ok(MeshReply::Incompatible { min_supported, message }) =
+            serde_json::from_value::<MeshReply>(raw.clone())
+        {
+            let theirs = raw
+                .get("protocol")
+                .and_then(serde_json::Value::as_u64)
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "?".into());
+            bail!(
+                "{message} (that device speaks Asterism protocol {min_supported}..={theirs}; \
+                 this one speaks {}..={})",
+                compat::min_supported(),
+                compat::protocol_version(),
+            );
+        }
+    }
+    serde_json::from_value(raw).context("reading a frame of a transfer")
 }
 
 async fn read_frame<T: serde::de::DeserializeOwned>(recv: &mut RecvStream) -> Result<T> {
@@ -2806,6 +3032,159 @@ mod tests {
         assert!(cache.last_seen("desktop").is_empty());
     }
 
+    // ---- version skew on the peer wire ------------------------------------
+    //
+    // Every one of these used to be the same thing on the asker's terminal:
+    // a dropped stream, reported as a device that could not be reached.
+
+    /// A peer from before the protocol version existed. Its frames arrive
+    /// with no `protocol` key at all, which is how [`write_frame`] — the
+    /// unversioned writer a move's payload still uses — writes one.
+    #[tokio::test]
+    async fn a_peer_that_names_no_protocol_is_refused_in_a_frame_it_can_read() {
+        let (client, connection, _dir) = wired().await;
+
+        let mut stream = connection.open_stream().await.unwrap();
+        write_frame(&mut stream.send, &MeshRequest::Ping).await.unwrap();
+
+        // Read past `read_reply`, which would turn this into an error: the
+        // claim under test is that a *frame* came back at all.
+        let opening: Opening<MeshReply> = read_opening(&mut stream.recv).await.unwrap();
+        assert_eq!(opening.protocol, Some(compat::protocol_version()));
+        match opening.body.unwrap() {
+            MeshReply::Incompatible { min_supported, message } => {
+                assert_eq!(min_supported, compat::min_supported());
+                assert!(message.contains("predates"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+
+        connection.close(b"done");
+        client.close().await;
+    }
+
+    /// A frame from inside the window that this build has no variant for:
+    /// the ordinary shape of a half-upgraded orbit, and the case that used to
+    /// close the stream.
+    #[tokio::test]
+    async fn a_frame_from_the_newer_half_of_the_window_is_refused_by_name() {
+        let (client, connection, _dir) = wired().await;
+
+        let mut stream = connection.open_stream().await.unwrap();
+        // Hand-built, because a variant this build does not have is by
+        // definition one that cannot be constructed in this build.
+        write_frame(
+            &mut stream.send,
+            &serde_json::json!({
+                "protocol": compat::protocol_version(),
+                "kind": "quantum_splice",
+                "name": "dev",
+            }),
+        )
+        .await
+        .unwrap();
+
+        let err = read_reply(&mut stream.recv).await.unwrap_err().to_string();
+        assert!(err.contains("no frame for"), "{err}");
+        assert!(err.contains("upgrade this device"), "{err}");
+
+        connection.close(b"done");
+        client.close().await;
+    }
+
+    /// The refusal a peer two releases behind gets, rather than a hang.
+    #[tokio::test]
+    async fn a_peer_below_the_window_is_told_so_rather_than_dropped() {
+        let (client, connection, _dir) = wired().await;
+
+        let mut stream = connection.open_stream().await.unwrap();
+        write_frame(
+            &mut stream.send,
+            &serde_json::json!({ "protocol": 0, "kind": "ping" }),
+        )
+        .await
+        .unwrap();
+
+        let err = read_reply(&mut stream.recv).await.unwrap_err().to_string();
+        assert!(err.contains("protocol 0"), "{err}");
+        assert!(err.contains("upgrade it"), "{err}");
+
+        connection.close(b"done");
+        client.close().await;
+    }
+
+    /// The asymmetric half: a peer from the future is refused, and the
+    /// refusal tells the *asker* to upgrade rather than the peer.
+    #[tokio::test]
+    async fn a_peer_from_the_future_is_refused_and_this_device_is_the_one_told_to_upgrade() {
+        let (client, connection, _dir) = wired().await;
+
+        let mut stream = connection.open_stream().await.unwrap();
+        write_frame(
+            &mut stream.send,
+            &serde_json::json!({
+                "protocol": compat::protocol_version() + 1,
+                "kind": "ping",
+            }),
+        )
+        .await
+        .unwrap();
+
+        let err = read_reply(&mut stream.recv).await.unwrap_err().to_string();
+        assert!(err.contains("It is newer; upgrade this device"), "{err}");
+
+        connection.close(b"done");
+        client.close().await;
+    }
+
+    /// A move is the one stream whose reply is not a [`MeshReply`], so a
+    /// refusal on one has to be recognised rather than parsed as payload.
+    #[tokio::test]
+    async fn a_refusal_on_a_move_stream_is_read_as_a_refusal_and_not_as_payload() {
+        let (client, connection, _dir) = wired().await;
+
+        let mut stream = connection.open_stream().await.unwrap();
+        // An unversioned opening frame, which the far side refuses — and it
+        // refuses in the shape a request/reply stream expects, on a stream
+        // that is about to carry `MoveFrame`s.
+        write_frame(
+            &mut stream.send,
+            &MeshRequest::MoveBase { reference: "debian:13".into() },
+        )
+        .await
+        .unwrap();
+
+        let err = read_move_frame(&mut stream.recv).await.unwrap_err().to_string();
+        assert!(err.contains("predates"), "{err}");
+        assert!(
+            !err.contains("missing field"),
+            "the refusal came back as a serde message about the frame shape: {err}"
+        );
+
+        connection.close(b"done");
+        client.close().await;
+    }
+
+    /// The envelope is additive: the frame underneath is the same object it
+    /// always was, so a build that ignores `protocol` still reads it.
+    #[test]
+    fn the_version_rides_beside_the_frame_rather_than_in_front_of_it() {
+        let wire = serde_json::to_value(Versioned {
+            protocol: Some(7),
+            body: &MeshRequest::SshSplice { name: "dev".into() },
+        })
+        .unwrap();
+        assert_eq!(wire["protocol"], 7);
+        assert_eq!(wire["kind"], "ssh_splice");
+        assert_eq!(wire["name"], "dev");
+
+        // And a frame written before the key existed still parses.
+        let old = serde_json::json!({ "kind": "ssh_splice", "name": "dev" });
+        let opening: Versioned<MeshRequest> = serde_json::from_value(old).unwrap();
+        assert_eq!(opening.protocol, None);
+        assert!(matches!(opening.body, MeshRequest::SshSplice { name } if name == "dev"));
+    }
+
     /// The one frame that turns a stream into a pipe has to refuse in words
     /// before it stops speaking words — a splice that just hangs would look
     /// to the user like ssh dialling into nothing.
@@ -2814,10 +3193,10 @@ mod tests {
         let (client, connection, _dir) = wired().await;
 
         let mut stream = connection.open_stream().await.unwrap();
-        write_frame(&mut stream.send, &MeshRequest::SshSplice { name: "ghost".into() })
+        write_opening(&mut stream.send, &MeshRequest::SshSplice { name: "ghost".into() })
             .await
             .unwrap();
-        let reply: MeshReply = read_frame(&mut stream.recv).await.unwrap();
+        let reply = read_reply(&mut stream.recv).await.unwrap();
 
         match reply {
             MeshReply::Rpc { response: Response::Error { message } } => {

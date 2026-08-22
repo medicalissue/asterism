@@ -27,7 +27,7 @@ use crate::{instance, paths};
 /// stage, and a unit that regenerates missing host keys at boot.
 /// 4: secrets egress — the per-instance CA, the proxy environment, and the
 /// opaque handles that stand in for values.
-const SEED_TEMPLATE_VERSION: u32 = 4;
+pub const SEED_TEMPLATE_VERSION: u32 = 4;
 
 /// One locally-hosted volume, resolved into everything the two sides of a
 /// directory share have to agree on.

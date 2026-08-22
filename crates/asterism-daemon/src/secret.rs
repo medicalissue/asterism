@@ -32,7 +32,7 @@ use asterism_mesh::DeviceIdentity;
 use crate::mesh::Mesh;
 use crate::Node;
 
-const CATALOG_VERSION: u32 = 1;
+use asterism_core::compat::CATALOG_VERSION;
 #[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "dev.asterism.secret";
 

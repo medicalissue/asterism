@@ -6,6 +6,30 @@
 //! and its position in the enum is not — so frames may be reordered and
 //! regrouped freely, and only a rename or a field change is a break.
 //!
+//! ### What survives a version skew, and what does not
+//!
+//! The two rules are not symmetric, and the asymmetry is deliberate rather
+//! than accidental — it is why `#[serde(default)]` appears on almost every
+//! field added after the fact, and why a new capability is a new *variant*
+//! rather than a new flag on an old one.
+//!
+//! * An unknown **field** is dropped in silence. Serde ignores what it was
+//!   not asked for, so a frame from a newer build arrives at an older one
+//!   with its extra fields gone. That is safe only when the field is an
+//!   addition the receiver can correctly ignore, which is exactly what
+//!   `#[serde(default)]` on the sender's side asserts. A field whose absence
+//!   would change what a frame *means* may not be added this way.
+//! * An unknown **variant** is a hard error, by name. There is no default to
+//!   fall back to and no sensible thing to do with a command that has never
+//!   been heard of, so serde refuses it and the daemon reports the refusal.
+//!   [`is_unknown_variant_error`] classifies that text, and the CLI turns it
+//!   into a daemon upgrade rather than a serde error on a user's terminal.
+//!
+//! Which is the whole reason [`Request::AttachBlock`] is not a flag on
+//! [`Request::AttachVolume`]: as a flag it would be dropped and the wrong
+//! thing recorded, and as a variant it is refused by name. Both halves of that
+//! are asserted in this module's tests.
+//!
 //! This module is a directory rather than a file because the two enums are
 //! the one thing every feature branch has to edit. The variants are banded
 //! into the same areas the CLI and the daemon are split along, so two branches
@@ -634,13 +658,26 @@ impl Request {
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Response {
     Ok,
-    /// Reply to [`Request::Ping`], carrying the daemon's crate version.
+    /// Reply to [`Request::Ping`]: what the daemon is, and what it speaks.
     ///
-    /// A daemon older than this variant answers `Ping` with plain `Ok`, so
-    /// the *absence* of a version is itself the mismatch signal — which is
-    /// what makes this a backward-compatible change rather than a break.
+    /// Two numbers, and they answer different questions. `version` is the
+    /// crate version, which is what a user recognises and what a bug report
+    /// needs. `protocol` is [`compat::PROTOCOL_VERSION`], which is the only
+    /// one compatibility is decided on — a patch release moves `version` and
+    /// leaves `protocol` alone, and a daemon in that position is talked to
+    /// rather than replaced.
+    ///
+    /// `protocol` is `None` from any daemon built before the number existed,
+    /// and that absence is the signal: such a daemon predates the window it
+    /// would have to be inside. A daemon older still answers `Ping` with plain
+    /// `Ok`, and one older than *that* refuses the variant by name. All three
+    /// are the same conclusion reached three ways.
+    ///
+    /// [`compat::PROTOCOL_VERSION`]: crate::compat::PROTOCOL_VERSION
     Pong {
         version: String,
+        #[serde(default)]
+        protocol: Option<u32>,
     },
 
     // ---- instances -----------------------------------------------------------
@@ -875,8 +912,77 @@ mod tests {
         let old: Response = serde_json::from_str(r#"{"result":"ok"}"#).unwrap();
         assert!(matches!(old, Response::Ok));
         // What this one sends.
-        let new: Response = serde_json::from_str(r#"{"result":"pong","version":"0.0.2"}"#).unwrap();
-        assert!(matches!(new, Response::Pong { version } if version == "0.0.2"));
+        let new: Response =
+            serde_json::from_str(r#"{"result":"pong","version":"0.0.2","protocol":1}"#).unwrap();
+        assert!(
+            matches!(new, Response::Pong { version, protocol } if version == "0.0.2"
+                && protocol == Some(1))
+        );
+    }
+
+    /// The three ways a daemon can decline to name a protocol, and the one
+    /// conclusion all three reach. Each is a different vintage of `astd`, and
+    /// the CLI has to reach "older than the number itself" from every one of
+    /// them without a special case per release.
+    #[test]
+    fn a_daemon_from_before_the_protocol_version_says_so_by_omission() {
+        // New enough to Pong, too old to have a protocol.
+        let pong: Response =
+            serde_json::from_str(r#"{"result":"pong","version":"0.0.1"}"#).unwrap();
+        assert!(matches!(pong, Response::Pong { protocol: None, .. }));
+        // Older: Ping is a variant it has, but Pong is not one it sends.
+        assert!(matches!(serde_json::from_str::<Response>(r#"{"result":"ok"}"#), Ok(Response::Ok)));
+        // Older still: it has never heard of Ping.
+        assert!(is_unknown_variant_error("bad request: unknown variant `ping`"));
+    }
+
+    // ---- the forward-compatibility policy, asserted --------------------------
+    //
+    // Stated at the top of this module, and these are what make it true rather
+    // than aspirational. They are two tests because they are two rules, and
+    // the whole design of the wire rests on them being different rules.
+
+    #[test]
+    fn a_field_from_a_newer_build_is_dropped_rather_than_refused() {
+        // What an `ast create` from a build with one more flag would send.
+        let wire = r#"{"cmd":"create","name":"dev","image":"debian:13",
+            "shape":{"cpus":2,"mem_mib":2048,"disk_gib":10},"gpu":"passthrough"}"#;
+        let decoded: Request = serde_json::from_str(wire).unwrap();
+        assert!(
+            matches!(decoded, Request::Create { name, .. } if name == "dev"),
+            "an unknown field has to be ignored, or every added flag is a break"
+        );
+    }
+
+    #[test]
+    fn a_variant_from_a_newer_build_is_refused_by_name_rather_than_dropped() {
+        let wire = r#"{"cmd":"attach_gpu","name":"dev","device":"0000:01:00.0"}"#;
+        let err = serde_json::from_str::<Request>(wire).unwrap_err().to_string();
+        assert!(
+            is_unknown_variant_error(&err),
+            "a command this build has never heard of must be refused in the words the \
+             CLI classifies, not accepted as something else: {err}"
+        );
+    }
+
+    /// Why [`Request::AttachBlock`] is a variant and not a flag on
+    /// [`Request::AttachVolume`], demonstrated rather than asserted in a
+    /// comment: as a flag it would be dropped by the two rules above and the
+    /// wrong thing recorded.
+    #[test]
+    fn a_capability_added_as_a_flag_would_have_been_silently_ignored() {
+        let as_a_flag = r#"{"cmd":"attach_volume","name":"dev","path":"tank",
+            "host":null,"block":true}"#;
+        let decoded: Request = serde_json::from_str(as_a_flag).unwrap();
+        assert!(
+            matches!(decoded, Request::AttachVolume { path, .. } if path == "tank"),
+            "the flag vanished and a directory share was recorded — which is why \
+             AttachBlock is its own variant"
+        );
+
+        let as_a_variant = r#"{"cmd":"attach_block","name":"dev","volume":"tank",
+            "device":"desktop"}"#;
+        assert!(serde_json::from_str::<Request>(as_a_variant).is_ok());
     }
 
     #[test]

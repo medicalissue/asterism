@@ -86,6 +86,27 @@ State lives in `~/.asterism` (override with `ASTERISM_HOME`).
 Workspace: `asterism-core` · `asterism-daemon` (`astd`) ·
 `asterism-cli` (`ast`) · `asterism-mesh`.
 
+## Upgrades
+
+The wire between `ast`, `astd` and another device's `astd` carries a
+protocol version of its own, separate from the release number. A build
+speaks that version and the two before it, so a patch release leaves a
+running daemon alone and a device that is two releases behind is still a
+peer rather than an outage.
+
+The asymmetry is the point. A daemon **older** than the window is
+replaced, because restarting it is the upgrade — and guests survive it,
+since they are separate processes the new daemon adopts. A daemon
+**newer** is refused and never signalled: it may hold state this build
+would drop, so the sentence you get says to upgrade rather than doing
+something about it. The same rule runs on a `$ASTERISM_HOME`, checked
+before a single store is opened, and between two devices that have
+skewed since they were paired.
+
+```console
+$ ast compat        # what this build speaks, and what is running and on disk
+```
+
 ## The mesh, and what it publishes
 
 Paired devices find each other by public key, so an orbit works when the
