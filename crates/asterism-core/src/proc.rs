@@ -726,7 +726,7 @@ fn boot_time_us() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
+    use std::process::{Child, Command, Stdio};
 
     /// A process that is definitely there for the length of the test.
     fn sleeper() -> std::process::Child {
@@ -958,8 +958,30 @@ mod tests {
 
     /// A process holding a path, the way a guest's qemu holds its monitor:
     /// on its own command line, where the kernel recorded it.
-    fn holder(path: &Path) -> std::process::Child {
-        Command::new("sleep").arg("30").arg(path).spawn().unwrap()
+    ///
+    /// `sleep 30 <path>` is not a fixture: GNU sleep treats the path as an
+    /// invalid second duration and exits immediately, while other sleep
+    /// implementations disagree about extra operands. `tail -f` is a
+    /// portable Unix long-lived helper and keeps the path in its own argv.
+    /// Return the executable name observed from the kernel as well, since
+    /// `/usr/bin/tail` and `/bin/tail` are both valid installations.
+    fn holder(path: &Path) -> (Child, String) {
+        let child = Command::new("tail")
+            .args(["-f", "/dev/null"])
+            .arg(path)
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let exec = ProcId::capture(child.id())
+            .unwrap()
+            .exec
+            .expect("the fixture executable should be readable");
+        let exec = exec
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("the fixture executable should have a UTF-8 name")
+            .to_owned();
+        (child, exec)
     }
 
     fn evidence<'a>(exec: &'a [&'a str], names: &'a [&'a Path]) -> Evidence<'a> {
@@ -969,10 +991,10 @@ mod tests {
     #[test]
     fn adoption_takes_a_process_carrying_something_only_this_instance_owns() {
         let ctl = PathBuf::from("/tmp/asterism-adopt-test/instances/dev/qmp.sock");
-        let mut child = holder(&ctl);
+        let (mut child, exec) = holder(&ctl);
         let now = crate::instance::now_unix();
 
-        let adopted = ProcId::adopt(child.id(), now, &evidence(&["sleep"], &[&ctl])).unwrap();
+        let adopted = ProcId::adopt(child.id(), now, &evidence(&[exec.as_str()], &[&ctl])).unwrap();
         assert_eq!(adopted.pid, child.id());
         assert!(adopted.alive());
 
@@ -996,16 +1018,16 @@ mod tests {
         let legacy_started_at = crate::instance::now_unix();
 
         // Somebody else's qemu, started 30s later, serving its own instance.
-        // `sleep` stands in for the binary; the executable family is checked
+        // `tail` stands in for the binary; the executable family is checked
         // separately and is not what this test turns on.
         let theirs = PathBuf::from("/tmp/asterism-adopt-test/instances/theirs/qmp.sock");
-        let mut foreign = holder(&theirs);
+        let (mut foreign, exec) = holder(&theirs);
         let started_30s_later = legacy_started_at + 30;
 
         let why = ProcId::adopt(
             foreign.id(),
             started_30s_later,
-            &evidence(&["sleep"], &[&ours]),
+            &evidence(&[exec.as_str()], &[&ours]),
         )
         .unwrap_err();
         assert!(
@@ -1039,12 +1061,12 @@ mod tests {
     fn a_foreign_vz_helper_started_after_the_handle_is_not_adopted() {
         let ours = PathBuf::from("/tmp/asterism-adopt-test/instances/ours/vz.json");
         let theirs = PathBuf::from("/tmp/asterism-adopt-test/instances/theirs/vz.json");
-        let mut foreign = holder(&theirs);
+        let (mut foreign, exec) = holder(&theirs);
 
         let why = ProcId::adopt(
             foreign.id(),
             crate::instance::now_unix() + 30,
-            &evidence(&["sleep"], &[&ours]),
+            &evidence(&[exec.as_str()], &[&ours]),
         )
         .unwrap_err();
         assert!(why.contains("not started for this instance"), "{why}");
@@ -1059,12 +1081,12 @@ mod tests {
     fn a_neighbouring_instance_is_not_this_one() {
         let ours = PathBuf::from("/tmp/asterism-adopt-test/instances/dev/qmp.sock");
         let neighbour = PathBuf::from("/tmp/asterism-adopt-test/instances/dev2/qmp.sock");
-        let mut foreign = holder(&neighbour);
+        let (mut foreign, exec) = holder(&neighbour);
 
         assert!(ProcId::adopt(
             foreign.id(),
             crate::instance::now_unix(),
-            &evidence(&["sleep"], &[&ours])
+            &evidence(&[exec.as_str()], &[&ours])
         )
         .is_err());
 
@@ -1092,11 +1114,11 @@ mod tests {
     #[test]
     fn adoption_refuses_a_process_running_something_else() {
         let ctl = PathBuf::from("/tmp/asterism-adopt-test/instances/dev/qmp.sock");
-        let mut child = holder(&ctl);
+        let (mut child, _exec) = holder(&ctl);
         let now = crate::instance::now_unix();
         let why =
             ProcId::adopt(child.id(), now, &evidence(&["qemu-system-*"], &[&ctl])).unwrap_err();
-        assert!(why.contains("sleep"), "{why}");
+        assert!(why.contains("not qemu-system-*"), "{why}");
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -1107,9 +1129,10 @@ mod tests {
     #[test]
     fn adoption_refuses_a_process_that_started_after_the_handle() {
         let ctl = PathBuf::from("/tmp/asterism-adopt-test/instances/dev/qmp.sock");
-        let mut child = holder(&ctl);
+        let (mut child, exec) = holder(&ctl);
         let long_ago = crate::instance::now_unix() - 3600;
-        let why = ProcId::adopt(child.id(), long_ago, &evidence(&["sleep"], &[&ctl])).unwrap_err();
+        let why =
+            ProcId::adopt(child.id(), long_ago, &evidence(&[exec.as_str()], &[&ctl])).unwrap_err();
         assert!(why.contains("different process"), "{why}");
         let _ = child.kill();
         let _ = child.wait();
