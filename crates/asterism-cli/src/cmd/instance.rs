@@ -58,10 +58,10 @@ pub(crate) enum Commands {
         /// Disk size, e.g. 20G.
         #[arg(long, default_value = "20G")]
         disk: String,
-        /// Hypervisor to run this instance on: `qemu` (default) or `vz`,
-        /// Apple's Virtualization.framework — faster to boot and needing no
-        /// `brew install qemu`, on macOS 14+ with a signed helper. Recorded
-        /// on the instance and used for every later boot.
+        /// Hypervisor to run this instance on: `qemu`, `vz` on macOS, or the
+        /// native `hyperv` backend on supported Windows hosts. If omitted,
+        /// the daemon selects the first capable backend. Recorded on the
+        /// instance and used for every later boot.
         #[arg(long, value_name = "NAME")]
         backend: Option<String>,
     },

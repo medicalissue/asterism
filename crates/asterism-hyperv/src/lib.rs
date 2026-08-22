@@ -17,6 +17,17 @@ pub const OWNER: &str = "asterism";
 pub const GUEST_PORT: u32 = 1023;
 pub const GUEST_SERVICE_ID: &str = "000003ff-facb-11e6-bd58-64006a7986d3";
 
+/// Immutable identity shared by the daemon-side protocol crate and helper.
+/// Release builds set `ASTERISM_BUILD_ID` to their source commit. A source
+/// build without an explicit identity is honest about the weaker guarantee.
+pub fn build_id() -> String {
+    format!(
+        "{}+{}",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("ASTERISM_BUILD_ID").unwrap_or("unknown")
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VmConfig {
     pub protocol: u32,
@@ -24,6 +35,8 @@ pub struct VmConfig {
     pub system_id: String,
     pub instance: String,
     pub root_vhdx: PathBuf,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data_vhdx: Vec<DiskAttachment>,
     pub seed_iso: PathBuf,
     pub console: PathBuf,
     pub cpus: u32,
@@ -35,6 +48,13 @@ pub struct VmConfig {
     pub agent_key: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore_state: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskAttachment {
+    pub path: PathBuf,
+    #[serde(default)]
+    pub readonly: bool,
 }
 
 impl VmConfig {
@@ -69,11 +89,38 @@ impl VmConfig {
         Ok(())
     }
 
+    pub fn read(path: &std::path::Path) -> Result<Self> {
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("reading the Hyper-V config at {}", path.display()))?;
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing the Hyper-V config at {}", path.display()))
+    }
+
+    pub fn write(&self, path: &std::path::Path) -> Result<()> {
+        self.validate()?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, serde_json::to_vec_pretty(self)?)
+            .with_context(|| format!("writing the Hyper-V config at {}", path.display()))
+    }
+
     /// HCS schema 2.1 document. Kept on the protocol side so every platform's
     /// unit tests can inspect the exact Windows configuration without linking
     /// ComputeCore. Only the helper submits it.
     pub fn hcs_document(&self) -> Result<String> {
         self.validate()?;
+        let mut attachments = serde_json::json!({
+            "0": { "Type": "VirtualDisk", "Path": self.root_vhdx },
+            "1": { "Type": "Iso", "Path": self.seed_iso, "ReadOnly": true }
+        });
+        for (index, disk) in self.data_vhdx.iter().enumerate() {
+            attachments[(index + 2).to_string()] = serde_json::json!({
+                "Type": "VirtualDisk",
+                "Path": disk.path,
+                "ReadOnly": disk.readonly
+            });
+        }
         let mut vm = serde_json::json!({
             "StopOnReset": true,
             "Chipset": {
@@ -100,10 +147,7 @@ impl VmConfig {
                 },
                 "Scsi": {
                     "root": {
-                        "Attachments": {
-                            "0": { "Type": "VirtualDisk", "Path": self.root_vhdx },
-                            "1": { "Type": "Iso", "Path": self.seed_iso, "ReadOnly": true }
-                        }
+                        "Attachments": attachments
                     }
                 },
                 "NetworkAdapters": {
@@ -115,7 +159,11 @@ impl VmConfig {
                 "HvSocket": {
                     "HvSocketConfig": {
                         "ServiceTable": {
-                            GUEST_SERVICE_ID: { "AllowWildcardBinds": false, "Disabled": false }
+                            GUEST_SERVICE_ID: {
+                                "AllowWildcardBinds": false,
+                                "BindSecurityDescriptor": "D:P(A;;FA;;;SY)(A;;FA;;;BA)",
+                                "ConnectSecurityDescriptor": "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
+                            }
                         }
                     }
                 }
@@ -173,12 +221,30 @@ impl VmConfig {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
     Probe,
-    MaterializeVhdx { source_raw: PathBuf, dest_vhdx: PathBuf },
-    Boot { config: VmConfig },
-    State { system_id: String },
-    Shutdown { system_id: String, timeout_ms: u32 },
-    Terminate { system_id: String },
-    Save { system_id: String, state_path: PathBuf },
+    MaterializeVhdx {
+        source_raw: PathBuf,
+        dest_vhdx: PathBuf,
+        size_bytes: u64,
+    },
+    Boot {
+        config: Box<VmConfig>,
+    },
+    State {
+        system_id: String,
+    },
+    Shutdown {
+        system_id: String,
+        timeout_ms: u32,
+    },
+    Terminate {
+        system_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        endpoint_id: Option<String>,
+    },
+    Save {
+        system_id: String,
+        state_path: PathBuf,
+    },
 }
 
 impl Request {
@@ -208,10 +274,30 @@ impl HostReady {
                 PROTOCOL_VERSION
             );
         }
+        let expected_build = build_id();
+        if self.build != expected_build {
+            bail!(
+                "astd-hyperv is build {}, but astd expects {}; reinstall the complete Windows artifact",
+                self.build,
+                expected_build
+            );
+        }
         if !self.edition.contains("Pro") && !self.edition.contains("Enterprise") {
             bail!(
                 "the native Hyper-V backend needs Windows 11 Pro or Enterprise; this is {}",
                 self.edition
+            );
+        }
+        let build = self
+            .windows
+            .rsplit('.')
+            .next()
+            .and_then(|part| part.parse::<u32>().ok())
+            .context("the Windows probe did not return a numeric build")?;
+        if build < 22_000 {
+            bail!(
+                "the native Hyper-V backend needs Windows 11 build 22000 or newer; this is {}",
+                self.windows
             );
         }
         if !self.elevated {
@@ -292,8 +378,22 @@ pub fn format_guid(bytes: [u8; 16]) -> String {
     let h = bytes.map(|byte| format!("{byte:02x}"));
     format!(
         "{}{}{}{}-{}{}-{}{}-{}{}-{}{}{}{}{}{}",
-        h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9], h[10], h[11],
-        h[12], h[13], h[14], h[15]
+        h[0],
+        h[1],
+        h[2],
+        h[3],
+        h[4],
+        h[5],
+        h[6],
+        h[7],
+        h[8],
+        h[9],
+        h[10],
+        h[11],
+        h[12],
+        h[13],
+        h[14],
+        h[15]
     )
 }
 
@@ -322,7 +422,8 @@ mod tests {
         let wire = serde_json::to_vec(&request).unwrap();
         assert_eq!(request, serde_json::from_slice(&wire).unwrap());
         assert!(Request::Terminate {
-            system_id: "6fce7c98-d05d-43c8-8207-141c56ccca18".into()
+            system_id: "6fce7c98-d05d-43c8-8207-141c56ccca18".into(),
+            endpoint_id: None,
         }
         .mutates());
     }
@@ -331,7 +432,7 @@ mod tests {
     fn unsupported_host_is_rejected_before_mutation() {
         let host = HostReady {
             protocol: PROTOCOL_VERSION,
-            build: "test".into(),
+            build: build_id(),
             windows: "11.0.26100".into(),
             edition: "Windows 11 Home".into(),
             elevated: true,
@@ -346,6 +447,21 @@ mod tests {
     }
 
     #[test]
+    fn a_helper_from_another_build_is_rejected() {
+        let host = HostReady {
+            protocol: PROTOCOL_VERSION,
+            build: "0.0.2+another-source".into(),
+            windows: "11.0.26100".into(),
+            edition: "Windows 11 Pro".into(),
+            elevated: true,
+            hcs_running: true,
+            hcn_running: true,
+        };
+        let error = host.require_supported().unwrap_err().to_string();
+        assert!(error.contains("reinstall the complete Windows artifact"), "{error}");
+    }
+
+    #[test]
     fn ids_are_canonical_protocol_data() {
         let id = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
         assert_eq!(parse_guid(&format_guid(id)).unwrap(), id);
@@ -355,11 +471,9 @@ mod tests {
     #[test]
     fn errors_stay_machine_readable_at_the_helper_boundary() {
         let mut output = Vec::new();
-        serve_once(
-            br#"{"op":"probe"}"#.as_slice(),
-            &mut output,
-            |_| anyhow::bail!("Hyper-V is disabled"),
-        )
+        serve_once(br#"{"op":"probe"}"#.as_slice(), &mut output, |_| {
+            anyhow::bail!("Hyper-V is disabled")
+        })
         .unwrap();
         assert_eq!(
             serde_json::from_slice::<Reply>(&output).unwrap(),
@@ -376,6 +490,10 @@ mod tests {
             system_id: "6fce7c98-d05d-43c8-8207-141c56ccca18".into(),
             instance: "dev".into(),
             root_vhdx: r"C:\Users\me\.asterism\instances\dev\disk.vhdx".into(),
+            data_vhdx: vec![DiskAttachment {
+                path: r"C:\Users\me\.asterism\instances\dev\data.vhdx".into(),
+                readonly: true,
+            }],
             seed_iso: r"C:\Users\me\.asterism\instances\dev\seed.iso".into(),
             console: r"\\.\pipe\asterism-dev-console".into(),
             cpus: 2,
@@ -391,17 +509,27 @@ mod tests {
 
     #[test]
     fn hcs_document_is_generation_two_durable_and_native() {
-        let doc: serde_json::Value = serde_json::from_str(&config().hcs_document().unwrap()).unwrap();
-        assert_eq!(doc["SchemaVersion"], serde_json::json!({"Major": 2, "Minor": 1}));
+        let doc: serde_json::Value =
+            serde_json::from_str(&config().hcs_document().unwrap()).unwrap();
+        assert_eq!(
+            doc["SchemaVersion"],
+            serde_json::json!({"Major": 2, "Minor": 1})
+        );
         assert_eq!(doc["ShouldTerminateOnLastHandleClosed"], false);
         assert_eq!(
             doc["VirtualMachine"]["Devices"]["Scsi"]["root"]["Attachments"]["0"]["Type"],
             "VirtualDisk"
         );
+        let service = &doc["VirtualMachine"]["Devices"]["HvSocket"]["HvSocketConfig"]
+            ["ServiceTable"][GUEST_SERVICE_ID];
+        assert_eq!(service["AllowWildcardBinds"], false);
         assert_eq!(
-            doc["VirtualMachine"]["Devices"]["HvSocket"]["HvSocketConfig"]
-                ["ServiceTable"][GUEST_SERVICE_ID]["Disabled"],
-            false
+            service["BindSecurityDescriptor"],
+            "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
+        );
+        assert_eq!(
+            doc["VirtualMachine"]["Devices"]["Scsi"]["root"]["Attachments"]["2"]["ReadOnly"],
+            true
         );
         let text = doc.to_string().to_ascii_lowercase();
         assert!(!text.contains("qemu"));
