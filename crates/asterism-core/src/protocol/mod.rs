@@ -742,6 +742,10 @@ impl Request {
     /// [`compat::PROTOCOL_VERSION`]: crate::compat::PROTOCOL_VERSION
     pub fn since(&self) -> u32 {
         match self {
+            // A proxy is only an address on an otherwise unchanged request.
+            // The receiving daemon must parse the enclosed frame, so the
+            // envelope cannot be spoken at an earlier protocol than it.
+            Request::Proxy { inner, .. } => inner.since(),
             Request::Compat => 2,
             Request::BackupExport { .. } | Request::BackupImport { .. } => 3,
             Request::DeviceShellStatus => 5,
@@ -766,6 +770,9 @@ impl Request {
     /// position.
     pub fn versioned_name(&self) -> Option<&'static str> {
         match self {
+            // Name the frame the user asked for, rather than its transparent
+            // routing envelope, in a compatibility refusal.
+            Request::Proxy { inner, .. } => inner.versioned_name(),
             Request::Compat => Some("compat"),
             Request::BackupExport { .. } => Some("backup_export"),
             Request::BackupImport { .. } => Some("backup_import"),
@@ -1348,6 +1355,27 @@ mod tests {
             .unwrap(),
             r#"{"cmd":"image_pull","reference":"ubuntu:24.04"}"#
         );
+    }
+
+    #[test]
+    fn a_proxy_inherits_its_inner_frames_protocol_floor_and_name() {
+        let proxied_images = Request::Proxy {
+            device: "nas".into(),
+            inner: Box::new(Request::ImageList),
+        };
+        assert_eq!(proxied_images.since(), 6);
+        assert_eq!(proxied_images.versioned_name(), Some("image_list"));
+        assert!(!proxied_images.speakable_at(5));
+        assert!(proxied_images.speakable_at(6));
+
+        // Routing does not make an old request newer.
+        let proxied_list = Request::Proxy {
+            device: "nas".into(),
+            inner: Box::new(Request::List),
+        };
+        assert_eq!(proxied_list.since(), crate::compat::FIRST_PROTOCOL);
+        assert_eq!(proxied_list.versioned_name(), None);
+        assert!(proxied_list.speakable_at(crate::compat::FIRST_PROTOCOL));
     }
 
     #[test]

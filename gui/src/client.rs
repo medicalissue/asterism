@@ -96,13 +96,7 @@ pub fn devices() -> Result<Vec<DeviceStatus>> {
 /// may cross the authenticated mesh; policy mutation has no corresponding
 /// remote helper.
 pub fn device_shell_status(device: Option<&str>) -> Result<ShellPolicyStatus> {
-    let request = match device {
-        Some(device) => Request::Proxy {
-            device: device.to_owned(),
-            inner: Box::new(Request::DeviceShellStatus),
-        },
-        None => Request::DeviceShellStatus,
-    };
+    let request = device_shell_status_request(device);
     let mut response = send_with(&request, ORBIT_TIMEOUT)?;
     // Protocol 4 exposed local status through the policy frame. Preserve
     // that read during a rolling upgrade, but never use the local-only frame
@@ -110,12 +104,24 @@ pub fn device_shell_status(device: Option<&str>) -> Result<ShellPolicyStatus> {
     if device.is_none()
         && matches!(&response, Response::Error { message } if protocol::is_unknown_variant_error(message))
     {
-        response = send(&Request::DeviceShellPolicy { action: ShellPolicyAction::Status })?;
+        response = send(&Request::DeviceShellPolicy {
+            action: ShellPolicyAction::Status,
+        })?;
     }
     match response {
         Response::DeviceShellStatus { status, .. } => Ok(status),
         Response::Error { message } => bail!(message),
         other => bail!("unexpected reply from astd: {other:?}"),
+    }
+}
+
+fn device_shell_status_request(device: Option<&str>) -> Request {
+    match device {
+        Some(device) => Request::Proxy {
+            device: device.to_owned(),
+            inner: Box::new(Request::DeviceShellStatus),
+        },
+        None => Request::DeviceShellStatus,
     }
 }
 
@@ -148,8 +154,13 @@ fn device_shell_policy_request(enabled: bool) -> Request {
 /// running and cannot tell us which build it is.
 pub fn daemon_build() -> Result<(String, Option<String>)> {
     let ours = compat::ours();
-    match send(&Request::Ping { protocol: ours.max, min_protocol: ours.min })? {
-        Response::Pong { version, build_id, .. } => Ok((version, build_id)),
+    match send(&Request::Ping {
+        protocol: ours.max,
+        min_protocol: ours.min,
+    })? {
+        Response::Pong {
+            version, build_id, ..
+        } => Ok((version, build_id)),
         Response::Ok => Ok(("older than 0.0.2".to_owned(), None)),
         Response::Error { message } => bail!(message),
         other => bail!("unexpected reply from astd: {other:?}"),
@@ -184,12 +195,17 @@ fn create_request(name: &str, image: &str, shape: Shape, backend: Option<&str>) 
 
 /// Boot an instance.
 pub fn up(name: &str) -> Result<()> {
-    expect_done(&Request::Up { name: name.to_owned(), restart: None })
+    expect_done(&Request::Up {
+        name: name.to_owned(),
+        restart: None,
+    })
 }
 
 /// Shut an instance down.
 pub fn down(name: &str) -> Result<()> {
-    expect_done(&Request::Down { name: name.to_owned() })
+    expect_done(&Request::Down {
+        name: name.to_owned(),
+    })
 }
 
 /// Take a disk snapshot. The daemon refuses this on a running instance;
@@ -216,7 +232,10 @@ pub fn snapshot_restore(name: &str, tag: &str) -> Result<()> {
 
 /// The tail of an instance's guest console, routed across the orbit by astd.
 pub fn logs(name: &str, lines: u32) -> Result<(String, bool)> {
-    match send(&Request::Logs { name: name.to_owned(), lines })? {
+    match send(&Request::Logs {
+        name: name.to_owned(),
+        lines,
+    })? {
         Response::Log { text, truncated } => Ok((text, truncated)),
         Response::Error { message } => bail!(message),
         other => bail!("unexpected reply from astd: {other:?}"),
@@ -224,9 +243,11 @@ pub fn logs(name: &str, lines: u32) -> Result<(String, bool)> {
 }
 
 pub fn backup(name: &str) -> Result<ExportReport> {
-    let destination = paths::home_dir()
-        .join("backups")
-        .join(format!("{}-{}", name, asterism_core::instance::now_unix()));
+    let destination = paths::home_dir().join("backups").join(format!(
+        "{}-{}",
+        name,
+        asterism_core::instance::now_unix()
+    ));
     match send_with(
         &Request::BackupExport {
             name: name.to_owned(),
@@ -248,7 +269,9 @@ pub fn restore_backup(source: &str, name: Option<&str>) -> Result<RestoreReport>
         std::env::current_dir()?.join(source)
     };
     let manifest = asterism_core::backup::inspect(&source)?;
-    let name = name.filter(|name| !name.is_empty()).unwrap_or(&manifest.instance.name);
+    let name = name
+        .filter(|name| !name.is_empty())
+        .unwrap_or(&manifest.instance.name);
     match send_with(
         &Request::BackupImport {
             source: source.display().to_string(),
@@ -278,7 +301,9 @@ pub fn volumes() -> Result<Vec<BlockVolume>> {
 /// tags rather than rows, and wants them cached — [`snapshot_tags`] is the
 /// way in.
 fn snapshots(name: &str) -> Result<Vec<Snapshot>> {
-    match send(&Request::SnapshotList { name: name.to_owned() })? {
+    match send(&Request::SnapshotList {
+        name: name.to_owned(),
+    })? {
         Response::Snapshots { snapshots } => Ok(snapshots),
         Response::Error { message } => bail!(message),
         other => bail!("unexpected reply from astd: {other:?}"),
@@ -323,7 +348,10 @@ pub fn snapshot_tags(names: &[String]) -> HashMap<String, Tags> {
     };
     if stale {
         let tags = names.iter().map(|n| (n.clone(), list_tags(n))).collect();
-        *cache = Some(SnapshotCache { at: Instant::now(), tags });
+        *cache = Some(SnapshotCache {
+            at: Instant::now(),
+            tags,
+        });
     }
     let fresh = cache.as_ref().expect("filled just above");
     names
@@ -365,18 +393,108 @@ fn send(request: &Request) -> Result<Response> {
 fn send_with(request: &Request, timeout: Duration) -> Result<Response> {
     let sock = paths::socket_path();
     let stream = connect(&sock)?;
+    if matches!(request, Request::Proxy { .. }) {
+        send_on(stream, request, timeout)
+    } else {
+        send_raw_on(stream, request, timeout)
+    }
+}
+
+/// Speak one request on an already-open local daemon connection.
+///
+/// A `Proxy` carries the inner frame verbatim, so its floor is the inner
+/// frame's floor. The connection must therefore settle a protocol before the
+/// proxy (or any other versioned request) is written.
+fn send_on(stream: UnixStream, request: &Request, timeout: Duration) -> Result<Response> {
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
 
     let mut writer = stream.try_clone()?;
+    let spoken = handshake(&mut writer, &stream)?;
+    refuse_unspeakable(request, spoken)?;
+    write_request(&mut writer, request)?;
+
+    read_response(&stream)
+}
+
+/// Send a direct request unchanged. The GUI has legacy direct-frame
+/// fallbacks, so only the transparent Proxy envelope needs the negotiated
+/// pre-write gate above.
+fn send_raw_on(stream: UnixStream, request: &Request, timeout: Duration) -> Result<Response> {
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    let mut writer = stream.try_clone()?;
+    write_request(&mut writer, request)?;
+    read_response(&stream)
+}
+
+/// Exchange protocol ranges before writing an application request.
+///
+/// The old `Ping` and `Pong` shapes still establish the original wire, so an
+/// old daemon can be refused locally before a newer proxy is put on the wire.
+fn handshake(writer: &mut UnixStream, stream: &UnixStream) -> Result<u32> {
+    let ours = compat::ours();
+    write_request(
+        writer,
+        &Request::Ping {
+            protocol: ours.max,
+            min_protocol: ours.min,
+        },
+    )?;
+
+    let peer = match read_response(stream)? {
+        Response::Pong {
+            protocol,
+            min_protocol,
+            ..
+        } => compat::Speaks::claimed(protocol, min_protocol),
+        Response::Ok => compat::Speaks::unversioned(),
+        Response::Error { message } if protocol::is_unknown_variant_error(&message) => {
+            compat::Speaks::unversioned()
+        }
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected reply to ping from astd: {other:?}"),
+    };
+    match compat::select(peer) {
+        compat::Selection::Common(spoken) => Ok(spoken),
+        compat::Selection::TooOld { theirs, ours } => {
+            Err(compat::too_old("astd on this device", theirs, ours))
+        }
+        compat::Selection::TooNew { theirs, ours } => {
+            Err(compat::too_new("astd on this device", theirs, ours))
+        }
+    }
+}
+
+/// Stop a request that the negotiated daemon cannot parse before it is sent.
+fn refuse_unspeakable(request: &Request, spoken: u32) -> Result<()> {
+    if request.speakable_at(spoken) {
+        return Ok(());
+    }
+    let what = request
+        .versioned_name()
+        .map(|name| format!("`ast {name}`"))
+        .unwrap_or_else(|| "that command".to_owned());
+    Err(compat::frame_too_new(
+        &what,
+        request.since(),
+        spoken,
+        "astd on this device",
+    ))
+}
+
+fn write_request(writer: &mut UnixStream, request: &Request) -> Result<()> {
     let mut line = serde_json::to_string(request)?;
     line.push('\n');
     writer
         .write_all(line.as_bytes())
         .context("writing to astd")?;
+    Ok(())
+}
 
+fn read_response(stream: &UnixStream) -> Result<Response> {
     let mut reply = String::new();
-    BufReader::new(stream)
+    BufReader::new(stream.try_clone()?)
         .read_line(&mut reply)
         .context("reading from astd")?;
     if reply.trim().is_empty() {
@@ -415,8 +533,10 @@ impl Conversation {
         // way out, and it works by dropping this.
         stream.set_read_timeout(None)?;
         stream.set_write_timeout(Some(IO_TIMEOUT))?;
-        let mut conn =
-            Conversation { write: stream.try_clone()?, read: BufReader::new(stream) };
+        let mut conn = Conversation {
+            write: stream.try_clone()?,
+            read: BufReader::new(stream),
+        };
         conn.send(request)?;
         Ok(conn)
     }
@@ -428,7 +548,9 @@ impl Conversation {
     pub fn send(&mut self, request: &Request) -> Result<()> {
         let mut line = serde_json::to_string(request)?;
         line.push('\n');
-        self.write.write_all(line.as_bytes()).context("writing to astd")?;
+        self.write
+            .write_all(line.as_bytes())
+            .context("writing to astd")?;
         Ok(())
     }
 
@@ -446,7 +568,9 @@ impl Conversation {
     /// The next line the daemon has to say.
     pub fn next(&mut self) -> Result<Response> {
         let mut line = String::new();
-        self.read.read_line(&mut line).context("reading from astd")?;
+        self.read
+            .read_line(&mut line)
+            .context("reading from astd")?;
         if line.trim().is_empty() {
             bail!("astd closed the connection without answering");
         }
@@ -561,6 +685,7 @@ fn tool_path(tool: &str, override_var: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
 
     fn machine() -> asterism_core::hv::Machine {
         asterism_core::hv::Machine {
@@ -577,7 +702,11 @@ mod tests {
     /// request.
     #[test]
     fn the_window_creates_with_the_frame_the_cli_sends() {
-        let shape = Shape { cpus: 2, mem_mib: 2048, disk_gib: 20 };
+        let shape = Shape {
+            cpus: 2,
+            mem_mib: 2048,
+            disk_gib: 20,
+        };
         let wire = serde_json::to_string(&create_request("dev", "debian:13", shape, None)).unwrap();
         assert_eq!(
             wire,
@@ -669,5 +798,83 @@ mod tests {
             serde_json::to_string(&device_shell_policy_request(false)).unwrap(),
             r#"{"cmd":"device_shell_policy","action":"disable"}"#
         );
+    }
+
+    fn proxy(inner: Request) -> Request {
+        Request::Proxy {
+            device: "other".into(),
+            inner: Box::new(inner),
+        }
+    }
+
+    /// A protocol-1 daemon may read the handshake, but must never receive a
+    /// newer proxy as a second frame. This covers both current proxy floors:
+    /// device-shell status at v5 and image inventory at v6.
+    fn old_daemon_receives_only_the_handshake(request: Request) {
+        let (client, mut daemon) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let mut reader = BufReader::new(daemon.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Request>(&line).unwrap(),
+                Request::Ping { .. }
+            ));
+            daemon.write_all(b"{\"result\":\"ok\"}\n").unwrap();
+
+            daemon
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            line.clear();
+            let second = reader.read_line(&mut line);
+            assert!(
+                matches!(second, Ok(0) | Err(_)),
+                "wrote an unsupported second frame"
+            );
+        });
+
+        assert!(send_on(client, &request, IO_TIMEOUT).is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn an_old_daemon_never_receives_a_newer_proxied_frame() {
+        old_daemon_receives_only_the_handshake(proxy(Request::DeviceShellStatus));
+        old_daemon_receives_only_the_handshake(proxy(Request::ImageList));
+    }
+
+    /// The GUI's remote device-shell caller goes through the same negotiated
+    /// door as every other GUI request, so the daemon sees Ping before Proxy.
+    #[test]
+    fn gui_remote_shell_status_handshakes_before_its_proxy() {
+        let request = device_shell_status_request(Some("other"));
+        let (client, mut daemon) = UnixStream::pair().unwrap();
+        let server = thread::spawn(move || {
+            let mut reader = BufReader::new(daemon.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Request>(&line).unwrap(),
+                Request::Ping { .. }
+            ));
+            daemon
+                .write_all(b"{\"result\":\"pong\",\"version\":\"test\",\"protocol\":5,\"min_protocol\":1}\n")
+                .unwrap();
+
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert!(matches!(
+                serde_json::from_str::<Request>(&line).unwrap(),
+                Request::Proxy { device, inner }
+                    if device == "other" && matches!(*inner, Request::DeviceShellStatus)
+            ));
+            daemon.write_all(b"{\"result\":\"ok\"}\n").unwrap();
+        });
+
+        assert!(matches!(
+            send_on(client, &request, IO_TIMEOUT).unwrap(),
+            Response::Ok
+        ));
+        server.join().unwrap();
     }
 }
