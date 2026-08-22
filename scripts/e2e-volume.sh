@@ -266,6 +266,15 @@ print(lease["holder"] if lease else "-")
 PY
 }
 
+holder_device_now() {
+  python3 - "$B/volumes.json" "$VOL" <<'PY'
+import json, sys
+store = json.load(open(sys.argv[1]))
+lease = store["volumes"][sys.argv[2]].get("lease")
+print(lease["holder_device"] if lease else "-")
+PY
+}
+
 # What the guest is running on, so the test can talk about a disk rather than
 # about a device name it guessed.
 in_guest() {
@@ -327,9 +336,11 @@ USED="$(du -k "$B/volumes/$VOL/disk.raw" | cut -f1)"
 echo "ok: the volume is a $VOLUME_GIB GiB sparse raw image and nothing else"
 
 VOLS="$(ASTERISM_HOME="$B" "$AST" volume ls 2>&1)" || fail "volume ls failed:"$'\n'"$VOLS"
-grep -qE "^NAME +SIZE +AGE +HELD BY$" <<<"$VOLS" || fail "no volume table:"$'\n'"$VOLS"
-grep -qE "^$VOL +${VOLUME_GIB}G +\S+ +-$" <<<"$VOLS" || fail "$VOL is not listed unheld:"$'\n'"$VOLS"
-echo "ok: ast volume ls shows it, held by nobody"
+grep -qE "^NAME +OWNER +SIZE +LATENCY +DURABILITY +SHARING +HELD BY$" <<<"$VOLS" \
+  || fail "no orbit storage table:"$'\n'"$VOLS"
+grep -qE "^$VOL +$B_NAME +${VOLUME_GIB}G +local +single-device +single-writer +-$" <<<"$VOLS" \
+  || fail "$VOL is not listed with explicit local semantics:"$'\n'"$VOLS"
+echo "ok: ast volume ls shows ownership, latency, durability and sharing"
 
 expect "volume rm takes one away" "x-scratch  removed" \
   env ASTERISM_HOME="$B" "$AST" volume rm x-scratch
@@ -342,12 +353,14 @@ refute "a name that would not survive a filename is refused" "may hold letters" 
 refute "a volume nobody has is missing from this device" "on this device" \
   env ASTERISM_HOME="$B" "$AST" volume rm ghost
 
-# A's volume list is its own, which is the point of volumes not being an
-# orbit-wide namespace.
-expect "A has no volumes of its own" "no volumes on this device" \
+# A sees the same part without querying B as a separate computer. The provider
+# remains explicit on the row, and `--device` still offers the provider-local
+# administrative view.
+expect "A sees B's volume in one orbit catalog" "$B_NAME" \
   env ASTERISM_HOME="$A" "$AST" volume ls
-# ...and A can still see B's, by naming the device that holds the bytes.
-expect "A can list B's volumes by naming B" "$VOL" \
+expect "A's catalog reports the remote access path" "single-writer" \
+  env ASTERISM_HOME="$A" "$AST" volume ls
+expect "provider-local administration remains available" "$VOL" \
   env ASTERISM_HOME="$A" "$AST" --device "$B_NAME" volume ls
 
 # ---- 3. an instance on A, attaching B's volume -----------------------------
@@ -376,7 +389,7 @@ expect "attach a same-device directory ($BACKEND)" "$SHARED_GUEST" \
 ATTACH=""
 ATTACHED=0
 for ATTEMPT in $(seq 1 100); do
-  if ATTACH="$(ASTERISM_HOME="$A" "$AST" attach "$INST" --volume "$B_NAME:$VOL" 2>&1)"; then
+  if ATTACH="$(ASTERISM_HOME="$A" "$AST" attach "$INST" --volume "$VOL" 2>&1)"; then
     ATTACHED=1
     break
   fi
@@ -591,11 +604,11 @@ expect "a second instance exists" "$OTHER  defined" \
 
 refute "a second instance cannot take a held volume" \
   "volume \"$VOL\" is held by instance \"$INST\"" \
-  env ASTERISM_HOME="$A" "$AST" attach "$OTHER" --volume "$B_NAME:$VOL"
+  env ASTERISM_HOME="$A" "$AST" attach "$OTHER" --volume "$VOL"
 refute "and the refusal says which device is writing to it" "cpu/ram on $A_NAME" \
-  env ASTERISM_HOME="$A" "$AST" attach "$OTHER" --volume "$B_NAME:$VOL"
+  env ASTERISM_HOME="$A" "$AST" attach "$OTHER" --volume "$VOL"
 refute "and how to end it" "ast detach $INST --volume $VOL" \
-  env ASTERISM_HOME="$A" "$AST" attach "$OTHER" --volume "$B_NAME:$VOL"
+  env ASTERISM_HOME="$A" "$AST" attach "$OTHER" --volume "$VOL"
 echo "ok: the second claimant is refused by name, by device, and told what to do"
 
 # The refusal changed nothing: the holder still holds it at the same epoch.
@@ -612,11 +625,30 @@ refute "a leased volume cannot be deleted" "is held by instance \"$INST\"" \
 # offers hotplug — so it is refused while the instance is up, and says so.
 
 refute "a running instance will not give up its disk" "is running and its guest has this volume" \
-  env ASTERISM_HOME="$A" "$AST" detach "$INST" --volume "$B_NAME:$VOL"
+  env ASTERISM_HOME="$A" "$AST" detach "$INST" --volume "$VOL"
 
 expect "stop it first" "$INST  stopped" env ASTERISM_HOME="$A" "$AST" down "$INST"
+
+# A portable backup carries the binding as an explicit rebind requirement;
+# it neither copies provider bytes nor restores a lease implicitly.
+BACKUP="$RUN/backup"
+expect "backup exports the stopped instance" "exported" \
+  env ASTERISM_HOME="$A" "$AST" backup export "$INST" "$BACKUP"
+ASTERISM_HOME="$A" "$AST" backup inspect "$BACKUP" --json >"$RUN/backup.json" \
+  || fail "backup inspection failed"
+python3 - "$RUN/backup.json" "$B_NAME" "$VOL" <<'PY' \
+  || fail "backup did not preserve the volume as a rebind requirement"
+import json, sys
+manifest = json.load(open(sys.argv[1]))
+assert manifest["instance"]["volumes"] == []
+rows = manifest["rebind"]["volumes"]
+assert any(row["source_device"] == sys.argv[2] and row["path"] == sys.argv[3]
+           and row["kind"] == "block" for row in rows)
+PY
+echo "ok: backup records the external storage part without copying or leasing it"
+
 expect "detach hands the lease back" "$VOL detached" \
-  env ASTERISM_HOME="$A" "$AST" detach "$INST" --volume "$B_NAME:$VOL"
+  env ASTERISM_HOME="$A" "$AST" detach "$INST" --volume "$VOL"
 
 [ "$(holder_now)" = "-" ] || fail "B still thinks somebody holds the volume"
 [ ! -e "$B/volumes/$VOL/nbd-e$E3.sock" ] \
@@ -626,7 +658,7 @@ LEFTOVER="$( { ls "$B/volumes/$VOL"/nbd-*.sock 2>/dev/null || true; } | wc -l | 
 echo "ok: detaching stopped the export and removed its socket"
 
 expect "and the volume goes to the other instance" "a disk in the guest" \
-  env ASTERISM_HOME="$A" "$AST" attach "$OTHER" --volume "$B_NAME:$VOL"
+  env ASTERISM_HOME="$A" "$AST" attach "$OTHER" --volume "$VOL"
 E4="$(epoch_now)"
 [ "$(holder_now)" = "$OTHER" ] || fail "the lease did not move to $OTHER"
 [ "$E4" -gt "$E3" ] || fail "moving the lease did not bump the epoch ($E3 -> $E4)"
@@ -646,6 +678,35 @@ expect "detach from the second instance" "$VOL detached" \
 expect "and back to the first" "a disk in the guest" \
   env ASTERISM_HOME="$A" "$AST" attach "$INST" --volume "$B_NAME:$VOL"
 
+# ---- 7b. cpu placement moves while storage ownership does not ---------------
+#
+# The instance is stopped and both device endpoints still carry their paired
+# paths. Move cpu/ram onto the storage owner and back; each boot renews the
+# lease for the new cpu device while the part's owner never changes.
+
+ASTERISM_HOME="$A" "$AST" move "$INST" "$B_NAME" >"$RUN/move-to-provider.out" 2>&1 \
+  || fail "moving cpu to the storage provider failed:"$'\n'"$(cat "$RUN/move-to-provider.out")"
+expect "the moved instance boots with provider-local storage" "$INST  running" \
+  env ASTERISM_HOME="$A" "$AST" up "$INST"
+[ "$(holder_device_now)" = "$B_NAME" ] \
+  || fail "the renewed lease did not follow cpu placement to $B_NAME"
+VOLUME_DEV="$(find_volume_device)"
+expect "the volume bytes survive cpu placement on their owner" "$MARKER" \
+  in_guest "sudo mkdir -p /data && sudo mount $VOLUME_DEV /data && cat /data/marker"
+
+expect "stop before moving cpu back" "$INST  stopped" \
+  env ASTERISM_HOME="$A" "$AST" down "$INST"
+ASTERISM_HOME="$A" "$AST" move "$INST" "$A_NAME" >"$RUN/move-back.out" 2>&1 \
+  || fail "moving cpu back from the provider failed:"$'\n'"$(cat "$RUN/move-back.out")"
+expect "the instance boots after storage becomes remote again" "$INST  running" \
+  env ASTERISM_HOME="$A" "$AST" up "$INST"
+[ "$(holder_device_now)" = "$A_NAME" ] \
+  || fail "the renewed lease did not follow cpu placement back to $A_NAME"
+VOLUME_DEV="$(find_volume_device)"
+expect "the guest still sees one local disk contract after both moves" "$MARKER" \
+  in_guest "sudo mkdir -p /data && sudo mount $VOLUME_DEV /data && cat /data/marker"
+echo "ok: cpu moved to the storage owner and back; ownership stayed on B and the guest contract stayed local"
+
 # ---- 8. the export dies under a running guest, and comes back --------------
 #
 # The storage daemon is a process, and processes die. QEMU is told to keep
@@ -653,11 +714,10 @@ expect "and back to the first" "a disk in the guest" \
 # reconnection finds the provider restarting the export at the *same* epoch —
 # same epoch because nothing about who may write has changed.
 
-expect "boot with the volume back on the first instance" "$INST  running" \
-  env ASTERISM_HOME="$A" "$AST" up "$INST"
+expect "the moved-back instance is still running" "status:  running" \
+  env ASTERISM_HOME="$A" "$AST" status "$INST"
 E5="$(epoch_now)"
-VOLUME_DEV="$(find_volume_device)"
-MOUNTED="$(in_guest "sudo mkdir -p /data && sudo mount $VOLUME_DEV /data && cat /data/marker")" \
+MOUNTED="$(in_guest "cat /data/marker")" \
   || fail "the guest could not mount its volume:"$'\n'"$MOUNTED"
 grep -qF "$MARKER" <<<"$MOUNTED" || fail "the marker is gone:"$'\n'"$MOUNTED"
 
@@ -834,8 +894,10 @@ if grep -qiE "qemu-system|blockdev|panicked" <<<"$BOOT"; then
 fi
 echo "ok: booting says which device is out of touch and which volume it wanted"
 
-refute "attaching says the same thing" "could not reach the device holding it: $B_NAME" \
+E_OFFLINE="$(epoch_now)"
+refute "placement refuses an unreachable owner before mutation" "storage provider \"$B_NAME\" is unreachable" \
   env ASTERISM_HOME="$A" "$AST" attach "$OTHER" --volume "$B_NAME:$VOL"
+[ "$(epoch_now)" = "$E_OFFLINE" ] || fail "placement refusal changed the provider fence"
 
 # And nothing was half-done: A did not start a guest it could not give a disk.
 LS="$(ASTERISM_HOME="$A" "$AST" ls --local 2>&1)"

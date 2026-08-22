@@ -681,6 +681,9 @@ async fn dispatch(request: Request, node: &Node, mesh: Option<&Arc<Mesh>>) -> Re
     if secret::is_orbit_request(&request) {
         return secret::serve(request, node, mesh).await;
     }
+    if volume::is_orbit_request(&request) {
+        return volume::serve_orbit(request, node, mesh).await;
+    }
     if orbit::claims(&request) {
         return orbit::serve(request, node, mesh).await;
     }

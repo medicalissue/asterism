@@ -301,8 +301,8 @@ enum Command {
     /// Cloud images receive a mount unit in their seed; OCI images receive
     /// the same mount in Asterism's generated pid 1.
     ///
-    /// A BLOCK VOLUME (`--volume desktop:tank`, made with `ast volume
-    /// create`) arrives as a plain disk: /dev/vdb, /dev/vdc and so on. The
+    /// A BLOCK VOLUME (`--volume tank`, made with `ast volume create`) arrives
+    /// as a plain disk: /dev/vdb, /dev/vdc and so on. The
     /// guest partitions, formats and mounts it itself, and never learns which
     /// device the bytes are on — put a filesystem on it once with
     /// `mkfs.ext4 /dev/vdb`, then mount it. It can come from any device in
@@ -320,12 +320,17 @@ enum Command {
     Attach {
         /// The instance to attach it to.
         name: String,
-        /// A directory path, or `<device>:<volume>` for a block volume.
+        /// A directory path, or an orbit block-volume name. `<device>:<name>`
+        /// constrains placement to one provider.
         #[arg(long, conflicts_with = "secret")]
         volume: Option<String>,
         /// Device that provides the volume (default: this device).
         #[arg(long, requires = "volume")]
         host: Option<String>,
+        /// Refuse a block placement whose measured round trip is slower than
+        /// this. A provider without a live measurement is also refused.
+        #[arg(long, value_name = "MS", requires = "volume")]
+        max_latency_ms: Option<u64>,
         /// Where a directory volume mounts in the guest (default:
         /// /mnt/ast/<name>). Meaningless for a block volume: the guest
         /// decides where its own disks go.
@@ -418,7 +423,7 @@ enum Command {
         #[arg(long)]
         down: bool,
     },
-    /// Create, list and delete this device's block volumes.
+    /// Create and delete this device's volumes; list orbit storage.
     #[command(subcommand)]
     Volume(VolumeCommand),
     /// Create, list, remove and rotate orbit-scoped secrets.
@@ -540,13 +545,12 @@ enum BackupCommand {
     },
 }
 
-/// `ast volume ...` — the block storage one device puts in the pool.
+/// `ast volume ...` — block storage devices put in the orbit pool.
 ///
 /// Volumes belong to the device that holds their bytes, and their names are
 /// per-device rather than orbit-global: `desktop:tank` and `nas:tank` are two
-/// volumes. So these commands are about *this* device unless `--device` says
-/// otherwise, which is the opposite of how instance commands work and is the
-/// honest way round — the bytes are somewhere in particular.
+/// distinct parts. Creation and removal target this device unless `--device`
+/// says otherwise; listing without a target assembles the orbit catalog.
 #[derive(Subcommand)]
 enum VolumeCommand {
     /// Make a new block volume on this device.
@@ -562,7 +566,7 @@ enum VolumeCommand {
         #[arg(long)]
         size: String,
     },
-    /// List this device's block volumes and who holds each one.
+    /// List orbit storage, its owners, access latency and attachment policy.
     Ls,
     /// Delete a block volume and its bytes. Refused while it is attached.
     Rm {
@@ -742,6 +746,7 @@ fn main() -> Result<()> {
             name,
             volume,
             host,
+            max_latency_ms,
             at,
             secret,
             to,
@@ -765,26 +770,32 @@ fn main() -> Result<()> {
                 env,
                 source_device: from,
             },
-            Attaching::Volume(volume) => match block_ref(&volume, host.as_deref()) {
-                Some((device, volume)) => {
+            Attaching::Volume(volume) => match storage_ref(&volume, host.as_deref()) {
+                Some((owner_device, volume)) => {
                     if at.is_some() {
                         bail!(
                             "--at is for directory volumes; a block volume arrives as a \
                                  disk and the guest mounts it wherever it likes"
                         );
                     }
-                    Request::AttachBlock {
+                    Request::AttachStorage {
                         name,
                         volume,
-                        device,
+                        owner_device,
+                        max_latency_ms,
                     }
                 }
-                None => Request::AttachVolume {
-                    name,
-                    path: volume_path(&volume, host.as_deref())?,
-                    host,
-                    mount_point: at,
-                },
+                None => {
+                    if max_latency_ms.is_some() {
+                        bail!("--max-latency-ms is for orbit block volumes, not directory shares");
+                    }
+                    Request::AttachVolume {
+                        name,
+                        path: volume_path(&volume, host.as_deref())?,
+                        host,
+                        mount_point: at,
+                    }
+                }
             },
         },
         Command::Detach {
@@ -794,11 +805,11 @@ fn main() -> Result<()> {
             secret,
         } => match attaching(volume, secret)? {
             Attaching::Secret(secret) => Request::DetachSecret { name, secret },
-            Attaching::Volume(volume) => match block_ref(&volume, host.as_deref()) {
+            Attaching::Volume(volume) => match storage_ref(&volume, host.as_deref()) {
                 Some((device, volume)) => Request::Detach {
                     name,
                     volume,
-                    host: Some(device),
+                    host: device,
                 },
                 None => Request::Detach {
                     name,
@@ -828,7 +839,8 @@ fn main() -> Result<()> {
             name,
             size_bytes: asterism_core::volume::parse_size(&size)?,
         },
-        Command::Volume(VolumeCommand::Ls) => Request::VolumeList,
+        Command::Volume(VolumeCommand::Ls) if device.is_some() => Request::VolumeList,
+        Command::Volume(VolumeCommand::Ls) => Request::VolumeCatalog,
         Command::Volume(VolumeCommand::Rm { name }) => Request::VolumeRemove { name },
         Command::Secret(cmd) => return secret_command(cmd, device.as_deref()),
         Command::Logs {
@@ -992,7 +1004,9 @@ fn main() -> Result<()> {
                     );
                 }
             }
-            Request::AttachVolume { .. } | Request::AttachBlock { .. } => {
+            Request::AttachVolume { .. }
+            | Request::AttachBlock { .. }
+            | Request::AttachStorage { .. } => {
                 print_attached(&instance)
             }
             Request::AttachSecret { ref secret, .. } => print_bound(&instance, secret),
@@ -1014,6 +1028,7 @@ fn main() -> Result<()> {
             Request::VolumeRemove { name } => println!("{name}  removed"),
             _ => print_volumes(&volumes),
         },
+        Response::VolumeCatalog { catalog } => print_volume_catalog(&catalog),
         Response::Orbit { rows } => print_table(&rows),
         // One device's shard, asked for by `--local` or `--device`. Rows from
         // a single shard are live by construction: the device answered.
@@ -1906,21 +1921,20 @@ fn verify_row(
 
 // ---- volumes ---------------------------------------------------------------
 
-/// Read `--volume` as a block volume, or decide it is a directory.
+/// Read `--volume` as an orbit storage part, or decide it is a directory.
 ///
 /// `<device>:<volume>` is the written form. A bare name plus `--host` is
 /// accepted too, because a directory on another device has always had to be
 /// an absolute path — so a relative-looking name with a device attached
 /// cannot have meant a directory.
-fn block_ref(volume: &str, host: Option<&str>) -> Option<(String, String)> {
+fn storage_ref(volume: &str, host: Option<&str>) -> Option<(Option<String>, String)> {
     if let Some((device, name)) = asterism_core::volume::parse_ref(volume) {
-        return Some((device, name));
+        return Some((Some(device), name));
     }
-    let host = host?;
     let looks_like_a_path =
         volume.starts_with('/') || volume.starts_with('.') || volume.starts_with('~');
     (!looks_like_a_path && asterism_core::volume::check_name(volume).is_ok())
-        .then(|| (host.to_owned(), volume.to_owned()))
+        .then(|| (host.map(str::to_owned), volume.to_owned()))
 }
 
 /// `ast volume ls`.
@@ -1940,6 +1954,47 @@ fn print_volumes(volumes: &[asterism_core::volume::BlockVolume]) {
             asterism_core::volume::format_size(v.size_bytes),
             age(v.created_at),
             v.holder_summary(),
+        );
+    }
+}
+
+/// `ast volume ls`: one catalog, with provider and access semantics stated
+/// on every row instead of making the user query devices one at a time.
+fn print_volume_catalog(catalog: &asterism_core::volume::Catalog) {
+    if catalog.volumes.is_empty() {
+        println!(
+            "no volumes in the reachable orbit — make one: ast volume create tank --size 100G"
+        );
+    } else {
+        println!(
+            "{:<20} {:<14} {:>8} {:>9} {:<13} {:<14} HELD BY",
+            "NAME", "OWNER", "SIZE", "LATENCY", "DURABILITY", "SHARING"
+        );
+        for part in &catalog.volumes {
+            let latency = match part.latency_micros {
+                Some(0) => "local".to_owned(),
+                Some(us) if us < 1000 => format!("{us}us"),
+                Some(us) => format!("{:.1}ms", us as f64 / 1000.0),
+                None => "unknown".to_owned(),
+            };
+            println!(
+                "{:<20} {:<14} {:>8} {:>9} {:<13} {:<14} {}",
+                part.volume.name,
+                part.owner_device,
+                asterism_core::volume::format_size(part.volume.size_bytes),
+                latency,
+                part.volume.durability,
+                part.volume.sharing,
+                part.volume.holder_summary(),
+            );
+        }
+    }
+    for provider in &catalog.unreachable {
+        eprintln!(
+            "unreachable storage provider {} ({}): {}",
+            provider.device,
+            provider.device_id.chars().take(12).collect::<String>(),
+            provider.reason
         );
     }
 }
@@ -3960,6 +4015,22 @@ mod tests {
 
         sync_update_path(&root.path().join("app"), true, false).unwrap();
         sync_update_path(&root.path().join("not-created"), false, true).unwrap();
+    }
+
+    #[test]
+    fn bare_volume_names_are_orbit_parts_and_paths_stay_directories() {
+        assert_eq!(storage_ref("tank", None), Some((None, "tank".into())));
+        assert_eq!(
+            storage_ref("nas:tank", None),
+            Some((Some("nas".into()), "tank".into()))
+        );
+        assert_eq!(
+            storage_ref("tank", Some("nas")),
+            Some((Some("nas".into()), "tank".into()))
+        );
+        assert_eq!(storage_ref("/srv/tank", None), None);
+        assert_eq!(storage_ref("./tank", None), None);
+        assert_eq!(storage_ref("~/tank", None), None);
     }
 
     /// A reply is a line, and a line the daemon never ends is not a reply.

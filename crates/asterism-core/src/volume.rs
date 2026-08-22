@@ -36,6 +36,44 @@ use crate::durable::{self, Loaded};
 use crate::instance::now_unix;
 use crate::proc::{Evidence as ProcEvidence, ProcId};
 
+/// What failure domain contains the only durable copy of a volume.
+///
+/// This is explicit even though only one mode exists today. A consumer can
+/// therefore refuse a placement that requires replication instead of
+/// treating an unadvertised property as a promise. Replicated volumes add a
+/// new variant; they do not change what existing rows meant.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Durability {
+    #[default]
+    SingleDevice,
+}
+
+impl std::fmt::Display for Durability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Durability::SingleDevice => "single-device",
+        })
+    }
+}
+
+/// Which simultaneous attachment contract a provider enforces.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Sharing {
+    /// One writable lease, protected by the provider's monotonic epoch.
+    #[default]
+    SingleWriter,
+}
+
+impl std::fmt::Display for Sharing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Sharing::SingleWriter => "single-writer",
+        })
+    }
+}
+
 /// The program that serves a block volume's NBD export. Named here because
 /// it is what a lease's recorded process must turn out to be running before
 /// this daemon will believe the lease.
@@ -86,6 +124,14 @@ pub struct BlockVolume {
     pub size_bytes: u64,
     /// Unix seconds.
     pub created_at: u64,
+    /// The failure-domain promise this provider makes. Defaulted for volume
+    /// books written before the orbit catalog made the promise explicit.
+    #[serde(default)]
+    pub durability: Durability,
+    /// The attachment contract. The lease below is the enforcement, while
+    /// this field is what placement and management surfaces can reason over.
+    #[serde(default)]
+    pub sharing: Sharing,
     /// Highest epoch ever granted on this volume. Monotonic, and persisted,
     /// so it survives a daemon restart — an epoch that reset would un-fence
     /// every consumer that had been shut out.
@@ -183,6 +229,8 @@ impl Store {
             name: name.to_owned(),
             size_bytes,
             created_at: now_unix(),
+            durability: Durability::SingleDevice,
+            sharing: Sharing::SingleWriter,
             epoch: 0,
             lease: None,
         };
@@ -383,6 +431,184 @@ impl Store {
     }
 }
 
+/// Whether bytes cross a device boundary before reaching the guest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Locality {
+    Local,
+    Remote,
+}
+
+/// One orbit-visible storage part.
+///
+/// `volume` remains the provider's authoritative row. Everything beside it
+/// describes how this consumer reaches that row now; none of it is persisted
+/// as authority or handed to the guest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogVolume {
+    pub owner_device: String,
+    pub owner_device_id: String,
+    pub locality: Locality,
+    /// `local`, `direct`, or `relay`. Diagnostic only: attaching code selects
+    /// a provider and the existing volume bridge hides this from the guest.
+    pub path: String,
+    /// Measured round-trip latency. `None` means the row came from durable
+    /// catalog knowledge rather than a live provider observation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_micros: Option<u64>,
+    pub volume: BlockVolume,
+}
+
+impl CatalogVolume {
+    pub fn available_to(&self, holder: &str) -> bool {
+        self.volume
+            .lease
+            .as_ref()
+            .is_none_or(|lease| lease.holder == holder)
+    }
+}
+
+/// A device whose storage contribution could not be observed in this read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnreachableStorage {
+    pub device: String,
+    pub device_id: String,
+    pub reason: String,
+}
+
+/// The storage visible from one point in the orbit at one moment.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Catalog {
+    pub volumes: Vec<CatalogVolume>,
+    #[serde(default)]
+    pub unreachable: Vec<UnreachableStorage>,
+}
+
+/// Requirements checked before placement is allowed to take a lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlacementPolicy {
+    pub durability: Durability,
+    pub sharing: Sharing,
+    /// None means no latency ceiling. A catalog row without a live latency
+    /// observation never satisfies an explicit ceiling.
+    pub max_latency_micros: Option<u64>,
+}
+
+impl Default for PlacementPolicy {
+    fn default() -> Self {
+        Self {
+            durability: Durability::SingleDevice,
+            sharing: Sharing::SingleWriter,
+            max_latency_micros: None,
+        }
+    }
+}
+
+impl Catalog {
+    /// Select one eligible provider without changing either provider or
+    /// guest state. Local wins, then measured latency, then stable device id.
+    /// A named owner is a constraint, not a hint.
+    pub fn place(
+        &self,
+        name: &str,
+        owner: Option<&str>,
+        holder: &str,
+        policy: PlacementPolicy,
+    ) -> Result<&CatalogVolume> {
+        let named: Vec<&CatalogVolume> = self
+            .volumes
+            .iter()
+            .filter(|candidate| candidate.volume.name == name)
+            .filter(|candidate| owner.is_none_or(|owner| candidate.owner_device == owner))
+            .collect();
+
+        if named.is_empty() {
+            if let Some(owner) = owner {
+                if let Some(device) = self.unreachable.iter().find(|d| d.device == owner) {
+                    bail!(
+                        "storage provider {owner:?} is unreachable, so volume {name:?} cannot be placed: {}",
+                        device.reason
+                    );
+                }
+                bail!("no volume named {name:?} on device {owner:?} — see: ast volume ls");
+            }
+            let unavailable = if self.unreachable.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; storage on {} could not be inspected",
+                    self.unreachable
+                        .iter()
+                        .map(|d| d.device.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            bail!(
+                "no volume named {name:?} in the reachable orbit{unavailable} — see: ast volume ls"
+            );
+        }
+
+        let mut eligible: Vec<&CatalogVolume> = named
+            .iter()
+            .copied()
+            .filter(|candidate| candidate.volume.durability == policy.durability)
+            .filter(|candidate| candidate.volume.sharing == policy.sharing)
+            .filter(|candidate| candidate.available_to(holder))
+            .filter(|candidate| {
+                policy.max_latency_micros.is_none_or(|ceiling| {
+                    candidate
+                        .latency_micros
+                        .is_some_and(|latency| latency <= ceiling)
+                })
+            })
+            .collect();
+
+        eligible.sort_by(|a, b| {
+            (
+                a.locality,
+                a.latency_micros.unwrap_or(u64::MAX),
+                &a.owner_device_id,
+            )
+                .cmp(&(
+                    b.locality,
+                    b.latency_micros.unwrap_or(u64::MAX),
+                    &b.owner_device_id,
+                ))
+        });
+        if let Some(selected) = eligible.first() {
+            return Ok(selected);
+        }
+
+        let busy: Vec<String> = named
+            .iter()
+            .filter_map(|candidate| {
+                candidate.volume.lease.as_ref().and_then(|lease| {
+                    (lease.holder != holder)
+                        .then(|| format!("{}: {}", candidate.owner_device, held_by(name, lease)))
+                })
+            })
+            .collect();
+        if !busy.is_empty() {
+            bail!(
+                "volume {name:?} has no eligible single-writer placement: {}",
+                busy.join("; ")
+            );
+        }
+        if let Some(ceiling) = policy.max_latency_micros {
+            bail!(
+                "volume {name:?} has no placement at or below {:.3}ms",
+                ceiling as f64 / 1000.0
+            );
+        }
+        bail!(
+            "volume {name:?} has no placement matching durability {} and sharing {}",
+            policy.durability,
+            policy.sharing
+        )
+    }
+}
+
 /// What this device says when it is asked about a volume it does not have.
 ///
 /// Names the device rather than the orbit, unlike an instance miss: volumes
@@ -528,6 +754,142 @@ mod tests {
         assert_eq!(parse_ref("~/here"), None);
         assert_eq!(parse_ref("tank"), None, "no device, no reference");
         assert_eq!(parse_ref("desktop:"), None);
+    }
+
+    fn part(name: &str, device: &str, locality: Locality, latency: u64) -> CatalogVolume {
+        CatalogVolume {
+            owner_device: device.into(),
+            owner_device_id: format!("id-{device}"),
+            locality,
+            path: match locality {
+                Locality::Local => "local",
+                Locality::Remote => "direct",
+            }
+            .into(),
+            latency_micros: Some(latency),
+            volume: BlockVolume {
+                name: name.into(),
+                size_bytes: 10 << 30,
+                created_at: 1,
+                durability: Durability::SingleDevice,
+                sharing: Sharing::SingleWriter,
+                epoch: 0,
+                lease: None,
+            },
+        }
+    }
+
+    #[test]
+    fn placement_prefers_local_then_latency_without_exposing_transport() {
+        let catalog = Catalog {
+            volumes: vec![
+                part("tank", "far", Locality::Remote, 8_000),
+                part("tank", "near", Locality::Remote, 500),
+                part("tank", "here", Locality::Local, 0),
+            ],
+            unreachable: Vec::new(),
+        };
+        assert_eq!(
+            catalog
+                .place("tank", None, "dev", PlacementPolicy::default())
+                .unwrap()
+                .owner_device,
+            "here"
+        );
+        assert_eq!(
+            catalog
+                .place("tank", Some("near"), "dev", PlacementPolicy::default())
+                .unwrap()
+                .owner_device,
+            "near"
+        );
+
+        let remote_only = Catalog {
+            volumes: catalog.volumes[..2].to_vec(),
+            unreachable: Vec::new(),
+        };
+        assert_eq!(
+            remote_only
+                .place("tank", None, "dev", PlacementPolicy::default())
+                .unwrap()
+                .owner_device,
+            "near"
+        );
+    }
+
+    #[test]
+    fn placement_refuses_busy_stale_and_slow_candidates_before_a_lease() {
+        let mut busy = part("tank", "nas", Locality::Remote, 7_000);
+        busy.volume.epoch = 4;
+        busy.volume.lease = Some(Lease {
+            holder: "database".into(),
+            holder_device: "desktop".into(),
+            epoch: 4,
+            granted_at: 1,
+            export: "tank-e4".into(),
+            pid: None,
+            proc: None,
+        });
+        let catalog = Catalog {
+            volumes: vec![busy],
+            unreachable: vec![UnreachableStorage {
+                device: "archive".into(),
+                device_id: "id-archive".into(),
+                reason: "offline".into(),
+            }],
+        };
+        let error = catalog
+            .place("tank", None, "dev", PlacementPolicy::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("held by instance \"database\""), "{error}");
+
+        let mut slow = part("scratch", "nas", Locality::Remote, 7_000);
+        slow.latency_micros = Some(7_000);
+        let catalog = Catalog {
+            volumes: vec![slow],
+            unreachable: Vec::new(),
+        };
+        let error = catalog
+            .place(
+                "scratch",
+                None,
+                "dev",
+                PlacementPolicy {
+                    max_latency_micros: Some(5_000),
+                    ..PlacementPolicy::default()
+                },
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("at or below 5.000ms"), "{error}");
+
+        let error = Catalog {
+            volumes: Vec::new(),
+            unreachable: vec![UnreachableStorage {
+                device: "archive".into(),
+                device_id: "id-archive".into(),
+                reason: "provider restarting".into(),
+            }],
+        }
+        .place("tank", Some("archive"), "dev", PlacementPolicy::default())
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("provider restarting"), "{error}");
+    }
+
+    #[test]
+    fn old_volume_rows_gain_explicit_safe_semantics() {
+        let old = r#"{
+            "name":"tank","size_bytes":1073741824,"created_at":1,
+            "epoch":0,"lease":null
+        }"#;
+        let volume: BlockVolume = serde_json::from_str(old).unwrap();
+        assert_eq!(volume.durability, Durability::SingleDevice);
+        assert_eq!(volume.sharing, Sharing::SingleWriter);
+        let encoded = serde_json::to_string(&volume).unwrap();
+        assert!(encoded.contains("\"durability\":\"single_device\""));
+        assert!(encoded.contains("\"sharing\":\"single_writer\""));
     }
 
     /// The whole safety property, in one test: one writer, and the epoch only

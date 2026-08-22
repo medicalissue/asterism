@@ -68,7 +68,9 @@ use asterism_core::paths;
 use asterism_core::proc::{ProcId, Signal};
 use asterism_core::protocol::{Request, Response};
 use asterism_core::tools::{run, tool};
-use asterism_core::volume::{self, BlockVolume, Store};
+use asterism_core::volume::{
+    self, BlockVolume, Catalog, CatalogVolume, Locality, PlacementPolicy, Store, UnreachableStorage,
+};
 use asterism_mesh::PathKind;
 
 use crate::mesh::{self, Mesh, Splice, TransferStats};
@@ -381,6 +383,140 @@ pub fn is_plane_request(req: &Request) -> bool {
             | Request::VolumeReconnect { .. }
             | Request::VolumeRelease { .. }
     )
+}
+
+/// Requests whose answer is assembled from every storage provider rather
+/// than read from this device's provider store.
+pub fn is_orbit_request(req: &Request) -> bool {
+    matches!(req, Request::VolumeCatalog)
+}
+
+/// Answer the orbit-visible storage read model.
+pub async fn serve_orbit(req: Request, node: &Node, mesh: Option<&Arc<Mesh>>) -> Response {
+    let result = match req {
+        Request::VolumeCatalog => catalog(node, mesh)
+            .await
+            .map(|catalog| Response::VolumeCatalog { catalog }),
+        other => Err(anyhow!("{other:?} is not an orbit storage request")),
+    };
+    reply(result)
+}
+
+/// Assemble every reachable provider into one catalog. Provider rows remain
+/// authoritative; latency and path are observations from this device now.
+pub async fn catalog(node: &Node, mesh: Option<&Arc<Mesh>>) -> Result<Catalog> {
+    let plane = plane()?;
+    let here = node.device_name().await;
+    let here_id = mesh
+        .map(|mesh| mesh.device_id().to_string())
+        .unwrap_or_else(|| format!("local:{here}"));
+    let local = plane.store.lock().await.list();
+    let mut catalog = Catalog {
+        volumes: local
+            .into_iter()
+            .map(|volume| CatalogVolume {
+                owner_device: here.clone(),
+                owner_device_id: here_id.clone(),
+                locality: Locality::Local,
+                path: "local".into(),
+                latency_micros: Some(0),
+                volume,
+            })
+            .collect(),
+        unreachable: Vec::new(),
+    };
+
+    let Some(mesh) = mesh else {
+        return Ok(catalog);
+    };
+    let peers = node.orbit.lock().await.devices().to_vec();
+    let mut asking = tokio::task::JoinSet::new();
+    for peer in peers {
+        let mesh = mesh.clone();
+        asking.spawn(async move {
+            let route = match mesh.ping(&peer.name).await {
+                Ok(Response::DevicePong { path, millis, .. }) => {
+                    let micros = (millis * 1000.0).round().clamp(0.0, u64::MAX as f64) as u64;
+                    (path, Some(micros))
+                }
+                _ => ("remote".to_owned(), None),
+            };
+            let response = mesh.proxy(&peer.name, Request::VolumeList).await;
+            (peer, route, response)
+        });
+    }
+    while let Some(result) = asking.join_next().await {
+        let Ok((peer, (path, latency_micros), response)) = result else {
+            continue;
+        };
+        match response {
+            Ok(Response::Volumes { volumes }) => {
+                catalog
+                    .volumes
+                    .extend(volumes.into_iter().map(|volume| CatalogVolume {
+                        owner_device: peer.name.clone(),
+                        owner_device_id: peer.device_id.clone(),
+                        locality: Locality::Remote,
+                        path: path.clone(),
+                        latency_micros,
+                        volume,
+                    }));
+            }
+            Ok(Response::Error { message }) => catalog.unreachable.push(UnreachableStorage {
+                device: peer.name,
+                device_id: peer.device_id,
+                reason: message,
+            }),
+            Ok(other) => catalog.unreachable.push(UnreachableStorage {
+                device: peer.name,
+                device_id: peer.device_id,
+                reason: format!("unexpected storage reply {other:?}"),
+            }),
+            Err(error) => catalog.unreachable.push(UnreachableStorage {
+                device: peer.name,
+                device_id: peer.device_id,
+                reason: format!("{error:#}"),
+            }),
+        }
+    }
+    catalog.volumes.sort_by(|a, b| {
+        (&a.volume.name, &a.owner_device_id).cmp(&(&b.volume.name, &b.owner_device_id))
+    });
+    catalog
+        .unreachable
+        .sort_by(|a, b| a.device_id.cmp(&b.device_id));
+    Ok(catalog)
+}
+
+/// Resolve an attach against the catalog before taking a provider lease.
+/// The lease operation below remains the final race-safe single-writer gate.
+pub async fn place(
+    volume: &str,
+    owner_device: Option<&str>,
+    holder: &str,
+    max_latency_ms: Option<u64>,
+) -> Result<String> {
+    let plane = plane()?;
+    let catalog = catalog(&plane.node, plane.mesh.as_ref()).await?;
+    let max_latency_micros = max_latency_ms
+        .map(|millis| {
+            millis
+                .checked_mul(1000)
+                .context("latency ceiling is too large")
+        })
+        .transpose()?;
+    Ok(catalog
+        .place(
+            volume,
+            owner_device,
+            holder,
+            PlacementPolicy {
+                max_latency_micros,
+                ..PlacementPolicy::default()
+            },
+        )?
+        .owner_device
+        .clone())
 }
 
 /// Answer one volume request against this device's own volumes.
@@ -1737,6 +1873,8 @@ mod tests {
     #[test]
     fn the_planes_requests_are_told_apart_from_the_shards() {
         assert!(is_plane_request(&Request::VolumeList));
+        assert!(is_orbit_request(&Request::VolumeCatalog));
+        assert!(!is_plane_request(&Request::VolumeCatalog));
         assert!(is_plane_request(&Request::VolumeCreate {
             name: "tank".into(),
             size_bytes: 1
@@ -1752,6 +1890,7 @@ mod tests {
             volume: "tank".into(),
             device: "desktop".into(),
         }));
+        assert!(!is_orbit_request(&Request::VolumeList));
     }
 
     #[tokio::test]

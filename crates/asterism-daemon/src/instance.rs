@@ -206,6 +206,16 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             volume: vol,
             device,
         } => attach_block(reg, &name, &vol, &device).await,
+        // Catalog placement is deliberately a separate frame from the
+        // device-qualified legacy attach. It resolves every eligibility
+        // requirement before taking a lease or changing the instance row;
+        // the provider's lease remains the race-safe final fence.
+        Request::AttachStorage {
+            name,
+            volume: vol,
+            owner_device,
+            max_latency_ms,
+        } => attach_storage(reg, &name, &vol, owner_device.as_deref(), max_latency_ms).await,
         Request::Detach {
             name,
             volume: vol,
@@ -664,6 +674,22 @@ async fn attach_block(reg: &mut Shard, name: &str, vol: &str, device: &str) -> R
     volume::preflight_remote_volume(device).await?;
     let (epoch, _export, size) = volume::take_lease(vol, device, name).await?;
     reg.attach_block(name, vol, device, epoch, size)
+}
+
+/// Catalog-driven block attachment. Every read-only placement check precedes
+/// the provider lease, and the instance row is still the final mutation.
+async fn attach_storage(
+    reg: &mut Shard,
+    name: &str,
+    vol: &str,
+    owner_device: Option<&str>,
+    max_latency_ms: Option<u64>,
+) -> Result<Instance> {
+    let inst = reg.get(name)?.clone();
+    let hv = backend::for_instance(&inst)?;
+    volume::check_backend(&*hv)?;
+    let device = volume::place(vol, owner_device, name, max_latency_ms).await?;
+    attach_block(reg, name, vol, &device).await
 }
 
 /// Bind an orbit secret to one authority this instance may reach.

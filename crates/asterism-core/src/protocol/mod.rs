@@ -176,6 +176,18 @@ pub enum Request {
         /// The device that holds them.
         device: String,
     },
+    /// Attach an orbit storage part by its volume name. The daemon holding
+    /// the instance reads the live catalog, checks placement, and only then
+    /// takes a lease. `owner_device` constrains placement when the caller
+    /// wants one provider; absent, local/lowest-latency eligible storage wins.
+    AttachStorage {
+        name: String,
+        volume: String,
+        #[serde(default)]
+        owner_device: Option<String>,
+        #[serde(default)]
+        max_latency_ms: Option<u64>,
+    },
     /// Bind an orbit secret to one authority an instance may reach.
     ///
     /// A separate frame from [`Request::AttachVolume`] and not a flag on it,
@@ -411,6 +423,9 @@ pub enum Request {
     },
     /// This device's block volumes, with their sizes and leases.
     VolumeList,
+    /// Every reachable device's storage contribution, annotated from this
+    /// consumer's point of view. Unlike `volume_list`, this is orbit-scoped.
+    VolumeCatalog,
     /// Delete a block volume and its bytes. Refused while it is leased.
     VolumeRemove {
         name: String,
@@ -620,6 +635,7 @@ impl Request {
             | Request::MarkConflicted { name, .. }
             | Request::AttachVolume { name, .. }
             | Request::AttachBlock { name, .. }
+            | Request::AttachStorage { name, .. }
             | Request::Detach { name, .. }
             | Request::Snapshot { name, .. }
             | Request::SnapshotList { name }
@@ -675,6 +691,7 @@ impl Request {
             // it to whoever happens to hold an instance of that name.
             Request::VolumeCreate { .. }
             | Request::VolumeList
+            | Request::VolumeCatalog
             | Request::VolumeRemove { .. }
             | Request::VolumeLease { .. }
             | Request::VolumeReconnect { .. }
@@ -732,6 +749,7 @@ impl Request {
         match self {
             Request::Compat => 2,
             Request::BackupExport { .. } | Request::BackupImport { .. } => 3,
+            Request::AttachStorage { .. } | Request::VolumeCatalog => 6,
             Request::DeviceShellStatus => 5,
             Request::DeviceShellPolicy { .. }
             | Request::DeviceShellOpen { .. }
@@ -756,6 +774,8 @@ impl Request {
             Request::Compat => Some("compat"),
             Request::BackupExport { .. } => Some("backup_export"),
             Request::BackupImport { .. } => Some("backup_import"),
+            Request::AttachStorage { .. } => Some("attach_storage"),
+            Request::VolumeCatalog => Some("volume_catalog"),
             Request::DeviceShellStatus => Some("device_shell_status"),
             Request::DeviceShellPolicy { .. }
             | Request::DeviceShellOpen { .. }
@@ -984,6 +1004,10 @@ pub enum Response {
     Volumes {
         volumes: Vec<crate::volume::BlockVolume>,
     },
+    /// Reply to [`Request::VolumeCatalog`].
+    VolumeCatalog {
+        catalog: crate::volume::Catalog,
+    },
     /// Reply to [`Request::VolumeLease`]: the lease was granted, at this
     /// epoch, under this export name.
     ///
@@ -1106,6 +1130,7 @@ impl Response {
         match self {
             Response::Compat { .. } => 2,
             Response::BackupExported { .. } | Response::BackupRestored { .. } => 3,
+            Response::VolumeCatalog { .. } => 6,
             Response::DeviceShellStatus { .. }
             | Response::DeviceShellAccepted { .. }
             | Response::DeviceShellRefused { .. }
@@ -1154,6 +1179,17 @@ pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
             .since(),
         ),
         ("device_shell_status", Request::DeviceShellStatus.since()),
+        ("volume_catalog", Request::VolumeCatalog.since()),
+        (
+            "attach_storage",
+            Request::AttachStorage {
+                name: String::new(),
+                volume: String::new(),
+                owner_device: None,
+                max_latency_ms: None,
+            }
+            .since(),
+        ),
     ]
     .into_iter()
     .map(|(name, version)| (name.to_owned(), version))
@@ -1301,6 +1337,7 @@ mod tests {
         assert!(Request::Compat.speakable_at(2));
         assert!(Request::List.speakable_at(1));
         assert_eq!(Request::DeviceShellStatus.since(), 5);
+        assert_eq!(Request::VolumeCatalog.since(), 6);
         assert_eq!(
             serde_json::to_string(&Request::DeviceShellStatus).unwrap(),
             r#"{"cmd":"device_shell_status"}"#
@@ -1315,6 +1352,8 @@ mod tests {
         assert_eq!(table.get("compat"), Some(&Request::Compat.since()));
         assert_eq!(table.get("backup_export"), Some(&3));
         assert_eq!(table.get("backup_import"), Some(&3));
+        assert_eq!(table.get("volume_catalog"), Some(&6));
+        assert_eq!(table.get("attach_storage"), Some(&6));
         assert_eq!(
             table.get("device-shell"),
             Some(&4),
@@ -1533,6 +1572,12 @@ mod tests {
                 volume: "tank".into(),
                 device: "desktop".into(),
             },
+            Request::AttachStorage {
+                name: "dev".into(),
+                volume: "tank".into(),
+                owner_device: None,
+                max_latency_ms: Some(5),
+            },
             Request::Detach {
                 name: "dev".into(),
                 volume: "tank".into(),
@@ -1642,6 +1687,7 @@ mod tests {
         assert!(matches!(lease, Request::VolumeLease { .. }));
         assert_eq!(lease.subject(), None, "a volume is a device's part");
         assert_eq!(Request::VolumeList.subject(), None);
+        assert_eq!(Request::VolumeCatalog.subject(), None);
         assert_eq!(
             Request::VolumeCreate {
                 name: "tank".into(),
@@ -1658,6 +1704,16 @@ mod tests {
                 name: "dev".into(),
                 volume: "tank".into(),
                 device: "desktop".into()
+            }
+            .subject(),
+            Some("dev")
+        );
+        assert_eq!(
+            Request::AttachStorage {
+                name: "dev".into(),
+                volume: "tank".into(),
+                owner_device: None,
+                max_latency_ms: None,
             }
             .subject(),
             Some("dev")
