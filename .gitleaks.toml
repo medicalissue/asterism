@@ -1,0 +1,8 @@
+title = "Asterism repository secret policy"
+
+[extend]
+useDefault = true
+
+# There are deliberately no allowlists. A false positive must be documented
+# in docs/supply-chain-exceptions.md with an exact rule/path, rationale, and
+# removal condition before it can be added here.

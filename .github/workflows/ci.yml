@@ -9,6 +9,54 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  supply-chain:
+    # This job has no write permission and does not upload source or secret
+    # findings. It reviews the exact committed lock graphs and the complete
+    # repository history on a GitHub-hosted runner.
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+
+      - name: Audit the locked Rust graph and license policy
+        uses: EmbarkStudios/cargo-deny-action@ae8fd5dc5a11c62c128f5f24f23cc7f8891c5ac5 # v2.0.10
+        with:
+          command: check advisories bans licenses sources
+          arguments: --all-features --locked
+
+      - name: Audit the locked GUI Rust graph and license policy
+        uses: EmbarkStudios/cargo-deny-action@ae8fd5dc5a11c62c128f5f24f23cc7f8891c5ac5 # v2.0.10
+        with:
+          command: check advisories bans licenses sources
+          arguments: --all-features --locked
+          manifest-path: gui/Cargo.toml
+
+      - name: Audit the locked GUI npm graph
+        run: npm --prefix gui/ui audit --package-lock-only --audit-level=low --ignore-scripts
+
+      - name: Scan the complete repository history for secrets
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+          GITLEAKS_ENABLE_COMMENTS: "false"
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+          GITLEAKS_VERSION: "8.24.2"
+
+      - name: Prove supply-chain metadata is deterministic
+        run: |
+          set -eu
+          version="ci-${GITHUB_SHA}"
+          node scripts/generate-supply-chain-metadata.mjs --out "${RUNNER_TEMP}/supply-chain/a" --version "$version"
+          node scripts/generate-supply-chain-metadata.mjs --out "${RUNNER_TEMP}/supply-chain/b" --version "$version"
+          cmp "${RUNNER_TEMP}/supply-chain/a/asterism-${version}-sbom.cdx.json" \
+              "${RUNNER_TEMP}/supply-chain/b/asterism-${version}-sbom.cdx.json"
+          cmp "${RUNNER_TEMP}/supply-chain/a/asterism-${version}-licenses.json" \
+              "${RUNNER_TEMP}/supply-chain/b/asterism-${version}-licenses.json"
+
   test:
     strategy:
       matrix:
