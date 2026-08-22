@@ -41,7 +41,7 @@ use objc2_virtualization::{
     VZEFIVariableStoreInitializationOptions, VZEntropyDeviceConfiguration,
     VZFileHandleSerialPortAttachment, VZGenericPlatformConfiguration, VZMACAddress,
     VZMemoryBalloonDeviceConfiguration, VZNATNetworkDeviceAttachment,
-    VZNetworkBlockDeviceStorageDeviceAttachment,
+    VZLinuxBootLoader, VZNetworkBlockDeviceStorageDeviceAttachment,
     VZNetworkBlockDeviceStorageDeviceAttachmentDelegate, VZNetworkDevice,
     VZNetworkDeviceConfiguration, VZSerialPortConfiguration, VZSocketDeviceConfiguration,
     VZStorageDeviceConfiguration, VZVirtioBlockDeviceConfiguration,
@@ -414,24 +414,47 @@ unsafe fn build_config(
     vm_config.setPlatform(&Retained::into_super(VZGenericPlatformConfiguration::new()));
 
     // ---- boot loader ---------------------------------------------------
-    // EFI with a persistent variable store. The store is what remembers the
-    // boot entry the guest's GRUB installed, so it is created once and
-    // reused; a fresh store every boot sends the firmware back to scanning
-    // for a fallback bootloader (spike landmine 5).
-    let boot = VZEFIBootLoader::new();
-    let vars = if config.efi_vars.exists() {
-        VZEFIVariableStore::initWithURL(VZEFIVariableStore::alloc(), &url(&config.efi_vars))
-    } else {
-        VZEFIVariableStore::initCreatingVariableStoreAtURL_options_error(
-            VZEFIVariableStore::alloc(),
-            &url(&config.efi_vars),
-            VZEFIVariableStoreInitializationOptions::empty(),
-        )
-        .map_err(vz_err)
-        .context("creating the EFI variable store")?
-    };
-    boot.setVariableStore(Some(&vars));
-    vm_config.setBootLoader(Some(&Retained::into_super(boot)));
+    match &config.direct_kernel {
+        Some(direct) => {
+            if !direct.kernel.exists() {
+                bail!("{} is not there to boot", direct.kernel.display());
+            }
+            let boot = VZLinuxBootLoader::initWithKernelURL(
+                VZLinuxBootLoader::alloc(),
+                &url(&direct.kernel),
+            );
+            boot.setCommandLine(&NSString::from_str(&direct.cmdline));
+            if let Some(initrd) = &direct.initrd {
+                if !initrd.exists() {
+                    bail!("{} is not there to boot", initrd.display());
+                }
+                boot.setInitialRamdiskURL(Some(&url(initrd)));
+            }
+            vm_config.setBootLoader(Some(&Retained::into_super(boot)));
+        }
+        None => {
+            // EFI with a persistent variable store. The store is what
+            // remembers the boot entry the guest's GRUB installed, so it is
+            // created once and reused (spike landmine 5).
+            let boot = VZEFIBootLoader::new();
+            let vars = if config.efi_vars.exists() {
+                VZEFIVariableStore::initWithURL(
+                    VZEFIVariableStore::alloc(),
+                    &url(&config.efi_vars),
+                )
+            } else {
+                VZEFIVariableStore::initCreatingVariableStoreAtURL_options_error(
+                    VZEFIVariableStore::alloc(),
+                    &url(&config.efi_vars),
+                    VZEFIVariableStoreInitializationOptions::empty(),
+                )
+                .map_err(vz_err)
+                .context("creating the EFI variable store")?
+            };
+            boot.setVariableStore(Some(&vars));
+            vm_config.setBootLoader(Some(&Retained::into_super(boot)));
+        }
+    }
 
     // ---- storage -------------------------------------------------------
     // Root first, seed second, extra disks after: cloud-init finds the
@@ -468,7 +491,11 @@ unsafe fn build_config(
         Ok(Retained::into_super(dev))
     };
     disks.push(attach(&config.root, false)?);
-    disks.push(attach(&config.seed, true)?);
+    // A directly booted OCI rootfs has no cloud-init and therefore no seed.
+    // Cloud images keep the historical root/seed ordering.
+    if config.direct_kernel.is_none() {
+        disks.push(attach(&config.seed, true)?);
+    }
     for disk in &config.extra_disks {
         match disk {
             Disk::File { path, readonly } => disks.push(attach(path, *readonly)?),

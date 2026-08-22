@@ -442,6 +442,10 @@ pub struct BootReq<'a> {
     /// Host directories to share into the guest. Only meaningful when
     /// [`Caps::shared_dir`] is `Some`.
     pub shares: Vec<Share>,
+    /// Per-instance secret-egress material. A cloud image receives this in
+    /// its NoCloud seed; an OCI rootfs receives the same public CA, opaque
+    /// handles and proxy address through its generated init.
+    pub egress: crate::seed::Egress,
     /// Attached volumes that arrive as disks, including remote ones.
     pub extra_disks: Vec<DiskSpec>,
     pub console: PathBuf,

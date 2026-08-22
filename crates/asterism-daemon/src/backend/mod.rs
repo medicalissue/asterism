@@ -216,16 +216,6 @@ pub fn for_handle(backend: &str) -> Result<Arc<dyn Hypervisor>> {
 /// record a volume the instance will be able to use once it is.
 pub fn check_can_share(inst: &Instance) -> Result<()> {
     let hv = for_instance(inst)?;
-    // An OCI guest runs the image's entrypoint under a generated init and
-    // nothing else: there is no cloud-init in it to act on a mount unit, and
-    // no 9p module in the kernel's initrd to mount one with.
-    if inst.image_kind == ImageKind::OciRootfs {
-        bail!(
-            "{:?} boots an OCI image, which has no init system to mount a volume \
-             with — put the volume on an instance built from a cloud image",
-            inst.name
-        );
-    }
     if hv.probe().is_ok() && hv.caps().shared_dir.is_none() {
         bail!(
             "the {} backend on this device cannot share host directories, so a \
@@ -338,6 +328,7 @@ pub fn disk_req(inst: &Instance) -> Result<BootReq<'_>> {
         seed: dir.join("seed.iso"),
         console: dir.join("console.log"),
         shares: Vec::new(),
+        egress: seed::Egress::default(),
         extra_disks: Vec::new(),
         dir,
     })
@@ -348,15 +339,6 @@ pub fn disk_req(inst: &Instance) -> Result<BootReq<'_>> {
 /// done before any backend is asked to do anything (BACKENDS.md §2).
 pub fn boot_req<'a>(inst: &'a Instance, hv: &dyn Hypervisor) -> Result<BootReq<'a>> {
     let mut req = disk_req(inst)?;
-
-    // An OCI guest has no cloud-init to hand a seed to: what a cloud image
-    // learns from one — its hostname, its ssh keys, its mounts — an OCI image
-    // has no way to act on. The generated init is the whole of its
-    // configuration, and it was written into the filesystem at pull time.
-    if req.base.kind == ImageKind::OciRootfs {
-        check_can_boot(hv, &req.base, &inst.publish)?;
-        return Ok(req);
-    }
 
     let shares = seed::shares(inst);
 
@@ -377,6 +359,18 @@ pub fn boot_req<'a>(inst: &'a Instance, hv: &dyn Hypervisor) -> Result<BootReq<'
     // say. An instance with no bindings gets an empty config and no listener.
     let egress = crate::egress::seed_config(inst)?;
 
+    // An OCI image has no cloud-init, but it does have Asterism's generated
+    // pid 1. Carry the same backend-neutral parts data to `prepare`, which
+    // refreshes that init in the instance's private root disk. This removes
+    // the old OCI-specific refusal without teaching orchestration which
+    // hypervisor is underneath it.
+    if req.base.kind == ImageKind::OciRootfs {
+        check_can_boot(hv, &req.base, &inst.publish)?;
+        req.shares = shares;
+        req.egress = egress;
+        return Ok(req);
+    }
+
     // The backend gets to add what its own devices need — for vz, the
     // `/dev/hvc0` console no stock cloud image knows about, and the agent
     // that answers on the guest's virtio socket.
@@ -386,6 +380,7 @@ pub fn boot_req<'a>(inst: &'a Instance, hv: &dyn Hypervisor) -> Result<BootReq<'
     seed::ensure(&inst.name, &req.seed, &shares, &guest_config, &egress)
         .context("building cloud-init seed")?;
     req.shares = shares;
+    req.egress = egress;
     Ok(req)
 }
 

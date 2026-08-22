@@ -92,6 +92,14 @@ pub struct Config {
     /// EFI variable store. Created by the helper on first boot, because
     /// only the framework can initialise one, and reused after.
     pub efi_vars: PathBuf,
+    /// A kernel handed directly to Virtualization.framework. Present for an
+    /// OCI root filesystem, which has no EFI bootloader of its own; absent
+    /// for a cloud-image disk, which boots through `efi_vars` above.
+    ///
+    /// Additive on the daemon/helper wire: an older config has no field and
+    /// therefore keeps taking the EFI path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_kernel: Option<LinuxBoot>,
     /// Where the guest's serial console lands.
     pub console: PathBuf,
     /// Unix socket the helper listens on for [`Command`]s.
@@ -117,6 +125,20 @@ pub struct Config {
     /// NAT, exactly as it did before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_key: Option<PathBuf>,
+}
+
+/// Virtualization.framework's native Linux boot-loader inputs.
+///
+/// This is deliberately just data. The daemon obtains and verifies the
+/// kernel through the shared OCI store; the signed helper translates these
+/// three paths/bytes to `VZLinuxBootLoader`. No QEMU option or device name is
+/// part of the helper protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinuxBoot {
+    pub kernel: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initrd: Option<PathBuf>,
+    pub cmdline: String,
 }
 
 /// One additional disk to put in front of the guest.
