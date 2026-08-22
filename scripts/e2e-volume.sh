@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# End-to-end for remote block volumes: bytes that live on one device, a guest
-# that runs on another, and a filesystem the guest believes is a local disk.
+# End-to-end for the storage parts journey: a same-device directory, remote
+# block bytes that live on a peer, and a guest that sees both as local parts.
 #
-# volume create -> attach across the mesh -> a REAL boot -> the attached disk
-# in the guest -> mkfs + mount + a marker -> down/up and the marker survives
+# directory attach + volume create -> block attach across the mesh -> a REAL
+# boot -> virtiofs/9p directory and attached disk in the guest -> mkfs + mount
+# + markers -> down/up and both survive
 # -> a second instance is refused by name -> detach, reattach elsewhere,
 # epoch bumped and the old export socket gone -> the export dies under a live
 # guest and comes back at the same epoch -> the consumer's own daemon is
@@ -61,6 +62,8 @@ B_NAME="vol-b-$$"
 INST="vol-e2e"        # the instance that really boots, on A
 OTHER="vol-e2e-two"   # the second claimant, defined and never booted
 VOL="tank"
+SHARED="$A/host-share"
+SHARED_GUEST="/workspace"
 IMAGE="${E2E_IMAGE:-debian:13}"
 
 # ---- the processes this test starts ----------------------------------------
@@ -353,6 +356,13 @@ expect "create the instance on A ($BACKEND)" "$INST  defined" \
   env ASTERISM_HOME="$A" "$AST" create "$INST" --backend "$BACKEND" --image "$IMAGE" \
     --mem 2G --disk 10G
 
+mkdir -p "$SHARED"
+chmod 0777 "$SHARED"
+HOST_MARKER="host-directory-$BACKEND-$(date +%s)"
+printf '%s\n' "$HOST_MARKER" >"$SHARED/host-marker"
+expect "attach a same-device directory ($BACKEND)" "$SHARED_GUEST" \
+  env ASTERISM_HOME="$A" "$AST" attach "$INST" --volume "$SHARED" --at "$SHARED_GUEST"
+
 ATTACH="$(ASTERISM_HOME="$A" "$AST" attach "$INST" --volume "$B_NAME:$VOL" 2>&1)" \
   || fail "attach failed:"$'\n'"$ATTACH"
 grep -qF "$B_NAME:$VOL  ->  a disk in the guest" <<<"$ATTACH" \
@@ -392,6 +402,17 @@ echo "ok: ast status shows the volume sourced from $B_NAME with its epoch"
 
 expect "the instance boots with the volume" "$INST  running" \
   env ASTERISM_HOME="$A" "$AST" up "$INST"
+
+SHARED_READ="$(in_guest "cat $SHARED_GUEST/host-marker")" \
+  || fail "the guest could not read its same-device directory:"$'\n'"$SHARED_READ"
+grep -qF "$HOST_MARKER" <<<"$SHARED_READ" \
+  || fail "the host marker did not reach the guest:"$'\n'"$SHARED_READ"
+GUEST_MARKER="guest-directory-$BACKEND-$(date +%s)"
+in_guest "echo '$GUEST_MARKER' > $SHARED_GUEST/guest-marker && sync" >/dev/null \
+  || fail "the guest could not write its same-device directory"
+grep -qF "$GUEST_MARKER" "$SHARED/guest-marker" \
+  || fail "the guest's directory write did not reach the host"
+echo "ok: the guest and host see the same writable directory through $BACKEND"
 
 # Booting renews the lease at a higher epoch, and the old export is revoked.
 E2="$(epoch_now)"
@@ -466,6 +487,8 @@ SURVIVED="$(in_guest "sudo mkdir -p /data && sudo mount $VOLUME_DEV /data && cat
 grep -qF "$MARKER" <<<"$SURVIVED" \
   || fail "the marker did not survive the reboot:"$'\n'"$SURVIVED"
 echo "ok: the filesystem and the marker survived down/up (now epoch $E3)"
+expect "the directory mount survives down/up too" "$HOST_MARKER" \
+  in_guest "cat $SHARED_GUEST/host-marker"
 
 # ---- 6. one writer, and the refusal names who has it -----------------------
 

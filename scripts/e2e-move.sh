@@ -252,12 +252,9 @@ ASTERISM_HOME="$A" "$AST" pull "$IMAGE" >/dev/null 2>&1 \
 [ -z "$(ls "$B/images" 2>/dev/null || true)" ] \
   || fail "B's image store is not empty, so the peer fetch proves nothing"
 
-# qemu by name, because of the attach two lines down: a directory share
-# reaches a guest over 9p, which vz cannot do. Selection is vz-first and is
-# made at create time, before the daemon knows a volume is coming, so a
-# create with no --backend lands on vz wherever vz works and the attach is
-# then refused. What this lane is about is what a move does with a stranded
-# directory share, not which backend the daemon picked.
+# qemu by name so this move lane keeps exercising the existing 9p transport;
+# the behavior under test is what a move does with any same-device directory
+# share, independent of whether its backend transport is 9p or virtiofs.
 expect "create on A" "$INST  defined" \
   env ASTERISM_HOME="$A" "$AST" create "$INST" --backend qemu --image "$IMAGE" \
     --mem 2G --disk 10G

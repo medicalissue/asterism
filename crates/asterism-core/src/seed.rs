@@ -901,6 +901,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn virtiofs_units_name_only_the_transport_vz_attaches() {
+        let shares = [share("/workspace/source", "/mnt/ast/source")];
+        let config = asterism_config(
+            &shares,
+            Some(ShareKind::Virtiofs),
+            &Egress::default(),
+        );
+        assert!(config.contains("Type=virtiofs"), "{config}");
+        assert!(config.contains("modprobe virtiofs"), "{config}");
+        assert!(config.contains("asterism-virtiofs.conf"), "{config}");
+        assert!(config.contains(&format!("What={}", shares[0].tag)), "{config}");
+        assert!(!config.contains("Type=9p"), "{config}");
+        assert!(!config.contains("trans=virtio"), "{config}");
+    }
+
     /// Two halves of the user-data can each need `runcmd:`, and YAML would
     /// silently keep only the second. They are merged rather than pasted, so
     /// both arrive in the guest.
@@ -1151,6 +1167,17 @@ mod tests {
         assert_eq!(none, fingerprint("dev", &[], None, "", &bare));
         assert_ne!(none, one);
         assert_ne!(one, elsewhere);
+        assert_ne!(
+            one,
+            fingerprint(
+                "dev",
+                &[share("/tank/media", "/mnt/ast/media")],
+                Some(ShareKind::Virtiofs),
+                "",
+                &bare,
+            ),
+            "a backend transport change has to reissue the guest's mount unit"
+        );
         assert_ne!(
             one,
             fingerprint(

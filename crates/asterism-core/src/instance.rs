@@ -40,9 +40,9 @@ impl std::fmt::Display for Status {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VolumeKind {
-    /// A host directory, shared as virtio-9p and mounted at `mount_point`.
-    /// Same device only; see `docs/ROADMAP.md` on why virtiofs and 9p have
-    /// no network transport and never will.
+    /// A host directory, shared through the backend's transport (9p or
+    /// virtiofs) and mounted at `mount_point`. Same device only: neither
+    /// transport has a network form.
     #[default]
     Dir,
     /// A block volume (`ast volume create`), served as NBD by the device
@@ -54,9 +54,9 @@ pub enum VolumeKind {
 /// A storage volume attached to an instance. `host` names the device the
 /// bytes live on.
 ///
-/// Directory volumes hosted on this device are passed to the guest as a
-/// virtio-9p share and mounted at `mount_point`. Block volumes name a volume
-/// created with `ast volume create` on `host`, and arrive as `/dev/vdX` —
+/// Directory volumes hosted on this device are passed to the guest through
+/// the backend's directory-share transport and mounted at `mount_point`.
+/// Block volumes name a volume created with `ast volume create` on `host`, and arrive as `/dev/vdX` —
 /// over the mesh as NBD when `host` is another device, which the guest has no
 /// way of telling.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,11 +126,11 @@ impl Volume {
             .unwrap_or_else(|| default_mount_point(&self.path))
     }
 
-    /// The virtio-9p mount tag identifying this share to the guest.
+    /// The virtio filesystem mount tag identifying this share to the guest.
     ///
     /// Derived from host+path with a fixed hash so the tag a guest was
     /// told about survives daemon restarts and toolchain upgrades. Tags
-    /// are capped at 31 bytes by virtio-9p; this is 15.
+    /// fit the stricter transport's tag limit; this is 15 bytes.
     pub fn mount_tag(&self) -> String {
         format!(
             "ast{:012x}",
@@ -449,7 +449,7 @@ pub struct Instance {
     pub secrets: Vec<Binding>,
     /// Guest paths of volumes the last cpu-part swap left behind.
     ///
-    /// A volume attached over 9p is a same-device part: the hypervisor
+    /// A directory share is a same-device part: the hypervisor
     /// shares a directory that is on its own disk. Move the cpu part to
     /// another device and that share has nothing to attach to. The row is
     /// *kept* — it is still what the user asked for, and it becomes true
@@ -595,8 +595,8 @@ impl Instance {
                     format!("{} -> {}", v.path, v.guest_path()),
                     if self.stranded.iter().any(|p| *p == v.guest_path()) {
                         Some(format!(
-                            "stranded by the cpu move — a directory on {}, and 9p \
-                             shares are same-device only",
+                            "stranded by the cpu move — a directory on {}, and \
+                             directory shares are same-device only",
                             v.host
                         ))
                     } else {
