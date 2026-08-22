@@ -15,10 +15,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-CARGO_TARGET_DIR="$TARGET_DIR" cargo test --locked --workspace --all-targets --no-run
+CARGO_TARGET_DIR="$TARGET_DIR" CARGO_INCREMENTAL=0 \
+  cargo test --locked --workspace --all-targets --no-run
 
 REACHABLE="$TARGET_DIR/reachable"
 TRACKED="$TARGET_DIR/tracked"
+AUDITED="$TARGET_DIR/audited"
+PLATFORM_EXCLUDED="$TARGET_DIR/platform-excluded"
 MISSING="$TARGET_DIR/missing"
 
 # Dep-info is a makefile rule. Joining its escaped continuations then splitting
@@ -32,7 +35,35 @@ find "$TARGET_DIR" -name '*.d' -type f -exec \
   sort -u >"$REACHABLE"
 
 find crates -type f -name '*.rs' -print | sort -u >"$TRACKED"
-comm -23 "$TRACKED" "$REACHABLE" >"$MISSING"
+
+# The astd-vz entry point builds a diagnostic stub away from macOS. Its four
+# implementation modules are consequently absent from rustc's dep-info there.
+# Keep this list exact, and prove each exclusion is still guarded by the
+# adjacent macOS cfg in the binary root before removing it from the audit.
+: >"$PLATFORM_EXCLUDED"
+if ! rustc --print cfg | grep -qx 'target_os="macos"'; then
+  HELPER_MAIN="crates/asterism-vz/src/helper/main.rs"
+  for module in agent ctl net vm; do
+    if ! awk -v module="$module" '
+      /^[[:space:]]*#\[cfg\(target_os[[:space:]]*=[[:space:]]*"macos"\)\][[:space:]]*$/ {
+        macos_cfg = 1
+        next
+      }
+      macos_cfg && $0 ~ "^[[:space:]]*mod[[:space:]]+" module "[[:space:]]*;[[:space:]]*$" {
+        found = 1
+      }
+      { macos_cfg = 0 }
+      END { exit !found }
+    ' "$HELPER_MAIN"; then
+      echo "source-graph exclusion is not proven macOS-only: $module.rs" >&2
+      exit 1
+    fi
+    printf 'crates/asterism-vz/src/helper/%s.rs\n' "$module"
+  done | sort -u >"$PLATFORM_EXCLUDED"
+fi
+
+comm -23 "$TRACKED" "$PLATFORM_EXCLUDED" >"$AUDITED"
+comm -23 "$AUDITED" "$REACHABLE" >"$MISSING"
 
 if [ -s "$MISSING" ]; then
   echo 'Rust sources outside the Cargo build graph:' >&2
