@@ -726,7 +726,6 @@ fn main() -> Result<()> {
                                  disk and the guest mounts it wherever it likes"
                         );
                     }
-                    warn_if_far(&device);
                     Request::AttachBlock {
                         name,
                         volume,
@@ -1842,34 +1841,6 @@ fn block_ref(volume: &str, host: Option<&str>) -> Option<(String, String)> {
         volume.starts_with('/') || volume.starts_with('.') || volume.starts_with('~');
     (!looks_like_a_path && asterism_core::volume::check_name(volume).is_ok())
         .then(|| (host.to_owned(), volume.to_owned()))
-}
-
-/// Above this, a block volume is worth thinking about rather than assuming.
-///
-/// NBD does a round trip per I/O the guest's queue cannot hide, so latency is
-/// the number that decides whether a remote volume feels like a disk or like
-/// a mistake. A LAN is well under a millisecond; a WAN is not.
-const SLOW_LINK_MS: f64 = 5.0;
-
-/// Say so, once, if the device holding the bytes is far away.
-///
-/// A note rather than a refusal: a slow volume is exactly right for an
-/// archive and exactly wrong for a database, and only the person attaching it
-/// knows which this is. Silent if the device cannot be reached — the attach
-/// itself is about to say so much better than a ping could.
-fn warn_if_far(device: &str) {
-    let Ok(Response::DevicePong { millis, .. }) = send(&Request::DevicePing {
-        device: device.to_owned(),
-    }) else {
-        return;
-    };
-    if millis > SLOW_LINK_MS {
-        eprintln!(
-            "note: {device} is {millis:.1}ms away — a volume over a link this slow \
-             reads like a slow disk. Fine for archives and backups; poor for a \
-             database or a build tree."
-        );
-    }
 }
 
 /// `ast volume ls`.
