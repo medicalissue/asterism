@@ -67,6 +67,14 @@ refute() {
   echo "ok: $description"
 }
 
+assert_no_tcp_listener() {
+  local pid listeners
+  command -v lsof >/dev/null 2>&1 || return 0
+  pid="$(cat "$B/astd.pid")"
+  listeners="$(lsof -nP -a -p "$pid" -iTCP -sTCP:LISTEN 2>/dev/null | tail -n +2 || true)"
+  [ -z "$listeners" ] || fail "target opened TCP listeners: $listeners"
+}
+
 mkdir -p "$A" "$B"
 start_daemon "$A"
 start_daemon "$B"
@@ -98,6 +106,18 @@ echo "ok: target accepted local approval with an explicit warning"
 # Non-PTY output and exact exit status.
 OUT="$(ASTERISM_HOME="$A" "$AST" ssh --host "$B_NAME" -- "printf mesh-ok")"
 [ "$OUT" = "mesh-ok" ] || fail "remote command output was $OUT"
+ASTERISM_HOME="$A" "$AST" ssh --host "$B_NAME" -- \
+  "printf stdout-ok; printf stderr-ok >&2" >"$A/stdout.out" 2>"$A/stderr.out"
+[ "$(cat "$A/stdout.out")" = "stdout-ok" ] || fail "remote stdout was not kept separate"
+[ "$(cat "$A/stderr.out")" = "stderr-ok" ] || fail "remote stderr was not kept separate"
+ASTERISM_HOME="$A" "$AST" ssh --host "$B_NAME" -- \
+  "dd if=/dev/zero bs=65536 count=2 2>/dev/null" >"$A/large-output.bin"
+[ "$(wc -c <"$A/large-output.bin" | tr -d ' ')" -eq 131072 ] || \
+  fail "large remote output did not cross multiple bounded frames"
+LARGE_INPUT_COUNT="$(dd if=/dev/zero bs=65536 count=2 2>/dev/null | \
+  ASTERISM_HOME="$A" "$AST" ssh --host "$B_NAME" -- "wc -c")"
+[ "$(tr -d ' ' <<<"$LARGE_INPUT_COUNT")" -eq 131072 ] || \
+  fail "large stdin did not cross multiple bounded frames"
 set +e
 ASTERISM_HOME="$A" "$AST" ssh --host "$B_NAME" -- "exit 23" >/dev/null 2>&1
 STATUS=$?
@@ -109,15 +129,15 @@ echo "ok: command output and exit status crossed the mesh"
 # 80x24 fallback; the unit test exercises a live resize to 94x42.
 PTY_OUT="$(ASTERISM_HOME="$A" "$AST" ssh --host "$B_NAME" -t -- "stty size")"
 tr -d '' <<<"$PTY_OUT" | grep -q "24 80" || fail "remote pty reported $PTY_OUT"
-echo "ok: forced command received a real pty"
+INTERACTIVE_OUT="$(printf 'test -t 0 && echo interactive-ok\nexit\n' | \
+  ASTERISM_HOME="$A" "$AST" ssh --host "$B_NAME" -t)"
+tr -d '\r' <<<"$INTERACTIVE_OUT" | grep -q "interactive-ok" || \
+  fail "interactive shell did not receive a controlling pty: $INTERACTIVE_OUT"
+echo "ok: forced command and interactive shell received a real pty"
 
 # The target daemon owns a QUIC/UDP endpoint and unix control socket, not a TCP
 # shell or sshd listener.
-B_PID="$(cat "$B/astd.pid")"
-if command -v lsof >/dev/null 2>&1; then
-  LISTENERS="$(lsof -nP -a -p "$B_PID" -iTCP -sTCP:LISTEN 2>/dev/null | tail -n +2 || true)"
-  [ -z "$LISTENERS" ] || fail "target opened TCP listeners: $LISTENERS"
-fi
+assert_no_tcp_listener
 echo "ok: device shell opened no TCP listener"
 
 # Disable linearizes before it drains and kills a tracked process group.
@@ -129,6 +149,7 @@ for _ in $(seq 1 100); do
   grep -q "^device shell: active" <<<"$STATUS_OUT" && break
   sleep 0.05
 done
+assert_no_tcp_listener
 DISABLE_OUT="$(ASTERISM_HOME="$B" "$AST" device shell disable)"
 grep -q "1 active session(s) cut" <<<"$DISABLE_OUT" || fail "disable did not report its cut"
 set +e
@@ -136,6 +157,7 @@ wait "$SESSION_PID"
 STATUS=$?
 set -e
 [ "$STATUS" -ne 0 ] || fail "the revoked session reported success"
+assert_no_tcp_listener
 refute "disabled target refuses a new stream" "disabled" env ASTERISM_HOME="$A" "$AST" ssh --host "$B_NAME" -- "printf forbidden"
 echo "ok: disable revoked an active process group and blocked new opens"
 
@@ -155,7 +177,9 @@ wait "$SESSION_PID"
 STATUS=$?
 set -e
 [ "$STATUS" -ne 0 ] || fail "peer removal left its session successful"
-echo "ok: peer removal revoked its active session"
+refute "removed peer cannot reuse its authenticated connection" "not in this orbit" env ASTERISM_HOME="$A" "$AST" ssh --host "$B_NAME" -- "printf forbidden"
+assert_no_tcp_listener
+echo "ok: peer removal revoked its active session and stale connection"
 
 # Audit carries the full authenticated key and lifecycle, but no command,
 # environment values, stdin, output or transcript.

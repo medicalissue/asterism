@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use asterism_core::device_shell::{
     ShellData, ShellExit, ShellFrame, ShellOpen, ShellOutput, ShellPolicyState, ShellPolicyStatus,
-    ShellSessionStatus, MAX_DATA_BYTES, MAX_TERMINAL_DIMENSION, POLICY_VERSION,
+    ShellSessionStatus, MAX_DATA_BYTES, MAX_FRAME_BYTES, MAX_TERMINAL_DIMENSION, POLICY_VERSION,
 };
 use asterism_core::durable;
 use asterism_core::instance::now_unix;
@@ -85,6 +85,7 @@ impl Default for PolicyFile {
 
 struct LiveSession {
     status: ShellSessionStatus,
+    epoch: u64,
     revoke: watch::Sender<Option<String>>,
 }
 
@@ -99,6 +100,7 @@ pub(crate) struct Manager {
     policy_path: PathBuf,
     audit_path: PathBuf,
     state: Mutex<State>,
+    audit_lock: Mutex<()>,
 }
 
 impl Manager {
@@ -155,6 +157,7 @@ impl Manager {
                 unavailable,
                 sessions: HashMap::new(),
             }),
+            audit_lock: Mutex::new(()),
         })
     }
 
@@ -231,20 +234,28 @@ impl Manager {
         durable::commit_json_private(&self.policy_path, &next)
             .context("committing the disabled device-shell policy")?;
         state.policy = next;
+        let epoch = state.policy.epoch;
         let sessions: Vec<_> = state
             .sessions
             .values()
-            .map(|session| (session.status.clone(), session.revoke.clone()))
+            .map(|session| {
+                (
+                    session.status.clone(),
+                    session.epoch,
+                    session.revoke.clone(),
+                )
+            })
             .collect();
         drop(state);
-        for (status, revoke) in &sessions {
+        self.audit_best_effort(AuditRecord::policy("deny", epoch));
+        for (status, epoch, revoke) in &sessions {
             let reason = "device shell disabled locally".to_owned();
-            let _ = self.audit(AuditRecord::session(
+            self.audit_best_effort(AuditRecord::session(
                 "revoke",
                 &status.session_id,
                 &status.peer_device_id,
                 &status.peer_name,
-                0,
+                *epoch,
                 status.pty,
                 Some(reason.clone()),
             ));
@@ -264,16 +275,22 @@ impl Manager {
             .sessions
             .values()
             .filter(|session| session.status.peer_device_id == peer_device_id)
-            .map(|session| (session.status.clone(), session.revoke.clone()))
+            .map(|session| {
+                (
+                    session.status.clone(),
+                    session.epoch,
+                    session.revoke.clone(),
+                )
+            })
             .collect();
         drop(state);
-        for (status, revoke) in &sessions {
-            let _ = self.audit(AuditRecord::session(
+        for (status, epoch, revoke) in &sessions {
+            self.audit_best_effort(AuditRecord::session(
                 "revoke",
                 &status.session_id,
                 &status.peer_device_id,
                 &status.peer_name,
-                0,
+                *epoch,
                 status.pty,
                 Some(reason.to_owned()),
             ));
@@ -283,7 +300,7 @@ impl Manager {
     }
 
     pub(crate) fn revoke_all(&self, reason: &str) {
-        let peers: Vec<String> = self
+        let mut peers: Vec<String> = self
             .state
             .lock()
             .expect("device-shell policy lock poisoned")
@@ -291,6 +308,8 @@ impl Manager {
             .values()
             .map(|s| s.status.peer_device_id.clone())
             .collect();
+        peers.sort();
+        peers.dedup();
         for peer in peers {
             self.revoke_peer(&peer, reason);
         }
@@ -347,10 +366,12 @@ impl Manager {
             None
         };
         if let Some((code, message)) = refusal {
+            let epoch = state.policy.epoch;
             drop(state);
-            let _ = self.audit(AuditRecord::deny(
+            self.audit_best_effort(AuditRecord::deny(
                 peer_device_id,
                 peer_name,
+                epoch,
                 code,
                 &message,
                 pty,
@@ -372,6 +393,7 @@ impl Manager {
             session_id.clone(),
             LiveSession {
                 status: status.clone(),
+                epoch,
                 revoke,
             },
         );
@@ -385,6 +407,10 @@ impl Manager {
     }
 
     fn audit(&self, record: AuditRecord) -> Result<()> {
+        let _audit = self
+            .audit_lock
+            .lock()
+            .expect("device-shell audit lock poisoned");
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -404,6 +430,13 @@ impl Manager {
         Ok(())
     }
 
+    fn audit_best_effort(&self, record: AuditRecord) {
+        let event = record.event.clone();
+        if let Err(e) = self.audit(record) {
+            eprintln!("astd: device-shell {event} audit failed: {e:#}");
+        }
+    }
+
     fn audit_denial(
         &self,
         peer_device_id: &str,
@@ -412,9 +445,16 @@ impl Manager {
         message: &str,
         pty: bool,
     ) {
-        let _ = self.audit(AuditRecord::deny(
+        let epoch = self
+            .state
+            .lock()
+            .expect("device-shell policy lock poisoned")
+            .policy
+            .epoch;
+        self.audit_best_effort(AuditRecord::deny(
             peer_device_id,
             peer_name,
+            epoch,
             code,
             message,
             pty,
@@ -458,7 +498,7 @@ impl Lease {
                 .clone()
                 .or_else(|| exit.code.map(|code| format!("exit {code}")))
                 .or_else(|| exit.signal.map(|signal| format!("signal {signal}")));
-            let _ = manager.audit(AuditRecord::session(
+            manager.audit_best_effort(AuditRecord::session(
                 "end",
                 &self.status.session_id,
                 &self.status.peer_device_id,
@@ -481,7 +521,7 @@ impl Drop for Lease {
                 .sessions
                 .remove(&self.status.session_id);
             if !self.finished {
-                let _ = manager.audit(AuditRecord::session(
+                manager.audit_best_effort(AuditRecord::session(
                     "end",
                     &self.status.session_id,
                     &self.status.peer_device_id,
@@ -529,14 +569,14 @@ impl AuditRecord {
         }
     }
 
-    fn deny(peer: &str, name: &str, code: &str, result: &str, pty: bool) -> Self {
+    fn deny(peer: &str, name: &str, epoch: u64, code: &str, result: &str, pty: bool) -> Self {
         Self {
             timestamp_utc: now_unix(),
             event: "deny".to_owned(),
             session_id: None,
             peer_device_id: Some(peer.to_owned()),
             peer_name: Some(name.to_owned()),
-            policy_epoch: 0,
+            policy_epoch: epoch,
             mode: Some(if pty { "pty" } else { "command" }),
             result: Some(result.to_owned()),
             refusal_code: Some(code.to_owned()),
@@ -1000,7 +1040,10 @@ impl Wire<'_, '_> {
                         data: data.clone(),
                     },
                     ShellFrame::Exit { exit } => Response::DeviceShellExit { exit: exit.clone() },
-                    other => bail!("cannot send a control frame to ast: {other:?}"),
+                    other => bail!(
+                        "cannot send a {} control frame to ast",
+                        shell_frame_name(other)
+                    ),
                 };
                 io.send(&response).await
             }
@@ -1016,7 +1059,7 @@ impl Wire<'_, '_> {
                 Request::DeviceShellResize { cols, rows } => Ok(ShellFrame::Resize { cols, rows }),
                 Request::DeviceShellSignal { signal } => Ok(ShellFrame::Signal { signal }),
                 Request::DeviceShellClose => Ok(ShellFrame::Close),
-                other => bail!("unexpected request during a device-shell session: {other:?}"),
+                _ => bail!("unexpected non-session request during a device-shell session"),
             },
         }
     }
@@ -1038,6 +1081,13 @@ pub(crate) async fn serve_mesh(
         let member = orbit.by_id(&peer_id).cloned();
         let Some(member) = member else {
             drop(orbit);
+            node.shell.audit_denial(
+                &peer_id,
+                "<not in orbit>",
+                "not_in_orbit",
+                "the authenticated peer is not in this orbit",
+                open.pty,
+            );
             send_refusal(
                 &mut wire,
                 "not_in_orbit",
@@ -1049,8 +1099,8 @@ pub(crate) async fn serve_mesh(
         if let Err(why) = open.validate() {
             drop(orbit);
             node.shell
-                .audit_denial(&peer_id, &member.name, "malformed", &why, open.pty);
-            send_refusal(&mut wire, "malformed", &why).await?;
+                .audit_denial(&peer_id, &member.name, "malformed", why, open.pty);
+            send_refusal(&mut wire, "malformed", why).await?;
             return Ok(());
         }
         // reserve is synchronous and occurs while membership's lock is held.
@@ -1083,9 +1133,9 @@ pub(crate) async fn serve_self<'a, 'b>(
     let peer_id = peer.to_string();
     if let Err(why) = open.validate() {
         node.shell
-            .audit_denial(&peer_id, &peer_name, "malformed", &why, open.pty);
+            .audit_denial(&peer_id, &peer_name, "malformed", why, open.pty);
         let mut wire = Wire::Local(io);
-        send_refusal(&mut wire, "malformed", &why).await?;
+        send_refusal(&mut wire, "malformed", why).await?;
         return Ok(());
     }
     let lease = node.shell.reserve(&peer_id, &peer_name, open.pty);
@@ -1128,7 +1178,10 @@ pub(crate) async fn bridge_client<'a, 'b>(
                     ShellFrame::Refused { code, message } => Response::DeviceShellRefused { code, message },
                     ShellFrame::Output { stream, data } => Response::DeviceShellOutput { stream, data },
                     ShellFrame::Exit { exit } => Response::DeviceShellExit { exit },
-                    other => bail!("the target sent a shell control frame to the client: {other:?}"),
+                    other => bail!(
+                        "the target sent a {} control frame to the client",
+                        shell_frame_name(&other)
+                    ),
                 };
                 io.send(&response).await?;
                 if terminal {
@@ -1143,7 +1196,7 @@ pub(crate) async fn bridge_client<'a, 'b>(
                     Request::DeviceShellResize { cols, rows } => ShellFrame::Resize { cols, rows },
                     Request::DeviceShellSignal { signal } => ShellFrame::Signal { signal },
                     Request::DeviceShellClose => ShellFrame::Close,
-                    other => bail!("unexpected request during a device-shell session: {other:?}"),
+                    _ => bail!("unexpected non-session request during a device-shell session"),
                 };
                 write_shell_frame(&mut stream.send, &frame).await?;
             }
@@ -1183,13 +1236,23 @@ async fn run(
             return Ok(());
         }
     };
-    send_bounded(
+    if let Err(e) = send_bounded(
         &mut wire,
         &ShellFrame::Accepted {
             session_id: lease.status.session_id.clone(),
         },
     )
-    .await?;
+    .await
+    {
+        let exit = terminate(
+            &mut running.exit,
+            running.pid,
+            format!("client disconnected before accepting the shell: {e:#}"),
+        )
+        .await;
+        lease.finish(&exit);
+        return Err(e);
+    }
 
     let mut exit = loop {
         tokio::select! {
@@ -1257,7 +1320,10 @@ async fn run(
                         break terminate(
                             &mut running.exit,
                             running.pid,
-                            format!("protocol error after open: unexpected {other:?}"),
+                            format!(
+                                "protocol error after open: unexpected {} frame",
+                                shell_frame_name(&other)
+                            ),
                         ).await;
                     }
                     Err(e) => {
@@ -1287,6 +1353,20 @@ async fn run(
     let _ = send_bounded(&mut wire, &ShellFrame::Exit { exit }).await;
     let _ = member; // retained through the session for its authenticated display name
     Ok(())
+}
+
+fn shell_frame_name(frame: &ShellFrame) -> &'static str {
+    match frame {
+        ShellFrame::Accepted { .. } => "accepted",
+        ShellFrame::Refused { .. } => "refused",
+        ShellFrame::Stdin { .. } => "stdin",
+        ShellFrame::StdinEof => "stdin_eof",
+        ShellFrame::Resize { .. } => "resize",
+        ShellFrame::Signal { .. } => "signal",
+        ShellFrame::Close => "close",
+        ShellFrame::Output { .. } => "output",
+        ShellFrame::Exit { .. } => "exit",
+    }
 }
 
 async fn terminate(exit: &mut oneshot::Receiver<ShellExit>, pid: i32, reason: String) -> ShellExit {
@@ -1328,15 +1408,12 @@ async fn send_bounded(wire: &mut Wire<'_, '_>, frame: &ShellFrame) -> Result<()>
 }
 
 fn split_refusal(rendered: &str) -> (&str, &str) {
-    rendered
-        .split_once(": ")
-        .map(|(code, message)| (code, message))
-        .unwrap_or(("refused", rendered))
+    rendered.split_once(": ").unwrap_or(("refused", rendered))
 }
 
 pub(crate) async fn write_shell_frame(send: &mut SendStream, frame: &ShellFrame) -> Result<()> {
     let bytes = serde_json::to_vec(frame)?;
-    if bytes.len() > MAX_DATA_BYTES + 4096 {
+    if bytes.len() > MAX_FRAME_BYTES {
         bail!("a device-shell frame is larger than its bounded payload permits");
     }
     send.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
@@ -1353,7 +1430,7 @@ pub(crate) async fn read_shell_frame(recv: &mut RecvStream) -> Result<ShellFrame
         .await
         .context("a device-shell frame header was still arriving after 5s")??;
     let len = u32::from_be_bytes(len) as usize;
-    if len > MAX_DATA_BYTES + 4096 {
+    if len > MAX_FRAME_BYTES {
         bail!("a device-shell frame of {len} bytes exceeds its bounded payload");
     }
     let mut bytes = vec![0u8; len];
@@ -1446,6 +1523,66 @@ mod tests {
         assert!(audit.contains("peer-a"));
         assert!(!audit.contains("\"command\":"));
         assert!(!audit.contains("\"transcript\":"));
+    }
+
+    #[test]
+    fn denials_and_revocations_record_the_policy_epoch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = manager(tmp.path());
+        let enabled = manager.enable(vec!["peer-a".into()]).unwrap();
+        let lease = manager.reserve("peer-a", "laptop", false).unwrap();
+        assert!(manager.reserve("peer-b", "stranger", false).is_err());
+        let (disabled, count) = manager.disable().unwrap();
+        assert_eq!(count, 1);
+
+        let records: Vec<serde_json::Value> =
+            std::fs::read_to_string(tmp.path().join("audit.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+        assert!(records.iter().any(|record| {
+            record["event"] == "deny"
+                && record["peer_device_id"] == "peer-b"
+                && record["policy_epoch"] == enabled.epoch
+        }));
+        assert!(records.iter().any(|record| {
+            record["event"] == "deny"
+                && record.get("session_id").is_none()
+                && record.get("refusal_code").is_none()
+                && record["policy_epoch"] == disabled.epoch
+        }));
+        assert!(records.iter().any(|record| {
+            record["event"] == "revoke"
+                && record["session_id"] == lease.status.session_id
+                && record["policy_epoch"] == enabled.epoch
+        }));
+    }
+
+    #[test]
+    fn concurrent_audit_records_remain_one_json_object_per_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = manager(tmp.path());
+        let mut writers = Vec::new();
+        for writer in 0..8 {
+            let manager = manager.clone();
+            writers.push(std::thread::spawn(move || {
+                for record in 0..32 {
+                    manager
+                        .audit(AuditRecord::policy("allow", writer * 32 + record))
+                        .unwrap();
+                }
+            }));
+        }
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let audit = std::fs::read_to_string(tmp.path().join("audit.jsonl")).unwrap();
+        let lines: Vec<_> = audit.lines().collect();
+        assert_eq!(lines.len(), 8 * 32);
+        assert!(lines
+            .iter()
+            .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok()));
     }
 
     #[test]

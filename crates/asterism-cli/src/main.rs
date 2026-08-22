@@ -2038,7 +2038,7 @@ fn device_shell(device: &str, words: &[String], force_pty: bool) -> Result<()> {
                 };
                 if let Err(e) = written {
                     if e.kind() == std::io::ErrorKind::BrokenPipe {
-                        let _ = requests.send(Request::DeviceShellClose);
+                        let _ = requests.try_send(Request::DeviceShellClose);
                         break asterism_core::device_shell::ShellExit {
                             code: Some(0),
                             signal: None,

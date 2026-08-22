@@ -15,12 +15,21 @@ pub const MAX_COMMAND_BYTES: usize = 32 * 1024;
 /// One stdin/stdout/stderr frame. Flow control, rather than an unbounded
 /// queue, carries larger streams as several frames.
 pub const MAX_DATA_BYTES: usize = 64 * 1024;
+/// Largest encoded control/data frame. A full binary payload expands to four
+/// base64 bytes per three input bytes; the remainder covers the JSON tag and
+/// fixed fields.
+pub const MAX_FRAME_BYTES: usize = MAX_DATA_BYTES.div_ceil(3) * 4 + 4096;
 /// Environment keys a caller may contribute.
 pub const MAX_ENV_VARS: usize = 32;
 /// Total bytes across contributed environment names and values.
 pub const MAX_ENV_BYTES: usize = 8 * 1024;
 /// A single contributed environment value.
 pub const MAX_ENV_VALUE_BYTES: usize = 256;
+/// Largest encoded opening frame. JSON may spell one decoded byte as a
+/// six-byte `\u00xx` escape, so the wire cap covers that worst case plus the
+/// fixed frame fields without falling back to the mesh's multi-megabyte RPC
+/// ceiling.
+pub const MAX_OPEN_FRAME_BYTES: usize = (MAX_COMMAND_BYTES + MAX_ENV_BYTES) * 6 + 4096;
 /// Rows and columns outside this range are malformed, not terminal sizes.
 pub const MAX_TERMINAL_DIMENSION: u16 = 1000;
 
@@ -280,6 +289,15 @@ mod tests {
         assert_eq!(serde_json::from_str::<ShellData>(&json).unwrap(), data);
         let too_large = format!("\"{}\"", "A".repeat(MAX_DATA_BYTES.div_ceil(3) * 4 + 1));
         assert!(serde_json::from_str::<ShellData>(&too_large).is_err());
+    }
+
+    #[test]
+    fn a_full_payload_fits_the_encoded_frame_limit() {
+        let frame = ShellFrame::Output {
+            stream: ShellOutput::Stdout,
+            data: ShellData::new(vec![0; MAX_DATA_BYTES]).unwrap(),
+        };
+        assert!(serde_json::to_vec(&frame).unwrap().len() <= MAX_FRAME_BYTES);
     }
 
     #[test]

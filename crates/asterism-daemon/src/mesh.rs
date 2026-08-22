@@ -47,7 +47,7 @@ use tokio::sync::{mpsc, Mutex};
 
 use asterism_core::compat;
 use asterism_core::cow;
-use asterism_core::device_shell::{ShellFrame, ShellOpen};
+use asterism_core::device_shell::{ShellFrame, ShellOpen, MAX_OPEN_FRAME_BYTES};
 use asterism_core::durable;
 use asterism_core::instance::Instance;
 use asterism_core::orbit::{self, Device, DeviceStatus, Orbit, WakeFacts};
@@ -94,6 +94,12 @@ const REFUSED: &str = "the other device did not confirm the pairing";
 /// anyway. The peer commits on some of these, so losing one is worse than
 /// spending a round trip on making sure it arrived.
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A stream that has been opened has five seconds to identify itself. Bulk
+/// transfers and interactive idle time have their own lifetimes after this
+/// frame; this deadline only prevents a peer from occupying a task forever
+/// with a partial request.
+const OPEN_FRAME_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Selects the mesh mode. `ASTERISM_MESH=local` opts out of discovery, and is
 /// what the tests set.
@@ -2613,7 +2619,12 @@ async fn serve_stream(
     node: Node,
     peer: DeviceId,
 ) -> Result<()> {
-    let arriving = read_frame::<Arriving>(&mut stream.recv).await?;
+    let (arriving, arriving_len) = tokio::time::timeout(
+        OPEN_FRAME_DEADLINE,
+        read_frame_with_len::<Arriving>(&mut stream.recv),
+    )
+    .await
+    .context("a mesh stream did not finish its opening frame within 5s")??;
 
     // What version this stream is spoken at, settled before the request is
     // looked at. A stream this daemon cannot serve is refused here, in words,
@@ -2651,6 +2662,22 @@ async fn serve_stream(
             return Ok(());
         }
     };
+
+    if matches!(arriving.request, MeshRequest::DeviceShell { .. })
+        && arriving_len > MAX_OPEN_FRAME_BYTES
+    {
+        crate::device_shell::write_shell_frame(
+            &mut stream.send,
+            &ShellFrame::Refused {
+                code: "malformed".into(),
+                message: format!(
+                    "a device-shell opening frame of {arriving_len} bytes exceeds the {MAX_OPEN_FRAME_BYTES}-byte limit"
+                ),
+            },
+        )
+        .await?;
+        return Ok(());
+    }
 
     let reply = match arriving.request {
         MeshRequest::Ping => {
@@ -2841,8 +2868,8 @@ fn incompatible(why: anyhow::Error) -> MeshReply {
 
 // ---- the CLI end of a conversation -----------------------------------------
 
-/// The unix socket, for the requests that are a conversation rather than a
-/// question: `ast device invite` prints a ticket, then a code, then asks.
+/// The unix socket, for requests that are a conversation rather than a
+/// question: pairing, wake, moves, and device shell sessions.
 pub struct ClientIo<'a> {
     /// Frames the CLI has yet to send, bounded and deadlined by the same
     /// seam every other request comes through — a conversation is a longer
@@ -2864,7 +2891,7 @@ impl ClientIo<'_> {
         loop {
             let line = match self.frames.next().await? {
                 Framing::Frame(line) => line,
-                Framing::Eof => bail!("ast closed the connection mid-pairing"),
+                Framing::Eof => bail!("ast closed the connection mid-conversation"),
                 Framing::Refused(why) => bail!("{why}"),
             };
             if line.trim().is_empty() {
@@ -2976,6 +3003,12 @@ async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Result<(
 }
 
 async fn read_frame<T: serde::de::DeserializeOwned>(recv: &mut RecvStream) -> Result<T> {
+    Ok(read_frame_with_len(recv).await?.0)
+}
+
+async fn read_frame_with_len<T: serde::de::DeserializeOwned>(
+    recv: &mut RecvStream,
+) -> Result<(T, usize)> {
     let mut len = [0u8; 4];
     recv.read_exact(&mut len).await?;
     let len = u32::from_be_bytes(len) as usize;
@@ -2984,7 +3017,7 @@ async fn read_frame<T: serde::de::DeserializeOwned>(recv: &mut RecvStream) -> Re
     }
     let mut buf = vec![0u8; len];
     recv.read_exact(&mut buf).await?;
-    Ok(serde_json::from_slice(&buf)?)
+    Ok((serde_json::from_slice(&buf)?, len))
 }
 
 #[cfg(test)]

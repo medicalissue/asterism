@@ -1255,6 +1255,13 @@ mod tests {
     fn the_frame_table_and_the_frames_agree() {
         let table = versioned_frames();
         assert_eq!(table.get("compat"), Some(&Request::Compat.since()));
+        assert_eq!(table.get("backup_export"), Some(&3));
+        assert_eq!(table.get("backup_import"), Some(&3));
+        assert_eq!(
+            table.get("device-shell"),
+            Some(&4),
+            "a protocol-3 backup daemon cannot parse device-shell variants"
+        );
         for (name, version) in &table {
             assert!(
                 *version > crate::compat::FIRST_PROTOCOL,

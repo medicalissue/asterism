@@ -59,7 +59,7 @@
 //! ### The window
 //!
 //! A build serves its own version and the [`SUPPORTED_BACK`] before it:
-//! N-2, N-1, N. That is a floor on how far back it will *serve*, not a
+//! currently N-3 through N. That is a floor on how far back it will *serve*, not a
 //! ceiling on how far forward it will speak — the ceiling is the other side's
 //! range, which is why a newer peer is usable.
 //!
@@ -118,8 +118,10 @@ pub const PROTOCOL_VERSION: u32 = 4;
 /// into a thing to be spoken to.
 pub const FIRST_PROTOCOL: u32 = 1;
 
-/// How many versions back this build still serves: the N-2 of N-2/N-1/N.
-pub const SUPPORTED_BACK: u32 = 2;
+/// How many versions back this build still serves. Protocol 4 widens the
+/// window by one so the unnumbered first wire remains usable while the new
+/// device-shell frames are negotiated independently of protocol 3.
+pub const SUPPORTED_BACK: u32 = 3;
 
 /// Format version of the home stamp document itself.
 pub const STAMP_VERSION: u32 = 1;
@@ -878,7 +880,7 @@ mod tests {
     }
 
     #[test]
-    fn the_window_reaches_n_minus_two() {
+    fn the_window_reaches_its_configured_floor() {
         let ours = Speaks::new(10u32.saturating_sub(SUPPORTED_BACK), 10);
         for v in ours.min..=ours.max {
             assert_eq!(
