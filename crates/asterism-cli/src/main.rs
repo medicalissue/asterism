@@ -690,6 +690,11 @@ enum DeviceCommand {
         #[command(subcommand)]
         action: Option<DeviceShellCommand>,
     },
+    /// Enable, disable or inspect this device's opt-in network-exit offer.
+    Exit {
+        #[command(subcommand)]
+        action: Option<DeviceExitCommand>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -699,6 +704,16 @@ enum DeviceShellCommand {
     /// Locally approve the devices currently in this orbit.
     Enable,
     /// Refuse new sessions and terminate every tracked active session.
+    Disable,
+}
+
+#[derive(Subcommand)]
+enum DeviceExitCommand {
+    /// Show whether this device offers attachment-scoped exit grants.
+    Status,
+    /// Approve the devices currently paired into this orbit as consumers.
+    Enable,
+    /// Revoke every grant and abort every active flow.
     Disable,
 }
 
@@ -1118,6 +1133,7 @@ fn main() -> Result<()> {
         | Response::DeviceShellRefused { .. }
         | Response::DeviceShellOutput { .. }
         | Response::DeviceShellExit { .. }
+        | Response::ExitProviderStatus { .. }
         | Response::Pong { .. }
         | Response::Compat { .. }
         | Response::Devices { .. }
@@ -1487,8 +1503,35 @@ fn device_command(cmd: DeviceCommand) -> Result<()> {
         DeviceCommand::Add { ticket, name, yes } => pair(Request::DeviceAdd { ticket, name }, yes),
         DeviceCommand::Wake { name } => wake(&name),
         DeviceCommand::Shell { action } => device_shell_policy(action),
+        DeviceCommand::Exit { action } => device_exit_policy(action),
         // Routed before this, so that `--device` can aim it.
         DeviceCommand::Check => device_check(None),
+    }
+}
+
+fn device_exit_policy(action: Option<DeviceExitCommand>) -> Result<()> {
+    use asterism_core::network::ExitProviderAction;
+    let action = match action.unwrap_or(DeviceExitCommand::Status) {
+        DeviceExitCommand::Status => ExitProviderAction::Status,
+        DeviceExitCommand::Enable => ExitProviderAction::Enable,
+        DeviceExitCommand::Disable => ExitProviderAction::Disable,
+    };
+    match send(&Request::ExitProviderPolicy { action })? {
+        Response::ExitProviderStatus { status } => {
+            println!(
+                "exit provider  {}  epoch {}  {} grant(s)",
+                if status.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                status.epoch,
+                status.grants
+            );
+            Ok(())
+        }
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected reply from astd: {other:?}"),
     }
 }
 

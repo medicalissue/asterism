@@ -145,6 +145,7 @@ impl Fixture {
                     addr: "192.0.2.1".parse().unwrap(),
                 },
             },
+            packet_edge_generation: None,
             started_at: 1,
         }
     }

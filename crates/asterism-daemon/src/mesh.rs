@@ -38,7 +38,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -102,10 +102,14 @@ const PAIRING_RATE_WINDOW: Duration = Duration::from_secs(60);
 /// that remembers those keys at the same time.
 const MAX_PAIRING_ATTEMPTS_PER_WINDOW: u32 = 32;
 
-/// Streams one trusted connection may make this daemon serve concurrently.
-/// This is intentionally per connection: a busy peer cannot stop the endpoint
-/// accepting another peer or a pairing proof.
+/// Streams one authenticated device may make this daemon serve concurrently,
+/// shared across every QUIC connection bearing that immutable identity.
+/// Reserve sixty-four streams for control/volume/move traffic.
+/// Exit flows have their own global budget and can never consume that reserve.
 const MAX_PEER_STREAMS: usize = 64;
+const MAX_OPENING_STREAMS: usize = 16;
+const MAX_EXIT_STREAMS: usize = 256;
+static EXIT_STREAMS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 /// Largest mesh frame we will read. An instance list is the big one and it is
 /// nowhere near this; the cap exists so a peer cannot ask for an allocation.
@@ -210,10 +214,34 @@ enum MeshRequest {
         /// The epoch that lease was granted at.
         epoch: u64,
     },
+    /// Ask an opted-in provider for one durable attachment grant. Peer
+    /// identity comes from QUIC and is intentionally absent from the frame.
+    ExitGrant {
+        instance_id: String,
+        routes: asterism_core::network::RoutePolicy,
+        dns: asterism_core::network::DnsPolicy,
+    },
+    /// Publish a pending grant only after the consumer shard is durable.
+    ExitActivate {
+        instance_id: String,
+        generation: u64,
+    },
+    /// Revoke the exact attachment generation and abort its live flows.
+    ExitRevoke {
+        instance_id: String,
+        generation: u64,
+    },
+    /// Observe the provider's actual resolver behind an authorized grant.
+    ExitProbe {
+        instance_id: String,
+        generation: u64,
+    },
     /// Open an outbound TCP flow on this device and turn the stream into the
     /// flow's byte pipe. `system_dns` resolves the virtual guest DNS address
     /// against this provider's resolver policy before connecting.
     ExitTcp {
+        instance_id: String,
+        generation: u64,
         destination: std::net::SocketAddr,
         system_dns: bool,
     },
@@ -221,9 +249,10 @@ enum MeshRequest {
     /// reply. UDP remains framed because it has message rather than stream
     /// semantics.
     ExitUdp {
+        instance_id: String,
+        generation: u64,
         destination: std::net::SocketAddr,
         system_dns: bool,
-        payload: Vec<u8>,
     },
 
     // ---- moving an instance's cpu part --------------------------------------
@@ -269,7 +298,12 @@ impl MeshRequest {
         match self {
             MeshRequest::Rpc { request } => request.since(),
             MeshRequest::DeviceShell { .. } => 4,
-            MeshRequest::ExitTcp { .. } | MeshRequest::ExitUdp { .. } => 6,
+            MeshRequest::ExitGrant { .. }
+            | MeshRequest::ExitActivate { .. }
+            | MeshRequest::ExitRevoke { .. }
+            | MeshRequest::ExitProbe { .. }
+            | MeshRequest::ExitTcp { .. }
+            | MeshRequest::ExitUdp { .. } => 7,
             _ => compat::FIRST_PROTOCOL,
         }
     }
@@ -299,6 +333,10 @@ impl MeshRequest {
             MeshRequest::SshSplice { .. } => "an ssh connection",
             MeshRequest::DeviceShell { .. } => "a device shell",
             MeshRequest::VolumeSplice { .. } => "a volume connection",
+            MeshRequest::ExitGrant { .. } => "an exit grant",
+            MeshRequest::ExitActivate { .. } => "an exit grant activation",
+            MeshRequest::ExitRevoke { .. } => "an exit revocation",
+            MeshRequest::ExitProbe { .. } => "an exit health probe",
             MeshRequest::ExitTcp { .. } => "an exit TCP flow",
             MeshRequest::ExitUdp { .. } => "an exit UDP datagram",
             MeshRequest::MoveExport { .. } => "an instance export",
@@ -401,6 +439,12 @@ enum MeshReply {
     ExitDatagram {
         payload: Vec<u8>,
     },
+    ExitGranted {
+        grant: asterism_core::network::ExitGrant,
+    },
+    ExitProbe {
+        dns_healthy: bool,
+    },
     /// The private half of this device's guest key, in OpenSSH format.
     GuestKey {
         key: String,
@@ -419,6 +463,31 @@ enum MeshReply {
         #[serde(default)]
         min_protocol: u32,
     },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ExitUdpFrame {
+    payload: Vec<u8>,
+}
+
+pub(crate) struct ExitUdpSession {
+    stream: asterism_mesh::MeshStream,
+}
+
+impl ExitUdpSession {
+    pub(crate) async fn exchange(&mut self, payload: Vec<u8>) -> Result<Vec<u8>> {
+        if payload.len() > 1500 {
+            bail!("exit UDP datagram exceeds the packet-edge MTU");
+        }
+        write_frame(&mut self.stream.send, &ExitUdpFrame { payload }).await?;
+        match read_frame::<MeshReply>(&mut self.stream.recv).await? {
+            MeshReply::ExitDatagram { payload } => Ok(payload),
+            MeshReply::Rpc {
+                response: Response::Error { message },
+            } => bail!(message),
+            other => bail!("exit UDP flow returned {other:?}"),
+        }
+    }
 }
 
 /// One side's half of the name exchange that follows a confirmed SAS.
@@ -480,6 +549,25 @@ pub struct Mesh {
     /// in flight. Device removal closes these, which is the revocation event
     /// for RPC, ssh and volume pipes alike.
     active: Mutex<HashMap<String, Vec<MeshConnection>>>,
+    /// Admission capacity keyed by authenticated device id, shared across
+    /// simultaneous connections so reconnect multiplication cannot multiply
+    /// either opening-frame allocations or long-lived control streams.
+    capacity: Mutex<HashMap<String, PeerCapacity>>,
+}
+
+#[derive(Clone)]
+struct PeerCapacity {
+    opening: Arc<Semaphore>,
+    control: Arc<Semaphore>,
+}
+
+impl PeerCapacity {
+    fn bounded() -> Self {
+        Self {
+            opening: Arc::new(Semaphore::new(MAX_OPENING_STREAMS)),
+            control: Arc::new(Semaphore::new(MAX_PEER_STREAMS)),
+        }
+    }
 }
 
 /// The current measured link to a peer, shared with remote-part health.
@@ -713,6 +801,7 @@ impl Mesh {
             conns: Mutex::new(HashMap::new()),
             telemetry: Mutex::new(HashMap::new()),
             active: Mutex::new(HashMap::new()),
+            capacity: Mutex::new(HashMap::new()),
         });
 
         tokio::spawn(accept_loop(mesh.clone(), node));
@@ -824,6 +913,16 @@ impl Mesh {
                 connection.close(b"device revoked");
             }
         }
+        self.capacity.lock().await.remove(&device.device_id);
+    }
+
+    async fn capacity_for(&self, device_id: &str) -> PeerCapacity {
+        self.capacity
+            .lock()
+            .await
+            .entry(device_id.to_owned())
+            .or_insert_with(PeerCapacity::bounded)
+            .clone()
     }
 
     async fn trusts(&self, device_id: &str) -> bool {
@@ -1497,18 +1596,142 @@ impl Mesh {
     /// Open an authenticated orbit stream whose far device owns the actual
     /// outbound TCP socket. QUIC path choice supplies direct/relay failover;
     /// the packet plane chooses which device before it gets here.
+    pub(crate) async fn request_exit_grant(
+        self: &Arc<Self>,
+        device: &str,
+        instance_id: &str,
+        routes: &asterism_core::network::RoutePolicy,
+        dns: &asterism_core::network::DnsPolicy,
+    ) -> Result<asterism_core::network::ExitGrant> {
+        let peer = self.device(device).await?;
+        let expected_id = peer.device_id.clone();
+        let connection = self.live_connection(&peer).await?;
+        match ask(
+            &connection,
+            &MeshRequest::ExitGrant {
+                instance_id: instance_id.to_owned(),
+                routes: routes.clone(),
+                dns: dns.clone(),
+            },
+        )
+        .await?
+        {
+            MeshReply::ExitGranted { grant } if grant.provider_device_id == expected_id => {
+                Ok(grant)
+            }
+            MeshReply::ExitGranted { .. } => bail!("exit provider identity changed during grant"),
+            MeshReply::Rpc {
+                response: Response::Error { message },
+            } => bail!(message),
+            MeshReply::Incompatible { message, .. } => bail!(message),
+            other => bail!("device {device:?} refused an exit grant: {other:?}"),
+        }
+    }
+
+    pub(crate) async fn activate_exit_grant(
+        self: &Arc<Self>,
+        device: &str,
+        instance_id: &str,
+        generation: u64,
+    ) -> Result<()> {
+        let peer = self.device(device).await?;
+        let connection = self.live_connection(&peer).await?;
+        match ask(
+            &connection,
+            &MeshRequest::ExitActivate {
+                instance_id: instance_id.to_owned(),
+                generation,
+            },
+        )
+        .await?
+        {
+            MeshReply::Rpc {
+                response: Response::Ok,
+            } => Ok(()),
+            MeshReply::Rpc {
+                response: Response::Error { message },
+            } => bail!(message),
+            MeshReply::Incompatible { message, .. } => bail!(message),
+            other => bail!("device {device:?} refused exit grant activation: {other:?}"),
+        }
+    }
+
+    pub(crate) async fn revoke_exit_grant(
+        self: &Arc<Self>,
+        device: &str,
+        instance_id: &str,
+        generation: u64,
+    ) -> Result<()> {
+        let peer = self.device(device).await?;
+        let connection = self.live_connection(&peer).await?;
+        match ask(
+            &connection,
+            &MeshRequest::ExitRevoke {
+                instance_id: instance_id.to_owned(),
+                generation,
+            },
+        )
+        .await?
+        {
+            MeshReply::Rpc {
+                response: Response::Ok,
+            } => Ok(()),
+            MeshReply::Rpc {
+                response: Response::Error { message },
+            } => bail!(message),
+            MeshReply::Incompatible { message, .. } => bail!(message),
+            other => bail!("device {device:?} refused exit revocation: {other:?}"),
+        }
+    }
+
+    pub(crate) async fn probe_exit_dns(
+        self: &Arc<Self>,
+        device: &str,
+        instance_id: &str,
+        grant: &asterism_core::network::ExitGrant,
+    ) -> Result<bool> {
+        let peer = self.device(device).await?;
+        if peer.device_id != grant.provider_device_id {
+            bail!("exit provider identity changed; detach and re-attach explicitly");
+        }
+        let connection = self.live_connection(&peer).await?;
+        match ask(
+            &connection,
+            &MeshRequest::ExitProbe {
+                instance_id: instance_id.to_owned(),
+                generation: grant.generation,
+            },
+        )
+        .await?
+        {
+            MeshReply::ExitProbe { dns_healthy } => Ok(dns_healthy),
+            MeshReply::Rpc {
+                response: Response::Error { message },
+            } => bail!(message),
+            MeshReply::Incompatible { message, .. } => bail!(message),
+            other => bail!("device {device:?} refused exit health probe: {other:?}"),
+        }
+    }
+
     pub(crate) async fn open_exit_tcp(
         self: &Arc<Self>,
         device: &str,
+        instance_id: &str,
+        grant: &asterism_core::network::ExitGrant,
         destination: std::net::SocketAddr,
         system_dns: bool,
     ) -> Result<asterism_mesh::MeshStream> {
         let peer = self.device(device).await?;
+        if peer.device_id != grant.provider_device_id {
+            bail!("exit provider identity changed; detach and re-attach explicitly");
+        }
         let connection = self.live_connection(&peer).await?;
         let mut stream = connection.open_stream().await?;
         open_stream_with(
             &mut stream.send,
             &MeshRequest::ExitTcp {
+                instance_id: instance_id.to_owned(),
+                generation: grant.generation,
                 destination,
                 system_dns,
             },
@@ -1524,27 +1747,33 @@ impl Mesh {
         }
     }
 
-    /// Send one UDP request through the selected exit device.
-    pub(crate) async fn send_exit_udp(
+    /// Open one reusable UDP NAT flow through the selected exit device.
+    pub(crate) async fn open_exit_udp(
         self: &Arc<Self>,
         device: &str,
+        instance_id: &str,
+        grant: &asterism_core::network::ExitGrant,
         destination: std::net::SocketAddr,
         system_dns: bool,
-        payload: Vec<u8>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<ExitUdpSession> {
         let peer = self.device(device).await?;
+        if peer.device_id != grant.provider_device_id {
+            bail!("exit provider identity changed; detach and re-attach explicitly");
+        }
         let connection = self.live_connection(&peer).await?;
-        match ask(
-            &connection,
+        let mut stream = connection.open_stream().await?;
+        open_stream_with(
+            &mut stream.send,
             &MeshRequest::ExitUdp {
+                instance_id: instance_id.to_owned(),
+                generation: grant.generation,
                 destination,
                 system_dns,
-                payload,
             },
         )
-        .await?
-        {
-            MeshReply::ExitDatagram { payload } => Ok(payload),
+        .await?;
+        match read_frame::<MeshReply>(&mut stream.recv).await? {
+            MeshReply::SpliceReady => Ok(ExitUdpSession { stream }),
             MeshReply::Rpc {
                 response: Response::Error { message },
             } => bail!(message),
@@ -2609,8 +2838,13 @@ async fn serve_exit_tcp(
     mut stream: asterism_mesh::MeshStream,
     destination: std::net::SocketAddr,
     system_dns: bool,
+    mut lease: crate::exit_policy::FlowLease,
+    _capacity: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<()> {
-    let upstream = async {
+    if !lease.allows(destination, system_dns) {
+        bail!("the exit grant refuses this destination or DNS mode");
+    }
+    let opening = async {
         let target = crate::exit_point::resolve_dns_target(destination, system_dns)?;
         tokio::time::timeout(
             Duration::from_secs(30),
@@ -2619,8 +2853,11 @@ async fn serve_exit_tcp(
         .await
         .context("exit TCP connect timed out")?
         .context("opening exit TCP socket")
-    }
-    .await;
+    };
+    let upstream = tokio::select! {
+        result = opening => result,
+        _ = lease.revoked.changed() => bail!("exit grant revoked during connect"),
+    };
     let upstream = match upstream {
         Ok(upstream) => upstream,
         Err(error) => {
@@ -2638,7 +2875,10 @@ async fn serve_exit_tcp(
         }
     };
     write_frame(&mut stream.send, &MeshReply::SpliceReady).await?;
-    pump(upstream, stream).await.map(|_| ())
+    tokio::select! {
+        result = pump(upstream, stream) => result.map(|_| ()),
+        _ = lease.revoked.changed() => bail!("exit grant revoked"),
+    }
 }
 
 /// Send one datagram from the selected provider and return its first reply.
@@ -2648,9 +2888,13 @@ async fn serve_exit_udp(
     mut stream: asterism_mesh::MeshStream,
     destination: std::net::SocketAddr,
     system_dns: bool,
-    payload: Vec<u8>,
+    mut lease: crate::exit_policy::FlowLease,
+    _capacity: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<()> {
-    let result = async {
+    if !lease.allows(destination, system_dns) {
+        bail!("the exit grant refuses this destination or DNS mode");
+    }
+    let opening = async {
         let target = crate::exit_point::resolve_dns_target(destination, system_dns)?;
         let bind = if target.is_ipv4() {
             "0.0.0.0:0"
@@ -2659,26 +2903,54 @@ async fn serve_exit_udp(
         };
         let socket = tokio::net::UdpSocket::bind(bind).await?;
         socket.connect(target).await?;
-        socket.send(&payload).await?;
-        let mut reply = vec![0; 65_507];
-        let count = tokio::time::timeout(Duration::from_secs(30), socket.recv(&mut reply))
-            .await
-            .context("exit UDP reply timed out")??;
-        reply.truncate(count);
-        Ok::<_, anyhow::Error>(reply)
-    }
-    .await;
-    let reply = match result {
-        Ok(payload) => MeshReply::ExitDatagram { payload },
-        Err(error) => MeshReply::Rpc {
-            response: Response::Error {
-                message: format!("{error:#}"),
-            },
-        },
+        Ok::<_, anyhow::Error>(socket)
     };
-    write_frame(&mut stream.send, &reply).await?;
-    let _ = stream.send.finish();
-    Ok(())
+    let socket = tokio::select! {
+        result = opening => result,
+        _ = lease.revoked.changed() => bail!("exit grant revoked during UDP open"),
+    };
+    let socket = match socket {
+        Ok(socket) => socket,
+        Err(error) => {
+            write_frame(
+                &mut stream.send,
+                &MeshReply::Rpc {
+                    response: Response::Error {
+                        message: format!("{error:#}"),
+                    },
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    write_frame(&mut stream.send, &MeshReply::SpliceReady).await?;
+    loop {
+        let frame = tokio::select! {
+            frame = tokio::time::timeout(
+                Duration::from_secs(60),
+                read_frame::<ExitUdpFrame>(&mut stream.recv),
+            ) => frame.context("exit UDP flow idle timeout")??,
+            _ = lease.revoked.changed() => bail!("exit grant revoked"),
+        };
+        if frame.payload.len() > 1500 {
+            bail!("exit UDP datagram exceeds the packet-edge MTU");
+        }
+        socket.send(&frame.payload).await?;
+        let mut reply = vec![0; 1500];
+        let count = tokio::select! {
+            result = tokio::time::timeout(Duration::from_secs(30), socket.recv(&mut reply)) => {
+                result.context("exit UDP reply timed out")??
+            }
+            _ = lease.revoked.changed() => bail!("exit grant revoked during UDP receive"),
+        };
+        reply.truncate(count);
+        write_frame(
+            &mut stream.send,
+            &MeshReply::ExitDatagram { payload: reply },
+        )
+        .await?;
+    }
 }
 
 // ---- moving an instance's bytes ---------------------------------------------
@@ -3308,7 +3580,17 @@ async fn serve_trusted_peer(mesh: Arc<Mesh>, connection: MeshConnection, node: N
         return;
     };
 
-    serve_peer(connection, node, peer_name, peer_id.clone()).await;
+    let provider_device_id = mesh.device_id().to_string();
+    let capacity = mesh.capacity_for(&peer_id).await;
+    serve_peer(
+        connection,
+        node,
+        peer_name,
+        peer_id.clone(),
+        provider_device_id,
+        capacity,
+    )
+    .await;
     mesh.untrack(&peer_id, stable).await;
 }
 
@@ -3318,12 +3600,13 @@ async fn serve_peer(
     node: Node,
     requester_device: String,
     requester_device_id: String,
+    provider_device_id: String,
+    capacity: PeerCapacity,
 ) {
     let peer_id = connection.remote_device_id();
     let peer = peer_id.short();
-    let slots = Arc::new(Semaphore::new(MAX_PEER_STREAMS));
     loop {
-        let Ok(slot) = Arc::clone(&slots).acquire_owned().await else {
+        let Ok(opening_slot) = Arc::clone(&capacity.opening).acquire_owned().await else {
             return;
         };
         let stream = match connection.accept_stream().await {
@@ -3335,10 +3618,20 @@ async fn serve_peer(
         let peer = peer.clone();
         let requester_device = requester_device.clone();
         let requester_device_id = requester_device_id.clone();
+        let provider_device_id = provider_device_id.clone();
+        let control_slots = capacity.control.clone();
         tokio::spawn(async move {
-            let _slot = slot;
-            if let Err(e) =
-                serve_stream(stream, node, peer_id, requester_device, requester_device_id).await
+            if let Err(e) = serve_stream(
+                stream,
+                node,
+                peer_id,
+                requester_device,
+                requester_device_id,
+                provider_device_id,
+                opening_slot,
+                control_slots,
+            )
+            .await
             {
                 eprintln!("astd: mesh stream from {peer} failed: {e:#}");
             }
@@ -3354,6 +3647,9 @@ async fn serve_stream(
     peer: DeviceId,
     requester_device: String,
     requester_device_id: String,
+    provider_device_id: String,
+    opening_slot: tokio::sync::OwnedSemaphorePermit,
+    control_slots: Arc<Semaphore>,
 ) -> Result<()> {
     let (arriving, arriving_len) = tokio::time::timeout(
         OPEN_FRAME_DEADLINE,
@@ -3361,6 +3657,7 @@ async fn serve_stream(
     )
     .await
     .context("a mesh stream did not finish its opening frame within 5s")??;
+    drop(opening_slot);
 
     // What version this stream is spoken at, settled before the request is
     // looked at. A stream this daemon cannot serve is refused here, in words,
@@ -3415,6 +3712,39 @@ async fn serve_stream(
         return Ok(());
     }
 
+    let is_exit_flow = matches!(
+        arriving.request,
+        MeshRequest::ExitTcp { .. } | MeshRequest::ExitUdp { .. }
+    );
+    let _control_capacity = if is_exit_flow {
+        None
+    } else {
+        Some(control_slots.acquire_owned().await?)
+    };
+    let mut exit_capacity = if is_exit_flow {
+        match EXIT_STREAMS
+            .get_or_init(|| Arc::new(Semaphore::new(MAX_EXIT_STREAMS)))
+            .clone()
+            .try_acquire_owned()
+        {
+            Ok(capacity) => Some(capacity),
+            Err(_) => {
+                write_frame(
+                    &mut stream.send,
+                    &MeshReply::Rpc {
+                        response: Response::Error {
+                            message: "exit provider is at its bounded flow capacity".into(),
+                        },
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+
     let reply = match arriving.request {
         MeshRequest::Ping => {
             let ours = compat::ours();
@@ -3443,15 +3773,141 @@ async fn serve_stream(
             )
             .await
         }
+        MeshRequest::ExitGrant {
+            instance_id,
+            routes,
+            dns,
+        } => {
+            let grant = node.exit.grant(
+                &requester_device_id,
+                &instance_id,
+                provider_device_id,
+                routes,
+                dns,
+            );
+            match grant {
+                Ok(grant) => MeshReply::ExitGranted { grant },
+                Err(error) => MeshReply::Rpc {
+                    response: Response::Error {
+                        message: format!("{error:#}"),
+                    },
+                },
+            }
+        }
+        MeshRequest::ExitActivate {
+            instance_id,
+            generation,
+        } => {
+            let response = match node.exit.activate(
+                &requester_device_id,
+                &instance_id,
+                generation,
+            ) {
+                Ok(()) => Response::Ok,
+                Err(error) => Response::Error {
+                    message: format!("{error:#}"),
+                },
+            };
+            MeshReply::Rpc { response }
+        }
+        MeshRequest::ExitRevoke {
+            instance_id,
+            generation,
+        } => {
+            let response = match node.exit.revoke(
+                &requester_device_id,
+                &instance_id,
+                generation,
+            ) {
+                Ok(()) => Response::Ok,
+                Err(error) => Response::Error {
+                    message: format!("{error:#}"),
+                },
+            };
+            MeshReply::Rpc { response }
+        }
+        MeshRequest::ExitProbe {
+            instance_id,
+            generation,
+        } => match node
+            .exit
+            .authorize(&requester_device_id, &instance_id, generation)
+        {
+            Ok(lease) => MeshReply::ExitProbe {
+                dns_healthy: crate::exit_point::dns_healthy(lease.resolver()).await,
+            },
+            Err(error) => MeshReply::Rpc {
+                response: Response::Error {
+                    message: format!("{error:#}"),
+                },
+            },
+        },
         MeshRequest::ExitTcp {
+            instance_id,
+            generation,
             destination,
             system_dns,
-        } => return serve_exit_tcp(stream, destination, system_dns).await,
+        } => {
+            let lease = match node
+                .exit
+                .authorize(&requester_device_id, &instance_id, generation)
+            {
+                Ok(lease) => lease,
+                Err(error) => {
+                    write_frame(
+                        &mut stream.send,
+                        &MeshReply::Rpc {
+                            response: Response::Error {
+                                message: format!("{error:#}"),
+                            },
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            return serve_exit_tcp(
+                stream,
+                destination,
+                system_dns,
+                lease,
+                exit_capacity.take().expect("exit TCP lane was classified"),
+            )
+            .await;
+        }
         MeshRequest::ExitUdp {
+            instance_id,
+            generation,
             destination,
             system_dns,
-            payload,
-        } => return serve_exit_udp(stream, destination, system_dns, payload).await,
+        } => {
+            let lease = match node
+                .exit
+                .authorize(&requester_device_id, &instance_id, generation)
+            {
+                Ok(lease) => lease,
+                Err(error) => {
+                    write_frame(
+                        &mut stream.send,
+                        &MeshReply::Rpc {
+                            response: Response::Error {
+                                message: format!("{error:#}"),
+                            },
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            return serve_exit_udp(
+                stream,
+                destination,
+                system_dns,
+                lease,
+                exit_capacity.take().expect("exit UDP lane was classified"),
+            )
+            .await;
+        }
         // Bulk, not request/reply: each of these stops being a framed RPC
         // after this line and becomes a stream of `MoveFrame`s.
         MeshRequest::MoveExport { name, epoch } => {
@@ -3482,6 +3938,9 @@ async fn serve_stream(
                 },
                 request if crate::device_shell::local_only_request(&request) => Response::Error {
                     message: "device-shell policy and sessions are accepted only on the target's local control socket or a dedicated shell stream".into(),
+                },
+                Request::ExitProviderPolicy { .. } => Response::Error {
+                    message: "exit-provider policy is accepted only on the target's private local control socket".into(),
                 },
                 // About this device's NIC rather than about its shard, so
                 // they stop here instead of going on to `crate::handle`. The
@@ -3790,6 +4249,66 @@ async fn read_frame_with_len<T: serde::de::DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_admission_capacity_is_shared_across_connection_clones() {
+        let first = PeerCapacity::bounded();
+        let reconnect = first.clone();
+        let opening: Vec<_> = (0..MAX_OPENING_STREAMS)
+            .map(|_| first.opening.clone().try_acquire_owned().unwrap())
+            .collect();
+        assert!(reconnect.opening.clone().try_acquire_owned().is_err());
+        drop(opening);
+        assert!(reconnect.opening.clone().try_acquire_owned().is_ok());
+
+        let control: Vec<_> = (0..MAX_PEER_STREAMS)
+            .map(|_| first.control.clone().try_acquire_owned().unwrap())
+            .collect();
+        assert!(reconnect.control.clone().try_acquire_owned().is_err());
+        drop(control);
+        assert!(reconnect.control.clone().try_acquire_owned().is_ok());
+    }
+
+    #[test]
+    fn every_exit_mesh_frame_is_fenced_at_protocol_seven() {
+        let routes = asterism_core::network::RoutePolicy::default();
+        let dns = asterism_core::network::DnsPolicy::ExitPoint;
+        let destination = "1.1.1.1:53".parse().unwrap();
+        let frames = [
+            MeshRequest::ExitGrant {
+                instance_id: "instance".into(),
+                routes,
+                dns,
+            },
+            MeshRequest::ExitActivate {
+                instance_id: "instance".into(),
+                generation: 1,
+            },
+            MeshRequest::ExitRevoke {
+                instance_id: "instance".into(),
+                generation: 1,
+            },
+            MeshRequest::ExitProbe {
+                instance_id: "instance".into(),
+                generation: 1,
+            },
+            MeshRequest::ExitTcp {
+                instance_id: "instance".into(),
+                generation: 1,
+                destination,
+                system_dns: false,
+            },
+            MeshRequest::ExitUdp {
+                instance_id: "instance".into(),
+                generation: 1,
+                destination,
+                system_dns: false,
+            },
+        ];
+        assert!(frames.iter().all(|frame| frame.since() == 7));
+        assert_eq!(Request::DetachExitPoint { name: "dev".into() }.since(), 6);
+    }
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn test_machine() -> asterism_core::hv::Machine {
@@ -4254,6 +4773,7 @@ mod tests {
                 Orbit::load(&dir.path().join("orbit.json")).unwrap(),
             )),
             shell: crate::device_shell::Manager::load_at(dir.path()),
+            exit: crate::exit_policy::Manager::load_at(&dir.path().join("exit-provider.json")),
         };
 
         let server = MeshEndpoint::bind(&DeviceIdentity::generate(), MeshMode::LocalOnly)
@@ -4266,7 +4786,15 @@ mod tests {
 
         tokio::spawn(async move {
             let conn = server.accept().await.unwrap().unwrap();
-            serve_peer(conn, node, "test-peer".into(), "test-peer-id".into()).await;
+            serve_peer(
+                conn,
+                node,
+                "test-peer".into(),
+                "test-peer-id".into(),
+                "provider-id".into(),
+                PeerCapacity::bounded(),
+            )
+            .await;
         });
 
         let connection = client.connect(addr).await.unwrap();
@@ -4341,6 +4869,7 @@ mod tests {
                 Orbit::load(&dir.path().join("orbit.json")).unwrap(),
             )),
             shell: crate::device_shell::Manager::load_at(dir.path()),
+            exit: crate::exit_policy::Manager::load_at(&dir.path().join("exit-provider.json")),
         };
         let server = MeshEndpoint::bind(&DeviceIdentity::generate(), MeshMode::LocalOnly)
             .await
@@ -4353,6 +4882,7 @@ mod tests {
             conns: Mutex::new(HashMap::new()),
             telemetry: Mutex::new(HashMap::new()),
             active: Mutex::new(HashMap::new()),
+            capacity: Mutex::new(HashMap::new()),
         });
         let issued = Arc::new(IssuedTicket::new(PairingTicket::issue(
             addr,
@@ -4431,6 +4961,7 @@ mod tests {
             )),
             orbit: orbit.clone(),
             shell: crate::device_shell::Manager::load_at(dir.path()),
+            exit: crate::exit_policy::Manager::load_at(&dir.path().join("exit-provider.json")),
         };
         let mesh = Arc::new(Mesh {
             endpoint: server,
@@ -4439,6 +4970,7 @@ mod tests {
             conns: Mutex::new(HashMap::new()),
             telemetry: Mutex::new(HashMap::new()),
             active: Mutex::new(HashMap::new()),
+            capacity: Mutex::new(HashMap::new()),
         });
         let loop_task = tokio::spawn(accept_loop(mesh.clone(), node));
         let connection = client.connect(addr).await.unwrap();

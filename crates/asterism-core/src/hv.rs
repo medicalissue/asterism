@@ -8,7 +8,7 @@
 //!
 //! See `docs/BACKENDS.md` for why the boundary sits exactly here.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -273,6 +273,14 @@ pub struct Handle {
     pub proc: Option<ProcId>,
     pub ctl: ControlChannel,
     pub endpoint: GuestEndpoint,
+    /// Packet-edge contract this exact guest process was booted with.
+    ///
+    /// This belongs on the persisted handle rather than in a sidecar: a
+    /// downgrade can boot a different process while leaving a sidecar
+    /// behind. Records from older writers omit it and are therefore never
+    /// assumed to have the restricted edge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packet_edge_generation: Option<String>,
     /// Unix seconds, matching `Instance::created_at`.
     pub started_at: u64,
 }
@@ -292,6 +300,7 @@ impl Handle {
             proc: Some(proc),
             ctl,
             endpoint,
+            packet_edge_generation: None,
             started_at: crate::instance::now_unix(),
         }
     }
@@ -431,9 +440,9 @@ pub enum GuestEgress {
 /// network plane how any one hypervisor spells a device.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuestNetwork {
-    /// Loopback endpoint accepting QEMU-compatible length-prefixed Ethernet
-    /// frames. It is never bound to a LAN address.
-    pub endpoint: SocketAddr,
+    /// Private unix endpoint accepting QEMU-compatible length-prefixed
+    /// Ethernet frames. Its deterministic path survives daemon restarts.
+    pub endpoint: PathBuf,
     /// Stable MAC of the ordinary backend NIC, so cloud-init can leave SSH
     /// and published-port replies on their original path.
     pub primary_mac: [u8; 6],
@@ -801,6 +810,7 @@ mod tests {
                 path: "/tmp/qmp.sock".into(),
             },
             endpoint: GuestEndpoint::HostForward { ssh_port: 22022 },
+            packet_edge_generation: Some("unix-restricted-v1".into()),
             started_at: 1_700_000_000,
         };
         let json = serde_json::to_string(&h).unwrap();
@@ -810,6 +820,7 @@ mod tests {
         // The bare pid stays on the wire beside the identity, so a daemon or
         // CLI older than identities still reads a handle this one wrote.
         assert!(json.contains("\"pid\":4242"), "{json}");
+        assert!(json.contains("unix-restricted-v1"), "{json}");
     }
 
     /// The compatibility direction that matters most: a registry written
@@ -825,6 +836,7 @@ mod tests {
         let h: Handle = serde_json::from_str(json).unwrap();
         assert_eq!(h.pid, Some(4242));
         assert_eq!(h.owned(), None, "a pid is not an identity");
+        assert_eq!(h.packet_edge_generation, None);
     }
 
     #[test]

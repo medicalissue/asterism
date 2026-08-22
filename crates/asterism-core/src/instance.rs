@@ -630,6 +630,7 @@ impl Instance {
                 path: crate::paths::qmp_socket_path(&self.name),
             },
             endpoint: GuestEndpoint::HostForward { ssh_port },
+            packet_edge_generation: None,
             started_at: self.created_at,
         });
     }

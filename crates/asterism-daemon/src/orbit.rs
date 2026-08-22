@@ -100,18 +100,35 @@ pub(crate) async fn serve(req: Request, node: &Node, mesh: Option<&Arc<Mesh>>) -
             None => no_mesh(),
         },
         Request::DeviceRemove { name } => match mesh {
-            Some(mesh) => match mesh.remove_device(&name).await {
-                Ok(removed) => {
-                    node.shell.revoke_peer(
-                        &removed.device_id,
-                        &format!("peer {name:?} was removed from this orbit"),
-                    );
-                    Response::Ok
+            Some(mesh) => {
+                let device_id = node
+                    .orbit
+                    .lock()
+                    .await
+                    .get(&name)
+                    .map(|device| device.device_id.clone());
+                if let Some(device_id) = &device_id {
+                    if let Err(error) = node.exit.revoke_peer(device_id) {
+                        return Response::Error {
+                            message: format!(
+                                "revoking {name:?}'s network-exit authority before membership removal: {error:#}"
+                            ),
+                        };
+                    }
                 }
-                Err(e) => Response::Error {
-                    message: format!("{e:#}"),
-                },
-            },
+                match mesh.remove_device(&name).await {
+                    Ok(removed) => {
+                        node.shell.revoke_peer(
+                            &removed.device_id,
+                            &format!("peer {name:?} was removed from this orbit"),
+                        );
+                        Response::Ok
+                    }
+                    Err(e) => Response::Error {
+                        message: format!("{e:#}"),
+                    },
+                }
+            }
             None => no_mesh(),
         },
         // A read capability, unlike the mutation request below. It is also

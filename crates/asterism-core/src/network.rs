@@ -9,7 +9,7 @@
 //! or relayed. Neither concern is encoded as a host-specific conditional in
 //! the instance model.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::str::FromStr;
 
@@ -35,6 +35,38 @@ pub const GUEST_ADDRESS_V6: IpAddr = IpAddr::V6(std::net::Ipv6Addr::new(
 
 /// Locally administered MAC used by the daemon side of every guest edge.
 pub const EDGE_GATEWAY_MAC: [u8; 6] = [0x02, 0x41, 0x53, 0x54, 0x00, 0x01];
+
+/// Whether a provider may open an ordinary outbound socket to this address.
+///
+/// Exit traffic is public-unicast by default. Provider-local namespaces are
+/// never inherited merely because a paired peer can reach the mesh: that
+/// would turn the packet plane into an SSRF and LAN-scanning oracle.
+pub fn is_public_unicast(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            let octets = address.octets();
+            !address.is_unspecified()
+                && !address.is_loopback()
+                && !address.is_private()
+                && !address.is_link_local()
+                && !address.is_multicast()
+                && !address.is_broadcast()
+                && !(octets[0] == 100 && (64..=127).contains(&octets[1]))
+                && !(octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+                && octets[0] != 0
+        }
+        IpAddr::V6(address) => {
+            if let Some(mapped) = address.to_ipv4_mapped() {
+                return is_public_unicast(IpAddr::V4(mapped));
+            }
+            !address.is_unspecified()
+                && !address.is_loopback()
+                && !address.is_multicast()
+                && !address.is_unique_local()
+                && !address.is_unicast_link_local()
+        }
+    }
+}
 
 /// Stable primary and edge NIC identities derived from the durable instance
 /// id. The two different fourth octets keep the devices distinct while a
@@ -204,6 +236,30 @@ pub enum DnsPolicy {
     Custom(Vec<IpAddr>),
 }
 
+/// Immutable provider identity and the provider-issued generation fencing one
+/// attachment. Names remain UI labels; neither authorization nor revocation
+/// follows a later device that happens to reuse one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExitGrant {
+    pub provider_device_id: String,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExitProviderAction {
+    Status,
+    Enable,
+    Disable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExitProviderStatus {
+    pub enabled: bool,
+    pub epoch: u64,
+    pub grants: usize,
+}
+
 /// A durable network part attached to an instance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExitPoint {
@@ -215,6 +271,10 @@ pub struct ExitPoint {
     pub routes: RoutePolicy,
     #[serde(default)]
     pub dns: DnsPolicy,
+    /// Provider-issued, attachment-scoped grants keyed by display name. The
+    /// value carries the immutable device id checked on every mesh flow.
+    #[serde(default)]
+    pub grants: BTreeMap<String, ExitGrant>,
     /// Runtime-only: populated on a status reply from current mesh
     /// observations, never by a registry row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -233,6 +293,7 @@ impl ExitPoint {
             providers,
             routes,
             dns,
+            grants: BTreeMap::new(),
             runtime: None,
         };
         exit.validate()?;
@@ -258,6 +319,9 @@ impl ExitPoint {
         }
         if matches!(&self.dns, DnsPolicy::Custom(servers) if servers.is_empty()) {
             return Err("custom DNS needs at least one resolver address".into());
+        }
+        if self.grants.keys().any(|name| !providers.contains(name)) {
+            return Err("an exit grant names a device outside the provider order".into());
         }
         for prefix in self.routes.include.iter().chain(&self.routes.exclude) {
             let width = if prefix.network.is_ipv4() { 32 } else { 128 };
@@ -504,5 +568,14 @@ mod tests {
         assert!(prefix.contains("10.9.255.1".parse().unwrap()));
         assert!(!prefix.contains("10.10.0.1".parse().unwrap()));
         assert!(!prefix.contains("::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn provider_sockets_reject_private_and_ipv4_mapped_private_addresses() {
+        assert!(is_public_unicast("1.1.1.1".parse().unwrap()));
+        assert!(!is_public_unicast("127.0.0.1".parse().unwrap()));
+        assert!(!is_public_unicast("10.0.0.1".parse().unwrap()));
+        assert!(!is_public_unicast("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(!is_public_unicast("::ffff:10.0.0.1".parse().unwrap()));
     }
 }

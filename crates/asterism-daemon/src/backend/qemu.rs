@@ -476,7 +476,7 @@ impl Hypervisor for Qemu {
                 (primary, None)
             });
         cmd.arg("-netdev")
-            .arg(netdev_arg(ssh_port, &inst.publish))
+            .arg(netdev_arg(ssh_port, &inst.publish, req.network.is_some()))
             .arg("-device")
             .arg(format!(
                 "virtio-net-pci,netdev=n0,mac={}",
@@ -484,7 +484,7 @@ impl Hypervisor for Qemu {
             ));
         if let (Some(network), Some(edge_mac)) = (&req.network, edge_mac) {
             cmd.arg("-netdev")
-                .arg(packet_netdev_arg(network.endpoint))
+                .arg(packet_netdev_arg(&network.endpoint))
                 .arg("-device")
                 .arg(format!(
                     "virtio-net-pci,netdev=astx,mac={}",
@@ -530,12 +530,16 @@ impl Hypervisor for Qemu {
             format!("qemu wrote pid {pid} to its pidfile and was gone before it could be recorded")
         })?;
 
-        Ok(Handle::owning(
+        let mut handle = Handle::owning(
             ID,
             proc,
             ControlChannel::Qmp { path: qmp },
             GuestEndpoint::HostForward { ssh_port },
-        ))
+        );
+        if req.network.is_some() {
+            handle.packet_edge_generation = Some(crate::exit_point::EDGE_GENERATION.into());
+        }
+        Ok(handle)
     }
 
     /// Ask the guest to power down cleanly via QMP (ACPI power button); a
@@ -831,8 +835,14 @@ fn cmdline(inst: &Instance) -> String {
 /// into the guest — which is the point: an OCI instance's port is reached
 /// exactly where its ssh would have been, so nothing else in Asterism has to
 /// learn a second way in.
-fn netdev_arg(ssh_port: u16, publish: &[PortForward]) -> String {
+fn netdev_arg(ssh_port: u16, publish: &[PortForward], restricted: bool) -> String {
     let mut arg = format!("user,id=n0,hostfwd=tcp:127.0.0.1:{ssh_port}-:22");
+    if restricted {
+        // Keep SSH/published hostfwd replies, but make the packet edge the
+        // guest's only possible outbound path. A hostile guest cannot bind
+        // the primary NIC and bypass a sleeping privacy exit through slirp.
+        arg.push_str(",restrict=on");
+    }
     for p in publish {
         arg.push_str(&format!(",hostfwd=tcp:127.0.0.1:{}-:{}", p.host, p.guest));
     }
@@ -841,12 +851,10 @@ fn netdev_arg(ssh_port: u16, publish: &[PortForward]) -> String {
 
 /// A reconnecting QEMU packet stream. The daemon end is loopback-only and
 /// reads the documented four-byte length plus Ethernet-frame wire format.
-fn packet_netdev_arg(endpoint: std::net::SocketAddr) -> String {
+fn packet_netdev_arg(endpoint: &std::path::Path) -> String {
     format!(
-        "stream,id=astx,server=off,addr.type=inet,addr.host={},addr.port={},\
-         addr.ipv4=on,addr.ipv6=off,reconnect-ms=1000",
-        endpoint.ip(),
-        endpoint.port()
+        "stream,id=astx,server=off,addr.type=unix,path={},reconnect-ms=1000",
+        qemu_escape(&endpoint.display().to_string())
     )
 }
 
@@ -1609,7 +1617,7 @@ mod tests {
     #[test]
     fn published_ports_are_forwards_on_the_same_netdev_as_ssh() {
         assert_eq!(
-            netdev_arg(22022, &[]),
+            netdev_arg(22022, &[], false),
             "user,id=n0,hostfwd=tcp:127.0.0.1:22022-:22"
         );
         assert_eq!(
@@ -1624,11 +1632,13 @@ mod tests {
                         host: 5432,
                         guest: 5432
                     }
-                ]
+                ],
+                false,
             ),
             "user,id=n0,hostfwd=tcp:127.0.0.1:22022-:22,\
              hostfwd=tcp:127.0.0.1:8080-:80,hostfwd=tcp:127.0.0.1:5432-:5432"
         );
+        assert!(netdev_arg(22022, &[], true).contains("restrict=on"));
     }
 
     #[test]
@@ -2005,6 +2015,7 @@ mod tests {
                 path: "/tmp/x.sock".into(),
             },
             endpoint: GuestEndpoint::HostForward { ssh_port: 22 },
+            packet_edge_generation: None,
             started_at: 0,
         }
     }

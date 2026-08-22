@@ -109,7 +109,7 @@ use crate::VERSION;
 /// * **4** — the opt-in, framed device-shell policy and session wire.
 /// * **5** — mesh-safe, read-only device-shell policy status.
 /// * **6** — attach/detach of the network exit-point part.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// The wire as it was before it carried a version.
 ///

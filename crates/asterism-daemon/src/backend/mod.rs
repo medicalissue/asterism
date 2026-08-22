@@ -787,6 +787,7 @@ mod tests {
                         path: "/tmp/x.sock".into(),
                     },
                     endpoint: GuestEndpoint::HostForward { ssh_port: 22 },
+                    packet_edge_generation: None,
                     started_at: now_unix(),
                 },
             )
@@ -889,6 +890,7 @@ mod tests {
                 proc: None,
                 ctl: ControlChannel::Qmp { path: ctl.clone() },
                 endpoint: GuestEndpoint::HostForward { ssh_port: 22 },
+                packet_edge_generation: None,
                 started_at: now_unix(),
             };
             assert!(
@@ -1024,6 +1026,7 @@ mod tests {
                         path: paths::qmp_socket_path("dev"),
                     },
                     endpoint: GuestEndpoint::HostForward { ssh_port: 22 },
+                    packet_edge_generation: None,
                     started_at: 0,
                 };
                 let inst = Instance::new(

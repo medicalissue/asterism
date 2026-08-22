@@ -202,6 +202,19 @@ pub fn instance_dir(name: &str) -> PathBuf {
     home_dir().join("instances").join(name)
 }
 
+/// Deterministic, private packet edge for a running guest.
+///
+/// QEMU reconnects to this path after an `astd` restart. [`short_socket`]
+/// keeps deeply nested test and user homes inside the platform `sun_path`
+/// limit without giving up the instance-specific identity.
+pub fn exit_socket(name: &str) -> PathBuf {
+    short_socket(instance_dir(name).join("exit.sock"))
+}
+
+pub fn exit_provider_policy_path() -> PathBuf {
+    home_dir().join("exit-provider.json")
+}
+
 /// Dedicated keypair used to reach guests; generated on first use.
 pub fn ssh_key_path() -> PathBuf {
     home_dir().join("id_ed25519")
