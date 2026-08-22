@@ -32,8 +32,9 @@ mod egress;
 mod swap;
 mod wake;
 
+use crate::instance::MoveSourcePhase;
 pub use egress::{EgressRequest, EgressResponse, MESH_FRAME_LIMIT};
-pub use swap::{BaseImage, MoveFile, MoveManifest};
+pub use swap::{BaseImage, MoveAuthorityPhase, MoveFile, MoveManifest};
 pub use wake::{CheckRow, Verdict};
 
 /// One request per line of JSON over the daemon's unix socket;
@@ -529,8 +530,9 @@ pub enum Request {
 
     // ---- swapping the cpu part ----------------------------------------------
     //
-    // `ast set <instance> cpu <device>` — an offline migration, and in the
-    // model's own words a change to one line of an instance's parts table.
+    // `ast set <instance> cpu <device>` — a live migration when compatible,
+    // with an explicit offline fallback, and in the model's own words a
+    // change to one line of an instance's parts table.
     // The daemon in front of the user drives it; the frames below are the
     // steps it drives, each aimed at one named device and therefore each
     // reporting no subject (see [`Request::subject`]).
@@ -542,10 +544,9 @@ pub enum Request {
         name: String,
         /// The device that will supply cpu and ram from here on.
         device: String,
-        /// Shut the guest down first, rather than refusing to move a
-        /// running instance. Offline migration is the only kind that works
-        /// on every backend we have, so this is a real choice and not a
-        /// convenience.
+        /// Force the portable offline path by shutting the guest down first.
+        /// Without this, a running guest negotiates live migration and a
+        /// stopped guest uses the same offline path as before.
         #[serde(default)]
         down: bool,
     },
@@ -570,9 +571,76 @@ pub enum Request {
     /// From here until a commit or an abort, this device holds the only
     /// bootable copy and will not boot it.
     MovePrepare {
+        #[serde(default)]
+        instance_id: String,
         name: String,
         to_device: String,
+        #[serde(default)]
+        to_device_id: String,
         epoch: u64,
+        #[serde(default)]
+        token: String,
+        #[serde(default)]
+        coordinator_id: String,
+        /// Keep the source guest running behind the move fence while its
+        /// disk is pre-copied. The backend migration stream performs the
+        /// final dirty-disk, RAM and device-state convergence.
+        #[serde(default)]
+        live: bool,
+    },
+    /// Durably record who may send a live migration before the target starts
+    /// receiving bytes or processes.
+    MoveBeginTarget {
+        manifest: Box<MoveManifest>,
+        epoch: u64,
+        source_device: String,
+        source_device_id: String,
+        token: String,
+        coordinator_id: String,
+    },
+    /// Start the target's staged root-disk NBD export. The source mirrors its
+    /// running root node here before RAM/device migration begins.
+    MoveLivePrepareDisk {
+        instance_id: String,
+        name: String,
+        epoch: u64,
+        token: String,
+    },
+    /// The source block job reached READY; make the mirrored root part of the
+    /// target's durable receipt before starting the incoming guest.
+    MoveLiveDiskReady {
+        instance_id: String,
+        name: String,
+        epoch: u64,
+        token: String,
+    },
+    /// Start the compatible target backend against the staged disk, paused
+    /// at its incoming-migration boundary.
+    MoveLivePrepareTarget {
+        manifest: Box<MoveManifest>,
+        epoch: u64,
+        /// Authenticated mesh identity the migration stream must arrive from.
+        source_device: String,
+        source_device_id: String,
+        token: String,
+    },
+    /// Serialize commit against abort on the target before the source crosses
+    /// its no-return marker. Reserved is durable and never abortable.
+    MoveReserveTarget {
+        instance_id: String,
+        name: String,
+        epoch: u64,
+        token: String,
+    },
+    /// Rebuild token-bound live streams after a daemon restart. `from_lane`
+    /// is a CAS generation: a lost reply replays the newer durable lane
+    /// instead of incrementing it twice.
+    MoveRecoverTarget {
+        instance_id: String,
+        name: String,
+        epoch: u64,
+        token: String,
+        from_lane: u64,
     },
     /// The bytes are all here and verified: adopt them. The staging
     /// directory becomes the instance directory and the row is written with
@@ -580,23 +648,62 @@ pub enum Request {
     MoveCommitTarget {
         manifest: Box<MoveManifest>,
         epoch: u64,
+        #[serde(default)]
+        token: String,
+    },
+    /// Query the durable target-side authority transaction. This is the
+    /// recovery path when a commit reply is lost.
+    MoveTargetStatus {
+        instance_id: String,
+        name: String,
+        epoch: u64,
+        token: String,
+    },
+    /// Query the source-owned durable no-return decision.
+    MoveSourceStatus {
+        instance_id: String,
+        name: String,
+        epoch: u64,
+        token: String,
+    },
+    /// Persist the source's no-return marker, finish dirty-disk mirroring,
+    /// release RAM/device switchover, and drain both opaque mesh pumps.
+    MoveDecideSource {
+        instance_id: String,
+        name: String,
+        epoch: u64,
+        token: String,
     },
     /// The target has acked: drop the row and the bytes.
     MoveCommitSource {
+        #[serde(default)]
+        instance_id: String,
         name: String,
         epoch: u64,
+        #[serde(default)]
+        token: String,
     },
     /// The move did not happen. Clear the fence; this row stays
     /// authoritative.
     MoveAbortSource {
+        #[serde(default)]
+        instance_id: String,
         name: String,
         epoch: u64,
+        #[serde(default)]
+        token: String,
     },
     /// The move did not happen. Delete the staging directory, which is the
     /// only place the half-transferred bytes ever were.
     MoveAbortTarget {
+        /// Added with live migration. Empty means a legacy/offline abort,
+        /// whose staging tree predates target authority transactions.
+        #[serde(default)]
+        instance_id: String,
         name: String,
         epoch: u64,
+        #[serde(default)]
+        token: String,
     },
 }
 
@@ -715,7 +822,16 @@ impl Request {
             | Request::MoveOffer { .. }
             | Request::MoveProbe { .. }
             | Request::MovePrepare { .. }
+            | Request::MoveBeginTarget { .. }
+            | Request::MoveLivePrepareDisk { .. }
+            | Request::MoveLiveDiskReady { .. }
+            | Request::MoveLivePrepareTarget { .. }
+            | Request::MoveReserveTarget { .. }
+            | Request::MoveRecoverTarget { .. }
             | Request::MoveCommitTarget { .. }
+            | Request::MoveTargetStatus { .. }
+            | Request::MoveSourceStatus { .. }
+            | Request::MoveDecideSource { .. }
             | Request::MoveCommitSource { .. }
             | Request::MoveAbortSource { .. }
             | Request::MoveAbortTarget { .. } => None,
@@ -757,6 +873,27 @@ impl Request {
             | Request::DeviceShellResize { .. }
             | Request::DeviceShellSignal { .. }
             | Request::DeviceShellClose => 4,
+            Request::MovePrepare {
+                instance_id, token, ..
+            } if !instance_id.is_empty() || !token.is_empty() => 7,
+            Request::MoveCommitTarget { token, .. }
+            | Request::MoveCommitSource { token, .. }
+            | Request::MoveAbortSource { token, .. }
+            | Request::MoveAbortTarget { token, .. }
+                if !token.is_empty() =>
+            {
+                7
+            }
+            Request::MoveBeginTarget { .. }
+            | Request::MoveLivePrepareDisk { .. }
+            | Request::MoveLiveDiskReady { .. }
+            | Request::MoveLivePrepareTarget { .. }
+            | Request::MoveReserveTarget { .. }
+            | Request::MoveRecoverTarget { .. }
+            | Request::MoveCommitTarget { .. }
+            | Request::MoveTargetStatus { .. }
+            | Request::MoveSourceStatus { .. }
+            | Request::MoveDecideSource { .. } => 7,
             _ => crate::compat::FIRST_PROTOCOL,
         }
     }
@@ -786,6 +923,20 @@ impl Request {
             | Request::DeviceShellClose => Some("device shell"),
             Request::ImageList => Some("image_list"),
             Request::ImagePull { .. } => Some("image_pull"),
+            Request::MovePrepare { .. }
+            | Request::MoveBeginTarget { .. }
+            | Request::MoveLivePrepareDisk { .. }
+            | Request::MoveLiveDiskReady { .. }
+            | Request::MoveLivePrepareTarget { .. }
+            | Request::MoveReserveTarget { .. }
+            | Request::MoveRecoverTarget { .. }
+            | Request::MoveCommitTarget { .. }
+            | Request::MoveTargetStatus { .. }
+            | Request::MoveSourceStatus { .. }
+            | Request::MoveDecideSource { .. }
+            | Request::MoveCommitSource { .. }
+            | Request::MoveAbortSource { .. }
+            | Request::MoveAbortTarget { .. } => Some("token-fenced migration"),
             _ => None,
         }
     }
@@ -1076,6 +1227,59 @@ pub enum Response {
         /// Whether the base image has to be fetched from the source first.
         needs_base: bool,
     },
+    /// The target backend is paused at its incoming migration boundary and
+    /// its staged copy is still unlisted and unbootable by Asterism.
+    MoveLiveReady {
+        #[serde(default)]
+        instance_id: String,
+        #[serde(default)]
+        epoch: u64,
+        #[serde(default)]
+        token: String,
+        lane: u64,
+    },
+    /// The target root disk is exported over NBD and ready for a dirty mirror.
+    MoveDiskReady {
+        #[serde(default)]
+        instance_id: String,
+        #[serde(default)]
+        epoch: u64,
+        #[serde(default)]
+        token: String,
+        lane: u64,
+    },
+    /// Durable answer to a target authority query or conditional abort.
+    MoveAuthority {
+        /// Immutable transaction identity. Defaults preserve decoding of the
+        /// unreleased early-v7 shape, but v7 writers always populate it.
+        #[serde(default)]
+        instance_id: String,
+        #[serde(default)]
+        epoch: u64,
+        #[serde(default)]
+        token: String,
+        /// Monotonic stream generation. Bulk frames from an older lane are
+        /// stale even when id/epoch/token match.
+        #[serde(default)]
+        lane: u64,
+        #[serde(default)]
+        disk_eof: bool,
+        #[serde(default)]
+        ram_eof: bool,
+        phase: MoveAuthorityPhase,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance: Option<Box<Instance>>,
+    },
+    /// Durable source-side decision, bound to the requested id/epoch/token.
+    MoveSource {
+        #[serde(default)]
+        instance_id: String,
+        #[serde(default)]
+        epoch: u64,
+        #[serde(default)]
+        token: String,
+        phase: MoveSourcePhase,
+    },
 
     Error {
         message: String,
@@ -1145,6 +1349,10 @@ impl Response {
             | Response::DeviceShellRefused { .. }
             | Response::DeviceShellOutput { .. }
             | Response::DeviceShellExit { .. } => 4,
+            Response::MoveLiveReady { .. }
+            | Response::MoveDiskReady { .. }
+            | Response::MoveAuthority { .. }
+            | Response::MoveSource { .. } => 7,
             _ => crate::compat::FIRST_PROTOCOL,
         }
     }
@@ -1184,6 +1392,34 @@ pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
             "device-shell",
             Request::DeviceShellPolicy {
                 action: ShellPolicyAction::Status,
+            }
+            .since(),
+        ),
+        (
+            "live-migration",
+            Request::MoveLivePrepareTarget {
+                manifest: Box::new(MoveManifest {
+                    instance: Instance::new(
+                        "compat",
+                        "source",
+                        "debian:13",
+                        Shape::default(),
+                        crate::hv::Machine {
+                            backend: "qemu".into(),
+                            machine_type: "virt".into(),
+                            cpu: "host".into(),
+                            hv_version: "test".into(),
+                        },
+                    ),
+                    arch: std::env::consts::ARCH.into(),
+                    base: BaseImage::absent("debian:13".into()),
+                    files: Vec::new(),
+                    local_volumes: Vec::new(),
+                }),
+                epoch: 1,
+                source_device: "source".into(),
+                source_device_id: "01".into(),
+                token: "attempt".into(),
             }
             .since(),
         ),

@@ -500,9 +500,14 @@ fn a_move_refuses_a_mutated_adopted_base_before_fencing_the_source() {
 
     let astd = Daemon::on(dir, home.clone());
     let reply = astd.ask_request(&Request::MovePrepare {
+        instance_id: String::new(),
         name: "dev".into(),
         to_device: "desktop".into(),
+        to_device_id: String::new(),
         epoch: 1,
+        token: String::new(),
+        coordinator_id: String::new(),
+        live: false,
     });
     let Response::Error { message } = reply else {
         panic!("a mutated source was offered to the move: {reply:?}");

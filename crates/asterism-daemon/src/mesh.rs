@@ -36,9 +36,9 @@
 //! carries — which is what makes a proxied command the same code path as a
 //! local one rather than a parallel implementation of it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -221,7 +221,13 @@ enum MeshRequest {
     /// Fenced: the far side serves this only while that instance is marked
     /// `moving` at exactly this epoch, so nobody can pull a live instance's
     /// disk off a device by asking nicely.
-    MoveExport { name: String, epoch: u64 },
+    MoveExport {
+        instance_id: String,
+        name: String,
+        epoch: u64,
+        token: String,
+        live: bool,
+    },
     /// Send me this base image.
     ///
     /// The peer fetch `docs/MODEL.md` asks for: a device that lacks an image
@@ -240,6 +246,45 @@ enum MeshRequest {
         manifest: Box<MoveManifest>,
         epoch: u64,
         from_device: String,
+        token: String,
+        live: bool,
+    },
+    /// Start the source QEMU blockdev-mirror and tunnel its NBD client to the
+    /// target's staged disk export.
+    MoveDiskSource {
+        instance_id: String,
+        name: String,
+        epoch: u64,
+        token: String,
+        lane: u64,
+        to_device: String,
+    },
+    /// Turn an authenticated stream into the target disk's NBD export.
+    MoveDiskSplice {
+        instance_id: String,
+        name: String,
+        epoch: u64,
+        token: String,
+        lane: u64,
+    },
+    /// Ask the source backend to emit its live migration stream and tunnel
+    /// it directly to `to_device`.
+    MoveLiveSource {
+        instance_id: String,
+        name: String,
+        epoch: u64,
+        token: String,
+        lane: u64,
+        to_device: String,
+    },
+    /// Turn this authenticated stream into the target backend's incoming
+    /// migration socket.
+    MoveLiveSplice {
+        instance_id: String,
+        name: String,
+        epoch: u64,
+        token: String,
+        lane: u64,
     },
 }
 
@@ -254,6 +299,12 @@ impl MeshRequest {
         match self {
             MeshRequest::Rpc { request } => request.since(),
             MeshRequest::DeviceShell { .. } => 4,
+            MeshRequest::MoveExport { .. }
+            | MeshRequest::MoveImport { .. }
+            | MeshRequest::MoveDiskSource { .. }
+            | MeshRequest::MoveDiskSplice { .. }
+            | MeshRequest::MoveLiveSource { .. }
+            | MeshRequest::MoveLiveSplice { .. } => 7,
             _ => compat::FIRST_PROTOCOL,
         }
     }
@@ -271,6 +322,8 @@ impl MeshRequest {
             MeshRequest::MoveExport { .. }
                 | MeshRequest::MoveBase { .. }
                 | MeshRequest::MoveImport { .. }
+                | MeshRequest::MoveDiskSource { .. }
+                | MeshRequest::MoveLiveSource { .. }
         )
     }
 
@@ -286,6 +339,10 @@ impl MeshRequest {
             MeshRequest::MoveExport { .. } => "an instance export",
             MeshRequest::MoveBase { .. } => "a base image",
             MeshRequest::MoveImport { .. } => "an instance import",
+            MeshRequest::MoveDiskSource { .. } => "a dirty-disk migration source",
+            MeshRequest::MoveDiskSplice { .. } => "a dirty-disk migration stream",
+            MeshRequest::MoveLiveSource { .. } => "a live migration source",
+            MeshRequest::MoveLiveSplice { .. } => "a live migration stream",
         }
     }
 }
@@ -718,6 +775,14 @@ impl Mesh {
     /// What this device calls itself.
     pub async fn self_name(&self) -> String {
         self.orbit.lock().await.self_name().to_owned()
+    }
+
+    /// Immutable authenticated identity for a named orbit device.
+    pub(crate) async fn device_id_of(&self, name: &str) -> Result<String> {
+        if name == self.self_name().await {
+            return Ok(self.device_id().to_string());
+        }
+        Ok(self.device(name).await?.device_id)
     }
 
     /// The orbit as `ast devices` prints it: this device first, then every
@@ -1498,17 +1563,20 @@ impl Mesh {
     /// whoever typed the command. An orbit is a set of mutually paired
     /// devices, so they normally can; when they cannot, the target's refusal
     /// arrives as "no device named ..." and nothing has moved.
+    #[allow(clippy::too_many_arguments)]
     pub async fn move_import(
         self: &Arc<Self>,
         target: &str,
         source: &str,
         manifest: &MoveManifest,
         epoch: u64,
+        token: &str,
+        live: bool,
         io: &mut ClientIo<'_>,
     ) -> Result<()> {
         if target == self.self_name().await {
             let mut report = Reporter::Client(io);
-            return import(self, manifest, epoch, source, &mut report).await;
+            return import(self, manifest, epoch, source, token, live, &mut report).await;
         }
 
         let peer = self.device(target).await?;
@@ -1520,6 +1588,8 @@ impl Mesh {
                 manifest: Box::new(manifest.clone()),
                 epoch,
                 from_device: source.to_owned(),
+                token: token.to_owned(),
+                live,
             },
         )
         .await?;
@@ -1535,6 +1605,85 @@ impl Mesh {
                 MoveFrame::Failed { message } => bail!(message),
                 other => bail!("device {target:?} answered an import with {other:?}"),
             }
+        }
+    }
+
+    /// Carry a backend's opaque migration stream source-to-target. The mesh
+    /// authenticates both devices; neither daemon interprets RAM, dirty-disk
+    /// pages or device state.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn live_migrate(
+        self: &Arc<Self>,
+        source: &str,
+        target: &str,
+        name: &str,
+        instance_id: &str,
+        epoch: u64,
+        token: &str,
+        lane: u64,
+        node: &Node,
+    ) -> Result<()> {
+        if source == self.self_name().await {
+            return run_live_source(node, target, instance_id, name, epoch, token, lane).await;
+        }
+        let peer = self.device(source).await?;
+        let connection = self.live_connection(&peer).await?;
+        let mut stream = connection.open_stream().await?;
+        open_stream_with(
+            &mut stream.send,
+            &MeshRequest::MoveLiveSource {
+                instance_id: instance_id.to_owned(),
+                name: name.to_owned(),
+                epoch,
+                token: token.to_owned(),
+                lane,
+                to_device: target.to_owned(),
+            },
+        )
+        .await?;
+        let _ = stream.send.finish();
+        match read_frame::<MoveFrame>(&mut stream.recv).await? {
+            MoveFrame::End { .. } => Ok(()),
+            MoveFrame::Failed { message } => bail!(message),
+            other => bail!("device {source:?} ended live migration with {other:?}"),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn live_disk_mirror(
+        self: &Arc<Self>,
+        source: &str,
+        target: &str,
+        instance_id: &str,
+        name: &str,
+        epoch: u64,
+        token: &str,
+        lane: u64,
+        node: &Node,
+    ) -> Result<()> {
+        if source == self.self_name().await {
+            return run_live_disk_source(node, target, instance_id, name, epoch, token, lane).await;
+        }
+        let peer = self.device(source).await?;
+        let connection = self.live_connection(&peer).await?;
+        let mut stream = connection.open_stream().await?;
+        open_stream_with(
+            &mut stream.send,
+            &MeshRequest::MoveDiskSource {
+                instance_id: instance_id.to_owned(),
+                name: name.to_owned(),
+                epoch,
+                token: token.to_owned(),
+                lane,
+                to_device: target.to_owned(),
+            },
+        )
+        .await?;
+        let _ = stream.send.finish();
+        match read_frame::<MoveFrame>(&mut stream.recv).await? {
+            MoveFrame::End { .. } => Ok(()),
+            MoveFrame::Failed { message } => bail!(message),
+            other => bail!("device {source:?} ended dirty-disk mirror with {other:?}"),
         }
     }
 
@@ -2483,6 +2632,426 @@ async fn serve_splice(
     pump(tcp, stream).await.map(|_| ())
 }
 
+async fn run_live_disk_source(
+    node: &Node,
+    target: &str,
+    instance_id: &str,
+    name: &str,
+    epoch: u64,
+    token: &str,
+    lane: u64,
+) -> Result<()> {
+    use asterism_core::hv::MigrationDiskTarget;
+
+    let inst = node.shard.lock().await.get(name)?.clone();
+    let target_device_id = inst
+        .moving
+        .as_ref()
+        .filter(|moving| {
+            inst.id == instance_id
+                && moving.epoch == epoch
+                && moving.token == token
+                && moving.to_device == target
+                && matches!(
+                    moving.phase,
+                    asterism_core::instance::MoveSourcePhase::Fenced
+                        | asterism_core::instance::MoveSourcePhase::Committed
+                )
+        })
+        .context("instance is not fenced for this dirty-disk mirror")?
+        .to_device_id
+        .clone();
+    let mesh = crate::swap::mesh()?;
+    if mesh.device_id_of(target).await? != target_device_id {
+        bail!("dirty-disk target identity changed after the durable source fence");
+    }
+    match mesh
+        .proxy(
+            target,
+            Request::MoveTargetStatus {
+                instance_id: instance_id.to_owned(),
+                name: name.to_owned(),
+                epoch,
+                token: token.to_owned(),
+            },
+        )
+        .await?
+    {
+        Response::MoveAuthority {
+            instance_id: winner_id,
+            epoch: winner_epoch,
+            token: winner_token,
+            lane: current,
+            phase:
+                asterism_core::protocol::MoveAuthorityPhase::DiskPrepared
+                | asterism_core::protocol::MoveAuthorityPhase::Reserved,
+            ..
+        } if winner_id == instance_id
+            && winner_epoch == epoch
+            && winner_token == token
+            && current == lane => {}
+        other => bail!("dirty-disk lane {lane} is not the target's durable winner: {other:?}"),
+    }
+    let handle = inst
+        .handle
+        .clone()
+        .context("a dirty-disk migration source has no backend handle")?;
+    let hv = crate::backend::for_handle(&handle.backend)?;
+    let socket = paths::migration_disk_source_socket_path(name, epoch);
+    let _ = std::fs::remove_file(&socket);
+    let listener = tokio::net::UnixListener::bind(&socket)?;
+    struct RemoveDisk(std::path::PathBuf);
+    impl Drop for RemoveDisk {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _remove = RemoveDisk(socket.clone());
+    let url = format!("unix:{}", socket.display());
+    let mirroring = tokio::task::spawn_blocking(move || {
+        hv.migration_disk_mirror(&handle, MigrationDiskTarget { url })
+    });
+    let (local, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+        .await
+        .context("source QEMU did not open the dirty-disk NBD stream")??;
+
+    let peer = mesh.device(target).await?;
+    let connection = mesh.live_connection(&peer).await?;
+    let mut stream = connection.open_stream().await?;
+    open_stream_with(
+        &mut stream.send,
+        &MeshRequest::MoveDiskSplice {
+            instance_id: instance_id.to_owned(),
+            name: name.to_owned(),
+            epoch,
+            token: token.to_owned(),
+            lane,
+        },
+    )
+    .await?;
+    match read_frame::<MeshReply>(&mut stream.recv).await? {
+        MeshReply::SpliceReady => {}
+        MeshReply::Rpc {
+            response: Response::Error { message },
+        } => bail!(message),
+        other => bail!("device {target:?} would not receive the disk mirror: {other:?}"),
+    }
+    let pumping = tokio::spawn(pump(local, stream));
+    if let Err(e) = mirroring
+        .await
+        .context("joining source dirty-disk mirror")?
+    {
+        pumping.abort();
+        return Err(e);
+    }
+    live_disk_pumps()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((name.to_owned(), epoch), pumping);
+    Ok(())
+}
+
+async fn run_live_source(
+    node: &Node,
+    target: &str,
+    instance_id: &str,
+    name: &str,
+    epoch: u64,
+    token: &str,
+    lane: u64,
+) -> Result<()> {
+    use asterism_core::hv::MigrationTarget;
+
+    let inst = node.shard.lock().await.get(name)?.clone();
+    let moving = inst
+        .moving
+        .as_ref()
+        .filter(|moving| {
+            inst.id == instance_id
+                && moving.epoch == epoch
+                && moving.token == token
+                && moving.to_device == target
+                && matches!(
+                    moving.phase,
+                    asterism_core::instance::MoveSourcePhase::Fenced
+                        | asterism_core::instance::MoveSourcePhase::Committed
+                )
+        })
+        .with_context(|| format!("instance {name:?} is not fenced for this live migration"))?;
+    let target_device_id = moving.to_device_id.clone();
+    let mesh = crate::swap::mesh()?;
+    if mesh.device_id_of(target).await? != target_device_id {
+        bail!("live target identity changed after the durable source fence");
+    }
+    match mesh
+        .proxy(
+            target,
+            Request::MoveTargetStatus {
+                instance_id: instance_id.to_owned(),
+                name: name.to_owned(),
+                epoch,
+                token: token.to_owned(),
+            },
+        )
+        .await?
+    {
+        Response::MoveAuthority {
+            instance_id: winner_id,
+            epoch: winner_epoch,
+            token: winner_token,
+            lane: current,
+            phase:
+                asterism_core::protocol::MoveAuthorityPhase::Prepared
+                | asterism_core::protocol::MoveAuthorityPhase::Reserved,
+            ..
+        } if winner_id == instance_id
+            && winner_epoch == epoch
+            && winner_token == token
+            && current == lane => {}
+        other => bail!("RAM/device lane {lane} is not the target's durable winner: {other:?}"),
+    }
+    let handle = inst
+        .handle
+        .clone()
+        .context("a live migration source has no running backend handle")?;
+    let hv = crate::backend::for_handle(&handle.backend)?;
+    if !hv.caps().live_migration {
+        bail!("the {} backend cannot migrate a running guest", hv.id());
+    }
+
+    let socket = paths::migration_source_socket_path(name, epoch);
+    let _ = std::fs::remove_file(&socket);
+    let listener = tokio::net::UnixListener::bind(&socket)?;
+    struct Remove(std::path::PathBuf);
+    impl Drop for Remove {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _remove = Remove(socket.clone());
+    let uri = format!("unix:{}", socket.display());
+    let migrating =
+        tokio::task::spawn_blocking(move || hv.migrate_out(&handle, MigrationTarget { url: uri }));
+    let (local, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+        .await
+        .context("the source backend did not open its migration stream")??;
+
+    let peer = mesh.device(target).await?;
+    let connection = mesh.live_connection(&peer).await?;
+    let mut stream = connection.open_stream().await?;
+    open_stream_with(
+        &mut stream.send,
+        &MeshRequest::MoveLiveSplice {
+            instance_id: inst.id.clone(),
+            name: name.to_owned(),
+            epoch,
+            token: token.to_owned(),
+            lane,
+        },
+    )
+    .await?;
+    match read_frame::<MeshReply>(&mut stream.recv).await? {
+        MeshReply::SpliceReady => {}
+        MeshReply::Rpc {
+            response: Response::Error { message },
+        } => bail!(message),
+        other => bail!("device {target:?} would not receive the migration: {other:?}"),
+    }
+    let pumping = tokio::spawn(pump(local, stream));
+    if let Err(e) = migrating
+        .await
+        .context("joining the source backend migration")?
+    {
+        pumping.abort();
+        return Err(e);
+    }
+    live_pumps()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((name.to_owned(), epoch), pumping);
+    Ok(())
+}
+
+type LivePump = tokio::task::JoinHandle<Result<TransferStats>>;
+
+fn live_pumps() -> &'static std::sync::Mutex<BTreeMap<(String, u64), LivePump>> {
+    static PUMPS: OnceLock<std::sync::Mutex<BTreeMap<(String, u64), LivePump>>> = OnceLock::new();
+    PUMPS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+pub(crate) fn has_live_pump(name: &str, epoch: u64) -> bool {
+    live_pumps()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&(name.to_owned(), epoch))
+}
+
+async fn join_pump(task: LivePump) -> Result<()> {
+    task.await.context("joining the migration stream pump")??;
+    Ok(())
+}
+
+pub(crate) async fn finish_live_pump(name: &str, epoch: u64) -> Result<()> {
+    let task = live_pumps()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(name.to_owned(), epoch));
+    if let Some(task) = task {
+        join_pump(task).await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn abort_live_pump(name: &str, epoch: u64) -> Result<()> {
+    let task = live_pumps()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(name.to_owned(), epoch));
+    if let Some(task) = task {
+        task.abort();
+        let _ = task.await;
+    }
+    Ok(())
+}
+
+fn live_disk_pumps() -> &'static std::sync::Mutex<BTreeMap<(String, u64), LivePump>> {
+    static PUMPS: OnceLock<std::sync::Mutex<BTreeMap<(String, u64), LivePump>>> = OnceLock::new();
+    PUMPS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+pub(crate) fn has_live_disk_pump(name: &str, epoch: u64) -> bool {
+    live_disk_pumps()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(&(name.to_owned(), epoch))
+}
+
+pub(crate) async fn finish_live_disk_pump(name: &str, epoch: u64) -> Result<()> {
+    let task = live_disk_pumps()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(name.to_owned(), epoch));
+    if let Some(task) = task {
+        join_pump(task).await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn abort_live_disk_pump(name: &str, epoch: u64) -> Result<()> {
+    let task = live_disk_pumps()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(name.to_owned(), epoch));
+    if let Some(task) = task {
+        task.abort();
+        let _ = task.await;
+    }
+    Ok(())
+}
+
+async fn serve_live_splice(
+    mut stream: asterism_mesh::MeshStream,
+    instance_id: &str,
+    name: &str,
+    epoch: u64,
+    token: &str,
+    lane: u64,
+    requester_device: &str,
+    requester_device_id: &str,
+) -> Result<()> {
+    if let Err(e) = crate::swap::authorize_live_splice(
+        instance_id,
+        name,
+        epoch,
+        requester_device,
+        requester_device_id,
+        token,
+        lane,
+    ) {
+        write_frame(
+            &mut stream.send,
+            &MeshReply::Rpc {
+                response: Response::Error {
+                    message: format!("{e:#}"),
+                },
+            },
+        )
+        .await?;
+        return Ok(());
+    }
+    let socket = crate::swap::live_socket(name, epoch);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let local = loop {
+        match tokio::net::UnixStream::connect(&socket).await {
+            Ok(local) => break local,
+            Err(e) if tokio::time::Instant::now() >= deadline => {
+                let refusal = MeshReply::Rpc {
+                    response: Response::Error {
+                        message: format!(
+                            "the incoming backend for {name:?} did not bind {}: {e}",
+                            socket.display()
+                        ),
+                    },
+                };
+                write_frame(&mut stream.send, &refusal).await?;
+                return Ok(());
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    };
+    write_frame(&mut stream.send, &MeshReply::SpliceReady).await?;
+    pump(local, stream).await?;
+    crate::swap::mark_target_stream_eof(instance_id, epoch, token, lane, false)?;
+    Ok(())
+}
+
+async fn serve_disk_splice(
+    mut stream: asterism_mesh::MeshStream,
+    instance_id: &str,
+    name: &str,
+    epoch: u64,
+    token: &str,
+    lane: u64,
+    requester_device: &str,
+    requester_device_id: &str,
+) -> Result<()> {
+    let export = match crate::swap::authorize_disk_splice(
+        instance_id,
+        name,
+        epoch,
+        token,
+        requester_device,
+        requester_device_id,
+        lane,
+    ) {
+        Ok(export) => export,
+        Err(e) => {
+            write_frame(
+                &mut stream.send,
+                &MeshReply::Rpc {
+                    response: Response::Error {
+                        message: format!("{e:#}"),
+                    },
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let local = tokio::net::UnixStream::connect(&export.socket)
+        .await
+        .with_context(|| {
+            format!(
+                "connecting to target disk export {}",
+                export.socket.display()
+            )
+        })?;
+    write_frame(&mut stream.send, &MeshReply::SpliceReady).await?;
+    pump(local, stream).await?;
+    crate::swap::mark_target_stream_eof(instance_id, epoch, token, lane, true)?;
+    Ok(())
+}
+
 /// The provider's end of a volume splice: check the lease, then become a pipe.
 ///
 /// A refusal goes back as an ordinary error frame, which is what makes a
@@ -2559,19 +3128,106 @@ impl Reporter<'_, '_> {
 /// no instance could be called that, no shard row points at it, and a daemon
 /// that dies here leaves something the next start sweeps — which is the whole
 /// reason a half-move cannot yield two bootable copies.
+fn live_root_file(path: &str) -> bool {
+    matches!(path, "disk.raw" | "disk.qcow2")
+}
+
+fn transfer_allocated(manifest: &MoveManifest, live: bool) -> u64 {
+    manifest
+        .files
+        .iter()
+        .filter(|file| !live || !live_root_file(&file.path))
+        .map(|file| file.allocated)
+        .sum()
+}
+
+fn move_import_lock(name: &str, epoch: u64) -> Arc<Mutex<()>> {
+    type Key = (String, u64);
+    static LOCKS: OnceLock<StdMutex<BTreeMap<Key, Weak<Mutex<()>>>>> = OnceLock::new();
+
+    let mut locks = LOCKS
+        .get_or_init(|| StdMutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    let key = (name.to_owned(), epoch);
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
+}
+
 async fn import(
     mesh: &Arc<Mesh>,
     manifest: &MoveManifest,
     epoch: u64,
     from_device: &str,
+    token: &str,
+    live: bool,
     report: &mut Reporter<'_, '_>,
 ) -> Result<()> {
     let name = manifest.instance.name.clone();
+    // Two forwarded imports for one name/epoch must not alternately delete
+    // and rewrite the same staging tree. A stale id still shares this lock,
+    // then fails the source proof below before touching any bytes.
+    let import_lock = move_import_lock(&name, epoch);
+    let _import_guard = import_lock.lock().await;
+
+    match mesh
+        .proxy(
+            from_device,
+            Request::MoveSourceStatus {
+                instance_id: manifest.instance.id.clone(),
+                name: name.clone(),
+                epoch,
+                token: token.to_owned(),
+            },
+        )
+        .await?
+    {
+        Response::MoveSource {
+            instance_id,
+            epoch: source_epoch,
+            token: source_token,
+            phase: asterism_core::instance::MoveSourcePhase::Fenced,
+        } if instance_id == manifest.instance.id
+            && source_epoch == epoch
+            && source_token == token => {}
+        Response::MoveSource { .. } => {
+            bail!("source fence does not match import id/epoch/token or is already committed")
+        }
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected source proof before move import: {other:?}"),
+    }
+
+    let source_device_id = if live {
+        let source_device_id = mesh.device_id_of(from_device).await?;
+        swap::authorize_live_import(manifest, epoch, token, from_device, &source_device_id)?;
+        Some(source_device_id)
+    } else {
+        None
+    };
+
     let staging = swap::staging_dir(&name, epoch);
     // An earlier attempt at this same epoch is not something to resume: the
     // manifest may have moved on and a half-file is worse than no file.
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging).with_context(|| format!("making {}", staging.display()))?;
+    if live {
+        for file in manifest
+            .files
+            .iter()
+            .filter(|file| live_root_file(&file.path))
+        {
+            let path = safe_join(&staging, &file.path)?;
+            let disk = std::fs::File::create(&path)?;
+            disk.set_len(file.len)?;
+            set_mode(&path, file.mode)?;
+            disk.sync_all()?;
+        }
+    }
 
     if swap::base_wanted(&manifest.base)? {
         fetch_base(mesh, from_device, manifest, report).await?;
@@ -2583,16 +3239,21 @@ async fn import(
     open_stream_with(
         &mut stream.send,
         &MeshRequest::MoveExport {
+            instance_id: manifest.instance.id.clone(),
             name: name.clone(),
             epoch,
+            token: token.to_owned(),
+            live,
         },
     )
     .await?;
     let _ = stream.send.finish();
 
-    let expected = manifest.allocated();
+    let expected = transfer_allocated(manifest, live);
     let mut receipt = swap::Receipt {
+        instance_id: manifest.instance.id.clone(),
         epoch,
+        token: token.to_owned(),
         from_device: from_device.to_owned(),
         bytes: 0,
         files: Default::default(),
@@ -2607,7 +3268,21 @@ async fn import(
             cow::human(expected)
         );
     }
-    receipt.save(&staging)?;
+    if let Some(source_device_id) = source_device_id.as_deref() {
+        // Abort may have won while bytes were flowing. Recheck under the
+        // target authority serializer before writing the only receipt that
+        // could make those bytes eligible for later publication.
+        swap::save_live_import_receipt(
+            manifest,
+            epoch,
+            token,
+            from_device,
+            source_device_id,
+            &receipt,
+        )?;
+    } else {
+        receipt.save(&staging)?;
+    }
     report
         .progress(
             format!(
@@ -2905,15 +3580,25 @@ async fn send_file(send: &mut SendStream, path: &Path, wire_name: &str) -> Resul
 async fn serve_move_export(
     mut stream: asterism_mesh::MeshStream,
     node: &Node,
+    instance_id: &str,
     name: &str,
     epoch: u64,
+    token: &str,
+    live: bool,
 ) -> Result<()> {
     let instance = {
         let reg = node.shard.lock().await;
         reg.get(name).cloned()
     };
     let fenced = instance.and_then(|inst| match &inst.moving {
-        Some(moving) if moving.epoch == epoch => Ok(inst),
+        Some(moving)
+            if inst.id == instance_id
+                && moving.epoch == epoch
+                && moving.token == token
+                && moving.live == live =>
+        {
+            Ok(inst)
+        }
         Some(moving) => Err(anyhow!(
             "instance {name:?} is being moved at epoch {}, not {epoch}",
             moving.epoch
@@ -2936,6 +3621,9 @@ async fn serve_move_export(
     let dir = paths::instance_dir(name);
     let mut bytes = 0u64;
     for file in &manifest.files {
+        if live && live_root_file(&file.path) {
+            continue;
+        }
         match send_file(&mut stream.send, &dir.join(&file.path), &file.path).await {
             Ok(written) => bytes += written,
             Err(e) => return fail(&mut stream.send, e).await,
@@ -2986,20 +3674,31 @@ async fn serve_move_import(
     manifest: &MoveManifest,
     epoch: u64,
     from_device: &str,
+    token: &str,
+    live: bool,
 ) -> Result<()> {
     let mesh = match crate::swap::mesh() {
         Ok(mesh) => mesh,
         Err(e) => return fail(&mut stream.send, e).await,
     };
     let mut report = Reporter::Stream(&mut stream.send);
-    let outcome = import(&mesh, manifest, epoch, from_device, &mut report).await;
+    let outcome = import(
+        &mesh,
+        manifest,
+        epoch,
+        from_device,
+        token,
+        live,
+        &mut report,
+    )
+    .await;
     match outcome {
         Ok(()) => {
             write_frame(
                 &mut stream.send,
                 &MoveFrame::End {
                     files: manifest.files.len() as u64,
-                    bytes: manifest.allocated(),
+                    bytes: transfer_allocated(manifest, live),
                 },
             )
             .await?
@@ -3285,15 +3984,120 @@ async fn serve_stream(
         }
         // Bulk, not request/reply: each of these stops being a framed RPC
         // after this line and becomes a stream of `MoveFrame`s.
-        MeshRequest::MoveExport { name, epoch } => {
-            return serve_move_export(stream, &node, &name, epoch).await
+        MeshRequest::MoveExport {
+            instance_id,
+            name,
+            epoch,
+            token,
+            live,
+        } => {
+            return serve_move_export(
+                stream,
+                &node,
+                &instance_id,
+                &name,
+                epoch,
+                &token,
+                live,
+            )
+            .await
         }
         MeshRequest::MoveBase { reference } => return serve_move_base(stream, &reference).await,
         MeshRequest::MoveImport {
             manifest,
             epoch,
             from_device,
-        } => return serve_move_import(stream, &manifest, epoch, &from_device).await,
+            token,
+            live,
+        } => {
+            return serve_move_import(stream, &manifest, epoch, &from_device, &token, live).await
+        }
+        MeshRequest::MoveDiskSource {
+            instance_id,
+            name,
+            epoch,
+            token,
+            lane,
+            to_device,
+        } => {
+            let result = run_live_disk_source(
+                &node,
+                &to_device,
+                &instance_id,
+                &name,
+                epoch,
+                &token,
+                lane,
+            )
+            .await;
+            let frame = match result {
+                Ok(()) => MoveFrame::End { files: 0, bytes: 0 },
+                Err(error) => MoveFrame::Failed {
+                    message: format!("{error:#}"),
+                },
+            };
+            write_frame(&mut stream.send, &frame).await?;
+            let _ = stream.send.finish();
+            return Ok(());
+        }
+        MeshRequest::MoveDiskSplice {
+            instance_id,
+            name,
+            epoch,
+            token,
+            lane,
+        } => {
+            return serve_disk_splice(
+                stream,
+                &instance_id,
+                &name,
+                epoch,
+                &token,
+                lane,
+                &requester_device,
+                &requester_device_id,
+            )
+            .await
+        }
+        MeshRequest::MoveLiveSource {
+            instance_id,
+            name,
+            epoch,
+            token,
+            lane,
+            to_device,
+        } => {
+            let result =
+                run_live_source(&node, &to_device, &instance_id, &name, epoch, &token, lane).await;
+            let frame = match result {
+                Ok(()) => MoveFrame::End { files: 0, bytes: 0 },
+                Err(error) => MoveFrame::Failed {
+                    message: format!("{error:#}"),
+                },
+            };
+            write_frame(&mut stream.send, &frame).await?;
+            let _ = stream.send.finish();
+            return Ok(());
+        }
+        MeshRequest::MoveLiveSplice {
+            instance_id,
+            name,
+            epoch,
+            token,
+            lane,
+        } => {
+            return serve_live_splice(
+                stream,
+                &instance_id,
+                &name,
+                epoch,
+                &token,
+                lane,
+                &requester_device,
+                &requester_device_id,
+            )
+            .await
+        }
         MeshRequest::GuestKey => match guest_key() {
             Ok(key) => MeshReply::GuestKey { key },
             Err(e) => MeshReply::Rpc {

@@ -394,6 +394,16 @@ fn every_capability_gated_method_has_exact_failure_language() {
             ),
             refusal("receive a migrating guest"),
         );
+        assert_gate(
+            caps.live_migration,
+            backend.migration_commit(&handle),
+            refusal("commit a live migration"),
+        );
+        assert_gate(
+            caps.live_migration,
+            backend.migration_abort(&handle),
+            refusal("abort a live migration"),
+        );
     });
 }
 

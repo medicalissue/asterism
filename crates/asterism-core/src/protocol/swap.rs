@@ -14,6 +14,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::instance::Instance;
 
+/// Durable target-side state of an authority transfer.
+///
+/// `Committing` is intentionally not abortable: the target may already have
+/// published its directory or row, so recovery completes the transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MoveAuthorityPhase {
+    Intent,
+    DiskPrepared,
+    Prepared,
+    /// Target-side durable winner against abort. Source may cross its own
+    /// no-return marker only after observing this exact token-bound phase.
+    Reserved,
+    Committing,
+    Committed,
+    Aborted,
+}
+
 /// A base image, as one device describes it to another.
 ///
 /// Base images are content-addressed and cached per device: a device that
@@ -194,25 +212,50 @@ mod tests {
                 manifest: manifest.clone(),
             },
             Request::MovePrepare {
+                instance_id: "instance-id".into(),
                 name: "dev".into(),
                 to_device: "desktop".into(),
+                to_device_id: "target-id".into(),
                 epoch: 1,
+                token: "token".into(),
+                coordinator_id: "coordinator-id".into(),
+                live: false,
             },
             Request::MoveCommitTarget {
                 manifest: manifest.clone(),
                 epoch: 1,
+                token: "token".into(),
+            },
+            Request::MoveReserveTarget {
+                instance_id: "instance-id".into(),
+                name: "dev".into(),
+                epoch: 1,
+                token: "token".into(),
+            },
+            Request::MoveRecoverTarget {
+                instance_id: "instance-id".into(),
+                name: "dev".into(),
+                epoch: 1,
+                token: "token".into(),
+                from_lane: 1,
             },
             Request::MoveCommitSource {
+                instance_id: "instance-id".into(),
                 name: "dev".into(),
                 epoch: 1,
+                token: "token".into(),
             },
             Request::MoveAbortSource {
+                instance_id: "instance-id".into(),
                 name: "dev".into(),
                 epoch: 1,
+                token: "token".into(),
             },
             Request::MoveAbortTarget {
+                instance_id: "instance-id".into(),
                 name: "dev".into(),
                 epoch: 1,
+                token: "token".into(),
             },
         ] {
             assert_eq!(
@@ -251,5 +294,38 @@ mod tests {
             new_name: "e".into()
         }
         .survives_a_move());
+    }
+
+    #[test]
+    fn live_preparation_is_versioned_without_changing_offline_move_frames() {
+        let old: Request = serde_json::from_str(
+            r#"{"cmd":"move_prepare","name":"dev","to_device":"desktop","epoch":1}"#,
+        )
+        .unwrap();
+        assert_eq!(old.since(), crate::compat::FIRST_PROTOCOL);
+        let Request::MovePrepare { live, .. } = old else {
+            panic!("the old frame changed shape")
+        };
+        assert!(!live, "an old peer always asked for the offline fence");
+
+        let old_abort: Request =
+            serde_json::from_str(r#"{"cmd":"move_abort_target","name":"dev","epoch":1}"#).unwrap();
+        let Request::MoveAbortTarget { instance_id, .. } = old_abort else {
+            panic!("the old abort frame changed shape")
+        };
+        assert!(instance_id.is_empty());
+
+        let live = Request::MovePrepare {
+            instance_id: "instance-id".into(),
+            name: "dev".into(),
+            to_device: "desktop".into(),
+            to_device_id: "target-id".into(),
+            epoch: 1,
+            token: "token".into(),
+            coordinator_id: "coordinator-id".into(),
+            live: true,
+        };
+        assert_eq!(live.since(), 7);
+        assert_eq!(live.versioned_name(), Some("token-fenced migration"));
     }
 }

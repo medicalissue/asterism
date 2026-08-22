@@ -430,10 +430,56 @@ pub struct Conflict {
 pub struct Moving {
     /// The device the cpu part is moving to.
     pub to_device: String,
+    /// Immutable identity of the destination. Device names are presentation
+    /// and may be reused; recovery and commit authorization use this id.
+    #[serde(default)]
+    pub to_device_id: String,
     /// The epoch this move will land on: one past the current one.
     pub epoch: u64,
     /// When the fence went up, Unix seconds.
     pub started_at: u64,
+    /// One unguessable idempotency key for this authority transfer.
+    #[serde(default)]
+    pub token: String,
+    /// Last target stream generation durably accepted by the source.
+    ///
+    /// A replacement generation is opened only by comparing this value with
+    /// the target authority WAL. Persisting it before opening either bulk
+    /// stream makes a lost recovery reply replay the same generation instead
+    /// of allocating an unbounded sequence of new ones.
+    #[serde(default = "initial_move_lane")]
+    pub lane: u64,
+    /// The device that began the move. It may disappear without becoming an
+    /// authority: source and target recovery are deliberately coordinator-free.
+    #[serde(default)]
+    pub coordinator_id: String,
+    /// The source-owned durable decision. `Committed` is written before the
+    /// first irreversible backend action and permanently forbids abort.
+    #[serde(default)]
+    pub phase: MoveSourcePhase,
+    /// The source guest may still exist at a backend migration boundary.
+    ///
+    /// A daemon restart must not treat that guest like an ordinary running
+    /// instance: authority is settled with the target transaction before the
+    /// guest may be resumed or resurrected.
+    #[serde(default)]
+    pub live: bool,
+}
+
+fn initial_move_lane() -> u64 {
+    // Live migration authority WALs written before the source stored this
+    // field used target generation one. Defaulting old rows to that value
+    // makes their first recovery allocate and fence a fresh generation.
+    1
+}
+
+/// Durable source half of a live authority transaction.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MoveSourcePhase {
+    #[default]
+    Fenced,
+    Committed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
