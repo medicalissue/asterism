@@ -27,6 +27,8 @@
 //! roadmap specifies both.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use crate::endpoint::{MeshConnection, MeshEndpoint};
 use crate::identity::DeviceId;
@@ -36,9 +38,17 @@ use crate::ticket::{PairingTicket, PairingToken, TOKEN_LEN};
 /// Wire version of the pairing exchange itself.
 const PAIRING_WIRE_VERSION: u8 = 1;
 
+/// Maximum time an untrusted connection gets to present one pairing proof.
+///
+/// This clock covers opening the first stream and delivering the complete,
+/// fixed-size request.  In particular, a peer that completes QUIC and then
+/// sends nothing cannot occupy one of the daemon's bounded proof slots for the
+/// life of the invitation.
+pub const PAIRING_PROOF_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// How long the inviter waits for the joiner to take delivery of the verdict
 /// before giving up and closing anyway.
-const REPLY_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const REPLY_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Server reply: the token was good.
 const REPLY_ACCEPT: u8 = 0x01;
@@ -98,6 +108,8 @@ pub enum PairingError {
     AlreadyUsed,
     /// The peer speaks a different version of the pairing exchange.
     VersionMismatch(u8),
+    /// An untrusted peer did not present a complete proof in time.
+    ProofTimedOut,
     /// The inviter refused, for the reason given.
     Rejected(&'static str),
     /// The peer that connected is not the one the ticket was issued for.
@@ -120,6 +132,11 @@ impl fmt::Display for PairingError {
             Self::VersionMismatch(v) => write!(
                 f,
                 "peer speaks pairing version {v}, this device speaks {PAIRING_WIRE_VERSION}"
+            ),
+            Self::ProofTimedOut => write!(
+                f,
+                "the peer did not present a complete pairing proof within {}s",
+                PAIRING_PROOF_TIMEOUT.as_secs()
             ),
             Self::Rejected(why) => write!(f, "the other device refused the pairing: {why}"),
             Self::WrongPeer { expected, found } => write!(
@@ -218,7 +235,7 @@ pub async fn join(
 /// retried against the same ticket.
 pub async fn accept(
     endpoint: &MeshEndpoint,
-    ticket: &mut IssuedTicket,
+    ticket: &IssuedTicket,
 ) -> Result<PairedPeer, PairingError> {
     let connection = endpoint
         .accept()
@@ -240,7 +257,7 @@ pub async fn accept(
 pub async fn accept_connection(
     endpoint: &MeshEndpoint,
     connection: MeshConnection,
-    ticket: &mut IssuedTicket,
+    ticket: &IssuedTicket,
 ) -> Result<PairedPeer, PairingError> {
     let sas = accept_on(endpoint, &connection, ticket).await?;
     Ok(PairedPeer {
@@ -254,16 +271,21 @@ pub async fn accept_connection(
 async fn accept_on(
     endpoint: &MeshEndpoint,
     connection: &MeshConnection,
-    ticket: &mut IssuedTicket,
+    ticket: &IssuedTicket,
 ) -> Result<SasCode, PairingError> {
-    let mut stream = connection.accept_stream().await?;
-
-    let mut request = [0u8; 1 + TOKEN_LEN];
-    stream
-        .recv
-        .read_exact(&mut request)
-        .await
-        .map_err(|e| PairingError::Transport(e.into()))?;
+    // Everything before redemption is controlled by an untrusted peer.  Put
+    // one deadline around both waiting for its stream and reading the proof so
+    // moving the stall from one side of the boundary to the other buys it
+    // nothing.
+    let (mut stream, request) = tokio::time::timeout(PAIRING_PROOF_TIMEOUT, async {
+        let mut stream = connection.accept_stream().await?;
+        let mut request = [0u8; 1 + TOKEN_LEN];
+        stream.recv.read_exact(&mut request).await?;
+        Ok::<_, anyhow::Error>((stream, request))
+    })
+    .await
+    .map_err(|_| PairingError::ProofTimedOut)?
+    .map_err(PairingError::Transport)?;
 
     let mut token = [0u8; TOKEN_LEN];
     token.copy_from_slice(&request[1..]);
@@ -305,7 +327,11 @@ async fn accept_on(
 #[derive(Debug)]
 pub struct IssuedTicket {
     ticket: PairingTicket,
-    redeemed: bool,
+    // An atomic is not an implementation detail here: one invitation admits a
+    // bounded set of proof readers concurrently, so two peers can present the
+    // right capability in parallel.  Exactly one compare-and-swap may turn it
+    // into trust.
+    redeemed: AtomicBool,
 }
 
 impl IssuedTicket {
@@ -313,7 +339,7 @@ impl IssuedTicket {
     pub fn new(ticket: PairingTicket) -> Self {
         Self {
             ticket,
-            redeemed: false,
+            redeemed: AtomicBool::new(false),
         }
     }
 
@@ -324,22 +350,20 @@ impl IssuedTicket {
 
     /// Whether the ticket has been spent.
     pub fn is_redeemed(&self) -> bool {
-        self.redeemed
+        self.redeemed.load(Ordering::Acquire)
     }
 
     /// Checks a presented token and marks the ticket spent.
     ///
-    /// The ticket is consumed on *any* well-formed attempt, not just a
-    /// successful one: otherwise an attacker holding a stolen ticket could
-    /// guess tokens indefinitely.
-    fn redeem(&mut self, version: u8, presented: &PairingToken) -> Result<(), PairingError> {
+    /// A bad guess does not consume the invitation.  The capability is 128
+    /// random bits and is rate/concurrency limited by the daemon; burning it
+    /// on a mismatch would turn any stranger who can reach the endpoint into
+    /// a one-packet denial of service.  A *correct* proof is consumed with one
+    /// atomic transition, which is what resists replay and parallel redemption.
+    fn redeem(&self, version: u8, presented: &PairingToken) -> Result<(), PairingError> {
         if version != PAIRING_WIRE_VERSION {
             return Err(PairingError::VersionMismatch(version));
         }
-        if self.redeemed {
-            return Err(PairingError::AlreadyUsed);
-        }
-        self.redeemed = true;
         if self.ticket.is_expired() {
             return Err(PairingError::Expired);
         }
@@ -347,7 +371,10 @@ impl IssuedTicket {
         if presented != self.ticket.token() {
             return Err(PairingError::BadToken);
         }
-        Ok(())
+        self.redeemed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| PairingError::AlreadyUsed)
     }
 }
 
@@ -397,14 +424,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_successful_pairing_gives_both_sides_the_same_code() {
-        let (inviter, joiner, mut issued) = fixture().await;
+    async fn pairing_without_a_coordinator_gives_both_sides_the_same_code() {
+        let (inviter, joiner, issued) = fixture().await;
         // The joiner only ever sees the encoded string, as a user would.
         let pasted = issued.ticket().encode();
         let ticket = PairingTicket::decode(&pasted).unwrap();
 
         let inviter_task = tokio::spawn(async move {
-            let peer = accept(&inviter, &mut issued).await.unwrap();
+            let peer = accept(&inviter, &issued).await.unwrap();
             (inviter, peer.device_id(), peer.sas(), issued)
         });
 
@@ -428,11 +455,11 @@ mod tests {
 
     #[tokio::test]
     async fn the_paired_connection_stays_usable_afterwards() {
-        let (inviter, joiner, mut issued) = fixture().await;
+        let (inviter, joiner, issued) = fixture().await;
         let ticket = PairingTicket::decode(&issued.ticket().encode()).unwrap();
 
         let inviter_task = tokio::spawn(async move {
-            let peer = accept(&inviter, &mut issued).await.unwrap();
+            let peer = accept(&inviter, &issued).await.unwrap();
             let mut stream = peer.connection().accept_stream().await.unwrap();
             let got = stream.recv.read_to_end(16).await.unwrap();
             assert_eq!(&got, b"ping");
@@ -455,12 +482,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_ticket_cannot_be_redeemed_twice() {
-        let (inviter, joiner, mut issued) = fixture().await;
+        let (inviter, joiner, issued) = fixture().await;
         let ticket = PairingTicket::decode(&issued.ticket().encode()).unwrap();
 
         let inviter_task = tokio::spawn(async move {
-            let first = accept(&inviter, &mut issued).await;
-            let second = accept(&inviter, &mut issued).await;
+            let first = accept(&inviter, &issued).await;
+            let second = accept(&inviter, &issued).await;
             (inviter, first.is_ok(), second)
         });
 
@@ -488,7 +515,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_wrong_token_is_refused() {
-        let (inviter, joiner, mut issued) = fixture().await;
+        let (inviter, joiner, issued) = fixture().await;
         // Same address and expiry, but a token the inviter never issued.
         let forged = PairingTicket::from_parts(
             issued.ticket().addr().clone(),
@@ -497,7 +524,7 @@ mod tests {
         );
 
         let inviter_task = tokio::spawn(async move {
-            let result = accept(&inviter, &mut issued).await;
+            let result = accept(&inviter, &issued).await;
             (inviter, result)
         });
 
@@ -533,29 +560,28 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_attempt_still_burns_the_ticket() {
-        // Otherwise a stolen ticket becomes an unlimited guessing oracle.
+    fn a_bad_guess_does_not_give_a_stranger_a_denial_of_service() {
         let addr = iroh::EndpointAddr::new(DeviceIdentity::generate().public_key());
-        let mut issued = IssuedTicket::new(PairingTicket::issue(addr, DEFAULT_TICKET_TTL));
+        let issued = IssuedTicket::new(PairingTicket::issue(addr, DEFAULT_TICKET_TTL));
 
         let wrong = PairingToken::from_bytes([0x00; TOKEN_LEN]);
         assert!(matches!(
             issued.redeem(PAIRING_WIRE_VERSION, &wrong),
             Err(PairingError::BadToken)
         ));
-        assert!(issued.is_redeemed(), "a bad guess must consume the ticket");
+        assert!(
+            !issued.is_redeemed(),
+            "a bad guess must leave the invitation available to its holder"
+        );
 
         let right = *issued.ticket().token();
-        assert!(matches!(
-            issued.redeem(PAIRING_WIRE_VERSION, &right),
-            Err(PairingError::AlreadyUsed)
-        ));
+        assert!(issued.redeem(PAIRING_WIRE_VERSION, &right).is_ok());
     }
 
     #[test]
     fn a_mismatched_wire_version_is_refused_without_touching_the_token() {
         let addr = iroh::EndpointAddr::new(DeviceIdentity::generate().public_key());
-        let mut issued = IssuedTicket::new(PairingTicket::issue(addr, DEFAULT_TICKET_TTL));
+        let issued = IssuedTicket::new(PairingTicket::issue(addr, DEFAULT_TICKET_TTL));
         let token = *issued.ticket().token();
 
         assert!(matches!(
@@ -567,5 +593,128 @@ mod tests {
             "a peer that cannot speak the protocol should not spend the ticket"
         );
         assert!(issued.redeem(PAIRING_WIRE_VERSION, &token).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_bad_peer_cannot_take_the_invitation_from_the_good_peer() {
+        let (inviter, joiner, issued) = fixture().await;
+        let ticket = issued.ticket().clone();
+        let forged = PairingTicket::from_parts(
+            ticket.addr().clone(),
+            ticket.expires_at(),
+            PairingToken::from_bytes([0xA5; TOKEN_LEN]),
+        );
+
+        let inviter_task = tokio::spawn(async move {
+            let bad = accept(&inviter, &issued).await;
+            let good = accept(&inviter, &issued).await;
+            (inviter, bad, good)
+        });
+
+        assert!(matches!(
+            join(&joiner, &forged).await,
+            Err(PairingError::BadToken)
+        ));
+        let good = join(&joiner, &ticket)
+            .await
+            .expect("the real ticket holder still gets in");
+        good.connection().close(b"done");
+
+        let (inviter, bad, good) = inviter_task.await.unwrap();
+        assert!(matches!(bad, Err(PairingError::BadToken)));
+        assert!(good.is_ok());
+        joiner.close().await;
+        inviter.close().await;
+    }
+
+    #[test]
+    fn parallel_redemption_has_exactly_one_winner() {
+        use std::sync::{Arc, Barrier};
+
+        const CONTENDERS: usize = 16;
+        let addr = iroh::EndpointAddr::new(DeviceIdentity::generate().public_key());
+        let issued = Arc::new(IssuedTicket::new(PairingTicket::issue(
+            addr,
+            DEFAULT_TICKET_TTL,
+        )));
+        let token = *issued.ticket().token();
+        let barrier = Arc::new(Barrier::new(CONTENDERS));
+        let mut threads = Vec::new();
+        for _ in 0..CONTENDERS {
+            let issued = Arc::clone(&issued);
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                issued.redeem(PAIRING_WIRE_VERSION, &token)
+            }));
+        }
+
+        let results: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(PairingError::AlreadyUsed)))
+                .count(),
+            CONTENDERS - 1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_truncated_proof_is_refused_without_spending_the_ticket() {
+        let (inviter, attacker, issued) = fixture().await;
+        let ticket = issued.ticket().clone();
+        let server = tokio::spawn(async move {
+            let result = accept(&inviter, &issued).await;
+            (inviter, issued, result)
+        });
+        let connection = attacker.connect(ticket.addr().clone()).await.unwrap();
+        let mut stream = connection.open_stream().await.unwrap();
+        stream
+            .send
+            .write_all(&[PAIRING_WIRE_VERSION])
+            .await
+            .unwrap();
+        stream.send.finish().unwrap();
+
+        let (inviter, issued, result) = server.await.unwrap();
+        assert!(matches!(result, Err(PairingError::Transport(_))));
+        assert!(!issued.is_redeemed());
+
+        connection.close(b"done");
+        attacker.close().await;
+        inviter.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_sends_no_proof_loses_its_bounded_slot() {
+        let (inviter, slow, issued) = fixture().await;
+        let addr = issued.ticket().addr().clone();
+        let server = tokio::spawn(async move {
+            let result = accept(&inviter, &issued).await;
+            (inviter, issued, result)
+        });
+        let connection = slow.connect(addr).await.unwrap();
+        let mut stream = connection.open_stream().await.unwrap();
+        stream
+            .send
+            .write_all(&[PAIRING_WIRE_VERSION])
+            .await
+            .unwrap();
+
+        let (inviter, issued, result) =
+            tokio::time::timeout(PAIRING_PROOF_TIMEOUT + Duration::from_secs(2), server)
+                .await
+                .expect("the proof reader itself must be bounded")
+                .unwrap();
+        assert!(matches!(result, Err(PairingError::ProofTimedOut)));
+        assert!(!issued.is_redeemed());
+
+        connection.close(b"done");
+        slow.close().await;
+        inviter.close().await;
     }
 }

@@ -71,11 +71,11 @@ async fn main() -> anyhow::Result<()> {
     say!("desktop", "({} bytes, waiting for a device…)", pasted.len());
     println!();
 
-    let mut issued = IssuedTicket::new(ticket);
+    let issued = IssuedTicket::new(ticket);
 
     // The inviter waits for exactly one device to turn up.
     let inviter = tokio::spawn(async move {
-        let peer = pairing::accept(&desktop, &mut issued).await?;
+        let peer = pairing::accept(&desktop, &issued).await?;
 
         say!("desktop", "{} connected", peer.device_id().short());
         say!("desktop", "confirmation code: {}", peer.sas().grouped());
