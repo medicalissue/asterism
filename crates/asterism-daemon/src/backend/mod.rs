@@ -45,7 +45,11 @@ pub fn by_id(id: &str) -> Result<Arc<dyn Hypervisor>> {
     if let Some(backend) = backends().iter().find(|backend| backend.id() == id) {
         return Ok(backend.clone());
     }
-    let available = backends().iter().map(|backend| backend.id()).collect::<Vec<_>>().join(", ");
+    let available = backends()
+        .iter()
+        .map(|backend| backend.id())
+        .collect::<Vec<_>>()
+        .join(", ");
     bail!("no {id:?} backend in this build — available backends: {available}")
 }
 
