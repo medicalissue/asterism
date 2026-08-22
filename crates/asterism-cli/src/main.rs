@@ -404,8 +404,7 @@ enum Command {
         // clap would hand this positional's value to it.
         #[arg(value_name = "DEVICE")]
         to: String,
-        /// Shut the guest down first. Moving cpu/ram is offline on every
-        /// backend Asterism has, so a running instance is refused without it.
+        /// Shut the guest down first, forcing the portable offline path.
         #[arg(long)]
         down: bool,
     },
@@ -419,7 +418,7 @@ enum Command {
         /// The device that will supply its cpu and ram from here on.
         #[arg(value_name = "DEVICE")]
         to: String,
-        /// Shut the guest down first.
+        /// Shut the guest down first, forcing the portable offline path.
         #[arg(long)]
         down: bool,
     },
@@ -1129,6 +1128,10 @@ fn main() -> Result<()> {
         | Response::Move { .. }
         | Response::MoveOffer { .. }
         | Response::MoveProbe { .. }
+        | Response::MoveLiveReady { .. }
+        | Response::MoveDiskReady { .. }
+        | Response::MoveAuthority { .. }
+        | Response::MoveSource { .. }
         | Response::Wake { .. }
         | Response::WakeFacts { .. }
         | Response::WakeCheck { .. }

@@ -138,13 +138,6 @@ async fn main() -> Result<()> {
         eprintln!("astd: {note}");
     }
 
-    // Now that this build has been established as one that may touch this
-    // home: a cpu-part swap this device was receiving when it died left a
-    // staging directory, and this is the "next contact" that clears it. It
-    // was never bootable and no shard row ever pointed at it, so there is
-    // nothing to consult first.
-    swap::sweep_staging();
-
     let node = Node {
         shard: Arc::new(Mutex::new(Shard::load(&paths::state_path())?)),
         orbit: Arc::new(Mutex::new(Orbit::load(&paths::orbit_path())?)),
@@ -159,6 +152,17 @@ async fn main() -> Result<()> {
     // `asterism_core::ipc::Door`.
     let door = transport::Door::open(&home, &paths::socket_path())?;
     let sock = door.socket().to_path_buf();
+
+    // Authority WALs are outside both staging and live trees. Reconcile them
+    // after winning the daemon election and before generic staging cleanup:
+    // Committing is completed, Prepared is durably aborted, and only then
+    // may an unreferenced staging tree be swept.
+    {
+        let device = node.device_name().await;
+        let mut reg = node.shard.lock().await;
+        swap::reconcile_target_startup(&mut reg, &device);
+    }
+    swap::sweep_staging();
 
     // Now, and not before, this process has proved it is the only daemon on
     // this home — the election is the mutex, so nothing here can be tidying
@@ -233,6 +237,11 @@ async fn main() -> Result<()> {
         }
     }
     volume::adopt_export_identities().await;
+
+    if let Some(mesh) = &mesh {
+        swap::reconcile_target_mesh(&node, mesh).await;
+        swap::reconcile_source_startup(&node, mesh).await;
+    }
 
     // What this device was running, it runs again — before the first
     // request is served, and then continuously (see `persist`).
@@ -786,6 +795,40 @@ pub(crate) async fn handle(req: Request, node: &Node) -> Response {
     }
     if images::is_plane_request(&req) {
         return images::serve(req).await;
+    }
+    // Source decision proof is intentionally read from the durable shard,
+    // outside the live registry mutex. Target commit holds its own shard
+    // while asking for this proof; a concurrent source-cleanup replay may
+    // hold the source shard while asking the target for status. Putting this
+    // read behind either mutex would create a two-device lock cycle. Atomic
+    // registry publication means a fresh load observes either Fenced or
+    // Committed, never a torn decision.
+    if let Request::MoveSourceStatus {
+        instance_id,
+        name,
+        epoch,
+        token,
+    } = &req
+    {
+        return match Shard::load(&paths::state_path()) {
+            Ok(reg) => swap::source_status(&reg, instance_id, name, *epoch, token),
+            Err(e) => Response::Error {
+                message: format!("loading durable source decision: {e:#}"),
+            },
+        };
+    }
+    // The source decision holds the shard only through its durable marker,
+    // then releases it while draining or reconstructing backend streams.
+    // Keeping this in the synchronous move dispatcher would make recovery
+    // deadlock when the local source lane needs to read its own row.
+    if let Request::MoveDecideSource {
+        instance_id,
+        name,
+        epoch,
+        token,
+    } = &req
+    {
+        return swap::decide_source(node, instance_id, name, *epoch, token).await;
     }
 
     let cpu_device = node.device_name().await;

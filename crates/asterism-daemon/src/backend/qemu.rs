@@ -33,6 +33,7 @@
 //! after that point is identical: the same clone of the same raw base, the
 //! same snapshots, the same QMP socket, the same shutdown.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -42,7 +43,8 @@ use anyhow::{bail, Context, Result};
 
 use asterism_core::hv::{
     BootReq, Caps, ControlChannel, DirectKernel, DiskFormat, DiskSpec, Firmware, GuestEgress,
-    GuestEndpoint, Handle, Hypervisor, ImageKind, Prepared, Ready, RunState, ShareKind, SnapshotId,
+    GuestEndpoint, Handle, Hypervisor, ImageKind, MigrationDiskExport, MigrationDiskTarget,
+    Prepared, Ready, RunState, ShareKind, SnapshotId,
 };
 use asterism_core::instance::{now_unix, PortForward};
 use asterism_core::proc::{ProcId, Signal};
@@ -228,6 +230,13 @@ impl Probe {
 /// to change for a foreign-arch guest.
 const CPU_MODEL: &str = "host";
 
+thread_local! {
+    /// Set only around the synchronous `migrate_in -> boot` call. Backends
+    /// are stateless; this keeps the public trait narrow while allowing the
+    /// ordinary launch path to add QEMU's incoming boundary for one call.
+    static INCOMING: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
 impl Hypervisor for Qemu {
     fn id(&self) -> &'static str {
         ID
@@ -253,7 +262,7 @@ impl Hypervisor for Qemu {
             disk_snapshot: true,
             // QEMU can live-migrate, but this backend does not implement
             // migrate_out/in yet, and Caps describes what is offered.
-            live_migration: false,
+            live_migration: true,
             disk_hotplug: false,
             shared_dir,
             nbd_disks: true,
@@ -382,7 +391,7 @@ impl Hypervisor for Qemu {
         let ssh_port = free_port()?;
         let pidfile = req.dir.join("qemu.pid");
         let _ = std::fs::remove_file(&pidfile);
-        let qmp = paths::qmp_socket_path(&inst.name);
+        let qmp = paths::qmp_socket_in(&req.dir);
         // A guest that died leaves its socket path behind and the next one
         // binds it. Any connection still held to the old one belongs to a
         // process that is gone.
@@ -438,7 +447,8 @@ impl Hypervisor for Qemu {
         // say, but QEMU turns those into devices *after* every explicit
         // `-device`, so one attached volume was enough to make the root disk
         // /dev/vdb. Device names a user can predict are worth four arguments.
-        for arg in disk_args(&prep.root, ROOT_NODE)? {
+        let incoming = INCOMING.with(|slot| slot.borrow().is_some());
+        for arg in disk_args_mode(&prep.root, ROOT_NODE, incoming)? {
             cmd.arg(arg);
         }
         for (index, disk) in req.extra_disks.iter().enumerate() {
@@ -474,6 +484,12 @@ impl Hypervisor for Qemu {
             .arg("-daemonize")
             .arg("-pidfile")
             .arg(&pidfile);
+
+        INCOMING.with(|incoming| {
+            if let Some(uri) = incoming.borrow().as_deref() {
+                cmd.arg("-incoming").arg(uri);
+            }
+        });
 
         for share in &req.shares {
             // mapped-xattr keeps guest ownership and permissions in host
@@ -563,6 +579,385 @@ impl Hypervisor for Qemu {
             true => RunState::Running,
             false => RunState::Stopped,
         })
+    }
+
+    fn migrate_out(&self, h: &Handle, to: asterism_core::hv::MigrationTarget) -> Result<()> {
+        use serde_json::{json, Value};
+        use std::time::{Duration, Instant};
+
+        let conn = qmp::on(h.ctl.path())?;
+        conn.execute(
+            "migrate-set-capabilities",
+            json!({ "capabilities": [
+                { "capability": "pause-before-switchover", "state": true }
+            ]}),
+        )?;
+        // Storage has its own blockdev-mirror/NBD lane. `blk` was removed in
+        // QEMU 9.1 and, more importantly, made it impossible to prove disk
+        // convergence independently from RAM/device state.
+        conn.execute("migrate", json!({ "uri": to.url }))?;
+        let deadline = Instant::now() + Duration::from_secs(15 * 60);
+        loop {
+            let state = conn.execute("query-migrate", Value::Null)?;
+            match state
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+            {
+                "pre-switchover" => return Ok(()),
+                "failed" | "cancelled" => {
+                    let error = state
+                        .get("error-desc")
+                        .and_then(Value::as_str)
+                        .unwrap_or("QEMU cancelled the migration");
+                    bail!("live migration failed: {error}");
+                }
+                _ if Instant::now() >= deadline => {
+                    let _ = conn.execute("migrate_cancel", Value::Null);
+                    bail!("live migration did not converge within 15 minutes");
+                }
+                _ => std::thread::sleep(Duration::from_millis(100)),
+            }
+        }
+    }
+
+    fn migrate_in(
+        &self,
+        req: &BootReq,
+        from: asterism_core::hv::MigrationSource,
+    ) -> Result<Handle> {
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                INCOMING.with(|slot| *slot.borrow_mut() = None);
+            }
+        }
+        INCOMING.with(|slot| *slot.borrow_mut() = Some(from.url));
+        let _clear = Clear;
+        let prep = self.prepare(req)?;
+        self.boot(req, &prep)
+    }
+
+    fn migration_disk_export(&self, req: &BootReq) -> Result<MigrationDiskExport> {
+        let prep = self.prepare(req)?;
+        let (path, format) = match prep.root {
+            DiskSpec::File { path, format, .. } => (path, format),
+            other => bail!("live migration requires a file-backed root disk, not {other:?}"),
+        };
+        let qsd = tool("qemu-storage-daemon").context(
+            "qemu-storage-daemon is required for live dirty-disk migration (it ships with qemu)",
+        )?;
+        let socket = paths::migration_disk_target_socket(&req.dir);
+        let monitor = paths::migration_disk_target_qmp_path(&req.dir);
+        let pidfile = paths::migration_disk_target_pid(&req.dir);
+        let export = "asterism-root".to_owned();
+        let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_file(&monitor);
+        let _ = std::fs::remove_file(&pidfile);
+        run(Command::new(qsd)
+            .arg("--daemonize")
+            .arg("--pidfile")
+            .arg(&pidfile)
+            .arg("--chardev")
+            .arg(format!(
+                "socket,id=ast-migration-qmp,path={},server=on,wait=off",
+                monitor.display()
+            ))
+            .arg("--monitor")
+            .arg("chardev=ast-migration-qmp,mode=control")
+            .arg("--blockdev")
+            .arg(format!(
+                "driver=file,node-name=ast-migration-file,locking=off,filename={}",
+                path.display()
+            ))
+            .arg("--blockdev")
+            .arg(format!(
+                "driver={},node-name=ast-migration-root,file=ast-migration-file",
+                format.as_str()
+            ))
+            .arg("--nbd-server")
+            .arg(format!("addr.type=unix,addr.path={}", socket.display()))
+            .arg("--export")
+            .arg(format!(
+                "type=nbd,id=ast-migration-export,node-name=ast-migration-root,name={export},writable=on"
+            )))?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !(socket.exists() && monitor.exists() && pidfile.exists()) {
+            if std::time::Instant::now() >= deadline {
+                bail!("qemu-storage-daemon did not make the migration NBD export ready")
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let pid = std::fs::read_to_string(&pidfile)?
+            .trim()
+            .parse::<u32>()
+            .context("qemu-storage-daemon wrote an invalid migration pidfile")?;
+        let proc = ProcId::capture(pid)
+            .context("the migration disk exporter exited before it could be recorded")?;
+        Ok(MigrationDiskExport {
+            socket,
+            monitor,
+            export,
+            proc,
+        })
+    }
+
+    fn migration_disk_export_stop(&self, export: &MigrationDiskExport) -> Result<()> {
+        if export.monitor.exists() {
+            let _ = qmp::on(&export.monitor)?.execute("quit", serde_json::Value::Null);
+            qmp::forget(&export.monitor);
+        }
+        if export.proc.alive() {
+            let _ = export.proc.signal(Signal::Term)?;
+            if !export.proc.wait_gone(Duration::from_secs(5)) {
+                let _ = export.proc.signal(Signal::Kill)?;
+            }
+        }
+        let _ = std::fs::remove_file(&export.socket);
+        let _ = std::fs::remove_file(&export.monitor);
+        Ok(())
+    }
+
+    fn migration_disk_mirror(&self, h: &Handle, to: MigrationDiskTarget) -> Result<()> {
+        use serde_json::{json, Value};
+        use std::time::Instant;
+
+        const NODE: &str = "ast-migration-target";
+        const JOB: &str = "ast-migration-root";
+        let socket = to
+            .url
+            .strip_prefix("unix:")
+            .context("migration disk target is not a unix socket")?;
+        let conn = qmp::on(h.ctl.path())?;
+        let _ = conn.execute("blockdev-del", json!({ "node-name": NODE }));
+        conn.execute(
+            "blockdev-add",
+            json!({
+                "driver": "nbd",
+                "node-name": NODE,
+                "server": { "type": "unix", "path": socket },
+                "export": "asterism-root"
+            }),
+        )?;
+        conn.execute(
+            "blockdev-mirror",
+            json!({
+                "job-id": JOB,
+                "device": ROOT_NODE,
+                "target": NODE,
+                "sync": "full",
+                "copy-mode": "write-blocking"
+            }),
+        )?;
+        let deadline = Instant::now() + Duration::from_secs(15 * 60);
+        loop {
+            let jobs = conn.execute("query-block-jobs", Value::Null)?;
+            let job = jobs.as_array().and_then(|jobs| {
+                jobs.iter()
+                    .find(|job| job.get("device").and_then(Value::as_str) == Some(JOB))
+            });
+            match job {
+                Some(job) if job.get("ready").and_then(Value::as_bool) == Some(true) => {
+                    return Ok(())
+                }
+                Some(job) if job.get("io-status").and_then(Value::as_str) != Some("ok") => {
+                    bail!("root-disk mirror failed: {job}")
+                }
+                None => bail!("root-disk mirror disappeared before reaching READY"),
+                _ if Instant::now() >= deadline => {
+                    let _ = conn.execute("block-job-cancel", json!({ "device": JOB }));
+                    bail!("root-disk mirror did not converge within 15 minutes")
+                }
+                _ => std::thread::sleep(Duration::from_millis(100)),
+            }
+        }
+    }
+
+    fn migration_disk_commit(&self, h: &Handle) -> Result<()> {
+        finish_disk_mirror(h, true)
+    }
+
+    fn migration_disk_ready(&self, h: &Handle) -> Result<()> {
+        use serde_json::Value;
+        let jobs = qmp::on(h.ctl.path())?.execute("query-block-jobs", Value::Null)?;
+        let ready = jobs.as_array().is_some_and(|jobs| {
+            jobs.iter().any(|job| {
+                job.get("device").and_then(Value::as_str) == Some(MIGRATION_DISK_JOB)
+                    && job.get("ready").and_then(Value::as_bool) == Some(true)
+                    && job.get("io-status").and_then(Value::as_str) == Some("ok")
+            })
+        });
+        if !ready {
+            bail!("root-disk mirror has not reached READY")
+        }
+        Ok(())
+    }
+
+    fn migration_source_ready(&self, h: &Handle) -> Result<()> {
+        use serde_json::Value;
+        let state = qmp::on(h.ctl.path())?.execute("query-migrate", Value::Null)?;
+        match state.get("status").and_then(Value::as_str) {
+            Some("pre-switchover" | "completed" | "postmigrate") => Ok(()),
+            _ => bail!("source is not at the live migration switchover boundary: {state}"),
+        }
+    }
+
+    fn migration_disk_abort(&self, h: &Handle) -> Result<()> {
+        finish_disk_mirror(h, false)
+    }
+
+    fn migration_commit(&self, h: &Handle) -> Result<()> {
+        use serde_json::{json, Value};
+        use std::time::{Duration, Instant};
+
+        let conn = qmp::on(h.ctl.path())?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut continued = false;
+        loop {
+            let state = conn.execute("query-migrate", Value::Null)?;
+            match state
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+            {
+                "completed" | "postmigrate" => return Ok(()),
+                "failed" | "cancelled" => bail!("QEMU refused the migration commit: {state}"),
+                "pre-switchover" if !continued => {
+                    conn.execute("migrate-continue", json!({ "state": "pre-switchover" }))?;
+                    continued = true;
+                }
+                _ if Instant::now() >= deadline => {
+                    bail!("QEMU did not complete migration switchover within 30 seconds")
+                }
+                _ => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+
+    fn migration_abort(&self, h: &Handle) -> Result<()> {
+        use serde_json::Value;
+        use std::time::{Duration, Instant};
+
+        let conn = qmp::on(h.ctl.path())?;
+        let mut status = conn.execute("query-migrate", Value::Null)?;
+        if !matches!(
+            status.get("status").and_then(Value::as_str),
+            Some("none" | "cancelled" | "failed")
+        ) {
+            conn.execute("migrate_cancel", Value::Null)?;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                status = conn.execute("query-migrate", Value::Null)?;
+                if matches!(
+                    status.get("status").and_then(Value::as_str),
+                    Some("none" | "cancelled" | "failed")
+                ) {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    bail!("QEMU did not cancel live migration within 30 seconds");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        let run = conn.execute("query-status", Value::Null)?;
+        if run.get("running").and_then(Value::as_bool) == Some(false) {
+            conn.execute("cont", Value::Null)?;
+        }
+        Ok(())
+    }
+
+    fn migration_source_reset(&self, h: &Handle) -> Result<()> {
+        use serde_json::Value;
+        use std::time::{Duration, Instant};
+
+        let conn = qmp::on(h.ctl.path())?;
+        let mut state = conn.execute("query-migrate", Value::Null)?;
+        if matches!(
+            state.get("status").and_then(Value::as_str),
+            Some("completed" | "postmigrate")
+        ) {
+            bail!("completed source migration cannot be restarted: {state}");
+        }
+        conn.execute("stop", Value::Null)?;
+        if !matches!(
+            state.get("status").and_then(Value::as_str),
+            Some("none" | "cancelled" | "failed")
+        ) {
+            conn.execute("migrate_cancel", Value::Null)?;
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                state = conn.execute("query-migrate", Value::Null)?;
+                if matches!(
+                    state.get("status").and_then(Value::as_str),
+                    Some("none" | "cancelled" | "failed")
+                ) {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    bail!("QEMU did not reset the stale migration lane within 30 seconds");
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        Ok(())
+    }
+
+    fn migration_target_complete(&self, h: &Handle) -> Result<()> {
+        use serde_json::Value;
+        use std::time::Instant;
+
+        let conn = qmp::on(h.ctl.path())?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let migration = conn.execute("query-migrate", Value::Null)?;
+            match migration.get("status").and_then(Value::as_str) {
+                Some("completed") => {
+                    let run = conn.execute("query-status", Value::Null)?;
+                    if run.get("running").and_then(Value::as_bool) == Some(true) {
+                        return Ok(());
+                    }
+                    bail!("incoming migration completed but target guest is not running: {run}")
+                }
+                Some("failed" | "cancelled") => bail!("incoming migration failed: {migration}"),
+                _ if Instant::now() >= deadline => {
+                    bail!("target did not report incoming migration completed within 30 seconds")
+                }
+                _ => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+
+    fn migration_target_abort(&self, req: &BootReq) -> Result<()> {
+        use serde_json::Value;
+
+        for monitor in [
+            paths::qmp_socket_in(&req.dir),
+            paths::migration_disk_target_qmp_path(&req.dir),
+        ] {
+            if !monitor.exists() {
+                continue;
+            }
+            // A staging control socket is created by one incoming process
+            // and is never published or reused. It remains exact evidence in
+            // the launch-to-WAL windows for QEMU and its disk exporter.
+            let _ = qmp::on(&monitor)?.execute("quit", Value::Null);
+            qmp::forget(&monitor);
+            let _ = std::fs::remove_file(&monitor);
+        }
+        Ok(())
+    }
+
+    fn migration_target_reset(&self, req: &BootReq) -> Result<()> {
+        use serde_json::Value;
+
+        let monitor = paths::qmp_socket_in(&req.dir);
+        if monitor.exists() {
+            let _ = qmp::on(&monitor)?.execute("quit", Value::Null);
+            qmp::forget(&monitor);
+            let _ = std::fs::remove_file(&monitor);
+        }
+        Ok(())
     }
 
     // ---- disk snapshots ----------------------------------------------------
@@ -674,16 +1069,25 @@ fn instance_dir(disk: &Path) -> Result<&Path> {
 /// it has to be a QEMU identifier — letters, digits, dash, underscore — and
 /// not, say, a volume's name off the wire.
 fn disk_args(disk: &DiskSpec, id: &str) -> Result<Vec<String>> {
+    disk_args_mode(disk, id, false)
+}
+
+fn disk_args_mode(disk: &DiskSpec, id: &str, shared_migration_file: bool) -> Result<Vec<String>> {
     let node = match disk {
         DiskSpec::File {
             path,
             format,
             readonly,
         } => format!(
-            "if=none,id={id},format={},{}file={}",
+            "if=none,id={id},format={},{}file={}{}",
             format.as_str(),
             if *readonly { "readonly=on," } else { "" },
             qemu_escape(&path.display().to_string()),
+            if shared_migration_file {
+                ",file.locking=off"
+            } else {
+                ""
+            },
         ),
         DiskSpec::Block { path, readonly } => format!(
             "if=none,id={id},format=raw,{}file={}",
@@ -732,6 +1136,46 @@ fn disk_args(disk: &DiskSpec, id: &str) -> Result<Vec<String>> {
 /// `astvol0`, `astvol1`, ... in the order they were attached.
 const ROOT_NODE: &str = "astroot";
 const SEED_NODE: &str = "astseed";
+const MIGRATION_DISK_NODE: &str = "ast-migration-target";
+const MIGRATION_DISK_JOB: &str = "ast-migration-root";
+
+fn finish_disk_mirror(h: &Handle, require_ready: bool) -> Result<()> {
+    use serde_json::{json, Value};
+    use std::time::Instant;
+
+    let conn = qmp::on(h.ctl.path())?;
+    let jobs = conn.execute("query-block-jobs", Value::Null)?;
+    let job = jobs.as_array().and_then(|jobs| {
+        jobs.iter()
+            .find(|job| job.get("device").and_then(Value::as_str) == Some(MIGRATION_DISK_JOB))
+    });
+    if let Some(job) = job {
+        if require_ready && job.get("ready").and_then(Value::as_bool) != Some(true) {
+            bail!("root-disk mirror is not READY at the source commit boundary: {job}")
+        }
+        // Cancelling a READY mirror produces a point-in-time complete target
+        // while leaving the source guest attached to its original root node.
+        conn.execute("block-job-cancel", json!({ "device": MIGRATION_DISK_JOB }))?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let jobs = conn.execute("query-block-jobs", Value::Null)?;
+            let present = jobs.as_array().is_some_and(|jobs| {
+                jobs.iter().any(|job| {
+                    job.get("device").and_then(Value::as_str) == Some(MIGRATION_DISK_JOB)
+                })
+            });
+            if !present {
+                break;
+            }
+            if Instant::now() >= deadline {
+                bail!("root-disk mirror did not finish within 30 seconds")
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let _ = conn.execute("blockdev-del", json!({ "node-name": MIGRATION_DISK_NODE }));
+    Ok(())
+}
 
 /// How long QEMU keeps retrying a dropped NBD connection before it starts
 /// failing the guest's I/O.
@@ -1871,17 +2315,18 @@ mod tests {
     /// The capability table is what the daemon gates on, so the shape of it
     /// matters more than any single flag.
     #[test]
-    fn qemu_offers_disk_snapshots_but_not_live_ones() {
+    fn qemu_offers_disk_snapshots_and_precopy_migration_but_not_live_snapshots() {
         let caps = Qemu::new().caps();
         assert!(caps.disk_snapshot);
         assert!(!caps.live_snapshot);
+        assert!(caps.live_migration);
         assert!(caps.disk_formats.contains(&DiskFormat::Qcow2));
     }
 
     /// The trait's default impls must stay reachable for what this backend
     /// does not offer, and must name the backend when they refuse.
     #[test]
-    fn unoffered_capabilities_refuse_by_name() {
+    fn unoffered_snapshot_capability_refuses_by_name() {
         let hv = Qemu::new();
         let h = handle(Some(ProcId {
             pid: 1,
@@ -1890,9 +2335,6 @@ mod tests {
         }));
         let err = hv.snapshot(&h, "t").unwrap_err().to_string();
         assert!(err.contains("qemu"), "{err}");
-        assert!(hv
-            .migrate_out(&h, asterism_core::hv::MigrationTarget { url: "x".into() })
-            .is_err());
     }
 
     /// A handle built the way one arrives off disk.

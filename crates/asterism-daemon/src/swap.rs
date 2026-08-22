@@ -39,7 +39,7 @@
 //! cloning it on the far side is the same optimisation as the one above,
 //! wearing a different hat.
 //!
-//! # Two phases, and an epoch
+//! # Durable authority, and an epoch
 //!
 //! There must never be two bootable copies. So:
 //!
@@ -48,34 +48,38 @@
 //! 2. **Transfer.** The target writes into a *staging* directory whose name
 //!    no instance can have. Nothing lists it, nothing boots it, and a daemon
 //!    that dies in the middle leaves it there to be swept.
-//! 3. **Commit, target.** The target checks what arrived against the manifest
-//!    — every file's length, every file's allocated byte count — renames the
-//!    staging directory into place and writes its shard row with itself
-//!    supplying cpu, at the new epoch. Only now does a second copy exist, and
-//!    the source's is already fenced.
-//! 4. **Commit, source.** The source drops its row and its bytes, and leaves
-//!    a note so that asking it directly gets "moved to desktop" rather than
-//!    "no such instance".
+//! 3. **Reserve, target (live only).** After dirty disk and RAM reach their
+//!    backend boundaries, the target durably chooses `Reserved` against the
+//!    only competing `Aborted` transition.
+//! 4. **Decide, source (live only).** Only after that exact token-bound
+//!    reservation, the source durably records its no-return decision before
+//!    releasing either switchover.
+//! 5. **Commit, target.** The target checks that source decision, both stream
+//!    EOF records and its incoming backend completion before it renames the
+//!    staging directory and writes its higher-epoch shard row.
+//! 6. **Commit, source.** The source writes a permanent completion WAL, drops
+//!    its row and bytes, and separately leaves an expiring courtesy note.
 //!
-//! Any failure before step 3's ack is an abort: the target's staging
-//! directory goes, the source's fence comes off, and the source's row — which
-//! never stopped being the authoritative one — is authoritative again. The
-//! epoch is what settles the case nothing else can: two rows for one instance
-//! id, from two devices that could not see each other, are decided by the
-//! higher number.
+//! A live abort is legal only before step 3 and only after the target records
+//! durable Aborted proof. After the source decision, recovery drives target
+//! commit forward and never makes the old row bootable again. The immutable
+//! id/epoch/token makes a late commit, abort or reply replay harmless.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use asterism_core::cow;
 use asterism_core::durable;
-use asterism_core::instance::{now_unix, Instance, Moving, Status, VolumeKind};
+use asterism_core::hv::{ControlChannel, Handle, MigrationDiskExport, MigrationSource, Ready};
+use asterism_core::instance::{now_unix, Instance, MoveSourcePhase, Moving, Status, VolumeKind};
 use asterism_core::paths;
-use asterism_core::protocol::{BaseImage, MoveFile, MoveManifest, Request, Response};
+use asterism_core::protocol::{
+    BaseImage, MoveAuthorityPhase, MoveFile, MoveManifest, Request, Response,
+};
 use asterism_core::registry::Shard;
 use asterism_core::verify::Digest;
 use asterism_core::{image, verify};
@@ -89,6 +93,11 @@ use crate::Node;
 /// — which is exactly why the staging directory is safe to leave lying
 /// around: nothing can resolve to it.
 pub const STAGING: &str = ".moving-";
+const LIVE_SOCKET: &str = ".live-migration.sock";
+const LIVE_HANDLE: &str = ".live-migration-handle.json";
+const LIVE_AUTHORITY: &str = ".move-authority.json";
+const AUTHORITY_DIR: &str = "move-authority";
+const SOURCE_COMPLETION_DIR: &str = "move-source-completion";
 
 /// How long a device remembers that an instance left it.
 ///
@@ -136,6 +145,39 @@ pub fn mesh() -> Result<Arc<Mesh>> {
         .context("this daemon has no mesh endpoint, so it cannot take an instance")
 }
 
+/// Serialize every target authority read/modify/write, including EOF writes
+/// made by mesh pump tasks that do not hold the shard mutex.  There is one
+/// daemon per device, so this is the target-local CAS boundary: a stale EOF
+/// callback cannot overwrite Aborted/Committing and disk/RAM EOF callbacks
+/// cannot lose one another's bit.
+fn with_authority_txn<T>(f: impl FnOnce() -> T) -> T {
+    static SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    f()
+}
+
+fn source_decision_lock(instance_id: &str, epoch: u64) -> Arc<tokio::sync::Mutex<()>> {
+    type Key = (String, u64);
+    type Lock = tokio::sync::Mutex<()>;
+    static LOCKS: OnceLock<Mutex<BTreeMap<Key, Weak<Lock>>>> = OnceLock::new();
+
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    let key = (instance_id.to_owned(), epoch);
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Lock::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
+}
+
 // ---- staging ---------------------------------------------------------------
 
 /// Where a half-arrived instance lives until it is committed.
@@ -147,6 +189,192 @@ pub fn staging_dir(name: &str, epoch: u64) -> PathBuf {
     paths::instance_dir(&format!("{name}{STAGING}{epoch}"))
 }
 
+pub(crate) fn live_socket(name: &str, epoch: u64) -> PathBuf {
+    paths::migration_socket_in(&staging_dir(name, epoch))
+}
+
+pub(crate) fn authorize_live_splice(
+    instance_id: &str,
+    name: &str,
+    epoch: u64,
+    source_device: &str,
+    source_device_id: &str,
+    token: &str,
+    lane: u64,
+) -> Result<()> {
+    let txn = load_authority(instance_id, epoch)?.with_context(|| {
+        format!("no durable target intent exists for id {instance_id:?} epoch {epoch}")
+    })?;
+    if !txn.live {
+        bail!("target authority is not a live migration");
+    }
+    if txn.name != name {
+        bail!("target intent is for {:?}, not {name:?}", txn.name);
+    }
+    if txn.token != token {
+        bail!("live migration token does not match the durable target claim");
+    }
+    if txn.lane != lane || !txn.lane_ready {
+        bail!(
+            "live migration lane {lane} is stale; target expects lane {}",
+            txn.lane
+        );
+    }
+    if txn.source_device != source_device || txn.source_device_id != source_device_id {
+        bail!(
+            "live migration for {name:?} expects authenticated source {:?} ({}) but arrived from {:?} ({})",
+            txn.source_device,
+            txn.source_device_id,
+            source_device,
+            source_device_id
+        );
+    }
+    if !matches!(
+        txn.phase,
+        MoveAuthorityPhase::Prepared | MoveAuthorityPhase::Reserved
+    ) {
+        bail!(
+            "live migration for {name:?} is {:?}, not prepared to accept a stream",
+            txn.phase
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn authorize_disk_splice(
+    instance_id: &str,
+    name: &str,
+    epoch: u64,
+    token: &str,
+    source_device: &str,
+    source_device_id: &str,
+    lane: u64,
+) -> Result<MigrationDiskExport> {
+    let txn = load_authority(instance_id, epoch)?
+        .with_context(|| format!("no target disk claim for id {instance_id:?} epoch {epoch}"))?;
+    if !txn.live
+        || txn.name != name
+        || txn.token != token
+        || txn.source_device != source_device
+        || txn.source_device_id != source_device_id
+        || txn.lane != lane
+        || !txn.lane_ready
+        || !matches!(
+            txn.phase,
+            MoveAuthorityPhase::DiskPrepared | MoveAuthorityPhase::Reserved
+        )
+    {
+        bail!("dirty-disk splice does not match the durable id/epoch/token/source claim");
+    }
+    txn.disk_export
+        .filter(|export| export.proc.alive())
+        .context("target disk export is absent or dead")
+}
+
+pub(crate) fn authorize_live_import(
+    manifest: &MoveManifest,
+    epoch: u64,
+    token: &str,
+    source_device: &str,
+    source_device_id: &str,
+) -> Result<()> {
+    with_authority_txn(|| {
+        validate_live_import_locked(manifest, epoch, token, source_device, source_device_id)
+    })
+}
+
+fn validate_live_import_locked(
+    manifest: &MoveManifest,
+    epoch: u64,
+    token: &str,
+    source_device: &str,
+    source_device_id: &str,
+) -> Result<()> {
+    let txn = load_authority(&manifest.instance.id, epoch)?
+        .context("target live-import authority is absent")?;
+    if !txn.live
+        || txn.phase != MoveAuthorityPhase::Intent
+        || txn.name != manifest.instance.name
+        || txn.token != token
+        || txn.source_device != source_device
+        || txn.source_device_id != source_device_id
+        || serde_json::to_vec(&txn.manifest)? != serde_json::to_vec(manifest)?
+    {
+        bail!("live import does not match the durable id/epoch/token/source/device intent");
+    }
+    Ok(())
+}
+
+pub(crate) fn save_live_import_receipt(
+    manifest: &MoveManifest,
+    epoch: u64,
+    token: &str,
+    source_device: &str,
+    source_device_id: &str,
+    receipt: &Receipt,
+) -> Result<()> {
+    with_authority_txn(|| {
+        validate_live_import_locked(manifest, epoch, token, source_device, source_device_id)?;
+        receipt.save(&staging_dir(&manifest.instance.name, epoch))
+    })
+}
+
+pub(crate) fn mark_target_stream_eof(
+    instance_id: &str,
+    epoch: u64,
+    token: &str,
+    lane: u64,
+    disk: bool,
+) -> Result<()> {
+    with_authority_txn(|| mark_target_stream_eof_locked(instance_id, epoch, token, lane, disk))
+}
+
+fn mark_target_stream_eof_locked(
+    instance_id: &str,
+    epoch: u64,
+    token: &str,
+    lane: u64,
+    disk: bool,
+) -> Result<()> {
+    let mut txn =
+        load_authority(instance_id, epoch)?.context("target claim vanished at stream EOF")?;
+    if txn.token != token {
+        bail!("stream EOF token does not match the target claim");
+    }
+    if !txn.live {
+        bail!("stream EOF does not belong to a live migration");
+    }
+    if txn.lane != lane || !txn.lane_ready {
+        bail!(
+            "stream EOF lane {lane} is stale; durable target lane is {}",
+            txn.lane
+        );
+    }
+    if !matches!(
+        txn.phase,
+        MoveAuthorityPhase::Prepared | MoveAuthorityPhase::Reserved
+    ) {
+        bail!(
+            "stream EOF cannot update target authority in phase {:?}",
+            txn.phase
+        );
+    }
+    if disk {
+        txn.disk_eof = true;
+    } else {
+        txn.ram_eof = true;
+    }
+    save_authority(&txn)
+}
+
+fn live_sessions() -> MutexGuard<'static, BTreeMap<(String, u64), Handle>> {
+    static SESSIONS: OnceLock<Mutex<BTreeMap<(String, u64), Handle>>> = OnceLock::new();
+    SESSIONS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// Delete every staging directory on this device.
 ///
 /// Run at daemon start — before the socket is bound, before the mesh comes
@@ -155,6 +383,22 @@ pub fn staging_dir(name: &str, epoch: u64) -> PathBuf {
 /// there is nothing to consult before removing one: if it were committed it
 /// would not be called this any more.
 pub fn sweep_staging() {
+    let mut claimed = BTreeSet::new();
+    let authority_dir = paths::home_dir().join(AUTHORITY_DIR);
+    if let Ok(entries) = std::fs::read_dir(authority_dir) {
+        for entry in entries.flatten() {
+            if let Ok(Some(loaded)) =
+                durable::load_json::<AuthorityTxn>(&entry.path(), "a move authority transaction")
+            {
+                if !matches!(
+                    loaded.value.phase,
+                    MoveAuthorityPhase::Committed | MoveAuthorityPhase::Aborted
+                ) {
+                    claimed.insert(staging_dir(&loaded.value.name, loaded.value.epoch));
+                }
+            }
+        }
+    }
     let dir = paths::home_dir().join("instances");
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
@@ -165,12 +409,402 @@ pub fn sweep_staging() {
         if !name.contains(STAGING) {
             continue;
         }
+        if claimed.contains(&entry.path()) {
+            continue;
+        }
+        let handle_path = entry.path().join(LIVE_HANDLE);
+        if let Ok(bytes) = std::fs::read(&handle_path) {
+            if let Ok(handle) = serde_json::from_slice::<Handle>(&bytes) {
+                let _ = backend::for_handle(&handle.backend).and_then(|hv| hv.kill(&handle));
+            }
+        }
+        // A deep home uses a short runtime path outside staging, so removing
+        // the directory alone would leave the backend socket behind.
+        let _ = std::fs::remove_file(paths::migration_socket_in(&entry.path()));
         match std::fs::remove_dir_all(entry.path()) {
             Ok(()) => eprintln!(
                 "astd: swept {} — an interrupted move left it, and it was never bootable",
                 entry.path().display()
             ),
             Err(e) => eprintln!("astd: could not sweep {}: {e}", entry.path().display()),
+        }
+    }
+}
+
+/// Reconcile target authority before generic staging cleanup or guest
+/// resurrection. A prepared transaction lost its stream with the daemon and
+/// is durably aborted; a transaction that crossed `Committing` is completed.
+pub fn reconcile_target_startup(reg: &mut Shard, device: &str) {
+    let dir = paths::home_dir().join(AUTHORITY_DIR);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let txn = match durable::load_json::<AuthorityTxn>(&path, "a move authority transaction") {
+            Ok(Some(loaded)) => loaded.value,
+            Ok(None) => continue,
+            Err(e) => {
+                eprintln!("astd: cannot reconcile {}: {e:#}", path.display());
+                continue;
+            }
+        };
+        let published = published_for(&txn)
+            || reg
+                .get(&txn.name)
+                .ok()
+                .is_some_and(|i| i.id == txn.instance_id && i.move_epoch == txn.epoch);
+        match txn.phase {
+            MoveAuthorityPhase::Intent
+            | MoveAuthorityPhase::DiskPrepared
+            | MoveAuthorityPhase::Prepared
+            | MoveAuthorityPhase::Reserved
+                if !published =>
+            {
+                eprintln!(
+                    "astd: target preparation for {:?} epoch {} remains fenced until source reconciliation",
+                    txn.name, txn.epoch
+                );
+            }
+            _ => {
+                let response = with_authority_txn(|| {
+                    target_status(
+                        reg,
+                        &txn.instance_id,
+                        &txn.name,
+                        txn.epoch,
+                        &txn.token,
+                        device,
+                    )
+                });
+                if let Response::Error { message } = response {
+                    eprintln!(
+                        "astd: target authority for {:?} epoch {} remains fenced: {message}",
+                        txn.name, txn.epoch
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Settle a source guest left at a live pre-switchover boundary. The target's
+/// durable transaction is the only fact that may resume or destroy it. If the
+/// target is unreachable or indeterminate the source stays fenced.
+pub async fn reconcile_source_startup(node: &Node, mesh: &Arc<Mesh>) {
+    let pending: Vec<(String, String, String, u64, String, MoveSourcePhase)> = {
+        let reg = node.shard.lock().await;
+        reg.list()
+            .into_iter()
+            .filter_map(|inst| {
+                let moving = inst.moving.as_ref()?;
+                moving.live.then(|| {
+                    (
+                        inst.id.clone(),
+                        inst.name.clone(),
+                        moving.to_device.clone(),
+                        moving.epoch,
+                        moving.token.clone(),
+                        moving.phase,
+                    )
+                })
+            })
+            .collect()
+    };
+
+    for (instance_id, name, target, epoch, token, source_phase) in pending {
+        if source_phase == MoveSourcePhase::Committed {
+            let manifest = {
+                let reg = node.shard.lock().await;
+                match reg.get(&name).and_then(manifest) {
+                    Ok(manifest) => manifest,
+                    Err(e) => {
+                        eprintln!("astd: cannot rebuild committed live move {name:?}: {e:#}");
+                        continue;
+                    }
+                }
+            };
+            if let Response::Error { message } =
+                decide_source(node, &instance_id, &name, epoch, &token).await
+            {
+                eprintln!("astd: committed live source {name:?} remains fenced: {message}");
+                continue;
+            }
+            match ask(
+                &target,
+                Request::MoveCommitTarget {
+                    manifest: Box::new(manifest),
+                    epoch,
+                    token: token.clone(),
+                },
+                node,
+                mesh,
+            )
+            .await
+            {
+                Ok(response) => {
+                    if let Err(e) = exact_target_commit(response, &instance_id, epoch, &token) {
+                        eprintln!(
+                            "astd: committed live source {name:?} remains fenced; target commit proof is invalid: {e:#}"
+                        );
+                        continue;
+                    }
+                    let mut reg = node.shard.lock().await;
+                    if let Response::Error { message } = commit_source_checked(
+                        &mut reg,
+                        &instance_id,
+                        &name,
+                        epoch,
+                        &token,
+                    )
+                    .await
+                    {
+                        eprintln!("astd: releasing committed live source {name:?}: {message}");
+                    }
+                }
+                Err(e) => eprintln!(
+                    "astd: committed live source {name:?} remains fenced until {target} is reachable: {e:#}"
+                ),
+            }
+            continue;
+        }
+        let status = ask(
+            &target,
+            Request::MoveTargetStatus {
+                instance_id: instance_id.clone(),
+                name: name.clone(),
+                epoch,
+                token: token.clone(),
+            },
+            node,
+            mesh,
+        )
+        .await;
+        let phase = match status {
+            Ok(response) => match exact_target_authority(response, &instance_id, epoch, &token) {
+                Ok(proof) => proof.phase,
+                Err(e) => {
+                    eprintln!(
+                        "astd: live source {name:?} remains fenced; target authority is invalid: {e:#}"
+                    );
+                    continue;
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "astd: live source {name:?} remains fenced until {target} is reachable: {e:#}"
+                );
+                continue;
+            }
+        };
+
+        if phase == MoveAuthorityPhase::Reserved {
+            let manifest = {
+                let reg = node.shard.lock().await;
+                match reg.get(&name).and_then(manifest) {
+                    Ok(manifest) => manifest,
+                    Err(e) => {
+                        eprintln!("astd: cannot rebuild reserved live move {name:?}: {e:#}");
+                        continue;
+                    }
+                }
+            };
+            if let Response::Error { message } =
+                decide_source(node, &instance_id, &name, epoch, &token).await
+            {
+                eprintln!("astd: reserved live source {name:?} remains fenced: {message}");
+                continue;
+            }
+            match ask(
+                &target,
+                Request::MoveCommitTarget {
+                    manifest: Box::new(manifest),
+                    epoch,
+                    token: token.clone(),
+                },
+                node,
+                mesh,
+            )
+            .await
+            {
+                Ok(response) => {
+                    if let Err(e) = exact_target_commit(response, &instance_id, epoch, &token) {
+                        eprintln!(
+                            "astd: reserved live source {name:?} remains fenced; target commit proof is invalid: {e:#}"
+                        );
+                        continue;
+                    }
+                    let mut reg = node.shard.lock().await;
+                    if let Response::Error { message } = commit_source_checked(
+                        &mut reg,
+                        &instance_id,
+                        &name,
+                        epoch,
+                        &token,
+                    )
+                    .await
+                    {
+                        eprintln!("astd: releasing recovered live source {name:?}: {message}");
+                    }
+                }
+                Err(e) => eprintln!(
+                    "astd: reserved live source {name:?} remains fenced until {target} is reachable: {e:#}"
+                ),
+            }
+            continue;
+        }
+
+        let commit = phase == MoveAuthorityPhase::Committed;
+        let abort = if matches!(
+            phase,
+            MoveAuthorityPhase::Intent
+                | MoveAuthorityPhase::DiskPrepared
+                | MoveAuthorityPhase::Prepared
+        ) {
+            target_abort_proof(&target, &instance_id, &name, epoch, &token, node, mesh)
+                .await
+                .unwrap_or(false)
+        } else {
+            phase == MoveAuthorityPhase::Aborted
+        };
+        let mut reg = node.shard.lock().await;
+        let response = if commit {
+            commit_source_after_proof(&mut reg, &instance_id, &name, epoch, &token)
+        } else if abort {
+            abort_source_checked(&mut reg, &instance_id, &name, epoch, &token).await
+        } else {
+            continue;
+        };
+        if let Response::Error { message } = response {
+            eprintln!("astd: reconciling live source {name:?}: {message}");
+        }
+    }
+}
+
+/// Reconcile target-side precommit WALs after the authenticated mesh exists.
+/// A target never guesses across an unreachable source: Fenced is the only
+/// abort proof, and Committed is the only direction that may finish publish.
+pub async fn reconcile_target_mesh(node: &Node, mesh: &Arc<Mesh>) {
+    let dir = paths::home_dir().join(AUTHORITY_DIR);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let mut pending = Vec::new();
+    for entry in entries.flatten() {
+        match durable::load_json::<AuthorityTxn>(&entry.path(), "a move authority transaction") {
+            Ok(Some(loaded))
+                if matches!(
+                    loaded.value.phase,
+                    MoveAuthorityPhase::Intent
+                        | MoveAuthorityPhase::DiskPrepared
+                        | MoveAuthorityPhase::Prepared
+                        | MoveAuthorityPhase::Reserved
+                ) =>
+            {
+                pending.push(loaded.value)
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("astd: cannot read target reconciliation WAL: {e:#}"),
+        }
+    }
+    let target = mesh.self_name().await;
+    for txn in pending {
+        let decision = ask(
+            &txn.source_device,
+            Request::MoveSourceStatus {
+                instance_id: txn.instance_id.clone(),
+                name: txn.name.clone(),
+                epoch: txn.epoch,
+                token: txn.token.clone(),
+            },
+            node,
+            mesh,
+        )
+        .await;
+        let source_phase = match decision {
+            Ok(response) => {
+                match exact_source_phase(response, &txn.instance_id, txn.epoch, &txn.token) {
+                    Ok(phase) => phase,
+                    Err(e) => {
+                        eprintln!(
+                        "astd: target {:?} epoch {} remains fenced; source proof is invalid: {e:#}",
+                        txn.name, txn.epoch
+                    );
+                        continue;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "astd: target {:?} epoch {} remains fenced until source is reachable: {e:#}",
+                    txn.name, txn.epoch
+                );
+                continue;
+            }
+        };
+        let request = match source_phase {
+            MoveSourcePhase::Fenced if txn.phase == MoveAuthorityPhase::Reserved => {
+                match ask(
+                    &txn.source_device,
+                    Request::MoveDecideSource {
+                        instance_id: txn.instance_id.clone(),
+                        name: txn.name.clone(),
+                        epoch: txn.epoch,
+                        token: txn.token.clone(),
+                    },
+                    node,
+                    mesh,
+                )
+                .await
+                {
+                    Ok(response)
+                        if exact_source_phase(
+                            response,
+                            &txn.instance_id,
+                            txn.epoch,
+                            &txn.token,
+                        )
+                        .is_ok_and(|phase| phase == MoveSourcePhase::Committed) =>
+                    {
+                        Request::MoveCommitTarget {
+                            manifest: Box::new(txn.manifest.clone()),
+                            epoch: txn.epoch,
+                            token: txn.token.clone(),
+                        }
+                    }
+                    Ok(_) => {
+                        eprintln!(
+                            "astd: reserved target {:?} epoch {} remains fenced; source did not replay the exact committed winner",
+                            txn.name, txn.epoch
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "astd: reserved target {:?} epoch {} remains fenced until source recovery: {e:#}",
+                            txn.name, txn.epoch
+                        );
+                        continue;
+                    }
+                }
+            }
+            MoveSourcePhase::Fenced => Request::MoveAbortTarget {
+                instance_id: txn.instance_id.clone(),
+                name: txn.name.clone(),
+                epoch: txn.epoch,
+                token: txn.token.clone(),
+            },
+            MoveSourcePhase::Committed => Request::MoveCommitTarget {
+                manifest: Box::new(txn.manifest.clone()),
+                epoch: txn.epoch,
+                token: txn.token.clone(),
+            },
+        };
+        if let Err(e) = ask(&target, request, node, mesh).await {
+            eprintln!(
+                "astd: target {:?} epoch {} reconciliation remains pending: {e:#}",
+                txn.name, txn.epoch
+            );
         }
     }
 }
@@ -183,12 +817,245 @@ pub fn sweep_staging() {
 /// never finished, whatever else it looks like.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Receipt {
+    #[serde(default)]
+    pub instance_id: String,
     pub epoch: u64,
+    #[serde(default)]
+    pub token: String,
     pub from_device: String,
     /// Total bytes written.
     pub bytes: u64,
     /// Per file, relative path to bytes written.
     pub files: BTreeMap<String, u64>,
+}
+
+/// Write-ahead record for the target half of an authority transfer.
+///
+/// It deliberately lives outside both the staging and live instance trees.
+/// Publishing either tree therefore cannot hide the evidence startup needs
+/// to finish or reject the transaction. The filename is the immutable
+/// instance id plus epoch; the name is only descriptive and may never select
+/// another transaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AuthorityTxn {
+    version: u32,
+    instance_id: String,
+    name: String,
+    epoch: u64,
+    phase: MoveAuthorityPhase,
+    manifest: MoveManifest,
+    live: bool,
+    #[serde(default)]
+    source_device: String,
+    #[serde(default)]
+    source_device_id: String,
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    coordinator_id: String,
+    #[serde(default)]
+    handle: Option<Handle>,
+    #[serde(default)]
+    disk_export: Option<MigrationDiskExport>,
+    #[serde(default)]
+    disk_eof: bool,
+    #[serde(default)]
+    ram_eof: bool,
+    #[serde(default = "initial_lane")]
+    lane: u64,
+    #[serde(default = "default_true")]
+    lane_ready: bool,
+}
+
+fn initial_lane() -> u64 {
+    1
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Identity evidence that moves with the staging tree when it is published.
+///
+/// A directory name alone is not authority: another instance may have
+/// claimed that name while a daemon was down. This marker makes the
+/// rename-before-row crash boundary distinguishable from such a collision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct AuthorityMarker {
+    version: u32,
+    instance_id: String,
+    epoch: u64,
+}
+
+impl AuthorityMarker {
+    fn of(txn: &AuthorityTxn) -> Self {
+        Self {
+            version: 1,
+            instance_id: txn.instance_id.clone(),
+            epoch: txn.epoch,
+        }
+    }
+}
+
+fn authority_key(instance_id: &str, epoch: u64) -> String {
+    let mut encoded = String::with_capacity(instance_id.len() * 2 + 24);
+    for byte in instance_id.as_bytes() {
+        use std::fmt::Write as _;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    format!("{encoded}-{epoch}.json")
+}
+
+fn authority_path(instance_id: &str, epoch: u64) -> PathBuf {
+    paths::home_dir()
+        .join(AUTHORITY_DIR)
+        .join(authority_key(instance_id, epoch))
+}
+
+fn load_authority(instance_id: &str, epoch: u64) -> Result<Option<AuthorityTxn>> {
+    let path = authority_path(instance_id, epoch);
+    let Some(loaded) = durable::load_json(&path, "a move authority transaction")? else {
+        return Ok(None);
+    };
+    let txn: AuthorityTxn = loaded.value;
+    if txn.instance_id != instance_id || txn.epoch != epoch {
+        bail!(
+            "move authority transaction {} is for id {:?} epoch {}, not {:?} epoch {epoch}",
+            path.display(),
+            txn.instance_id,
+            txn.epoch,
+            instance_id
+        );
+    }
+    Ok(Some(txn))
+}
+
+fn load_authority_for_name_epoch(name: &str, epoch: u64) -> Result<Option<AuthorityTxn>> {
+    let dir = paths::home_dir().join(AUTHORITY_DIR);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+    };
+    let mut winner = None;
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(loaded) =
+            durable::load_json::<AuthorityTxn>(&path, "a move authority transaction")?
+        else {
+            continue;
+        };
+        let txn = loaded.value;
+        if txn.name != name || txn.epoch != epoch {
+            continue;
+        }
+        if winner.is_some() {
+            bail!("multiple target authority transactions claim {name:?} at epoch {epoch}");
+        }
+        winner = Some(txn);
+    }
+    Ok(winner)
+}
+
+fn save_authority(txn: &AuthorityTxn) -> Result<()> {
+    durable::commit_json(&authority_path(&txn.instance_id, txn.epoch), txn)
+        .context("committing the target authority transaction")
+}
+
+fn save_authority_marker(dir: &Path, txn: &AuthorityTxn) -> Result<()> {
+    durable::commit_json(&dir.join(LIVE_AUTHORITY), &AuthorityMarker::of(txn))
+        .context("recording the immutable authority of the tree being published")
+}
+
+fn published_for(txn: &AuthorityTxn) -> bool {
+    let path = paths::instance_dir(&txn.name).join(LIVE_AUTHORITY);
+    durable::load_json::<AuthorityMarker>(&path, "a published move authority marker")
+        .ok()
+        .flatten()
+        .is_some_and(|loaded| loaded.value == AuthorityMarker::of(txn))
+}
+
+fn validate_target_replay(
+    txn: &AuthorityTxn,
+    manifest: &MoveManifest,
+    epoch: u64,
+    source_device: &str,
+    source_device_id: &str,
+    token: &str,
+    coordinator_id: Option<&str>,
+) -> Result<()> {
+    if !txn.live
+        || txn.epoch != epoch
+        || txn.instance_id != manifest.instance.id
+        || txn.name != manifest.instance.name
+        || txn.source_device != source_device
+        || txn.source_device_id != source_device_id
+        || txn.token != token
+        || coordinator_id.is_some_and(|id| txn.coordinator_id != id)
+        || serde_json::to_vec(&txn.manifest)? != serde_json::to_vec(manifest)?
+    {
+        bail!(
+            "live migration replay does not match the durable target authority for id {:?} epoch {epoch}",
+            manifest.instance.id
+        );
+    }
+    Ok(())
+}
+
+fn authority_response(txn: &AuthorityTxn, reg: &Shard) -> Response {
+    let instance = if txn.phase == MoveAuthorityPhase::Committed {
+        reg.get(&txn.name)
+            .ok()
+            .filter(|i| i.id == txn.instance_id && i.move_epoch == txn.epoch)
+            .cloned()
+            .map(Box::new)
+    } else {
+        None
+    };
+    Response::MoveAuthority {
+        instance_id: txn.instance_id.clone(),
+        epoch: txn.epoch,
+        token: txn.token.clone(),
+        lane: txn.lane,
+        disk_eof: txn.disk_eof,
+        ram_eof: txn.ram_eof,
+        phase: txn.phase,
+        instance,
+    }
+}
+
+fn authority_phase_response(txn: &AuthorityTxn) -> Response {
+    Response::MoveAuthority {
+        instance_id: txn.instance_id.clone(),
+        epoch: txn.epoch,
+        token: txn.token.clone(),
+        lane: txn.lane,
+        disk_eof: txn.disk_eof,
+        ram_eof: txn.ram_eof,
+        phase: txn.phase,
+        instance: None,
+    }
+}
+
+fn disk_ready_response(txn: &AuthorityTxn) -> Response {
+    Response::MoveDiskReady {
+        instance_id: txn.instance_id.clone(),
+        epoch: txn.epoch,
+        token: txn.token.clone(),
+        lane: txn.lane,
+    }
+}
+
+fn live_ready_response(txn: &AuthorityTxn) -> Response {
+    Response::MoveLiveReady {
+        instance_id: txn.instance_id.clone(),
+        epoch: txn.epoch,
+        token: txn.token.clone(),
+        lane: txn.lane,
+    }
 }
 
 impl Receipt {
@@ -197,8 +1064,7 @@ impl Receipt {
     }
 
     pub fn save(&self, dir: &Path) -> Result<()> {
-        std::fs::write(Self::path(dir), serde_json::to_vec_pretty(self)?)
-            .context("recording what arrived")
+        durable::commit_json(&Self::path(dir), self).context("recording what arrived")
     }
 
     fn load(dir: &Path) -> Result<Self> {
@@ -390,7 +1256,16 @@ pub(crate) fn is_step(req: &Request) -> bool {
         Request::MoveOffer { .. }
             | Request::MoveProbe { .. }
             | Request::MovePrepare { .. }
+            | Request::MoveBeginTarget { .. }
+            | Request::MoveLivePrepareDisk { .. }
+            | Request::MoveLiveDiskReady { .. }
+            | Request::MoveLivePrepareTarget { .. }
+            | Request::MoveReserveTarget { .. }
+            | Request::MoveRecoverTarget { .. }
             | Request::MoveCommitTarget { .. }
+            | Request::MoveTargetStatus { .. }
+            | Request::MoveSourceStatus { .. }
+            | Request::MoveDecideSource { .. }
             | Request::MoveCommitSource { .. }
             | Request::MoveAbortSource { .. }
             | Request::MoveAbortTarget { .. }
@@ -411,18 +1286,162 @@ pub(crate) fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Response
             tokio::task::block_in_place(|| probe(&manifest, cpu_device, already_here))
         }
         Request::MovePrepare {
+            instance_id,
             name,
             to_device,
+            to_device_id,
             epoch,
-        } => tokio::task::block_in_place(|| prepare(reg, &name, &to_device, epoch)),
-        Request::MoveCommitTarget { manifest, epoch } => {
-            tokio::task::block_in_place(|| commit_target(reg, &manifest, epoch, cpu_device))
-        }
-        Request::MoveCommitSource { name, epoch } => {
-            tokio::task::block_in_place(|| commit_source(reg, &name, epoch))
-        }
-        Request::MoveAbortSource { name, epoch } => abort_source(reg, &name, epoch),
-        Request::MoveAbortTarget { name, epoch } => abort_target(&name, epoch),
+            token,
+            coordinator_id,
+            live,
+        } => tokio::task::block_in_place(|| {
+            prepare(
+                reg,
+                &instance_id,
+                &name,
+                &to_device,
+                &to_device_id,
+                epoch,
+                &token,
+                &coordinator_id,
+                live,
+            )
+        }),
+        Request::MoveBeginTarget {
+            manifest,
+            epoch,
+            source_device,
+            source_device_id,
+            token,
+            coordinator_id,
+        } => tokio::task::block_in_place(|| {
+            with_authority_txn(|| {
+                begin_target(
+                    &manifest,
+                    epoch,
+                    cpu_device,
+                    &source_device,
+                    &source_device_id,
+                    &token,
+                    &coordinator_id,
+                )
+            })
+        }),
+        Request::MoveLivePrepareDisk {
+            instance_id,
+            name,
+            epoch,
+            token,
+        } => tokio::task::block_in_place(|| {
+            with_authority_txn(|| prepare_disk_target(&instance_id, &name, epoch, &token))
+        }),
+        Request::MoveLiveDiskReady {
+            instance_id,
+            name,
+            epoch,
+            token,
+        } => tokio::task::block_in_place(|| {
+            with_authority_txn(|| disk_ready_target(&instance_id, &name, epoch, &token))
+        }),
+        Request::MoveLivePrepareTarget {
+            manifest,
+            epoch,
+            source_device,
+            source_device_id,
+            token,
+        } => tokio::task::block_in_place(|| {
+            with_authority_txn(|| {
+                live_prepare_target(
+                    &manifest,
+                    epoch,
+                    cpu_device,
+                    &source_device,
+                    &source_device_id,
+                    &token,
+                )
+            })
+        }),
+        Request::MoveReserveTarget {
+            instance_id,
+            name,
+            epoch,
+            token,
+        } => tokio::task::block_in_place(|| {
+            with_authority_txn(|| reserve_target(reg, &instance_id, &name, epoch, &token))
+        }),
+        Request::MoveRecoverTarget {
+            instance_id,
+            name,
+            epoch,
+            token,
+            from_lane,
+        } => tokio::task::block_in_place(|| {
+            with_authority_txn(|| {
+                recover_target(reg, &instance_id, &name, epoch, &token, from_lane)
+            })
+        }),
+        Request::MoveCommitTarget {
+            manifest,
+            epoch,
+            token,
+        } => tokio::task::block_in_place(|| {
+            with_authority_txn(|| commit_target(reg, &manifest, epoch, &token, cpu_device))
+        }),
+        Request::MoveTargetStatus {
+            instance_id,
+            name,
+            epoch,
+            token,
+        } => tokio::task::block_in_place(|| {
+            with_authority_txn(|| {
+                target_status(reg, &instance_id, &name, epoch, &token, cpu_device)
+            })
+        }),
+        Request::MoveSourceStatus {
+            instance_id,
+            name,
+            epoch,
+            token,
+        } => tokio::task::block_in_place(|| source_status(reg, &instance_id, &name, epoch, &token)),
+        Request::MoveDecideSource { .. } => Response::Error {
+            message: "source decision must run through the asynchronous node handler".into(),
+        },
+        Request::MoveCommitSource {
+            instance_id,
+            name,
+            epoch,
+            token,
+        } => tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(commit_source_checked(
+                reg,
+                &instance_id,
+                &name,
+                epoch,
+                &token,
+            ))
+        }),
+        Request::MoveAbortSource {
+            instance_id,
+            name,
+            epoch,
+            token,
+        } => tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(abort_source_checked(
+                reg,
+                &instance_id,
+                &name,
+                epoch,
+                &token,
+            ))
+        }),
+        Request::MoveAbortTarget {
+            instance_id,
+            name,
+            epoch,
+            token,
+        } => tokio::task::block_in_place(|| {
+            with_authority_txn(|| abort_target(reg, &instance_id, &name, epoch, &token))
+        }),
         other => Response::Error {
             message: format!("{other:?} is not a step of a move"),
         },
@@ -456,18 +1475,64 @@ pub fn offer(reg: &Shard, name: &str) -> Response {
 /// Fence the instance and answer with the manifest as it stands now.
 ///
 /// From here this device holds the only bootable copy and will not boot it.
-/// A fence already in place is superseded rather than refused: the epoch only
-/// ever goes up, so a move that was interrupted with nobody left to abort it
-/// does not strand the instance for good.
-pub fn prepare(reg: &mut Shard, name: &str, to_device: &str, epoch: u64) -> Response {
+/// A fence already in place is replayed only for the exact same attempt.
+/// Recovery must settle it before a newer coordinator can begin.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare(
+    reg: &mut Shard,
+    instance_id: &str,
+    name: &str,
+    to_device: &str,
+    to_device_id: &str,
+    epoch: u64,
+    token: &str,
+    coordinator_id: &str,
+    live: bool,
+) -> Response {
     let inst = match reg
         .get(name)
         .cloned()
-        .and_then(|inst| movable(&inst).map(|()| inst))
+        .and_then(|inst| movable(&inst, live).map(|()| inst))
     {
         Ok(inst) => inst,
         Err(e) => return error(e),
     };
+    let instance_id = if !live && instance_id.is_empty() {
+        inst.id.as_str()
+    } else {
+        instance_id
+    };
+    if inst.id != instance_id {
+        return error(anyhow!(
+            "instance name {name:?} identifies {}, not requested id {instance_id}",
+            inst.id
+        ));
+    }
+    if live && (token.is_empty() || to_device_id.is_empty() || coordinator_id.is_empty()) {
+        return error(anyhow!(
+            "live migration requires immutable target, token and coordinator identities"
+        ));
+    }
+    if let Some(existing) = &inst.moving {
+        if existing.epoch == epoch
+            && existing.to_device == to_device
+            && existing.to_device_id == to_device_id
+            && existing.token == token
+            && existing.coordinator_id == coordinator_id
+            && existing.live == live
+        {
+            return match manifest(&inst) {
+                Ok(manifest) => Response::MoveOffer {
+                    manifest: Box::new(manifest),
+                },
+                Err(e) => error(e),
+            };
+        }
+        return error(anyhow!(
+            "instance {name:?} already has an active move at epoch {} with another immutable token",
+            existing.epoch
+        ));
+    }
     if epoch <= inst.move_epoch {
         return error(anyhow!(
             "instance {name:?} is already at move epoch {} — a move to {to_device} at \
@@ -487,8 +1552,14 @@ pub fn prepare(reg: &mut Shard, name: &str, to_device: &str, epoch: u64) -> Resp
         name,
         Some(Moving {
             to_device: to_device.to_owned(),
+            to_device_id: to_device_id.to_owned(),
             epoch,
             started_at: now_unix(),
+            token: token.to_owned(),
+            lane: 0,
+            coordinator_id: coordinator_id.to_owned(),
+            phase: MoveSourcePhase::Fenced,
+            live,
         }),
     );
     match fenced.and_then(|inst| reg.save().map(|()| inst)) {
@@ -502,20 +1573,697 @@ pub fn prepare(reg: &mut Shard, name: &str, to_device: &str, epoch: u64) -> Resp
     }
 }
 
-/// The target has the bytes and has said so. Drop the row, drop the disk,
-/// leave a note.
-pub fn commit_source(reg: &mut Shard, name: &str, epoch: u64) -> Response {
-    let inst = match reg.get(name).cloned() {
-        Ok(inst) => inst,
+/// Verify the target's durable authority before dropping the source.
+///
+/// The coordinator's commit request is not proof: it may be replayed, forged
+/// by another orbit member, or arrive after a reply was lost. The target's
+/// id/epoch transaction is the only fact that authorizes deletion.
+pub fn source_status(
+    reg: &Shard,
+    instance_id: &str,
+    name: &str,
+    epoch: u64,
+    token: &str,
+) -> Response {
+    let inst = match reg.get(name) {
+        Ok(inst) if inst.id == instance_id => inst,
+        Ok(inst) => {
+            return error(anyhow!(
+                "source name belongs to id {}, not {instance_id}",
+                inst.id
+            ))
+        }
         Err(e) => return error(e),
     };
+    let Some(moving) = inst.moving.as_ref() else {
+        return error(anyhow!("source has no durable move transaction"));
+    };
+    if moving.epoch != epoch || moving.token != token {
+        return error(anyhow!(
+            "source move identity does not match id/epoch/token"
+        ));
+    }
+    Response::MoveSource {
+        instance_id: instance_id.to_owned(),
+        epoch,
+        token: token.to_owned(),
+        phase: moving.phase,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TargetProof {
+    phase: MoveAuthorityPhase,
+    lane: u64,
+    disk_eof: bool,
+    ram_eof: bool,
+}
+
+fn exact_source_phase(
+    response: Response,
+    instance_id: &str,
+    epoch: u64,
+    token: &str,
+) -> Result<MoveSourcePhase> {
+    match response {
+        Response::MoveSource {
+            instance_id: winner_id,
+            epoch: winner_epoch,
+            token: winner_token,
+            phase,
+        } if winner_id == instance_id && winner_epoch == epoch && winner_token == token => {
+            Ok(phase)
+        }
+        Response::MoveSource { .. } => bail!("source decision reply does not match id/epoch/token"),
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected source decision: {other:?}"),
+    }
+}
+
+async fn target_proof(
+    target: &Arc<Mesh>,
+    device: &str,
+    instance_id: &str,
+    name: &str,
+    epoch: u64,
+    token: &str,
+) -> Result<TargetProof> {
+    exact_target_authority(
+        target
+            .proxy(
+                device,
+                Request::MoveTargetStatus {
+                    instance_id: instance_id.to_owned(),
+                    name: name.to_owned(),
+                    epoch,
+                    token: token.to_owned(),
+                },
+            )
+            .await?,
+        instance_id,
+        epoch,
+        token,
+    )
+}
+
+fn exact_target_authority(
+    response: Response,
+    instance_id: &str,
+    epoch: u64,
+    token: &str,
+) -> Result<TargetProof> {
+    match response {
+        Response::MoveAuthority {
+            instance_id: winner_id,
+            epoch: winner_epoch,
+            token: winner_token,
+            phase,
+            lane,
+            disk_eof,
+            ram_eof,
+            ..
+        } if winner_id == instance_id && winner_epoch == epoch && winner_token == token => {
+            Ok(TargetProof {
+                phase,
+                lane,
+                disk_eof,
+                ram_eof,
+            })
+        }
+        Response::MoveAuthority { .. } => {
+            bail!("target authority reply does not match id/epoch/token")
+        }
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected target authority reply: {other:?}"),
+    }
+}
+
+fn exact_target_commit(
+    response: Response,
+    instance_id: &str,
+    epoch: u64,
+    token: &str,
+) -> Result<()> {
+    match response {
+        Response::Instance { instance, .. }
+            if instance.id == instance_id && instance.move_epoch == epoch =>
+        {
+            Ok(())
+        }
+        Response::MoveAuthority {
+            instance_id: winner_id,
+            epoch: winner_epoch,
+            token: winner_token,
+            phase: MoveAuthorityPhase::Committed,
+            ..
+        } if winner_id == instance_id && winner_epoch == epoch && winner_token == token => Ok(()),
+        Response::Error { message } => bail!(message),
+        other => bail!("target commit reply does not match id/epoch/token: {other:?}"),
+    }
+}
+
+pub async fn decide_source(
+    node: &Node,
+    instance_id: &str,
+    name: &str,
+    epoch: u64,
+    token: &str,
+) -> Response {
+    // Reply loss can run two copies of this handler concurrently. Serialize
+    // one source transaction across target CAS, source WAL and stream work;
+    // otherwise both copies could attach producers to the same accepted lane.
+    // Status proof deliberately bypasses this lock, so target recovery never
+    // waits on the source while the source waits on the target.
+    let decision_lock = source_decision_lock(instance_id, epoch);
+    let _decision_guard = decision_lock.lock().await;
+    let mut reg = node.shard.lock().await;
+    let inst = match reg.get(name).cloned() {
+        Ok(inst) if inst.id == instance_id => inst,
+        Ok(inst) => {
+            return error(anyhow!(
+                "source name belongs to id {}, not {instance_id}",
+                inst.id
+            ))
+        }
+        Err(e) => return error(e),
+    };
+    let Some(mut moving) = inst.moving.clone() else {
+        return error(anyhow!("source has no durable move transaction"));
+    };
+    if moving.epoch != epoch || moving.token != token || !moving.live {
+        return error(anyhow!(
+            "source move identity does not match id/epoch/token"
+        ));
+    }
+    let handle = inst.handle.as_ref().filter(|handle| backend::alive(handle));
+    if handle.is_none() && moving.phase == MoveSourcePhase::Committed {
+        drop(reg);
+        let target = match mesh() {
+            Ok(mesh) => mesh,
+            Err(e) => return error(e),
+        };
+        match target_proof(
+            &target,
+            &moving.to_device,
+            instance_id,
+            name,
+            epoch,
+            token,
+        )
+        .await
+        {
+            Ok(TargetProof {
+                phase: MoveAuthorityPhase::Committing | MoveAuthorityPhase::Committed,
+                ..
+            }) => {
+                return Response::MoveSource {
+                    instance_id: instance_id.to_owned(),
+                    epoch,
+                    token: token.to_owned(),
+                    phase: MoveSourcePhase::Committed,
+                }
+            }
+            Ok(proof) => {
+                return error(anyhow!(
+                    "source backend is dead while target authority is {:?}; forward recovery cannot continue",
+                    proof.phase
+                ))
+            }
+            Err(e) => return error(e.context("proving target authority after source exit")),
+        }
+    }
+    let Some(handle) = handle else {
+        return error(anyhow!(
+            "source backend is not alive at the commit boundary"
+        ));
+    };
+    let hv = match backend::for_handle(&handle.backend) {
+        Ok(hv) => hv,
+        Err(e) => return error(e),
+    };
+
+    if moving.phase == MoveSourcePhase::Fenced {
+        if let Err(e) = hv
+            .migration_disk_ready(handle)
+            .and_then(|_| hv.migration_source_ready(handle))
+        {
+            return error(e.context("source is not ready for its durable no-return decision"));
+        }
+        let target = match mesh() {
+            Ok(mesh) => mesh,
+            Err(e) => return error(e),
+        };
+        match target.device_id_of(&moving.to_device).await {
+            Ok(id) if id == moving.to_device_id => {}
+            Ok(_) => {
+                return error(anyhow!(
+                    "live target identity changed after the durable source fence"
+                ))
+            }
+            Err(e) => return error(e.context("resolving the fenced live target")),
+        }
+        let reservation = target
+            .proxy(
+                &moving.to_device,
+                Request::MoveReserveTarget {
+                    instance_id: instance_id.to_owned(),
+                    name: name.to_owned(),
+                    epoch,
+                    token: token.to_owned(),
+                },
+            )
+            .await;
+        let reserved_lane = match reservation {
+            Ok(Response::MoveAuthority {
+                instance_id: winner_id,
+                epoch: winner_epoch,
+                token: winner_token,
+                phase: MoveAuthorityPhase::Reserved,
+                lane,
+                ..
+            }) if winner_id == instance_id
+                && winner_epoch == epoch
+                && winner_token == token
+                && lane > 0 =>
+            {
+                lane
+            }
+            Ok(Response::MoveAuthority { phase, .. }) => {
+                return error(anyhow!(
+                    "target decision winner is {phase:?}, not Reserved; source remains Fenced"
+                ))
+            }
+            Ok(Response::Error { message }) => return error(anyhow!(message)),
+            Ok(other) => return error(anyhow!("unexpected target reservation: {other:?}")),
+            Err(e) => {
+                return error(
+                    e.context("target reservation is indeterminate; source remains Fenced"),
+                )
+            }
+        };
+        moving.lane = reserved_lane;
+        if let Err(e) = persist_source_decision(&mut reg, name, &mut moving) {
+            return error(e.context("persisting the source no-return marker"));
+        }
+    }
+
+    // The source marker is now durable. Stream work must not retain the
+    // shard mutex: local lane reconstruction reads this row through `Node`,
+    // and source cleanup/status must remain responsive during a long drain.
+    drop(reg);
+
+    let target = match mesh() {
+        Ok(mesh) => mesh,
+        Err(e) => return error(e),
+    };
+
+    // The ordinary, no-crash path drains the generation already opened by
+    // the coordinator. Missing tasks are not success: they mean this daemon
+    // restarted and must consult/rebuild the durable target lane below.
+    if crate::mesh::has_live_disk_pump(name, epoch) {
+        let _ = hv.migration_disk_commit(handle);
+        let _ = crate::mesh::finish_live_disk_pump(name, epoch).await;
+    }
+    let disk_proof =
+        target_proof(&target, &moving.to_device, instance_id, name, epoch, token).await;
+    if disk_proof.as_ref().is_ok_and(|proof| proof.disk_eof)
+        && crate::mesh::has_live_pump(name, epoch)
+    {
+        let _ = hv.migration_commit(handle);
+        let _ = crate::mesh::finish_live_pump(name, epoch).await;
+    }
+
+    let mut proof =
+        match target_proof(&target, &moving.to_device, instance_id, name, epoch, token).await {
+            Ok(proof) => proof,
+            Err(e) => return error(e.context("reading target stream completion")),
+        };
+    if matches!(
+        proof.phase,
+        MoveAuthorityPhase::Committing | MoveAuthorityPhase::Committed
+    ) {
+        return Response::MoveSource {
+            instance_id: instance_id.to_owned(),
+            epoch,
+            token: token.to_owned(),
+            phase: MoveSourcePhase::Committed,
+        };
+    }
+    if proof.phase != MoveAuthorityPhase::Reserved {
+        return error(anyhow!(
+            "target authority is {:?}, not Reserved during source completion",
+            proof.phase
+        ));
+    }
+
+    if !proof.disk_eof || !proof.ram_eof {
+        let recovery = target
+            .proxy(
+                &moving.to_device,
+                Request::MoveRecoverTarget {
+                    instance_id: instance_id.to_owned(),
+                    name: name.to_owned(),
+                    epoch,
+                    token: token.to_owned(),
+                    from_lane: moving.lane,
+                },
+            )
+            .await;
+        proof = match recovery {
+            Ok(Response::MoveAuthority {
+                instance_id: winner_id,
+                epoch: winner_epoch,
+                token: winner_token,
+                phase: MoveAuthorityPhase::Reserved,
+                lane,
+                disk_eof,
+                ram_eof,
+                ..
+            }) if winner_id == instance_id && winner_epoch == epoch && winner_token == token => {
+                TargetProof {
+                    phase: MoveAuthorityPhase::Reserved,
+                    lane,
+                    disk_eof,
+                    ram_eof,
+                }
+            }
+            Ok(Response::Error { message }) => return error(anyhow!(message)),
+            Ok(other) => return error(anyhow!("unexpected target recovery reply: {other:?}")),
+            Err(e) => return error(e.context("rebuilding target stream endpoints")),
+        };
+        let mut reg = node.shard.lock().await;
+        if let Err(e) = persist_source_lane(
+            &mut reg,
+            instance_id,
+            name,
+            epoch,
+            token,
+            proof.lane,
+            &mut moving,
+        ) {
+            return error(e.context("persisting the replacement target stream lane"));
+        }
+        drop(reg);
+    }
+
+    let source_device = target.self_name().await;
+    if !proof.disk_eof {
+        let _ = hv.migration_disk_abort(handle);
+        if let Err(e) = target
+            .live_disk_mirror(
+                &source_device,
+                &moving.to_device,
+                instance_id,
+                name,
+                epoch,
+                token,
+                proof.lane,
+                node,
+            )
+            .await
+            .and_then(|_| hv.migration_disk_ready(handle))
+        {
+            return error(e.context("restarting the committed dirty-disk lane"));
+        }
+        if let Err(e) = hv.migration_disk_commit(handle) {
+            return error(e.context("cutting the recovered dirty-disk mirror"));
+        }
+        if let Err(e) = crate::mesh::finish_live_disk_pump(name, epoch).await {
+            return error(e.context("draining the recovered dirty-disk lane"));
+        }
+    }
+    if !proof.ram_eof {
+        if let Err(e) = hv.migration_source_reset(handle) {
+            return error(e.context("resetting the stale committed source lane"));
+        }
+        if let Err(e) = target
+            .live_migrate(
+                &source_device,
+                &moving.to_device,
+                name,
+                instance_id,
+                epoch,
+                token,
+                proof.lane,
+                node,
+            )
+            .await
+        {
+            return error(e.context("restarting committed RAM/device migration"));
+        }
+        if let Err(e) = hv.migration_commit(handle) {
+            return error(e.context("releasing recovered RAM/device switchover"));
+        }
+        if let Err(e) = crate::mesh::finish_live_pump(name, epoch).await {
+            return error(e.context("draining the recovered RAM/device lane"));
+        }
+    }
+
+    proof = match target_proof(&target, &moving.to_device, instance_id, name, epoch, token).await {
+        Ok(proof) => proof,
+        Err(e) => return error(e.context("confirming recovered stream completion")),
+    };
+    if proof.phase != MoveAuthorityPhase::Reserved || !proof.disk_eof || !proof.ram_eof {
+        return error(anyhow!(
+            "target lane {} is {:?} with disk_eof={} ram_eof={}; source remains committed and fenced",
+            proof.lane,
+            proof.phase,
+            proof.disk_eof,
+            proof.ram_eof
+        ));
+    }
+    Response::MoveSource {
+        instance_id: instance_id.to_owned(),
+        epoch,
+        token: token.to_owned(),
+        phase: MoveSourcePhase::Committed,
+    }
+}
+
+fn persist_source_decision(reg: &mut Shard, name: &str, moving: &mut Moving) -> Result<()> {
+    moving.phase = MoveSourcePhase::Committed;
+    reg.set_moving(name, Some(moving.clone()))?;
+    match reg.save() {
+        Ok(()) => Ok(()),
+        Err(save_error) => {
+            if let Err(reload_error) = reload_source_moving(reg, name, moving) {
+                return Err(save_error.context(format!(
+                    "the source decision save also could not be reconciled from disk: {reload_error:#}"
+                )));
+            }
+            Err(save_error)
+        }
+    }
+}
+
+fn reload_source_moving(reg: &mut Shard, name: &str, moving: &mut Moving) -> Result<()> {
+    reg.reload()?;
+    *moving = reg
+        .get(name)?
+        .moving
+        .clone()
+        .context("durable source row has no move after a failed save")?;
+    Ok(())
+}
+
+fn persist_source_lane(
+    reg: &mut Shard,
+    instance_id: &str,
+    name: &str,
+    epoch: u64,
+    token: &str,
+    lane: u64,
+    moving: &mut Moving,
+) -> Result<()> {
+    let current = reg.get(name)?;
+    if current.id != instance_id {
+        bail!(
+            "source lane belongs to id {}, not {instance_id}",
+            current.id
+        );
+    }
+    let durable = current
+        .moving
+        .as_ref()
+        .context("source move vanished while persisting its stream lane")?;
+    if durable.epoch != epoch
+        || durable.token != token
+        || !durable.live
+        || durable.phase != MoveSourcePhase::Committed
+    {
+        bail!("source stream lane does not match a committed id/epoch/token");
+    }
+    if durable.lane > lane {
+        bail!(
+            "target recovery replied with stale lane {lane}; source already records {}",
+            durable.lane
+        );
+    }
+    if durable.lane == lane {
+        *moving = durable.clone();
+        return Ok(());
+    }
+    let mut updated = durable.clone();
+    updated.lane = lane;
+    reg.set_moving(name, Some(updated.clone()))?;
+    match reg.save() {
+        Ok(()) => {
+            *moving = updated;
+            Ok(())
+        }
+        Err(save_error) => {
+            if let Err(reload_error) = reload_source_moving(reg, name, moving) {
+                return Err(save_error.context(format!(
+                    "the source lane save also could not be reconciled from disk: {reload_error:#}"
+                )));
+            }
+            Err(save_error)
+        }
+    }
+}
+
+fn validate_live_publish_state(
+    txn: &AuthorityTxn,
+    source_phase: MoveSourcePhase,
+    target_complete: bool,
+) -> Result<()> {
+    if txn.phase != MoveAuthorityPhase::Reserved {
+        bail!("live target is {:?}, not reserved to commit", txn.phase);
+    }
+    if source_phase != MoveSourcePhase::Committed {
+        bail!("source decision is {source_phase:?}, not durably committed");
+    }
+    if !txn.lane_ready {
+        bail!("live target replacement lane is not ready");
+    }
+    if !txn.disk_eof || !txn.ram_eof {
+        bail!("live target has not durably observed both disk and RAM stream EOF");
+    }
+    if !target_complete {
+        bail!("incoming backend has not completed migration");
+    }
+    Ok(())
+}
+
+pub async fn commit_source_checked(
+    reg: &mut Shard,
+    instance_id: &str,
+    name: &str,
+    epoch: u64,
+    token: &str,
+) -> Response {
+    let inst = match reg.get(name).cloned() {
+        Ok(inst) => inst,
+        // A replay after the row was durably removed is already complete.
+        Err(_) => {
+            match load_source_completion(instance_id, name, epoch, token) {
+                Ok(Some(completion)) => return replay_source_completion(&completion),
+                Ok(None) => {}
+                Err(e) => return error(e),
+            }
+            return match moved_note_full(name) {
+                Some(note)
+                    if note.epoch == epoch
+                        && note.token == token
+                        && (note.instance_id == instance_id
+                            || (instance_id.is_empty() && token.is_empty())) =>
+                {
+                    Response::Ok
+                }
+                _ => error(anyhow!(
+                    "no matching source row or moved note for commit replay"
+                )),
+            };
+        }
+    };
+    if !instance_id.is_empty() && inst.id != instance_id {
+        return error(anyhow!(
+            "source name belongs to id {}, not {instance_id}",
+            inst.id
+        ));
+    }
+    let Some(moving) = inst.moving.as_ref().filter(|moving| moving.epoch == epoch) else {
+        return error(anyhow!(
+            "instance {name:?} is not fenced for move epoch {epoch}"
+        ));
+    };
+    if moving.token != token || (moving.live && moving.phase != MoveSourcePhase::Committed) {
+        return error(anyhow!(
+            "source has not durably committed this id/epoch/token"
+        ));
+    }
+    if moving.live {
+        let mesh = match mesh() {
+            Ok(mesh) => mesh,
+            Err(e) => return error(e),
+        };
+        match target_proof(&mesh, &moving.to_device, &inst.id, name, epoch, token).await {
+            Ok(TargetProof {
+                phase: MoveAuthorityPhase::Committed,
+                ..
+            }) => {}
+            Ok(proof) => {
+                return error(anyhow!(
+                    "target authority is {:?}, not durably committed; source remains fenced",
+                    proof.phase
+                ))
+            }
+            Err(e) => {
+                return error(
+                    e.context("target commit proof is unavailable; source remains fenced"),
+                )
+            }
+        }
+    }
+    commit_source_after_proof(reg, instance_id, name, epoch, token)
+}
+
+/// The target has durably committed. Drop the row, drop the disk, leave a
+/// note. Idempotent across a dead source process and a replayed request.
+fn commit_source_after_proof(
+    reg: &mut Shard,
+    instance_id: &str,
+    name: &str,
+    epoch: u64,
+    token: &str,
+) -> Response {
+    let inst = match reg.get(name).cloned() {
+        Ok(inst) => inst,
+        Err(_) => {
+            match load_source_completion(instance_id, name, epoch, token) {
+                Ok(Some(completion)) => return replay_source_completion(&completion),
+                Ok(None) => {}
+                Err(e) => return error(e),
+            }
+            return match moved_note_full(name) {
+                Some(note)
+                    if note.epoch == epoch
+                        && note.token == token
+                        && (note.instance_id == instance_id
+                            || (instance_id.is_empty() && token.is_empty())) =>
+                {
+                    Response::Ok
+                }
+                _ => error(anyhow!("no matching moved note for source commit replay")),
+            };
+        }
+    };
+    if !instance_id.is_empty() && inst.id != instance_id {
+        return error(anyhow!(
+            "source name belongs to id {}, not {instance_id}",
+            inst.id
+        ));
+    }
     let Some(moving) = inst.moving.clone() else {
         return error(anyhow!(
             "instance {name:?} is not being moved from this device — refusing to \
              delete a copy nothing has taken over from"
         ));
     };
-    if moving.epoch != epoch {
+    if moving.epoch != epoch
+        || moving.token != token
+        || (moving.live && moving.phase != MoveSourcePhase::Committed)
+    {
         return error(anyhow!(
             "instance {name:?} is being moved at epoch {}, not {epoch} — refusing to \
              commit a move this device is not the source of",
@@ -523,35 +2271,179 @@ pub fn commit_source(reg: &mut Shard, name: &str, epoch: u64) -> Response {
         ));
     }
 
-    if let Err(e) = reg.remove(name).and_then(|_| reg.save()) {
+    if let Some(handle) = &inst.handle.filter(backend::alive) {
+        if let Err(e) = backend::for_handle(&handle.backend).and_then(|hv| hv.kill(handle)) {
+            return error(e.context("the migrated source guest could not be fenced off"));
+        }
+    }
+    if let Err(e) = reg.set_stopped(name) {
         return error(e);
     }
-    crate::persist::forget(name);
-    let _ = std::fs::remove_dir_all(paths::instance_dir(name));
-    remember_move(name, &moving.to_device, epoch);
-    Response::Ok
+    let completion = SourceCompletion {
+        version: 1,
+        instance_id: inst.id.clone(),
+        name: name.to_owned(),
+        to_device: moving.to_device.clone(),
+        epoch,
+        token: token.to_owned(),
+    };
+    match load_source_completion(instance_id, name, epoch, token) {
+        Ok(Some(existing)) if existing == completion => {}
+        Ok(Some(_)) => {
+            return error(anyhow!(
+                "source completion winner differs from the current durable move"
+            ))
+        }
+        Ok(None) => {
+            if let Err(e) = save_source_completion(&completion) {
+                return error(e);
+            }
+        }
+        Err(e) => return error(e),
+    }
+    if let Err(e) = reg.remove(name) {
+        return error(e);
+    }
+    if let Err(save_error) = reg.save() {
+        if let Err(reload_error) = reg.reload() {
+            return error(save_error.context(format!(
+                "the source row save also could not be reconciled from disk: {reload_error:#}"
+            )));
+        }
+        return error(save_error);
+    }
+    replay_source_completion(&completion)
 }
 
 /// The move did not happen. Take the fence off; this row never stopped being
 /// the authoritative one.
-pub fn abort_source(reg: &mut Shard, name: &str, epoch: u64) -> Response {
+pub async fn abort_source_checked(
+    reg: &mut Shard,
+    instance_id: &str,
+    name: &str,
+    epoch: u64,
+    token: &str,
+) -> Response {
+    if let Ok(inst) = reg.get(name).cloned() {
+        if !instance_id.is_empty() && inst.id != instance_id {
+            return error(anyhow!(
+                "source name belongs to id {}, not {instance_id}",
+                inst.id
+            ));
+        }
+        if let Some(moving) = inst
+            .moving
+            .as_ref()
+            .filter(|m| m.epoch == epoch && m.token == token && m.live)
+        {
+            if moving.phase == MoveSourcePhase::Committed {
+                return error(anyhow!(
+                    "source no-return marker is committed; abort is permanently refused"
+                ));
+            }
+            let mesh = match mesh() {
+                Ok(mesh) => mesh,
+                Err(e) => return error(e),
+            };
+            match target_proof(&mesh, &moving.to_device, &inst.id, name, epoch, token).await {
+                Ok(TargetProof {
+                    phase: MoveAuthorityPhase::Aborted,
+                    ..
+                }) => {}
+                Ok(proof) => {
+                    return error(anyhow!(
+                        "target authority is {:?}, not durably aborted; source remains fenced",
+                        proof.phase
+                    ))
+                }
+                Err(e) => {
+                    return error(
+                        e.context("target abort proof is unavailable; source remains fenced"),
+                    )
+                }
+            }
+        }
+    }
+    abort_source_after_proof(reg, instance_id, name, epoch, token).await
+}
+
+async fn abort_source_after_proof(
+    reg: &mut Shard,
+    instance_id: &str,
+    name: &str,
+    epoch: u64,
+    token: &str,
+) -> Response {
     match reg.get(name).cloned() {
         // Nothing to unfence is not a failure: an abort is sent on paths that
         // may never have got as far as fencing anything.
         Err(_) => Response::Ok,
         Ok(inst) => {
-            if inst.moving.as_ref().is_some_and(|m| m.epoch != epoch) {
+            if inst.moving.is_none() {
+                return if inst.move_epoch >= epoch {
+                    Response::Ok
+                } else {
+                    error(anyhow!(
+                        "instance {name:?} has no move at epoch {epoch} to abort"
+                    ))
+                };
+            }
+            if (!instance_id.is_empty() && inst.id != instance_id)
+                || inst
+                    .moving
+                    .as_ref()
+                    .is_some_and(|m| m.epoch != epoch || m.token != token)
+            {
                 return error(anyhow!(
                     "instance {name:?} is being moved at a different epoch — leaving \
                      that move's fence alone"
                 ));
             }
-            match reg.set_moving(name, None).and_then(|_| reg.save()) {
+            if inst
+                .moving
+                .as_ref()
+                .is_some_and(|m| m.phase == MoveSourcePhase::Committed)
+            {
+                return error(anyhow!("source no-return marker forbids abort"));
+            }
+            if let Some(handle) = &inst.handle {
+                let stopped = backend::for_handle(&handle.backend).and_then(|hv| {
+                    hv.migration_disk_abort(handle)?;
+                    hv.migration_abort(handle)
+                });
+                if let Err(e) = stopped {
+                    return error(
+                        e.context("the source backend could not resume after migration abort"),
+                    );
+                }
+                let _ = crate::mesh::abort_live_disk_pump(name, epoch).await;
+                let _ = crate::mesh::abort_live_pump(name, epoch).await;
+            }
+            match persist_source_abort(reg, name, epoch) {
                 Ok(()) => Response::Ok,
                 Err(e) => error(e),
             }
         }
     }
+}
+
+fn persist_source_abort(reg: &mut Shard, name: &str, epoch: u64) -> Result<()> {
+    if reg
+        .get(name)
+        .is_ok_and(|instance| instance.moving.is_none() && instance.move_epoch >= epoch)
+    {
+        return Ok(());
+    }
+    reg.finish_aborted_move(name, epoch)?;
+    if let Err(save_error) = reg.save() {
+        if let Err(reload_error) = reg.reload() {
+            return Err(save_error.context(format!(
+                "the source abort save also could not be reconciled from disk: {reload_error:#}"
+            )));
+        }
+        return Err(save_error);
+    }
+    Ok(())
 }
 
 /// An instance in a name collision answers nothing but the rename that ends
@@ -564,9 +2456,9 @@ fn unconflicted(inst: &Instance) -> Result<()> {
 }
 
 /// Whether this instance can be moved at all, in the words the refusal needs.
-fn movable(inst: &Instance) -> Result<()> {
+fn movable(inst: &Instance, live: bool) -> Result<()> {
     unconflicted(inst)?;
-    if inst.status == Status::Running {
+    if inst.status == Status::Running && !live {
         bail!(
             "instance {:?} is running — an offline move needs it stopped: \
              `ast down {}`, or pass --down",
@@ -654,6 +2546,9 @@ fn probe_refusal(
     };
     match hv.probe() {
         Ok(ready) => {
+            if let Some(refusal) = live_refusal(inst, hv.caps().live_migration, &ready, device) {
+                return Some(refusal);
+            }
             if ready.version != machine.hv_version {
                 notes.push(format!(
                     "{device} runs {} {} and {:?} was defined against {} — an \
@@ -703,6 +2598,580 @@ fn probe_refusal(
         ));
     }
     None
+}
+
+fn major(version: &str) -> &str {
+    version.split('.').next().unwrap_or(version)
+}
+
+fn live_refusal(
+    inst: &Instance,
+    live_capability: bool,
+    ready: &Ready,
+    device: &str,
+) -> Option<String> {
+    if inst.status != Status::Running {
+        return None;
+    }
+    let machine = &inst.machine;
+    if !live_capability {
+        return Some(format!(
+            "device {device}'s {} backend cannot receive a running guest — use --down \
+             for the offline move",
+            machine.backend
+        ));
+    }
+    if major(&ready.version) != major(&machine.hv_version)
+        || ready.machine_type != machine.machine_type
+        || ready.cpu != machine.cpu
+    {
+        return Some(format!(
+            "device {device}'s live-migration machine is incompatible: source is \
+             {machine}, target is {} {} ({}, cpu {}). Use --down for the portable \
+             offline move",
+            machine.backend, ready.version, ready.machine_type, ready.cpu
+        ));
+    }
+    if !inst.volumes.is_empty() {
+        return Some(format!(
+            "instance {:?} has attached volumes whose live lease handoff is not supported \
+             — use --down",
+            inst.name
+        ));
+    }
+    None
+}
+
+fn begin_target(
+    manifest: &MoveManifest,
+    epoch: u64,
+    device: &str,
+    source_device: &str,
+    source_device_id: &str,
+    token: &str,
+    coordinator_id: &str,
+) -> Response {
+    if manifest.instance.cpu_device != source_device {
+        return error(anyhow!(
+            "instance record names source {:?}, not {source_device:?}",
+            manifest.instance.cpu_device
+        ));
+    }
+    if let Some(refusal) = probe_refusal(manifest, device, false, &mut Vec::new()) {
+        return error(anyhow!(refusal));
+    }
+    let txn = AuthorityTxn {
+        version: 1,
+        instance_id: manifest.instance.id.clone(),
+        name: manifest.instance.name.clone(),
+        epoch,
+        phase: MoveAuthorityPhase::Intent,
+        manifest: manifest.clone(),
+        live: true,
+        source_device: source_device.to_owned(),
+        source_device_id: source_device_id.to_owned(),
+        token: token.to_owned(),
+        coordinator_id: coordinator_id.to_owned(),
+        handle: None,
+        disk_export: None,
+        disk_eof: false,
+        ram_eof: false,
+        lane: initial_lane(),
+        lane_ready: true,
+    };
+    match load_authority(&txn.instance_id, epoch) {
+        Ok(Some(existing)) => {
+            match validate_target_replay(
+                &existing,
+                manifest,
+                epoch,
+                source_device,
+                source_device_id,
+                token,
+                Some(coordinator_id),
+            ) {
+                Ok(()) => authority_phase_response(&existing),
+                Err(e) => error(e),
+            }
+        }
+        Ok(None) => match load_authority_for_name_epoch(&txn.name, epoch) {
+            Ok(Some(existing)) => error(anyhow!(
+                "target name/epoch is already claimed by instance id {:?} and token {:?}",
+                existing.instance_id,
+                existing.token
+            )),
+            Ok(None) => match save_authority(&txn) {
+                Ok(()) => authority_phase_response(&txn),
+                Err(e) => error(e),
+            },
+            Err(e) => error(e),
+        },
+        Err(e) => error(e),
+    }
+}
+
+fn prepare_disk_target(instance_id: &str, name: &str, epoch: u64, token: &str) -> Response {
+    let mut txn = match load_authority(instance_id, epoch) {
+        Ok(Some(txn)) if txn.name == name && txn.token == token && txn.live => txn,
+        Ok(Some(_)) => return error(anyhow!("target disk request does not match id/epoch/token")),
+        Ok(None) => return error(anyhow!("target intent is absent")),
+        Err(e) => return error(e),
+    };
+    if txn.phase == MoveAuthorityPhase::DiskPrepared {
+        return if txn
+            .disk_export
+            .as_ref()
+            .is_some_and(|export| export.proc.alive())
+        {
+            disk_ready_response(&txn)
+        } else {
+            error(anyhow!("recorded target disk export is not alive"))
+        };
+    }
+    if matches!(
+        txn.phase,
+        MoveAuthorityPhase::Prepared
+            | MoveAuthorityPhase::Reserved
+            | MoveAuthorityPhase::Committing
+            | MoveAuthorityPhase::Committed
+            | MoveAuthorityPhase::Aborted
+    ) {
+        return authority_phase_response(&txn);
+    }
+    if txn.phase != MoveAuthorityPhase::Intent {
+        return error(anyhow!(
+            "target disk cannot be prepared in phase {:?}",
+            txn.phase
+        ));
+    }
+    let staging = staging_dir(name, epoch);
+    let export = (|| -> Result<MigrationDiskExport> {
+        let hv = backend::for_instance(&txn.manifest.instance)?;
+        let req = backend::migration_req(&txn.manifest.instance, staging)?;
+        hv.migration_disk_export(&req)
+    })();
+    let export = match export {
+        Ok(export) => export,
+        Err(e) => return error(e.context("starting the staged root-disk NBD export")),
+    };
+    txn.disk_export = Some(export.clone());
+    txn.phase = MoveAuthorityPhase::DiskPrepared;
+    if let Err(e) = save_authority(&txn) {
+        if let Ok(hv) = backend::for_instance(&txn.manifest.instance) {
+            let _ = hv.migration_disk_export_stop(&export);
+        }
+        return error(e.context("recording target disk export before accepting a mirror"));
+    }
+    disk_ready_response(&txn)
+}
+
+fn disk_ready_target(instance_id: &str, name: &str, epoch: u64, token: &str) -> Response {
+    let txn = match load_authority(instance_id, epoch) {
+        Ok(Some(txn)) if txn.name == name && txn.token == token && txn.live => txn,
+        Ok(Some(_)) => {
+            return error(anyhow!(
+                "target disk-ready request does not match id/epoch/token"
+            ))
+        }
+        Ok(None) => return error(anyhow!("target intent is absent")),
+        Err(e) => return error(e),
+    };
+    if txn.phase != MoveAuthorityPhase::DiskPrepared {
+        return if matches!(
+            txn.phase,
+            MoveAuthorityPhase::Prepared
+                | MoveAuthorityPhase::Reserved
+                | MoveAuthorityPhase::Committing
+                | MoveAuthorityPhase::Committed
+                | MoveAuthorityPhase::Aborted
+        ) {
+            authority_phase_response(&txn)
+        } else {
+            error(anyhow!("target disk is not exported for mirroring"))
+        };
+    }
+    let staging = staging_dir(name, epoch);
+    let mut receipt = match Receipt::load(&staging) {
+        Ok(receipt) => receipt,
+        Err(e) => return error(e),
+    };
+    for file in txn
+        .manifest
+        .files
+        .iter()
+        .filter(|file| matches!(file.path.as_str(), "disk.raw" | "disk.qcow2"))
+    {
+        let path = staging.join(&file.path);
+        if !std::fs::metadata(&path).is_ok_and(|meta| meta.len() == file.len) {
+            return error(anyhow!("mirrored root disk has the wrong length"));
+        }
+        if !receipt.files.contains_key(&file.path) {
+            receipt.files.insert(file.path.clone(), file.allocated);
+            receipt.bytes = receipt.bytes.saturating_add(file.allocated);
+        }
+    }
+    match receipt.save(&staging) {
+        Ok(()) => authority_phase_response(&txn),
+        Err(e) => error(e.context("recording root-disk mirror readiness")),
+    }
+}
+
+/// Start the target backend in incoming mode against the unlisted staged
+/// directory. The returned handle stays process-local until the epoch commit
+/// publishes both the directory and registry row.
+fn live_prepare_target(
+    manifest: &MoveManifest,
+    epoch: u64,
+    device: &str,
+    source_device: &str,
+    source_device_id: &str,
+    token: &str,
+) -> Response {
+    if manifest.instance.status != Status::Running {
+        return error(anyhow!(
+            "live target preparation requires a running source guest"
+        ));
+    }
+    if let Some(refusal) = probe_refusal(manifest, device, false, &mut Vec::new()) {
+        return error(anyhow!(refusal));
+    }
+    if manifest.instance.cpu_device != source_device {
+        return error(anyhow!(
+            "live migration claims source {source_device:?}, but the instance record names {:?}",
+            manifest.instance.cpu_device
+        ));
+    }
+    let staging = staging_dir(&manifest.instance.name, epoch);
+    if let Err(e) = verify(&staging, manifest, epoch, token) {
+        return error(e.context("the live pre-copy is incomplete"));
+    }
+    let receipt = match Receipt::load(&staging) {
+        Ok(receipt) => receipt,
+        Err(e) => return error(e),
+    };
+    if receipt.from_device != source_device {
+        return error(anyhow!(
+            "the staged bytes came from {:?}, not authenticated source {source_device:?}",
+            receipt.from_device
+        ));
+    }
+    let mut txn = AuthorityTxn {
+        version: 1,
+        instance_id: manifest.instance.id.clone(),
+        name: manifest.instance.name.clone(),
+        epoch,
+        phase: MoveAuthorityPhase::Intent,
+        manifest: manifest.clone(),
+        live: true,
+        source_device: source_device.to_owned(),
+        source_device_id: source_device_id.to_owned(),
+        token: token.to_owned(),
+        coordinator_id: String::new(),
+        handle: None,
+        disk_export: None,
+        disk_eof: false,
+        ram_eof: false,
+        lane: initial_lane(),
+        lane_ready: true,
+    };
+    match load_authority(&txn.instance_id, epoch) {
+        Ok(Some(existing)) => {
+            if let Err(e) = validate_target_replay(
+                &existing,
+                manifest,
+                epoch,
+                source_device,
+                source_device_id,
+                token,
+                None,
+            ) {
+                return error(e);
+            }
+            if existing.phase == MoveAuthorityPhase::Prepared {
+                return live_ready_response(&existing);
+            }
+            if matches!(
+                existing.phase,
+                MoveAuthorityPhase::Reserved
+                    | MoveAuthorityPhase::Committing
+                    | MoveAuthorityPhase::Committed
+                    | MoveAuthorityPhase::Aborted
+            ) {
+                return authority_phase_response(&existing);
+            }
+            if existing.phase != MoveAuthorityPhase::DiskPrepared {
+                return error(anyhow!(
+                    "live target transaction is already {:?}",
+                    existing.phase
+                ));
+            }
+            txn = existing;
+        }
+        Ok(None) => return error(anyhow!("target intent must precede live preparation")),
+        Err(e) => return error(e),
+    }
+    let socket = live_socket(&manifest.instance.name, epoch);
+    let _ = std::fs::remove_file(&socket);
+    let started = (|| -> Result<Handle> {
+        let hv = backend::for_instance(&manifest.instance)?;
+        let req = backend::migration_req(&manifest.instance, staging.clone())?;
+        hv.migrate_in(
+            &req,
+            MigrationSource {
+                url: format!("unix:{}", socket.display()),
+            },
+        )
+    })();
+    match started {
+        Ok(handle) => {
+            if let Err(e) = durable::commit_json(&staging.join(LIVE_HANDLE), &handle) {
+                let _ = backend::for_handle(&handle.backend).and_then(|hv| hv.kill(&handle));
+                return error(
+                    e.context("recording the incoming guest so restart cleanup can fence it"),
+                );
+            }
+            txn.handle = Some(handle.clone());
+            txn.phase = MoveAuthorityPhase::Prepared;
+            if let Err(e) = save_authority(&txn) {
+                let _ = backend::for_handle(&handle.backend).and_then(|hv| hv.kill(&handle));
+                return error(
+                    e.context("recording the prepared target before accepting migration bytes"),
+                );
+            }
+            live_sessions().insert((manifest.instance.name.clone(), epoch), handle);
+            live_ready_response(&txn)
+        }
+        Err(e) => error(e.context("starting the incoming live-migration guest")),
+    }
+}
+
+/// Durably choose the forward/commit leg on the target.
+///
+/// This function runs under both the target shard mutex and
+/// [`with_authority_txn`].  Target abort uses the same serialization point,
+/// so `Prepared -> Reserved` and `Prepared -> Aborted` are a real CAS with
+/// one durable winner.  The source is forbidden to write its own no-return
+/// marker until this exact id/epoch/token replays `Reserved`.
+fn reserve_target(reg: &Shard, instance_id: &str, name: &str, epoch: u64, token: &str) -> Response {
+    let mut txn = match load_authority(instance_id, epoch) {
+        Ok(Some(txn))
+            if txn.live && txn.name == name && txn.token == token && txn.epoch == epoch =>
+        {
+            txn
+        }
+        Ok(Some(txn)) => {
+            return error(anyhow!(
+                "target reservation does not match durable id/epoch/token winner {:?}",
+                txn.name
+            ))
+        }
+        Ok(None) => return error(anyhow!("no target authority transaction exists")),
+        Err(e) => return error(e),
+    };
+    match txn.phase {
+        MoveAuthorityPhase::Prepared => {
+            if !txn.lane_ready {
+                return error(anyhow!("target stream lane is not ready for reservation"));
+            }
+            if published_for(&txn)
+                || reg.get(name).ok().is_some_and(|instance| {
+                    instance.id == instance_id && instance.move_epoch == epoch
+                })
+            {
+                return error(anyhow!(
+                    "prepared target has publication evidence before reservation"
+                ));
+            }
+            txn.phase = MoveAuthorityPhase::Reserved;
+            match save_authority(&txn) {
+                Ok(()) => authority_response(&txn, reg),
+                Err(e) => error(e.context("recording the target commit reservation")),
+            }
+        }
+        MoveAuthorityPhase::Reserved
+        | MoveAuthorityPhase::Committing
+        | MoveAuthorityPhase::Committed
+        | MoveAuthorityPhase::Aborted => authority_response(&txn, reg),
+        MoveAuthorityPhase::Intent | MoveAuthorityPhase::DiskPrepared => error(anyhow!(
+            "target is {:?}, not prepared to reserve commit",
+            txn.phase
+        )),
+    }
+}
+
+fn record_completed_incoming(txn: &mut AuthorityTxn) -> Result<bool> {
+    if txn.ram_eof {
+        return Ok(true);
+    }
+    let Some(handle) = txn.handle.as_ref() else {
+        return Ok(false);
+    };
+    let hv = backend::for_handle(&handle.backend)?;
+    if hv.migration_target_complete(handle).is_err() {
+        return Ok(false);
+    }
+    txn.ram_eof = true;
+    save_authority(txn).context("recording backend-proved RAM migration completion")?;
+    Ok(true)
+}
+
+/// Rebuild a lost mesh lane after the source no-return marker.
+///
+/// `from_lane` is a generation CAS. The first request durably advances the
+/// lane with `lane_ready = false`; a reply-loss replay finishes that same
+/// generation instead of allocating another. Old bulk opens and EOF writers
+/// carry the prior generation and are refused by the target WAL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryLane {
+    Replay,
+    Rebuild,
+}
+
+fn select_recovery_lane(txn: &mut AuthorityTxn, from_lane: u64) -> Result<RecoveryLane> {
+    if txn.lane < from_lane {
+        bail!(
+            "recovery lane {from_lane} is newer than durable lane {}",
+            txn.lane
+        );
+    }
+    if txn.lane == from_lane && txn.lane_ready {
+        txn.lane = txn
+            .lane
+            .checked_add(1)
+            .context("live stream lane counter is exhausted")?;
+        txn.lane_ready = false;
+        save_authority(txn).context("allocating the replacement live stream lane")?;
+        return Ok(RecoveryLane::Rebuild);
+    }
+    if txn.lane_ready {
+        return Ok(RecoveryLane::Replay);
+    }
+    Ok(RecoveryLane::Rebuild)
+}
+
+fn recover_target(
+    reg: &Shard,
+    instance_id: &str,
+    name: &str,
+    epoch: u64,
+    token: &str,
+    from_lane: u64,
+) -> Response {
+    let mut txn = match load_authority(instance_id, epoch) {
+        Ok(Some(txn))
+            if txn.live && txn.name == name && txn.token == token && txn.epoch == epoch =>
+        {
+            txn
+        }
+        Ok(Some(_)) => return error(anyhow!("live recovery does not match id/epoch/token")),
+        Ok(None) => return error(anyhow!("no target authority transaction exists")),
+        Err(e) => return error(e),
+    };
+    if txn.phase != MoveAuthorityPhase::Reserved {
+        return if matches!(
+            txn.phase,
+            MoveAuthorityPhase::Committing
+                | MoveAuthorityPhase::Committed
+                | MoveAuthorityPhase::Aborted
+        ) {
+            authority_response(&txn, reg)
+        } else {
+            error(anyhow!(
+                "target is {:?}, not reserved for forward recovery",
+                txn.phase
+            ))
+        };
+    }
+
+    let source = match mesh() {
+        Ok(mesh) => mesh,
+        Err(e) => return error(e),
+    };
+    let proof = tokio::runtime::Handle::current().block_on(source.proxy(
+        &txn.source_device,
+        Request::MoveSourceStatus {
+            instance_id: txn.instance_id.clone(),
+            name: txn.name.clone(),
+            epoch: txn.epoch,
+            token: txn.token.clone(),
+        },
+    ));
+    match proof
+        .and_then(|response| exact_source_phase(response, &txn.instance_id, txn.epoch, &txn.token))
+    {
+        Ok(MoveSourcePhase::Committed) => {}
+        Ok(phase) => {
+            return error(anyhow!(
+                "source decision is {phase:?}; target recovery requires Committed"
+            ))
+        }
+        Err(e) => return error(e.context("source recovery proof is unavailable")),
+    }
+
+    if let Err(e) = record_completed_incoming(&mut txn) {
+        return error(e);
+    }
+    if txn.disk_eof && txn.ram_eof {
+        return authority_response(&txn, reg);
+    }
+    match select_recovery_lane(&mut txn, from_lane) {
+        Ok(RecoveryLane::Replay) => return authority_response(&txn, reg),
+        Ok(RecoveryLane::Rebuild) => {}
+        Err(e) => return error(e),
+    }
+
+    let staging = staging_dir(name, epoch);
+    let hv = match backend::for_instance(&txn.manifest.instance) {
+        Ok(hv) => hv,
+        Err(e) => return error(e),
+    };
+    let req = match backend::migration_req(&txn.manifest.instance, staging.clone()) {
+        Ok(req) => req,
+        Err(e) => return error(e),
+    };
+
+    if !txn.ram_eof {
+        if let Err(e) = hv.migration_target_reset(&req) {
+            return error(e.context("fencing the stale incoming migration lane"));
+        }
+        live_sessions().remove(&(name.to_owned(), epoch));
+        txn.handle = None;
+    }
+    if !txn.disk_eof
+        && !txn
+            .disk_export
+            .as_ref()
+            .is_some_and(|export| export.proc.alive())
+    {
+        match hv.migration_disk_export(&req) {
+            Ok(export) => txn.disk_export = Some(export),
+            Err(e) => return error(e.context("restarting the target disk export")),
+        }
+    }
+    if !txn.ram_eof {
+        let socket = live_socket(name, epoch);
+        let _ = std::fs::remove_file(&socket);
+        let handle = match hv.migrate_in(
+            &req,
+            MigrationSource {
+                url: format!("unix:{}", socket.display()),
+            },
+        ) {
+            Ok(handle) => handle,
+            Err(e) => return error(e.context("restarting the incoming migration backend")),
+        };
+        if let Err(e) = durable::commit_json(&staging.join(LIVE_HANDLE), &handle) {
+            let _ = backend::for_handle(&handle.backend).and_then(|backend| backend.kill(&handle));
+            return error(e.context("recording the recovered incoming backend"));
+        }
+        txn.handle = Some(handle.clone());
+        live_sessions().insert((name.to_owned(), epoch), handle);
+    }
+    txn.lane_ready = true;
+    match save_authority(&txn) {
+        Ok(()) => authority_response(&txn, reg),
+        Err(e) => error(e.context("publishing the replacement live stream lane")),
+    }
 }
 
 /// Does the base image have to be fetched from the source?
@@ -775,70 +3244,264 @@ pub fn commit_target(
     reg: &mut Shard,
     manifest: &MoveManifest,
     epoch: u64,
+    token: &str,
     device: &str,
 ) -> Response {
     let name = manifest.instance.name.clone();
     let staging = staging_dir(&name, epoch);
-    if let Err(e) = verify(&staging, manifest, epoch) {
-        return error(e);
-    }
-
-    let live = paths::instance_dir(&name);
-    if live.exists() {
-        return error(anyhow!(
-            "device {device} already has an instance directory at {} — refusing to \
-             put a second copy of {name:?} on top of it",
-            live.display()
-        ));
-    }
-    if let Some(parent) = live.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return error(anyhow!("{e}"));
+    let mut txn = match load_authority(&manifest.instance.id, epoch) {
+        Ok(Some(txn)) => txn,
+        Ok(None) => {
+            match load_authority_for_name_epoch(&name, epoch) {
+                Ok(Some(existing)) => {
+                    return error(anyhow!(
+                        "target name/epoch is already claimed by instance id {:?} and token {:?}",
+                        existing.instance_id,
+                        existing.token
+                    ))
+                }
+                Ok(None) => {}
+                Err(e) => return error(e),
+            }
+            if let Err(e) = verify(&staging, manifest, epoch, token) {
+                return error(e);
+            }
+            let receipt = match Receipt::load(&staging) {
+                Ok(receipt) => receipt,
+                Err(e) => return error(e),
+            };
+            let txn = AuthorityTxn {
+                version: 1,
+                instance_id: manifest.instance.id.clone(),
+                name: name.clone(),
+                epoch,
+                phase: MoveAuthorityPhase::Intent,
+                manifest: manifest.clone(),
+                live: false,
+                source_device: receipt.from_device,
+                source_device_id: String::new(),
+                token: token.to_owned(),
+                coordinator_id: String::new(),
+                handle: None,
+                disk_export: None,
+                disk_eof: false,
+                ram_eof: false,
+                lane: initial_lane(),
+                lane_ready: true,
+            };
+            if let Err(e) = save_authority(&txn) {
+                return error(e.context("recording target intent before adoption"));
+            }
+            txn
         }
-    }
-    // The rename first, then the receipt: a rename that fails leaves the
-    // staging directory exactly as it was, receipt included, so the move can
-    // be aborted or retried against something that still adds up.
-    //
-    // Every byte of the tree is forced down before the rename. This is the
-    // one moment a second copy of the instance exists, and the source is
-    // about to be told it can stop existing: a disk still sitting in the page
-    // cache when the power goes is a move that lost the instance.
-    if let Err(e) = durable::publish_dir(&staging, &live) {
+        Err(e) => return error(e),
+    };
+    if txn.name != name || txn.manifest.instance.id != manifest.instance.id {
         return error(anyhow!(
-            "could not adopt {}: {e:#} — it is still staged and still not bootable",
-            staging.display()
+            "authority transaction id/epoch belongs to {:?}, not {name:?}",
+            txn.name
         ));
     }
-    let _ = std::fs::remove_file(Receipt::path(&live));
-
-    let mut adopted = manifest.instance.clone();
-    adopted.cpu_device = device.to_owned();
-    // A guest that was running was shut down before any of this; anything
-    // else keeps the state it had, so an instance that had never been booted
-    // does not arrive claiming to have been.
-    if adopted.status == Status::Running {
-        adopted.status = Status::Stopped;
+    if txn.token != token {
+        return error(anyhow!(
+            "target commit token does not match the durable transaction"
+        ));
     }
-    adopted.handle = None;
-    adopted.moving = None;
-    adopted.conflict = None;
-    adopted.move_epoch = epoch;
-    adopted.stranded = manifest.local_volumes.clone();
-    match reg
-        .adopt(adopted)
-        .and_then(|inst| reg.save().map(|()| inst))
-    {
+    match txn.phase {
+        MoveAuthorityPhase::Committed => return committed_response(reg, &txn),
+        MoveAuthorityPhase::Aborted => {
+            return error(anyhow!("target authority transaction was durably aborted"))
+        }
+        MoveAuthorityPhase::Intent
+        | MoveAuthorityPhase::DiskPrepared
+        | MoveAuthorityPhase::Prepared
+        | MoveAuthorityPhase::Reserved => {
+            if txn.live {
+                if txn.phase != MoveAuthorityPhase::Reserved {
+                    return error(anyhow!(
+                        "live target is {:?}; commit has not won the durable reservation",
+                        txn.phase
+                    ));
+                }
+                let Some(handle) = txn.handle.as_ref() else {
+                    return error(anyhow!(
+                        "live target has no recorded incoming backend handle"
+                    ));
+                };
+                let hv = match backend::for_handle(&handle.backend) {
+                    Ok(hv) => hv,
+                    Err(e) => return error(e),
+                };
+                let target_complete = match hv.migration_target_complete(handle) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        return error(e.context("incoming backend has not completed migration"))
+                    }
+                };
+                let source = match mesh() {
+                    Ok(mesh) => mesh,
+                    Err(e) => return error(e),
+                };
+                let proof = tokio::runtime::Handle::current().block_on(source.proxy(
+                    &txn.source_device,
+                    Request::MoveSourceStatus {
+                        instance_id: txn.instance_id.clone(),
+                        name: txn.name.clone(),
+                        epoch: txn.epoch,
+                        token: txn.token.clone(),
+                    },
+                ));
+                let source_phase = match proof.and_then(|response| {
+                    exact_source_phase(response, &txn.instance_id, txn.epoch, &txn.token)
+                }) {
+                    Ok(phase) => phase,
+                    Err(e) => return error(e.context("source no-return proof is unavailable")),
+                };
+                if let Err(e) = validate_live_publish_state(&txn, source_phase, target_complete) {
+                    return error(e);
+                }
+                if let Some(export) = txn.disk_export.as_ref() {
+                    if let Err(e) = hv.migration_disk_export_stop(export) {
+                        return error(e.context("stopping the completed target disk export"));
+                    }
+                }
+            }
+            // This durable one-way transition precedes *every* publish and
+            // row mutation. From here, abort is forbidden and recovery
+            // finishes adoption after any error or crash.
+            txn.phase = MoveAuthorityPhase::Committing;
+            if let Err(e) = save_authority(&txn) {
+                return error(e.context("recording the point of no return before adoption"));
+            }
+        }
+        MoveAuthorityPhase::Committing => {}
+    }
+    match finish_target_commit(reg, &mut txn, device) {
         Ok(instance) => Response::Instance {
             instance,
             guest_health: None,
         },
-        Err(e) => error(e),
+        Err(e) => error(e.context(
+            "target commit is in progress and cannot be aborted; retry or query its authority",
+        )),
     }
 }
 
+fn committed_response(reg: &Shard, txn: &AuthorityTxn) -> Response {
+    match reg.get(&txn.name).ok().filter(|i| {
+        i.id == txn.instance_id && i.move_epoch == txn.epoch
+    }) {
+        Some(instance) => Response::Instance {
+            instance: instance.clone(),
+            guest_health: None,
+        },
+        None => error(anyhow!(
+            "transaction says committed but its target row is missing; startup reconciliation is required"
+        )),
+    }
+}
+
+fn qmp_path_after_publish(current: &Path, staging: &Path, name: &str) -> PathBuf {
+    if current == staging.join("qmp.sock") {
+        paths::qmp_socket_path(name)
+    } else {
+        // `qmp_socket_in` shortened this path into the runtime directory.
+        // Publishing staging does not move that socket, so its handle must
+        // keep naming the exact path the backend bound.
+        current.to_path_buf()
+    }
+}
+
+/// Complete the one-way half of target adoption. Every step is idempotent:
+/// startup and an RPC replay use this same function after any crash boundary.
+fn finish_target_commit(reg: &mut Shard, txn: &mut AuthorityTxn, device: &str) -> Result<Instance> {
+    let name = txn.name.clone();
+    let staging = staging_dir(&name, txn.epoch);
+    let live = paths::instance_dir(&name);
+
+    if !live.exists() {
+        verify(&staging, &txn.manifest, txn.epoch, &txn.token)?;
+        save_authority_marker(&staging, txn)?;
+        if let Some(parent) = live.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        durable::publish_dir(&staging, &live)
+            .with_context(|| format!("publishing {}", live.display()))?;
+    } else if !published_for(txn) {
+        bail!(
+            "{} exists but is not the published tree for id {:?} epoch {}",
+            live.display(),
+            txn.instance_id,
+            txn.epoch
+        );
+    }
+
+    let existing = reg.get(&name).ok().cloned();
+    let instance = if let Some(instance) = existing {
+        if instance.id != txn.instance_id
+            || instance.move_epoch != txn.epoch
+            || instance.cpu_device != device
+        {
+            bail!(
+                "target row for {name:?} does not match transaction id {:?} epoch {} on {device}",
+                txn.instance_id,
+                txn.epoch
+            );
+        }
+        if txn.live
+            && instance.status == Status::Running
+            && !instance.handle.as_ref().is_some_and(backend::alive)
+        {
+            bail!("target row for {name:?} still says Running but its migrated backend is dead");
+        }
+        instance
+    } else {
+        let live_handle = txn
+            .handle
+            .clone()
+            .or_else(|| live_sessions().get(&(name.clone(), txn.epoch)).cloned());
+        if txn.live && !live_handle.as_ref().is_some_and(backend::alive) {
+            bail!(
+                "live target backend handle is absent or dead; refusing to publish a stopped row"
+            );
+        }
+        let mut adopted = txn.manifest.instance.clone();
+        adopted.cpu_device = device.to_owned();
+        if !txn.live && adopted.status == Status::Running && live_handle.is_none() {
+            adopted.status = Status::Stopped;
+        }
+        adopted.handle = live_handle.map(|mut handle| {
+            if let ControlChannel::Qmp { path } = &mut handle.ctl {
+                *path = qmp_path_after_publish(path, &staging, &name);
+            }
+            handle
+        });
+        adopted.moving = None;
+        adopted.conflict = None;
+        adopted.move_epoch = txn.epoch;
+        adopted.stranded = txn.manifest.local_volumes.clone();
+        reg.adopt(adopted)?
+    };
+
+    // A save that returns an error may nevertheless have reached rename;
+    // never remove the row or kill the target here. The Committing WAL makes
+    // a retry save and inspect exactly this state before it can mark itself
+    // Committed.
+    reg.save()?;
+
+    txn.phase = MoveAuthorityPhase::Committed;
+    save_authority(txn)?;
+    live_sessions().remove(&(name.clone(), txn.epoch));
+    let _ = std::fs::remove_file(Receipt::path(&live));
+    let _ = std::fs::remove_file(live.join(LIVE_HANDLE));
+    let _ = std::fs::remove_file(live_socket(&name, txn.epoch));
+    let _ = std::fs::remove_file(live.join(LIVE_SOCKET));
+    let _ = std::fs::remove_file(live.join(LIVE_AUTHORITY));
+    Ok(instance)
+}
+
 /// The completeness check the commit turns on.
-fn verify(staging: &Path, manifest: &MoveManifest, epoch: u64) -> Result<()> {
+fn verify(staging: &Path, manifest: &MoveManifest, epoch: u64, token: &str) -> Result<()> {
     if !staging.is_dir() {
         bail!(
             "nothing arrived for {:?} at epoch {epoch} — there is no staging \
@@ -847,6 +3510,12 @@ fn verify(staging: &Path, manifest: &MoveManifest, epoch: u64) -> Result<()> {
         );
     }
     let receipt = Receipt::load(staging)?;
+    if receipt.instance_id != manifest.instance.id || receipt.token != token {
+        bail!(
+            "what is staged for {:?} belongs to another instance or move token",
+            manifest.instance.name
+        );
+    }
     if receipt.epoch != epoch {
         bail!(
             "what is staged for {:?} came from epoch {}, not {epoch}",
@@ -886,21 +3555,367 @@ fn verify(staging: &Path, manifest: &MoveManifest, epoch: u64) -> Result<()> {
     Ok(())
 }
 
-/// Delete a staging directory. What an abort owes the target.
-pub fn abort_target(name: &str, epoch: u64) -> Response {
-    let staging = staging_dir(name, epoch);
-    match std::fs::remove_dir_all(&staging) {
-        Ok(()) | Err(_) => Response::Ok,
+fn target_status(
+    reg: &mut Shard,
+    instance_id: &str,
+    name: &str,
+    epoch: u64,
+    token: &str,
+    device: &str,
+) -> Response {
+    let mut txn = match load_authority(instance_id, epoch) {
+        Ok(Some(txn)) if txn.name == name && txn.token == token => txn,
+        Ok(Some(txn)) => {
+            return error(anyhow!(
+                "authority key belongs to another name or token ({:?})",
+                txn.name,
+            ))
+        }
+        Ok(None) => return error(anyhow!("no target authority transaction exists")),
+        Err(e) => return error(e),
+    };
+
+    if txn.phase == MoveAuthorityPhase::Reserved {
+        if let Err(e) = record_completed_incoming(&mut txn) {
+            return error(e.context("reconciling completed incoming migration"));
+        }
     }
+
+    // A published tree or matching row is authority evidence even if the
+    // last WAL save was lost. Bias permanently toward completing target
+    // authority; never manufacture an abort proof around it.
+    let matching_row = reg
+        .get(name)
+        .ok()
+        .is_some_and(|i| i.id == instance_id && i.move_epoch == epoch && i.cpu_device == device);
+    if matches!(
+        txn.phase,
+        MoveAuthorityPhase::Intent
+            | MoveAuthorityPhase::DiskPrepared
+            | MoveAuthorityPhase::Prepared
+            | MoveAuthorityPhase::Reserved
+    ) && (published_for(&txn) || matching_row)
+    {
+        return error(anyhow!(
+            "precommit target has publication evidence without a no-return WAL; refusing to infer authority"
+        ));
+    }
+    if matches!(
+        txn.phase,
+        MoveAuthorityPhase::Committing | MoveAuthorityPhase::Committed
+    ) {
+        if let Err(e) = finish_target_commit(reg, &mut txn, device) {
+            return error(e.context("reconciling target authority"));
+        }
+    }
+    if txn.phase == MoveAuthorityPhase::Aborted {
+        if let Err(e) = finish_target_abort(&mut txn) {
+            return error(e.context("finishing the durable target abort"));
+        }
+    }
+    authority_response(&txn, reg)
+}
+
+/// Conditional abort. A successful response is the durable proof the source
+/// needs before it may resume. Committing and Committed are never abortable.
+pub fn abort_target(
+    reg: &mut Shard,
+    instance_id: &str,
+    name: &str,
+    epoch: u64,
+    token: &str,
+) -> Response {
+    let mut txn = match load_authority(instance_id, epoch) {
+        Ok(Some(txn)) if txn.name == name && txn.token == token => txn,
+        Ok(Some(txn)) => {
+            return error(anyhow!(
+                "authority key belongs to another name or token ({:?})",
+                txn.name,
+            ))
+        }
+        Ok(None) => {
+            // Offline moves and peers from before protocol 6 have no target
+            // authority WAL before adoption. At this point there is no live
+            // guest and no published tree to fence: retain the original
+            // idempotent abort behavior and remove only this epoch's staging.
+            let staging = staging_dir(name, epoch);
+            match load_authority_for_name_epoch(name, epoch) {
+                Ok(Some(existing)) => {
+                    return error(anyhow!(
+                        "target name/epoch is claimed by instance id {:?} and token {:?}",
+                        existing.instance_id,
+                        existing.token
+                    ))
+                }
+                Ok(None) => {}
+                Err(e) => return error(e),
+            }
+            if staging.exists() && !instance_id.is_empty() {
+                let receipt = match Receipt::load(&staging) {
+                    Ok(receipt) => receipt,
+                    Err(e) => return error(e),
+                };
+                if receipt.instance_id != instance_id
+                    || receipt.epoch != epoch
+                    || receipt.token != token
+                {
+                    return error(anyhow!(
+                        "target staging does not match abort id/epoch/token"
+                    ));
+                }
+            }
+            let _ = std::fs::remove_file(paths::migration_socket_in(&staging));
+            if let Err(e) = std::fs::remove_dir_all(&staging) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return error(e.into());
+                }
+            }
+            return Response::Ok;
+        }
+        Err(e) => return error(e),
+    };
+    if matches!(
+        txn.phase,
+        MoveAuthorityPhase::Reserved
+            | MoveAuthorityPhase::Committing
+            | MoveAuthorityPhase::Committed
+    ) || published_for(&txn)
+        || reg
+            .get(name)
+            .ok()
+            .is_some_and(|i| i.id == instance_id && i.move_epoch == epoch)
+    {
+        return authority_response(&txn, reg);
+    }
+    if txn.phase == MoveAuthorityPhase::Aborted {
+        return match finish_target_abort(&mut txn) {
+            Ok(()) => authority_response(&txn, reg),
+            Err(e) => error(e.context("finishing the durable target abort")),
+        };
+    }
+    if txn.live {
+        let source = match mesh() {
+            Ok(mesh) => mesh,
+            Err(e) => return error(e),
+        };
+        let proof = tokio::runtime::Handle::current().block_on(source.proxy(
+            &txn.source_device,
+            Request::MoveSourceStatus {
+                instance_id: txn.instance_id.clone(),
+                name: txn.name.clone(),
+                epoch: txn.epoch,
+                token: txn.token.clone(),
+            },
+        ));
+        match proof.and_then(|response| {
+            exact_source_phase(response, &txn.instance_id, txn.epoch, &txn.token)
+        }) {
+            Ok(MoveSourcePhase::Fenced) => {}
+            Ok(MoveSourcePhase::Committed) => {
+                return error(anyhow!(
+                    "source no-return marker is committed; target abort is permanently refused"
+                ))
+            }
+            Err(e) => return error(e.context("source abort proof is unavailable")),
+        }
+    }
+
+    choose_target_abort_after_fenced(reg, instance_id, name, epoch, token)
+}
+
+/// Complete the abort leg after a Fenced source proof. The caller still owns
+/// the target shard mutex and authority serialization guard, so the reload is
+/// a CAS revalidation rather than a stale remote-read write.
+fn choose_target_abort_after_fenced(
+    reg: &Shard,
+    instance_id: &str,
+    name: &str,
+    epoch: u64,
+    token: &str,
+) -> Response {
+    // Re-read under the same target serialization point after the remote
+    // proof.  This makes the proof advisory rather than a stale write
+    // authorization: only a still-Prepared transaction may choose Aborted.
+    let mut txn = match load_authority(instance_id, epoch) {
+        Ok(Some(current)) if current.name == name && current.token == token => current,
+        Ok(Some(_)) => return error(anyhow!("target abort winner changed identity")),
+        Ok(None) => return error(anyhow!("target abort transaction disappeared")),
+        Err(e) => return error(e),
+    };
+    if matches!(
+        txn.phase,
+        MoveAuthorityPhase::Reserved
+            | MoveAuthorityPhase::Committing
+            | MoveAuthorityPhase::Committed
+    ) {
+        return authority_response(&txn, reg);
+    }
+    if txn.phase == MoveAuthorityPhase::Aborted {
+        return match finish_target_abort(&mut txn) {
+            Ok(()) => authority_response(&txn, reg),
+            Err(e) => error(e.context("finishing the durable target abort")),
+        };
+    }
+
+    // The decision WAL precedes every destructive action.  A crash after
+    // this save can only replay cleanup; it can never leave a Prepared WAL
+    // whose incoming process was already killed and then let reservation win.
+    txn.phase = MoveAuthorityPhase::Aborted;
+    if let Err(e) = save_authority(&txn) {
+        return error(e.context("recording the durable target abort winner"));
+    }
+    match finish_target_abort(&mut txn) {
+        Ok(()) => authority_response(&txn, reg),
+        Err(e) => error(e.context("target is durably aborted but cleanup remains pending")),
+    }
+}
+
+/// Fence every process and byte owned by a durable Aborted target.  Cleanup
+/// is idempotent and its final WAL rewrite merely drops the now-dead handle;
+/// the Aborted decision itself was persisted before this function is called.
+fn finish_target_abort(txn: &mut AuthorityTxn) -> Result<()> {
+    if txn.phase != MoveAuthorityPhase::Aborted {
+        bail!("target cleanup requires a durable Aborted decision");
+    }
+    let name = txn.name.clone();
+    let epoch = txn.epoch;
+    let handle = live_sessions()
+        .remove(&(name.to_owned(), epoch))
+        .or_else(|| txn.handle.clone())
+        .or_else(|| {
+            std::fs::read(staging_dir(name, epoch).join(LIVE_HANDLE))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        });
+    if let Some(handle) = handle {
+        if let Err(e) = backend::for_handle(&handle.backend).and_then(|hv| hv.kill(&handle)) {
+            return Err(e.context("fencing the uncommitted target guest"));
+        }
+    }
+    if txn.live {
+        let staging = staging_dir(name, epoch);
+        let cleanup = (|| -> Result<()> {
+            let hv = backend::for_instance(&txn.manifest.instance)?;
+            let req = backend::migration_req(&txn.manifest.instance, staging)?;
+            hv.migration_target_abort(&req)
+        })();
+        if let Err(e) = cleanup {
+            return Err(e.context("fencing an incoming target without a recorded handle"));
+        }
+    }
+    if let Some(export) = txn.disk_export.as_ref() {
+        if let Ok(hv) = backend::for_instance(&txn.manifest.instance) {
+            if let Err(e) = hv.migration_disk_export_stop(export) {
+                return Err(e.context("stopping the uncommitted target disk export"));
+            }
+        }
+    }
+    let staging = staging_dir(name, epoch);
+    let _ = std::fs::remove_file(paths::migration_socket_in(&staging));
+    if let Err(e) = std::fs::remove_dir_all(&staging) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(e.into());
+        }
+    }
+    txn.handle = None;
+    txn.disk_export = None;
+    save_authority(txn).context("recording completed target abort cleanup")
 }
 
 // ---- what a device remembers about an instance that left -------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MovedNote {
+    #[serde(default)]
+    pub instance_id: String,
     pub to_device: String,
     pub epoch: u64,
+    #[serde(default)]
+    pub token: String,
     pub at: u64,
+}
+
+/// Permanent source-side completion proof.
+///
+/// Unlike [`MovedNote`], this is not a display cache and never expires.  It
+/// is written before the source row is removed, so a lost commit reply or a
+/// crash during byte cleanup can replay the exact id/epoch/token forever.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SourceCompletion {
+    version: u32,
+    instance_id: String,
+    name: String,
+    to_device: String,
+    epoch: u64,
+    token: String,
+}
+
+fn hex_key(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len() * 2);
+    for byte in value.as_bytes() {
+        use std::fmt::Write as _;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn source_completion_path(instance_id: &str, epoch: u64, token: &str) -> PathBuf {
+    paths::home_dir().join(SOURCE_COMPLETION_DIR).join(format!(
+        "{}-{epoch}-{}.json",
+        hex_key(instance_id),
+        hex_key(token)
+    ))
+}
+
+fn load_source_completion(
+    instance_id: &str,
+    name: &str,
+    epoch: u64,
+    token: &str,
+) -> Result<Option<SourceCompletion>> {
+    let path = source_completion_path(instance_id, epoch, token);
+    let Some(loaded) = durable::load_json::<SourceCompletion>(&path, "a source move completion")?
+    else {
+        return Ok(None);
+    };
+    let completion = loaded.value;
+    if completion.instance_id != instance_id
+        || completion.name != name
+        || completion.epoch != epoch
+        || completion.token != token
+    {
+        bail!("source completion WAL does not match id/name/epoch/token");
+    }
+    Ok(Some(completion))
+}
+
+fn save_source_completion(completion: &SourceCompletion) -> Result<()> {
+    durable::commit_json(
+        &source_completion_path(&completion.instance_id, completion.epoch, &completion.token),
+        completion,
+    )
+    .context("committing the permanent source completion WAL")
+}
+
+fn replay_source_completion(completion: &SourceCompletion) -> Response {
+    crate::persist::forget(&completion.name);
+    let source_dir = paths::instance_dir(&completion.name);
+    if let Err(e) = std::fs::remove_dir_all(&source_dir) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return error(anyhow!(e).context(format!(
+                "removing migrated source bytes at {}",
+                source_dir.display()
+            )));
+        }
+    }
+    remember_move(
+        &completion.name,
+        &completion.instance_id,
+        &completion.to_device,
+        completion.epoch,
+        &completion.token,
+    );
+    Response::Ok
 }
 
 fn notes_path() -> PathBuf {
@@ -914,15 +3929,17 @@ fn load_notes() -> BTreeMap<String, MovedNote> {
         .unwrap_or_default()
 }
 
-fn remember_move(name: &str, to_device: &str, epoch: u64) {
+fn remember_move(name: &str, instance_id: &str, to_device: &str, epoch: u64, token: &str) {
     let mut notes = load_notes();
     let now = now_unix();
     notes.retain(|_, note| now.saturating_sub(note.at) < NOTE_TTL_SECS);
     notes.insert(
         name.to_owned(),
         MovedNote {
+            instance_id: instance_id.to_owned(),
             to_device: to_device.to_owned(),
             epoch,
+            token: token.to_owned(),
             at: now,
         },
     );
@@ -939,7 +3956,7 @@ fn remember_move(name: &str, to_device: &str, epoch: u64) {
 /// ordinary path resolves the name across the orbit and lands on whoever
 /// holds the row now.
 pub fn moved_note(name: &str) -> Option<String> {
-    let note = load_notes().get(name).cloned()?;
+    let note = moved_note_full(name)?;
     if now_unix().saturating_sub(note.at) >= NOTE_TTL_SECS {
         return None;
     }
@@ -948,6 +3965,11 @@ pub fn moved_note(name: &str) -> Option<String> {
          `ast status {name}` from anywhere in this orbit will find it",
         note.to_device
     ))
+}
+
+fn moved_note_full(name: &str) -> Option<MovedNote> {
+    let note = load_notes().get(name).cloned()?;
+    (now_unix().saturating_sub(note.at) < NOTE_TTL_SECS).then_some(note)
 }
 
 // ---- the orchestrator ------------------------------------------------------
@@ -995,14 +4017,8 @@ pub async fn run(
     }
 
     let mut manifest = offer_of(name, &source, node, mesh).await?;
-    if manifest.instance.status == Status::Running {
-        if !down {
-            bail!(
-                "instance {name:?} is running on {source}. Moving cpu/ram is an offline \
-                 operation on every backend Asterism has — pass --down to shut the guest \
-                 down first"
-            );
-        }
+    let live = manifest.instance.status == Status::Running && !down;
+    if manifest.instance.status == Status::Running && down {
         io.send(&line(format!("shutting {name} down on {source} first")))
             .await?;
         expect_ok(
@@ -1051,8 +4067,9 @@ pub async fn run(
     // checked; a reader who wants to know whether the sparse walk earned its
     // keep should not have to work it out from "1.23 GiB".
     io.send(&line(format!(
-        "moving {name} from {source} to {device}: {} of {} across {} file(s) \
+        "{} {name} from {source} to {device}: {} of {} across {} file(s) \
          [allocated={} virtual={}]",
+        if live { "pre-copying" } else { "moving" },
         cow::human(manifest.allocated()),
         cow::human(manifest.virtual_size()),
         manifest.files.len(),
@@ -1072,12 +4089,21 @@ pub async fn run(
 
     // ---- phase one: fence the source, then move the bytes ------------------
     let epoch = manifest.instance.move_epoch + 1;
+    let token = uuid::Uuid::new_v4().to_string();
+    let coordinator_id = mesh.device_id().to_string();
+    let source_device_id = mesh.device_id_of(&source).await?;
+    let target_device_id = mesh.device_id_of(device).await?;
     let prepared = ask(
         &source,
         Request::MovePrepare {
+            instance_id: manifest.instance.id.clone(),
             name: name.to_owned(),
             to_device: device.to_owned(),
+            to_device_id: target_device_id,
             epoch,
+            token: token.clone(),
+            coordinator_id: coordinator_id.clone(),
+            live,
         },
         node,
         mesh,
@@ -1093,92 +4119,122 @@ pub async fn run(
     )))
     .await?;
 
-    let outcome = transfer_and_commit(&manifest, &source, device, epoch, node, mesh, io).await;
+    let outcome = transfer_and_commit_target(
+        &manifest,
+        &source,
+        device,
+        &source_device_id,
+        &coordinator_id,
+        epoch,
+        &token,
+        live,
+        node,
+        mesh,
+        io,
+    )
+    .await;
     if let Err(e) = outcome {
-        // Nothing the target staged is bootable and nothing has been written
-        // to its shard, so this is a tidy-up rather than a rollback.
-        let _ = ask(
-            device,
-            Request::MoveAbortTarget {
-                name: name.to_owned(),
-                epoch,
-            },
-            node,
-            mesh,
-        )
-        .await;
-        let _ = ask(
-            &source,
-            Request::MoveAbortSource {
-                name: name.to_owned(),
-                epoch,
-            },
-            node,
-            mesh,
-        )
-        .await;
-        io.send(&line(format!(
-            "the move did not happen — {source} still supplies {name}'s cpu"
-        )))
-        .await?;
-        return Err(e);
+        let may_resume = if live {
+            match ask(
+                &source,
+                Request::MoveSourceStatus {
+                    instance_id: manifest.instance.id.clone(),
+                    name: name.to_owned(),
+                    epoch,
+                    token: token.clone(),
+                },
+                node,
+                mesh,
+            )
+            .await
+            {
+                Ok(response) => {
+                    match exact_source_phase(response, &manifest.instance.id, epoch, &token) {
+                        Ok(MoveSourcePhase::Fenced) => {
+                            target_abort_proof(
+                                device,
+                                &manifest.instance.id,
+                                name,
+                                epoch,
+                                &token,
+                                node,
+                                mesh,
+                            )
+                            .await
+                        }
+                        Ok(MoveSourcePhase::Committed) => Ok(false),
+                        Err(error) => Err(error),
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            // Offline migration predates the authority protocol. Its source
+            // guest is stopped and the existing --down semantics remain.
+            let _ = ask(
+                device,
+                Request::MoveAbortTarget {
+                    instance_id: manifest.instance.id.clone(),
+                    name: name.to_owned(),
+                    epoch,
+                    token: token.clone(),
+                },
+                node,
+                mesh,
+            )
+            .await;
+            Ok(true)
+        };
+        if matches!(may_resume, Ok(true)) {
+            expect_ok(
+                ask(
+                    &source,
+                    Request::MoveAbortSource {
+                        instance_id: manifest.instance.id.clone(),
+                        name: name.to_owned(),
+                        epoch,
+                        token: token.clone(),
+                    },
+                    node,
+                    mesh,
+                )
+                .await?,
+            )?;
+            io.send(&line(format!(
+                "the move was durably aborted — {source} still supplies {name}'s cpu"
+            )))
+            .await?;
+            return Err(e);
+        }
+        return Err(e.context(format!(
+            "target authority could not be proven aborted; {source}'s guest remains fenced and must not be resumed"
+        )));
     }
 
-    io.send(&Response::Move {
-        text: format!(
-            "{name}: cpu/ram now sourced from {device} (move epoch {epoch}) — \
-             `ast up {name}` boots it there"
-        ),
-        done: true,
-    })
-    .await
-}
-
-/// Phases two and three: the bytes, then the two commits in order.
-#[allow(clippy::too_many_arguments)]
-async fn transfer_and_commit(
-    manifest: &MoveManifest,
-    source: &str,
-    device: &str,
-    epoch: u64,
-    node: &Node,
-    mesh: &Arc<Mesh>,
-    io: &mut ClientIo<'_>,
-) -> Result<()> {
-    let name = manifest.instance.name.clone();
-
-    mesh.move_import(device, source, manifest, epoch, io)
-        .await?;
-
-    // The target checks what arrived against the manifest and only then does
-    // a second copy of this instance exist anywhere.
-    expect_instance(
-        ask(
-            device,
-            Request::MoveCommitTarget {
-                manifest: Box::new(manifest.clone()),
-                epoch,
-            },
-            node,
-            mesh,
-        )
-        .await?,
-    )
-    .with_context(|| format!("{device} would not adopt {name:?}"))?;
-    io.send(&line(format!(
-        "{device} has it, verified against the manifest"
-    )))
-    .await?;
-
-    // Past this point the move has happened. A source that will not answer
-    // now leaves a stale copy rather than losing one, and the epoch on the
-    // target's row is what settles which is which.
+    // The target commit is the point of no return. From here an error must
+    // never run either abort: the target row is authoritative at the higher
+    // epoch, and clearing the source fence would create two runnable copies.
     expect_ok(
         ask(
-            source,
+            &source,
             Request::MoveCommitSource {
-                name: name.clone(),
+                instance_id: manifest.instance.id.clone(),
+                name: name.to_owned(),
                 epoch,
+                token: token.clone(),
+            },
+            Request::MoveReserveTarget {
+                instance_id: "instance-id".into(),
+                name: "dev".into(),
+                epoch: 1,
+                token: "token".into(),
+            },
+            Request::MoveRecoverTarget {
+                instance_id: "instance-id".into(),
+                name: "dev".into(),
+                epoch: 1,
+                token: "token".into(),
+                from_lane: 1,
             },
             node,
             mesh,
@@ -1188,12 +4244,295 @@ async fn transfer_and_commit(
     .with_context(|| {
         format!(
             "{device} has {name:?} at epoch {epoch} and {source} would not let go of \
-             its copy — the higher epoch is the live one, and {source}'s copy is stale"
+             its copy — the higher epoch is authoritative; the source remains fenced"
         )
     })?;
     io.send(&line(format!("{source} has dropped its copy")))
         .await?;
+
+    io.send(&Response::Move {
+        text: format!(
+            "{name}: cpu/ram now sourced from {device} (move epoch {epoch}){}",
+            if live {
+                " — the running guest and its control channel continued there"
+            } else {
+                " — `ast up` boots it there"
+            }
+        ),
+        done: true,
+    })
+    .await
+}
+
+/// Phases two and three: the bytes, then the two commits in order.
+#[allow(clippy::too_many_arguments)]
+async fn transfer_and_commit_target(
+    manifest: &MoveManifest,
+    source: &str,
+    device: &str,
+    source_device_id: &str,
+    coordinator_id: &str,
+    epoch: u64,
+    token: &str,
+    live: bool,
+    node: &Node,
+    mesh: &Arc<Mesh>,
+    io: &mut ClientIo<'_>,
+) -> Result<()> {
+    let name = manifest.instance.name.clone();
+
+    if live {
+        let begun = ask(
+            device,
+            Request::MoveBeginTarget {
+                manifest: Box::new(manifest.clone()),
+                epoch,
+                source_device: source.to_owned(),
+                source_device_id: source_device_id.to_owned(),
+                token: token.to_owned(),
+                coordinator_id: coordinator_id.to_owned(),
+            },
+            node,
+            mesh,
+        )
+        .await?;
+        match exact_target_authority(begun, &manifest.instance.id, epoch, token)? {
+            TargetProof {
+                phase:
+                    MoveAuthorityPhase::Intent
+                    | MoveAuthorityPhase::DiskPrepared
+                    | MoveAuthorityPhase::Prepared,
+                ..
+            } => {}
+            other => bail!("device {device:?} began live migration with {other:?}"),
+        }
+    }
+
+    mesh.move_import(device, source, manifest, epoch, token, live, io)
+        .await?;
+
+    if live {
+        let lane = expect_move_disk_ready(
+            ask(
+                device,
+                Request::MoveLivePrepareDisk {
+                    instance_id: manifest.instance.id.clone(),
+                    name: name.clone(),
+                    epoch,
+                    token: token.to_owned(),
+                },
+                node,
+                mesh,
+            )
+            .await?,
+            &manifest.instance.id,
+            epoch,
+            token,
+        )?;
+        mesh.live_disk_mirror(
+            source,
+            device,
+            &manifest.instance.id,
+            &name,
+            epoch,
+            token,
+            lane,
+            node,
+        )
+        .await
+        .context("the dirty-disk mirror did not reach READY")?;
+        let disk_recorded = ask(
+            device,
+            Request::MoveLiveDiskReady {
+                instance_id: manifest.instance.id.clone(),
+                name: name.clone(),
+                epoch,
+                token: token.to_owned(),
+            },
+            node,
+            mesh,
+        )
+        .await?;
+        match exact_target_authority(disk_recorded, &manifest.instance.id, epoch, token)? {
+            TargetProof {
+                phase: MoveAuthorityPhase::DiskPrepared,
+                ..
+            } => {}
+            other => bail!("device {device:?} recorded dirty-disk readiness as {other:?}"),
+        }
+        let ram_lane = match ask(
+            device,
+            Request::MoveLivePrepareTarget {
+                manifest: Box::new(manifest.clone()),
+                epoch,
+                source_device: source.to_owned(),
+                source_device_id: source_device_id.to_owned(),
+                token: token.to_owned(),
+            },
+            node,
+            mesh,
+        )
+        .await?
+        {
+            Response::MoveLiveReady {
+                instance_id,
+                epoch: winner_epoch,
+                token: winner_token,
+                lane,
+            } if instance_id == manifest.instance.id
+                && winner_epoch == epoch
+                && winner_token == token =>
+            {
+                lane
+            }
+            Response::Error { message } => bail!(message),
+            other => bail!("device {device:?} prepared live migration with {other:?}"),
+        };
+        if ram_lane != lane {
+            bail!("target changed live stream lane during initial preparation");
+        }
+        io.send(&line(format!(
+            "{device}'s compatible backend is waiting on the staged pre-copy"
+        )))
+        .await?;
+        mesh.live_migrate(
+            source,
+            device,
+            &name,
+            &manifest.instance.id,
+            epoch,
+            token,
+            lane,
+            node,
+        )
+        .await
+        .context("the backend migration stream failed before authority transferred")?;
+        let decision = ask(
+            source,
+            Request::MoveDecideSource {
+                instance_id: manifest.instance.id.clone(),
+                name: name.clone(),
+                epoch,
+                token: token.to_owned(),
+            },
+            node,
+            mesh,
+        )
+        .await?;
+        if exact_source_phase(decision, &manifest.instance.id, epoch, token)?
+            != MoveSourcePhase::Committed
+        {
+            bail!("device {source:?} did not durably commit live migration");
+        }
+        io.send(&line(
+            "dirty disk, memory and device state converged; source execution is fenced".into(),
+        ))
+        .await?;
+    }
+
+    // The target checks what arrived against the manifest and only then does
+    // a second copy of this instance exist anywhere.
+    commit_target_with_recovery(device, manifest, epoch, token, node, mesh)
+        .await
+        .with_context(|| format!("{device} would not adopt {name:?}"))?;
+    io.send(&line(format!(
+        "{device} has it, verified against the manifest"
+    )))
+    .await?;
+
     Ok(())
+}
+
+async fn commit_target_with_recovery(
+    device: &str,
+    manifest: &MoveManifest,
+    epoch: u64,
+    token: &str,
+    node: &Node,
+    mesh: &Arc<Mesh>,
+) -> Result<()> {
+    let mut last = None;
+    for _ in 0..3 {
+        match ask(
+            device,
+            Request::MoveCommitTarget {
+                manifest: Box::new(manifest.clone()),
+                epoch,
+                token: token.to_owned(),
+            },
+            node,
+            mesh,
+        )
+        .await
+        {
+            Ok(Response::Instance { instance, .. })
+                if instance.id == manifest.instance.id && instance.move_epoch == epoch =>
+            {
+                return Ok(())
+            }
+            Ok(Response::Error { message }) => last = Some(anyhow!(message)),
+            Ok(other) => last = Some(anyhow!("unexpected target commit answer: {other:?}")),
+            Err(e) => last = Some(e),
+        }
+
+        match ask(
+            device,
+            Request::MoveTargetStatus {
+                instance_id: manifest.instance.id.clone(),
+                name: manifest.instance.name.clone(),
+                epoch,
+                token: token.to_owned(),
+            },
+            node,
+            mesh,
+        )
+        .await
+        {
+            Ok(response) => {
+                match exact_target_authority(response, &manifest.instance.id, epoch, token) {
+                    Ok(TargetProof {
+                        phase: MoveAuthorityPhase::Committed,
+                        ..
+                    }) => return Ok(()),
+                    Ok(TargetProof {
+                        phase: MoveAuthorityPhase::Aborted,
+                        ..
+                    }) => bail!("target transaction was durably aborted"),
+                    Ok(_) => continue,
+                    Err(e) => last = Some(e),
+                }
+            }
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow!("target authority remained indeterminate")))
+}
+
+async fn target_abort_proof(
+    device: &str,
+    instance_id: &str,
+    name: &str,
+    epoch: u64,
+    token: &str,
+    node: &Node,
+    mesh: &Arc<Mesh>,
+) -> Result<bool> {
+    let response = ask(
+        device,
+        Request::MoveAbortTarget {
+            instance_id: instance_id.to_owned(),
+            name: name.to_owned(),
+            epoch,
+            token: token.to_owned(),
+        },
+        node,
+        mesh,
+    )
+    .await?;
+    Ok(
+        exact_target_authority(response, instance_id, epoch, token)?.phase
+            == MoveAuthorityPhase::Aborted,
+    )
 }
 
 /// Which device holds this instance's row, in the orbit's own words.
@@ -1252,11 +4591,21 @@ fn expect_ok(response: Response) -> Result<()> {
     }
 }
 
-fn expect_instance(response: Response) -> Result<Instance> {
+fn expect_move_disk_ready(
+    response: Response,
+    instance_id: &str,
+    epoch: u64,
+    token: &str,
+) -> Result<u64> {
     match response {
-        Response::Instance { instance, .. } => Ok(instance),
+        Response::MoveDiskReady {
+            instance_id: winner_id,
+            epoch: winner_epoch,
+            token: winner_token,
+            lane,
+        } if winner_id == instance_id && winner_epoch == epoch && winner_token == token => Ok(lane),
         Response::Error { message } => bail!(message),
-        other => bail!("unexpected answer: {other:?}"),
+        other => bail!("expected dirty-disk readiness, got {other:?}"),
     }
 }
 
@@ -1281,6 +4630,77 @@ mod tests {
             cpu: "host".into(),
             hv_version: "test".into(),
         }
+    }
+
+    fn running_instance() -> Instance {
+        let mut instance = Instance::new(
+            "dev",
+            "laptop",
+            "debian:13",
+            Default::default(),
+            asterism_core::hv::Machine {
+                backend: "qemu".into(),
+                machine_type: "virt-9.0".into(),
+                cpu: "host".into(),
+                hv_version: "9.2.1".into(),
+            },
+        );
+        instance.status = Status::Running;
+        instance
+    }
+
+    fn ready(version: &str, machine_type: &str, cpu: &str) -> Ready {
+        Ready {
+            version: version.into(),
+            accel: "kvm".into(),
+            machine_type: machine_type.into(),
+            cpu: cpu.into(),
+        }
+    }
+
+    #[test]
+    fn live_migration_negotiates_capability_and_machine_compatibility() {
+        let instance = running_instance();
+        assert!(live_refusal(
+            &instance,
+            true,
+            &ready("9.7.0", "virt-9.0", "host"),
+            "desktop"
+        )
+        .is_none());
+
+        for (candidate, needle) in [
+            (ready("10.0.0", "virt-9.0", "host"), "incompatible"),
+            (ready("9.2.1", "virt-10.0", "host"), "incompatible"),
+            (ready("9.2.1", "virt-9.0", "max"), "incompatible"),
+        ] {
+            let refusal = live_refusal(&instance, true, &candidate, "desktop").unwrap();
+            assert!(refusal.contains(needle), "{refusal}");
+            assert!(refusal.contains("--down"), "{refusal}");
+        }
+
+        let refusal = live_refusal(
+            &instance,
+            false,
+            &ready("9.2.1", "virt-9.0", "host"),
+            "desktop",
+        )
+        .unwrap();
+        assert!(
+            refusal.contains("cannot receive a running guest"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn a_live_fence_admits_the_running_source_but_the_offline_fence_does_not() {
+        let instance = running_instance();
+        assert!(movable(&instance, true).is_ok());
+        let refusal = movable(&instance, false).unwrap_err().to_string();
+        assert!(
+            refusal.contains("offline move needs it stopped"),
+            "{refusal}"
+        );
     }
 
     #[test]
@@ -1390,21 +4810,32 @@ mod tests {
         for req in [
             Request::MoveOffer { name: "dev".into() },
             Request::MovePrepare {
+                instance_id: "instance-id".into(),
                 name: "dev".into(),
                 to_device: "desktop".into(),
+                to_device_id: "target-id".into(),
                 epoch: 1,
+                token: "token".into(),
+                coordinator_id: "coordinator-id".into(),
+                live: false,
             },
             Request::MoveCommitSource {
+                instance_id: "instance-id".into(),
                 name: "dev".into(),
                 epoch: 1,
+                token: "token".into(),
             },
             Request::MoveAbortSource {
+                instance_id: "instance-id".into(),
                 name: "dev".into(),
                 epoch: 1,
+                token: "token".into(),
             },
             Request::MoveAbortTarget {
+                instance_id: "instance-id".into(),
                 name: "dev".into(),
                 epoch: 1,
+                token: "token".into(),
             },
         ] {
             assert!(is_step(&req), "{req:?}");
@@ -1432,6 +4863,8 @@ mod tests {
             "disk.raw.part",
             "egress-ca.key.bak",
             ".move-receipt.json",
+            LIVE_SOCKET,
+            LIVE_HANDLE,
         ] {
             assert!(
                 is_plumbing(junk),
@@ -1482,47 +4915,1800 @@ mod tests {
         }]);
 
         // No receipt at all: the transfer never finished.
-        let err = verify(&staging, &manifest, 1).unwrap_err().to_string();
+        let err = verify(&staging, &manifest, 1, "token")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("never finished"), "{err}");
 
         // A receipt from another epoch is somebody else's transfer.
         Receipt {
+            instance_id: manifest.instance.id.clone(),
             epoch: 2,
+            token: "token".into(),
             from_device: "laptop".into(),
             bytes: 4096,
             files: [("disk.raw".to_owned(), 4096u64)].into_iter().collect(),
         }
         .save(&staging)
         .unwrap();
-        let err = verify(&staging, &manifest, 1).unwrap_err().to_string();
+        let err = verify(&staging, &manifest, 1, "token")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("epoch"), "{err}");
 
         // The right epoch and the right bytes is the one that passes.
         Receipt {
+            instance_id: manifest.instance.id.clone(),
             epoch: 1,
+            token: "token".into(),
             from_device: "laptop".into(),
             bytes: 4096,
             files: [("disk.raw".to_owned(), 4096u64)].into_iter().collect(),
         }
         .save(&staging)
         .unwrap();
-        verify(&staging, &manifest, 1).unwrap();
+        verify(&staging, &manifest, 1, "token").unwrap();
+
+        let mut wrong_identity = Receipt::load(&staging).unwrap();
+        wrong_identity.instance_id = "stale-instance-id".into();
+        wrong_identity.save(&staging).unwrap();
+        let err = verify(&staging, &manifest, 1, "token")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("another instance"), "{err}");
+        wrong_identity.instance_id = manifest.instance.id.clone();
+        wrong_identity.token = "stale-token".into();
+        wrong_identity.save(&staging).unwrap();
+        let err = verify(&staging, &manifest, 1, "token")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("move token"), "{err}");
+        wrong_identity.token = "token".into();
+        wrong_identity.save(&staging).unwrap();
 
         // A file that arrived the wrong length is refused even though the
         // byte count adds up — sparse means those are different questions.
         std::fs::write(staging.join("disk.raw"), vec![0u8; 2048]).unwrap();
-        let err = verify(&staging, &manifest, 1).unwrap_err().to_string();
+        let err = verify(&staging, &manifest, 1, "token")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("2048") && err.contains("4096"), "{err}");
 
         // And a file that never turned up at all.
         std::fs::remove_file(staging.join("disk.raw")).unwrap();
-        let err = verify(&staging, &manifest, 1).unwrap_err().to_string();
+        let err = verify(&staging, &manifest, 1, "token")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("did not arrive"), "{err}");
 
         // A staging directory that is not there is the crashed-mid-move case.
-        let err = verify(&dir.path().join("nope"), &manifest, 1)
+        let err = verify(&dir.path().join("nope"), &manifest, 1, "token")
             .unwrap_err()
             .to_string();
         assert!(err.contains("no staging directory"), "{err}");
+    }
+
+    /// Exercise the authority handoff at the two filesystem boundaries that
+    /// used to be ambiguous: publication before the row, and the row before
+    /// the final WAL phase. Both failures are replayed from only durable
+    /// state, as a restarted daemon would see them.
+    #[test]
+    fn target_authority_recovers_every_publish_boundary_and_aborts_conditionally() {
+        use asterism_core::durable::faults::{self, Point};
+        use std::ffi::OsString;
+        use std::io;
+
+        static HOME_ENV: OnceLock<Mutex<()>> = OnceLock::new();
+        let _serial = HOME_ENV
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        struct RestoreHome(Option<OsString>);
+        impl Drop for RestoreHome {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("ASTERISM_HOME", value),
+                    None => std::env::remove_var("ASTERISM_HOME"),
+                }
+            }
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let _restore = RestoreHome(std::env::var_os("ASTERISM_HOME"));
+        std::env::set_var("ASTERISM_HOME", home.path());
+
+        fn staged(manifest: &MoveManifest, epoch: u64) {
+            let dir = staging_dir(&manifest.instance.name, epoch);
+            std::fs::create_dir_all(&dir).unwrap();
+            Receipt {
+                instance_id: manifest.instance.id.clone(),
+                epoch,
+                token: "token".into(),
+                from_device: manifest.instance.cpu_device.clone(),
+                bytes: 0,
+                files: BTreeMap::new(),
+            }
+            .save(&dir)
+            .unwrap();
+        }
+
+        fn txn(manifest: &MoveManifest, epoch: u64, phase: MoveAuthorityPhase) -> AuthorityTxn {
+            AuthorityTxn {
+                version: 1,
+                instance_id: manifest.instance.id.clone(),
+                name: manifest.instance.name.clone(),
+                epoch,
+                phase,
+                manifest: manifest.clone(),
+                live: false,
+                source_device: manifest.instance.cpu_device.clone(),
+                source_device_id: "source-id".into(),
+                token: "token".into(),
+                coordinator_id: "coordinator-id".into(),
+                handle: None,
+                disk_export: None,
+                disk_eof: false,
+                ram_eof: false,
+                lane: initial_lane(),
+                lane_ready: true,
+            }
+        }
+
+        fn set_phase_locked(
+            instance_id: &str,
+            epoch: u64,
+            phase: MoveAuthorityPhase,
+        ) -> Result<()> {
+            let mut authority = load_authority(instance_id, epoch)?
+                .context("test authority transaction disappeared")?;
+            authority.phase = phase;
+            save_authority(&authority)
+        }
+
+        let state = paths::state_path();
+        let mut reg = Shard::load(&state).unwrap();
+
+        // The source decision is an atomic durable choice at every write
+        // boundary. A rename failure leaves Fenced; a directory-sync failure
+        // may report an error after the Committed bytes became live. Reload,
+        // rather than the caller's return value, is the recovery oracle.
+        for (index, point, expected) in [
+            (0, Point::Rename, MoveSourcePhase::Fenced),
+            (1, Point::SyncDir, MoveSourcePhase::Committed),
+        ] {
+            let mut source = manifest_of(Vec::new()).instance;
+            source.name = format!("source-marker-{index}");
+            source.id = format!("source-marker-id-{index}");
+            let mut moving = Moving {
+                to_device: "desktop".into(),
+                to_device_id: "target-id".into(),
+                epoch: 7,
+                started_at: now_unix(),
+                token: format!("source-token-{index}"),
+                lane: initial_lane(),
+                coordinator_id: "coordinator-id".into(),
+                phase: MoveSourcePhase::Fenced,
+                live: true,
+            };
+            source.moving = Some(moving.clone());
+            reg.adopt(source).unwrap();
+            reg.save().unwrap();
+            let armed = faults::arm_once(
+                if index == 0 {
+                    "source-marker-rename"
+                } else {
+                    "source-marker-sync"
+                },
+                point,
+                home.path().display().to_string(),
+                io::ErrorKind::Other,
+            );
+            assert!(persist_source_decision(
+                &mut reg,
+                &format!("source-marker-{index}"),
+                &mut moving
+            )
+            .is_err());
+            drop(armed);
+            assert_eq!(
+                reg.get(&format!("source-marker-{index}"))
+                    .unwrap()
+                    .moving
+                    .as_ref()
+                    .unwrap()
+                    .phase,
+                expected,
+                "failed source saves must immediately restore the in-memory durability oracle"
+            );
+            reg = Shard::load(&state).unwrap();
+            assert_eq!(
+                reg.get(&format!("source-marker-{index}"))
+                    .unwrap()
+                    .moving
+                    .as_ref()
+                    .unwrap()
+                    .phase,
+                expected
+            );
+        }
+
+        // Reply loss and crash replay cannot create a second authority. The
+        // immutable source marker selects exactly one owner: before it, the
+        // source; from it onward, the target. Publication is a discoverability
+        // step and never transfers authority in the opposite direction.
+        let gate_manifest = manifest_of(Vec::new());
+        let mut gate = txn(&gate_manifest, 11, MoveAuthorityPhase::Reserved);
+        gate.live = true;
+        gate.disk_eof = true;
+        gate.ram_eof = true;
+        assert!(validate_live_publish_state(&gate, MoveSourcePhase::Fenced, true).is_err());
+        gate.disk_eof = false;
+        assert!(validate_live_publish_state(&gate, MoveSourcePhase::Committed, true).is_err());
+        gate.disk_eof = true;
+        assert!(validate_live_publish_state(&gate, MoveSourcePhase::Committed, false).is_err());
+        for _reply_replay in 0..3 {
+            assert!(validate_live_publish_state(&gate, MoveSourcePhase::Committed, true).is_ok());
+        }
+        for (source_phase, target_published) in [
+            (MoveSourcePhase::Fenced, false),
+            (MoveSourcePhase::Committed, false),
+            (MoveSourcePhase::Committed, true),
+        ] {
+            let source_authority = source_phase == MoveSourcePhase::Fenced;
+            let target_authority = source_phase == MoveSourcePhase::Committed;
+            assert_eq!(
+                usize::from(source_authority) + usize::from(target_authority),
+                1,
+                "source={source_phase:?} target_published={target_published}"
+            );
+        }
+
+        // The target shard mutex and authority serializer form the single
+        // decision CAS.  Hold the abort handler immediately after its remote
+        // Fenced observation: a real reservation handler blocks, then
+        // deterministically replays Aborted after the abort WAL wins.
+        use std::sync::Barrier;
+        use std::thread;
+
+        let mut abort_manifest = manifest_of(Vec::new());
+        abort_manifest.instance.name = "decision-abort-wins".into();
+        abort_manifest.instance.id = "decision-abort-id".into();
+        let abort_epoch = 21;
+        let mut abort_txn = txn(&abort_manifest, abort_epoch, MoveAuthorityPhase::Prepared);
+        abort_txn.live = true;
+        save_authority(&abort_txn).unwrap();
+        let shared = Arc::new(Mutex::new(Shard::load(&state).unwrap()));
+        let observed = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let abort_thread = {
+            let shared = shared.clone();
+            let observed = observed.clone();
+            let release = release.clone();
+            let id = abort_manifest.instance.id.clone();
+            thread::spawn(move || {
+                let reg = shared.lock().unwrap_or_else(|e| e.into_inner());
+                with_authority_txn(|| {
+                    observed.wait();
+                    release.wait();
+                    choose_target_abort_after_fenced(
+                        &reg,
+                        &id,
+                        "decision-abort-wins",
+                        abort_epoch,
+                        "token",
+                    )
+                })
+            })
+        };
+        observed.wait();
+        let reserve_thread = {
+            let shared = shared.clone();
+            let id = abort_manifest.instance.id.clone();
+            thread::spawn(move || {
+                let reg = shared.lock().unwrap_or_else(|e| e.into_inner());
+                with_authority_txn(|| {
+                    reserve_target(&reg, &id, "decision-abort-wins", abort_epoch, "token")
+                })
+            })
+        };
+        release.wait();
+        assert!(matches!(
+            abort_thread.join().unwrap(),
+            Response::MoveAuthority {
+                phase: MoveAuthorityPhase::Aborted,
+                ..
+            }
+        ));
+        assert!(matches!(
+            reserve_thread.join().unwrap(),
+            Response::MoveAuthority {
+                phase: MoveAuthorityPhase::Aborted,
+                ..
+            }
+        ));
+        assert_eq!(
+            load_authority(&abort_manifest.instance.id, abort_epoch)
+                .unwrap()
+                .unwrap()
+                .phase,
+            MoveAuthorityPhase::Aborted
+        );
+
+        // Reverse the barriers: reservation persists while holding the
+        // target mutex, and the delayed abort handler can only replay that
+        // non-abortable winner. This is the source-Committed/target-forward
+        // leg; the opposite leg above leaves the source Fenced and runnable.
+        let mut reserve_manifest = manifest_of(Vec::new());
+        reserve_manifest.instance.name = "decision-reserve-wins".into();
+        reserve_manifest.instance.id = "decision-reserve-id".into();
+        let reserve_epoch = 22;
+        let mut reserve_txn = txn(
+            &reserve_manifest,
+            reserve_epoch,
+            MoveAuthorityPhase::Prepared,
+        );
+        reserve_txn.live = true;
+        save_authority(&reserve_txn).unwrap();
+        let shared = Arc::new(Mutex::new(Shard::load(&state).unwrap()));
+        let observed = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let reserve_thread = {
+            let shared = shared.clone();
+            let observed = observed.clone();
+            let release = release.clone();
+            let id = reserve_manifest.instance.id.clone();
+            thread::spawn(move || {
+                let reg = shared.lock().unwrap_or_else(|e| e.into_inner());
+                with_authority_txn(|| {
+                    observed.wait();
+                    release.wait();
+                    reserve_target(&reg, &id, "decision-reserve-wins", reserve_epoch, "token")
+                })
+            })
+        };
+        observed.wait();
+        let abort_thread = {
+            let shared = shared.clone();
+            let id = reserve_manifest.instance.id.clone();
+            thread::spawn(move || {
+                let reg = shared.lock().unwrap_or_else(|e| e.into_inner());
+                with_authority_txn(|| {
+                    choose_target_abort_after_fenced(
+                        &reg,
+                        &id,
+                        "decision-reserve-wins",
+                        reserve_epoch,
+                        "token",
+                    )
+                })
+            })
+        };
+        release.wait();
+        assert!(matches!(
+            reserve_thread.join().unwrap(),
+            Response::MoveAuthority {
+                phase: MoveAuthorityPhase::Reserved,
+                ..
+            }
+        ));
+        assert!(matches!(
+            abort_thread.join().unwrap(),
+            Response::MoveAuthority {
+                phase: MoveAuthorityPhase::Reserved,
+                ..
+            }
+        ));
+
+        // Disk and RAM callbacks race outside the shard mutex, but the
+        // authority updater serializes their whole load/modify/save. Both
+        // proofs remain set, and a callback delayed past either terminal
+        // decision is refused instead of rolling the phase backward.
+        let mut eof_manifest = manifest_of(Vec::new());
+        eof_manifest.instance.name = "concurrent-eof".into();
+        eof_manifest.instance.id = "concurrent-eof-id".into();
+        let eof_epoch = 23;
+        let mut eof_txn = txn(&eof_manifest, eof_epoch, MoveAuthorityPhase::Reserved);
+        eof_txn.live = true;
+        save_authority(&eof_txn).unwrap();
+        let disk = {
+            let id = eof_manifest.instance.id.clone();
+            thread::spawn(move || {
+                mark_target_stream_eof(&id, eof_epoch, "token", initial_lane(), true)
+            })
+        };
+        let ram = {
+            let id = eof_manifest.instance.id.clone();
+            thread::spawn(move || {
+                mark_target_stream_eof(&id, eof_epoch, "token", initial_lane(), false)
+            })
+        };
+        disk.join().unwrap().unwrap();
+        ram.join().unwrap().unwrap();
+        let both = load_authority(&eof_manifest.instance.id, eof_epoch)
+            .unwrap()
+            .unwrap();
+        assert!(both.disk_eof && both.ram_eof);
+        let mut terminal = both.clone();
+        terminal.phase = MoveAuthorityPhase::Committing;
+        save_authority(&terminal).unwrap();
+        assert!(mark_target_stream_eof(
+            &eof_manifest.instance.id,
+            eof_epoch,
+            "token",
+            initial_lane(),
+            true
+        )
+        .is_err());
+        assert_eq!(
+            load_authority(&eof_manifest.instance.id, eof_epoch)
+                .unwrap()
+                .unwrap()
+                .phase,
+            MoveAuthorityPhase::Committing
+        );
+
+        // EOF and abort use the same target-local transaction boundary. Test
+        // both orders with barriers: an abort that wins first makes the late
+        // callback fail, while an EOF that wins first is retained by the
+        // subsequently durable Aborted winner.
+        let mut abort_eof_manifest = manifest_of(Vec::new());
+        abort_eof_manifest.instance.name = "abort-before-eof".into();
+        abort_eof_manifest.instance.id = "abort-before-eof-id".into();
+        let abort_eof_epoch = 24;
+        let mut abort_eof = txn(
+            &abort_eof_manifest,
+            abort_eof_epoch,
+            MoveAuthorityPhase::Prepared,
+        );
+        abort_eof.live = true;
+        save_authority(&abort_eof).unwrap();
+        let observed = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let abort_thread = {
+            let observed = observed.clone();
+            let release = release.clone();
+            let id = abort_eof_manifest.instance.id.clone();
+            let state = state.clone();
+            thread::spawn(move || {
+                let reg = Shard::load(&state).unwrap();
+                with_authority_txn(|| {
+                    observed.wait();
+                    release.wait();
+                    choose_target_abort_after_fenced(
+                        &reg,
+                        &id,
+                        "abort-before-eof",
+                        abort_eof_epoch,
+                        "token",
+                    )
+                })
+            })
+        };
+        observed.wait();
+        let eof_thread = {
+            let id = abort_eof_manifest.instance.id.clone();
+            thread::spawn(move || {
+                mark_target_stream_eof(&id, abort_eof_epoch, "token", initial_lane(), true)
+            })
+        };
+        release.wait();
+        assert!(matches!(
+            abort_thread.join().unwrap(),
+            Response::MoveAuthority {
+                phase: MoveAuthorityPhase::Aborted,
+                ..
+            }
+        ));
+        assert!(eof_thread.join().unwrap().is_err());
+        let winner = load_authority(&abort_eof_manifest.instance.id, abort_eof_epoch)
+            .unwrap()
+            .unwrap();
+        assert_eq!(winner.phase, MoveAuthorityPhase::Aborted);
+        assert!(!winner.disk_eof);
+
+        let mut eof_abort_manifest = manifest_of(Vec::new());
+        eof_abort_manifest.instance.name = "eof-before-abort".into();
+        eof_abort_manifest.instance.id = "eof-before-abort-id".into();
+        let eof_abort_epoch = 25;
+        let mut eof_abort = txn(
+            &eof_abort_manifest,
+            eof_abort_epoch,
+            MoveAuthorityPhase::Prepared,
+        );
+        eof_abort.live = true;
+        save_authority(&eof_abort).unwrap();
+        let observed = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let eof_thread = {
+            let observed = observed.clone();
+            let release = release.clone();
+            let id = eof_abort_manifest.instance.id.clone();
+            thread::spawn(move || {
+                with_authority_txn(|| {
+                    observed.wait();
+                    release.wait();
+                    mark_target_stream_eof_locked(
+                        &id,
+                        eof_abort_epoch,
+                        "token",
+                        initial_lane(),
+                        true,
+                    )
+                })
+            })
+        };
+        observed.wait();
+        let abort_thread = {
+            let id = eof_abort_manifest.instance.id.clone();
+            let state = state.clone();
+            thread::spawn(move || {
+                let reg = Shard::load(&state).unwrap();
+                with_authority_txn(|| {
+                    choose_target_abort_after_fenced(
+                        &reg,
+                        &id,
+                        "eof-before-abort",
+                        eof_abort_epoch,
+                        "token",
+                    )
+                })
+            })
+        };
+        release.wait();
+        eof_thread.join().unwrap().unwrap();
+        assert!(matches!(
+            abort_thread.join().unwrap(),
+            Response::MoveAuthority {
+                phase: MoveAuthorityPhase::Aborted,
+                ..
+            }
+        ));
+        let winner = load_authority(&eof_abort_manifest.instance.id, eof_abort_epoch)
+            .unwrap()
+            .unwrap();
+        assert_eq!(winner.phase, MoveAuthorityPhase::Aborted);
+        assert!(winner.disk_eof);
+
+        // The same serialization prevents a stale callback from restoring
+        // Prepared after the commit point of no return. Exercise both winner
+        // orders, then both atomic-file failure results before Committing.
+        for eof_first in [false, true] {
+            let mut manifest = manifest_of(Vec::new());
+            manifest.instance.name = format!("eof-commit-{eof_first}");
+            manifest.instance.id = format!("eof-commit-id-{eof_first}");
+            let epoch = if eof_first { 27 } else { 26 };
+            let mut authority = txn(&manifest, epoch, MoveAuthorityPhase::Reserved);
+            authority.live = true;
+            save_authority(&authority).unwrap();
+            let observed = Arc::new(Barrier::new(2));
+            let release = Arc::new(Barrier::new(2));
+            let first = {
+                let observed = observed.clone();
+                let release = release.clone();
+                let id = manifest.instance.id.clone();
+                thread::spawn(move || {
+                    with_authority_txn(|| {
+                        observed.wait();
+                        release.wait();
+                        if eof_first {
+                            mark_target_stream_eof_locked(&id, epoch, "token", initial_lane(), true)
+                        } else {
+                            set_phase_locked(&id, epoch, MoveAuthorityPhase::Committing)
+                        }
+                    })
+                })
+            };
+            observed.wait();
+            let second = {
+                let id = manifest.instance.id.clone();
+                thread::spawn(move || {
+                    with_authority_txn(|| {
+                        if eof_first {
+                            set_phase_locked(&id, epoch, MoveAuthorityPhase::Committing)
+                        } else {
+                            mark_target_stream_eof_locked(&id, epoch, "token", initial_lane(), true)
+                        }
+                    })
+                })
+            };
+            release.wait();
+            first.join().unwrap().unwrap();
+            let second_result = second.join().unwrap();
+            assert_eq!(second_result.is_ok(), eof_first);
+            let durable = load_authority(&manifest.instance.id, epoch)
+                .unwrap()
+                .unwrap();
+            assert_eq!(durable.phase, MoveAuthorityPhase::Committing);
+            assert_eq!(durable.disk_eof, eof_first);
+        }
+
+        for (index, point, expected_eof) in [(0, Point::Rename, false), (1, Point::SyncDir, true)] {
+            let mut manifest = manifest_of(Vec::new());
+            manifest.instance.name = format!("eof-phase-fault-{index}");
+            manifest.instance.id = format!("eof-phase-fault-id-{index}");
+            let epoch = 28 + index;
+            let mut authority = txn(&manifest, epoch, MoveAuthorityPhase::Reserved);
+            authority.live = true;
+            save_authority(&authority).unwrap();
+            let armed = faults::arm_once(
+                if index == 0 {
+                    "eof-phase-rename"
+                } else {
+                    "eof-phase-sync"
+                },
+                point,
+                if index == 0 {
+                    authority_key(&manifest.instance.id, epoch)
+                } else {
+                    paths::home_dir().join(AUTHORITY_DIR).display().to_string()
+                },
+                io::ErrorKind::Other,
+            );
+            assert!(mark_target_stream_eof(
+                &manifest.instance.id,
+                epoch,
+                "token",
+                initial_lane(),
+                true,
+            )
+            .is_err());
+            drop(armed);
+            with_authority_txn(|| {
+                set_phase_locked(&manifest.instance.id, epoch, MoveAuthorityPhase::Committing)
+            })
+            .unwrap();
+            let durable = load_authority(&manifest.instance.id, epoch)
+                .unwrap()
+                .unwrap();
+            assert_eq!(durable.phase, MoveAuthorityPhase::Committing);
+            assert_eq!(durable.disk_eof, expected_eof);
+        }
+
+        // Lost reservation replies at both atomic-file boundaries replay the
+        // durable winner. Rename failure leaves Prepared and retries the CAS;
+        // SyncDir may report failure after Reserved became visible, and the
+        // retry returns that exact id/epoch/token winner.
+        for (index, point, expected_after_fault) in [
+            (0, Point::Rename, MoveAuthorityPhase::Prepared),
+            (1, Point::SyncDir, MoveAuthorityPhase::Reserved),
+        ] {
+            let mut manifest = manifest_of(Vec::new());
+            manifest.instance.name = format!("reservation-fault-{index}");
+            manifest.instance.id = format!("reservation-fault-id-{index}");
+            let epoch = 30 + index;
+            let mut authority = txn(&manifest, epoch, MoveAuthorityPhase::Prepared);
+            authority.live = true;
+            save_authority(&authority).unwrap();
+            let armed = faults::arm_once(
+                if index == 0 {
+                    "reservation-rename"
+                } else {
+                    "reservation-sync"
+                },
+                point,
+                if index == 0 {
+                    authority_key(&manifest.instance.id, epoch)
+                } else {
+                    paths::home_dir().join(AUTHORITY_DIR).display().to_string()
+                },
+                io::ErrorKind::Other,
+            );
+            assert!(matches!(
+                with_authority_txn(|| reserve_target(
+                    &reg,
+                    &manifest.instance.id,
+                    &manifest.instance.name,
+                    epoch,
+                    "token"
+                )),
+                Response::Error { .. }
+            ));
+            drop(armed);
+            assert_eq!(
+                load_authority(&manifest.instance.id, epoch)
+                    .unwrap()
+                    .unwrap()
+                    .phase,
+                expected_after_fault
+            );
+            assert!(matches!(
+                with_authority_txn(|| reserve_target(
+                    &reg,
+                    &manifest.instance.id,
+                    &manifest.instance.name,
+                    epoch,
+                    "token"
+                )),
+                Response::MoveAuthority {
+                    phase: MoveAuthorityPhase::Reserved,
+                    ..
+                }
+            ));
+        }
+
+        for (index, point, expected_after_fault) in [
+            (0, Point::Rename, MoveAuthorityPhase::Prepared),
+            (1, Point::SyncDir, MoveAuthorityPhase::Aborted),
+        ] {
+            let mut manifest = manifest_of(Vec::new());
+            manifest.instance.name = format!("abort-fault-{index}");
+            manifest.instance.id = format!("abort-fault-id-{index}");
+            let epoch = 32 + index;
+            let mut authority = txn(&manifest, epoch, MoveAuthorityPhase::Prepared);
+            authority.live = true;
+            save_authority(&authority).unwrap();
+            let armed = faults::arm_once(
+                if index == 0 {
+                    "abort-rename"
+                } else {
+                    "abort-sync"
+                },
+                point,
+                if index == 0 {
+                    authority_key(&manifest.instance.id, epoch)
+                } else {
+                    paths::home_dir().join(AUTHORITY_DIR).display().to_string()
+                },
+                io::ErrorKind::Other,
+            );
+            assert!(matches!(
+                with_authority_txn(|| choose_target_abort_after_fenced(
+                    &reg,
+                    &manifest.instance.id,
+                    &manifest.instance.name,
+                    epoch,
+                    "token",
+                )),
+                Response::Error { .. }
+            ));
+            drop(armed);
+            assert_eq!(
+                load_authority(&manifest.instance.id, epoch)
+                    .unwrap()
+                    .unwrap()
+                    .phase,
+                expected_after_fault
+            );
+            assert!(matches!(
+                with_authority_txn(|| choose_target_abort_after_fenced(
+                    &reg,
+                    &manifest.instance.id,
+                    &manifest.instance.name,
+                    epoch,
+                    "token",
+                )),
+                Response::MoveAuthority {
+                    phase: MoveAuthorityPhase::Aborted,
+                    ..
+                }
+            ));
+        }
+
+        // Replacement-lane allocation is a durable CAS against the lane the
+        // source last recorded. A rename failure retries the allocation;
+        // SyncDir reply loss finishes the already-allocated generation; and
+        // a replay after lane publication never allocates lane three.
+        for (index, point, expected_lane_after_fault) in
+            [(0, Point::Rename, 1), (1, Point::SyncDir, 2)]
+        {
+            let mut manifest = manifest_of(Vec::new());
+            manifest.instance.name = format!("lane-fault-{index}");
+            manifest.instance.id = format!("lane-fault-id-{index}");
+            let epoch = 35 + index;
+            let mut authority = txn(&manifest, epoch, MoveAuthorityPhase::Reserved);
+            authority.live = true;
+            save_authority(&authority).unwrap();
+            let armed = faults::arm_once(
+                if index == 0 {
+                    "lane-rename"
+                } else {
+                    "lane-sync"
+                },
+                point,
+                if index == 0 {
+                    authority_key(&manifest.instance.id, epoch)
+                } else {
+                    paths::home_dir().join(AUTHORITY_DIR).display().to_string()
+                },
+                io::ErrorKind::Other,
+            );
+            let mut attempted = authority.clone();
+            assert!(select_recovery_lane(&mut attempted, initial_lane()).is_err());
+            drop(armed);
+            let mut durable = load_authority(&manifest.instance.id, epoch)
+                .unwrap()
+                .unwrap();
+            assert_eq!(durable.lane, expected_lane_after_fault);
+            assert_eq!(
+                select_recovery_lane(&mut durable, initial_lane()).unwrap(),
+                RecoveryLane::Rebuild
+            );
+            assert_eq!(durable.lane, 2);
+            assert!(!durable.lane_ready);
+
+            durable.lane_ready = true;
+            save_authority(&durable).unwrap();
+            let mut lost_reply = load_authority(&manifest.instance.id, epoch)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                select_recovery_lane(&mut lost_reply, initial_lane()).unwrap(),
+                RecoveryLane::Replay
+            );
+            assert_eq!(lost_reply.lane, 2);
+        }
+
+        // The source records the replacement generation before bulk opens.
+        // Its in-memory row is reconciled from disk at both atomic-save fault
+        // boundaries, so retry uses exactly the durability result a restart
+        // would observe and a stale reply cannot move the lane backward.
+        for (index, point, expected_lane_after_fault) in
+            [(0, Point::Rename, 1), (1, Point::SyncDir, 2)]
+        {
+            let mut source = manifest_of(Vec::new()).instance;
+            source.name = format!("source-lane-fault-{index}");
+            source.id = format!("source-lane-fault-id-{index}");
+            let mut moving = Moving {
+                to_device: "desktop".into(),
+                to_device_id: "target-id".into(),
+                epoch: 38 + index,
+                started_at: now_unix(),
+                token: format!("source-lane-token-{index}"),
+                lane: initial_lane(),
+                coordinator_id: "coordinator-id".into(),
+                phase: MoveSourcePhase::Committed,
+                live: true,
+            };
+            source.moving = Some(moving.clone());
+            let move_epoch = moving.epoch;
+            let move_token = moving.token.clone();
+            reg.adopt(source.clone()).unwrap();
+            reg.save().unwrap();
+            let armed = faults::arm_once(
+                if index == 0 {
+                    "source-lane-rename"
+                } else {
+                    "source-lane-sync"
+                },
+                point,
+                if index == 0 {
+                    state.display().to_string()
+                } else {
+                    home.path().display().to_string()
+                },
+                io::ErrorKind::Other,
+            );
+            assert!(persist_source_lane(
+                &mut reg,
+                &source.id,
+                &source.name,
+                move_epoch,
+                &move_token,
+                2,
+                &mut moving,
+            )
+            .is_err());
+            drop(armed);
+            assert_eq!(moving.lane, expected_lane_after_fault);
+            assert_eq!(
+                reg.get(&source.name).unwrap().moving.as_ref().unwrap().lane,
+                expected_lane_after_fault
+            );
+            persist_source_lane(
+                &mut reg,
+                &source.id,
+                &source.name,
+                move_epoch,
+                &move_token,
+                2,
+                &mut moving,
+            )
+            .unwrap();
+            assert_eq!(moving.lane, 2);
+            assert!(persist_source_lane(
+                &mut reg,
+                &source.id,
+                &source.name,
+                move_epoch,
+                &move_token,
+                1,
+                &mut moving,
+            )
+            .is_err());
+        }
+
+        // Source completion is a permanent WAL, not the 24-hour moved-note
+        // cache. Faults before its rename leave the row; faults after the WAL
+        // but before row publication replay deletion, and an absent row with
+        // leftover bytes is still cleanable indefinitely.
+        reg = Shard::load(&state).unwrap();
+        let mut source = manifest_of(Vec::new()).instance;
+        source.name = "source-completion-rename".into();
+        source.id = "source-completion-rename-id".into();
+        source.moving = Some(Moving {
+            to_device: "desktop".into(),
+            to_device_id: "target-id".into(),
+            epoch: 40,
+            started_at: now_unix(),
+            token: "completion-token".into(),
+            lane: 0,
+            coordinator_id: "coordinator-id".into(),
+            phase: MoveSourcePhase::Fenced,
+            live: false,
+        });
+        reg.adopt(source.clone()).unwrap();
+        reg.save().unwrap();
+        let armed = faults::arm_once(
+            "source-completion-rename",
+            Point::Rename,
+            source_completion_path(&source.id, 40, "completion-token")
+                .display()
+                .to_string(),
+            io::ErrorKind::Other,
+        );
+        assert!(matches!(
+            commit_source_after_proof(&mut reg, &source.id, &source.name, 40, "completion-token"),
+            Response::Error { .. }
+        ));
+        drop(armed);
+        assert!(reg.get(&source.name).is_ok());
+        assert!(matches!(
+            commit_source_after_proof(&mut reg, &source.id, &source.name, 40, "completion-token"),
+            Response::Ok
+        ));
+
+        // Once the completion WAL exists, row-removal faults reconcile the
+        // live registry from disk before returning. Rename failure retains
+        // the row; SyncDir reply loss observes it absent. Either retry then
+        // removes the row and bytes without relying on the courtesy note.
+        for (index, point, row_after_fault) in
+            [(0, Point::Rename, true), (1, Point::SyncDir, false)]
+        {
+            let mut source = manifest_of(Vec::new()).instance;
+            source.name = format!("source-row-fault-{index}");
+            source.id = format!("source-row-fault-id-{index}");
+            let epoch = 42 + index;
+            let token = format!("source-row-token-{index}");
+            source.moving = Some(Moving {
+                to_device: "desktop".into(),
+                to_device_id: "target-id".into(),
+                epoch,
+                started_at: now_unix(),
+                token: token.clone(),
+                lane: 0,
+                coordinator_id: "coordinator-id".into(),
+                phase: MoveSourcePhase::Fenced,
+                live: false,
+            });
+            reg.adopt(source.clone()).unwrap();
+            reg.save().unwrap();
+            let source_dir = paths::instance_dir(&source.name);
+            std::fs::create_dir_all(&source_dir).unwrap();
+            std::fs::write(source_dir.join("disk.raw"), b"source bytes").unwrap();
+            save_source_completion(&SourceCompletion {
+                version: 1,
+                instance_id: source.id.clone(),
+                name: source.name.clone(),
+                to_device: "desktop".into(),
+                epoch,
+                token: token.clone(),
+            })
+            .unwrap();
+            let armed = faults::arm_once(
+                if index == 0 {
+                    "source-row-rename"
+                } else {
+                    "source-row-sync"
+                },
+                point,
+                if index == 0 {
+                    state.display().to_string()
+                } else {
+                    home.path().display().to_string()
+                },
+                io::ErrorKind::Other,
+            );
+            assert!(matches!(
+                commit_source_after_proof(&mut reg, &source.id, &source.name, epoch, &token,),
+                Response::Error { .. }
+            ));
+            drop(armed);
+            assert_eq!(reg.get(&source.name).is_ok(), row_after_fault);
+            assert!(
+                load_source_completion(&source.id, &source.name, epoch, &token)
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(matches!(
+                commit_source_after_proof(&mut reg, &source.id, &source.name, epoch, &token,),
+                Response::Ok
+            ));
+            assert!(reg.get(&source.name).is_err());
+            assert!(!source_dir.exists());
+        }
+
+        // An abort consumes its epoch on the source. A retry therefore gets
+        // a distinct authority key and fresh token; stale frames keep
+        // replaying the old Aborted winner without poisoning the new attempt.
+        let mut retry_source = manifest_of(Vec::new()).instance;
+        retry_source.name = "abort-retry".into();
+        retry_source.id = "abort-retry-id".into();
+        retry_source.moving = Some(Moving {
+            to_device: "desktop".into(),
+            to_device_id: "target-id".into(),
+            epoch: 50,
+            started_at: now_unix(),
+            token: "old-token".into(),
+            lane: initial_lane(),
+            coordinator_id: "coordinator-id".into(),
+            phase: MoveSourcePhase::Fenced,
+            live: true,
+        });
+        reg.adopt(retry_source.clone()).unwrap();
+        persist_source_abort(&mut reg, &retry_source.name, 50).unwrap();
+        persist_source_abort(&mut reg, &retry_source.name, 50).unwrap();
+        assert_eq!(reg.get(&retry_source.name).unwrap().move_epoch, 50);
+        let mut next = reg.get(&retry_source.name).unwrap().clone();
+        next.moving = Some(Moving {
+            to_device: "desktop".into(),
+            to_device_id: "target-id".into(),
+            epoch: 51,
+            started_at: now_unix(),
+            token: "new-token".into(),
+            lane: initial_lane(),
+            coordinator_id: "coordinator-id".into(),
+            phase: MoveSourcePhase::Fenced,
+            live: true,
+        });
+        reg.set_moving(&next.name, next.moving.clone()).unwrap();
+        reg.save().unwrap();
+        let mut old_manifest = manifest_of(Vec::new());
+        old_manifest.instance.name = retry_source.name.clone();
+        old_manifest.instance.id = retry_source.id.clone();
+        let mut old = txn(&old_manifest, 50, MoveAuthorityPhase::Aborted);
+        old.live = true;
+        old.token = "old-token".into();
+        save_authority(&old).unwrap();
+        let mut new = txn(&old_manifest, 51, MoveAuthorityPhase::Prepared);
+        new.live = true;
+        new.token = "new-token".into();
+        save_authority(&new).unwrap();
+        assert!(matches!(
+            with_authority_txn(|| reserve_target(
+                &reg,
+                &retry_source.id,
+                &retry_source.name,
+                51,
+                "new-token"
+            )),
+            Response::MoveAuthority {
+                phase: MoveAuthorityPhase::Reserved,
+                ..
+            }
+        ));
+        assert!(matches!(
+            with_authority_txn(|| reserve_target(
+                &reg,
+                &retry_source.id,
+                &retry_source.name,
+                50,
+                "old-token"
+            )),
+            Response::MoveAuthority {
+                phase: MoveAuthorityPhase::Aborted,
+                ..
+            }
+        ));
+
+        for (index, point, moving_after_fault) in
+            [(0, Point::Rename, true), (1, Point::SyncDir, false)]
+        {
+            let mut source = manifest_of(Vec::new()).instance;
+            source.name = format!("source-abort-fault-{index}");
+            source.id = format!("source-abort-fault-id-{index}");
+            let epoch = 52 + index;
+            source.moving = Some(Moving {
+                to_device: "desktop".into(),
+                to_device_id: "target-id".into(),
+                epoch,
+                started_at: now_unix(),
+                token: format!("source-abort-token-{index}"),
+                lane: initial_lane(),
+                coordinator_id: "coordinator-id".into(),
+                phase: MoveSourcePhase::Fenced,
+                live: true,
+            });
+            reg.adopt(source.clone()).unwrap();
+            reg.save().unwrap();
+            let armed = faults::arm_once(
+                if index == 0 {
+                    "source-abort-rename"
+                } else {
+                    "source-abort-sync"
+                },
+                point,
+                if index == 0 {
+                    state.display().to_string()
+                } else {
+                    home.path().display().to_string()
+                },
+                io::ErrorKind::Other,
+            );
+            assert!(persist_source_abort(&mut reg, &source.name, epoch).is_err());
+            drop(armed);
+            let durable = reg.get(&source.name).unwrap();
+            assert_eq!(durable.moving.is_some(), moving_after_fault);
+            assert_eq!(
+                durable.move_epoch,
+                if moving_after_fault { 0 } else { epoch }
+            );
+            persist_source_abort(&mut reg, &source.name, epoch).unwrap();
+            assert!(reg.get(&source.name).unwrap().moving.is_none());
+            assert_eq!(reg.get(&source.name).unwrap().move_epoch, epoch);
+        }
+
+        // A name/epoch has one target transaction even when a stale frame
+        // changes the instance id (and therefore the authority filename).
+        // The staged receipt independently binds id/epoch/token, so neither
+        // commit nor the legacy no-WAL abort path can mutate another attempt.
+        let mut stale_manifest = manifest_of(Vec::new());
+        stale_manifest.instance.name = "stale-frame-matrix".into();
+        stale_manifest.instance.id = "stale-frame-winner-id".into();
+        let stale_epoch = 60;
+        staged(&stale_manifest, stale_epoch);
+        let mut stale_authority = txn(&stale_manifest, stale_epoch, MoveAuthorityPhase::Reserved);
+        stale_authority.live = true;
+        save_authority(&stale_authority).unwrap();
+        assert_eq!(
+            load_authority_for_name_epoch(&stale_manifest.instance.name, stale_epoch)
+                .unwrap()
+                .unwrap()
+                .instance_id,
+            stale_manifest.instance.id
+        );
+        let mut wrong_manifest = stale_manifest.clone();
+        wrong_manifest.instance.id = "stale-frame-wrong-id".into();
+        assert!(matches!(
+            commit_target(&mut reg, &wrong_manifest, stale_epoch, "token", "desktop",),
+            Response::Error { .. }
+        ));
+        assert!(staging_dir(&stale_manifest.instance.name, stale_epoch).exists());
+        assert!(matches!(
+            abort_target(
+                &mut reg,
+                &wrong_manifest.instance.id,
+                &stale_manifest.instance.name,
+                stale_epoch,
+                "token",
+            ),
+            Response::Error { .. }
+        ));
+        assert!(matches!(
+            abort_target(
+                &mut reg,
+                &stale_manifest.instance.id,
+                &stale_manifest.instance.name,
+                stale_epoch,
+                "wrong-token",
+            ),
+            Response::Error { .. }
+        ));
+        assert!(staging_dir(&stale_manifest.instance.name, stale_epoch).exists());
+
+        let mut offline_stale = manifest_of(Vec::new());
+        offline_stale.instance.name = "offline-stale-abort".into();
+        offline_stale.instance.id = "offline-stale-abort-id".into();
+        let offline_stale_epoch = 61;
+        staged(&offline_stale, offline_stale_epoch);
+        assert!(matches!(
+            abort_target(
+                &mut reg,
+                &offline_stale.instance.id,
+                &offline_stale.instance.name,
+                offline_stale_epoch,
+                "wrong-token",
+            ),
+            Response::Error { .. }
+        ));
+        assert!(staging_dir(&offline_stale.instance.name, offline_stale_epoch).exists());
+        assert!(matches!(
+            abort_target(
+                &mut reg,
+                &offline_stale.instance.id,
+                &offline_stale.instance.name,
+                offline_stale_epoch,
+                "token",
+            ),
+            Response::Ok
+        ));
+        assert!(!staging_dir(&offline_stale.instance.name, offline_stale_epoch).exists());
+
+        // Every target-side RPC and both live bulk splice authorizers reject
+        // stale identity components before process or filesystem mutation.
+        let id = &stale_manifest.instance.id;
+        let name = &stale_manifest.instance.name;
+        for response in [
+            prepare_disk_target("wrong-id", name, stale_epoch, "token"),
+            prepare_disk_target(id, "wrong-name", stale_epoch, "token"),
+            prepare_disk_target(id, name, stale_epoch + 1, "token"),
+            prepare_disk_target(id, name, stale_epoch, "wrong-token"),
+            disk_ready_target("wrong-id", name, stale_epoch, "token"),
+            disk_ready_target(id, "wrong-name", stale_epoch, "token"),
+            disk_ready_target(id, name, stale_epoch + 1, "token"),
+            disk_ready_target(id, name, stale_epoch, "wrong-token"),
+            reserve_target(&reg, "wrong-id", name, stale_epoch, "token"),
+            reserve_target(&reg, id, "wrong-name", stale_epoch, "token"),
+            reserve_target(&reg, id, name, stale_epoch + 1, "token"),
+            reserve_target(&reg, id, name, stale_epoch, "wrong-token"),
+            recover_target(&reg, "wrong-id", name, stale_epoch, "token", 1),
+            recover_target(&reg, id, "wrong-name", stale_epoch, "token", 1),
+            recover_target(&reg, id, name, stale_epoch + 1, "token", 1),
+            recover_target(&reg, id, name, stale_epoch, "wrong-token", 1),
+            target_status(&mut reg, "wrong-id", name, stale_epoch, "token", "desktop"),
+            target_status(&mut reg, id, "wrong-name", stale_epoch, "token", "desktop"),
+            target_status(&mut reg, id, name, stale_epoch + 1, "token", "desktop"),
+            target_status(&mut reg, id, name, stale_epoch, "wrong-token", "desktop"),
+        ] {
+            assert!(matches!(response, Response::Error { .. }), "{response:?}");
+        }
+        for result in [
+            authorize_live_splice(
+                "wrong-id",
+                name,
+                stale_epoch,
+                "laptop",
+                "source-id",
+                "token",
+                initial_lane(),
+            ),
+            authorize_live_splice(
+                id,
+                "wrong-name",
+                stale_epoch,
+                "laptop",
+                "source-id",
+                "token",
+                initial_lane(),
+            ),
+            authorize_live_splice(
+                id,
+                name,
+                stale_epoch + 1,
+                "laptop",
+                "source-id",
+                "token",
+                initial_lane(),
+            ),
+            authorize_live_splice(
+                id,
+                name,
+                stale_epoch,
+                "wrong-device",
+                "source-id",
+                "token",
+                initial_lane(),
+            ),
+            authorize_live_splice(
+                id,
+                name,
+                stale_epoch,
+                "laptop",
+                "wrong-device-id",
+                "token",
+                initial_lane(),
+            ),
+            authorize_live_splice(
+                id,
+                name,
+                stale_epoch,
+                "laptop",
+                "source-id",
+                "wrong-token",
+                initial_lane(),
+            ),
+            authorize_live_splice(
+                id,
+                name,
+                stale_epoch,
+                "laptop",
+                "source-id",
+                "token",
+                initial_lane() + 1,
+            ),
+            authorize_disk_splice(
+                "wrong-id",
+                name,
+                stale_epoch,
+                "token",
+                "laptop",
+                "source-id",
+                initial_lane(),
+            )
+            .map(|_| ()),
+            authorize_disk_splice(
+                id,
+                "wrong-name",
+                stale_epoch,
+                "token",
+                "laptop",
+                "source-id",
+                initial_lane(),
+            )
+            .map(|_| ()),
+            authorize_disk_splice(
+                id,
+                name,
+                stale_epoch + 1,
+                "token",
+                "laptop",
+                "source-id",
+                initial_lane(),
+            )
+            .map(|_| ()),
+            authorize_disk_splice(
+                id,
+                name,
+                stale_epoch,
+                "wrong-token",
+                "laptop",
+                "source-id",
+                initial_lane(),
+            )
+            .map(|_| ()),
+            authorize_disk_splice(
+                id,
+                name,
+                stale_epoch,
+                "token",
+                "wrong-device",
+                "source-id",
+                initial_lane(),
+            )
+            .map(|_| ()),
+            authorize_disk_splice(
+                id,
+                name,
+                stale_epoch,
+                "token",
+                "laptop",
+                "wrong-device-id",
+                initial_lane(),
+            )
+            .map(|_| ()),
+            authorize_disk_splice(
+                id,
+                name,
+                stale_epoch,
+                "token",
+                "laptop",
+                "source-id",
+                initial_lane() + 1,
+            )
+            .map(|_| ()),
+        ] {
+            assert!(result.is_err());
+        }
+        assert!(authorize_live_splice(
+            id,
+            name,
+            stale_epoch,
+            "laptop",
+            "source-id",
+            "token",
+            initial_lane(),
+        )
+        .is_ok());
+        let correct_disk = authorize_disk_splice(
+            id,
+            name,
+            stale_epoch,
+            "token",
+            "laptop",
+            "source-id",
+            initial_lane(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(correct_disk.contains("absent or dead"), "{correct_disk}");
+
+        let mut import_manifest = manifest_of(Vec::new());
+        import_manifest.instance.name = "live-import-fence".into();
+        import_manifest.instance.id = "live-import-fence-id".into();
+        let import_epoch = 62;
+        let mut import_authority = txn(&import_manifest, import_epoch, MoveAuthorityPhase::Intent);
+        import_authority.live = true;
+        save_authority(&import_authority).unwrap();
+        assert!(authorize_live_import(
+            &import_manifest,
+            import_epoch,
+            "token",
+            "laptop",
+            "source-id",
+        )
+        .is_ok());
+        let mut wrong_import = import_manifest.clone();
+        wrong_import.instance.id = "wrong-import-id".into();
+        for result in [
+            authorize_live_import(&wrong_import, import_epoch, "token", "laptop", "source-id"),
+            authorize_live_import(
+                &import_manifest,
+                import_epoch + 1,
+                "token",
+                "laptop",
+                "source-id",
+            ),
+            authorize_live_import(
+                &import_manifest,
+                import_epoch,
+                "wrong-token",
+                "laptop",
+                "source-id",
+            ),
+            authorize_live_import(
+                &import_manifest,
+                import_epoch,
+                "token",
+                "wrong-source",
+                "source-id",
+            ),
+            authorize_live_import(
+                &import_manifest,
+                import_epoch,
+                "token",
+                "laptop",
+                "wrong-source-id",
+            ),
+        ] {
+            assert!(result.is_err());
+        }
+        let import_staging = staging_dir(&import_manifest.instance.name, import_epoch);
+        std::fs::create_dir_all(&import_staging).unwrap();
+        let import_receipt = Receipt {
+            instance_id: import_manifest.instance.id.clone(),
+            epoch: import_epoch,
+            token: "token".into(),
+            from_device: "laptop".into(),
+            bytes: 0,
+            files: BTreeMap::new(),
+        };
+        save_live_import_receipt(
+            &import_manifest,
+            import_epoch,
+            "token",
+            "laptop",
+            "source-id",
+            &import_receipt,
+        )
+        .unwrap();
+        std::fs::remove_file(Receipt::path(&import_staging)).unwrap();
+        import_authority.phase = MoveAuthorityPhase::Aborted;
+        save_authority(&import_authority).unwrap();
+        assert!(save_live_import_receipt(
+            &import_manifest,
+            import_epoch,
+            "token",
+            "laptop",
+            "source-id",
+            &import_receipt,
+        )
+        .is_err());
+        assert!(!Receipt::path(&import_staging).exists());
+        assert!(reg.get(&source.name).is_err());
+        assert!(
+            load_source_completion(&source.id, &source.name, 40, "completion-token")
+                .unwrap()
+                .is_some()
+        );
+
+        let stranded = SourceCompletion {
+            version: 1,
+            instance_id: "stranded-source-id".into(),
+            name: "stranded-source".into(),
+            to_device: "desktop".into(),
+            epoch: 41,
+            token: "stranded-token".into(),
+        };
+        save_source_completion(&stranded).unwrap();
+        let stranded_dir = paths::instance_dir(&stranded.name);
+        std::fs::create_dir_all(&stranded_dir).unwrap();
+        std::fs::write(stranded_dir.join("disk.raw"), b"left after row save").unwrap();
+        assert!(matches!(
+            commit_source_after_proof(
+                &mut reg,
+                &stranded.instance_id,
+                &stranded.name,
+                stranded.epoch,
+                &stranded.token
+            ),
+            Response::Ok
+        ));
+        assert!(!stranded_dir.exists());
+        let _ = std::fs::remove_file(notes_path());
+        assert!(matches!(
+            commit_source_after_proof(
+                &mut reg,
+                &stranded.instance_id,
+                &stranded.name,
+                stranded.epoch,
+                &stranded.token
+            ),
+            Response::Ok
+        ));
+
+        // Failure after the directory rename but before the registry row:
+        // the immutable marker turns the published tree back into a row.
+        let first = manifest_of(Vec::new());
+        let first_epoch = 1;
+        staged(&first, first_epoch);
+        save_authority(&txn(&first, first_epoch, MoveAuthorityPhase::Prepared)).unwrap();
+        let state_filter = state.display().to_string();
+        let armed = faults::arm_once(
+            "move-row-after-publish",
+            Point::Rename,
+            state_filter,
+            io::ErrorKind::Other,
+        );
+        let failed = commit_target(&mut reg, &first, first_epoch, "token", "desktop");
+        assert!(matches!(failed, Response::Error { .. }), "{failed:?}");
+        drop(armed);
+        assert!(paths::instance_dir("dev").is_dir());
+        assert!(published_for(
+            &load_authority(&first.instance.id, first_epoch)
+                .unwrap()
+                .unwrap()
+        ));
+
+        let mut restarted = Shard::load(&state).unwrap();
+        assert!(restarted.get("dev").is_err(), "the row save was injected");
+        let recovered = target_status(
+            &mut restarted,
+            &first.instance.id,
+            "dev",
+            first_epoch,
+            "token",
+            "desktop",
+        );
+        assert!(matches!(
+            recovered,
+            Response::MoveAuthority {
+                phase: MoveAuthorityPhase::Committed,
+                ..
+            }
+        ));
+        assert_eq!(restarted.get("dev").unwrap().move_epoch, first_epoch);
+        assert!(
+            !paths::instance_dir("dev").join(LIVE_AUTHORITY).exists(),
+            "the committed WAL supersedes the in-tree recovery marker"
+        );
+        assert!(matches!(
+            commit_target(&mut restarted, &first, first_epoch, "token", "desktop"),
+            Response::Instance { .. }
+        ));
+
+        // Failure after the row save but before the WAL says Committed: a
+        // query replays Committing and the conditional abort cannot win.
+        let mut second = manifest_of(Vec::new());
+        second.instance.name = "dev-two".into();
+        second.instance.id = "instance-two".into();
+        let second_epoch = 4;
+        staged(&second, second_epoch);
+        let mut second_txn = txn(&second, second_epoch, MoveAuthorityPhase::Committing);
+        save_authority(&second_txn).unwrap();
+        let wal_filter = authority_key(&second.instance.id, second_epoch);
+        let armed = faults::arm_once(
+            "move-wal-after-row",
+            Point::Rename,
+            wal_filter,
+            io::ErrorKind::Other,
+        );
+        assert!(finish_target_commit(&mut restarted, &mut second_txn, "desktop").is_err());
+        drop(armed);
+        let mut restarted = Shard::load(&state).unwrap();
+        assert_eq!(restarted.get("dev-two").unwrap().move_epoch, second_epoch);
+        assert_eq!(
+            load_authority(&second.instance.id, second_epoch)
+                .unwrap()
+                .unwrap()
+                .phase,
+            MoveAuthorityPhase::Committing
+        );
+        assert!(matches!(
+            abort_target(
+                &mut restarted,
+                &second.instance.id,
+                "dev-two",
+                second_epoch,
+                "token"
+            ),
+            Response::MoveAuthority {
+                phase: MoveAuthorityPhase::Committing,
+                ..
+            }
+        ));
+        assert!(matches!(
+            target_status(
+                &mut restarted,
+                &second.instance.id,
+                "dev-two",
+                second_epoch,
+                "token",
+                "desktop"
+            ),
+            Response::MoveAuthority {
+                phase: MoveAuthorityPhase::Committed,
+                ..
+            }
+        ));
+
+        // Before publication, abort is durable and replayable. A directory
+        // with the same human name but no matching id/epoch marker does not
+        // impersonate this transaction.
+        let mut third = manifest_of(Vec::new());
+        third.instance.name = "claimed-name".into();
+        third.instance.id = "instance-three".into();
+        let third_epoch = 2;
+        staged(&third, third_epoch);
+        let mut third_txn = txn(&third, third_epoch, MoveAuthorityPhase::Prepared);
+        third_txn.live = true;
+        save_authority(&third_txn).unwrap();
+        std::fs::create_dir_all(paths::instance_dir("claimed-name")).unwrap();
+        assert!(authorize_live_splice(
+            &third.instance.id,
+            "claimed-name",
+            third_epoch,
+            "laptop",
+            "source-id",
+            "token",
+            initial_lane()
+        )
+        .is_ok());
+        assert!(authorize_live_splice(
+            &third.instance.id,
+            "claimed-name",
+            third_epoch,
+            "laptop",
+            "impostor-id",
+            "token",
+            initial_lane()
+        )
+        .is_err());
+        let mut mismatched = third.clone();
+        mismatched.instance.name = "other-name".into();
+        assert!(validate_target_replay(
+            &third_txn,
+            &mismatched,
+            third_epoch,
+            "laptop",
+            "source-id",
+            "token",
+            None,
+        )
+        .is_err());
+        assert!(validate_target_replay(
+            &third_txn,
+            &third,
+            third_epoch,
+            "laptop",
+            "source-id",
+            "token",
+            Some("wrong-coordinator-id"),
+        )
+        .is_err());
+        assert!(matches!(
+            abort_target(
+                &mut restarted,
+                &third.instance.id,
+                "claimed-name",
+                third_epoch,
+                "token"
+            ),
+            Response::MoveAuthority {
+                phase: MoveAuthorityPhase::Aborted,
+                ..
+            }
+        ));
+        assert!(!staging_dir("claimed-name", third_epoch).exists());
+        assert!(
+            paths::instance_dir("claimed-name").is_dir(),
+            "conditional abort must not remove an unrelated live tree"
+        );
+        assert!(matches!(
+            abort_target(
+                &mut restarted,
+                &third.instance.id,
+                "claimed-name",
+                third_epoch,
+                "token"
+            ),
+            Response::MoveAuthority {
+                phase: MoveAuthorityPhase::Aborted,
+                ..
+            }
+        ));
+        assert_ne!(
+            authority_path(&third.instance.id, third_epoch),
+            authority_path(&third.instance.id, third_epoch + 1),
+            "authority is keyed by immutable id and epoch"
+        );
+
+        // A matching higher-epoch row is not sufficient completion proof for
+        // a live move. Under either restart policy, a dead handle keeps the
+        // WAL at Committing and source deletion remains forbidden.
+        for (index, restart) in [
+            (0, asterism_core::instance::Restart::Always),
+            (1, asterism_core::instance::Restart::Never),
+        ] {
+            let mut manifest = manifest_of(Vec::new());
+            manifest.instance.name = format!("dead-committing-{index}");
+            manifest.instance.id = format!("dead-committing-id-{index}");
+            manifest.instance.status = Status::Running;
+            manifest.instance.policy.restart = restart;
+            let epoch = 70 + index;
+            staged(&manifest, epoch);
+            let dead_handle = Handle {
+                backend: "qemu".into(),
+                pid: None,
+                proc: None,
+                ctl: ControlChannel::Qmp {
+                    path: home.path().join(format!("dead-qmp-{index}.sock")),
+                },
+                endpoint: asterism_core::hv::GuestEndpoint::HostForward { ssh_port: 0 },
+                started_at: now_unix(),
+            };
+            let mut authority = txn(&manifest, epoch, MoveAuthorityPhase::Committing);
+            authority.live = true;
+            authority.handle = Some(dead_handle.clone());
+            save_authority(&authority).unwrap();
+            let staging = staging_dir(&manifest.instance.name, epoch);
+            save_authority_marker(&staging, &authority).unwrap();
+            durable::publish_dir(&staging, &paths::instance_dir(&manifest.instance.name)).unwrap();
+            let mut row = manifest.instance.clone();
+            row.cpu_device = "desktop".into();
+            row.handle = Some(dead_handle);
+            row.move_epoch = epoch;
+            restarted.adopt(row).unwrap();
+            restarted.save().unwrap();
+            assert!(matches!(
+                target_status(
+                    &mut restarted,
+                    &manifest.instance.id,
+                    &manifest.instance.name,
+                    epoch,
+                    "token",
+                    "desktop",
+                ),
+                Response::Error { .. }
+            ));
+            assert_eq!(
+                load_authority(&manifest.instance.id, epoch)
+                    .unwrap()
+                    .unwrap()
+                    .phase,
+                MoveAuthorityPhase::Committing
+            );
+        }
+
+        // An offline or protocol-5 abort has no authority WAL. It still
+        // removes exactly its staging epoch and returns the old response.
+        let legacy_epoch = 9;
+        let legacy = staging_dir("legacy", legacy_epoch);
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("partial"), b"bytes").unwrap();
+        assert!(matches!(
+            abort_target(&mut restarted, "", "legacy", legacy_epoch, "token"),
+            Response::Ok
+        ));
+        assert!(!legacy.exists());
+
+        // Runtime-shortened QMP sockets do not move with a directory rename;
+        // ordinary sockets inside staging do.
+        let stage = PathBuf::from("/state/instances/dev.moving-1");
+        assert_eq!(
+            qmp_path_after_publish(&stage.join("qmp.sock"), &stage, "dev"),
+            paths::qmp_socket_path("dev")
+        );
+        let shortened = PathBuf::from("/runtime/0123456789abcdef.sock");
+        assert_eq!(qmp_path_after_publish(&shortened, &stage, "dev"), shortened);
     }
 }

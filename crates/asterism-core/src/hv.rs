@@ -612,6 +612,23 @@ pub struct MigrationSource {
     pub url: String,
 }
 
+/// Target of a live root-disk mirror. The backend sees an ordinary NBD URL;
+/// orchestration may carry the connection across the orbit mesh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationDiskTarget {
+    pub url: String,
+}
+
+/// Durable identity of the process exporting the staged target disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationDiskExport {
+    pub socket: PathBuf,
+    #[serde(default)]
+    pub monitor: PathBuf,
+    pub export: String,
+    pub proc: crate::proc::ProcId,
+}
+
 /// Total budget `stop()` has to get a guest down before it is killed.
 /// Split three ways: a graceful request, then SIGTERM, then SIGKILL.
 pub const STOP_DEADLINE: Duration = Duration::from_secs(40);
@@ -737,6 +754,81 @@ pub trait Hypervisor: Send + Sync {
     /// Gated on [`Caps::live_migration`].
     fn migrate_in(&self, _req: &BootReq, _from: MigrationSource) -> Result<Handle> {
         unsupported(self.id(), "receive a migrating guest")
+    }
+
+    /// Export the staged root disk for a source-side dirty block mirror.
+    fn migration_disk_export(&self, _req: &BootReq) -> Result<MigrationDiskExport> {
+        unsupported(self.id(), "export a live migration target disk")
+    }
+
+    /// Stop a target disk export after the mirror stream has drained.
+    fn migration_disk_export_stop(&self, _export: &MigrationDiskExport) -> Result<()> {
+        unsupported(self.id(), "stop a live migration target disk export")
+    }
+
+    /// Start a full dirty-tracked mirror and wait until it reaches READY.
+    fn migration_disk_mirror(&self, _h: &Handle, _to: MigrationDiskTarget) -> Result<()> {
+        unsupported(self.id(), "mirror a running root disk")
+    }
+
+    /// Verify the block job is at its READY convergence boundary.
+    fn migration_disk_ready(&self, _h: &Handle) -> Result<()> {
+        unsupported(self.id(), "verify a running root-disk mirror")
+    }
+
+    /// Verify RAM/device migration is paused at pre-switchover.
+    fn migration_source_ready(&self, _h: &Handle) -> Result<()> {
+        unsupported(self.id(), "verify a live migration switchover boundary")
+    }
+
+    /// Cut a READY mirror at a point in time and close its NBD node.
+    fn migration_disk_commit(&self, _h: &Handle) -> Result<()> {
+        unsupported(self.id(), "commit a running root-disk mirror")
+    }
+
+    /// Cancel a mirror that never crossed the source commit marker.
+    fn migration_disk_abort(&self, _h: &Handle) -> Result<()> {
+        unsupported(self.id(), "abort a running root-disk mirror")
+    }
+
+    /// Release a source paused at the backend's switchover boundary after
+    /// the target authority record is durable.
+    fn migration_commit(&self, _h: &Handle) -> Result<()> {
+        unsupported(self.id(), "commit a live migration")
+    }
+
+    /// Cancel a source paused at switchover and resume it after the target
+    /// staging guest has been discarded.
+    fn migration_abort(&self, _h: &Handle) -> Result<()> {
+        unsupported(self.id(), "abort a live migration")
+    }
+
+    /// Cancel a failed/incomplete source lane while keeping the guest
+    /// stopped. Unlike migration abort, this is used after the durable source
+    /// marker and must never resume source execution.
+    fn migration_source_reset(&self, _h: &Handle) -> Result<()> {
+        unsupported(self.id(), "reset a committed live migration source")
+    }
+
+    /// Gate target publication on its own incoming backend, not the source's
+    /// observation that bytes were handed to a socket.
+    fn migration_target_complete(&self, _h: &Handle) -> Result<()> {
+        unsupported(self.id(), "prove an incoming migration completed")
+    }
+
+    /// Fence an uncommitted incoming guest through the deterministic control
+    /// endpoint in its staging directory. This closes the launch-to-handle
+    /// WAL window: recovery can stop the exact backend even if no [`Handle`]
+    /// was returned to the daemon before it crashed.
+    fn migration_target_abort(&self, _req: &BootReq) -> Result<()> {
+        unsupported(self.id(), "abort an uncommitted incoming migration target")
+    }
+
+    /// Fence only the incoming RAM/device-state backend while preserving the
+    /// staged disk exporter. Used to rebuild a token-bound stream lane after
+    /// a daemon crash without discarding a completed disk mirror.
+    fn migration_target_reset(&self, _req: &BootReq) -> Result<()> {
+        unsupported(self.id(), "reset an incoming migration target")
     }
 }
 
