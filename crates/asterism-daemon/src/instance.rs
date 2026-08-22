@@ -44,6 +44,10 @@ use crate::{backend, egress, persist, swap, volume, Node};
 /// door, and that is the whole reason no command needed a second
 /// implementation to be answerable from anywhere in the orbit.
 pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Response {
+    let refresh_exit = matches!(
+        &req,
+        Request::AttachExitPoint { .. } | Request::DetachExitPoint { .. }
+    );
     // Reads answer straight from memory; mutations persist before replying.
     let mutation = match req {
         // The version handshake, answered here rather than earlier on purpose:
@@ -150,6 +154,13 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             // is a great deal better than an instance that cannot be deleted
             // because a NAS is asleep.
             if let Ok(inst) = reg.get(&name).cloned() {
+                if let Err(error) = crate::exit_point::revoke(&inst).await {
+                    return Response::Error {
+                        message: format!(
+                            "revoking network-exit grants before removing {name:?}: {error:#}"
+                        ),
+                    };
+                }
                 volume::take_down(&name).await;
                 crate::exit_point::take_down(&name);
                 volume::release_all(&inst).await;
@@ -238,8 +249,8 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             .await
         }
         Request::DetachSecret { name, secret } => detach_secret(reg, &name, &secret),
-        Request::AttachExitPoint { name, exit } => attach_exit_point(reg, &name, *exit),
-        Request::DetachExitPoint { name } => detach_exit_point(reg, &name),
+        Request::AttachExitPoint { name, exit } => attach_exit_point(reg, &name, *exit).await,
+        Request::DetachExitPoint { name } => detach_exit_point(reg, &name).await,
         Request::BackupExport { name, destination } => {
             let exported = reg.get(&name).cloned().and_then(|inst| {
                 let provenance = backup::image_provenance(&inst)?;
@@ -282,9 +293,28 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
     match mutation {
         Ok(instance) => {
             if let Err(e) = reg.save() {
+                if refresh_exit {
+                    if let Ok(reloaded) = Shard::load(&paths::state_path()) {
+                        *reg = reloaded;
+                        if let Ok(previous) = reg.get(&instance.name).cloned() {
+                            let _ = crate::exit_point::activate(&previous).await;
+                            crate::exit_point::update(&previous.name, previous.exit_point.clone());
+                        }
+                    }
+                }
                 return Response::Error {
                     message: format!("saving registry: {e:#}"),
                 };
+            }
+            if refresh_exit {
+                crate::exit_point::update(&instance.name, instance.exit_point.clone());
+                if let Err(error) = crate::exit_point::activate(&instance).await {
+                    return Response::Error {
+                        message: format!(
+                            "exit policy is durable but remains failed closed until its provider grant activates: {error:#}"
+                        ),
+                    };
+                }
             }
             Response::Instance {
                 instance,
@@ -724,22 +754,24 @@ fn detach_secret(reg: &mut Shard, name: &str, secret: &str) -> Result<Instance> 
 /// Record a provider policy only when this instance's backend has the packet
 /// edge needed to enforce it. A running plane observes the new policy without
 /// changing either guest NIC.
-fn attach_exit_point(
+async fn attach_exit_point(
     reg: &mut Shard,
     name: &str,
     exit: asterism_core::network::ExitPoint,
 ) -> Result<Instance> {
     let current = reg.get(name)?.clone();
     backend::check_can_network(&current)?;
+    let exit = crate::exit_point::grant(&current, exit).await?;
+    crate::exit_point::stage_transition(&current, Some(&exit))?;
     let instance = reg.attach_exit_point(name, exit)?;
-    crate::exit_point::update(name, instance.exit_point.clone());
     Ok(instance)
 }
 
 /// Restore CPU-device egress behind the same stable guest edge.
-fn detach_exit_point(reg: &mut Shard, name: &str) -> Result<Instance> {
+async fn detach_exit_point(reg: &mut Shard, name: &str) -> Result<Instance> {
+    let current = reg.get(name)?.clone();
+    crate::exit_point::stage_transition(&current, None)?;
     let instance = reg.detach_exit_point(name)?;
-    crate::exit_point::update(name, None);
     Ok(instance)
 }
 

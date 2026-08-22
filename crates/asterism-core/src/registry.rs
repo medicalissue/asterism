@@ -733,6 +733,7 @@ mod tests {
                 path: "/tmp/qmp.sock".into(),
             },
             endpoint: GuestEndpoint::HostForward { ssh_port },
+            packet_edge_generation: None,
             started_at: 1_700_000_000,
         }
     }

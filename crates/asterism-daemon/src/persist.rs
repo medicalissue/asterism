@@ -47,6 +47,7 @@ use std::io::Write;
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use tokio::sync::Mutex;
 
 use asterism_core::hv::RunState;
@@ -70,6 +71,64 @@ const BACKOFF: [u64; 3] = [5, 30, 120];
 /// goes back to full, so a crash next week is not measured against a crash
 /// today.
 const STABLE: Duration = Duration::from_secs(300);
+
+/// Stop every live QEMU whose persisted handle does not prove that exact
+/// process was booted with the restricted Unix packet edge.
+///
+/// Main calls this before starting the mesh or local request loop. Failure is
+/// therefore a daemon-startup failure, not a warning beside a still-running
+/// bypass. `stop` may finish by merely sending SIGKILL, so liveness is
+/// verified and one explicit hard-kill retry is made before returning.
+pub async fn fence_legacy_packet_edges(registry: &Arc<Mutex<Shard>>) -> anyhow::Result<()> {
+    let mut reg = registry.lock().await;
+    let candidates: Vec<Instance> = reg
+        .list()
+        .into_iter()
+        .filter(|inst| inst.status == Status::Running && alive(inst))
+        .collect();
+    let mut changed = false;
+    for inst in candidates {
+        let hypervisor = backend::for_instance(&inst)?;
+        if !hypervisor.caps().guest_packet_network || crate::exit_point::restart_compatible(&inst) {
+            continue;
+        }
+        let handle = inst
+            .handle
+            .as_ref()
+            .context("legacy running guest has no backend handle")?;
+        eprintln!(
+            "astd: {} has an unproven legacy packet edge; security-fencing it before any service starts",
+            inst.name
+        );
+        if hypervisor.stop(handle, Duration::from_secs(30)).is_err() || alive(&inst) {
+            hypervisor
+                .kill(handle)
+                .with_context(|| format!("hard-fencing legacy guest {:?}", inst.name))?;
+        }
+        if let Some(proc) = handle.owned() {
+            let _ = proc.wait_gone(Duration::from_secs(5));
+        }
+        if alive(&inst) {
+            anyhow::bail!(
+                "SECURITY: legacy guest {:?} remains alive after stop and hard-kill; refusing to start services",
+                inst.name
+            );
+        }
+        if inst.policy.restart == Restart::Never {
+            reg.set_stopped(&inst.name)?;
+            append_to_console(
+                &inst.name,
+                "asterism: stopped once during the packet-edge security upgrade; restart manually with `ast up`",
+            )?;
+            changed = true;
+        }
+    }
+    if changed {
+        reg.save()
+            .context("saving registry after fencing legacy packet edges")?;
+    }
+    Ok(())
+}
 
 // ---- the watch table -------------------------------------------------------
 
@@ -180,7 +239,7 @@ fn note_alive(name: &str) {
 /// Per-instance failures are logged and the instance is handed to the
 /// supervisor. Nothing here aborts startup: a daemon that refuses to come
 /// up because one guest will not boot is worse than the guest being down.
-pub async fn resurrect(registry: &Arc<Mutex<Shard>>) {
+pub async fn resurrect(registry: &Arc<Mutex<Shard>>) -> anyhow::Result<()> {
     let mut reg = registry.lock().await;
     let recorded: Vec<Instance> = reg
         .list()
@@ -188,7 +247,7 @@ pub async fn resurrect(registry: &Arc<Mutex<Shard>>) {
         .filter(|i| i.status == Status::Running)
         .collect();
     if recorded.is_empty() {
-        return;
+        return Ok(());
     }
 
     for inst in recorded {
@@ -200,6 +259,14 @@ pub async fn resurrect(registry: &Arc<Mutex<Shard>>) {
         // an accept loop it runs, and both died with the last one, so the
         // guest is sitting there retrying a socket nothing is behind.
         if alive(&inst) {
+            let legacy_packet_edge = backend::for_instance(&inst)
+                .is_ok_and(|hypervisor| hypervisor.caps().guest_packet_network)
+                && !crate::exit_point::restart_compatible(&inst);
+            if legacy_packet_edge {
+                anyhow::bail!(
+                    "SECURITY: live guest {name:?} lost its handle-bound packet-edge proof after startup fencing; refusing resurrection"
+                );
+            }
             eprintln!(
                 "astd: {name} was already running ({}) and kept running",
                 inst.handle
@@ -208,6 +275,12 @@ pub async fn resurrect(registry: &Arc<Mutex<Shard>>) {
                     .map(|p| p.to_string())
                     .unwrap_or_else(|| "no process of its own".into())
             );
+            if let Err(error) = crate::exit_point::activate(&inst).await {
+                eprintln!("astd: reconciling exit grants for {name}: {error:#}");
+            }
+            if let Err(error) = crate::exit_point::reattach(&inst) {
+                eprintln!("astd: reattaching packet edge for {name}: {error:#}");
+            }
             crate::volume::reattach(&inst).await;
             continue;
         }
@@ -234,6 +307,7 @@ pub async fn resurrect(registry: &Arc<Mutex<Shard>>) {
     if let Err(e) = reg.save() {
         eprintln!("astd: saving the registry after resurrection: {e:#}");
     }
+    Ok(())
 }
 
 // ---- the supervisor --------------------------------------------------------
@@ -542,6 +616,7 @@ mod tests {
             endpoint: asterism_core::hv::GuestEndpoint::GuestAddr {
                 addr: "192.168.64.3".parse().unwrap(),
             },
+            packet_edge_generation: None,
             started_at: 0,
         });
         inst

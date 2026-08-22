@@ -23,6 +23,7 @@ use crate::device_shell::{
 use crate::hv::GuestHealth;
 use crate::image::{ImagePullResult, ImageRow};
 use crate::instance::{Instance, PortForward, Restart, Shape};
+use crate::network::{ExitProviderAction, ExitProviderStatus};
 use crate::orbit::{Device, DeviceStatus, WakeFacts};
 use crate::registry::OrbitRow;
 use crate::secret::Secret;
@@ -373,6 +374,10 @@ pub enum Request {
     DeviceShellPolicy {
         action: ShellPolicyAction,
     },
+    /// Local opt-in for serving attachment-scoped network exit grants.
+    ExitProviderPolicy {
+        action: ExitProviderAction,
+    },
     /// Round-trip a mesh stream to one device and time it.
     DevicePing {
         device: String,
@@ -683,6 +688,7 @@ impl Request {
             | Request::DeviceShellResize { .. }
             | Request::DeviceShellSignal { .. }
             | Request::DeviceShellClose => None,
+            Request::ExitProviderPolicy { .. } => None,
 
             // About devices, not instances. `ast device wake desktop` names a
             // device on purpose — it is the one command whose subject really
@@ -765,6 +771,7 @@ impl Request {
             Request::DeviceShellStatus => 5,
             Request::ImageList | Request::ImagePull { .. } => 6,
             Request::AttachExitPoint { .. } | Request::DetachExitPoint { .. } => 7,
+            Request::ExitProviderPolicy { .. } => 8,
             Request::DeviceShellPolicy { .. }
             | Request::DeviceShellOpen { .. }
             | Request::DeviceShellInput { .. }
@@ -795,6 +802,7 @@ impl Request {
             Request::AttachExitPoint { .. } | Request::DetachExitPoint { .. } => {
                 Some("network exit-point")
             }
+            Request::ExitProviderPolicy { .. } => Some("network exit provider policy"),
             Request::DeviceShellPolicy { .. }
             | Request::DeviceShellOpen { .. }
             | Request::DeviceShellInput { .. }
@@ -951,6 +959,9 @@ pub enum Response {
         status: ShellPolicyStatus,
         #[serde(default)]
         revoked: usize,
+    },
+    ExitProviderStatus {
+        status: ExitProviderStatus,
     },
     /// The first successful reply to [`Request::DeviceShellOpen`].
     DeviceShellAccepted {
@@ -1163,6 +1174,7 @@ impl Response {
             | Response::DeviceShellRefused { .. }
             | Response::DeviceShellOutput { .. }
             | Response::DeviceShellExit { .. } => 4,
+            Response::ExitProviderStatus { .. } => 8,
             _ => crate::compat::FIRST_PROTOCOL,
         }
     }
@@ -1221,6 +1233,19 @@ pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
             }
             .since(),
         ),
+        (
+            "network-exit-provider-policy",
+            Request::ExitProviderPolicy {
+                action: ExitProviderAction::Status,
+            }
+            .since(),
+        ),
+        ("exit_grant", 8),
+        ("exit_activate", 8),
+        ("exit_revoke", 8),
+        ("exit_probe", 8),
+        ("exit_tcp", 7),
+        ("exit_udp", 7),
     ]
     .into_iter()
     .map(|(name, version)| (name.to_owned(), version))
@@ -1450,7 +1475,18 @@ mod tests {
             Some(&4),
             "a protocol-3 backup daemon cannot parse device-shell variants"
         );
-        assert_eq!(table.get("network-exit-point"), Some(&6));
+        assert_eq!(table.get("network-exit-point"), Some(&7));
+        assert_eq!(table.get("network-exit-provider-policy"), Some(&8));
+        for frame in [
+            "exit_grant",
+            "exit_activate",
+            "exit_revoke",
+            "exit_probe",
+            "exit_tcp",
+            "exit_udp",
+        ] {
+            assert_eq!(table.get(frame), Some(&7));
+        }
         for (name, version) in &table {
             assert!(
                 *version > crate::compat::FIRST_PROTOCOL,

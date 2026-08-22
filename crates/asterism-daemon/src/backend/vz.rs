@@ -1601,6 +1601,7 @@ mod tests {
             endpoint: GuestEndpoint::GuestAddr {
                 addr: "192.168.64.3".parse().unwrap(),
             },
+            packet_edge_generation: None,
             started_at: 0,
         };
         assert!(hv.stop(&h, Duration::from_millis(1)).is_ok());
@@ -1710,6 +1711,7 @@ mod tests {
             endpoint: GuestEndpoint::GuestAddr {
                 addr: "192.168.64.3".parse().unwrap(),
             },
+            packet_edge_generation: None,
             started_at: 0,
         }
     }

@@ -110,7 +110,8 @@ use crate::VERSION;
 /// * **5** — mesh-safe, read-only device-shell policy status.
 /// * **6** — device-local structured image catalog and pull results.
 /// * **7** — attach/detach of the network exit-point part.
-pub const PROTOCOL_VERSION: u32 = 7;
+/// * **8** — exit-provider policy and grant-control frames.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// The wire as it was before it carried a version.
 ///
