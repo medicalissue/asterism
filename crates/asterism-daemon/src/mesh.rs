@@ -3595,6 +3595,14 @@ async fn serve_trusted_peer(mesh: Arc<Mesh>, connection: MeshConnection, node: N
 }
 
 /// Serves streams from one trusted peer until it goes away.
+#[derive(Clone)]
+struct Requester {
+    peer: DeviceId,
+    name: String,
+    device_id: String,
+    provider_device_id: String,
+}
+
 async fn serve_peer(
     connection: MeshConnection,
     node: Node,
@@ -3605,6 +3613,12 @@ async fn serve_peer(
 ) {
     let peer_id = connection.remote_device_id();
     let peer = peer_id.short();
+    let requester = Requester {
+        peer: peer_id,
+        name: requester_device,
+        device_id: requester_device_id,
+        provider_device_id,
+    };
     loop {
         let Ok(opening_slot) = Arc::clone(&capacity.opening).acquire_owned().await else {
             return;
@@ -3616,22 +3630,10 @@ async fn serve_peer(
         };
         let node = node.clone();
         let peer = peer.clone();
-        let requester_device = requester_device.clone();
-        let requester_device_id = requester_device_id.clone();
-        let provider_device_id = provider_device_id.clone();
+        let requester = requester.clone();
         let control_slots = capacity.control.clone();
         tokio::spawn(async move {
-            if let Err(e) = serve_stream(
-                stream,
-                node,
-                peer_id,
-                requester_device,
-                requester_device_id,
-                provider_device_id,
-                opening_slot,
-                control_slots,
-            )
-            .await
+            if let Err(e) = serve_stream(stream, node, requester, opening_slot, control_slots).await
             {
                 eprintln!("astd: mesh stream from {peer} failed: {e:#}");
             }
@@ -3644,10 +3646,7 @@ async fn serve_peer(
 async fn serve_stream(
     mut stream: asterism_mesh::MeshStream,
     node: Node,
-    peer: DeviceId,
-    requester_device: String,
-    requester_device_id: String,
-    provider_device_id: String,
+    requester: Requester,
     opening_slot: tokio::sync::OwnedSemaphorePermit,
     control_slots: Arc<Semaphore>,
 ) -> Result<()> {
@@ -3756,7 +3755,7 @@ async fn serve_stream(
         }
         MeshRequest::SshSplice { name } => return serve_splice(stream, &node, &name).await,
         MeshRequest::DeviceShell { open } => {
-            return crate::device_shell::serve_mesh(stream, peer, &node, open).await
+            return crate::device_shell::serve_mesh(stream, requester.peer, &node, open).await
         }
         MeshRequest::VolumeSplice {
             volume,
@@ -3768,8 +3767,8 @@ async fn serve_stream(
                 &volume,
                 &holder,
                 epoch,
-                &requester_device,
-                &requester_device_id,
+                &requester.name,
+                &requester.device_id,
             )
             .await
         }
@@ -3779,9 +3778,9 @@ async fn serve_stream(
             dns,
         } => {
             let grant = node.exit.grant(
-                &requester_device_id,
+                &requester.device_id,
                 &instance_id,
-                provider_device_id,
+                requester.provider_device_id.clone(),
                 routes,
                 dns,
             );
@@ -3799,7 +3798,7 @@ async fn serve_stream(
             generation,
         } => {
             let response = match node.exit.activate(
-                &requester_device_id,
+                &requester.device_id,
                 &instance_id,
                 generation,
             ) {
@@ -3815,7 +3814,7 @@ async fn serve_stream(
             generation,
         } => {
             let response = match node.exit.revoke(
-                &requester_device_id,
+                &requester.device_id,
                 &instance_id,
                 generation,
             ) {
@@ -3831,7 +3830,7 @@ async fn serve_stream(
             generation,
         } => match node
             .exit
-            .authorize(&requester_device_id, &instance_id, generation)
+            .authorize(&requester.device_id, &instance_id, generation)
         {
             Ok(lease) => MeshReply::ExitProbe {
                 dns_healthy: crate::exit_point::dns_healthy(lease.resolver()).await,
@@ -3850,7 +3849,7 @@ async fn serve_stream(
         } => {
             let lease = match node
                 .exit
-                .authorize(&requester_device_id, &instance_id, generation)
+                .authorize(&requester.device_id, &instance_id, generation)
             {
                 Ok(lease) => lease,
                 Err(error) => {
@@ -3883,7 +3882,7 @@ async fn serve_stream(
         } => {
             let lease = match node
                 .exit
-                .authorize(&requester_device_id, &instance_id, generation)
+                .authorize(&requester.device_id, &instance_id, generation)
             {
                 Ok(lease) => lease,
                 Err(error) => {
@@ -3973,8 +3972,8 @@ async fn serve_stream(
                 request if crate::volume::is_plane_request(&request) => {
                     crate::volume::serve_authenticated(
                         request,
-                        &requester_device,
-                        &requester_device_id,
+                        &requester.name,
+                        &requester.device_id,
                     )
                     .await
                 }
