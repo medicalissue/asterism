@@ -650,32 +650,50 @@ mod tests {
         /// instance-owned socket path.  The shell keeps the path as a plain
         /// argument; its short-lived `sleep` child receives only a valid
         /// duration, which works with both BSD and GNU `sleep`.
-        struct SocketArgFixture(Child);
+        struct SocketArgFixture {
+            child: Child,
+            exec: String,
+        }
 
         impl SocketArgFixture {
             fn spawn(socket: &Path) -> Self {
-                Self(
-                    Command::new("/bin/sh")
-                        .args([
-                            "-c",
-                            "while :; do sleep 1; done",
-                            "asterism-adoption-fixture",
-                        ])
-                        .arg(socket)
-                        .spawn()
-                        .unwrap(),
-                )
+                let child = Command::new("/bin/sh")
+                    .args([
+                        "-c",
+                        "while :; do sleep 1; done",
+                        "asterism-adoption-fixture",
+                    ])
+                    .arg(socket)
+                    .spawn()
+                    .unwrap();
+                // `/bin/sh` is an alias on some hosts (notably to `dash` on
+                // Linux). Adoption intentionally compares the executable
+                // identity exactly, so make this fixture expect what the
+                // kernel reports rather than weakening that product check.
+                let exec = ProcId::capture(child.id())
+                    .unwrap()
+                    .exec
+                    .expect("the fixture executable should be readable")
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("the fixture executable should have a UTF-8 name")
+                    .to_owned();
+                Self { child, exec }
             }
 
             fn id(&self) -> u32 {
-                self.0.id()
+                self.child.id()
+            }
+
+            fn exec(&self) -> &str {
+                &self.exec
             }
         }
 
         impl Drop for SocketArgFixture {
             fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
+                let _ = self.child.kill();
+                let _ = self.child.wait();
             }
         }
 
@@ -737,7 +755,7 @@ mod tests {
                 guest.id(),
                 handle.started_at,
                 &Evidence {
-                    exec: &["sh"],
+                    exec: &[guest.exec()],
                     names: &[&ctl],
                 },
             )
@@ -778,7 +796,7 @@ mod tests {
                     foreign.id(),
                     handle.started_at.saturating_sub(30),
                     &Evidence {
-                        exec: &["sh"],
+                        exec: &[foreign.exec()],
                         names: &[&paths::qmp_socket_path("ours")],
                     },
                 )
