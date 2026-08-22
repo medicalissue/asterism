@@ -84,6 +84,7 @@
   .state-line { display: flex; align-items: center; gap: 7px; margin-top: 7px; color: var(--color-text-secondary); font-size: 12px; }
   .separator-dot { color: var(--color-text-disabled); }
   .action-strip { display: flex; align-items: center; gap: 7px; margin-top: 24px; padding: 9px; border: var(--hairline); border-radius: 9px; background: var(--app-subtle); }
+  .operation-note { margin: 8px 2px 0; color: var(--color-text-secondary); font-size: 11px; overflow-wrap: anywhere; }
   .action-divider { width: 1px; height: 22px; margin: 0 2px; background: var(--color-border); }
   .facts-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px; margin-top: 22px; overflow: hidden; border: var(--hairline); border-radius: 9px; background: var(--color-border); }
   .fact { display: flex; min-width: 0; flex-direction: column; gap: 5px; padding: 12px 14px; background: var(--app-canvas); }
@@ -142,6 +143,11 @@
   .pair-body p { color: var(--color-text-secondary); font-size: 12px; line-height: 1.5; }
   .ticket-input { width: 100%; height: 110px; resize: none; padding: 10px; border: var(--hairline); border-radius: 7px; outline: 0; background: var(--app-subtle); color: var(--color-text-primary); font-size: 11px; user-select: text; }
   .ticket-input:focus { border-color: var(--color-accent); box-shadow: 0 0 0 2px var(--app-selected); }
+  .backup-form { display: flex; flex-direction: column; gap: 16px; }
+  .backup-form label { display: grid; gap: 7px; color: var(--color-text-secondary); font-size: 11px; font-weight: 600; }
+  .backup-form label small { font-weight: 400; }
+  .backup-form input { width: 100%; height: 36px; padding: 0 10px; border: var(--hairline); border-radius: 7px; outline: none; background: var(--app-subtle); color: var(--color-text-primary); user-select: text; }
+  .backup-form input:focus { border-color: var(--color-accent); box-shadow: 0 0 0 2px var(--app-selected); }
   .ticket-block { display: flex; width: 100%; align-items: center; gap: 8px; padding: 9px; border: var(--hairline); border-radius: 7px; background: var(--app-subtle); }
   .ticket-block code { flex: 1; overflow-wrap: anywhere; font-size: 10px; user-select: text; }
   .sas-code { font: 600 34px/1 var(--font-family-code); letter-spacing: .16em; color: var(--color-accent); user-select: text; }

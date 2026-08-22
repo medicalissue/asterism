@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
+use asterism_core::backup::{ExportReport, RestoreReport};
 use asterism_core::compat;
 use asterism_core::instance::{Instance, Shape};
 use asterism_core::orbit::DeviceStatus;
@@ -49,6 +50,9 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// `List`; on an orbit view it is a stopwatch that goes off before the
 /// answer arrives and reports a working daemon as unreachable.
 const ORBIT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Backups legitimately read and hash gigabytes. The operation itself is
+/// resumable; the UI should keep listening rather than manufacture a timeout.
+const BACKUP_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 /// Minimum gap between two attempts to start `astd` ourselves.
 const SPAWN_COOLDOWN: Duration = Duration::from_secs(15);
 
@@ -163,6 +167,45 @@ pub fn snapshot_restore(name: &str, tag: &str) -> Result<()> {
 pub fn logs(name: &str, lines: u32) -> Result<(String, bool)> {
     match send(&Request::Logs { name: name.to_owned(), lines })? {
         Response::Log { text, truncated } => Ok((text, truncated)),
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected reply from astd: {other:?}"),
+    }
+}
+
+pub fn backup(name: &str) -> Result<ExportReport> {
+    let destination = paths::home_dir()
+        .join("backups")
+        .join(format!("{}-{}", name, asterism_core::instance::now_unix()));
+    match send_with(
+        &Request::BackupExport {
+            name: name.to_owned(),
+            destination: destination.display().to_string(),
+        },
+        BACKUP_TIMEOUT,
+    )? {
+        Response::BackupExported { report } => Ok(report),
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected reply from astd: {other:?}"),
+    }
+}
+
+pub fn restore_backup(source: &str, name: Option<&str>) -> Result<RestoreReport> {
+    let source = std::path::PathBuf::from(source);
+    let source = if source.is_absolute() {
+        source
+    } else {
+        std::env::current_dir()?.join(source)
+    };
+    let manifest = asterism_core::backup::inspect(&source)?;
+    let name = name.filter(|name| !name.is_empty()).unwrap_or(&manifest.instance.name);
+    match send_with(
+        &Request::BackupImport {
+            source: source.display().to_string(),
+            name: name.to_owned(),
+        },
+        BACKUP_TIMEOUT,
+    )? {
+        Response::BackupRestored { report } => Ok(report),
         Response::Error { message } => bail!(message),
         other => bail!("unexpected reply from astd: {other:?}"),
     }

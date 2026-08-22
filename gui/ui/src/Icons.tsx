@@ -34,4 +34,4 @@ export const CopyIcon = (props: Props) => <Icon {...props}><rect x="5" y="5" wid
 export const ChevronIcon = (props: Props) => <Icon {...props}><path d="m6 3.5 4.5 4.5L6 12.5"/></Icon>;
 export const CloudIcon = (props: Props) => <Icon {...props}><path d="M4.2 12.5h7.2a2.6 2.6 0 0 0 .4-5.2A4 4 0 0 0 4.2 6 3.3 3.3 0 0 0 4.2 12.5Z"/></Icon>;
 export const BoxIcon = (props: Props) => <Icon {...props}><path d="m8 2 5.5 3v6L8 14l-5.5-3V5L8 2Z"/><path d="m2.5 5 5.5 3 5.5-3M8 8v6"/></Icon>;
-
+export const BackupIcon = (props: Props) => <Icon {...props}><path d="M3 3.5h8l2 2V13H3V3.5Z"/><path d="M5 3.5v3h5v-3M5.5 13V9h5v4"/></Icon>;

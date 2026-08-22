@@ -64,11 +64,16 @@ ms() { python3 -c "import sys; print(int((float(sys.argv[1])-float(sys.argv[2]))
 for f in "$CHV" "$CHR" "$FC" "$KERNEL" "$INITRD" "$BASE"; do
   [ -e "$f" ] || { echo "missing $f" >&2; exit 1; }
 done
-[ "$MODE" != all ] && [ "$MODE" != oci ] || [ -e "$OCI" ] || {
-  echo "missing $OCI (build it with scripts/build-linux-vmm-oci-rootfs.sh)" >&2
+if [ "$MODE" = all ] || [ "$MODE" = oci ]; then
+  [ -e "$OCI" ] || {
+    echo "missing $OCI (build it with scripts/build-linux-vmm-oci-rootfs.sh)" >&2
+    exit 1
+  }
+fi
+if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+  echo "/dev/kvm not rw" >&2
   exit 1
-}
-[ -r /dev/kvm ] && [ -w /dev/kvm ] || { echo "/dev/kvm not rw" >&2; exit 1; }
+fi
 
 # ---- guest side: one seed for both VMMs --------------------------------------
 # cloud-init (NoCloud) drops an "agent": a python process that (1) connects
@@ -217,7 +222,7 @@ bench_chv() {
     sleep 0.2
     t0=$(now)
     pid=$(chv_spawn "$d" "$ROOT")
-    t1=$(wait_ready "$d/ready") || { say "chv round $r: NO READY in ${READY_TIMEOUT}s"; cat "$d/chv.log" | tail -20; kill -9 "$pid" "$lpid" 2>/dev/null || true; continue; }
+    t1=$(wait_ready "$d/ready") || { say "chv round $r: NO READY in ${READY_TIMEOUT}s"; tail -20 "$d/chv.log"; kill -9 "$pid" "$lpid" 2>/dev/null || true; continue; }
     local boot_ms; boot_ms=$(ms "$t1" "$t0")
     sleep 10
     local rss; rss=$(rss_kib "$pid")

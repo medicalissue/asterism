@@ -19,42 +19,38 @@ use anyhow::{bail, Context, Result};
 use asterism_core::hv::{BootReq, DiskFormat, Handle, Hypervisor, ImageKind, ImageRef, Machine};
 use asterism_core::instance::{Instance, PortForward};
 use asterism_core::proc::{Evidence, Ownership, ProcId};
-use asterism_core::{image, paths, seed};
+use asterism_core::{image, paths, profile, seed};
 
 pub mod qemu;
 pub mod qmp;
 pub mod vz;
+
+#[cfg(test)]
+mod conformance;
 
 /// The backends this build has, constructed once.
 ///
 /// Once, because [`Hypervisor::probe`] caches: rebuilding them per call
 /// would re-run tool discovery and `codesign` on every request the daemon
 /// serves.
-struct Backends {
-    qemu: Arc<dyn Hypervisor>,
-    vz: Arc<dyn Hypervisor>,
-}
-
-fn backends() -> &'static Backends {
-    static BACKENDS: OnceLock<Backends> = OnceLock::new();
-    BACKENDS.get_or_init(|| Backends {
-        qemu: Arc::new(qemu::Qemu::new()),
-        vz: Arc::new(vz::Vz::new()),
-    })
+fn backends() -> &'static [Arc<dyn Hypervisor>] {
+    static BACKENDS: OnceLock<Vec<Arc<dyn Hypervisor>>> = OnceLock::new();
+    BACKENDS
+        .get_or_init(|| vec![Arc::new(qemu::Qemu::new()), Arc::new(vz::Vz::new())])
+        .as_slice()
 }
 
 /// A backend by its stable id, or the list of the ones that exist.
 pub fn by_id(id: &str) -> Result<Arc<dyn Hypervisor>> {
-    let b = backends();
-    match id {
-        qemu::ID => Ok(b.qemu.clone()),
-        vz::ID => Ok(b.vz.clone()),
-        other => bail!(
-            "no {other:?} backend in this build — there is {} and {}",
-            qemu::ID,
-            vz::ID
-        ),
+    if let Some(backend) = backends().iter().find(|backend| backend.id() == id) {
+        return Ok(backend.clone());
     }
+    let available = backends()
+        .iter()
+        .map(|backend| backend.id())
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!("no {id:?} backend in this build — available backends: {available}")
 }
 
 /// The capabilities a backend must have for one create request.
@@ -378,6 +374,14 @@ pub fn boot_req<'a>(inst: &'a Instance, hv: &dyn Hypervisor) -> Result<BootReq<'
     // say. An instance with no bindings gets an empty config and no listener.
     let egress = crate::egress::seed_config(inst)?;
 
+    // What this instance was asked to become, past the image it boots.
+    // Resolved here rather than at create time as well as there: the catalog
+    // is this binary's, and an instance created by an older one may name a
+    // profile this one has since renamed — which is a refusal to boot with a
+    // reason on it, not a guest quietly missing half its tools.
+    let bootstrap = profile::Bootstrap::resolve(&inst.profiles)
+        .with_context(|| format!("the bootstrap profiles recorded on {:?}", inst.name))?;
+
     // The backend gets to add what its own devices need — for vz, the
     // `/dev/hvc0` console no stock cloud image knows about, and the agent
     // that answers on the guest's virtio socket.
@@ -391,6 +395,7 @@ pub fn boot_req<'a>(inst: &'a Instance, hv: &dyn Hypervisor) -> Result<BootReq<'
         share_kind,
         &guest_config,
         &egress,
+        &bootstrap,
     )
     .context("building cloud-init seed")?;
     req.shares = shares;

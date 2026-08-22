@@ -2,9 +2,10 @@ import {useEffect, useState} from 'react';
 import {Button} from '@astryxdesign/core/Button';
 
 import type {InstanceRow, Instances as Model} from './bridge';
-import {copy, loadConsoleTail, loadSnapshots} from './bridge';
+import {backupInstance, copy, loadConsoleTail, loadSnapshots, restoreInstance} from './bridge';
 import {
   CloseIcon,
+  BackupIcon,
   CopyIcon,
   LayersIcon,
   LinkIcon,
@@ -26,6 +27,7 @@ export function Instances({
   const rows = model?.fleet.kind === 'rows' ? model.fleet.rows : [];
   const [selectedName, setSelectedName] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
+  const [restoring, setRestoring] = useState(false);
 
   useEffect(() => {
     setSelectedName(previous => {
@@ -42,11 +44,15 @@ export function Instances({
   }
   if (rows.length === 0) {
     return (
-      <div className="zero-state">
-        <span className="zero-glyph">✦</span>
-        <strong>No instances in this orbit</strong>
-        <p>Create a cloud VM or boot an OCI image on hardware you already own.</p>
-      </div>
+      <>
+        <div className="zero-state">
+          <span className="zero-glyph">✦</span>
+          <strong>No instances in this orbit</strong>
+          <p>Create a new instance, or restore a portable backup from another device.</p>
+          <Button label="Restore backup" size="sm" variant="secondary" icon={<BackupIcon />} onClick={() => setRestoring(true)} />
+        </div>
+        {restoring ? <RestoreSheet onClose={() => setRestoring(false)} /> : null}
+      </>
     );
   }
 
@@ -55,7 +61,7 @@ export function Instances({
       <section className="collection-pane" aria-label="Orbit-wide instances">
         <div className="collection-head">
           <span>{rows.length} {rows.length === 1 ? 'instance' : 'instances'}</span>
-          <span>CPU source</span>
+          <button className="text-action" onClick={() => setRestoring(true)}>Restore backup</button>
         </div>
         <div className="instance-list">
           {rows.map(row => (
@@ -90,6 +96,7 @@ export function Instances({
       {selected && connecting ? (
         <ConnectionSheet row={selected} onAct={onAct} onClose={() => setConnecting(false)} />
       ) : null}
+      {restoring ? <RestoreSheet onClose={() => setRestoring(false)} /> : null}
     </div>
   );
 }
@@ -107,6 +114,8 @@ function InstanceDetail({
 }) {
   const [snapshots, setSnapshots] = useState<string[] | null>(null);
   const [snapshotError, setSnapshotError] = useState('');
+  const [backupStatus, setBackupStatus] = useState('');
+  const [backupBusy, setBackupBusy] = useState(false);
 
   const readSnapshots = () => {
     setSnapshots(null);
@@ -168,7 +177,24 @@ function InstanceDetail({
           tooltip={!row.can_snapshot ? 'Stop the instance before changing its disk snapshots.' : undefined}
           onClick={() => onAct(`snap:${row.name}`, `Taking a snapshot of ${row.name}`)}
         />
+        <Button
+          label="Backup"
+          size="sm"
+          variant="ghost"
+          icon={<BackupIcon />}
+          isDisabled={!row.can_snapshot || busy || backupBusy}
+          tooltip={!row.can_snapshot ? 'Stop the instance before exporting a consistent backup.' : undefined}
+          onClick={() => {
+            setBackupBusy(true);
+            setBackupStatus('Exporting and verifying chunks…');
+            backupInstance(row.name).then(
+              report => setBackupStatus(`Saved to ${report.destination}`),
+              error => setBackupStatus(String(error)),
+            ).finally(() => setBackupBusy(false));
+          }}
+        />
       </div>
+      {backupStatus ? <p className="operation-note">{backupStatus}</p> : null}
 
       <div className="facts-grid">
         <Fact label="Source device" value={row.cpu_device} />
@@ -219,6 +245,55 @@ function InstanceDetail({
           </div>
         )}
       </DetailSection>
+    </div>
+  );
+}
+
+function RestoreSheet({onClose}: {onClose: () => void}) {
+  const [source, setSource] = useState('');
+  const [name, setName] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState('');
+  const [bad, setBad] = useState(false);
+
+  return (
+    <div className="sheet-scrim" role="presentation" onMouseDown={event => {
+      if (event.currentTarget === event.target && !busy) onClose();
+    }}>
+      <section className="connection-sheet" role="dialog" aria-modal="true" aria-label="Restore portable backup">
+        <header className="sheet-head">
+          <div><div className="eyebrow">PORTABLE BACKUP</div><h2>Restore an instance</h2></div>
+          <Button label="Close" isIconOnly size="sm" variant="ghost" icon={<CloseIcon />} isDisabled={busy} onClick={onClose} />
+        </header>
+        <section className="sheet-section backup-form">
+          <p className="quiet-copy">The manifest and every content-addressed chunk are verified before the instance becomes visible.</p>
+          <label><span>Backup directory</span><input value={source} onChange={event => setSource(event.target.value)} placeholder="/Volumes/Backup/dev" autoFocus /></label>
+          <label><span>Instance name <small>optional</small></span><input value={name} onChange={event => setName(event.target.value)} placeholder="Keep the exported name" /></label>
+          <Button
+            label={busy ? 'Restoring…' : 'Verify and restore'}
+            size="sm"
+            variant="primary"
+            icon={<BackupIcon />}
+            isDisabled={!source.trim() || busy}
+            onClick={() => {
+              setBusy(true);
+              setBad(false);
+              setResult('Verifying manifest and chunks…');
+              restoreInstance(source.trim(), name.trim() || undefined).then(
+                report => {
+                  const rebinds = report.rebind.volumes.length + report.rebind.secrets.length;
+                  setResult(`${report.instance} restored. ${rebinds ? `${rebinds} external part(s) need rebinding.` : 'No external parts need rebinding.'}`);
+                },
+                error => {
+                  setBad(true);
+                  setResult(String(error));
+                },
+              ).finally(() => setBusy(false));
+            }}
+          />
+          {result ? <p className={bad ? 'inline-error' : 'operation-note'}>{result}</p> : null}
+        </section>
+      </section>
     </div>
   );
 }

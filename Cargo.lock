@@ -208,6 +208,7 @@ dependencies = [
  "asterism-core",
  "asterism-mesh",
  "asterism-vz",
+ "blake3",
  "bytes",
  "http",
  "http-body-util",

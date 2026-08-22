@@ -25,12 +25,13 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use asterism_core::compat;
 use asterism_core::durable;
 use asterism_core::hv::{ImageKind, RunState, STOP_DEADLINE};
 use asterism_core::instance::{local_host, Instance, Policy, Status};
+use asterism_core::profile;
 use asterism_core::protocol::{Request, Response};
 use asterism_core::registry::{self, Shard};
+use asterism_core::{backup, compat};
 use asterism_core::{paths, VERSION};
 
 use crate::mesh::Mesh;
@@ -87,6 +88,7 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             shape,
             backend: requested,
             publish,
+            profiles,
         } => {
             // `_recording` rather than plain `image_ref`: a local file is
             // never adopted into the store, so the moment the user names it
@@ -94,14 +96,28 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             backend::image_ref_recording(&image).and_then(|r| {
                 let requirements = backend::CreateRequirements::new(&r, &publish);
                 let machine = backend::select_for(requested.as_deref(), requirements)?;
+                // Resolved before the row exists, so a mistyped profile is a
+                // refusal rather than an instance that cannot boot. Nothing
+                // is applied here: profiles reach a guest through its seed.
+                check_profiles(&r.kind, &profiles)?;
                 reg.create(&name, cpu_device, &r.name, shape, machine)?;
                 if r.kind == ImageKind::OciRootfs {
                     // A container that has finished is not a crash; see
                     // `Policy::never`.
                     reg.set_policy(&name, Policy::never())?;
                 }
+                if !profiles.is_empty() {
+                    reg.set_profiles(&name, profiles)?;
+                }
                 reg.set_source(&name, r.kind, publish)
             })
+        }
+        // Recorded now, applied at the next boot. Saying so is the CLI's
+        // job; refusing a name the catalog does not know is this one's.
+        Request::SetProfiles { name, profiles } => {
+            let kind = reg.get(&name).map(|i| i.image_kind);
+            kind.and_then(|kind| check_profiles(&kind, &profiles))
+                .and_then(|_| reg.set_profiles(&name, profiles))
         }
         // `--restart` is recorded before the boot, so an instance that comes
         // up and immediately dies is already carrying the policy the user
@@ -217,6 +233,28 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             .await
         }
         Request::DetachSecret { name, secret } => detach_secret(reg, &name, &secret),
+        Request::BackupExport { name, destination } => {
+            let exported = reg.get(&name).cloned().and_then(|inst| {
+                let provenance = backup::image_provenance(&inst)?;
+                backup::export(
+                    &inst,
+                    &paths::instance_dir(&name),
+                    Path::new(&destination),
+                    provenance,
+                )
+            });
+            return match exported {
+                Ok(report) => Response::BackupExported { report },
+                Err(e) => Response::Error {
+                    message: format!("{e:#}"),
+                },
+            };
+        }
+        Request::BackupImport { source, name } => {
+            return tokio::task::block_in_place(|| {
+                restore_backup(reg, Path::new(&source), &name, cpu_device)
+            });
+        }
         // A file on this device's disk, read here rather than by the CLI, so
         // that the answer is the same whoever asked and from wherever.
         Request::Logs { name, lines } => {
@@ -355,8 +393,123 @@ fn claimed_name(req: &Request) -> Option<&str> {
     match req {
         Request::Create { name, .. } => Some(name),
         Request::Rename { new_name, .. } => Some(new_name),
+        Request::BackupImport { name, .. } => Some(name),
         _ => None,
     }
+}
+
+/// Verify and stage the whole backup before one live path or registry row is
+/// touched, then publish the directory and row as one recoverable operation.
+fn restore_backup(reg: &mut Shard, source: &Path, name: &str, cpu_device: &str) -> Response {
+    if let Ok(existing) = reg.get(name) {
+        return Response::Error {
+            message: registry::taken(existing),
+        };
+    }
+    let live = paths::instance_dir(name);
+    // The same backup gets the same staging directory and resumes there; a
+    // different backup of the same name gets a different one, so files that
+    // were present in an older export can never leak into this restore.
+    let preview = match backup::inspect(source) {
+        Ok(manifest) => manifest,
+        Err(e) => {
+            return Response::Error {
+                message: format!("{e:#}"),
+            }
+        }
+    };
+    let restore_key =
+        blake3::hash(format!("{}:{}", preview.instance.id, preview.created_at).as_bytes()).to_hex();
+    let staging = paths::home_dir()
+        .join("instances")
+        .join(format!(".{name}.restoring-{}", &restore_key[..12]));
+
+    // A power cut after publishing the directory but before saving the row
+    // leaves one distinctive state: a live directory with our restore
+    // receipt and no registry entry. Retrying the same import verifies those
+    // files again and finishes the row instead of stranding the instance.
+    let receipt = live.join(".restore-receipt.json");
+    let recovering_publication = if live.exists() {
+        match std::fs::read(&receipt)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<backup::RestoreReport>(&bytes).ok())
+        {
+            Some(report) if report.instance == name && report.id == preview.instance.id => true,
+            _ => {
+                return Response::Error {
+                    message: format!(
+                        "{} already exists without a matching restore receipt — refusing to overwrite possible instance bytes",
+                        live.display()
+                    ),
+                }
+            }
+        }
+    } else {
+        false
+    };
+    let restore_at = if recovering_publication {
+        &live
+    } else {
+        &staging
+    };
+    let (mut instance, report) = match backup::restore_to(source, restore_at, name) {
+        Ok(restored) => restored,
+        Err(e) => {
+            return Response::Error {
+                message: format!("{e:#}"),
+            }
+        }
+    };
+    if reg.list().iter().any(|held| held.id == instance.id) {
+        return Response::Error {
+            message: format!(
+                "instance identity {} already exists on this device — refusing to create a second writer",
+                instance.id
+            ),
+        };
+    }
+    instance.cpu_device = cpu_device.to_owned();
+    if !recovering_publication {
+        if let Err(e) = durable::publish_dir(&staging, &live) {
+            return Response::Error {
+                message: format!("publishing restored instance: {e:#}"),
+            };
+        }
+    }
+    let adopted = reg.adopt(instance).and_then(|_| reg.save());
+    if let Err(e) = adopted {
+        let _ = reg.remove(name);
+        if !recovering_publication {
+            let _ = durable::publish_rename(&live, &staging);
+        }
+        return Response::Error {
+            message: format!("saving restored instance: {e:#}"),
+        };
+    }
+    let _ = std::fs::remove_file(live.join(".restore-receipt.json"));
+    Response::BackupRestored { report }
+}
+
+/// Refuse a profile set that cannot be applied, before anything is written.
+///
+/// Two ways it cannot be. The name may not be in the catalog, which
+/// [`profile::Bootstrap::resolve`] answers with the catalog itself. Or the
+/// instance may be an OCI one, which has no cloud-init and therefore no way
+/// to be told anything: a container image's whole configuration was written
+/// into its filesystem at pull time, so a profile silently doing nothing is
+/// the alternative to saying this.
+fn check_profiles(kind: &ImageKind, profiles: &[String]) -> Result<()> {
+    if profiles.is_empty() {
+        return Ok(());
+    }
+    if *kind == ImageKind::OciRootfs {
+        anyhow::bail!(
+            "a container image has no cloud-init to apply a bootstrap profile with — \
+             its configuration is the image. Boot a cloud image (ast images) \
+             to use profiles"
+        );
+    }
+    profile::Bootstrap::resolve(profiles).map(|_| ())
 }
 
 /// Claims a name in the orbit's one flat instance namespace.
@@ -750,6 +903,29 @@ mod tests {
         );
     }
 
+    /// A profile that cannot be applied is refused before the row exists.
+    ///
+    /// Both refusals are about the same thing: an instance whose record
+    /// promises work that will never happen. One is a name nothing answers
+    /// to; the other is a guest with no cloud-init to be told anything by,
+    /// which is every OCI instance and is not a thing a message can fix.
+    #[test]
+    fn a_profile_that_cannot_be_applied_is_refused_at_create() {
+        assert!(check_profiles(&ImageKind::Disk, &["claude".to_owned()]).is_ok());
+        // Nothing asked for is nothing to refuse, whatever the image is.
+        assert!(check_profiles(&ImageKind::OciRootfs, &[]).is_ok());
+
+        let err = check_profiles(&ImageKind::Disk, &["cladue".to_owned()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no bootstrap profile called"), "{err}");
+
+        let err = check_profiles(&ImageKind::OciRootfs, &["claude".to_owned()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("container image has no cloud-init"), "{err}");
+    }
+
     /// Claiming and resolving are different questions, and a rename asks
     /// both — the old name is resolved, the new one is claimed. Getting that
     /// round the wrong way would refuse every rename ever typed, because the
@@ -770,6 +946,7 @@ mod tests {
                 shape: Default::default(),
                 backend: None,
                 publish: Vec::new(),
+                profiles: Vec::new(),
             }),
             Some("dev")
         );

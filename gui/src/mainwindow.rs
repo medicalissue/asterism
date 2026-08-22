@@ -246,6 +246,24 @@ pub(crate) async fn snapshots(name: String) -> Result<Vec<String>, String> {
     .await?
 }
 
+#[tauri::command]
+pub(crate) async fn backup_instance(
+    name: String,
+) -> Result<asterism_core::backup::ExportReport, String> {
+    blocking(move || client::backup(&name).map_err(|error| format!("{error:#}"))).await?
+}
+
+#[tauri::command]
+pub(crate) async fn restore_instance(
+    source: String,
+    name: Option<String>,
+) -> Result<asterism_core::backup::RestoreReport, String> {
+    blocking(move || {
+        client::restore_backup(&source, name.as_deref()).map_err(|error| format!("{error:#}"))
+    })
+    .await?
+}
+
 // ---- doing -----------------------------------------------------------------
 
 /// Perform one [`Action`], by id. The same ids the tray uses and the same

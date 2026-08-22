@@ -89,6 +89,16 @@ enum Command {
         /// on the instance and used for every later boot.
         #[arg(long, value_name = "NAME")]
         backend: Option<String>,
+        /// Bootstrap profile to apply at first boot (`ast profiles` lists
+        /// them). Repeatable, and what a profile needs comes with it:
+        /// `--profile claude` installs the base tools and Node too.
+        ///
+        /// The image stays whatever you asked for. A profile is applied
+        /// inside the guest by its own systemd unit, so ssh answers while
+        /// the packages are still landing — `ast profile <name> --check`
+        /// says when it is done and what it got.
+        #[arg(long = "profile", value_name = "NAME")]
+        profiles: Vec<String>,
     },
     /// Boot an instance.
     ///
@@ -209,6 +219,9 @@ enum Command {
         /// The snapshot to roll back to, as `ast snapshots` lists it.
         tag: String,
     },
+    /// Export, inspect and restore portable content-addressed backups.
+    #[command(subcommand)]
+    Backup(BackupCommand),
     /// List known images and whether they are downloaded.
     ///
     /// This device's image store: the aliases it knows and what is already
@@ -224,6 +237,30 @@ enum Command {
         /// its size and timestamp put back.
         #[arg(long)]
         verify: bool,
+    },
+    /// List the bootstrap profiles this Asterism can apply to a guest.
+    Profiles,
+    /// Show, change or verify an instance's bootstrap profiles.
+    ///
+    /// With no profile named, this says what the instance is recorded as
+    /// having. Naming profiles replaces that set — they are applied by the
+    /// next boot, because the seed is what carries them into the guest.
+    ///
+    /// `--check` is the other half, and the one worth typing twice: it runs
+    /// the guest's own verifier over ssh and prints what it found. Every
+    /// profile ends in checks, so this reports the tools it installed, the
+    /// versions they answer with, and whether a credential has ended up on
+    /// the guest's disk — which is the one thing a bound secret guarantees
+    /// and the one thing nothing but a look can confirm.
+    Profile {
+        /// The instance.
+        name: String,
+        /// The profiles it should have. Omit to leave them alone.
+        #[arg(value_name = "PROFILE")]
+        profiles: Vec<String>,
+        /// Run the guest's verifier instead of changing anything.
+        #[arg(long, conflicts_with = "profiles")]
+        check: bool,
     },
     /// Download an image into this device's store.
     Pull {
@@ -438,6 +475,32 @@ enum SnapshotCommand {
     Take(Vec<String>),
 }
 
+#[derive(Subcommand)]
+enum BackupCommand {
+    /// Export a stopped instance's definition, disk and snapshots.
+    Export {
+        name: String,
+        #[arg(value_name = "DIRECTORY")]
+        destination: String,
+    },
+    /// Inspect a backup's redacted manifest without restoring it.
+    Inspect {
+        #[arg(value_name = "DIRECTORY")]
+        source: String,
+        /// Print the complete redacted manifest as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify and transactionally restore a backup on this device.
+    Import {
+        #[arg(value_name = "DIRECTORY")]
+        source: String,
+        /// Restore under another orbit-global name. Identity is preserved.
+        #[arg(long)]
+        name: Option<String>,
+    },
+}
+
 /// `ast volume ...` — the block storage one device puts in the pool.
 ///
 /// Volumes belong to the device that holds their bytes, and their names are
@@ -553,7 +616,12 @@ fn main() -> Result<()> {
             mem,
             disk,
             backend,
+            profiles,
         } => {
+            // Resolved here as well as in the daemon, because a mistyped
+            // profile should cost the user a message rather than a
+            // gigabyte: `ensure_pulled` below downloads the image.
+            asterism_core::profile::resolve(&profiles)?;
             // An image for another device has to be on that device: pulling it
             // here would fill this disk and still leave the far one without it.
             let resolved = match &device {
@@ -569,6 +637,7 @@ fn main() -> Result<()> {
                     disk_gib: parse_disk_gib(&disk)?,
                 },
                 backend,
+                profiles,
                 publish: publish
                     .iter()
                     .map(|p| p.parse::<PortForward>())
@@ -702,6 +771,43 @@ fn main() -> Result<()> {
         }
         Command::Snapshots { name } => return print_snapshots(&name, device.as_deref()),
         Command::Restore { name, tag } => return restore_snapshot(&name, &tag, device.as_deref()),
+        Command::Backup(BackupCommand::Export { name, destination }) => Request::BackupExport {
+            name,
+            destination: absolute_path(&destination)?.display().to_string(),
+        },
+        Command::Backup(BackupCommand::Inspect { source, json }) => {
+            local_only("backup inspect", device.as_deref())?;
+            return inspect_backup(&source, json);
+        }
+        Command::Backup(BackupCommand::Import { source, name }) => {
+            let source = absolute_path(&source)?;
+            let manifest = asterism_core::backup::inspect(&source)?;
+            Request::BackupImport {
+                source: source.display().to_string(),
+                name: name.unwrap_or(manifest.instance.name),
+            }
+        }
+        // The catalog is this binary's, not a device's: it is what this
+        // Asterism knows how to make a guest into.
+        Command::Profiles => {
+            local_only("profiles", device.as_deref())?;
+            return print_profiles();
+        }
+        // `--check` is not a request at all: the answer is inside the guest,
+        // and the way in is the one `ast ssh` already uses.
+        Command::Profile {
+            name, check: true, ..
+        } => {
+            local_only("profile --check", device.as_deref())?;
+            return check_profiles(&name);
+        }
+        Command::Profile { name, profiles, .. } if profiles.is_empty() => {
+            return show_profiles(&name, device.as_deref());
+        }
+        Command::Profile { name, profiles, .. } => {
+            asterism_core::profile::resolve(&profiles)?;
+            Request::SetProfiles { name, profiles }
+        }
         // The image store is per device, so both of these are about this one.
         Command::Images { verify } => {
             local_only("images", device.as_deref())?;
@@ -762,6 +868,7 @@ fn main() -> Result<()> {
         Response::Ok => {}
         Response::Instance { instance } => match request {
             Request::Status { .. } => print_detail(&instance),
+            Request::SetProfiles { .. } => print_profile_state(&instance),
             Request::Remove { .. } => println!("{}  removed", instance.name),
             Request::Rename { name, .. } => println!("{name}  renamed to {}", instance.name),
             Request::Up { .. } => {
@@ -811,6 +918,35 @@ fn main() -> Result<()> {
                 .map(|instance| OrbitRow { instance, live: true })
                 .collect::<Vec<_>>(),
         ),
+        Response::BackupExported { report } => {
+            println!(
+                "exported {} file(s), {} logical bytes to {}",
+                report.files, report.logical_bytes, report.destination
+            );
+            println!(
+                "{} data chunk(s), {} reused",
+                report.data_chunks, report.reused_chunks
+            );
+        }
+        Response::BackupRestored { report } => {
+            println!("{}  restored ({})", report.instance, report.id);
+            if report.rebind.volumes.is_empty() && report.rebind.secrets.is_empty() {
+                println!("no external parts need rebinding");
+            } else {
+                for volume in report.rebind.volumes {
+                    println!(
+                        "rebind volume: {}:{} ({:?})",
+                        volume.source_device, volume.path, volume.kind
+                    );
+                }
+                for secret in report.rebind.secrets {
+                    println!(
+                        "rebind secret: {} to {} (previous source: {})",
+                        secret.secret, secret.authority, secret.source_device
+                    );
+                }
+            }
+        }
         // The handshake owns Pong, `ast snapshots` owns Snapshots, `ast ssh`
         // and `ast logs` return long before here. Any of them arriving is astd
         // answering a different question.
@@ -843,6 +979,39 @@ fn main() -> Result<()> {
         }
         Response::Error { message } => bail!(message),
     }
+    Ok(())
+}
+
+fn absolute_path(path: &str) -> Result<std::path::PathBuf> {
+    let path = std::path::PathBuf::from(path);
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    Ok(std::env::current_dir()?.join(path))
+}
+
+fn inspect_backup(source: &str, json: bool) -> Result<()> {
+    let source = absolute_path(source)?;
+    let manifest = asterism_core::backup::verify(&source)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&manifest)?);
+        return Ok(());
+    }
+    println!("{}  {}", manifest.instance.name, manifest.instance.id);
+    println!(
+        "{} file(s), {} logical bytes, format {}",
+        manifest.files.len(),
+        manifest.files.iter().map(|file| file.len).sum::<u64>(),
+        manifest.version
+    );
+    if let Some(image) = manifest.image {
+        println!("image: {}  {}", image.reference, image.content);
+    }
+    println!(
+        "external parts to rebind: {} volume(s), {} secret(s)",
+        manifest.rebind.volumes.len(),
+        manifest.rebind.secrets.len()
+    );
     Ok(())
 }
 
@@ -1849,6 +2018,122 @@ fn print_snapshots(name: &str, device: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+// ---- bootstrap profiles ----------------------------------------------------
+
+/// `ast profiles` — what this Asterism knows how to make a guest into.
+///
+/// The catalog is a constant in this binary rather than something a device
+/// holds, so this prints without asking anyone: the daemon is not the
+/// authority on what `claude` means, the version of Asterism applying it is.
+fn print_profiles() -> Result<()> {
+    println!("{:<8} {:<8} WHAT IT ADDS", "PROFILE", "VERSION");
+    for profile in asterism_core::profile::CATALOG {
+        println!(
+            "{:<8} {:<8} {}",
+            profile.name, profile.version, profile.summary
+        );
+        if !profile.requires.is_empty() {
+            println!("{:<17} with: {}", "", profile.requires.join(", "));
+        }
+    }
+    println!("\nast create dev --image debian:13 --profile claude");
+    println!("ast profile dev --check      # what the guest actually has");
+    Ok(())
+}
+
+/// `ast profile <instance>` — what this instance is recorded as having.
+fn show_profiles(name: &str, device: Option<&str>) -> Result<()> {
+    let request = aimed(Request::Status { name: name.into() }, device);
+    match send(&request)? {
+        Response::Instance { instance } => {
+            print_profile_state(&instance);
+            Ok(())
+        }
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected reply from astd: {other:?}"),
+    }
+}
+
+/// The profile half of an instance, printed after a change and on its own.
+///
+/// What is printed is what the *record* says, and the record is a promise
+/// about the next boot rather than a report on the guest. So a running
+/// instance whose set has just changed is told the two commands that make
+/// the promise true, and every instance is told where the real answer lives.
+fn print_profile_state(inst: &Instance) {
+    if inst.profiles.is_empty() {
+        println!("{}  no bootstrap profiles", inst.name);
+        println!(
+            "this guest is whatever its image is — add one with: \
+             ast profile {} claude",
+            inst.name
+        );
+        return;
+    }
+    // Resolved rather than echoed: `claude` on its own is three profiles,
+    // and the user should see the three they are getting.
+    let resolved = asterism_core::profile::resolve(&inst.profiles);
+    let names = match &resolved {
+        Ok(profiles) => profiles
+            .iter()
+            .map(|p| p.name)
+            .collect::<Vec<_>>()
+            .join(" "),
+        // A name this binary does not know is a downgrade, not a typo: the
+        // instance was created by a newer Asterism. It is printed as it was
+        // recorded, because that is the fact, and the boot that would refuse
+        // it says so in its own words.
+        Err(_) => inst.profiles.join(" "),
+    };
+    println!("{}  {names}", inst.name);
+    if let Err(e) = &resolved {
+        println!("but this ast cannot apply that set: {e:#}");
+        return;
+    }
+    match inst.status {
+        asterism_core::instance::Status::Running => println!(
+            "the record is what the next boot applies: ast down {0} && ast up {0}",
+            inst.name
+        ),
+        _ => println!("applied at the next boot: ast up {}", inst.name),
+    }
+    println!(
+        "what the guest actually has: ast profile {} --check",
+        inst.name
+    );
+}
+
+/// `ast profile <instance> --check` — ask the guest.
+///
+/// The verifier is generated into the guest by the same seed that carried
+/// the profiles, so it knows exactly what this instance was promised and
+/// nothing about what any other one was. Running it over ssh rather than
+/// reimplementing it here is the point: the host has opinions about what
+/// should be true, and only the guest has facts.
+fn check_profiles(name: &str) -> Result<()> {
+    // An instance with no profiles has no verifier inside it, and `ssh`
+    // would answer that with `command not found` and an exit status. Asking
+    // the record first turns that into the sentence it should have been.
+    if let Response::Instance { instance } = send(&Request::Status { name: name.into() })? {
+        if instance.profiles.is_empty() {
+            bail!(
+                "{name} has no bootstrap profiles, so there is nothing in it to ask — \
+                 ast profile {name} claude, then ast down {name} && ast up {name}"
+            );
+        }
+    }
+    // From here the guest answers for itself, and its exit status is this
+    // command's: a failed check is a failed command, which is what a script
+    // that runs this after a boot needs it to be.
+    ssh(
+        name,
+        &[
+            "sudo".to_owned(),
+            "/usr/local/sbin/asterism-check".to_owned(),
+        ],
+    )
+}
+
 // ---- logs ------------------------------------------------------------------
 
 /// Print the guest's serial console, wherever the guest is.
@@ -2630,8 +2915,13 @@ fn print_bugreport() -> Result<()> {
         }
         Some(Response::Instances { instances }) => {
             for i in instances {
+                let profiles = if i.profiles.is_empty() {
+                    "-".to_owned()
+                } else {
+                    i.profiles.join(",")
+                };
                 println!(
-                    "{:<16} {:<9} {:<14} {}",
+                    "{:<16} {:<9} {:<14} {} profiles={profiles}",
                     i.name, i.status, i.image_kind, i.id
                 );
             }
@@ -2736,6 +3026,15 @@ fn print_detail(inst: &Instance) {
         }
     );
     println!("age:     {}", age(inst.created_at));
+    // Worth a line only when there are some: an instance with no profiles is
+    // the ordinary case and its guest is exactly its image.
+    if !inst.profiles.is_empty() {
+        println!(
+            "profiles: {} (what the guest has: ast profile {} --check)",
+            inst.profiles.join(" "),
+            inst.name
+        );
+    }
     if let Some(disk) = local_disk(inst) {
         println!("disk:    {disk}");
     }

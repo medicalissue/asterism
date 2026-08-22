@@ -16,6 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::backup::{ExportReport, RestoreReport};
 use crate::instance::{Instance, PortForward, Restart, Shape};
 use crate::orbit::{Device, DeviceStatus, WakeFacts};
 use crate::registry::OrbitRow;
@@ -99,6 +100,11 @@ pub enum Request {
         /// them, which is every `ast create` of a cloud image.
         #[serde(default)]
         publish: Vec<PortForward>,
+        /// Bootstrap profiles to apply at first boot (`ast create --profile
+        /// claude`). Empty from a CLI that predates them, and empty from
+        /// every `ast create` that did not ask for one.
+        #[serde(default)]
+        profiles: Vec<String>,
     },
     Up {
         name: String,
@@ -111,6 +117,13 @@ pub enum Request {
     },
     Down {
         name: String,
+    },
+    /// Change which bootstrap profiles an instance has (`ast profile dev
+    /// claude`). Recorded now, applied by the next boot: the seed is what
+    /// carries them, and a seed reaches a guest when that guest starts.
+    SetProfiles {
+        name: String,
+        profiles: Vec<String>,
     },
     Remove {
         name: String,
@@ -201,6 +214,21 @@ pub enum Request {
         /// The device it came from. `None` means this one.
         #[serde(default)]
         host: Option<String>,
+    },
+
+    // ---- portable backups ---------------------------------------------------
+    /// Export a stopped instance on the device holding its durable bytes.
+    BackupExport {
+        name: String,
+        /// Directory on that device. The CLI canonicalises local paths before
+        /// sending so a daemon's working directory never changes the target.
+        destination: String,
+    },
+    /// Restore a verified backup onto this device and claim `name` across the
+    /// orbit before publishing any bytes.
+    BackupImport {
+        source: String,
+        name: String,
     },
 
     // ---- snapshots -----------------------------------------------------------
@@ -550,6 +578,7 @@ impl Request {
             | Request::Down { name }
             | Request::Remove { name }
             | Request::Status { name }
+            | Request::SetProfiles { name, .. }
             | Request::Rename { name, .. }
             | Request::MarkConflicted { name, .. }
             | Request::AttachVolume { name, .. }
@@ -565,6 +594,7 @@ impl Request {
             // other, and the binding is written on whichever device holds it.
             | Request::AttachSecret { name, .. }
             | Request::DetachSecret { name, .. }
+            | Request::BackupExport { name, .. }
             | Request::SshEndpoint { name } => Some(name),
 
             // The handshake, and the two views of the registry. A list is
@@ -572,6 +602,7 @@ impl Request {
             Request::Ping { .. }
             | Request::Compat
             | Request::Create { .. }
+            | Request::BackupImport { .. }
             | Request::List
             | Request::ListOrbit => None,
 
@@ -655,6 +686,7 @@ impl Request {
     pub fn since(&self) -> u32 {
         match self {
             Request::Compat => 2,
+            Request::BackupExport { .. } | Request::BackupImport { .. } => 3,
             _ => crate::compat::FIRST_PROTOCOL,
         }
     }
@@ -669,6 +701,8 @@ impl Request {
     pub fn versioned_name(&self) -> Option<&'static str> {
         match self {
             Request::Compat => Some("compat"),
+            Request::BackupExport { .. } => Some("backup_export"),
+            Request::BackupImport { .. } => Some("backup_import"),
             _ => None,
         }
     }
@@ -763,6 +797,14 @@ pub enum Response {
     /// every shard that answered plus the cached rows of those that did not.
     Orbit {
         rows: Vec<OrbitRow>,
+    },
+
+    // ---- portable backups ---------------------------------------------------
+    BackupExported {
+        report: ExportReport,
+    },
+    BackupRestored {
+        report: RestoreReport,
     },
 
     // ---- snapshots -----------------------------------------------------------
@@ -972,6 +1014,7 @@ impl Response {
     pub fn since(&self) -> u32 {
         match self {
             Response::Compat { .. } => 2,
+            Response::BackupExported { .. } | Response::BackupRestored { .. } => 3,
             _ => crate::compat::FIRST_PROTOCOL,
         }
     }
@@ -989,10 +1032,28 @@ impl Response {
 /// and a frame in [`Request::since`] that disagree is a test failure, not a
 /// discovery made on a socket.
 pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
-    [("compat", Request::Compat.since())]
-        .into_iter()
-        .map(|(name, version)| (name.to_owned(), version))
-        .collect()
+    [
+        ("compat", Request::Compat.since()),
+        (
+            "backup_export",
+            Request::BackupExport {
+                name: String::new(),
+                destination: String::new(),
+            }
+            .since(),
+        ),
+        (
+            "backup_import",
+            Request::BackupImport {
+                source: String::new(),
+                name: String::new(),
+            }
+            .since(),
+        ),
+    ]
+    .into_iter()
+    .map(|(name, version)| (name.to_owned(), version))
+    .collect()
 }
 
 /// How a daemon that is too old to understand us gives itself away: serde
@@ -1208,10 +1269,16 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(create, Request::Create { backend: None, .. }));
-        let Request::Create { publish, .. } = &create else {
+        let Request::Create {
+            publish, profiles, ..
+        } = &create
+        else {
             unreachable!("a create")
         };
         assert!(publish.is_empty(), "a cloud image publishes nothing");
+        // ...and nothing about bootstrap profiles, which is the instance
+        // that CLI would have made: a stock image and nothing else.
+        assert!(profiles.is_empty(), "an older create asks for no profiles");
 
         // ...and one from a CLI that has `-p` carries what it asked for.
         let published: Request = serde_json::from_str(
@@ -1345,8 +1412,19 @@ mod tests {
             shape: Shape::default(),
             backend: None,
             publish: Vec::new(),
+            profiles: Vec::new(),
         };
         assert_eq!(create.subject(), None);
+        // Changing an instance's profiles is about that instance, so it
+        // resolves across the orbit like every other instance command.
+        assert_eq!(
+            Request::SetProfiles {
+                name: "dev".into(),
+                profiles: vec!["claude".into()]
+            }
+            .subject(),
+            Some("dev")
+        );
         assert_eq!(Request::List.subject(), None);
         assert_eq!(Request::ListOrbit.subject(), None);
         assert_eq!(Request::Devices.subject(), None);
