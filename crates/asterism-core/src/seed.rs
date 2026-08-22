@@ -18,6 +18,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::hv::ShareKind;
 use crate::instance::{Instance, Volume};
+use crate::profile::Bootstrap;
 use crate::tools::{run, tool};
 use crate::{instance, paths};
 
@@ -31,6 +32,14 @@ use crate::{instance, paths};
 /// 5: directory-share transport is part of the seed. A guest moving between
 /// capable backends must replace a 9p unit with a virtiofs unit (or back),
 /// even when the host paths and mount points did not change.
+///
+/// What earns a bump is a change to what a seed says about an instance that
+/// already exists. Bootstrap profiles did not: an instance with none gets a
+/// byte-identical seed, and an instance with one cannot have been created by
+/// a daemon that did not have them. Reissuing every seed in every orbit for
+/// a feature none of those guests use would have handed each of them a new
+/// `instance-id` — and with it a first boot it has already had, host keys
+/// included.
 pub const SEED_TEMPLATE_VERSION: u32 = 5;
 
 /// One locally-hosted volume, resolved into everything the two sides of a
@@ -117,6 +126,12 @@ pub fn shares(inst: &Instance) -> Vec<Share> {
 /// `extra` is cloud-config the *backend* needs in the guest — see
 /// [`crate::hv::Hypervisor::guest_config`]. It is appended verbatim, so it
 /// arrives in the guest exactly as the backend wrote it.
+///
+/// `bootstrap` is the instance's profiles ([`crate::profile`]), and it rides
+/// the same mechanism for the same reason: bump a profile's version and the
+/// fingerprint moves, so a guest that has been up for a month applies the
+/// new work at its next boot rather than staying at whatever it was built
+/// with.
 pub fn ensure(
     name: &str,
     seed: &Path,
@@ -124,17 +139,20 @@ pub fn ensure(
     share_kind: Option<ShareKind>,
     extra: &str,
     egress: &Egress,
+    bootstrap: &Bootstrap,
 ) -> Result<()> {
     if !shares.is_empty() && share_kind.is_none() {
         bail!("cannot build mount units without a directory-share transport");
     }
     let stamp_path = seed.with_file_name("seed.stamp");
-    let stamp = fingerprint(name, shares, share_kind, extra, egress);
+    let stamp = fingerprint(name, shares, share_kind, extra, egress, bootstrap);
     let current = std::fs::read_to_string(&stamp_path).unwrap_or_default();
     if seed.exists() && current.trim() == stamp {
         return Ok(());
     }
-    build(name, seed, shares, share_kind, extra, egress, &stamp)?;
+    build(
+        name, seed, shares, share_kind, extra, egress, bootstrap, &stamp,
+    )?;
     std::fs::write(&stamp_path, &stamp)?;
     Ok(())
 }
@@ -154,6 +172,7 @@ fn fingerprint(
     share_kind: Option<ShareKind>,
     extra: &str,
     egress: &Egress,
+    bootstrap: &Bootstrap,
 ) -> String {
     let mut material = format!("v{SEED_TEMPLATE_VERSION}\n{name}\n");
     if !shares.is_empty() {
@@ -191,6 +210,15 @@ fn fingerprint(
             material.push('\n');
         }
     }
+    // Names and versions, not the rendered scripts: what the guest is asked
+    // to become is the thing that has changed when this moves, and a comment
+    // reworded in a bootstrap script is not a reason to make every guest
+    // in the orbit run its first-boot work again. An instance with no
+    // profiles folds in nothing, so adding this section reissued no seed.
+    if !bootstrap.is_empty() {
+        material.push_str(&bootstrap.stamp());
+        material.push('\n');
+    }
     format!("{:016x}", instance::fnv1a(&material))
 }
 
@@ -203,6 +231,7 @@ fn build(
     share_kind: Option<ShareKind>,
     extra: &str,
     egress: &Egress,
+    bootstrap: &Bootstrap,
     stamp: &str,
 ) -> Result<()> {
     let mut keys = vec![ensure_asterism_key()?];
@@ -224,7 +253,10 @@ fn build(
     // the backend's half both want `write_files` and `runcmd`, so they are
     // merged key by key rather than concatenated. A key that cannot be
     // merged says so instead of quietly losing one side.
-    let config = merge(&asterism_config(shares, share_kind, egress), extra)
+    let config = merge(
+        &asterism_config(shares, share_kind, egress, bootstrap),
+        extra,
+    )
         .with_context(|| format!("building the seed for {name:?}"))?;
 
     let user_data = format!(
@@ -282,17 +314,24 @@ fn build(
 /// One function because it is one cloud-config: `write_files` and `runcmd`
 /// are written once each, whether or not there are volumes, and merged with
 /// the backend's own half by [`merge`].
-fn asterism_config(shares: &[Share], share_kind: Option<ShareKind>, egress: &Egress) -> String {
+fn asterism_config(
+    shares: &[Share],
+    share_kind: Option<ShareKind>,
+    egress: &Egress,
+    bootstrap: &Bootstrap,
+) -> String {
     let mut out = String::from("bootcmd:\n");
     out.push_str(HOSTKEY_BOOTCMD);
     out.push_str("write_files:\n");
     out.push_str(HOSTKEY_UNIT);
     out.push_str(&mount_units(shares, share_kind));
     out.push_str(&egress_files(egress));
+    out.push_str(&bootstrap_files(bootstrap));
     out.push_str("runcmd:\n");
     out.push_str(HOSTKEY_RUNCMD);
     out.push_str(&mount_runcmd(shares, share_kind));
     out.push_str(&egress_runcmd(egress));
+    out.push_str(&bootstrap_runcmd(bootstrap));
     out
 }
 
@@ -586,6 +625,45 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// The `write_files` entries that carry an instance's bootstrap profiles
+/// into its guest.
+///
+/// [`crate::profile`] decides what a guest needs; this decides what survives
+/// the trip. A `write_files` entry is a YAML block scalar, so every line of
+/// a shell script is indented under it — a blank line in a script included,
+/// because a line carrying only the block's own indentation reads back as
+/// the empty line it was, and it keeps the one invariant this file's YAML
+/// can be checked against: every line is either a key or indented under one.
+fn bootstrap_files(bootstrap: &Bootstrap) -> String {
+    let mut out = String::new();
+    for (path, mode, content) in bootstrap.files() {
+        out.push_str(&format!(
+            "\x20 - path: {path}\n\x20   permissions: '{mode}'\n\x20   content: |\n"
+        ));
+        for line in content.lines() {
+            out.push_str(&format!("\x20     {line}\n"));
+        }
+    }
+    out
+}
+
+/// The `runcmd` entry that sets the bootstrap going.
+///
+/// It comes last in the list on purpose: the host-key insurance and the
+/// mounts are seconds and this is minutes, and a share an agent is about to
+/// work in should be there before the thing that installs the agent.
+fn bootstrap_runcmd(bootstrap: &Bootstrap) -> String {
+    let runcmd = bootstrap.runcmd();
+    if runcmd.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\x20 - |\n");
+    for line in runcmd.lines() {
+        out.push_str(&format!("\x20   {line}\n"));
+    }
+    out
+}
+
 /// The `runcmd` entry that enables those mount units.
 ///
 /// Enabling rather than just starting is what carries the mounts across
@@ -684,7 +762,7 @@ const INDENT: &str = "  ";
 /// it runs it at boot — this is here so a backend's test can run it now.
 pub fn mergeable(guest_config: &str) -> Result<()> {
     merge(
-        &asterism_config(&[], None, &Egress::default()),
+        &asterism_config(&[], None, &Egress::default(), &Bootstrap::default()),
         guest_config,
     )
     .map(|_| ())
@@ -841,7 +919,7 @@ mod tests {
     /// its host keys flushed, and a way back if it lost them anyway.
     #[test]
     fn every_guest_gets_the_host_key_insurance_volumes_or_not() {
-        let bare = asterism_config(&[], None, &Egress::default());
+        let bare = asterism_config(&[], None, &Egress::default(), &Bootstrap::default());
         assert!(bare.contains("- path: /etc/systemd/system/asterism-hostkeys.service"));
         assert!(bare.contains("ssh-keygen -A"));
         assert!(bare.contains("systemctl enable asterism-hostkeys.service"));
@@ -867,7 +945,12 @@ mod tests {
             share("/tank/media", "/mnt/ast/media"),
             share("/tank/code", "/srv/code"),
         ];
-        let config = asterism_config(&shares, Some(ShareKind::NinePfs), &Egress::default());
+        let config = asterism_config(
+            &shares,
+            Some(ShareKind::NinePfs),
+            &Egress::default(),
+            &Bootstrap::default(),
+        );
         assert!(config.contains("- path: /etc/systemd/system/mnt-ast-media.mount"));
         assert!(config.contains("- path: /etc/systemd/system/srv-code.mount"));
         assert!(config.contains("Where=/mnt/ast/media"));
@@ -888,6 +971,7 @@ mod tests {
             &[share("/tank/a", "/mnt/ast/e2e-vol")],
             Some(ShareKind::NinePfs),
             &Egress::default(),
+            &Bootstrap::default(),
         );
         assert!(dashed.contains(r"- path: /etc/systemd/system/mnt-ast-e2e\x2dvol.mount"));
         assert!(dashed.contains(r"for unit in 'mnt-ast-e2e\x2dvol.mount'; do"));
@@ -904,7 +988,12 @@ mod tests {
     #[test]
     fn virtiofs_units_name_only_the_transport_vz_attaches() {
         let shares = [share("/workspace/source", "/mnt/ast/source")];
-        let config = asterism_config(&shares, Some(ShareKind::Virtiofs), &Egress::default());
+        let config = asterism_config(
+            &shares,
+            Some(ShareKind::Virtiofs),
+            &Egress::default(),
+            &Bootstrap::default(),
+        );
         assert!(config.contains("Type=virtiofs"), "{config}");
         assert!(config.contains("modprobe virtiofs"), "{config}");
         assert!(config.contains("asterism-virtiofs.conf"), "{config}");
@@ -925,6 +1014,7 @@ mod tests {
             &[share("/tank/media", "/mnt/ast/media")],
             Some(ShareKind::NinePfs),
             &Egress::default(),
+            &Bootstrap::default(),
         );
         let vz = VZ_LIKE;
         let merged = merge(&ours, vz).unwrap();
@@ -997,8 +1087,11 @@ mod tests {
     #[test]
     fn the_assembled_user_data_never_says_the_same_key_twice() {
         let shares = vec![share("/tank/media", "/mnt/ast/media")];
+        // The whole of what a seed can carry: mounts, a bound secret, and a
+        // guest that is being made into somewhere an agent can work.
+        let bootstrap = Bootstrap::resolve(&["claude".to_owned(), "codex".to_owned()]).unwrap();
         let config = merge(
-            &asterism_config(&shares, Some(ShareKind::NinePfs), &Egress::default()),
+            &asterism_config(&shares, Some(ShareKind::NinePfs), &egress(), &bootstrap),
             VZ_LIKE,
         )
         .unwrap();
@@ -1049,7 +1142,7 @@ mod tests {
 
     #[test]
     fn a_seed_carries_the_certificate_and_the_handle_and_nothing_else() {
-        let config = asterism_config(&[], None, &egress());
+        let config = asterism_config(&[], None, &egress(), &Bootstrap::default());
         // The certificate, in both places a distribution looks.
         assert!(config.contains("/usr/local/share/ca-certificates/asterism-egress.crt"));
         assert!(config.contains("/etc/pki/ca-trust/source/anchors/asterism-egress.crt"));
@@ -1072,7 +1165,7 @@ mod tests {
 
         // An instance with no bindings gets none of it, and its seed does not
         // move just because this section was added to the file.
-        let bare = asterism_config(&[], None, &Egress::default());
+        let bare = asterism_config(&[], None, &Egress::default(), &Bootstrap::default());
         assert!(!bare.contains("asterism-egress"));
     }
 
@@ -1080,7 +1173,7 @@ mod tests {
     /// a YAML block scalar has two ways to be quietly wrong. Both were, once.
     #[test]
     fn the_script_a_bound_guest_runs_is_shell_a_guest_can_actually_run() {
-        let config = asterism_config(&[], None, &egress());
+        let config = asterism_config(&[], None, &egress(), &Bootstrap::default());
         // Pull the runcmd entry back out of the cloud-config, undoing the
         // block scalar's indentation, which is what cloud-init hands `sh`.
         let script: String = config
@@ -1123,10 +1216,34 @@ mod tests {
         // A reissued seed carries a new instance-id, which makes a guest redo
         // its first-boot work — so this must move exactly when the guest has
         // something new to be told, and never otherwise.
-        let none = fingerprint("dev", &[], None, "", &Egress::default());
-        let bound = fingerprint("dev", &[], None, "", &egress());
+        let none = fingerprint(
+            "dev",
+            &[],
+            None,
+            "",
+            &Egress::default(),
+            &Bootstrap::default(),
+        );
+        let bound = fingerprint(
+            "dev",
+            &[],
+            None,
+            "",
+            &egress(),
+            &Bootstrap::default(),
+        );
         assert_ne!(none, bound);
-        assert_eq!(bound, fingerprint("dev", &[], None, "", &egress()));
+        assert_eq!(
+            bound,
+            fingerprint(
+                "dev",
+                &[],
+                None,
+                "",
+                &egress(),
+                &Bootstrap::default()
+            )
+        );
 
         // The port is in it: a proxy that came back somewhere else is a guest
         // that has to be told where.
@@ -1134,7 +1251,10 @@ mod tests {
             proxy: "http://10.0.2.2:39000".into(),
             ..egress()
         };
-        assert_ne!(bound, fingerprint("dev", &[], None, "", &moved));
+        assert_ne!(
+            bound,
+            fingerprint("dev", &[], None, "", &moved, &Bootstrap::default())
+        );
 
         // So is the handle: revoking a binding and making a new one must not
         // leave a guest holding the old handle.
@@ -1142,19 +1262,171 @@ mod tests {
             handles: vec![("ANTHROPIC_API_KEY".into(), "sk-ant-ast-YYY".into())],
             ..egress()
         };
-        assert_ne!(bound, fingerprint("dev", &[], None, "", &reminted));
+        assert_ne!(
+            bound,
+            fingerprint("dev", &[], None, "", &reminted, &Bootstrap::default())
+        );
+    }
+
+    /// A profile reaches the guest as files and one `runcmd`, under the same
+    /// two keys everything else in this seed uses.
+    #[test]
+    fn a_profile_reaches_the_guest_in_the_seed_that_carries_everything_else() {
+        let bootstrap = Bootstrap::resolve(&["claude".to_owned()]).unwrap();
+        let config = asterism_config(&[], None, &Egress::default(), &bootstrap);
+
+        // Still one of each key. Two `write_files` would mean the host-key
+        // insurance or the bootstrap silently not arriving.
+        let keys: Vec<String> = blocks(&config).into_iter().map(|b| b.key).collect();
+        assert_eq!(keys, vec!["bootcmd", "write_files", "runcmd"]);
+
+        assert!(config.contains("- path: /usr/local/sbin/asterism-bootstrap"));
+        assert!(config.contains("- path: /usr/local/sbin/asterism-check"));
+        assert!(config.contains("- path: /etc/systemd/system/asterism-bootstrap.service"));
+        assert!(config.contains("- path: /etc/asterism/bootstrap.stamp"));
+        assert!(config.contains("permissions: '0755'"));
+        assert!(config.contains("systemctl start --no-block asterism-bootstrap.service"));
+
+        // The host keys are seen to first: seconds of work before minutes of
+        // it, and a guest that is reachable while the packages land.
+        let hostkeys = config.find("systemctl enable asterism-hostkeys").unwrap();
+        let boot = config.find("systemctl enable asterism-bootstrap").unwrap();
+        assert!(hostkeys < boot, "{config}");
+
+        // Every line of a block scalar is indented under its key, and the
+        // shell inside one is not YAML that a parser could reinterpret.
+        for line in config.lines() {
+            assert!(
+                line.starts_with(' ') || line.ends_with(':'),
+                "unindented line in cloud-config: {line:?}"
+            );
+        }
+    }
+
+    /// A script comes back out of the seed as the script that went in.
+    ///
+    /// The trip is a YAML block scalar, and the failure it can have is
+    /// silent: an indentation bug does not stop cloud-init writing the file,
+    /// it writes a *different* file, and the first sign of that is a unit
+    /// that dies at boot inside a guest nobody is watching. So the block is
+    /// read back the way cloud-init would — strip the block's indentation,
+    /// keep everything else — and compared to what the profile said.
+    #[test]
+    fn a_script_survives_the_trip_through_the_seed() {
+        let bootstrap = Bootstrap::resolve(&["claude".to_owned()]).unwrap();
+        let config = asterism_config(&[], None, &Egress::default(), &bootstrap);
+        for (path, _, content) in bootstrap.files() {
+            let entry = config
+                .find(&format!("- path: {path}\n"))
+                .unwrap_or_else(|| panic!("{path} is not in the seed:\n{config}"));
+            let body = config[entry..]
+                .split_once("content: |\n")
+                .expect("a block scalar")
+                .1;
+            let mut back = String::new();
+            for line in body.lines() {
+                // The block ends at the first line that is not part of it.
+                let Some(rest) = line.strip_prefix("\x20     ") else { break };
+                back.push_str(rest);
+                back.push('\n');
+            }
+            assert_eq!(back, content, "{path} did not survive the seed");
+        }
+    }
+
+    /// An instance with no profiles is byte-for-byte the instance it was
+    /// before profiles existed. Nothing written, nothing run, and — the
+    /// half that matters — nothing in the fingerprint, so adding this
+    /// feature did not hand every guest in every orbit a new instance-id
+    /// and a fresh set of first-boot work.
+    #[test]
+    fn no_profiles_leaves_the_seed_exactly_as_it_was() {
+        let bare = asterism_config(&[], None, &Egress::default(), &Bootstrap::default());
+        assert!(!bare.contains("asterism-bootstrap"), "{bare}");
+        assert!(!bare.contains("asterism-check"), "{bare}");
+        assert_eq!(
+            fingerprint(
+                "dev",
+                &[],
+                None,
+                "",
+                &Egress::default(),
+                &Bootstrap::default()
+            ),
+            fingerprint(
+                "dev",
+                &[],
+                None,
+                "",
+                &Egress::default(),
+                &Bootstrap::resolve(&[]).unwrap()
+            )
+        );
+    }
+
+    /// The fingerprint is what carries a changed profile set into a guest
+    /// that has already booted: it moves when the set does, and a set that
+    /// has not changed does not reissue a seed.
+    #[test]
+    fn a_changed_profile_set_reissues_the_seed() {
+        let none = fingerprint(
+            "dev",
+            &[],
+            None,
+            "",
+            &Egress::default(),
+            &Bootstrap::default(),
+        );
+        let claude = Bootstrap::resolve(&["claude".to_owned()]).unwrap();
+        let both = Bootstrap::resolve(&["claude".to_owned(), "codex".to_owned()]).unwrap();
+        let with_claude = fingerprint("dev", &[], None, "", &Egress::default(), &claude);
+        assert_ne!(none, with_claude);
+        assert_ne!(
+            with_claude,
+            fingerprint("dev", &[], None, "", &Egress::default(), &both)
+        );
+        assert_eq!(
+            with_claude,
+            fingerprint(
+                "dev",
+                &[],
+                None,
+                "",
+                &Egress::default(),
+                &Bootstrap::resolve(&["claude".to_owned()]).unwrap()
+            )
+        );
+        // Asking for the same set the long way round is the same set: the
+        // fingerprint is what the guest will be, not what was typed.
+        assert_eq!(
+            with_claude,
+            fingerprint(
+                "dev",
+                &[],
+                None,
+                "",
+                &Egress::default(),
+                &Bootstrap::resolve(&[
+                    "base".to_owned(),
+                    "node".to_owned(),
+                    "claude".to_owned()
+                ])
+                .unwrap()
+            )
+        );
     }
 
     #[test]
     fn the_fingerprint_moves_when_the_volumes_do() {
         let bare = Egress::default();
-        let none = fingerprint("dev", &[], None, "", &bare);
+        let none = fingerprint("dev", &[], None, "", &bare, &Bootstrap::default());
         let one = fingerprint(
             "dev",
             &[share("/tank/media", "/mnt/ast/media")],
             Some(ShareKind::NinePfs),
             "",
             &bare,
+            &Bootstrap::default(),
         );
         let elsewhere = fingerprint(
             "dev",
@@ -1162,8 +1434,12 @@ mod tests {
             Some(ShareKind::NinePfs),
             "",
             &bare,
+            &Bootstrap::default(),
         );
-        assert_eq!(none, fingerprint("dev", &[], None, "", &bare));
+        assert_eq!(
+            none,
+            fingerprint("dev", &[], None, "", &bare, &Bootstrap::default())
+        );
         assert_ne!(none, one);
         assert_ne!(one, elsewhere);
         assert_ne!(
@@ -1174,6 +1450,7 @@ mod tests {
                 Some(ShareKind::Virtiofs),
                 "",
                 &bare,
+                &Bootstrap::default(),
             ),
             "a backend transport change has to reissue the guest's mount unit"
         );
@@ -1185,6 +1462,7 @@ mod tests {
                 Some(ShareKind::NinePfs),
                 "",
                 &bare,
+                &Bootstrap::default(),
             )
         );
 
@@ -1193,7 +1471,14 @@ mod tests {
         // built for the backend it is actually running on.
         assert_ne!(
             none,
-            fingerprint("dev", &[], None, "bootcmd:\n - [ sh, -c, x ]\n", &bare)
+            fingerprint(
+                "dev",
+                &[],
+                None,
+                "bootcmd:\n - [ sh, -c, x ]\n",
+                &bare,
+                &Bootstrap::default()
+            )
         );
     }
 
@@ -1242,7 +1527,11 @@ mod tests {
     #[test]
     fn one_bootcmd_entry_cannot_end_the_others() {
         let backend = "bootcmd:\n - |\n   echo the-backends-own-entry\n";
-        let merged = merge(&asterism_config(&[], None, &Egress::default()), backend).unwrap();
+        let merged = merge(
+            &asterism_config(&[], None, &Egress::default(), &Bootstrap::default()),
+            backend,
+        )
+        .unwrap();
 
         // What cloud-init makes of it: the entries, in order, as one
         // script. (Block scalars only — the list form a backend may also

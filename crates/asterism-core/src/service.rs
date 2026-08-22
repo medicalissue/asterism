@@ -32,6 +32,44 @@ use anyhow::{bail, Context, Result};
 /// on one login would be two daemons fighting over the same service slot.
 pub const LABEL: &str = "com.asterism.astd";
 
+/// A deliberately narrow escape hatch for isolated end-to-end tests. The
+/// production service label is fixed, but a harness that owns a temporary
+/// ASTERISM_HOME must not replace the user's real login service while proving
+/// restart behaviour.
+const TEST_LABEL_ENV: &str = "ASTERISM_TEST_SERVICE_LABEL";
+
+fn test_label() -> Result<Option<String>> {
+    let value = match std::env::var(TEST_LABEL_ENV) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            bail!("{TEST_LABEL_ENV} is not valid Unicode")
+        }
+    };
+    validate_test_label(&value)?;
+    if std::env::var_os("ASTERISM_HOME").is_none() {
+        bail!("{TEST_LABEL_ENV} requires an explicit ASTERISM_HOME");
+    }
+    Ok(Some(value))
+}
+
+fn validate_test_label(value: &str) -> Result<()> {
+    const PREFIX: &str = "com.asterism.astd.test.";
+    if value.len() > 120
+        || !value.starts_with(PREFIX)
+        || value.ends_with('.')
+        || value.contains("..")
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    {
+        bail!(
+            "{TEST_LABEL_ENV} must start with {PREFIX}, use only ASCII letters, digits, dots, or hyphens, and be at most 120 bytes"
+        );
+    }
+    Ok(())
+}
+
 /// What to install: which binary, with which environment.
 #[derive(Debug, Clone)]
 pub struct Spec {
@@ -192,13 +230,15 @@ mod imp {
 
     use anyhow::{Context, Result};
 
-    use super::{home, run, Manager, Report, Spec, State, LABEL};
+    use super::{home, run, test_label, Manager, Report, Spec, State, LABEL};
 
     pub fn manager() -> Result<Box<dyn Manager>> {
-        Ok(Box::new(Launchd))
+        Ok(Box::new(Launchd { label: test_label()?.unwrap_or_else(|| LABEL.to_owned()) }))
     }
 
-    pub struct Launchd;
+    pub struct Launchd {
+        label: String,
+    }
 
     impl Launchd {
         fn domain(&self) -> Result<String> {
@@ -210,7 +250,7 @@ mod imp {
         }
 
         fn target(&self) -> Result<String> {
-            Ok(format!("{}/{LABEL}", self.domain()?))
+            Ok(format!("{}/{}", self.domain()?, self.label))
         }
     }
 
@@ -223,7 +263,7 @@ mod imp {
             home()
                 .unwrap_or_else(|_| PathBuf::from("."))
                 .join("Library/LaunchAgents")
-                .join(format!("{LABEL}.plist"))
+                .join(format!("{}.plist", self.label))
         }
 
         fn install(&self, spec: &Spec) -> Result<Report> {
@@ -247,7 +287,7 @@ mod imp {
             // reboot with no daemon and no explanation. This is the one piece
             // of Asterism's state that lives outside ASTERISM_HOME, and it
             // gets the same treatment as the rest.
-            crate::durable::commit(&unit, plist(spec).as_bytes())
+            crate::durable::commit(&unit, plist(spec, &self.label).as_bytes())
                 .with_context(|| format!("writing {}", unit.display()))?;
             report.step(format!("wrote {}", unit.display()));
 
@@ -258,7 +298,7 @@ mod imp {
                 .arg("bootout")
                 .arg(&target))?;
             if booted_out {
-                report.step(format!("unloaded the previous {LABEL}"));
+                report.step(format!("unloaded the previous {}", self.label));
             }
 
             let (ok, out) = run(std::process::Command::new("launchctl")
@@ -377,7 +417,7 @@ mod imp {
     /// A LaunchAgent, not a LaunchDaemon, on purpose: astd runs as the user
     /// whose `~/.asterism` it owns, needs their ssh keys, and boots guests
     /// that a root daemon would run with the wrong ownership.
-    fn plist(spec: &Spec) -> String {
+    fn plist(spec: &Spec, label: &str) -> String {
         let mut env = format!(
             "      <key>PATH</key>\n      <string>{}</string>\n",
             escape(&spec.path_env)
@@ -415,7 +455,7 @@ mod imp {
 </dict>
 </plist>
 "#,
-            label = LABEL,
+            label = escape(label),
             program = escape(&spec.program.display().to_string()),
             env = env,
             log = escape(&spec.log.display().to_string()),
@@ -437,7 +477,7 @@ mod imp {
 
         #[test]
         fn the_plist_promises_persistence_and_names_the_binary() {
-            let text = plist(&spec());
+            let text = plist(&spec(), LABEL);
             assert!(text.contains("<key>KeepAlive</key>\n  <true/>"), "{text}");
             assert!(text.contains("<key>RunAtLoad</key>\n  <true/>"), "{text}");
             assert!(text.contains("/opt/homebrew/bin/astd"));
@@ -453,7 +493,7 @@ mod imp {
         /// their unit points at something that moved.
         #[test]
         fn the_recorded_program_round_trips() {
-            let text = plist(&spec());
+            let text = plist(&spec(), LABEL);
             assert_eq!(
                 program_from_plist(&text),
                 Some(PathBuf::from("/opt/homebrew/bin/astd"))
@@ -465,7 +505,7 @@ mod imp {
         fn a_home_with_xml_in_it_cannot_break_the_plist() {
             let mut s = spec();
             s.home = Some(PathBuf::from("/tmp/a<b>&c"));
-            let text = plist(&s);
+            let text = plist(&s, LABEL);
             assert!(text.contains("/tmp/a&lt;b&gt;&amp;c"), "{text}");
         }
 
@@ -487,13 +527,16 @@ mod imp {
 
     use anyhow::{Context, Result};
 
-    use super::{home, run, Manager, Report, Spec, State};
+    use super::{home, run, test_label, Manager, Report, Spec, State};
 
     pub fn manager() -> Result<Box<dyn Manager>> {
-        Ok(Box::new(Systemd))
+        let unit = test_label()?.map_or_else(|| UNIT.to_owned(), |label| format!("{label}.service"));
+        Ok(Box::new(Systemd { unit }))
     }
 
-    pub struct Systemd;
+    pub struct Systemd {
+        unit: String,
+    }
 
     const UNIT: &str = "astd.service";
 
@@ -515,7 +558,7 @@ mod imp {
                         .unwrap_or_else(|_| PathBuf::from("."))
                         .join(".config")
                 });
-            base.join("systemd/user").join(UNIT)
+            base.join("systemd/user").join(&self.unit)
         }
 
         fn install(&self, spec: &Spec) -> Result<Report> {
@@ -542,13 +585,12 @@ mod imp {
             let (_, _) =
                 run(std::process::Command::new("systemctl").args(["--user", "daemon-reload"]))?;
             report.step("systemctl --user daemon-reload");
-            let (ok, out) =
-                run(std::process::Command::new("systemctl")
-                    .args(["--user", "enable", "--now", UNIT]))?;
+            let (ok, out) = run(std::process::Command::new("systemctl")
+                .args(["--user", "enable", "--now", &self.unit]))?;
             if !ok {
-                anyhow::bail!("systemctl could not enable {UNIT}: {}", out.trim());
+                anyhow::bail!("systemctl could not enable {}: {}", self.unit, out.trim());
             }
-            report.step(format!("systemctl --user enable --now {UNIT}"));
+            report.step(format!("systemctl --user enable --now {}", self.unit));
             // A user unit dies at logout unless lingering is on, which is
             // the difference between "starts when I log in" and "never
             // sleeps". It needs privileges we do not assume here.
@@ -564,9 +606,9 @@ mod imp {
             };
             if systemctl_present() {
                 let (ok, out) = run(std::process::Command::new("systemctl")
-                    .args(["--user", "disable", "--now", UNIT]))?;
+                    .args(["--user", "disable", "--now", &self.unit]))?;
                 report.step(match ok {
-                    true => format!("systemctl --user disable --now {UNIT}"),
+                    true => format!("systemctl --user disable --now {}", self.unit),
                     false => format!("systemd had nothing enabled ({})", out.trim()),
                 });
             }
@@ -618,18 +660,19 @@ mod imp {
                 state.notes.push("systemctl is not on PATH".into());
                 return Ok(state);
             }
-            let (_, enabled) =
-                run(std::process::Command::new("systemctl").args(["--user", "is-enabled", UNIT]))?;
+            let (_, enabled) = run(std::process::Command::new("systemctl")
+                .args(["--user", "is-enabled", &self.unit]))?;
             state.loaded = enabled.trim() == "enabled";
-            let (_, props) = run(std::process::Command::new("systemctl").args([
-                "--user",
-                "show",
-                UNIT,
-                "-p",
-                "MainPID",
-                "-p",
-                "ActiveState",
-            ]))?;
+            let (_, props) = run(std::process::Command::new("systemctl")
+                .args([
+                    "--user",
+                    "show",
+                    &self.unit,
+                    "-p",
+                    "MainPID",
+                    "-p",
+                    "ActiveState",
+                ]))?;
             for line in props.lines() {
                 if let Some(v) = line.strip_prefix("MainPID=") {
                     state.pid = v.trim().parse().ok().filter(|p| *p != 0);
@@ -739,5 +782,13 @@ mod tests {
     #[test]
     fn a_program_that_is_not_there_is_refused_at_install_time() {
         assert!(Spec::for_program(Path::new("/no/such/astd")).is_err());
+    }
+
+    #[test]
+    fn test_service_labels_are_bounded_and_namespaced() {
+        assert!(validate_test_label("com.asterism.astd.test.profile-123").is_ok());
+        assert!(validate_test_label(LABEL).is_err());
+        assert!(validate_test_label("com.asterism.astd.test.bad/name").is_err());
+        assert!(validate_test_label("com.asterism.astd.test.bad..name").is_err());
     }
 }

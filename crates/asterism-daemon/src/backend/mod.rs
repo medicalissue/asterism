@@ -19,7 +19,7 @@ use anyhow::{bail, Context, Result};
 use asterism_core::hv::{BootReq, DiskFormat, Handle, Hypervisor, ImageKind, ImageRef, Machine};
 use asterism_core::instance::{Instance, PortForward};
 use asterism_core::proc::{Evidence, Ownership, ProcId};
-use asterism_core::{image, paths, seed};
+use asterism_core::{image, paths, profile, seed};
 
 pub mod qemu;
 pub mod qmp;
@@ -374,6 +374,14 @@ pub fn boot_req<'a>(inst: &'a Instance, hv: &dyn Hypervisor) -> Result<BootReq<'
     // say. An instance with no bindings gets an empty config and no listener.
     let egress = crate::egress::seed_config(inst)?;
 
+    // What this instance was asked to become, past the image it boots.
+    // Resolved here rather than at create time as well as there: the catalog
+    // is this binary's, and an instance created by an older one may name a
+    // profile this one has since renamed — which is a refusal to boot with a
+    // reason on it, not a guest quietly missing half its tools.
+    let bootstrap = profile::Bootstrap::resolve(&inst.profiles)
+        .with_context(|| format!("the bootstrap profiles recorded on {:?}", inst.name))?;
+
     // The backend gets to add what its own devices need — for vz, the
     // `/dev/hvc0` console no stock cloud image knows about, and the agent
     // that answers on the guest's virtio socket.
@@ -387,6 +395,7 @@ pub fn boot_req<'a>(inst: &'a Instance, hv: &dyn Hypervisor) -> Result<BootReq<'
         share_kind,
         &guest_config,
         &egress,
+        &bootstrap,
     )
     .context("building cloud-init seed")?;
     req.shares = shares;
