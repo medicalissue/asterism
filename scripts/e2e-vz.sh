@@ -67,8 +67,13 @@ IMAGE="${E2E_IMAGE:-debian:13}"
 INST=vze2e
 DEF=vzdefault        # the create that names no backend at all
 REF=vzref            # the qemu instance the timings are compared against
+OCI=vzoci             # an OCI rootfs booted by VZLinuxBootLoader
 MARKER="marker-$$"
 PROOF=/home/ast/PROOF
+OCI_VOL="$ASTERISM_HOME/vz-oci-volume"
+OCI_HOST_MARKER="vz-oci-host-$$"
+OCI_GUEST_MARKER="vz-oci-guest-$$"
+OCI_REBOOT_MARKER="vz-oci-reboot-$$"
 
 # The qemu boot-time comparison is opt-in, and gated again on qemu actually
 # being runnable here. A Mac with no QEMU installed is the supported
@@ -163,7 +168,7 @@ cleanup() {
   # The product's own path first, so a normal run's cleanup is the graceful
   # one and the signals below have nothing left to do.
   local name pid
-  for name in "$INST" "$DEF" "$REF"; do
+  for name in "$INST" "$DEF" "$REF" "$OCI"; do
     track_running "$name"
     "$AST" down "$name" >/dev/null 2>&1 || true
     "$AST" rm "$name" >/dev/null 2>&1 || true
@@ -461,6 +466,68 @@ kill -0 "$VZ_PID2" 2>/dev/null && fail "helper $VZ_PID2 still answers kill -0 af
 echo "ok: the stopped helper left nothing that looks alive"
 expect "status agrees it is stopped" "status:  stopped" "$AST" status "$INST"
 expect "rm"     "$INST  removed"  "$AST" rm "$INST"
+
+# ---- an OCI rootfs through VZ's native Linux boot loader ------------------
+
+# No ssh and no cloud-init are smuggled into this image. Its generated pid 1
+# runs DHCP, the helper resolves that exact lease from the pinned MAC/name,
+# and stdout reaches the same hvc0 console as a cloud-image guest.
+expect "create an OCI instance on vz" "$OCI  defined" \
+  "$AST" create "$OCI" --backend vz --image nginx --mem 1G --disk 10G
+expect "the OCI instance really selected vz" "machine: vz" "$AST" status "$OCI"
+expect "its source remains an OCI rootfs" "oci rootfs, direct kernel boot" \
+  "$AST" status "$OCI"
+
+# Mount over nginx's entrypoint hook directory so the image itself performs
+# both sides of the proof before it starts the server. On the first boot the
+# guest must read host bytes and write its own marker through virtiofs. On the
+# second boot it must observe that first guest marker before writing another;
+# a recreated or read-only share cannot satisfy those assertions.
+mkdir -p "$OCI_VOL"
+printf '%s\n' "$OCI_HOST_MARKER" >"$OCI_VOL/host-marker"
+cat >"$OCI_VOL/10-asterism-virtiofs-proof.sh" <<EOF
+#!/bin/sh
+set -eu
+cd /docker-entrypoint.d
+grep -qF '$OCI_HOST_MARKER' host-marker
+if [ -f guest-marker ]; then
+  grep -qF '$OCI_GUEST_MARKER' guest-marker
+  printf '%s\n' '$OCI_REBOOT_MARKER' > reboot-marker
+  echo 'asterism: virtiofs marker survived reboot'
+else
+  printf '%s\n' '$OCI_GUEST_MARKER' > guest-marker
+  echo 'asterism: virtiofs marker read-write succeeded'
+fi
+sync
+EOF
+chmod +x "$OCI_VOL/10-asterism-virtiofs-proof.sh"
+expect "attach a directory to the VZ OCI guest" "/docker-entrypoint.d" \
+  "$AST" attach "$OCI" --volume "$OCI_VOL" --at /docker-entrypoint.d
+expect "up the OCI instance on vz" "$OCI  running" "$AST" up "$OCI"
+track_running "$OCI"
+expect_eventually "the OCI entrypoint reached hvc0" "asterism: starting the image entrypoint" \
+  "$AST" logs "$OCI" -n 400
+expect_eventually "the VZ guest read and wrote through virtiofs" \
+  "asterism: virtiofs marker read-write succeeded" "$AST" logs "$OCI" -n 400
+expect "the guest marker reached the host" "$OCI_GUEST_MARKER" \
+  cat "$OCI_VOL/guest-marker"
+expect_eventually "nginx started inside the VZ microVM" "start worker process" \
+  "$AST" logs "$OCI" -n 400
+expect "down the OCI instance" "$OCI  stopped" "$AST" down "$OCI"
+expect "snapshot the stopped OCI disk" "$OCI  snapshot clean" \
+  "$AST" snapshot "$OCI" clean
+expect "boot the snapshotted OCI disk again" "$OCI  running" "$AST" up "$OCI"
+track_running "$OCI"
+expect_eventually "the guest observed its virtiofs marker after reboot" \
+  "asterism: virtiofs marker survived reboot" "$AST" logs "$OCI" -n 400
+expect "the first guest marker still exists after reboot" "$OCI_GUEST_MARKER" \
+  cat "$OCI_VOL/guest-marker"
+expect "the rebooting guest wrote a second host-visible marker" "$OCI_REBOOT_MARKER" \
+  cat "$OCI_VOL/reboot-marker"
+expect_eventually "the restored OCI disk runs nginx again" "start worker process" \
+  "$AST" logs "$OCI" -n 400
+expect "down the OCI instance again" "$OCI  stopped" "$AST" down "$OCI"
+expect "remove the OCI instance" "$OCI  removed" "$AST" rm "$OCI"
 
 # ---- the same image under qemu, for the timing -----------------------------
 #

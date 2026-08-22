@@ -27,6 +27,7 @@ http = "1"
 # crate that computes all of it per-architecture beats constants written
 # down here that would only be right on some architectures.
 libc = "0.2"
+ruzstd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 # Every boot input is verified against a content address before it is adopted

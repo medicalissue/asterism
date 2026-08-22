@@ -540,7 +540,7 @@ fn egress_files(egress: &Egress) -> String {
             out.push_str(&format!("\x20     {line}\n"));
         }
     }
-    let exports = environment(egress);
+    let exports = egress_environment(egress);
     out.push_str(
         "\x20 - path: /etc/profile.d/asterism-egress.sh\n\
          \x20   permissions: '0644'\n\
@@ -588,7 +588,7 @@ fn egress_runcmd(egress: &Egress) -> String {
     if egress.is_empty() {
         return String::new();
     }
-    let lines: Vec<String> = environment(egress)
+    let lines: Vec<String> = egress_environment(egress)
         .iter()
         .map(|(key, value)| shell_quote(&format!("{key}={value}")))
         .collect();
@@ -619,7 +619,12 @@ fn egress_runcmd(egress: &Egress) -> String {
 }
 
 /// The environment a bound guest runs with, in the order it is written.
-fn environment(egress: &Egress) -> Vec<(String, String)> {
+/// Environment presented to a guest process for one egress binding set.
+///
+/// Shared with the OCI bootstrap path: cloud images receive these lines via
+/// cloud-init, while OCI images export the identical values from their
+/// generated pid 1 before starting the image entrypoint.
+pub fn egress_environment(egress: &Egress) -> Vec<(String, String)> {
     let mut out = vec![
         ("HTTPS_PROXY".to_owned(), egress.proxy.clone()),
         ("https_proxy".to_owned(), egress.proxy.clone()),
