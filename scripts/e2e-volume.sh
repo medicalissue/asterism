@@ -53,8 +53,14 @@ fi
 
 # Fresh, SHORT homes: unix socket paths are capped near 104 bytes, and a volume
 # adds an export socket and a bridge socket to the pile. Deliberately nowhere
-# near the user's own ~/.asterism.
-RUN="/private/tmp/ast-vol-$$"
+# near the user's own ~/.asterism. macOS exposes its short temporary root at
+# /private/tmp; Linux exposes the same role at /tmp.
+if [ -d /private/tmp ] && [ -w /private/tmp ]; then
+  SHORT_TMP=/private/tmp
+else
+  SHORT_TMP=/tmp
+fi
+RUN="$SHORT_TMP/ast-vol-$$"
 A="$RUN/a"            # supplies cpu/ram: the guest runs here
 B="$RUN/b"            # supplies the bytes: the volume lives here
 A_NAME="vol-a-$$"
