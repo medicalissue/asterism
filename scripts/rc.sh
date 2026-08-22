@@ -253,13 +253,21 @@ build_artifact() {
   mkdir -p "$dist"
   say "building $VERSION from this tree"
   cargo build --release --locked --package asterism-cli --package asterism-daemon \
+    --package asterism-vz \
     || fail "the release build did not succeed"
   # Stripped, then packed with COPYFILE_DISABLE so macOS does not smuggle
   # ._ AppleDouble entries into the tarball and change its digest for a
   # reason nobody can see. Both are what release.yml does.
-  cp target/release/ast target/release/astd "$RUN/dist/"
-  strip -x "$RUN/dist/ast" "$RUN/dist/astd"
-  COPYFILE_DISABLE=1 tar -czf "$dist/$TARBALL" -C "$RUN/dist" ast astd \
+  cp target/release/ast target/release/astd target/release/astd-vz "$RUN/dist/"
+  strip -x "$RUN/dist/ast" "$RUN/dist/astd" "$RUN/dist/astd-vz"
+  # Stripping changes signed bytes, so the helper is signed only after its
+  # release shape is final. Sign the copy that enters the tarball, not a
+  # neighboring build output that users never receive.
+  codesign --force --sign - --entitlements crates/asterism-vz/vz.entitlements \
+    "$RUN/dist/astd-vz" || fail "could not sign the release VZ helper"
+  codesign --verify --strict "$RUN/dist/astd-vz" \
+    || fail "the release VZ helper signature does not verify"
+  COPYFILE_DISABLE=1 tar -czf "$dist/$TARBALL" -C "$RUN/dist" ast astd astd-vz \
     || fail "could not pack $TARBALL"
   ( cd "$dist" && shasum -a 256 "$TARBALL" >SHA256SUMS ) \
     || fail "could not checksum $TARBALL"
