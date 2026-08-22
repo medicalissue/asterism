@@ -54,6 +54,7 @@ VOL="tank"
 ROOT_FORWARD="$(sysctl -n net.ipv4.ip_forward)"
 DAEMONS=()
 WAN_RULE=0
+CLEANED=0
 
 fail() { echo "NETWORK REALMS E2E FAIL: $*" >&2; exit 1; }
 
@@ -70,8 +71,64 @@ kill_daemon() {
   sudo kill -KILL "$pid" 2>/dev/null || true
 }
 
+is_task_export() {
+  local pid="$1" pidfile="$2" exe=""
+  exe="$(sudo readlink "/proc/$pid/exe" 2>/dev/null || true)"
+  [ "${exe##*/}" = qemu-storage-daemon ] || return 1
+  sudo cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' '\n' | grep -Fqx -- "$pidfile"
+}
+
+stop_task_exports() {
+  local pidfile="" pid="" alive=0
+  while IFS= read -r pidfile; do
+    pid="$(cat "$pidfile" 2>/dev/null || true)"
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    sudo kill -0 "$pid" 2>/dev/null || continue
+    if ! is_task_export "$pid" "$pidfile"; then
+      echo "NETWORK REALMS E2E FAIL: refusing to signal pid $pid from $pidfile: identity mismatch" >&2
+      alive=1
+      continue
+    fi
+    sudo kill -TERM "$pid" 2>/dev/null || true
+    for _ in $(seq 1 50); do
+      sudo kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if sudo kill -0 "$pid" 2>/dev/null; then
+      sudo kill -KILL "$pid" 2>/dev/null || true
+      for _ in $(seq 1 50); do
+        sudo kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+      done
+    fi
+    if sudo kill -0 "$pid" 2>/dev/null && is_task_export "$pid" "$pidfile"; then
+      echo "NETWORK REALMS E2E FAIL: task export pid $pid did not exit" >&2
+      alive=1
+    fi
+  done < <(find "$A/volumes" "$B/volumes" -type f -name 'nbd-e*.pid' 2>/dev/null)
+  return "$alive"
+}
+
+assert_no_task_exports() {
+  local proc="" pid="" exe="" cmdline="" found=0
+  for proc in /proc/[0-9]*; do
+    pid="${proc##*/}"
+    exe="$(sudo readlink "$proc/exe" 2>/dev/null || true)"
+    [ "${exe##*/}" = qemu-storage-daemon ] || continue
+    cmdline="$(sudo cat "$proc/cmdline" 2>/dev/null | tr '\0' '\n' || true)"
+    if grep -Fq -- "$RUN/" <<<"$cmdline"; then
+      echo "NETWORK REALMS E2E FAIL: task export pid $pid survived cleanup" >&2
+      found=1
+    fi
+  done
+  return "$found"
+}
+
 cleanup() {
+  [ "$CLEANED" = 0 ] || return 0
+  CLEANED=1
   set +e
+  local failed=0
   if [ -n "${ASTERISM_TEST_ARTIFACTS:-}" ]; then
     evidence="$ASTERISM_TEST_ARTIFACTS/network-realms"
     mkdir -p "$evidence/a" "$evidence/b"
@@ -92,6 +149,7 @@ cleanup() {
   fi
   kill_daemon "$A"
   kill_daemon "$B"
+  stop_task_exports || failed=1
   # `sudo ... &` leaves a shell job which waits for the namespaced daemon.
   # SIGSTOP/SIGCONT targets the daemon's pidfile identity, not that wrapper;
   # reap any wrapper which remained stopped rather than leaking a task-owned
@@ -124,6 +182,7 @@ cleanup() {
   sudo ip link del "$LAN" 2>/dev/null || true
   sudo sysctl -w "net.ipv4.ip_forward=$ROOT_FORWARD" >/dev/null
   rm -rf "$RUN"
+  return "$failed"
 }
 trap cleanup EXIT
 
@@ -388,4 +447,9 @@ if grep -q '127.0.0.1:1' "$B/orbit.json"; then
 fi
 echo "ok: provider/consumer daemon restart repaired a stale address by key — $RECOVERED"
 
+cleanup || fail "task-owned cleanup did not complete"
+trap - EXIT
+set -e
+assert_no_task_exports || fail "task-owned storage exports remain after cleanup"
+echo "ok: task-owned storage exports terminated and no exact-run process remains"
 echo "NETWORK REALMS E2E GREEN"
