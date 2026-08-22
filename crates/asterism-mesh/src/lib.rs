@@ -61,5 +61,7 @@ pub use ticket::{PairingTicket, PairingToken, TicketError, DEFAULT_TICKET_TTL};
 /// Re-exported iroh types that appear in this crate's public API.
 pub mod iroh_types {
     pub use iroh::endpoint::{Connection, RecvStream, SendStream};
-    pub use iroh::{EndpointAddr, EndpointId, PublicKey, RelayUrl, SecretKey, TransportAddr};
+    pub use iroh::{
+        EndpointAddr, EndpointId, PublicKey, RelayUrl, SecretKey, Signature, TransportAddr,
+    };
 }

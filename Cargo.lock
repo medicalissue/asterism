@@ -184,6 +184,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "asterism-coordinator"
+version = "0.0.2"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "asterism-core",
+ "asterism-mesh",
+ "blake3",
+ "data-encoding",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "asterism-core"
 version = "0.0.2"
 dependencies = [
