@@ -49,6 +49,7 @@ git archive HEAD | limactl shell kvmhost -- tar -xf - -C "$VM_RUN"
 limactl shell kvmhost -- bash -lc "
   cd '$VM_RUN'
   export CARGO_TARGET_DIR='$VM_RUN/target' CARGO_INCREMENTAL=0
+  if command -v sccache >/dev/null; then export RUSTC_WRAPPER=sccache; fi
   export ASTERISM_BUILD_ID='$SOURCE_SHA'
   cargo build --workspace
 " 2>&1 | tee "$EVIDENCE/build.log"

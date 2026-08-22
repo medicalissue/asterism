@@ -785,7 +785,9 @@ pub fn bring_up(inst: &Instance, hv: &dyn Hypervisor) -> Result<Raised> {
 /// any boot-side mutation begins.
 async fn preflight_all(blocks: &[Volume]) -> Result<()> {
     for volume in blocks {
-        preflight_remote_volume(&volume.host).await?;
+        preflight_remote_volume(&volume.host)
+            .await
+            .with_context(|| format!("leasing volume {}:{}", volume.host, volume.path))?;
     }
     Ok(())
 }
