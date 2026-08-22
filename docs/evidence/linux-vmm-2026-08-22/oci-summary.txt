@@ -1,0 +1,18 @@
+== host: Linux 6.8.0-137-generic aarch64; PRETTY_NAME="Ubuntu 24.04.4 LTS"; nested=apple; kvm=crw-rw-rw-
+== inputs: base.raw 3758096384 B sha256 63cb4783adb9c4de…; Image 59079048 B; initrd 29239653 B
+== artifacts: cloud-hypervisor 5468264 B, ch-remote 1490952 B, virtiofsd 2951472 B (1.10.0-1ubuntu0.1); firecracker 3254360 B, jailer 1916808 B
+== identical OCI workload: image=docker.io/library/python@sha256:d09d15e60962ca365d1cd544a48773bac9d33f2fb1b00f2aa0deec78ade7dc31 platform=linux/arm64 platform_manifest=sha256:c95cd47204b8f236725fc8cf94726abe3f32755a062393597efadd9a5d24fbe1 config=sha256:cb9af8d170f77f291e66758095a4ded08c37643ae7b1793f386a7d6b5f090487 kernel_modules=6.8.0-137-generic
+oci.rootfs: 805306368 B sha256 cbaaeacbb15130c7…; read-only; init=/sbin/asterism-bench-init
+oci chv round 1: boot-to-vsock-ready 12586 ms; idle RSS 229748 KiB (guest 1024 MiB, 2 vcpu)
+oci chv workload: 42
+oci chv round 2: boot-to-vsock-ready 11613 ms; idle RSS 227704 KiB (guest 1024 MiB, 2 vcpu)
+oci chv workload: 42
+oci chv round 3: boot-to-vsock-ready 14663 ms; idle RSS 235892 KiB (guest 1024 MiB, 2 vcpu)
+oci chv workload: 42
+oci fc round 1: boot-to-vsock-ready 19444 ms; idle RSS 216908 KiB (guest 1024 MiB, 2 vcpu)
+oci fc workload: 42
+oci fc round 2: boot-to-vsock-ready 21040 ms; idle RSS 213600 KiB (guest 1024 MiB, 2 vcpu)
+oci fc workload: 42
+oci fc round 3: boot-to-vsock-ready 16088 ms; idle RSS 213540 KiB (guest 1024 MiB, 2 vcpu)
+oci fc workload: 42
+== done

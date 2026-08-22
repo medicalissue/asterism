@@ -1,0 +1,37 @@
+== host: Linux 6.8.0-137-generic aarch64; PRETTY_NAME="Ubuntu 24.04.4 LTS"; nested=apple; kvm=crw-rw-rw-
+== inputs: base.raw 3758096384 B sha256 63cb4783adb9c4de…; Image 59079048 B; initrd 29239653 B
+== artifacts: cloud-hypervisor 5468264 B, ch-remote 1490952 B, virtiofsd 2951472 B (1.10.0-1ubuntu0.1); firecracker 3254360 B, jailer 1916808 B
+== Cloud Hypervisor cloud-hypervisor v53.0
+chv round 1: boot-to-vsock-ready 17418 ms; idle RSS 514524 KiB (guest 1024 MiB, 2 vcpu)
+chv round 2: boot-to-vsock-ready 16478 ms; idle RSS 485856 KiB (guest 1024 MiB, 2 vcpu)
+chv round 3: boot-to-vsock-ready 17044 ms; idle RSS 479712 KiB (guest 1024 MiB, 2 vcpu)
+-- chv matrix
+vsock h->g: 6.8.0-137-generic PRETTY_NAME="Ubuntu 24.04.4 LTS"
+recovery: VMM ppid=1 (1 = reparented, survives spawner)
+virtiofs hot-add on non-shared memory: 5: Using vhost-user requires using shared memory or huge pages
+disk hot-add: {"id":"_disk3","bdf":"0000:00:05.0"}
+guest pci rescan: vdc 256M
+disk hot-add: PROVEN (guest sees 256M disk)
+disk hot-remove: (removed _disk3)
+host reads guest write on hot-added disk: hello-from-guest
+remote(NBD-over-unix) block hot-add as /dev/nbd0: {"id":"_disk4","bdf":"0000:00:06.0"}
+guest remote block discovery: /dev/vdd [rc=0]
+guest writes to remote block: ok [rc=0]
+provider side sees guest write through NBD: via-nbd
+cpu resize on aarch64: HTTP 500, Failed to create Vcpu, Resource busy (os error 16)
+guest nproc after cpu resize: 2
+memory resize without hotplug_size: HTTP 500, Not enough space in the hotplug RAM region
+snapshot took 1913 ms; files: config.json=1451 memory-ranges=1073741824 state.json=63774
+restore+resume 2062 ms; guest after restore: 41 up 0 minutes
+snapshot/restore: PROVEN
+reboot after SIGKILL: PROVEN, ready in 16059 ms; counter=41
+-- chv guest 2: shared memory, virtiofs, memory hotplug, landlock
+guest2 (shared=on, virtiofs, landlock) ready in 103208 ms; RSS VMM 483460 KiB + virtiofsd 3784 KiB
+virtiofs mount: host-wrote-this mounted [rc=0]
+host sees guest write via virtiofs: guest-wrote-this
+memory hot-add: accepted
+guest MemTotal after hot-add (was ~1024 MiB): MemTotal: 980380 kB
+cpu hot-add on aarch64: HTTP 500, Failed to create Vcpu, Resource busy (os error 16)
+guest nproc: 2
+vm.info hotplugged: cpus boot=2,max=4; memory size=2147483648 hotplug_size=2147483648
+seccomp: on by default

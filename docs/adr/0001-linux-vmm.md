@@ -46,14 +46,17 @@ three ways and records what survived:
   validated in our test suite, and using them might result in unexpected
   behaviour".
 * **"Cloud Hypervisor's feature list is marketing; the matrix will not hold on
-  a real host."** It held on a real KVM host (nested, see §3): vsock both
-  ways, virtio-fs through the distro's `virtiofsd`, local block hot-add and
-  hot-remove, an NBD-over-unix export consumed as a host block device,
-  pause/snapshot/restore/resume with guest state intact, memory hot-add, SIGKILL
-  recovery, and the VMM surviving its spawner. The two refusals are
-  documented ones: **CPU hotplug is x86-only** (`docs/hotplug.md`), and
-  virtio-fs / vhost-user needs `--memory shared=on`, which is a boot-time
-  property of the guest, not something a running guest can be given.
+  a real host."** The product-critical rows held on a real KVM host (nested,
+  see §3): vsock both ways, virtio-fs through the distro's `virtiofsd`, local
+  block hot-add and hot-remove, an NBD-over-unix export consumed as a host
+  block device, pause/snapshot/restore/resume with guest state intact, SIGKILL
+  recovery, and the VMM surviving its spawner. Device hotplug is proven;
+  compute hotplug is not: **CPU hotplug is x86-only** (`docs/hotplug.md`), and
+  on this aarch64 run the VMM accepted a memory resize and reported 2 GiB but
+  guest `MemTotal` remained 980,380 KiB. Virtio-fs / vhost-user also needs
+  `--memory shared=on`, a boot-time property rather than something a running
+  guest can be given. These are capability/refusal results, not reasons to
+  hide architecture behind backend-name conditionals.
 * **"Cloud Hypervisor is too immature / too fast-moving to bet a product on."**
   Real cost, not a refutation. Releases every ~6 weeks, bug fixes for two
   cycles (~12 weeks) then EOL, and **snapshot/restore and live migration are
@@ -97,6 +100,7 @@ performance. §5 is the spec for reproducing them on a supported host.
 | Firecracker | v1.16.1 (2026-07-02), `firecracker-v1.16.1-aarch64.tgz` sha256 `8d0e69f6d6f9a1724551f607f18504052c16c1828ee3d4d7b6e6c73380871e0e` |
 | virtiofsd | Ubuntu noble package 1.10.0-1ubuntu0.1 (upstream is 1.14.0; Fedora ships 1.14.0) |
 | Guest shape | 2 vCPU, 1024 MiB, no NIC, `systemd-networkd-wait-online` masked on the cmdline for both, NoCloud seed with a python vsock agent started from `runcmd` |
+| OCI workload | `python:3.12-alpine` index sha256 `d09d15e6…`, linux/arm64 manifest `c95cd472…`, config `cb9af8d1…`; read-only 768 MiB ext4 sha256 `cbaaeacb…` with the matching Ubuntu module tree and a Python vsock init |
 | Bench | `scripts/bench-linux-vmm.sh` in this tree |
 
 **Artifact footprint (bytes the product would ship).**
@@ -114,7 +118,65 @@ Hypervisor on aarch64. Neither number decides anything.
 
 ### 3.1 Results
 
-RESULTS_PLACEHOLDER
+Reviewable summaries are committed under
+`docs/evidence/linux-vmm-2026-08-22/`; the detailed VMM/serial logs remain on
+the evidence host. Each timing starts immediately before VMM spawn and ends
+when the guest initiates a vsock connection to host port 5000. RSS is the VMM
+process's `VmRSS` 10 seconds after ready: it includes resident guest-memory
+pages but does not add the nominal 1 GiB as a separate number.
+
+**Pinned cloud image.** Cloud Hypervisor completed three rounds. Its median
+was 17,044 ms and 485,856 KiB:
+
+| | Round 1 | Round 2 | Round 3 | Median |
+|---|---:|---:|---:|---:|
+| Cloud Hypervisor boot-to-ready | 17,418 ms | 16,478 ms | 17,044 ms | **17,044 ms** |
+| Cloud Hypervisor idle RSS | 514,524 KiB | 485,856 KiB | 479,712 KiB | **485,856 KiB** |
+
+Firecracker completed two cloud-image boots across the preserved attempts:
+130,763 ms / 479,856 KiB on the already-exercised disk and 328,910 ms /
+486,712 KiB from a clean copy of the pinned image. A following boot stalled in
+cloud-init on host kernel 6.8, which Firecracker does not support. Those two
+successes are evidence that it boots this image, but not a distribution from
+which to report a median. The clean-disk result is carried in the committed
+matrix summary; the warm result and stalled serial log are retained on the
+host.
+
+**Identical OCI workload.** Both VMMs booted the same read-only ext4, kernel,
+initrd, 2-vCPU/1-GiB shape and Python vsock workload three times. Every round
+returned `42` over host-to-guest vsock after the guest-to-host ready signal:
+
+| | Round 1 | Round 2 | Round 3 | Median |
+|---|---:|---:|---:|---:|
+| Cloud Hypervisor boot-to-ready | 12,586 ms | 11,613 ms | 14,663 ms | **12,586 ms** |
+| Firecracker boot-to-ready | 19,444 ms | 21,040 ms | 16,088 ms | **19,444 ms** |
+| Cloud Hypervisor idle RSS | 229,748 KiB | 227,704 KiB | 235,892 KiB | **229,748 KiB** |
+| Firecracker idle RSS | 216,908 KiB | 213,600 KiB | 213,540 KiB | **213,600 KiB** |
+
+On this nested host Firecracker was **54.5% slower**, not at most half of
+Cloud Hypervisor's boot time. It saved 16,148 KiB (15.8 MiB) of VMM RSS for
+one idle guest. That is not the §6 density measurement (20 concurrent guests),
+and the nested host cannot pass or fail the binding gate, but the measured
+direction supplies no reason to pay for a second backend now.
+
+**Required capability matrix.** `PROVEN` means the guest and provider both
+observed content/state, not merely that an API returned 2xx.
+
+| Requirement | Cloud Hypervisor v53.0 | Firecracker v1.16.1 |
+|---|---|---|
+| vsock both ways | **PROVEN**: guest ready arrived on host port 5000; host command returned kernel/OS on guest port 5001 | **PROVEN** through the identical protocol, including every OCI workload returning `42` |
+| Local directory | **PROVEN** with `shared=on` + distro `virtiofsd`: guest read `host-wrote-this`; host read `guest-wrote-this` | **ABSENT**: no shared-filesystem device; virtio-fs is explicitly not on the roadmap |
+| Local block | **PROVEN**: 256 MiB hot-add, guest PCI rescan, guest write observed in the host file, then VMM hot-remove | Default MMIO hot-add refused HTTP 400 (`PCI is not enabled`); **PROVEN, developer preview** under `--enable-pci`, guest rescan exposed `vdd` 256 MiB |
+| Remote block | **PROVEN**: NBD-over-unix → host `/dev/nbd0` → VMM hot-add; provider read `via-nbd` after guest unmount | **PROVEN pre-boot**: the same NBD path was attached as `vdc`; provider read `via-nbd`. Production jailer must place the device in its chroot |
+| Snapshot / restore | **PROVEN**: full snapshot 1,913 ms; new VMM restore+resume 2,062 ms; guest counter remained 41 | **PROVEN**: full snapshot 18,498 ms; load+resume 169 ms; guest counter remained 41 |
+| Hotplug / resize | Block proven. Memory resize was accepted and VMM config became 2 GiB, but guest `MemTotal` stayed 980,380 KiB; CPU resize failed on aarch64 | Default transport refuses block/memory hotplug. With PCI + preboot virtio-mem, block hot-add was visible and guest `MemTotal` grew to 2,026,916 KiB. CPU has no post-boot API |
+| Recovery | **PROVEN**: VMM reparented to PID 1; after `SIGKILL`, disk booted in 16,059 ms with counter 41 | **PROVEN**: VMM reparented to PID 1; after `SIGKILL`, disk booted in 342,032 ms with counter 41 |
+
+The matrix fixes Cloud Hypervisor as the general Linux backend because every
+durable-instance requirement has an implementation path, while Firecracker's
+directory-sharing and migration absences are categorical. Firecracker's PCI
+and virtio-mem results are real improvements over its old device model, but
+they do not turn it into the durable backend and do not pass the OCI lane gate.
 
 ## 4. Requirements recorded (package, kernel, privilege, jail, update)
 
@@ -151,11 +213,15 @@ the nested VM's sparse image grew (`EXT4-fs warning … I/O error 10`), which
 is why the script reuses one root disk and reruns cloud-init with a fresh
 instance-id instead of cloning the image per boot.
 
-Additionally, for the §6 gate only, the OCI workload: build the rootfs the
-way `oci.rs` does (`mke2fs -d`), from a pinned `python:3.12-alpine` digest,
-with `/lib/modules/<kernel>` copied in from the cloud image so the vsock
-transport can load, and the bench agent as `init`. Boot it through both VMMs
-with the same `Image`/initrd and measure the same two numbers.
+For the §6 gate, build the pinned OCI workload with
+`scripts/build-linux-vmm-oci-rootfs.sh`, which mirrors `oci.rs`'s `mke2fs -d`
+shape, copies `/lib/modules/<kernel>` from the pinned cloud image so the vsock
+transport can load, and installs the bench agent as init. Then run
+`ROUNDS=10 scripts/bench-linux-vmm.sh oci`; it boots the same read-only ext4,
+`Image` and initrd through both VMMs and records the same two numbers. The
+checked-in builder pins the arm64 platform manifest used here and deliberately
+refuses another architecture; pin the x86_64 manifest before the x86_64 gate
+run rather than resolving a moving tag during measurement.
 
 ## 6. The Firecracker gate (as-lvf.19)
 

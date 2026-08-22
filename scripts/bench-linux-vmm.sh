@@ -21,6 +21,8 @@
 #
 # Inputs (all in $BENCH, default ~/bench):
 #   base.raw        the pinned cloud image, converted to raw
+#   oci.raw         the pinned workload from build-linux-vmm-oci-rootfs.sh
+#   oci.manifest    its image/platform/config/module provenance
 #   Image           the matching kernel, *uncompressed* arm64 Image or x86 bzImage
 #   initrd          the matching initrd
 #   cloud-hypervisor, ch-remote, firecracker, jailer   pinned release binaries
@@ -43,6 +45,8 @@ FC="$BENCH/firecracker"
 KERNEL="$BENCH/Image"
 INITRD="$BENCH/initrd"
 BASE="$BENCH/base.raw"
+OCI="$BENCH/oci.raw"
+MODE="${1:-all}"
 
 case "$ARCH" in
   aarch64) CHV_CONSOLE=ttyAMA0; FC_CONSOLE=ttyS0 ;;
@@ -60,6 +64,10 @@ ms() { python3 -c "import sys; print(int((float(sys.argv[1])-float(sys.argv[2]))
 for f in "$CHV" "$CHR" "$FC" "$KERNEL" "$INITRD" "$BASE"; do
   [ -e "$f" ] || { echo "missing $f" >&2; exit 1; }
 done
+[ "$MODE" != all ] && [ "$MODE" != oci ] || [ -e "$OCI" ] || {
+  echo "missing $OCI (build it with scripts/build-linux-vmm-oci-rootfs.sh)" >&2
+  exit 1
+}
 [ -r /dev/kvm ] && [ -w /dev/kvm ] || { echo "/dev/kvm not rw" >&2; exit 1; }
 
 # ---- guest side: one seed for both VMMs --------------------------------------
@@ -137,6 +145,10 @@ while b"[rc=" not in out:          # the agent's trailer; EOF also ends it
     out += d
 sys.stdout.write(out.decode(errors="replace"))
 PY
+}
+
+persist_agent_service() { # persist_agent_service <vsock-uds>
+  vs_cmd "$1" 'printf "%s\n" "[Unit]" "After=local-fs.target" "[Service]" "ExecStartPre=-/sbin/modprobe vmw_vsock_virtio_transport" "ExecStart=/usr/local/bin/bench-agent" "Restart=always" "[Install]" "WantedBy=multi-user.target" > /etc/systemd/system/bench-agent.service; systemctl enable bench-agent.service >/dev/null; echo enabled' | head -1
 }
 
 # Listener for the guest's "ready": prints the receive time to $2 and exits.
@@ -218,9 +230,10 @@ bench_chv() {
   say "-- chv matrix"
   # vsock host->guest (the agent answering at all is the proof)
   say "vsock h->g: $(vs_cmd "$vs" 'uname -r; cat /etc/os-release | grep -m1 PRETTY' | head -2 | tr '\n' ' ')"
+  say "persistent recovery agent: $(persist_agent_service "$vs")"
   # recovery: VMM outlives the shell that spawned it (this shell is alive, so
   # prove it the other way: the parent of the VMM is init, not us)
-  say "recovery: VMM ppid=$(awk '/^PPid/{print $2}' /proc/$pid/status) (1 = reparented, survives spawner)"
+  say "recovery: VMM ppid=$(awk '/^PPid/{print $2}' "/proc/$pid/status") (1 = reparented, survives spawner)"
 
   # local directory sharing: virtiofs via virtiofsd (vhost-user) -> needs
   # shared memory, which is a *boot-time* property, so hot-add the fs onto a
@@ -231,7 +244,7 @@ bench_chv() {
 
   # local block hotplug
   rm -f "$d/extra.raw"; truncate -s 256M "$d/extra.raw"; mkfs.ext4 -q "$d/extra.raw"
-  local add; add=$("$CHR" --api-socket "$api" add-disk "path=$d/extra.raw,image_type=raw" 2>&1)
+  local add; add=$("$CHR" --api-socket "$api" add-disk "path=$d/extra.raw,image_type=raw,serial=localhot" 2>&1)
   say "disk hot-add: $add"
   sleep 2
   local seen; seen=$(vs_cmd "$vs" 'lsblk -dn -o NAME,SIZE | tr "\n" " "')
@@ -240,8 +253,14 @@ bench_chv() {
     say "guest pci rescan + dmesg: $(vs_cmd "$vs" 'echo 1 > /sys/bus/pci/rescan; sleep 2; lsblk -dn -o NAME,SIZE | tr "\n" " "; dmesg | tail -4 | tr "\n" "|"; ls /sys/bus/pci/devices | tr "\n" " "; cat /sys/firmware/acpi/tables/APIC >/dev/null 2>&1 && echo acpi-tables-present || echo no-acpi-tables' | tr '\n' ' ')"
     seen=$(vs_cmd "$vs" 'lsblk -dn -o NAME,SIZE | tr "\n" " "')
   fi
-  echo "$seen" | grep -q '256M' && say "disk hot-add: PROVEN (guest sees 256M disk)" || say "disk hot-add: NOT SEEN"
-  vs_cmd "$vs" 'mount /dev/vdc /mnt && echo hello-from-guest > /mnt/proof && umount /mnt' | tail -1
+  if echo "$seen" | grep -q '256M'; then
+    say "disk hot-add: PROVEN (guest sees 256M disk)"
+  else
+    say "disk hot-add: NOT SEEN"
+  fi
+  # This command is intentionally single-quoted: it expands inside the guest.
+  # shellcheck disable=SC2016
+  vs_cmd "$vs" 'dev=$(readlink -f /dev/disk/by-id/virtio-localhot); mount "$dev" /mnt && echo hello-from-guest > /mnt/proof && sync && umount /mnt' | tail -1
   local dev_id; dev_id=$(echo "$add" | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])')
   say "disk hot-remove: $("$CHR" --api-socket "$api" remove-device "$dev_id" 2>&1 || true) (removed $dev_id)"
   sleep 1
@@ -256,10 +275,12 @@ bench_chv() {
   local nbd_pid=$!; sleep 0.5
   sudo nbd-client -unix "$d/nbd.sock" -name vol /dev/nbd0 >/dev/null
   sudo chmod 666 /dev/nbd0
-  add=$("$CHR" --api-socket "$api" add-disk "path=/dev/nbd0,image_type=raw" 2>&1)
+  add=$("$CHR" --api-socket "$api" add-disk "path=/dev/nbd0,image_type=raw,serial=remotevol" 2>&1)
   say "remote(NBD-over-unix) block hot-add as /dev/nbd0: $add"
   sleep 2
-  say "guest writes to remote block: $(vs_cmd "$vs" 'mount /dev/vdc /mnt && echo via-nbd > /mnt/proof && sync && umount /mnt && echo ok' | tr '\n' ' ')"
+  say "guest remote block discovery: $(vs_cmd "$vs" 'echo 1 > /sys/bus/pci/rescan; sleep 2; readlink -f /dev/disk/by-id/virtio-remotevol' | tr '\n' ' ')"
+  # shellcheck disable=SC2016 # expands inside the guest
+  say "guest writes to remote block: $(vs_cmd "$vs" 'dev=$(readlink -f /dev/disk/by-id/virtio-remotevol); mount "$dev" /mnt && echo via-nbd > /mnt/proof && sync && umount /mnt && echo ok' | tr '\n' ' ')"
   dev_id=$(echo "$add" | python3 -c 'import sys,json; print(json.load(sys.stdin)["id"])')
   "$CHR" --api-socket "$api" remove-device "$dev_id" >/dev/null 2>&1 || true
   sleep 1; sudo nbd-client -d /dev/nbd0 >/dev/null; kill "$nbd_pid" 2>/dev/null || true; wait "$nbd_pid" 2>/dev/null || true
@@ -279,7 +300,7 @@ bench_chv() {
   "$CHR" --api-socket "$api" pause
   local ts0; ts0=$(now)
   "$CHR" --api-socket "$api" snapshot "file://$d/snap"
-  say "snapshot took $(ms "$(now)" "$ts0") ms; files: $(ls -l "$d/snap" | awk 'NR>1{print $9"="$5}' | tr '\n' ' ')"
+  say "snapshot took $(ms "$(now)" "$ts0") ms; files: $(find "$d/snap" -maxdepth 1 -type f -printf '%f=%s\n' | sort | tr '\n' ' ')"
   "$CHR" --api-socket "$api" shutdown-vmm; wait "$pid" 2>/dev/null || true
   rm -f "$api" "$vs"
   ts0=$(now)
@@ -290,12 +311,17 @@ bench_chv() {
   local tr; tr=$(ms "$(now)" "$ts0")
   local after; after=$(vs_cmd "$vs" 'cat /root/counter; uptime -p' | head -2 | tr '\n' ' ')
   say "restore+resume ${tr} ms; guest after restore: $after"
-  echo "$after" | grep -q '^41' && say "snapshot/restore: PROVEN" || say "snapshot/restore: FAILED"
+  if echo "$after" | grep -q '^41'; then
+    say "snapshot/restore: PROVEN"
+  else
+    say "snapshot/restore: FAILED"
+  fi
   rm -rf "$d/snap"; trim
 
   # recovery from SIGKILL: the disk must boot again.
   kill -9 "$pid"; wait "$pid" 2>/dev/null || true
   sleep 1
+  fresh_root "$ROOT"
   rm -f "$d/ready"; lpid=$(ready_listener "$d/vsock.sock_5000" "$d/ready"); sleep 0.2
   rm -f "$api" "$vs"
   t0=$(now); pid=$(CHV_LOG=chv-reboot.log chv_spawn "$d" "$ROOT")
@@ -318,7 +344,8 @@ bench_chv() {
     say "host sees guest write via virtiofs: $(cat "$d/share/from-guest" 2>&1)"
     say "memory hot-add: $("$CHR" --api-socket "$api" resize --memory 2048M 2>&1 || true)"
     sleep 3
-    say "guest MemTotal after hot-add (was ~${MEM_MIB} MiB): $(vs_cmd "$vs" 'grep MemTotal /proc/meminfo' | head -1)"
+    # shellcheck disable=SC2016 # expands inside the guest
+    say "guest MemTotal after hot-add (was ~${MEM_MIB} MiB): $(vs_cmd "$vs" 'modprobe virtio_mem || true; for state in /sys/devices/system/memory/memory*/state; do [ "$(cat "$state")" = offline ] && echo online > "$state" || true; done; grep MemTotal /proc/meminfo' | grep MemTotal | tail -1)"
     say "cpu hot-add on $ARCH: $("$CHR" --api-socket "$api" resize --cpus 4 2>&1 || true)"; sleep 2
     say "guest nproc: $(vs_cmd "$vs" 'nproc' | head -1)"
     say "vm.info hotplugged: $(curl -s --unix-socket "$api" http://localhost/api/v1/vm.info | python3 -c 'import sys,json; c=json.load(sys.stdin); print("cpus",c["config"]["cpus"],"mem",c["config"]["memory"]["size"],"hotplug_size",c["config"]["memory"]["hotplug_size"])')"
@@ -331,8 +358,8 @@ bench_chv() {
 }
 
 # ---- Firecracker -------------------------------------------------------------
-fc_config() { # fc_config <dir> <root.raw> <out.json> [pci:0/1] [memhotplug:0/1]
-  local d="$1" root="$2" out="$3" pci="${4:-0}" mh="${5:-0}"
+fc_config() { # fc_config <dir> <root.raw> <out.json> [memhotplug:0/1]
+  local d="$1" root="$2" out="$3" mh="${4:-0}"
   python3 - "$d" "$root" "$out" "$BENCH" "$KERNEL" "$INITRD" "$FC_CONSOLE" "$VCPUS" "$MEM_MIB" "$mh" <<'PY'
 import json, sys
 d, root, out, bench, kernel, initrd, con, vcpus, mem, mh = sys.argv[1:]
@@ -340,7 +367,9 @@ cfg = {
   "boot-source": {"kernel_image_path": kernel, "initrd_path": initrd,
                   "boot_args": f"console={con} root=/dev/vda1 rw systemd.mask=systemd-networkd-wait-online.service"},
   "drives": [
-    {"drive_id": "rootfs", "path_on_host": root, "is_root_device": True, "is_read_only": False},
+    # False is deliberate: when true Firecracker appends root=/dev/vda to the
+    # cmdline, overriding the partitioned cloud image's root=/dev/vda1.
+    {"drive_id": "rootfs", "path_on_host": root, "is_root_device": False, "is_read_only": False},
     {"drive_id": "seed", "path_on_host": f"{bench}/seed.img", "is_root_device": False, "is_read_only": True}],
   "machine-config": {"vcpu_count": int(vcpus), "mem_size_mib": int(mem)},
   "vsock": {"guest_cid": 3, "uds_path": f"{d}/vsock.sock"},
@@ -388,7 +417,8 @@ bench_fc() {
 
   say "-- fc matrix"
   say "vsock h->g: $(vs_cmd "$vs" 'uname -r; grep -m1 PRETTY /etc/os-release' | head -2 | tr '\n' ' ')"
-  say "recovery: VMM ppid=$(awk '/^PPid/{print $2}' /proc/$pid/status) (1 = reparented, survives spawner)"
+  say "persistent recovery agent: $(persist_agent_service "$vs")"
+  say "recovery: VMM ppid=$(awk '/^PPid/{print $2}' "/proc/$pid/status") (1 = reparented, survives spawner)"
   say "virtiofs / directory sharing: no such device in the Firecracker device model (docs/device-api.md; #1180 'not on our roadmap')"
 
   # block hot-add WITHOUT --enable-pci (the default transport, MMIO)
@@ -405,7 +435,7 @@ bench_fc() {
   rm -rf "$d/snap"; mkdir -p "$d/snap"
   fc_api "$api" PATCH /vm '{"state":"Paused"}' >/dev/null
   local ts0; ts0=$(now)
-  say "snapshot: $(fc_api "$api" PUT /snapshot/create "{\"snapshot_type\":\"Full\",\"snapshot_path\":\"$d/snap/state\",\"mem_file_path\":\"$d/snap/mem\"}") in $(ms "$(now)" "$ts0") ms; files: $(ls -l "$d/snap" | awk 'NR>1{print $9"="$5}' | tr '\n' ' ')"
+  say "snapshot: $(fc_api "$api" PUT /snapshot/create "{\"snapshot_type\":\"Full\",\"snapshot_path\":\"$d/snap/state\",\"mem_file_path\":\"$d/snap/mem\"}") in $(ms "$(now)" "$ts0") ms; files: $(find "$d/snap" -maxdepth 1 -type f -printf '%f=%s\n' | sort | tr '\n' ' ')"
   kill -9 "$pid"; wait "$pid" 2>/dev/null || true
   rm -f "$api" "$vs"
   ts0=$(now)
@@ -416,10 +446,15 @@ bench_fc() {
   sleep 1
   local after; after=$(vs_cmd "$vs" 'cat /root/counter; uptime -p' | head -2 | tr '\n' ' ')
   say "guest after restore: $after"
-  echo "$after" | grep -q '^41' && say "snapshot/restore: PROVEN" || say "snapshot/restore: FAILED"
+  if echo "$after" | grep -q '^41'; then
+    say "snapshot/restore: PROVEN"
+  else
+    say "snapshot/restore: FAILED"
+  fi
   rm -rf "$d/snap"; trim
 
   kill -9 "$pid"; wait "$pid" 2>/dev/null || true; sleep 1
+  fresh_root "$ROOT"
   rm -f "$d/ready" "$api" "$vs"
   lpid=$(ready_listener "$d/vsock.sock_5000" "$d/ready"); sleep 0.2
   fc_config "$d" "$ROOT" "$d/cfg.json"
@@ -435,7 +470,7 @@ bench_fc() {
   local nbd_pid=$!; sleep 0.5
   sudo nbd-client -unix "$d/nbd.sock" -name vol /dev/nbd0 >/dev/null; sudo chmod 666 /dev/nbd0
   fresh_root "$ROOT"; rm -f "$d/ready" "$api" "$vs"
-  fc_config "$d" "$ROOT" "$d/cfg2.json" 1 1
+  fc_config "$d" "$ROOT" "$d/cfg2.json" 1
   python3 - "$d/cfg2.json" <<'PY'
 import json, sys
 p = sys.argv[1]; c = json.load(open(p))
@@ -453,7 +488,8 @@ PY
     say "guest after pci rescan: $(vs_cmd "$vs" 'echo 1 > /sys/bus/pci/rescan; sleep 1; lsblk -dn -o NAME,SIZE | tr "\n" " "' | head -1)"
     say "memory hot-add (virtio-mem) to 2048: $(fc_api "$api" PATCH /hotplug/memory '{"requested_size_mib":1024}')"
     sleep 3
-    say "guest MemTotal after hot-add (was ~${MEM_MIB} MiB): $(vs_cmd "$vs" 'modprobe virtio_mem; sleep 1; grep MemTotal /proc/meminfo' | grep MemTotal)"
+    # shellcheck disable=SC2016 # expands inside the guest
+    say "guest MemTotal after hot-add (was ~${MEM_MIB} MiB): $(vs_cmd "$vs" 'modprobe virtio_mem || true; for state in /sys/devices/system/memory/memory*/state; do [ "$(cat "$state")" = offline ] && echo online > "$state" || true; done; grep MemTotal /proc/meminfo' | grep MemTotal | tail -1)"
     say "hotplug/memory status: $(fc_api "$api" GET /hotplug/memory)"
   else
     say "guest2: NO READY"; tail -20 "$d/serial.log"
@@ -464,14 +500,91 @@ PY
   say "seccomp: on by default; jailer needs root (docs/jailer.md) and copies/hard-links every drive into its chroot"
 }
 
+# ---- identical OCI workload -------------------------------------------------
+# oci.raw is built from the pinned python:3.12-alpine manifest by the companion
+# builder. Its init mounts the minimum pseudo-filesystems, loads the Ubuntu
+# kernel's vsock transport, and starts the same Python ready agent on both VMMs.
+# The root is read-only so every round consumes byte-identical input.
+chv_oci_spawn() { # chv_oci_spawn <dir>
+  local d="$1"
+  rm -f "$d/api.sock" "$d/vsock.sock"
+  setsid "$CHV" --api-socket "$d/api.sock" \
+    --kernel "$KERNEL" --initramfs "$INITRD" \
+    --cmdline "console=$CHV_CONSOLE root=/dev/vda ro init=/sbin/asterism-bench-init panic=1" \
+    --cpus "boot=$VCPUS,max=$VCPUS" --memory "size=${MEM_MIB}M" \
+    --disk "path=$OCI,readonly=on,image_type=raw" \
+    --vsock "cid=3,socket=$d/vsock.sock" \
+    --serial "file=$d/serial.log" --console off \
+    > "$d/chv.log" 2>&1 &
+  echo $!
+}
+
+fc_oci_config() { # fc_oci_config <dir> <out.json>
+  local d="$1" out="$2"
+  python3 - "$d" "$out" "$KERNEL" "$INITRD" "$FC_CONSOLE" "$VCPUS" "$MEM_MIB" "$OCI" <<'PY'
+import json, sys
+d, out, kernel, initrd, con, vcpus, mem, root = sys.argv[1:]
+cfg = {
+  "boot-source": {"kernel_image_path": kernel, "initrd_path": initrd,
+                  "boot_args": f"console={con} root=/dev/vda ro init=/sbin/asterism-bench-init panic=1"},
+  "drives": [{"drive_id": "rootfs", "path_on_host": root,
+              "is_root_device": True, "is_read_only": True}],
+  "machine-config": {"vcpu_count": int(vcpus), "mem_size_mib": int(mem)},
+  "vsock": {"guest_cid": 3, "uds_path": f"{d}/vsock.sock"},
+}
+json.dump(cfg, open(out, "w"), indent=1)
+PY
+}
+
+bench_oci() {
+  local d="$OUT/oci"; mkdir -p "$d/chv" "$d/fc"
+  say "== identical OCI workload: $(cat "$BENCH/oci.manifest")"
+  say "oci.rootfs: $(stat -c %s "$OCI") B sha256 $(sha256sum "$OCI" | cut -c1-16)…; read-only; init=/sbin/asterism-bench-init"
+  local vmm r vd t0 t1 pid lpid boot_ms
+  for vmm in chv fc; do
+    vd="$d/$vmm"
+    for r in $(seq 1 "$ROUNDS"); do
+      rm -f "$vd/ready"
+      lpid=$(ready_listener "$vd/vsock.sock_5000" "$vd/ready"); sleep 0.2
+      t0=$(now)
+      if [ "$vmm" = chv ]; then
+        pid=$(chv_oci_spawn "$vd")
+      else
+        fc_oci_config "$vd" "$vd/cfg.json"
+        pid=$(fc_spawn "$vd" "$vd/cfg.json")
+      fi
+      if ! t1=$(wait_ready "$vd/ready"); then
+        say "oci $vmm round $r: NO READY in ${READY_TIMEOUT}s"
+        tail -20 "$vd/serial.log" || true
+        kill -9 "$pid" "$lpid" 2>/dev/null || true
+        continue
+      fi
+      boot_ms=$(ms "$t1" "$t0")
+      sleep 10
+      say "oci $vmm round $r: boot-to-vsock-ready ${boot_ms} ms; idle RSS $(rss_kib "$pid") KiB (guest ${MEM_MIB} MiB, ${VCPUS} vcpu)"
+      say "oci $vmm workload: $(vs_cmd "$vd/vsock.sock" 'python3 -c "print(6 * 7)"' | head -1)"
+      if [ "$vmm" = chv ]; then
+        "$CHR" --api-socket "$vd/api.sock" shutdown-vmm >/dev/null 2>&1 || true
+      else
+        fc_api "$vd/api.sock" PUT /actions '{"action_type":"SendCtrlAltDel"}' >/dev/null || true
+        sleep 1
+        kill -9 "$pid" 2>/dev/null || true
+      fi
+      wait "$pid" 2>/dev/null || true
+    done
+  done
+}
+
 # ---- footprint ---------------------------------------------------------------
-say "== host: $(uname -srm); $(grep -m1 PRETTY /etc/os-release); nested=$(systemd-detect-virt 2>/dev/null || echo ?); kvm=$(ls -l /dev/kvm | awk '{print $1}')"
+say "== host: $(uname -srm); $(grep -m1 PRETTY /etc/os-release); nested=$(systemd-detect-virt 2>/dev/null || echo ?); kvm=$(stat -c %A /dev/kvm)"
 say "== inputs: base.raw $(stat -c %s "$BASE") B sha256 $(sha256sum "$BASE" | cut -c1-16)…; Image $(stat -c %s "$KERNEL") B; initrd $(stat -L -c %s "$INITRD") B"
 say "== artifacts: cloud-hypervisor $(stat -L -c %s "$CHV") B, ch-remote $(stat -L -c %s "$CHR") B, virtiofsd $(stat -c %s /usr/libexec/virtiofsd) B ($(dpkg-query -W -f='${Version}' virtiofsd)); firecracker $(stat -L -c %s "$FC") B, jailer $(stat -L -c %s "$BENCH/jailer") B"
 
-case "${1:-all}" in
+case "$MODE" in
   chv) bench_chv ;;
   fc) bench_fc ;;
-  all) bench_chv; bench_fc ;;
+  oci) bench_oci ;;
+  all) bench_chv; bench_fc; bench_oci ;;
+  *) echo "usage: $0 {all|chv|fc|oci}" >&2; exit 2 ;;
 esac
 say "== done; raw logs under $OUT"

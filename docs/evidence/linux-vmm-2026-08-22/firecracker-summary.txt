@@ -1,0 +1,30 @@
+== host: Linux 6.8.0-137-generic aarch64; PRETTY_NAME="Ubuntu 24.04.4 LTS"; nested=apple; kvm=crw-rw-rw-
+== inputs: base.raw 3758096384 B sha256 63cb4783adb9c4de…; Image 59079048 B; initrd 29239653 B
+== artifacts: cloud-hypervisor 5468264 B, ch-remote 1490952 B, virtiofsd 2951472 B (1.10.0-1ubuntu0.1); firecracker 3254360 B, jailer 1916808 B
+== Firecracker Firecracker v1.16.1
+fc round 1: boot-to-vsock-ready 328910 ms; idle RSS 486712 KiB (guest 1024 MiB, 2 vcpu)
+-- fc matrix
+vsock h->g: 6.8.0-137-generic PRETTY_NAME="Ubuntu 24.04.4 LTS"
+recovery: VMM ppid=1 (1 = reparented, survives spawner)
+virtiofs / directory sharing: no such device in the Firecracker device model
+disk hot-add on MMIO transport (default): {"fault_message":"PCI is not enabled"} [http 400]
+drive PATCH (path swap of existing 'seed'): [http 204]
+memory hot-add without pre-boot hotplug config: {"fault_message":"Memory hotplug update error: Failed perform action on device: Device not found"} [http 400]
+cpu hot-add: no API (machine-config is pre-boot only): {"fault_message":"The requested operation is not supported after starting the microVM."} [http 400]
+snapshot: [http 204] in 18498 ms; files: mem=1073741824 state=11045
+restore: [http 204] in 169 ms
+guest after restore: 41 up 4 minutes
+snapshot/restore: PROVEN
+reboot after SIGKILL: PROVEN, ready in 342032 ms; counter=41
+-- fc guest 2: --enable-pci, virtio-mem, remote block
+guest2 (pci, virtio-mem headroom 2048M, /dev/nbd0 drive) ready in 186408 ms; RSS 472460 KiB
+guest lsblk: vda 3.5G vdb 366K vdc 256M
+guest writes to remote(NBD) block: ok [rc=0]
+disk hot-add on PCI (dev preview): [http 204]
+guest after pci rescan: vda 3.5G vdb 366K vdc 256M vdd 256M
+memory hot-add (virtio-mem) to 2048: [http 204]
+guest MemTotal after hot-add (was ~1024 MiB): MemTotal: 2026916 kB
+hotplug/memory status: {"block_size_mib":2,"total_size_mib":2048,"slot_size_mib":128,"plugged_size_mib":1024,"requested_size_mib":1024} [http 200]
+provider side sees guest write through NBD: via-nbd
+seccomp: on by default; jailer needs root and copies/hard-links every drive into its chroot
+== done
