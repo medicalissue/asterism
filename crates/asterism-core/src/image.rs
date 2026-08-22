@@ -1720,7 +1720,13 @@ mod tests {
     fn pull_progress_is_bounded_and_keeps_the_latest_observation() {
         let mut progress = Vec::new();
         for i in 0..(MAX_PULL_PROGRESS + 8) {
-            push_progress(&mut progress, "phase", i as u64, None, i == MAX_PULL_PROGRESS + 7);
+            push_progress(
+                &mut progress,
+                "phase",
+                i as u64,
+                None,
+                i == MAX_PULL_PROGRESS + 7,
+            );
         }
         assert_eq!(progress.len(), MAX_PULL_PROGRESS);
         assert!(progress.last().is_some_and(|item| item.done));
