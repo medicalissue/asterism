@@ -94,6 +94,10 @@ impl Node {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if print_early_exit() {
+        return Ok(());
+    }
+
     // Before anything: the signals that mean "stop". Registering one is what
     // makes it ours — until then the default disposition applies, and for
     // both of these that is death with nothing tidied up. The socket is
@@ -255,6 +259,30 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
         }
+    }
+}
+
+/// Print the daemon's identity without starting it.
+///
+/// This deliberately runs before even registering signal handlers: asking a
+/// shipped binary what it is must not create state or claim its unix socket.
+fn print_early_exit() -> bool {
+    match std::env::args().nth(1).as_deref() {
+        Some("--version") => {
+            println!("astd {VERSION}");
+            true
+        }
+        Some("--help") => {
+            println!(
+                "astd — the Asterism device daemon\n\n\
+                 Usage: astd\n\n\
+                 Options:\n\
+                   --help     Print help\n\
+                   --version  Print version"
+            );
+            true
+        }
+        _ => false,
     }
 }
 
