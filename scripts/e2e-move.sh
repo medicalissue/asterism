@@ -268,6 +268,33 @@ DISK_A="$A/instances/$INST/disk.raw"
 VIRTUAL="$(file_size "$DISK_A")"
 echo "ok: A's root disk claims $VIRTUAL bytes"
 
+# A provenance record only speaks for the bytes that were actually adopted.
+# Exercise the public move command with a same-length replacement and prove
+# the refusal happens before either source fencing or target staging. The
+# first two bytes are saved and restored so the happy-path move below still
+# uses the image this test pulled.
+BASE_A="$(ls "$A/images/"*.raw 2>/dev/null | head -1)"
+[ -n "$BASE_A" ] || fail "A has no adopted raw base image to mutate"
+BASE_PREFIX="$RUN/base-prefix"
+MUTATED_PREFIX="$RUN/mutated-prefix"
+dd if="$BASE_A" of="$BASE_PREFIX" bs=1 count=2 >/dev/null 2>&1
+printf 'XX' | dd of="$BASE_A" bs=1 count=2 conv=notrunc >/dev/null 2>&1
+dd if="$BASE_A" of="$MUTATED_PREFIX" bs=1 count=2 >/dev/null 2>&1
+if cmp -s "$BASE_PREFIX" "$MUTATED_PREFIX"; then
+  printf 'YY' | dd of="$BASE_A" bs=1 count=2 conv=notrunc >/dev/null 2>&1
+fi
+cp "$A/state.json" "$RUN/state-before-mutated-move.json"
+refute "a move refuses a mutated adopted source" "has changed since it was pulled" \
+  env ASTERISM_HOME="$A" "$AST" move "$INST" "$B_NAME"
+cmp -s "$A/state.json" "$RUN/state-before-mutated-move.json" \
+  || fail "the refused move fenced or otherwise changed A's source row"
+[ ! -e "$B/instances/$INST" ] \
+  || fail "the refused move staged an instance directory on B"
+[ -z "$(ls "$B/images" 2>/dev/null || true)" ] \
+  || fail "the refused move changed B's image store"
+dd if="$BASE_PREFIX" of="$BASE_A" bs=1 count=2 conv=notrunc >/dev/null 2>&1
+echo "ok: a mutated source is refused before either device is changed"
+
 # ---- 3. the move -----------------------------------------------------------
 
 MOVE_OUT="$RUN/move.out"

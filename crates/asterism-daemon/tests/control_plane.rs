@@ -19,7 +19,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use asterism_core::hv::Machine;
+use asterism_core::instance::Shape;
 use asterism_core::ipc;
+use asterism_core::protocol::{Request, Response};
+use asterism_core::registry::Shard;
+use asterism_core::verify::{self, Source};
 
 /// An `astd` on a home of its own, killed when the test ends.
 struct Daemon {
@@ -67,6 +72,12 @@ impl Daemon {
         stream.write_all(line.as_bytes()).unwrap();
         stream.write_all(b"\n").unwrap();
         read_line(&mut stream)
+    }
+
+    fn ask_request(&self, request: &Request) -> Response {
+        let line = serde_json::to_string(request).expect("encoding a request");
+        let reply = self.ask(&line);
+        serde_json::from_str(&reply).unwrap_or_else(|e| panic!("decoding {reply:?}: {e}"))
     }
 
     /// Still there, still answering, still this version.
@@ -136,6 +147,80 @@ fn connect_patiently(sock: &Path) -> UnixStream {
 
 fn mode_of(path: &Path) -> u32 {
     std::fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
+/// A move is not allowed to turn an old provenance claim into a new one.
+///
+/// This goes through the daemon socket and the real `MovePrepare` request,
+/// rather than constructing a manifest or calling the verifier directly.
+/// The same-length replacement matters: the refusal rests on comparing the
+/// bytes, not on noticing that a file became a different size. `MovePrepare`
+/// is also the first mutating move frame, so an unchanged registry proves the
+/// check is on the safe side of that boundary.
+#[test]
+fn a_move_refuses_a_mutated_adopted_base_before_fencing_the_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let images = home.join("images");
+    std::fs::create_dir_all(&images).unwrap();
+
+    let staged = images.join("debian-13.raw.part");
+    let base = images.join("debian-13.raw");
+    std::fs::write(&staged, b"trusted").unwrap();
+    verify::adopt(
+        &staged,
+        &base,
+        None,
+        Source::new("base-image", "test publisher")
+            .derived_from([format!("sha256:{}", "a".repeat(64))]),
+    )
+    .unwrap();
+
+    let state = home.join("state.json");
+    let mut shard = Shard::load(&state).unwrap();
+    shard
+        .create(
+            "dev",
+            "laptop",
+            "debian:13",
+            Shape::default(),
+            Machine {
+                backend: "qemu".into(),
+                machine_type: "virt".into(),
+                cpu: "host".into(),
+                hv_version: "test".into(),
+            },
+        )
+        .unwrap();
+    shard.save().unwrap();
+
+    // Same length, different content: only a real provenance verification
+    // distinguishes this from what was adopted.
+    std::fs::write(&base, b"mutated").unwrap();
+    let state_before = std::fs::read(&state).unwrap();
+
+    let astd = Daemon::on(dir, home.clone());
+    let reply = astd.ask_request(&Request::MovePrepare {
+        name: "dev".into(),
+        to_device: "desktop".into(),
+        epoch: 1,
+    });
+    let Response::Error { message } = reply else {
+        panic!("a mutated source was offered to the move: {reply:?}");
+    };
+    assert!(message.contains("source bytes cannot be verified"), "{message}");
+    assert!(message.contains("has changed since it was pulled"), "{message}");
+
+    assert_eq!(
+        std::fs::read(&state).unwrap(),
+        state_before,
+        "the refused move changed the source shard"
+    );
+    let Response::Instance { instance } = astd.ask_request(&Request::Status { name: "dev".into() })
+    else {
+        panic!("the source row could not be read after refusal");
+    };
+    assert!(instance.moving.is_none(), "the refused move mutated the source row");
 }
 
 /// The shape of the whole thing, on the binary that ships: state nobody else

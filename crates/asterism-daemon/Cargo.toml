@@ -15,7 +15,6 @@ asterism-core.workspace = true
 asterism-mesh.workspace = true
 asterism-vz.workspace = true
 anyhow.workspace = true
-blake3.workspace = true
 # The secrets egress data plane, and every line of it is somebody else's
 # maintained code. Asterism owns the policy — which authority, which handle,
 # which header — and none of the transport.

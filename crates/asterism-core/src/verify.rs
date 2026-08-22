@@ -595,12 +595,21 @@ impl Depth {
     }
 }
 
-/// Confirm an artifact is still the one that was adopted, using the record
-/// written beside it.
+/// Return the provenance record, but only after confirming the artifact is
+/// still the bytes that record describes.
+///
+/// Returning the record that was checked matters to callers that need to
+/// repeat part of its claim elsewhere. Reading it a second time after the
+/// check would create a gap in which a replacement record could be exported
+/// without ever having been measured against the artifact.
 ///
 /// The record's path is separate from the artifact's because a local file
 /// the user owns is verified against a record kept in the store.
-pub fn check_recorded(artifact: &Path, record_at: &Path, depth: Depth) -> Result<()> {
+pub fn verified_provenance(
+    artifact: &Path,
+    record_at: &Path,
+    depth: Depth,
+) -> Result<Provenance> {
     // Absence first, and separately: "there is nothing here" and "what is
     // here cannot be accounted for" are different problems with different
     // fixes, and folding the first into the second would tell somebody who
@@ -637,7 +646,7 @@ pub fn check_recorded(artifact: &Path, record_at: &Path, depth: Depth) -> Result
     }
 
     if depth == Depth::Quick && mtime_of(&meta) == record.mtime {
-        return Ok(());
+        return Ok(record);
     }
     record.content.verify_file(artifact, "it").with_context(|| {
         // A file the user owns was never "pulled from" anywhere, and telling
@@ -653,7 +662,14 @@ pub fn check_recorded(artifact: &Path, record_at: &Path, depth: Depth) -> Result
                 record.source
             ),
         }
-    })
+    })?;
+    Ok(record)
+}
+
+/// Confirm an artifact is still the one that was adopted, using the record
+/// written beside it.
+pub fn check_recorded(artifact: &Path, record_at: &Path, depth: Depth) -> Result<()> {
+    verified_provenance(artifact, record_at, depth).map(drop)
 }
 
 /// The usual case: the record sits beside the artifact.

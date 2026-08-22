@@ -311,66 +311,53 @@ fn base_image(inst: &Instance) -> Result<BaseImage> {
     if !base.path.exists() {
         return Ok(BaseImage::absent(reference));
     }
-    let len = std::fs::metadata(&base.path)?.len();
+    // A provenance record is evidence about particular bytes, not a label
+    // that may be copied onto whatever happens to occupy the path today.
+    // Hash the source in full before repeating its parents in a manifest,
+    // and keep the exact record that was checked rather than reading it a
+    // second time after the check. The target will independently check the
+    // bytes it receives against `digest` below.
+    let provenance = verify::verified_provenance(&base.path, &base.record, verify::Depth::Full)
+        .with_context(|| {
+            format!(
+                "refusing to move {:?} from base image {} because its source bytes cannot be verified",
+                inst.name, reference
+            )
+        })?;
+    // Use the address from that same checked record. Hashing again here
+    // would reopen a gap: bytes replaced between the verification and the
+    // second hash could be sent under a fresh address while carrying the old
+    // record's parents. Bare BLAKE3 is the manifest's historical wire shape;
+    // other algorithms name themselves, which `wire_digest` accepts.
+    let digest = if provenance.content.algo() == verify::OWN_ALGO {
+        provenance.content.hex().to_owned()
+    } else {
+        provenance.content.to_string()
+    };
+    // Keep every identity field on the same checked snapshot. A later stat
+    // would let a concurrent replacement advertise a different length under
+    // the record's address (the target would still reject its bytes, but the
+    // manifest would no longer describe one coherent artifact).
+    let len = provenance.size;
     Ok(BaseImage {
         reference,
         len,
         allocated: cow::allocated(&cow::extents(&base.path)?),
-        digest: digest_of(&base.path)?,
-        // Read from the record this device adopted the base against, so that
-        // the copy the target adopts can say the same thing about the same
-        // bytes. Nothing here if the source has no record: that base is
-        // already unbootable *here*, and inventing a parent for it would only
-        // move the surprise to the other device.
-        derived_from: verify::provenance(&base.record)
-            .map(|record| record.derived_from)
-            .unwrap_or_default(),
+        digest,
+        // These are from the record just proved against these bytes. A record
+        // that is missing, malformed, or belongs to older bytes refuses above
+        // instead of lending an unproved parent to the target's new record.
+        derived_from: provenance.derived_from,
     })
-}
-
-/// Content address of a file, cached next to it.
-///
-/// Base images are large and immutable, and a move asks for the same digest
-/// every time. The sidecar is keyed on length and mtime, so an image that is
-/// replaced is re-hashed and one that is not costs a stat.
-pub fn digest_of(path: &Path) -> Result<String> {
-    use std::io::Read;
-    use std::os::unix::fs::MetadataExt;
-
-    let meta = std::fs::metadata(path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let key = format!("{}:{}", meta.len(), meta.mtime());
-    let sidecar = path.with_extension("digest");
-    if let Ok(cached) = std::fs::read_to_string(&sidecar) {
-        if let Some(digest) = cached.strip_prefix(&format!("{key} ")) {
-            return Ok(digest.trim().to_owned());
-        }
-    }
-
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buf = vec![0u8; 1 << 20];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    let digest = hasher.finalize().to_hex().to_string();
-    let _ = std::fs::write(&sidecar, format!("{key} {digest}\n"));
-    Ok(digest)
 }
 
 /// Read a manifest's content address as the verifier's [`Digest`].
 ///
-/// [`digest_of`] writes bare hex and the manifest has always carried it that
-/// way, so the algorithm is not on the wire. It is supplied here, in the one
-/// place that also knows which hash `digest_of` computes — and a peer that
-/// starts naming its algorithm is understood rather than rejected. A digest
-/// this build cannot check is refused before anything is adopted, which is
-/// [`asterism_core::verify::Digest::parse`]'s job and the reason this is not
-/// a `format!` at the call site.
+/// Move manifests historically carry this project's BLAKE3 address as bare
+/// hex, so the algorithm is supplied here. A peer that names an algorithm is
+/// understood too. A digest this build cannot check is refused before
+/// anything is adopted, which is [`asterism_core::verify::Digest::parse`]'s
+/// job and the reason this is not a `format!` at the call site.
 pub fn wire_digest(digest: &str) -> Result<Digest> {
     let spelled =
         if digest.contains(':') { digest.to_owned() } else { format!("blake3:{digest}") };
@@ -467,15 +454,23 @@ pub fn prepare(reg: &mut Shard, name: &str, to_device: &str, epoch: u64) -> Resp
             inst.move_epoch
         ));
     }
+    // Rebuild and verify the offer before the first mutation. The base may
+    // have changed between the read-only preflight and this request; if so,
+    // neither this source row nor anything on the target is touched. Once
+    // fenced, only the instance field differs from this manifest.
+    let mut manifest = match manifest(&inst) {
+        Ok(manifest) => manifest,
+        Err(e) => return error(e),
+    };
     let fenced = reg.set_moving(
         name,
         Some(Moving { to_device: to_device.to_owned(), epoch, started_at: now_unix() }),
     );
     match fenced.and_then(|inst| reg.save().map(|()| inst)) {
-        Ok(inst) => match manifest(&inst) {
-            Ok(manifest) => Response::MoveOffer { manifest: Box::new(manifest) },
-            Err(e) => error(e),
-        },
+        Ok(inst) => {
+            manifest.instance = inst;
+            Response::MoveOffer { manifest: Box::new(manifest) }
+        }
         Err(e) => error(e),
     }
 }
@@ -1283,22 +1278,5 @@ mod tests {
         // A staging directory that is not there is the crashed-mid-move case.
         let err = verify(&dir.path().join("nope"), &manifest, 1).unwrap_err().to_string();
         assert!(err.contains("no staging directory"), "{err}");
-    }
-
-    #[test]
-    fn a_digest_is_stable_and_cached_next_to_what_it_addresses() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("base.raw");
-        std::fs::write(&path, b"asterism").unwrap();
-
-        let first = digest_of(&path).unwrap();
-        assert_eq!(first.len(), 64, "a blake3 hex digest");
-        assert_eq!(first, digest_of(&path).unwrap());
-        assert!(path.with_extension("digest").exists(), "the sidecar is written");
-
-        // Different bytes, different address — and the sidecar is keyed on
-        // length and mtime, so it does not hand back the stale one.
-        std::fs::write(&path, b"something else entirely").unwrap();
-        assert_ne!(first, digest_of(&path).unwrap());
     }
 }
