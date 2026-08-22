@@ -64,7 +64,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch, 2026-08-05
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 peeled commit
 
       # The build id is stamped into the binaries at compile time and is what
       # ties `ast`, `astd` and the desktop app to one build. Naming the commit
@@ -282,12 +282,15 @@ jobs:
         run: |
           set -eu
           version="${{ steps.version.outputs.version }}"
+          node scripts/generate-supply-chain-metadata.mjs --out "dist/${version}" --version "$version"
           # Every artifact, not just the tarball — asterism.rb is checked
           # against this file too when the installer stands up a local tap.
           cli="asterism-${version}-darwin-arm64.tar.gz"
           app="Asterism-${version}-darwin-arm64.app.tar.gz"
           dmg="Asterism-${version}-darwin-arm64.dmg"
-          ( cd "dist/${version}" && shasum -a 256 "$cli" "$app" "$dmg" asterism.rb >SHA256SUMS )
+          sbom="asterism-${version}-sbom.cdx.json"
+          licenses="asterism-${version}-licenses.json"
+          ( cd "dist/${version}" && shasum -a 256 "$cli" "$app" "$dmg" "$sbom" "$licenses" asterism.rb >SHA256SUMS )
           cli_sha="$(shasum -a 256 "dist/${version}/${cli}" | awk '{print $1}')"
           app_sha="$(shasum -a 256 "dist/${version}/${app}" | awk '{print $1}')"
           base="https://github.com/${{ github.repository }}/releases/download/${version}"
@@ -378,6 +381,8 @@ jobs:
           RELEASE.json.sig
           SHA256SUMS
           asterism-${version}-darwin-arm64.tar.gz
+          asterism-${version}-licenses.json
+          asterism-${version}-sbom.cdx.json
           asterism.rb
           NAMES
           )"
@@ -570,4 +575,6 @@ jobs:
             "dist/${version}/SHA256SUMS" \
             "dist/${version}/RELEASE.json" \
             "dist/${version}/RELEASE.json.sig" \
+            "dist/${version}/asterism-${version}-sbom.cdx.json" \
+            "dist/${version}/asterism-${version}-licenses.json" \
             "dist/${version}/asterism.rb"

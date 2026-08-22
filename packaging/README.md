@@ -91,13 +91,30 @@ v0.1.0/
   RELEASE.json                          # exact build, URLs, digests, minimum updater
   RELEASE.json.sig                      # mandatory detached update signature
   asterism.rb                           # the Homebrew formula for this tag
-  SHA256SUMS                            # hashes CLI/app payloads, DMG, and formula
+  asterism-v0.1.0-sbom.cdx.json         # deterministic CycloneDX dependency SBOM
+  asterism-v0.1.0-licenses.json         # deterministic third-party license manifest
+  SHA256SUMS                            # hashes payloads, metadata, DMG, and formula
   SHA256SUMS.sig                        # when a signing key exists
 ```
 
 The CLI tarball is flat on purpose: the installer unpacks it and expects `ast` and
 `astd` at the top, and refuses a tarball missing either rather than installing
 half a release.
+
+### Supply-chain metadata
+
+Every release also publishes a CycloneDX 1.5 SBOM and a compact third-party
+license manifest. Both are generated only from the committed CLI/daemon and GUI
+Rust lockfiles plus the GUI npm lockfile, sorted by package URL, and
+intentionally contain neither a timestamp nor a generated UUID. Re-running
+`node scripts/generate-supply-chain-metadata.mjs --out DIR --version vX.Y.Z`
+against the same locks produces byte-identical files. `SHA256SUMS` covers both
+metadata files alongside the shipped binaries and app artifacts.
+
+The CI supply-chain job audits those exact lockfiles, scans all reachable Git
+history and the checked-out tree locally for secrets, and tests the generator
+twice for deterministic output. Its exception policy is documented in
+[`docs/supply-chain-exceptions.md`](../docs/supply-chain-exceptions.md).
 
 The app tarball remains the signed update channel's payload; it is not the
 manual installer. For a first desktop install, open the DMG and drag
