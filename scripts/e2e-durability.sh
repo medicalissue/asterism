@@ -106,7 +106,7 @@ start_astd_expecting_refusal() {
   for _ in $(seq 1 100); do
     if ! kill -0 "$pid" 2>/dev/null; then
       wait "$pid" 2>/dev/null && fail "astd started when it should have refused"
-      cat "$out" | tee -a "$LOG"
+      tee -a "$LOG" <"$out"
       return 0
     fi
     sleep 0.2

@@ -130,7 +130,9 @@ running_pid() {
 track_running() {
   local pid
   pid="$(running_pid "$1" || true)"
-  [ -n "$pid" ] && track_guest "$pid" || true
+  if [ -n "$pid" ]; then
+    track_guest "$pid" || true
+  fi
 }
 
 # <pid> <ticks>: has it gone within ticks * 0.2s?
@@ -170,7 +172,9 @@ cleanup() {
     stop_pid "$pid" "guest process" || true
   done
   pid="$(astd_pid || true)"
-  [ -n "$pid" ] && stop_pid "$pid" "astd" || true
+  if [ -n "$pid" ]; then
+    stop_pid "$pid" "astd" || true
+  fi
   rm -rf "$ASTERISM_HOME"
   harness_artifacts_note
 }
@@ -337,7 +341,9 @@ helper_log_eventually "the ssh banner path also finished, for comparison" \
   "answered at 192\\.168\\.[0-9.]+ after [0-9.]+s — SSH-"
 AGENT_AT="$(sed -n 's/.* is at [0-9.]* after \([0-9.]*\)s — the guest said so.*/\1/p' "$HELPER_LOG" | head -1)"
 SSH_AT="$(sed -n 's/.* answered at [0-9.]* after \([0-9.]*\)s — SSH-.*/\1/p' "$HELPER_LOG" | head -1)"
-[ -n "$AGENT_AT" ] && [ -n "$SSH_AT" ] || fail "could not read both timings from $HELPER_LOG"
+if [ -z "$AGENT_AT" ] || [ -z "$SSH_AT" ]; then
+  fail "could not read both timings from $HELPER_LOG"
+fi
 echo "ok: guest found by its agent at ${AGENT_AT}s, by an ssh banner at ${SSH_AT}s"
 python3 -c "import sys; sys.exit(0 if $AGENT_AT <= $SSH_AT else 1)" \
   || fail "the guest agent (${AGENT_AT}s) was slower than the ssh banner (${SSH_AT}s), \

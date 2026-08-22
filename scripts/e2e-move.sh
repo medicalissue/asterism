@@ -362,8 +362,9 @@ echo "ok: the move reported $PROGRESS progress lines as the bytes went"
 # Sparse efficiency: the wire carried the allocated ranges, not the file.
 ALLOCATED="$(sed -n 's/.*\[allocated=\([0-9]*\) virtual=\([0-9]*\)\].*/\1/p' "$MOVE_OUT" | head -1)"
 CLAIMED="$(sed -n 's/.*\[allocated=\([0-9]*\) virtual=\([0-9]*\)\].*/\2/p' "$MOVE_OUT" | head -1)"
-[ -n "$ALLOCATED" ] && [ -n "$CLAIMED" ] \
-  || fail "the move never reported its byte counts:"$'\n'"$(cat "$MOVE_OUT")"
+if [ -z "$ALLOCATED" ] || [ -z "$CLAIMED" ]; then
+  fail "the move never reported its byte counts:"$'\n'"$(cat "$MOVE_OUT")"
+fi
 [ "$CLAIMED" -gt "$VIRTUAL" ] || [ "$CLAIMED" -eq "$VIRTUAL" ] \
   || fail "the manifest claims $CLAIMED bytes and the disk alone is $VIRTUAL"
 # Well under half: a fresh 10 GiB Debian instance holds a small fraction of it.
