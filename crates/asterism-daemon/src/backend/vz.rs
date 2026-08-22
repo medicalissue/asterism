@@ -48,16 +48,17 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use asterism_core::hv::{
-    BootReq, Caps, ControlChannel, DiskFormat, DiskSpec, GuestEndpoint, Handle, Hypervisor,
-    Prepared, Ready, RunState, ShareKind, SnapshotId,
+    BootReq, Caps, ControlChannel, DirectKernel, DiskFormat, DiskSpec, GuestEndpoint, GuestHealth,
+    Handle, Hypervisor, ImageKind, Prepared, Ready, RunState, ShareKind, SnapshotId,
 };
-use asterism_core::instance::Instance;
+use asterism_core::instance::{now_unix, Instance};
 use asterism_core::proc::{ProcId, Signal};
 use asterism_core::snapshot::{self, Snapshot};
-use asterism_core::{cow, paths, tools};
+use asterism_core::{cow, oci, paths, tools};
 use asterism_vz::guest;
 use asterism_vz::{
-    Command as VzCommand, Config, Discovery, Disk as VzDisk, Reply, Share as VzShare, StopReason,
+    Command as VzCommand, Config, Discovery, Disk as VzDisk, LinuxBoot, Reply, Share as VzShare,
+    StopReason,
 };
 
 use super::{alive, grow, owned};
@@ -381,10 +382,10 @@ impl Hypervisor for Vz {
             // Rosetta translates x86-64 *user binaries* inside an arm64
             // guest; it is not a foreign-arch machine.
             foreign_arch: false,
-            // Virtualization.framework can boot a Linux kernel directly, but
-            // this backend wires up EFI only — so an OCI rootfs, which has no
-            // bootloader, is refused rather than half-supported.
-            direct_kernel: false,
+            // VZLinuxBootLoader takes the verified kernel/initrd pair (with
+            // the publisher's gzip wrapper removed when necessary), so an
+            // OCI rootfs needs no firmware or bootloader of its own.
+            direct_kernel: true,
             // The guest gets an address of its own on the NAT, so there is
             // nothing to forward from this host's loopback.
             port_forward: false,
@@ -439,10 +440,20 @@ impl Hypervisor for Vz {
         } else {
             self.create_root(req, &raw)?
         };
+        let kernel = if req.base.kind == ImageKind::OciRootfs {
+            let (kernel, initrd) = oci::linux_boot_kernel()?;
+            Some(DirectKernel {
+                kernel,
+                initrd: Some(initrd),
+                cmdline: oci_cmdline(&req.instance.name),
+            })
+        } else {
+            None
+        };
         Ok(Prepared {
             root,
             firmware: None,
-            kernel: None,
+            kernel,
         })
     }
 
@@ -464,14 +475,32 @@ impl Hypervisor for Vz {
         let p = self.probed()?;
         let inst = req.instance;
 
-        if !req.seed.exists() {
+        if prep.kernel.is_none() && !req.seed.exists() {
             bail!("no cloud-init seed at {}", req.seed.display());
         }
+        if req.base.kind == ImageKind::OciRootfs {
+            oci::configure_instance(
+                &req.base.path,
+                prep.root_path()?,
+                &req.shares,
+                (!req.shares.is_empty()).then_some(ShareKind::Virtiofs),
+                &req.egress,
+                &req.bootstrap,
+            )?;
+        }
+
+        let direct_kernel = prep.kernel.as_ref().map(|direct| LinuxBoot {
+            kernel: direct.kernel.clone(),
+            initrd: direct.initrd.clone(),
+            cmdline: direct.cmdline.clone(),
+        });
+
         let config = Config {
             instance: inst.name.clone(),
             root: prep.root_path()?.to_owned(),
             seed: req.seed.clone(),
             efi_vars: req.dir.join("efi-vars.bin"),
+            direct_kernel,
             console: req.console.clone(),
             ctl: paths::vz_socket_path(&inst.name),
             extra_disks: req
@@ -483,13 +512,22 @@ impl Hypervisor for Vz {
             cpus: inst.shape.cpus,
             mem_mib: inst.shape.mem_mib,
             mac: asterism_vz::mac_for(&inst.name),
+            // An OCI rootfs has no cloud image in which to install the
+            // Python guest agent or sshd. Its generated init runs DHCP with
+            // this instance's pinned MAC, so a current matching lease is
+            // the endpoint rather than merely a candidate for an ssh probe.
+            dhcp_lease_is_endpoint: prep.kernel.is_some(),
             // The key, not the bytes: `vz.json` is what a human reads to
             // find out what a running guest was built from, and a secret
             // does not belong in it. Only named when it is actually there —
             // an instance whose seed predates the agent has no key file,
             // and telling the helper to look for one would be a boot that
             // complains instead of one that falls back.
-            agent_key: Some(paths::guest_agent_key_path(&inst.name)).filter(|path| path.exists()),
+            agent_key: prep
+                .kernel
+                .is_none()
+                .then(|| paths::guest_agent_key_path(&inst.name))
+                .filter(|path| path.exists()),
         };
         let config_path = req.dir.join("vz.json");
         config.write(&config_path)?;
@@ -528,7 +566,13 @@ impl Hypervisor for Vz {
         reap_in_background(child);
         let proc = proc?;
 
-        match wait_for_guest(&config.ctl, &proc, &log_path, &inst.name) {
+        match wait_for_guest(
+            &config.ctl,
+            &proc,
+            &log_path,
+            &inst.name,
+            config.dhcp_lease_is_endpoint,
+        ) {
             Ok(addr) => Ok(Handle::owning(
                 ID,
                 proc,
@@ -729,6 +773,22 @@ impl Hypervisor for Vz {
         }
     }
 
+    fn guest_health(&self, h: &Handle) -> Result<Option<GuestHealth>> {
+        let info = self.info(h, Duration::from_secs(2))?;
+        Ok(info
+            .agent
+            .as_deref()
+            .and_then(|agent| agent.status.as_ref())
+            .map(|status| GuestHealth {
+                addrs: status.addrs.clone(),
+                uptime_secs: status.uptime_secs,
+                ssh: status.ssh,
+                cloud_init: status.cloud_init.clone(),
+                load1: status.load1,
+                mem_available_kib: status.mem_available_kib,
+            }))
+    }
+
     // ---- disk snapshots ----------------------------------------------------
     //
     // Identical to the QEMU backend's raw path, and deliberately so: a
@@ -761,6 +821,22 @@ impl Hypervisor for Vz {
 }
 
 // ---- boot ------------------------------------------------------------------
+
+/// Kernel arguments for a directly booted OCI rootfs on VZ.
+///
+/// Unlike QEMU user-net, Virtualization.framework's NAT chooses an address,
+/// so the generated init runs DHCP. The pinned hostname and MAC let the
+/// helper identify the resulting lease without teaching orchestration about
+/// macOS's network layout.
+fn oci_cmdline(instance: &str) -> String {
+    format!(
+        "root=/dev/vda rw console=hvc0 net.ifnames=0 panic=10 init={} \
+         asterism.hostname={} asterism.time={}",
+        oci::INIT_PATH,
+        instance,
+        now_unix(),
+    )
+}
 
 /// Wait for a helper that is on its way out to let go of its socket.
 ///
@@ -854,7 +930,13 @@ fn take_down_over_the_socket(h: &Handle, command: VzCommand, budget: Duration) -
 /// all", which fails fast and quotes the helper's own log; the second is
 /// "has the guest finished booting", which is slow by nature and is the
 /// wait a user experiences as `ast up`.
-fn wait_for_guest(ctl: &Path, proc: &ProcId, log: &Path, instance: &str) -> Result<IpAddr> {
+fn wait_for_guest(
+    ctl: &Path,
+    proc: &ProcId,
+    log: &Path,
+    instance: &str,
+    dhcp_lease_is_endpoint: bool,
+) -> Result<IpAddr> {
     let started = Instant::now();
     let helper_deadline = started + HELPER_TIMEOUT;
     let deadline = started + BOOT_TIMEOUT;
@@ -884,7 +966,12 @@ fn wait_for_guest(ctl: &Path, proc: &ProcId, log: &Path, instance: &str) -> Resu
                     }
                 }
                 if let Some(addr) = info.guest_ip {
-                    if matches!(info.endpoint_via, Some(Discovery::Ssh) | None) {
+                    if dhcp_lease_is_endpoint {
+                        eprintln!(
+                            "astd: {instance} received {addr} from Virtualization.framework's \
+                             DHCP network"
+                        );
+                    } else if matches!(info.endpoint_via, Some(Discovery::Ssh) | None) {
                         // Worth a line because it is the slower, weaker
                         // path: an address out of the lease file that
                         // something answered on. A guest that keeps landing
@@ -1202,6 +1289,8 @@ mod tests {
             base,
             seed: dir.join("seed.iso"),
             shares: Vec::new(),
+            egress: Default::default(),
+            bootstrap: Default::default(),
             extra_disks: Vec::new(),
             console: dir.join("console.log"),
         }
@@ -1325,7 +1414,22 @@ mod tests {
         assert!(!caps.live_migration);
         assert_eq!(caps.shared_dir, Some(ShareKind::Virtiofs));
         assert!(caps.nbd_disks);
+        assert!(caps.direct_kernel, "VZLinuxBootLoader is wired through");
         assert_eq!(caps.disk_formats, &[DiskFormat::Raw], "no qcow2, ever");
+    }
+
+    #[test]
+    fn an_oci_kernel_uses_vzs_console_and_guest_dhcp() {
+        let line = oci_cmdline("oci-web");
+        assert!(line.contains("root=/dev/vda rw"), "{line}");
+        assert!(line.contains("console=hvc0"), "{line}");
+        assert!(line.contains("init=/asterism-init"), "{line}");
+        assert!(line.contains("asterism.hostname=oci-web"), "{line}");
+        assert!(line.contains("asterism.time="), "{line}");
+        assert!(
+            !line.contains("asterism.ip="),
+            "VZ NAT chooses the address: {line}"
+        );
     }
 
     /// Everything the guest is asked to do about `/dev/hvc0`, and the two
@@ -1549,6 +1653,42 @@ mod tests {
             console: "/i/vzdisky/console.log".into(),
             storage_error: lost,
         }
+    }
+
+    #[test]
+    fn guest_health_is_taken_from_the_authenticated_agent_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("health.sock");
+        let mut info = helper_info(asterism_vz::State::Running, None);
+        info.agent = Some(Box::new(asterism_vz::AgentInfo {
+            version: 1,
+            agent: "asterism-guest/1".into(),
+            hostname: "dev".into(),
+            boot_id: "boot".into(),
+            kernel: "6.8".into(),
+            since: 1,
+            status: Some(guest::Status {
+                addrs: vec!["192.168.64.7".parse().unwrap()],
+                uptime_secs: 125.9,
+                ssh: true,
+                cloud_init: "done".into(),
+                load1: Some(0.42),
+                mem_available_kib: Some(1_572_864),
+            }),
+        }));
+        fake_helper(&sock, info);
+
+        assert_eq!(
+            Vz::new().guest_health(&handle_on(&sock)).unwrap(),
+            Some(GuestHealth {
+                addrs: vec!["192.168.64.7".parse().unwrap()],
+                uptime_secs: 125.9,
+                ssh: true,
+                cloud_init: "done".into(),
+                load1: Some(0.42),
+                mem_available_kib: Some(1_572_864),
+            })
+        );
     }
 
     /// A handle owning this test process, which is the live helper these
@@ -1935,7 +2075,7 @@ mod tests {
         );
 
         let me = ProcId::capture(std::process::id()).unwrap();
-        let err = wait_for_guest(&sock, &me, &log, "vzdisky")
+        let err = wait_for_guest(&sock, &me, &log, "vzdisky", false)
             .unwrap_err()
             .to_string();
         assert!(err.contains("stopped while booting"), "{err}");

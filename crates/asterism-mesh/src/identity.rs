@@ -14,12 +14,17 @@
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use iroh::{PublicKey, SecretKey};
 
 /// Magic line prefix for the on-disk key file, so a stray file is never
 /// mistaken for a key and a future format change is detectable.
 const KEY_FILE_MAGIC: &str = "asterism-device-key/1";
+
+/// Makes temporary key paths distinct across threads in one process.  The
+/// process id and current time in [`temp_path`] distinguish restarts.
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// The file mode a private key must have: readable and writable by its owner,
 /// invisible to everyone else.
@@ -165,8 +170,16 @@ impl DeviceIdentity {
             Ok(identity) => Ok(identity),
             Err(IdentityError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
                 let identity = Self::generate();
-                identity.save(path)?;
-                Ok(identity)
+                match identity.install_new(path) {
+                    Ok(()) => Ok(identity),
+                    // Another daemon won the first-start race.  Its key is the
+                    // identity now, and every contender must return it rather
+                    // than overwrite it with a different one.
+                    Err(IdentityError::Io(e)) if e.kind() == io::ErrorKind::AlreadyExists => {
+                        Self::load(path)
+                    }
+                    Err(e) => Err(e),
+                }
             }
             Err(e) => Err(e),
         }
@@ -215,20 +228,10 @@ impl DeviceIdentity {
     /// created `0600` from the start — never briefly world-readable.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), IdentityError> {
         let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-
-        let body = format!(
-            "# Asterism device key. Anyone who reads this file can impersonate this device.\n\
-             {KEY_FILE_MAGIC} {}\n",
-            data_encoding::HEXLOWER.encode(&self.secret.to_bytes()),
-        );
+        create_parent(path)?;
 
         let tmp = temp_path(path);
-        write_private(&tmp, body.as_bytes())?;
+        write_private(&tmp, self.body().as_bytes())?;
         match std::fs::rename(&tmp, path) {
             // The rename is a change to the *directory*, and until the
             // directory is flushed it is a promise the drive has not made.
@@ -243,6 +246,34 @@ impl DeviceIdentity {
                 Err(e.into())
             }
         }
+    }
+
+    /// Installs a first identity without ever replacing another process's
+    /// winner.  A hard link is the portable no-clobber publish primitive:
+    /// both names are in one directory, and creating the destination fails
+    /// atomically when it already exists.
+    fn install_new(&self, path: &Path) -> Result<(), IdentityError> {
+        create_parent(path)?;
+        let tmp = temp_path(path);
+        write_private(&tmp, self.body().as_bytes())?;
+        match std::fs::hard_link(&tmp, path) {
+            Ok(()) => {
+                std::fs::remove_file(&tmp)?;
+                sync_dir(parent_dir(path))
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(e.into())
+            }
+        }
+    }
+
+    fn body(&self) -> String {
+        format!(
+            "# Asterism device key. Anyone who reads this file can impersonate this device.\n\
+             {KEY_FILE_MAGIC} {}\n",
+            data_encoding::HEXLOWER.encode(&self.secret.to_bytes()),
+        )
     }
 
     /// The secret key, for binding an iroh endpoint.
@@ -284,8 +315,28 @@ fn sync_dir(dir: &Path) -> Result<(), IdentityError> {
 /// Builds the sibling temporary path used for the atomic save.
 fn temp_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(".tmp");
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    name.push(format!(".tmp.{}.{nanos}.{sequence}", std::process::id()));
     path.with_file_name(name)
+}
+
+fn create_parent(path: &Path) -> Result<(), IdentityError> {
+    let parent = parent_dir(path);
+    if parent != Path::new(".") {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
+fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
 }
 
 #[cfg(unix)]
@@ -295,8 +346,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
     let mut file = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(KEY_FILE_MODE)
         .open(path)?;
     file.write_all(bytes)?;
@@ -307,7 +357,14 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 #[cfg(not(unix))]
 fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    std::fs::write(path, bytes)
+    use std::io::Write;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 #[cfg(unix)]
@@ -372,6 +429,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn concurrent_first_start_installs_one_identity_without_rotation() {
+        use std::sync::{Arc, Barrier};
+
+        const STARTERS: usize = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let path = Arc::new(dir.path().join("device.key"));
+        let barrier = Arc::new(Barrier::new(STARTERS));
+        let mut threads = Vec::new();
+        for _ in 0..STARTERS {
+            let path = Arc::clone(&path);
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                DeviceIdentity::load_or_create(path.as_path())
+                    .unwrap()
+                    .device_id()
+            }));
+        }
+
+        let ids: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert!(ids.iter().all(|id| *id == ids[0]));
+        assert_eq!(DeviceIdentity::load(&*path).unwrap().device_id(), ids[0]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn persisted_key_is_mode_0600() {
@@ -431,7 +516,7 @@ mod tests {
             .unwrap()
             .filter_map(Result::ok)
             .map(|e| e.file_name())
-            .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+            .filter(|name| name.to_string_lossy().contains(".tmp."))
             .collect();
         assert!(leftovers.is_empty(), "stray temp files: {leftovers:?}");
     }

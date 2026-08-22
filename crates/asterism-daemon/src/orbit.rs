@@ -45,6 +45,7 @@ pub(crate) fn claims(req: &Request) -> bool {
             | Request::DeviceWake { .. }
             | Request::DevicePing { .. }
             | Request::DeviceRemove { .. }
+            | Request::DeviceShellStatus
             | Request::DeviceShellPolicy { .. }
             | Request::PairConfirm { .. }
             | Request::ListOrbit
@@ -112,6 +113,14 @@ pub(crate) async fn serve(req: Request, node: &Node, mesh: Option<&Arc<Mesh>>) -
                 },
             },
             None => no_mesh(),
+        },
+        // A read capability, unlike the mutation request below. It is also
+        // served to authenticated mesh callers, which lets every management
+        // surface consume the daemon's own model without gaining authority
+        // to change the target account's policy.
+        Request::DeviceShellStatus => Response::DeviceShellStatus {
+            status: node.shell.status(mesh.is_some()),
+            revoked: 0,
         },
         Request::DeviceShellPolicy { action } => {
             match action {
@@ -233,6 +242,7 @@ mod tests {
             Request::DeviceRemove {
                 name: "desktop".into(),
             },
+            Request::DeviceShellStatus,
             Request::DeviceShellPolicy {
                 action: ShellPolicyAction::Status,
             },

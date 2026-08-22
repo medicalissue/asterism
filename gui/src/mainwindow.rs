@@ -203,6 +203,15 @@ pub(crate) async fn device_rows() -> Result<Devices, String> {
     blocking(Devices::load).await
 }
 
+/// Enable or disable only this app's local daemon. There is deliberately no
+/// target parameter; remote rows are a read capability.
+#[tauri::command]
+pub(crate) async fn set_device_shell(enabled: bool) -> Result<crate::devices::Shell, String> {
+    blocking(move || crate::devices::set_shell(enabled))
+        .await?
+        .map_err(|error| format!("{error:#}"))
+}
+
 #[tauri::command]
 pub(crate) async fn settings_rows(app: AppHandle) -> Result<Settings, String> {
     let autostart = crate::autostart_enabled(&app);

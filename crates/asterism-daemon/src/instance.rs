@@ -26,7 +26,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 
 use asterism_core::durable;
-use asterism_core::hv::{ImageKind, RunState, STOP_DEADLINE};
+use asterism_core::hv::{GuestHealth, ImageKind, RunState, STOP_DEADLINE};
 use asterism_core::instance::{local_host, Instance, Policy, Status};
 use asterism_core::profile;
 use asterism_core::protocol::{Request, Response};
@@ -74,7 +74,7 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
                 Ok(instance) => {
                     let mut instance = instance.clone();
                     volume::annotate_runtime(&mut instance).await;
-                    Response::Instance { instance }
+                    status_response(instance)
                 }
                 Err(e) => Response::Error {
                     message: format!("{e:#}"),
@@ -101,7 +101,7 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
                 // Resolved before the row exists, so a mistyped profile is a
                 // refusal rather than an instance that cannot boot. Nothing
                 // is applied here: profiles reach a guest through its seed.
-                check_profiles(&r.kind, &profiles)?;
+                check_profiles(&profiles)?;
                 reg.create(&name, cpu_device, &r.name, shape, machine)?;
                 if r.kind == ImageKind::OciRootfs {
                     // A container that has finished is not a crash; see
@@ -116,11 +116,11 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
         }
         // Recorded now, applied at the next boot. Saying so is the CLI's
         // job; refusing a name the catalog does not know is this one's.
-        Request::SetProfiles { name, profiles } => {
-            let kind = reg.get(&name).map(|i| i.image_kind);
-            kind.and_then(|kind| check_profiles(&kind, &profiles))
-                .and_then(|_| reg.set_profiles(&name, profiles))
-        }
+        Request::SetProfiles { name, profiles } => reg
+            .get(&name)
+            .map(|_| ())
+            .and_then(|_| check_profiles(&profiles))
+            .and_then(|_| reg.set_profiles(&name, profiles)),
         // `--restart` is recorded before the boot, so an instance that comes
         // up and immediately dies is already carrying the policy the user
         // asked for when the supervisor looks at the corpse.
@@ -281,12 +281,41 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
                     message: format!("saving registry: {e:#}"),
                 };
             }
-            Response::Instance { instance }
+            Response::Instance {
+                instance,
+                guest_health: None,
+            }
         }
         Err(e) => Response::Error {
             message: format!("{e:#}"),
         },
     }
+}
+
+/// Make a status response from the recorded row plus a fresh, optional guest
+/// observation. The registry is deliberately not changed: agent health is a
+/// sample, while its rows are durable instance configuration and lifecycle.
+fn status_response(instance: Instance) -> Response {
+    let guest_health = instance
+        .handle
+        .as_ref()
+        .and_then(guest_health)
+        .map(Box::new);
+    Response::Instance {
+        instance,
+        guest_health,
+    }
+}
+
+/// Ask the backend that owns this handle, rather than selecting on a host or
+/// backend name here. A failed status poll is absence of a guest observation,
+/// not evidence that a still-running instance has died.
+fn guest_health(handle: &asterism_core::hv::Handle) -> Option<GuestHealth> {
+    backend::for_handle(&handle.backend)
+        .ok()?
+        .guest_health(handle)
+        .ok()
+        .flatten()
 }
 
 /// What a request that no area of this daemon claims is told.
@@ -492,25 +521,13 @@ fn restore_backup(reg: &mut Shard, source: &Path, name: &str, cpu_device: &str) 
     Response::BackupRestored { report }
 }
 
-/// Refuse a profile set that cannot be applied, before anything is written.
+/// Refuse an unknown profile before anything is written.
 ///
-/// Two ways it cannot be. The name may not be in the catalog, which
-/// [`profile::Bootstrap::resolve`] answers with the catalog itself. Or the
-/// instance may be an OCI one, which has no cloud-init and therefore no way
-/// to be told anything: a container image's whole configuration was written
-/// into its filesystem at pull time, so a profile silently doing nothing is
-/// the alternative to saying this.
-fn check_profiles(kind: &ImageKind, profiles: &[String]) -> Result<()> {
-    if profiles.is_empty() {
-        return Ok(());
-    }
-    if *kind == ImageKind::OciRootfs {
-        anyhow::bail!(
-            "a container image has no cloud-init to apply a bootstrap profile with — \
-             its configuration is the image. Boot a cloud image (ast images) \
-             to use profiles"
-        );
-    }
+/// [`profile::Bootstrap::resolve`] answers with the catalog when a name is
+/// unknown. Both cloud images and OCI rootfs images consume the resolved
+/// bootstrap at boot: cloud images through their seed and OCI images through
+/// Asterism's generated init.
+fn check_profiles(profiles: &[String]) -> Result<()> {
     profile::Bootstrap::resolve(profiles).map(|_| ())
 }
 
@@ -909,27 +926,16 @@ mod tests {
         );
     }
 
-    /// A profile that cannot be applied is refused before the row exists.
-    ///
-    /// Both refusals are about the same thing: an instance whose record
-    /// promises work that will never happen. One is a name nothing answers
-    /// to; the other is a guest with no cloud-init to be told anything by,
-    /// which is every OCI instance and is not a thing a message can fix.
+    /// An unknown profile is refused before the row exists.
     #[test]
-    fn a_profile_that_cannot_be_applied_is_refused_at_create() {
-        assert!(check_profiles(&ImageKind::Disk, &["claude".to_owned()]).is_ok());
-        // Nothing asked for is nothing to refuse, whatever the image is.
-        assert!(check_profiles(&ImageKind::OciRootfs, &[]).is_ok());
+    fn an_unknown_profile_is_refused_at_create() {
+        assert!(check_profiles(&["claude".to_owned()]).is_ok());
+        assert!(check_profiles(&[]).is_ok());
 
-        let err = check_profiles(&ImageKind::Disk, &["cladue".to_owned()])
+        let err = check_profiles(&["cladue".to_owned()])
             .unwrap_err()
             .to_string();
         assert!(err.contains("no bootstrap profile called"), "{err}");
-
-        let err = check_profiles(&ImageKind::OciRootfs, &["claude".to_owned()])
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("container image has no cloud-init"), "{err}");
     }
 
     /// Claiming and resolving are different questions, and a rename asks

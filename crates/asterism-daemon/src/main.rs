@@ -99,11 +99,15 @@ async fn main() -> Result<()> {
     // Release activation has to prove the staged daemon before it replaces a
     // running one. This path touches no state and binds no socket, so a
     // downgrade refusal remains a refusal before mutation.
-    if matches!(std::env::args().nth(1).as_deref(), Some("-V" | "--version")) {
+    if matches!(std::env::args().nth(1).as_deref(), Some("-V")) {
         println!("version   {}", asterism_core::VERSION);
         println!("build     {}", asterism_core::BUILD_ID);
         return Ok(());
     }
+    if print_early_exit() {
+        return Ok(());
+    }
+
     // Before anything: the signals that mean "stop". Registering one is what
     // makes it ours — until then the default disposition applies, and for
     // both of these that is death with nothing tidied up. The socket is
@@ -267,6 +271,30 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
         }
+    }
+}
+
+/// Print the daemon's identity without starting it.
+///
+/// This deliberately runs before even registering signal handlers: asking a
+/// shipped binary what it is must not create state or claim its unix socket.
+fn print_early_exit() -> bool {
+    match std::env::args().nth(1).as_deref() {
+        Some("--version") => {
+            println!("astd {VERSION}");
+            true
+        }
+        Some("--help") => {
+            println!(
+                "astd — the Asterism device daemon\n\n\
+                 Usage: astd\n\n\
+                 Options:\n\
+                   --help     Print help\n\
+                   --version  Print version"
+            );
+            true
+        }
+        _ => false,
     }
 }
 

@@ -315,6 +315,35 @@ pub enum RunState {
     Stopped,
 }
 
+/// The guest's account of its health, gathered through a backend's
+/// authenticated guest-agent channel.
+///
+/// This is deliberately separate from [`RunState`]: a hypervisor can know
+/// that its VM process is live while the guest has no network, is still
+/// provisioning, or is short of memory. Backends without a guest agent simply
+/// leave it absent from a status reply.
+// No `Eq`: uptime and load are measured as floating-point values by the
+// guest, and treating two separately sampled values as exactly equal would
+// not describe a useful property.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GuestHealth {
+    /// Addresses reported by the guest itself, with the default-route address
+    /// first when it knows one.
+    #[serde(default)]
+    pub addrs: Vec<IpAddr>,
+    #[serde(default)]
+    pub uptime_secs: f64,
+    #[serde(default)]
+    pub ssh: bool,
+    /// `done`, `running`, `error`, or `unknown`, from cloud-init.
+    #[serde(default)]
+    pub cloud_init: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load1: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_available_kib: Option<u64>,
+}
+
 // ---- capability and identity ----------------------------------------------
 
 /// Kind of host-directory sharing a backend offers.
@@ -547,6 +576,14 @@ pub struct BootReq<'a> {
     /// Host directories to share into the guest. Only meaningful when
     /// [`Caps::shared_dir`] is `Some`.
     pub shares: Vec<Share>,
+    /// Per-instance secret-egress material. A cloud image receives this in
+    /// its NoCloud seed; an OCI rootfs receives the same public CA, opaque
+    /// handles and proxy address through its generated init.
+    pub egress: crate::seed::Egress,
+    /// Resolved bootstrap profiles. Cloud images receive these in NoCloud;
+    /// OCI root filesystems receive the same files and driver through their
+    /// generated init.
+    pub bootstrap: crate::profile::Bootstrap,
     /// Attached volumes that arrive as disks, including remote ones.
     pub extra_disks: Vec<DiskSpec>,
     pub console: PathBuf,
@@ -639,6 +676,14 @@ pub trait Hypervisor: Send + Sync {
     /// Liveness for a handle reloaded from the registry after an astd
     /// restart. Never assumes the handle is still valid.
     fn state(&self, h: &Handle) -> Result<RunState>;
+
+    /// The guest's own current health, where this backend has an authenticated
+    /// channel for it. This is an observation for `ast status`, not a
+    /// liveness test: failure to collect it leaves the instance's recorded
+    /// state intact and returns no guest health.
+    fn guest_health(&self, _h: &Handle) -> Result<Option<GuestHealth>> {
+        Ok(None)
+    }
 
     // ---- capability-gated; default impls refuse ----------------------------
 

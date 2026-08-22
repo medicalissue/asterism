@@ -15,7 +15,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -23,6 +23,7 @@ jobs:
       - run: cargo build --workspace
       - run: cargo test --workspace
       - run: bash scripts/e2e-remote-gpu.sh
+      - run: bash scripts/check-rust-source-graph.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   # The installer is the first thing a user runs and the one piece of this
@@ -34,7 +35,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install shellcheck
         run: |
@@ -89,7 +90,7 @@ jobs:
   rc:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy

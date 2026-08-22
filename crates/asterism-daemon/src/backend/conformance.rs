@@ -121,6 +121,8 @@ impl Fixture {
             },
             seed: self.dir.join("seed.iso"),
             shares: Vec::new(),
+            egress: Default::default(),
+            bootstrap: Default::default(),
             extra_disks: Vec::new(),
             // Logs are an input to the mandatory boot method, not something
             // a backend is allowed to relocate by naming convention.

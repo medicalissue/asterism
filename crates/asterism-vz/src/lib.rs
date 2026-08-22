@@ -92,6 +92,14 @@ pub struct Config {
     /// EFI variable store. Created by the helper on first boot, because
     /// only the framework can initialise one, and reused after.
     pub efi_vars: PathBuf,
+    /// A kernel handed directly to Virtualization.framework. Present for an
+    /// OCI root filesystem, which has no EFI bootloader of its own; absent
+    /// for a cloud-image disk, which boots through `efi_vars` above.
+    ///
+    /// Additive on the daemon/helper wire: an older config has no field and
+    /// therefore keeps taking the EFI path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_kernel: Option<LinuxBoot>,
     /// Where the guest's serial console lands.
     pub console: PathBuf,
     /// Unix socket the helper listens on for [`Command`]s.
@@ -110,6 +118,12 @@ pub struct Config {
     /// `/var/db/dhcpd_leases` — a random MAC means no way to guess the
     /// guest's address when the guest cannot be asked for it.
     pub mac: String,
+    /// Treat a matching DHCP lease as the guest endpoint without requiring
+    /// an ssh banner. OCI root filesystems set this because their generated
+    /// init runs DHCP but deliberately carries neither sshd nor the Python
+    /// guest agent. Cloud images keep the stronger historical proof.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dhcp_lease_is_endpoint: bool,
     /// The per-instance key the guest agent is authenticated with
     /// ([`guest::Key`]), as a path rather than as the bytes: this file is
     /// written next to the guest's disk and read by whoever looks at what a
@@ -122,6 +136,20 @@ pub struct Config {
     /// NAT, exactly as it did before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_key: Option<PathBuf>,
+}
+
+/// Virtualization.framework's native Linux boot-loader inputs.
+///
+/// This is deliberately just data. The daemon obtains and verifies the
+/// kernel through the shared OCI store; the signed helper translates these
+/// three paths/bytes to `VZLinuxBootLoader`. No QEMU option or device name is
+/// part of the helper protocol.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinuxBoot {
+    pub kernel: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initrd: Option<PathBuf>,
+    pub cmdline: String,
 }
 
 /// One additional disk to put in front of the guest.
@@ -177,6 +205,10 @@ impl Config {
         std::fs::write(path, serde_json::to_vec_pretty(self)?)
             .with_context(|| format!("writing {}", path.display()))
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// What the daemon can ask of a running helper.
@@ -528,6 +560,11 @@ mod tests {
             root: "/i/dev/disk.raw".into(),
             seed: "/i/dev/seed.iso".into(),
             efi_vars: "/i/dev/efi-vars.bin".into(),
+            direct_kernel: Some(LinuxBoot {
+                kernel: "/images/kernel/arm64-vmlinuz".into(),
+                initrd: Some("/images/kernel/arm64-initrd".into()),
+                cmdline: "root=/dev/vda".into(),
+            }),
             console: "/i/dev/console.log".into(),
             ctl: "/i/dev/vz.sock".into(),
             extra_disks: vec![Disk::File {
@@ -541,6 +578,7 @@ mod tests {
             cpus: 2,
             mem_mib: 2048,
             mac: mac_for("dev"),
+            dhcp_lease_is_endpoint: true,
             agent_key: Some("/i/dev/agent.key".into()),
         };
         config.write(&path).unwrap();
@@ -557,6 +595,8 @@ mod tests {
             "cpus":1,"mem_mib":512,"mac":"52:54:00:aa:bb:cc"}"#;
         let config: Config = serde_json::from_str(json).unwrap();
         assert!(config.extra_disks.is_empty());
+        assert!(config.direct_kernel.is_none());
+        assert!(!config.dhcp_lease_is_endpoint);
         assert!(config.shares.is_empty());
     }
 

@@ -369,6 +369,53 @@ fn storm_evidence(reports: &[StormReport]) -> String {
         .join("\n")
 }
 
+/// Informational flags are questions about the binary, not requests to start
+/// a daemon. In particular they must not create a home or bind its socket.
+#[test]
+fn informational_flags_exit_before_creating_or_binding_the_daemon() {
+    for (argument, expected) in [
+        ("--version", format!("astd {}\n", asterism_core::VERSION)),
+        (
+            "--help",
+            "astd — the Asterism device daemon\n\n\
+             Usage: astd\n\n\
+             Options:\n\
+               --help     Print help\n\
+               --version  Print version\n"
+                .to_owned(),
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let home = dir.path().join("home");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_astd"))
+            .arg(argument)
+            .env("ASTERISM_HOME", &home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("running astd");
+
+        let status = wait_for_exit(&mut child, Duration::from_secs(2))
+            .unwrap_or_else(|| panic!("astd {argument} did not exit"));
+        assert!(status.success(), "astd {argument} failed: {status}");
+
+        let mut stdout = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        assert_eq!(stdout, expected);
+        assert!(
+            !home.exists(),
+            "astd {argument} created daemon state at {}",
+            home.display()
+        );
+    }
+}
+
 fn read_line(stream: &mut UnixStream) -> String {
     let mut reply = String::new();
     BufReader::new(stream)
@@ -474,7 +521,8 @@ fn a_move_refuses_a_mutated_adopted_base_before_fencing_the_source() {
         state_before,
         "the refused move changed the source shard"
     );
-    let Response::Instance { instance } = astd.ask_request(&Request::Status { name: "dev".into() })
+    let Response::Instance { instance, .. } =
+        astd.ask_request(&Request::Status { name: "dev".into() })
     else {
         panic!("the source row could not be read after refusal");
     };
@@ -584,7 +632,7 @@ fn a_portable_restore_resumes_after_publication_wins_the_crash() {
     };
     assert_eq!(report.id, instance.id);
     assert!(!live.join(".restore-receipt.json").exists());
-    let Response::Instance { instance: held } = astd.ask_request(&Request::Status {
+    let Response::Instance { instance: held, .. } = astd.ask_request(&Request::Status {
         name: "recovered".into(),
     }) else {
         panic!("the recovered row is not in the shard");

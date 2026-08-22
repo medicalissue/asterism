@@ -20,8 +20,8 @@
 //! shutdown altogether).
 
 use std::cell::{Cell, RefCell};
-use std::ffi::c_int;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::ffi::{c_int, c_void};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -40,8 +40,8 @@ use objc2_virtualization::{
     VZDiskImageStorageDeviceAttachment, VZDiskImageSynchronizationMode, VZDiskSynchronizationMode,
     VZEFIBootLoader, VZEFIVariableStore, VZEFIVariableStoreInitializationOptions,
     VZEntropyDeviceConfiguration, VZFileHandleSerialPortAttachment, VZGenericPlatformConfiguration,
-    VZMACAddress, VZMemoryBalloonDeviceConfiguration, VZNATNetworkDeviceAttachment,
-    VZNetworkBlockDeviceStorageDeviceAttachment,
+    VZLinuxBootLoader, VZMACAddress, VZMemoryBalloonDeviceConfiguration,
+    VZNATNetworkDeviceAttachment, VZNetworkBlockDeviceStorageDeviceAttachment,
     VZNetworkBlockDeviceStorageDeviceAttachmentDelegate, VZNetworkDevice,
     VZNetworkDeviceConfiguration, VZSerialPortConfiguration, VZSharedDirectory,
     VZSingleDirectoryShare, VZSocketDeviceConfiguration, VZStorageDeviceConfiguration,
@@ -393,6 +393,56 @@ pub struct Machine {
 /// which need not.
 type Connected = Result<(Retained<VZVirtioSocketConnection>, RawFd), String>;
 
+/// Make an owned copy of a descriptor VZ gave us and prove that it is still
+/// a socket before handing it to the agent thread.
+///
+/// A restarted guest can race `connectToPort:`: the completion may carry a
+/// non-negative descriptor whose number has already been reused. `dup` only
+/// proves that the number is currently open; `SO_TYPE` also proves that it is
+/// a socket. Keeping the duplicate in `OwnedFd` while checking it makes the
+/// rejected path close its copy immediately.
+fn duplicate_socket_fd(fd: RawFd) -> Result<RawFd, String> {
+    let copy = unsafe { dup(fd) };
+    if copy == -1 {
+        return Err(format!(
+            "could not duplicate the connection's descriptor (fd {fd}): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: `dup` returned a new descriptor owned by this process.
+    let copy = unsafe { OwnedFd::from_raw_fd(copy) };
+    socket_type(copy.as_raw_fd()).map_err(|err| {
+        format!(
+            "VZ returned a stale guest-agent descriptor (fd {fd}, duplicated as {}): \
+             checking SO_TYPE failed: {err}",
+            copy.as_raw_fd(),
+        )
+    })?;
+    Ok(copy.into_raw_fd())
+}
+
+/// Ask the kernel whether `fd` is a socket without changing its state.
+fn socket_type(fd: RawFd) -> std::io::Result<c_int> {
+    let mut kind = 0;
+    let mut len = std::mem::size_of_val(&kind) as SockLen;
+    // SAFETY: the pointers name writable local storage for the duration of
+    // this call, and the constants are the Darwin socket ABI values.
+    let result = unsafe {
+        getsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_TYPE,
+            (&mut kind as *mut c_int).cast::<c_void>(),
+            &mut len,
+        )
+    };
+    if result == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(kind)
+    }
+}
+
 /// Translate the config into a validated `VZVirtualMachineConfiguration`.
 ///
 /// # Safety
@@ -415,24 +465,44 @@ unsafe fn build_config(
     vm_config.setPlatform(&Retained::into_super(VZGenericPlatformConfiguration::new()));
 
     // ---- boot loader ---------------------------------------------------
-    // EFI with a persistent variable store. The store is what remembers the
-    // boot entry the guest's GRUB installed, so it is created once and
-    // reused; a fresh store every boot sends the firmware back to scanning
-    // for a fallback bootloader (spike landmine 5).
-    let boot = VZEFIBootLoader::new();
-    let vars = if config.efi_vars.exists() {
-        VZEFIVariableStore::initWithURL(VZEFIVariableStore::alloc(), &url(&config.efi_vars))
-    } else {
-        VZEFIVariableStore::initCreatingVariableStoreAtURL_options_error(
-            VZEFIVariableStore::alloc(),
-            &url(&config.efi_vars),
-            VZEFIVariableStoreInitializationOptions::empty(),
-        )
-        .map_err(vz_err)
-        .context("creating the EFI variable store")?
-    };
-    boot.setVariableStore(Some(&vars));
-    vm_config.setBootLoader(Some(&Retained::into_super(boot)));
+    match &config.direct_kernel {
+        Some(direct) => {
+            if !direct.kernel.exists() {
+                bail!("{} is not there to boot", direct.kernel.display());
+            }
+            let boot = VZLinuxBootLoader::initWithKernelURL(
+                VZLinuxBootLoader::alloc(),
+                &url(&direct.kernel),
+            );
+            boot.setCommandLine(&NSString::from_str(&direct.cmdline));
+            if let Some(initrd) = &direct.initrd {
+                if !initrd.exists() {
+                    bail!("{} is not there to boot", initrd.display());
+                }
+                boot.setInitialRamdiskURL(Some(&url(initrd)));
+            }
+            vm_config.setBootLoader(Some(&Retained::into_super(boot)));
+        }
+        None => {
+            // EFI with a persistent variable store. The store is what
+            // remembers the boot entry the guest's GRUB installed, so it is
+            // created once and reused (spike landmine 5).
+            let boot = VZEFIBootLoader::new();
+            let vars = if config.efi_vars.exists() {
+                VZEFIVariableStore::initWithURL(VZEFIVariableStore::alloc(), &url(&config.efi_vars))
+            } else {
+                VZEFIVariableStore::initCreatingVariableStoreAtURL_options_error(
+                    VZEFIVariableStore::alloc(),
+                    &url(&config.efi_vars),
+                    VZEFIVariableStoreInitializationOptions::empty(),
+                )
+                .map_err(vz_err)
+                .context("creating the EFI variable store")?
+            };
+            boot.setVariableStore(Some(&vars));
+            vm_config.setBootLoader(Some(&Retained::into_super(boot)));
+        }
+    }
 
     // ---- storage -------------------------------------------------------
     // Root first, seed second, extra disks after: cloud-init finds the
@@ -469,7 +539,11 @@ unsafe fn build_config(
         Ok(Retained::into_super(dev))
     };
     disks.push(attach(&config.root, false)?);
-    disks.push(attach(&config.seed, true)?);
+    // A directly booted OCI rootfs has no cloud-init and therefore no seed.
+    // Cloud images keep the historical root/seed ordering.
+    if config.direct_kernel.is_none() {
+        disks.push(attach(&config.seed, true)?);
+    }
     for disk in &config.extra_disks {
         match disk {
             Disk::File { path, readonly } => disks.push(attach(path, *readonly)?),
@@ -824,12 +898,11 @@ impl Machine {
                                 // Duped rather than borrowed: VZ closes its own
                                 // descriptor when this object is released, and
                                 // the session thread must not be reading a
-                                // descriptor somebody else can close.
-                                match unsafe { dup(conn.fileDescriptor()) } {
-                                    -1 => Err("could not duplicate the connection's descriptor"
-                                        .to_owned()),
-                                    fd => Ok((conn, fd)),
-                                }
+                                // descriptor somebody else can close. `dup`
+                                // alone is not enough after a quick guest-agent
+                                // restart: a stale descriptor number can already
+                                // name something else by this point.
+                                duplicate_socket_fd(conn.fileDescriptor()).map(|fd| (conn, fd))
                             }
                         },
                     };
@@ -905,11 +978,44 @@ impl Machine {
 // `clonefile`.
 extern "C" {
     fn dup(fd: c_int) -> c_int;
+    fn getsockopt(
+        socket: c_int,
+        level: c_int,
+        name: c_int,
+        value: *mut c_void,
+        value_len: *mut SockLen,
+    ) -> c_int;
 }
+
+// Darwin's `socklen_t`, `SOL_SOCKET`, and `SO_TYPE`. Kept here with `dup`
+// rather than adding libc solely for these two FFI calls.
+type SockLen = u32;
+const SOL_SOCKET: c_int = 0xffff;
+const SO_TYPE: c_int = 0x1008;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconnect_descriptor_must_still_be_a_socket() {
+        use std::fs::File;
+        use std::os::unix::net::UnixStream;
+
+        let (socket, _) = UnixStream::pair().unwrap();
+        let copy = duplicate_socket_fd(socket.as_raw_fd()).unwrap();
+        // SAFETY: `duplicate_socket_fd` returns a fresh descriptor owned by
+        // this test. This also proves the accepted path stays usable.
+        let copy = unsafe { OwnedFd::from_raw_fd(copy) };
+        assert!(socket_type(copy.as_raw_fd()).is_ok());
+
+        // `dup` succeeds for this descriptor, but it is not a socket. This
+        // is the stale-number case a fast guest-agent restart can create;
+        // reject it before the session thread reaches `setsockopt`.
+        let not_a_socket = File::open("/dev/null").unwrap();
+        let error = duplicate_socket_fd(not_a_socket.as_raw_fd()).unwrap_err();
+        assert!(error.contains("checking SO_TYPE failed"), "{error}");
+    }
 
     #[test]
     fn unix_nbd_uri_preserves_free_text_as_data() {

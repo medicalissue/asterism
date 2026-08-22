@@ -38,12 +38,12 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 
 use asterism_core::compat;
 use asterism_core::cow;
@@ -79,6 +79,33 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the pairing exchange waits on the peer's half after the code has
 /// been shown. This is a human's reading-and-typing time, not a network one.
 const PAIR_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Proofs from strangers which may be in flight for one invitation.
+///
+/// QUIC authentication tells us which key connected but, during pairing, not
+/// whether that key holds the invitation.  Proof readers therefore live
+/// behind their own small cap.  The endpoint accept loop never waits for one
+/// of these permits, so strangers can consume only their lane and never the
+/// single loop trusted peers need.
+const MAX_PENDING_PAIRING_PROOFS: usize = 8;
+
+/// Attempts one device identity may make in a rolling pairing-rate window.
+const MAX_PAIRING_ATTEMPTS_PER_DEVICE: u32 = 3;
+
+/// Window for the per-device pairing attempt limit.
+const PAIRING_RATE_WINDOW: Duration = Duration::from_secs(60);
+
+/// Attempts all strangers together may make in one pairing-rate window.
+///
+/// The per-device limit stops one key guessing repeatedly.  This second cap
+/// stops an attacker minting a new key for every guess, and bounds the map
+/// that remembers those keys at the same time.
+const MAX_PAIRING_ATTEMPTS_PER_WINDOW: u32 = 32;
+
+/// Streams one trusted connection may make this daemon serve concurrently.
+/// This is intentionally per connection: a busy peer cannot stop the endpoint
+/// accepting another peer or a pairing proof.
+const MAX_PEER_STREAMS: usize = 64;
 
 /// Largest mesh frame we will read. An instance list is the big one and it is
 /// nowhere near this; the cap exists so a peer cannot ask for an allocation.
@@ -421,12 +448,16 @@ pub struct Mesh {
     /// Where the accept loop sends a connection from a device that is not in
     /// the orbit, while a ticket is outstanding. `None` the rest of the time,
     /// which is what makes an unpaired connection a refusal.
-    pending: Arc<Mutex<Option<mpsc::Sender<MeshConnection>>>>,
+    pending: Arc<Mutex<Option<Arc<PendingPairing>>>>,
     /// One connection per peer, kept warm. Keyed by device id.
     conns: Mutex<HashMap<String, MeshConnection>>,
     /// Last measured reachability for each peer. This is observation, not
     /// identity or placement state, and deliberately dies with the daemon.
     telemetry: Mutex<HashMap<String, PeerTelemetry>>,
+    /// Every live inbound and outbound connection, including streams already
+    /// in flight. Device removal closes these, which is the revocation event
+    /// for RPC, ssh and volume pipes alike.
+    active: Mutex<HashMap<String, Vec<MeshConnection>>>,
 }
 
 /// The current measured link to a peer, shared with remote-part health.
@@ -506,6 +537,140 @@ struct Dialed {
     reason: &'static str,
 }
 
+/// One open invitation and the deliberately narrow unauthenticated lane it
+/// exposes.
+struct PendingPairing {
+    issued: Arc<IssuedTicket>,
+    accepted: mpsc::Sender<PairedPeer>,
+    slots: Arc<Semaphore>,
+    attempts: StdMutex<AttemptBook>,
+}
+
+#[derive(Clone, Copy)]
+struct AttemptWindow {
+    began: Instant,
+    count: u32,
+}
+
+struct AttemptBook {
+    began: Instant,
+    total: u32,
+    devices: HashMap<String, AttemptWindow>,
+}
+
+impl PendingPairing {
+    fn new(issued: Arc<IssuedTicket>, accepted: mpsc::Sender<PairedPeer>) -> Arc<Self> {
+        Arc::new(Self {
+            issued,
+            accepted,
+            slots: Arc::new(Semaphore::new(MAX_PENDING_PAIRING_PROOFS)),
+            attempts: StdMutex::new(AttemptBook {
+                began: Instant::now(),
+                total: 0,
+                devices: HashMap::new(),
+            }),
+        })
+    }
+
+    /// Starts proof validation without ever waiting in the endpoint accept
+    /// loop.  Capacity and rate refusals close this connection and leave the
+    /// invitation available to an honest peer.
+    fn consider(self: &Arc<Self>, endpoint: MeshEndpoint, connection: MeshConnection) {
+        let peer = connection.remote_device_id();
+        if self.issued.is_redeemed() || self.issued.ticket().is_expired() {
+            connection.close(b"pairing invitation unavailable");
+            return;
+        }
+        let Ok(slot) = Arc::clone(&self.slots).try_acquire_owned() else {
+            connection.close(b"pairing proof capacity reached");
+            return;
+        };
+        if !self.allow_attempt(&peer.to_string()) {
+            connection.close(b"pairing rate limit");
+            return;
+        }
+
+        let pending = Arc::clone(self);
+        tokio::spawn(async move {
+            let closing = connection.clone();
+            match pairing::accept_connection(&endpoint, connection, &pending.issued).await {
+                Ok(peer) => {
+                    if let Err(err) = pending.accepted.try_send(peer) {
+                        err.into_inner()
+                            .connection()
+                            .close(b"pairing invitation closed");
+                    }
+                }
+                Err(e) => {
+                    closing.close(b"pairing proof rejected");
+                    eprintln!(
+                        "astd: pairing proof from {} rejected: {e}",
+                        closing.remote_device_id().short()
+                    );
+                }
+            }
+            drop(slot);
+        });
+    }
+
+    fn allow_attempt(&self, peer: &str) -> bool {
+        self.allow_attempt_at(peer, Instant::now())
+    }
+
+    fn allow_attempt_at(&self, peer: &str, now: Instant) -> bool {
+        let mut book = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
+        if now.duration_since(book.began) >= PAIRING_RATE_WINDOW {
+            book.began = now;
+            book.total = 0;
+            book.devices.clear();
+        }
+        if book.total >= MAX_PAIRING_ATTEMPTS_PER_WINDOW {
+            return false;
+        }
+
+        let window = book
+            .devices
+            .entry(peer.to_owned())
+            .or_insert(AttemptWindow {
+                began: now,
+                count: 0,
+            });
+        if now.duration_since(window.began) >= PAIRING_RATE_WINDOW {
+            *window = AttemptWindow {
+                began: now,
+                count: 0,
+            };
+        }
+        if window.count >= MAX_PAIRING_ATTEMPTS_PER_DEVICE {
+            return false;
+        }
+        window.count += 1;
+        book.total += 1;
+        true
+    }
+}
+
+/// Loads the key which identifies this device to every peer.
+///
+/// A device with no peers may safely mint its first identity.  A device with
+/// an existing orbit may not: generating a replacement would make this daemon
+/// a stranger to every peer while leaving their keys trusted locally, an
+/// asymmetric half-rotation that looks like a network outage.  Restoring the
+/// original file is the recovery operation and is deliberately retryable.
+fn load_device_identity(path: &Path, has_peers: bool) -> Result<DeviceIdentity> {
+    if has_peers {
+        return DeviceIdentity::load(path).with_context(|| {
+            format!(
+                "this device already belongs to an orbit but its identity {} could not be loaded; \
+                 restore that file from backup (or move orbit.json aside to intentionally start a \
+                 new orbit) — refusing to generate a replacement key",
+                path.display()
+            )
+        });
+    }
+    DeviceIdentity::load_or_create(path).context("creating this device's first mesh identity")
+}
+
 impl Mesh {
     /// Brings the endpoint up and starts accepting.
     ///
@@ -513,8 +678,8 @@ impl Mesh {
     /// first run and never rotated: rotating it would make this device a
     /// stranger to every peer that has already paired with it.
     pub async fn start(node: Node) -> Result<Arc<Self>> {
-        let identity = DeviceIdentity::load_or_create(paths::device_key_path())
-            .context("loading this device's mesh identity")?;
+        let has_peers = !node.orbit.lock().await.devices().is_empty();
+        let identity = load_device_identity(&paths::device_key_path(), has_peers)?;
         let endpoint = MeshEndpoint::bind(&identity, mesh_mode())
             .await
             .context("binding the mesh endpoint")?;
@@ -525,6 +690,7 @@ impl Mesh {
             pending: Arc::new(Mutex::new(None)),
             conns: Mutex::new(HashMap::new()),
             telemetry: Mutex::new(HashMap::new()),
+            active: Mutex::new(HashMap::new()),
         });
 
         tokio::spawn(accept_loop(mesh.clone(), node));
@@ -604,13 +770,67 @@ impl Mesh {
     }
 
     /// Drops a device from the orbit. Its key stops being trusted at once —
-    /// the accept loop reads the same store this writes.
+    /// the accept loop reads the same store this writes, and every connection
+    /// already authenticated as that key is closed before this call returns.
     pub async fn remove_device(&self, name: &str) -> Result<Device> {
-        let mut orbit = self.orbit.lock().await;
-        let removed = orbit.remove(name)?;
-        orbit.save()?;
-        self.conns.lock().await.remove(&removed.device_id);
-        Ok(removed)
+        let (device, removal, membership_gone) = {
+            let mut orbit = self.orbit.lock().await;
+            let device = orbit.removal_target(name)?;
+            let removal = crate::volume::remove_device(&mut orbit, &device)
+                .await
+                .with_context(|| format!("removing device {name:?} and revoking its leases"));
+            let membership_gone = !orbit.trusts(&device.device_id);
+            (device, removal, membership_gone)
+        };
+
+        // An error after the orbit rename can still leave the new membership
+        // visible (the failed step was its directory flush). Close live
+        // authority whenever the in-memory store says the key is gone, even
+        // if the caller must retry to obtain a durability guarantee.
+        if membership_gone {
+            self.close_device_connections(&device).await;
+        }
+        removal
+    }
+
+    async fn close_device_connections(&self, device: &Device) {
+        if let Some(connection) = self.conns.lock().await.remove(&device.device_id) {
+            connection.close(b"device revoked");
+        }
+        if let Some(connections) = self.active.lock().await.remove(&device.device_id) {
+            for connection in connections {
+                connection.close(b"device revoked");
+            }
+        }
+    }
+
+    async fn trusts(&self, device_id: &str) -> bool {
+        self.orbit.lock().await.trusts(device_id)
+    }
+
+    /// Registers a connection in the set device revocation closes.
+    async fn track(&self, connection: &MeshConnection) {
+        let peer = connection.remote_device_id().to_string();
+        let stable = connection.connection().stable_id();
+        let mut active = self.active.lock().await;
+        let held = active.entry(peer).or_default();
+        held.retain(|c| c.connection().close_reason().is_none());
+        if !held.iter().any(|c| c.connection().stable_id() == stable) {
+            held.push(connection.clone());
+        }
+    }
+
+    async fn untrack(&self, device_id: &str, stable_id: usize) {
+        let mut active = self.active.lock().await;
+        let Some(held) = active.get_mut(device_id) else {
+            return;
+        };
+        held.retain(|c| {
+            c.connection().stable_id() != stable_id && c.connection().close_reason().is_none()
+        });
+        if held.is_empty() {
+            active.remove(device_id);
+        }
     }
 
     /// Times a round trip to one device: `ast ping`.
@@ -1058,7 +1278,7 @@ impl Mesh {
             let (mesh, device, name) = (self.clone(), peer.name.clone(), name.to_owned());
             asking.spawn(async move {
                 let found = match mesh.proxy(&device, Request::Status { name }).await {
-                    Ok(Response::Instance { instance }) => Some(instance),
+                    Ok(Response::Instance { instance, .. }) => Some(instance),
                     _ => None,
                 };
                 (device, found)
@@ -1157,7 +1377,7 @@ impl Mesh {
             )
             .await?
         {
-            Response::Instance { instance } => {
+            Response::Instance { instance, .. } => {
                 if instance.endpoint().is_none() {
                     bail!("instance {name:?} is not running — `ast up {name}` first");
                 }
@@ -1374,30 +1594,45 @@ impl Mesh {
             .map(Duration::from_secs)
             .unwrap_or(DEFAULT_TICKET_TTL);
         let addr = self.endpoint.direct_addr().await?;
-        let mut issued = IssuedTicket::new(PairingTicket::issue(addr.clone(), ttl));
+        if ttl.is_zero() {
+            bail!("a pairing invitation must be valid for at least one second");
+        }
+        let issued = Arc::new(IssuedTicket::new(PairingTicket::issue(addr.clone(), ttl)));
 
-        let (tx, mut rx) = mpsc::channel(1);
-        *self.pending.lock().await = Some(tx.clone());
+        let (accepted, mut rx) = mpsc::channel(1);
+        let pending = PendingPairing::new(Arc::clone(&issued), accepted);
+        {
+            let mut open = self.pending.lock().await;
+            if open.as_ref().is_some_and(|held| {
+                !held.issued.ticket().is_expired() && !held.issued.is_redeemed()
+            }) {
+                bail!("another pairing invitation is already open on this device");
+            }
+            *open = Some(Arc::clone(&pending));
+        }
 
-        io.send(&Response::Ticket {
-            ticket: issued.ticket().encode(),
-            expires_in_secs: ttl.as_secs(),
-        })
-        .await?;
+        if let Err(e) = io
+            .send(&Response::Ticket {
+                ticket: issued.ticket().encode(),
+                expires_in_secs: ttl.as_secs(),
+            })
+            .await
+        {
+            self.withdraw(&pending).await;
+            return Err(e);
+        }
 
-        let connection = tokio::time::timeout(ttl, rx.recv()).await;
-        // The ticket is single-use, so the window closes on the first taker
-        // whether or not the pairing then succeeds — but only *this* invite's
-        // window: a second `ast device invite` has taken the slot over, and
-        // closing that one on this one's way out would strand it.
-        self.withdraw(&tx).await;
-        let connection = connection
+        let peer = tokio::time::timeout(ttl, rx.recv()).await;
+        // A proof reader consumes neither the invitation nor this receiver.
+        // The window closes only after the first *valid* capability, or when
+        // its own clock expires.  `withdraw` is identity-checked so an older
+        // invite cannot close the one that replaced it.
+        self.withdraw(&pending).await;
+        let peer = peer
             .map_err(|_| anyhow!("nobody redeemed the ticket within {}s", ttl.as_secs()))?
             .ok_or_else(|| {
                 anyhow!("this invitation was replaced by another `ast device invite`")
             })?;
-
-        let peer = pairing::accept_connection(&self.endpoint, connection, &mut issued).await?;
         self.settle(peer, addr, Role::Inviter, io).await
     }
 
@@ -1592,9 +1827,12 @@ impl Mesh {
     }
 
     /// Closes the pairing window, if it is still the one `tx` opened.
-    async fn withdraw(&self, tx: &mpsc::Sender<MeshConnection>) {
+    async fn withdraw(&self, window: &Arc<PendingPairing>) {
         let mut pending = self.pending.lock().await;
-        if pending.as_ref().is_some_and(|held| held.same_channel(tx)) {
+        if pending
+            .as_ref()
+            .is_some_and(|held| Arc::ptr_eq(held, window))
+        {
             *pending = None;
         }
     }
@@ -1714,6 +1952,12 @@ impl Mesh {
         let cached = self.conns.lock().await.get(&device.device_id).cloned();
         if let Some(cached) = cached {
             let started = Instant::now();
+            self.track(&cached).await;
+            if !self.trusts(&device.device_id).await {
+                self.discard_connection(&device.device_id, &cached, b"device revoked")
+                    .await;
+                bail!("device {:?} is no longer in this orbit", device.name);
+            }
             if let Ok(Ok(MeshReply::Pong { .. })) =
                 tokio::time::timeout(PROBE_TIMEOUT, ask(&cached, &MeshRequest::Ping)).await
             {
@@ -1726,7 +1970,8 @@ impl Mesh {
                 .await;
                 return Ok(cached);
             }
-            self.conns.lock().await.remove(&device.device_id);
+            self.discard_connection(&device.device_id, &cached, b"stale connection")
+                .await;
             self.observe_failure(&device.device_id, "cached_connection_lost")
                 .await;
         }
@@ -1738,8 +1983,14 @@ impl Mesh {
                 return Err(e);
             }
         };
+        self.track(&connection).await;
+        if !self.trusts(&device.device_id).await {
+            self.discard_connection(&device.device_id, &connection, b"device revoked")
+                .await;
+            bail!("device {:?} is no longer in this orbit", device.name);
+        }
         let started = Instant::now();
-        let answered = tokio::time::timeout(PROBE_TIMEOUT, ask(&connection, &MeshRequest::Ping))
+        let proof = tokio::time::timeout(PROBE_TIMEOUT, ask(&connection, &MeshRequest::Ping))
             .await
             .map_err(|_| {
                 anyhow!(
@@ -1749,10 +2000,13 @@ impl Mesh {
             })
             .and_then(|answer| {
                 // A device that refuses us closes the connection here, and
-                // its reason ("not in this orbit") is the useful half.
+                // its reason ("not in this orbit") is the useful half of the
+                // message.
                 answer.with_context(|| format!("could not reach device {:?}", device.name))
             });
-        if let Err(e) = answered {
+        if let Err(e) = proof {
+            self.discard_connection(&device.device_id, &connection, b"mesh probe failed")
+                .await;
             self.observe_failure(&device.device_id, "dial_answered_but_mesh_failed")
                 .await;
             return Err(e);
@@ -1769,6 +2023,28 @@ impl Mesh {
         // guesswork again.
         self.record_addrs(device).await;
         Ok(connection)
+    }
+
+    /// Closes one exact connection and forgets every cache/registry reference
+    /// to it.  Comparing stable ids matters when a stale probe and a fresh
+    /// dial cross: the stale cleanup must not remove the replacement.
+    async fn discard_connection(
+        &self,
+        device_id: &str,
+        connection: &MeshConnection,
+        reason: &[u8],
+    ) {
+        let stable = connection.connection().stable_id();
+        connection.close(reason);
+        let mut conns = self.conns.lock().await;
+        if conns
+            .get(device_id)
+            .is_some_and(|held| held.connection().stable_id() == stable)
+        {
+            conns.remove(device_id);
+        }
+        drop(conns);
+        self.untrack(device_id, stable).await;
     }
 
     /// Dials `device` at the addresses the orbit store remembers, and — if
@@ -2149,13 +2425,12 @@ where
         Ok::<(), anyhow::Error>(())
     };
 
-    // Whichever direction finishes first ends the session: an ssh that has
-    // hung up, or a QEMU that has closed its NBD connection, is not waiting
-    // for anything from the other side.
-    tokio::select! {
-        r = up => r,
-        r = down => r,
-    }?;
+    // EOF only closes one half of a stream. In particular, an NBD client may
+    // finish its request direction before the export has written the reply it
+    // is waiting for. Keep the opposite direction alive after forwarding the
+    // half-close, just as `copy_bidirectional` does; dropping it here turns a
+    // healthy, delayed reply into a first-I/O error under scheduler pressure.
+    tokio::try_join!(up, down)?;
     Ok(TransferStats {
         sent_bytes: sent_bytes.load(Ordering::Relaxed),
         received_bytes: received_bytes.load(Ordering::Relaxed),
@@ -2179,7 +2454,7 @@ async fn serve_splice(
     )
     .await
     {
-        Response::Instance { instance } => instance
+        Response::Instance { instance, .. } => instance
             .endpoint()
             .map(|e| e.ssh_target())
             .ok_or_else(|| anyhow!("instance {name:?} is not running — `ast up {name}` first")),
@@ -2218,8 +2493,18 @@ async fn serve_volume_splice(
     volume: &str,
     holder: &str,
     epoch: u64,
+    requester_device: &str,
+    requester_device_id: &str,
 ) -> Result<()> {
-    let export = match crate::volume::open_export(volume, holder, epoch).await {
+    let export = match crate::volume::open_export(
+        volume,
+        holder,
+        epoch,
+        requester_device,
+        requester_device_id,
+    )
+    .await
+    {
         Ok(export) => export,
         Err(e) => {
             let refusal = MeshReply::Rpc {
@@ -2821,20 +3106,17 @@ async fn accept_loop(mesh: Arc<Mesh>, node: Node) {
         let peer = connection.remote_device_id();
         let peer_id = peer.to_string();
 
-        if mesh.orbit.lock().await.trusts(&peer_id) {
-            tokio::spawn(serve_peer(connection, node.clone()));
+        if mesh.trusts(&peer_id).await {
+            tokio::spawn(serve_trusted_peer(mesh.clone(), connection, node.clone()));
             continue;
         }
 
         // The one unauthenticated path in the daemon, and it exists only while
         // a ticket this device minted is outstanding. The token in that ticket
         // is what actually authorizes the peer; this only routes it.
-        let waiting = mesh.pending.lock().await.take();
-        if let Some(tx) = waiting {
-            if tx.send(connection).await.is_ok() {
-                continue;
-            }
-            eprintln!("astd: a device turned up after the invite had gone away");
+        let waiting = mesh.pending.lock().await.clone();
+        if let Some(pending) = waiting {
+            pending.consider(mesh.endpoint.clone(), connection);
             continue;
         }
 
@@ -2846,11 +3128,44 @@ async fn accept_loop(mesh: Arc<Mesh>, node: Node) {
     }
 }
 
+/// Registers a trusted connection before serving it and rechecks membership
+/// afterwards.  That order closes both removal races: if removal happened
+/// first the recheck refuses, and if it happens second the registry contains
+/// the exact connection removal must close.
+async fn serve_trusted_peer(mesh: Arc<Mesh>, connection: MeshConnection, node: Node) {
+    let peer_id = connection.remote_device_id().to_string();
+    let stable = connection.connection().stable_id();
+    mesh.track(&connection).await;
+    let peer_name = mesh
+        .orbit
+        .lock()
+        .await
+        .by_id(&peer_id)
+        .map(|device| device.name.clone());
+    let Some(peer_name) = peer_name else {
+        connection.close(b"device revoked");
+        mesh.untrack(&peer_id, stable).await;
+        return;
+    };
+
+    serve_peer(connection, node, peer_name, peer_id.clone()).await;
+    mesh.untrack(&peer_id, stable).await;
+}
+
 /// Serves streams from one trusted peer until it goes away.
-async fn serve_peer(connection: MeshConnection, node: Node) {
+async fn serve_peer(
+    connection: MeshConnection,
+    node: Node,
+    requester_device: String,
+    requester_device_id: String,
+) {
     let peer_id = connection.remote_device_id();
     let peer = peer_id.short();
+    let slots = Arc::new(Semaphore::new(MAX_PEER_STREAMS));
     loop {
+        let Ok(slot) = Arc::clone(&slots).acquire_owned().await else {
+            return;
+        };
         let stream = match connection.accept_stream().await {
             Ok(s) => s,
             // The normal end of a peer's visit.
@@ -2858,8 +3173,13 @@ async fn serve_peer(connection: MeshConnection, node: Node) {
         };
         let node = node.clone();
         let peer = peer.clone();
+        let requester_device = requester_device.clone();
+        let requester_device_id = requester_device_id.clone();
         tokio::spawn(async move {
-            if let Err(e) = serve_stream(stream, node, peer_id).await {
+            let _slot = slot;
+            if let Err(e) =
+                serve_stream(stream, node, peer_id, requester_device, requester_device_id).await
+            {
                 eprintln!("astd: mesh stream from {peer} failed: {e:#}");
             }
         });
@@ -2872,6 +3192,8 @@ async fn serve_stream(
     mut stream: asterism_mesh::MeshStream,
     node: Node,
     peer: DeviceId,
+    requester_device: String,
+    requester_device_id: String,
 ) -> Result<()> {
     let (arriving, arriving_len) = tokio::time::timeout(
         OPEN_FRAME_DEADLINE,
@@ -2950,7 +3272,17 @@ async fn serve_stream(
             volume,
             holder,
             epoch,
-        } => return serve_volume_splice(stream, &volume, &holder, epoch).await,
+        } => {
+            return serve_volume_splice(
+                stream,
+                &volume,
+                &holder,
+                epoch,
+                &requester_device,
+                &requester_device_id,
+            )
+            .await
+        }
         // Bulk, not request/reply: each of these stops being a framed RPC
         // after this line and becomes a stream of `MoveFrame`s.
         MeshRequest::MoveExport { name, epoch } => {
@@ -3006,6 +3338,18 @@ async fn serve_stream(
                     device: node.device_name().await,
                     rows: crate::wake::check(),
                 },
+                Request::DeviceShellStatus => Response::DeviceShellStatus {
+                    status: node.shell.status(true),
+                    revoked: 0,
+                },
+                request if crate::volume::is_plane_request(&request) => {
+                    crate::volume::serve_authenticated(
+                        request,
+                        &requester_device,
+                        &requester_device_id,
+                    )
+                    .await
+                }
                 request => crate::handle(request, &node).await,
             },
         },
@@ -3277,6 +3621,7 @@ async fn read_frame_with_len<T: serde::de::DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn test_machine() -> asterism_core::hv::Machine {
         asterism_core::hv::Machine {
@@ -3294,6 +3639,86 @@ mod tests {
             addrs.iter().map(|s| s.to_string()).collect(),
             relays.iter().map(|s| s.to_string()).collect(),
         )
+    }
+
+    fn pending_pairing() -> Arc<PendingPairing> {
+        let addr = EndpointAddr::new(DeviceIdentity::generate().public_key());
+        let issued = Arc::new(IssuedTicket::new(PairingTicket::issue(
+            addr,
+            DEFAULT_TICKET_TTL,
+        )));
+        let (accepted, _rx) = mpsc::channel(1);
+        PendingPairing::new(issued, accepted)
+    }
+
+    #[test]
+    fn pairing_guesses_are_limited_per_identity_and_in_total() {
+        let pending = pending_pairing();
+        let now = Instant::now();
+        for _ in 0..MAX_PAIRING_ATTEMPTS_PER_DEVICE {
+            assert!(pending.allow_attempt_at("one-key", now));
+        }
+        assert!(!pending.allow_attempt_at("one-key", now));
+
+        // Rotating the QUIC identity cannot grow the bookkeeping without
+        // bound or turn the ticket into a high-rate guessing oracle.
+        let rotating = pending_pairing();
+        for i in 0..MAX_PAIRING_ATTEMPTS_PER_WINDOW {
+            assert!(rotating.allow_attempt_at(&format!("key-{i}"), now));
+        }
+        assert!(!rotating.allow_attempt_at("one-more-key", now));
+        let book = rotating.attempts.lock().unwrap();
+        assert_eq!(book.total, MAX_PAIRING_ATTEMPTS_PER_WINDOW);
+        assert_eq!(book.devices.len(), MAX_PAIRING_ATTEMPTS_PER_WINDOW as usize);
+    }
+
+    #[test]
+    fn the_pairing_rate_window_recovers_after_it_expires() {
+        let pending = pending_pairing();
+        let now = Instant::now();
+        for _ in 0..MAX_PAIRING_ATTEMPTS_PER_DEVICE {
+            assert!(pending.allow_attempt_at("one-key", now));
+        }
+        assert!(!pending.allow_attempt_at("one-key", now));
+        assert!(pending.allow_attempt_at("one-key", now + PAIRING_RATE_WINDOW));
+    }
+
+    #[test]
+    fn a_missing_key_in_an_existing_orbit_is_fail_closed_and_recoverable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("id_device");
+        let original = DeviceIdentity::generate();
+        original.save(&path).unwrap();
+        let original_id = original.device_id();
+
+        std::fs::remove_file(&path).unwrap();
+        let error = load_device_identity(&path, true).unwrap_err().to_string();
+        assert!(error.contains("already belongs to an orbit"), "{error}");
+        assert!(error.contains("refusing to generate"), "{error}");
+        assert!(
+            !path.exists(),
+            "failure must not mint an asymmetric identity"
+        );
+
+        // Restoring the backed-up key is enough; no peer or coordinator is
+        // involved in recovery and the next startup sees the old identity.
+        original.save(&path).unwrap();
+        assert_eq!(
+            load_device_identity(&path, true).unwrap().device_id(),
+            original_id
+        );
+    }
+
+    #[test]
+    fn a_device_with_no_orbit_mints_its_first_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("id_device");
+        let first = load_device_identity(&path, false).unwrap();
+        assert!(path.exists());
+        assert_eq!(
+            load_device_identity(&path, false).unwrap().device_id(),
+            first.device_id()
+        );
     }
 
     #[test]
@@ -3672,11 +4097,224 @@ mod tests {
 
         tokio::spawn(async move {
             let conn = server.accept().await.unwrap().unwrap();
-            serve_peer(conn, node).await;
+            serve_peer(conn, node, "test-peer".into(), "test-peer-id".into()).await;
         });
 
         let connection = client.connect(addr).await.unwrap();
         (client, connection, dir)
+    }
+
+    /// NBD's request and reply directions are independently closed. The
+    /// bridge must relay the provider's reply after QEMU has half-closed its
+    /// request side, rather than treating that half-close as a whole-session
+    /// failure.
+    #[tokio::test]
+    async fn a_half_closed_volume_side_keeps_receiving_the_peer_reply() {
+        let server = MeshEndpoint::bind(&DeviceIdentity::generate(), MeshMode::LocalOnly)
+            .await
+            .unwrap();
+        let client = MeshEndpoint::bind(&DeviceIdentity::generate(), MeshMode::LocalOnly)
+            .await
+            .unwrap();
+        let address = server.direct_addr().await.unwrap();
+        let (request_seen, seen) = tokio::sync::oneshot::channel();
+        let (release_provider, release) = tokio::sync::oneshot::channel();
+        let listener = server.clone();
+
+        let provider = tokio::spawn(async move {
+            let connection = listener.accept().await.unwrap().unwrap();
+            let mut stream = connection.accept_stream().await.unwrap();
+            let request = stream.recv.read_to_end(1024).await.unwrap();
+            assert_eq!(request, b"nbd request");
+            request_seen.send(()).unwrap();
+            stream.send.write_all(b"nbd reply").await.unwrap();
+            let _ = stream.send.finish();
+            release.await.unwrap();
+        });
+
+        let connection = client.connect(address).await.unwrap();
+        let stream = connection.open_stream().await.unwrap();
+        let (bridge, mut nbd) = tokio::net::UnixStream::pair().unwrap();
+        let splice = tokio::spawn(pump(bridge, stream));
+
+        nbd.write_all(b"nbd request").await.unwrap();
+        nbd.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), seen)
+            .await
+            .expect("the provider never received the local half-close")
+            .unwrap();
+        let mut reply = [0u8; b"nbd reply".len()];
+        tokio::time::timeout(Duration::from_secs(3), nbd.read_exact(&mut reply))
+            .await
+            .expect("the provider reply was dropped after the local half-close")
+            .unwrap();
+        assert_eq!(&reply, b"nbd reply");
+
+        release_provider.send(()).unwrap();
+        provider.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), splice)
+            .await
+            .expect("the splice did not close after both peers finished")
+            .unwrap()
+            .unwrap();
+        connection.close(b"done");
+        client.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_slow_stranger_cannot_block_the_real_ticket_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node {
+            shard: Arc::new(Mutex::new(
+                asterism_core::registry::Shard::load(&dir.path().join("state.json")).unwrap(),
+            )),
+            orbit: Arc::new(Mutex::new(
+                Orbit::load(&dir.path().join("orbit.json")).unwrap(),
+            )),
+            shell: crate::device_shell::Manager::load_at(dir.path()),
+        };
+        let server = MeshEndpoint::bind(&DeviceIdentity::generate(), MeshMode::LocalOnly)
+            .await
+            .unwrap();
+        let addr = server.direct_addr().await.unwrap();
+        let mesh = Arc::new(Mesh {
+            endpoint: server,
+            orbit: node.orbit.clone(),
+            pending: Arc::new(Mutex::new(None)),
+            conns: Mutex::new(HashMap::new()),
+            telemetry: Mutex::new(HashMap::new()),
+            active: Mutex::new(HashMap::new()),
+        });
+        let issued = Arc::new(IssuedTicket::new(PairingTicket::issue(
+            addr,
+            DEFAULT_TICKET_TTL,
+        )));
+        let ticket = issued.ticket().clone();
+        let (accepted, mut rx) = mpsc::channel(1);
+        let pending = PendingPairing::new(issued, accepted);
+        *mesh.pending.lock().await = Some(Arc::clone(&pending));
+        let loop_task = tokio::spawn(accept_loop(mesh.clone(), node));
+
+        let slow = MeshEndpoint::bind(&DeviceIdentity::generate(), MeshMode::LocalOnly)
+            .await
+            .unwrap();
+        let slow_connection = slow.connect(ticket.addr().clone()).await.unwrap();
+        // Prove the slow connection reached a proof task and is occupying one
+        // bounded lane before the honest peer arrives.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pending.slots.available_permits() == MAX_PENDING_PAIRING_PROOFS {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the slow proof should be admitted");
+
+        let good = MeshEndpoint::bind(&DeviceIdentity::generate(), MeshMode::LocalOnly)
+            .await
+            .unwrap();
+        let joined = tokio::time::timeout(Duration::from_secs(2), pairing::join(&good, &ticket))
+            .await
+            .expect("the honest peer must not wait for the slow proof timeout")
+            .unwrap();
+        let accepted = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .expect("the valid proof reaches the invitation");
+
+        joined.connection().close(b"done");
+        accepted.connection().close(b"done");
+        slow_connection.close(b"done");
+        slow.close().await;
+        good.close().await;
+        mesh.endpoint.close().await;
+        tokio::time::timeout(Duration::from_secs(1), loop_task)
+            .await
+            .expect("the accept loop stops with its endpoint")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn removing_a_device_closes_its_live_connection_and_streams() {
+        let dir = tempfile::tempdir().unwrap();
+        let client_identity = DeviceIdentity::generate();
+        let server = MeshEndpoint::bind(&DeviceIdentity::generate(), MeshMode::LocalOnly)
+            .await
+            .unwrap();
+        let addr = server.direct_addr().await.unwrap();
+        let client = MeshEndpoint::bind(&client_identity, MeshMode::LocalOnly)
+            .await
+            .unwrap();
+
+        let mut orbit = Orbit::load(&dir.path().join("orbit.json")).unwrap();
+        orbit
+            .add(orbit::device_now(
+                "client",
+                &client_identity.device_id().to_string(),
+                Vec::new(),
+                Vec::new(),
+            ))
+            .unwrap();
+        orbit.save().unwrap();
+        let orbit = Arc::new(Mutex::new(orbit));
+        let node = Node {
+            shard: Arc::new(Mutex::new(
+                asterism_core::registry::Shard::load(&dir.path().join("state.json")).unwrap(),
+            )),
+            orbit: orbit.clone(),
+            shell: crate::device_shell::Manager::load_at(dir.path()),
+        };
+        let mesh = Arc::new(Mesh {
+            endpoint: server,
+            orbit,
+            pending: Arc::new(Mutex::new(None)),
+            conns: Mutex::new(HashMap::new()),
+            telemetry: Mutex::new(HashMap::new()),
+            active: Mutex::new(HashMap::new()),
+        });
+        let loop_task = tokio::spawn(accept_loop(mesh.clone(), node));
+        let connection = client.connect(addr).await.unwrap();
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), ask(&connection, &MeshRequest::Ping))
+                .await
+                .unwrap()
+                .unwrap(),
+            MeshReply::Pong { .. }
+        ));
+        assert_eq!(
+            mesh.active
+                .lock()
+                .await
+                .values()
+                .map(Vec::len)
+                .sum::<usize>(),
+            1
+        );
+
+        // Leave one request frame deliberately incomplete. RPC, ssh and NBD
+        // all ride streams on this same connection, so closing it is the live
+        // revocation primitive for every one of those data paths.
+        let mut stalled = connection.open_stream().await.unwrap();
+        stalled
+            .send
+            .write_all(&1024u32.to_be_bytes())
+            .await
+            .unwrap();
+        stalled.send.write_all(b"{").await.unwrap();
+
+        mesh.remove_device("client").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), connection.connection().closed())
+            .await
+            .expect("revocation closes the authenticated connection immediately");
+        assert!(!mesh.trusts(&client_identity.device_id().to_string()).await);
+        assert!(mesh.active.lock().await.is_empty());
+
+        client.close().await;
+        mesh.endpoint.close().await;
+        tokio::time::timeout(Duration::from_secs(1), loop_task)
+            .await
+            .expect("the accept loop stops with its endpoint")
+            .unwrap();
     }
 
     #[tokio::test]

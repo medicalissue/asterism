@@ -20,6 +20,7 @@ use crate::backup::{ExportReport, RestoreReport};
 use crate::device_shell::{
     ShellData, ShellExit, ShellOpen, ShellOutput, ShellPolicyAction, ShellPolicyStatus,
 };
+use crate::hv::GuestHealth;
 use crate::instance::{Instance, PortForward, Restart, Shape};
 use crate::orbit::{Device, DeviceStatus, WakeFacts};
 use crate::registry::OrbitRow;
@@ -347,9 +348,15 @@ pub enum Request {
     DeviceRemove {
         name: String,
     },
-    /// Read or change this device's shell offer. The daemon accepts this only
-    /// from its private local control socket; a mesh RPC is explicitly
-    /// refused even though the enum remains parseable across versions.
+    /// Read this device's shell offer. Unlike policy mutation, this is safe
+    /// over authenticated mesh RPC and is the read contract used by remote
+    /// and hosted management surfaces.
+    DeviceShellStatus,
+    /// Change this device's shell offer. The daemon accepts this only from
+    /// its private local control socket; a mesh RPC is explicitly refused
+    /// even though the enum remains parseable across versions. `Status` is
+    /// retained for protocol-4 clients, but new readers use
+    /// [`Request::DeviceShellStatus`].
     DeviceShellPolicy {
         action: ShellPolicyAction,
     },
@@ -644,6 +651,7 @@ impl Request {
             | Request::PairConfirm { .. }
             | Request::DeviceRemove { .. }
             | Request::DevicePing { .. }
+            | Request::DeviceShellStatus
             | Request::DeviceShellPolicy { .. }
             | Request::DeviceShellOpen { .. }
             | Request::DeviceShellInput { .. }
@@ -724,6 +732,7 @@ impl Request {
         match self {
             Request::Compat => 2,
             Request::BackupExport { .. } | Request::BackupImport { .. } => 3,
+            Request::DeviceShellStatus => 5,
             Request::DeviceShellPolicy { .. }
             | Request::DeviceShellOpen { .. }
             | Request::DeviceShellInput { .. }
@@ -747,6 +756,7 @@ impl Request {
             Request::Compat => Some("compat"),
             Request::BackupExport { .. } => Some("backup_export"),
             Request::BackupImport { .. } => Some("backup_import"),
+            Request::DeviceShellStatus => Some("device_shell_status"),
             Request::DeviceShellPolicy { .. }
             | Request::DeviceShellOpen { .. }
             | Request::DeviceShellInput { .. }
@@ -839,6 +849,11 @@ pub enum Response {
     // ---- instances -----------------------------------------------------------
     Instance {
         instance: Instance,
+        /// The guest's own health snapshot, populated for `Status` by a
+        /// backend that has an authenticated guest-agent channel. It is not
+        /// persisted in the registry: every status request asks again.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        guest_health: Option<Box<GuestHealth>>,
     },
     /// Reply to [`Request::List`]: one device's shard.
     Instances {
@@ -1138,6 +1153,7 @@ pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
             }
             .since(),
         ),
+        ("device_shell_status", Request::DeviceShellStatus.since()),
     ]
     .into_iter()
     .map(|(name, version)| (name.to_owned(), version))
@@ -1161,6 +1177,43 @@ pub fn is_unknown_variant_error(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_instance_reply_carries_optional_fresh_guest_health() {
+        let response = Response::Instance {
+            instance: Instance::new(
+                "dev",
+                "desktop",
+                "debian:13",
+                Shape::default(),
+                crate::hv::Machine {
+                    backend: "vz".into(),
+                    machine_type: "generic".into(),
+                    cpu: "host".into(),
+                    hv_version: "15.6".into(),
+                },
+            ),
+            guest_health: Some(Box::new(GuestHealth {
+                addrs: vec!["192.168.64.7".parse().unwrap()],
+                uptime_secs: 125.9,
+                ssh: true,
+                cloud_init: "done".into(),
+                load1: Some(0.42),
+                mem_available_kib: Some(1_572_864),
+            })),
+        };
+        let wire = serde_json::to_string(&response).unwrap();
+        assert!(wire.contains("guest_health"), "{wire}");
+        let Response::Instance {
+            guest_health: Some(health),
+            ..
+        } = serde_json::from_str::<Response>(&wire).unwrap()
+        else {
+            panic!("the health sample survived the response wire")
+        };
+        assert_eq!(health.cloud_init, "done");
+        assert_eq!(health.mem_available_kib, Some(1_572_864));
+    }
 
     #[test]
     fn a_pre_pong_daemon_is_recognisable() {
@@ -1247,6 +1300,11 @@ mod tests {
         assert!(!Request::Compat.speakable_at(1));
         assert!(Request::Compat.speakable_at(2));
         assert!(Request::List.speakable_at(1));
+        assert_eq!(Request::DeviceShellStatus.since(), 5);
+        assert_eq!(
+            serde_json::to_string(&Request::DeviceShellStatus).unwrap(),
+            r#"{"cmd":"device_shell_status"}"#
+        );
     }
 
     /// The table `ast compat` prints and the rule the code follows are the

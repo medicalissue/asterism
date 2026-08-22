@@ -65,6 +65,8 @@ struct PolicyFile {
     #[serde(default)]
     enabled_at: u64,
     #[serde(default)]
+    changed_at: u64,
+    #[serde(default)]
     epoch: u64,
     /// Full Ed25519 public keys. Names and short ids are never authority.
     #[serde(default)]
@@ -77,6 +79,7 @@ impl Default for PolicyFile {
             version: POLICY_VERSION,
             enabled: false,
             enabled_at: 0,
+            changed_at: 0,
             epoch: 0,
             allowed_device_ids: Vec::new(),
         }
@@ -171,7 +174,12 @@ impl Manager {
                 "the mesh endpoint is unavailable, so no authenticated device-shell stream can be served".to_owned()
             })
         });
-        let active: Vec<_> = state.sessions.values().map(|s| s.status.clone()).collect();
+        let mut active: Vec<_> = state.sessions.values().map(|s| s.status.clone()).collect();
+        active.sort_by(|a, b| {
+            a.started_at
+                .cmp(&b.started_at)
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
         let policy_state = if unavailable.is_some() {
             ShellPolicyState::Unavailable
         } else if state.policy.enabled && !active.is_empty() {
@@ -184,6 +192,9 @@ impl Manager {
         ShellPolicyStatus {
             state: policy_state,
             epoch: state.policy.epoch,
+            changed_at: (state.policy.changed_at != 0)
+                .then_some(state.policy.changed_at)
+                .or_else(|| (state.policy.enabled_at != 0).then_some(state.policy.enabled_at)),
             enabled_at: (state.policy.enabled_at != 0).then_some(state.policy.enabled_at),
             active,
             unavailable_reason: unavailable,
@@ -202,10 +213,12 @@ impl Manager {
         if let Some(why) = &state.unavailable {
             bail!(why.clone());
         }
+        let changed_at = now_unix();
         let next = PolicyFile {
             version: POLICY_VERSION,
             enabled: true,
-            enabled_at: now_unix(),
+            enabled_at: changed_at,
+            changed_at,
             epoch: state.policy.epoch.saturating_add(1),
             allowed_device_ids,
         };
@@ -228,6 +241,7 @@ impl Manager {
             version: POLICY_VERSION,
             enabled: false,
             enabled_at: 0,
+            changed_at: now_unix(),
             epoch: state.policy.epoch.saturating_add(1),
             allowed_device_ids: Vec::new(),
         };
@@ -387,6 +401,7 @@ impl Manager {
             started_at: now_unix(),
             pty,
         };
+        state.policy.changed_at = status.started_at;
         let (revoke, revoked) = watch::channel(None);
         let epoch = state.policy.epoch;
         state.sessions.insert(
@@ -514,12 +529,14 @@ impl Lease {
 impl Drop for Lease {
     fn drop(&mut self) {
         if let Some(manager) = self.manager.upgrade() {
-            manager
+            let mut state = manager
                 .state
                 .lock()
-                .expect("device-shell policy lock poisoned")
-                .sessions
-                .remove(&self.status.session_id);
+                .expect("device-shell policy lock poisoned");
+            if state.sessions.remove(&self.status.session_id).is_some() {
+                state.policy.changed_at = now_unix();
+            }
+            drop(state);
             if !self.finished {
                 manager.audit_best_effort(AuditRecord::session(
                     "end",
@@ -1349,11 +1366,12 @@ async fn run(
         }
     };
 
-    // The waiter can win the race with its stdout reader. Drain the bounded
-    // queue briefly so a command's final line is not lost behind its status.
-    while let Ok(Some(output)) =
-        tokio::time::timeout(Duration::from_millis(50), running.output.recv()).await
-    {
+    // The waiter can win the race with its output reader. The reader owns the
+    // last sender, so channel close is the kernel-backed EOF boundary: every
+    // byte read before the child closed its descriptors is forwarded before
+    // the exit frame. A wall-clock drain would turn this ordering guarantee
+    // into a fixture race.
+    while let Some(output) = running.output.recv().await {
         if send_bounded(&mut wire, &output).await.is_err() {
             exit.reason
                 .get_or_insert_with(|| "client disconnected before final output".to_owned());
@@ -1463,11 +1481,19 @@ mod tests {
     fn missing_policy_is_disabled_and_new_pairings_do_not_inherit_approval() {
         let tmp = tempfile::tempdir().unwrap();
         let manager = manager(tmp.path());
-        assert_eq!(manager.status(true).state, ShellPolicyState::Disabled);
-        manager.enable(vec!["peer-a".into()]).unwrap();
+        let missing = manager.status(true);
+        assert_eq!(missing.state, ShellPolicyState::Disabled);
+        assert_eq!(missing.changed_at, None);
+        let enabled = manager.enable(vec!["peer-a".into()]).unwrap();
+        assert_eq!(enabled.changed_at, enabled.enabled_at);
         let approved = manager.reserve("peer-a", "laptop", false).unwrap();
+        let active = manager.status(true);
+        assert_eq!(active.state, ShellPolicyState::Active);
+        assert_eq!(active.active_sessions(), 1);
+        assert!(active.changed_at.is_some());
         assert!(manager.reserve("peer-b", "new-laptop", false).is_err());
         drop(approved);
+        assert!(manager.status(true).changed_at.is_some());
         let mode = std::fs::metadata(tmp.path().join("shell.json"))
             .unwrap()
             .permissions()
@@ -1612,6 +1638,7 @@ mod tests {
             },
         }));
         assert!(local_only_request(&Request::DeviceShellEof));
+        assert!(!local_only_request(&Request::DeviceShellStatus));
         assert!(!local_only_request(&Request::List));
     }
 
@@ -1620,31 +1647,93 @@ mod tests {
         if privilege_refusal().is_some() {
             return;
         }
-        let open = ShellOpen {
-            command: Some("stty size; exit 37".into()),
-            pty: true,
-            cols: 93,
-            rows: 41,
-            env: vec![],
-        };
-        let mut running = spawn(&open).unwrap();
-        resize(running.pty_master.as_ref().unwrap(), 94, 42).unwrap();
-        let mut bytes = Vec::new();
-        let exit = loop {
-            tokio::select! {
-                frame = running.output.recv() => {
-                    if let Some(ShellFrame::Output { data, .. }) = frame {
+        for iteration in 0..128 {
+            let open = ShellOpen {
+                command: Some(
+                    "printf 'ready\\n'; IFS= read -r marker; stty size; printf 'done-%s\\n' \"$marker\"; exit 37".into(),
+                ),
+                pty: true,
+                cols: 93,
+                rows: 41,
+                env: vec![],
+            };
+            let mut running = spawn(&open).unwrap();
+            let mut bytes = Vec::new();
+            loop {
+                match running.output.recv().await {
+                    Some(ShellFrame::Output { data, .. }) => {
                         bytes.extend_from_slice(data.as_bytes());
+                        if bytes
+                            .windows(b"ready\r\n".len())
+                            .any(|window| window == b"ready\r\n")
+                        {
+                            break;
+                        }
+                    }
+                    Some(_) => {}
+                    None => panic!("iteration {iteration}: PTY output closed before resize"),
+                }
+            }
+
+            resize(running.pty_master.as_ref().unwrap(), 94, 42).unwrap();
+            running
+                .input
+                .send(ProcessInput::Data(
+                    format!("marker-{iteration}\n").into_bytes(),
+                ))
+                .await
+                .unwrap();
+
+            let mut exit = None;
+            let mut output_open = true;
+            while exit.is_none() || output_open {
+                tokio::select! {
+                    frame = running.output.recv(), if output_open => {
+                        match frame {
+                            Some(ShellFrame::Output { data, .. }) => bytes.extend_from_slice(data.as_bytes()),
+                            Some(_) => {},
+                            None => output_open = false,
+                        }
+                    }
+                    result = &mut running.exit, if exit.is_none() => {
+                        exit = Some(result.unwrap());
                     }
                 }
-                exit = &mut running.exit => break exit.unwrap(),
             }
-        };
-        assert_eq!(exit.code, Some(37));
-        let output = String::from_utf8_lossy(&bytes);
-        assert!(
-            output.contains("42 94") || output.contains("41 93"),
-            "{output:?}"
-        );
+
+            assert_eq!(
+                exit.unwrap(),
+                ShellExit {
+                    code: Some(37),
+                    signal: None,
+                    core_dumped: false,
+                    reason: None,
+                },
+                "iteration {iteration}",
+            );
+            let output = String::from_utf8_lossy(&bytes);
+            assert!(
+                output.contains("ready\r\n"),
+                "iteration {iteration}: {output:?}"
+            );
+            assert!(
+                output.contains("42 94\r\n"),
+                "iteration {iteration}: {output:?}"
+            );
+            assert!(
+                output.contains(&format!("done-marker-{iteration}\r\n")),
+                "iteration {iteration}: {output:?}"
+            );
+            assert_eq!(
+                unsafe { libc::kill(running.pid, 0) },
+                -1,
+                "child leaked in iteration {iteration}"
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH),
+                "child pid remained live in iteration {iteration}"
+            );
+        }
     }
 }

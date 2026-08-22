@@ -356,6 +356,65 @@ impl Orbit {
         &self.self_name
     }
 
+    /// The durable document backing this orbit.
+    ///
+    /// Other stores which participate in a cross-store transition use its
+    /// directory so tests and alternate homes keep the whole transaction in
+    /// one state root.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Resolves a device-removal request to one exact identity.
+    ///
+    /// The live store is authoritative while the name is present. If it is
+    /// absent, the last-known-good copy may be the interrupted removal's old
+    /// side: the first commit removed this exact key, while confirmation
+    /// failed before replacing the backup. Returning that record makes the
+    /// confirmation retryable without treating another key which later took
+    /// the same human name as the device being confirmed.
+    pub fn removal_target(&self, name: &str) -> Result<Device> {
+        if let Some(device) = self.get(name) {
+            return Ok(device.clone());
+        }
+
+        let backup = durable::backup_path(&self.path);
+        let bytes = std::fs::read(&backup).with_context(|| {
+            format!("no device named {name:?} in this orbit — see: ast devices")
+        })?;
+        let file: OrbitFile = serde_json::from_slice(&bytes).with_context(|| {
+            format!(
+                "the live orbit has no device named {name:?}, and its recovery copy at {} \
+                 cannot identify an interrupted removal",
+                backup.display()
+            )
+        })?;
+        if file.version > ORBIT_VERSION {
+            bail!(
+                "the recovery copy at {} is orbit format {}, but this build speaks \
+                 {ORBIT_VERSION}",
+                backup.display(),
+                file.version
+            );
+        }
+        let device = file
+            .devices
+            .into_iter()
+            .find(|device| device.name == name)
+            .with_context(|| {
+                format!("no device named {name:?} in this orbit — see: ast devices")
+            })?;
+        if let Some(current) = self.by_id(&device.device_id) {
+            bail!(
+                "device key {} is currently named {:?}, not {name:?}; refusing to substitute \
+                 one identity in a removal retry",
+                device.short_id(),
+                current.name
+            );
+        }
+        Ok(device)
+    }
+
     /// Renames this device.
     ///
     /// Refused if a peer already answers to that name — two devices called
@@ -446,6 +505,66 @@ impl Orbit {
             bail!("no device named {name:?} in this orbit — see: ast devices");
         };
         Ok(self.devices.remove(i))
+    }
+
+    /// Removes a peer and does not return success until that removal is
+    /// durable.
+    ///
+    /// A commit can report an error on either side of its publishing rename.
+    /// Reloading after an error tells the live daemon which side became
+    /// visible. If the rename landed but its directory flush failed, writing
+    /// that already-removed state once more gives the retry a fresh durability
+    /// boundary. If it did not land, the in-memory store is restored to the
+    /// still-committed membership so a later call can retry the removal.
+    pub fn remove_durable(&mut self, expected: &Device) -> Result<Device> {
+        let removed_now = match self.by_id(&expected.device_id) {
+            Some(current) if current.name != expected.name => bail!(
+                "device key {} is currently named {:?}, not {:?}; refusing to substitute one \
+                 identity in a removal",
+                expected.short_id(),
+                current.name,
+                expected.name
+            ),
+            Some(_) => {
+                let removed = self.remove(&expected.name)?;
+                debug_assert_eq!(removed.device_id, expected.device_id);
+                true
+            }
+            // The exact key is already absent. A different key may now own
+            // the same name; confirmation saves that replacement untouched.
+            None => false,
+        };
+
+        if removed_now {
+            if let Err(first) = self.save() {
+                *self = Self::load(&self.path).with_context(|| {
+                    format!(
+                        "reloading the orbit store after removing {:?} could not be committed: \
+                         {first:#}",
+                        expected.name
+                    )
+                })?;
+                if self.by_id(&expected.device_id).is_some() {
+                    return Err(first).with_context(|| {
+                        format!("removing device {:?} from the orbit", expected.name)
+                    });
+                }
+            }
+        }
+
+        // The backup is a recovery input, not inert history. This save is
+        // also the idempotent retry when the exact key is already absent: it
+        // replaces a stale recovery copy without touching a same-name device
+        // carrying another key.
+        self.save().with_context(|| {
+            format!(
+                "confirming device {:?} ({}) is absent from both the live and recovery orbit \
+                 stores",
+                expected.name,
+                expected.short_id()
+            )
+        })?;
+        Ok(expected.clone())
     }
 
     /// Records what a peer just said about its own place on the wire.
@@ -896,6 +1015,153 @@ mod tests {
             !reloaded.trusts("bb"),
             "a pairing that did not commit is not a pairing"
         );
+    }
+
+    #[test]
+    fn failed_durable_removal_restores_membership_and_can_be_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orbit.json");
+        let mut o = orbit(dir.path());
+        o.add(peer("laptop", "old-key")).unwrap();
+        o.save().unwrap();
+        let device = o.get("laptop").unwrap().clone();
+
+        let armed = durable::faults::arm(
+            "remove-rollback",
+            durable::faults::Point::Rename,
+            path.display().to_string(),
+            std::io::ErrorKind::Other,
+        );
+        assert!(o.remove_durable(&device).is_err());
+        assert!(o.trusts("old-key"), "memory follows the durable store");
+        assert!(Orbit::load(&path).unwrap().trusts("old-key"));
+        drop(armed);
+
+        assert_eq!(o.remove_durable(&device).unwrap().device_id, "old-key");
+        assert!(!Orbit::load(&path).unwrap().trusts("old-key"));
+    }
+
+    #[test]
+    fn ambiguous_removal_commit_is_confirmed_at_a_fresh_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orbit.json");
+        let mut o = orbit(dir.path());
+        o.add(peer("laptop", "old-key")).unwrap();
+        o.save().unwrap();
+        let device = o.get("laptop").unwrap().clone();
+
+        let _armed = durable::faults::arm_once(
+            "remove-sync",
+            durable::faults::Point::SyncDir,
+            dir.path().display().to_string(),
+            std::io::ErrorKind::Other,
+        );
+        assert_eq!(o.remove_durable(&device).unwrap().device_id, "old-key");
+        assert!(!Orbit::load(&path).unwrap().trusts("old-key"));
+    }
+
+    #[test]
+    fn recovery_copy_cannot_restore_a_removed_device_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orbit.json");
+        let mut o = orbit(dir.path());
+        o.add(peer("laptop", "old-key")).unwrap();
+        o.save().unwrap();
+        let device = o.get("laptop").unwrap().clone();
+        o.remove_durable(&device).unwrap();
+
+        std::fs::write(&path, b"{").unwrap();
+        assert!(
+            !Orbit::load(&path).unwrap().trusts("old-key"),
+            "last-known-good membership must be revoked too"
+        );
+    }
+
+    /// Reproduce the Refinery boundary exactly: the first save has removed
+    /// the member and left the old key in `.bak`; the confirmation then dies
+    /// before `keep_backup` can rotate that copy. Each filesystem step before
+    /// backup replacement must leave enough exact identity to retry, and the
+    /// retry must make corrupt-live recovery stay revoked.
+    #[test]
+    fn every_pre_backup_confirmation_failure_is_exactly_retryable() {
+        use durable::faults::Point;
+
+        for (tag, point) in [
+            ("confirm-create", Point::Create),
+            ("confirm-write", Point::Write),
+            ("confirm-sync-file", Point::SyncFile),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("{tag}-orbit.json"));
+            let mut o = Orbit::load(&path).unwrap();
+            o.set_self_name("here").unwrap();
+            o.add(peer("laptop", "old-key")).unwrap();
+            o.save().unwrap();
+            let expected = o.get("laptop").unwrap().clone();
+
+            o.remove("laptop").unwrap();
+            o.save().unwrap();
+            assert!(!o.trusts("old-key"));
+            assert!(
+                Orbit::load(&durable::backup_path(&path))
+                    .unwrap()
+                    .trusts("old-key"),
+                "fixture must stop between removal and confirmation at {point:?}"
+            );
+
+            let armed = durable::faults::arm(
+                tag,
+                point,
+                path.display().to_string(),
+                std::io::ErrorKind::Other,
+            );
+            assert!(o.remove_durable(&expected).is_err(), "{point:?}");
+            assert!(!o.trusts("old-key"), "{point:?}");
+            assert!(
+                Orbit::load(&durable::backup_path(&path))
+                    .unwrap()
+                    .trusts("old-key"),
+                "the injected failure must precede backup rotation at {point:?}"
+            );
+            // A retry normally arrives after the failed command (and may
+            // arrive after a daemon restart), so recover the identity from
+            // disk rather than relying on the caller's in-memory `expected`.
+            let mut restarted = Orbit::load(&path).unwrap();
+            let retry = restarted.removal_target("laptop").unwrap();
+            assert_eq!(retry.name, expected.name, "{point:?}");
+            assert_eq!(retry.device_id, expected.device_id, "{point:?}");
+            drop(armed);
+
+            restarted.remove_durable(&retry).unwrap();
+            std::fs::write(&path, b"{").unwrap();
+            assert!(
+                !Orbit::load(&path).unwrap().trusts("old-key"),
+                "corrupt-live recovery resurrected the key after {point:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_retry_neither_removes_a_same_name_key_nor_follows_a_renamed_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut o = orbit(dir.path());
+        o.add(peer("laptop", "old-key")).unwrap();
+        o.save().unwrap();
+        let old = o.get("laptop").unwrap().clone();
+        o.remove("laptop").unwrap();
+        o.save().unwrap();
+        o.add(peer("laptop", "new-key")).unwrap();
+        o.save().unwrap();
+
+        o.remove_durable(&old).unwrap();
+        assert!(o.trusts("new-key"));
+        assert_eq!(o.get("laptop").unwrap().device_id, "new-key");
+
+        let expected_new = o.get("laptop").unwrap().clone();
+        o.add(peer("travel-laptop", "new-key")).unwrap();
+        assert!(o.remove_durable(&expected_new).is_err());
+        assert!(o.trusts("new-key"));
+        assert_eq!(o.by_id("new-key").unwrap().name, "travel-laptop");
     }
 
     /// A torn orbit store is repaired from the last-known-good copy rather
