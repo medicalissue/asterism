@@ -12,9 +12,9 @@
 # and asking, and never installs a byte it has not checksummed.
 #
 # This is the CLI: `ast`, the `astd` daemon it starts, and `astd-vz`, the
-# code-signed helper that owns Virtualization.framework guests — without it
-# on the machine, `--backend vz` has nothing to run and Asterism falls back
-# to QEMU. The desktop app is a separate DMG — see
+# code-signed helper that owns Virtualization.framework guests on macOS, or
+# the pinned Cloud Hypervisor and virtiofsd helpers on Linux. The desktop app
+# is a separate DMG — see
 # https://asterism.run/download.
 #
 # Environment:
@@ -44,6 +44,10 @@ REPO_URL="https://github.com/${REPO}.git"
 VERSION="${ASTERISM_VERSION:-}"
 METHOD="${ASTERISM_METHOD:-release}"
 PREFIX="${ASTERISM_PREFIX:-${HOME}/.local}"
+# Test harnesses may stage host integration beneath a disposable root. Real
+# installs leave this empty and therefore use the fixed, root-owned paths that
+# the daemon and sudoers both name.
+SYSTEM_ROOT="${ASTERISM_SYSTEM_ROOT:-}"
 ASSUME_YES="${ASTERISM_YES:-0}"
 FORCE="${ASTERISM_FORCE:-0}"
 REF="${ASTERISM_REF:-}"
@@ -208,6 +212,8 @@ detect_target() {
 
 	case "${os}-${arch}" in
 	Darwin-arm64) printf 'darwin-arm64' ;;
+	Linux-x86_64) printf 'linux-x86_64' ;;
+	Linux-arm64) printf 'linux-arm64' ;;
 	*) return 1 ;;
 	esac
 }
@@ -215,7 +221,7 @@ detect_target() {
 unsupported_target() {
 	err "no binary release for $(uname -s) $(uname -m)."
 	err ""
-	err "Asterism publishes binaries for macOS on Apple silicon (darwin-arm64)."
+	err "Asterism publishes binaries for macOS on Apple silicon and Linux on x86-64 or arm64."
 	err "Everything else builds from source, which needs Rust and a few minutes:"
 	err ""
 	err "    curl -fsSL https://asterism.run/install.sh | ASTERISM_METHOD=source sh"
@@ -263,7 +269,8 @@ receipt_complete() {
 	files="$(receipt_field files || true)"
 	[ -n "$files" ] || return 1
 	for rel in $files; do
-		[ -x "${PREFIX}/${rel}" ] || return 1
+		[ -e "${PREFIX}/${rel}" ] || return 1
+		case "$rel" in bin/*) [ -x "${PREFIX}/${rel}" ] || return 1 ;; esac
 	done
 	return 0
 }
@@ -289,6 +296,22 @@ drop_stale_helper() {
 	receipt_lists bin/astd-vz || return 0
 	rm -f "${PREFIX}/bin/astd-vz"
 	say "removed ${PREFIX}/bin/astd-vz — this build ships no helper, and one from another build must not answer for it"
+}
+
+drop_stale_linux_helpers() {
+	for rel in bin/cloud-hypervisor bin/virtiofsd \
+		share/asterism/linux-components.env \
+		share/asterism/asterism-nbd \
+		share/asterism/licenses/cloud-hypervisor-Apache-2.0.txt \
+		share/asterism/licenses/cloud-hypervisor-BSD-3-Clause.txt \
+		share/asterism/licenses/virtiofsd-Apache-2.0.txt \
+		share/asterism/licenses/virtiofsd-BSD-3-Clause.txt; do
+		receipt_lists "$rel" || continue
+		[ -e "${PREFIX}/${rel}" ] || continue
+		rm -f "${PREFIX}/${rel}"
+		say "removed ${PREFIX}/${rel} — this target ships no Linux helper"
+	done
+	rmdir "${PREFIX}/share/asterism/licenses" 2>/dev/null || true
 }
 
 # ---- resolving a version ---------------------------------------------------
@@ -430,6 +453,16 @@ install_release() {
 		vz=0
 	fi
 	if [ -f "${unpack}/asterism-update" ]; then updater=1; else updater=0; fi
+	case "$target" in
+	linux-*)
+		for helper in cloud-hypervisor virtiofsd; do
+			[ -f "${unpack}/${helper}" ] || die "${artifact} has no ${helper}. Refusing to install a Linux release without its pinned native backend."
+		done
+		[ -f "${unpack}/share/asterism/asterism-nbd" ] || die "${artifact} has no checked NBD privilege wrapper. Refusing a partial Linux runtime."
+		linux_helpers=1
+		;;
+	*) linux_helpers=0 ;;
+	esac
 
 	ensure_writable_prefix
 	place "${unpack}/ast" ast
@@ -437,7 +470,17 @@ install_release() {
 	if [ "$updater" = "1" ]; then
 		place_at "${unpack}/asterism-update" libexec/asterism/asterism-update
 	fi
+	if [ "$linux_helpers" = "1" ]; then
+		place "${unpack}/cloud-hypervisor" cloud-hypervisor
+		place "${unpack}/virtiofsd" virtiofsd
+		if [ -d "${unpack}/share/asterism" ]; then
+			mkdir -p "${PREFIX}/share/asterism"
+			cp -R "${unpack}/share/asterism/." "${PREFIX}/share/asterism/"
+		fi
+		configure_chv_linux "${unpack}/share/asterism/asterism-nbd"
+	fi
 	if [ "$vz" = "1" ]; then
+		[ "$linux_helpers" = "1" ] || drop_stale_linux_helpers
 		place "${unpack}/astd-vz" astd-vz
 		unquarantine "${PREFIX}/bin/ast" "${PREFIX}/bin/astd" "${PREFIX}/bin/astd-vz"
 		if [ "$updater" = "1" ]; then
@@ -445,7 +488,30 @@ install_release() {
 		else
 			write_receipt "$version" "$target" release "$got" bin/ast bin/astd bin/astd-vz
 		fi
+	elif [ "$linux_helpers" = "1" ]; then
+		drop_stale_helper
+		if [ "$updater" = "1" ]; then
+			write_receipt "$version" "$target" release "$got" \
+				bin/ast bin/astd bin/cloud-hypervisor bin/virtiofsd \
+				libexec/asterism/asterism-update \
+				share/asterism/linux-components.env \
+				share/asterism/asterism-nbd \
+				share/asterism/licenses/cloud-hypervisor-Apache-2.0.txt \
+				share/asterism/licenses/cloud-hypervisor-BSD-3-Clause.txt \
+				share/asterism/licenses/virtiofsd-Apache-2.0.txt \
+				share/asterism/licenses/virtiofsd-BSD-3-Clause.txt
+		else
+			write_receipt "$version" "$target" release "$got" \
+				bin/ast bin/astd bin/cloud-hypervisor bin/virtiofsd \
+				share/asterism/linux-components.env \
+				share/asterism/asterism-nbd \
+				share/asterism/licenses/cloud-hypervisor-Apache-2.0.txt \
+				share/asterism/licenses/cloud-hypervisor-BSD-3-Clause.txt \
+				share/asterism/licenses/virtiofsd-Apache-2.0.txt \
+				share/asterism/licenses/virtiofsd-BSD-3-Clause.txt
+		fi
 	else
+		drop_stale_linux_helpers
 		unquarantine "${PREFIX}/bin/ast" "${PREFIX}/bin/astd"
 		drop_stale_helper
 		if [ "$updater" = "1" ]; then
@@ -459,7 +525,7 @@ install_release() {
 		say "upgraded ${installed} -> ${version}"
 	fi
 	note_vz "$vz"
-	note_qemu
+	if [ "$linux_helpers" = "1" ]; then note_chv; else note_qemu; fi
 	note_path
 }
 
@@ -488,10 +554,6 @@ install_source() {
 		err ""
 		exit 1
 	fi
-	if [ "$(uname -s)" = "Linux" ]; then
-		ensure_qemu_linux
-	fi
-
 	src="${XDG_CACHE_HOME:-${HOME}/.cache}/asterism/src"
 	if [ -d "${src}/.git" ]; then
 		say "updating ${src} to ${ref}"
@@ -507,6 +569,11 @@ install_source() {
 	say "cargo build --release --locked (a few minutes)"
 	(cd "$src" && cargo build --release --locked \
 		--package asterism-cli --package asterism-daemon)
+	linux_helpers=0
+	if [ "$(uname -s)" = "Linux" ]; then
+		prepare_chv_source "$src"
+		linux_helpers=1
+	fi
 
 	# The vz helper is built by the script in the tree that knows how to
 	# sign it, because building it is not enough: an unsigned helper carries
@@ -531,20 +598,134 @@ install_source() {
 	place "${src}/target/release/ast" ast
 	place "${src}/target/release/astd" astd
 	place_at "${src}/packaging/update.sh" libexec/asterism/asterism-update
+	if [ "$linux_helpers" = "1" ]; then
+		place "$CHV_SOURCE_BIN" cloud-hypervisor
+		place "$VIRTIOFSD_SOURCE_BIN" virtiofsd
+		configure_chv_linux "${src}/packaging/asterism-nbd"
+	fi
 	if [ "$vz" = "1" ]; then
 		place "${src}/target/release/astd-vz" astd-vz
 		write_receipt "$ref" "source" source "" bin/ast bin/astd bin/astd-vz libexec/asterism/asterism-update
+	elif [ "$linux_helpers" = "1" ]; then
+		drop_stale_helper
+		write_receipt "$ref" "source" source "" bin/ast bin/astd bin/cloud-hypervisor bin/virtiofsd libexec/asterism/asterism-update
 	else
 		drop_stale_helper
 		write_receipt "$ref" "source" source "" bin/ast bin/astd libexec/asterism/asterism-update
 	fi
 	note_vz "$vz"
-	note_qemu
+	if [ "$linux_helpers" = "1" ]; then note_chv; else note_qemu; fi
 	note_path
 }
 
-# QEMU comes from the system package manager, with consent. Asterism never
-# bundles QEMU — see the licensing notes in packaging/README.md.
+prepare_chv_source() {
+	source_root="$1"
+	# This is data from the checked-out tag/ref, not code from the network.
+	# shellcheck disable=SC1090,SC1091
+	. "${source_root}/packaging/linux-components.env"
+	case "$(uname -m)" in
+	x86_64 | amd64)
+		chv_url="$CLOUD_HYPERVISOR_X86_64_URL"
+		chv_sha="$CLOUD_HYPERVISOR_X86_64_SHA256"
+		;;
+	aarch64 | arm64)
+		chv_url="$CLOUD_HYPERVISOR_AARCH64_URL"
+		chv_sha="$CLOUD_HYPERVISOR_AARCH64_SHA256"
+		;;
+	*) die "Cloud Hypervisor has no pinned helper for $(uname -m)" ;;
+	esac
+	CHV_SOURCE_BIN="${TMPDIR_SELF}/cloud-hypervisor"
+	fetch "$chv_url" "$CHV_SOURCE_BIN" || die "could not download pinned Cloud Hypervisor"
+	[ "$(sha256_of "$CHV_SOURCE_BIN")" = "$chv_sha" ] || die "pinned Cloud Hypervisor digest mismatch"
+	chmod 0755 "$CHV_SOURCE_BIN"
+
+	virtio_tar="${TMPDIR_SELF}/virtiofsd.tar.gz"
+	fetch "$VIRTIOFSD_TARBALL" "$virtio_tar" || die "could not download pinned virtiofsd source"
+	[ "$(sha256_of "$virtio_tar")" = "$VIRTIOFSD_TARBALL_SHA256" ] || die "pinned virtiofsd source digest mismatch"
+	tar -xzf "$virtio_tar" -C "$TMPDIR_SELF"
+	virtio_target="${TMPDIR_SELF}/virtiofsd-target"
+	CARGO_TARGET_DIR="$virtio_target" cargo build --release --locked \
+		--manifest-path "${TMPDIR_SELF}/virtiofsd-${VIRTIOFSD_VERSION}/Cargo.toml"
+	VIRTIOFSD_SOURCE_BIN="${virtio_target}/release/virtiofsd"
+}
+
+# Grant only what the bundled VMM needs to create its per-instance TAP. KVM
+# itself remains protected by /dev/kvm ownership; this does not bypass it.
+configure_chv_linux() {
+	nbd_helper_source="$1"
+	[ "$(uname -s)" = "Linux" ] || return 0
+
+	# nbd-client is named nbd-client on Debian/Ubuntu and nbd on Fedora/RHEL.
+	# kmod provides modprobe on both families. Install only when the host does
+	# not already carry the required command, so an existing administrator-
+	# managed package remains authoritative.
+	if ! have nbd-client || ! have modprobe; then
+		if have apt-get; then
+			run_root apt-get install -y nbd-client kmod
+		elif have dnf; then
+			run_root dnf install -y nbd kmod
+		elif have zypper; then
+			run_root zypper --non-interactive install nbd kmod
+		else
+			die "remote block volumes need nbd-client and modprobe; install the nbd and kmod packages, then re-run."
+		fi
+	fi
+	have nbd-client || die "the package manager completed but nbd-client is still unavailable"
+	have modprobe || die "the package manager completed but modprobe is still unavailable"
+
+	modules_load="${TMPDIR_SELF}/asterism-nbd.modules-load"
+	modprobe_options="${TMPDIR_SELF}/asterism-nbd.modprobe"
+	printf 'nbd\n' >"$modules_load"
+	printf 'options nbd nbds_max=64\n' >"$modprobe_options"
+	run_root install -d -m 0755 "${SYSTEM_ROOT}/etc/modules-load.d" "${SYSTEM_ROOT}/etc/modprobe.d"
+	run_root install -m 0644 "$modules_load" "${SYSTEM_ROOT}/etc/modules-load.d/asterism-nbd.conf"
+	run_root install -m 0644 "$modprobe_options" "${SYSTEM_ROOT}/etc/modprobe.d/asterism-nbd.conf"
+	run_root modprobe nbd nbds_max=64
+
+	# The daemon never gets general nbd-client access. It may invoke only this
+	# root-owned argument-checking wrapper, and only without an environment-
+	# supplied command path. One policy is installed for the invoking account.
+	nbd_helper="${SYSTEM_ROOT}/usr/local/libexec/asterism/asterism-nbd"
+	run_root install -d -m 0755 "$(dirname "$nbd_helper")"
+	run_root install -m 0755 "$nbd_helper_source" "$nbd_helper"
+	nbd_user="$(id -un)"
+	case "$nbd_user" in *[!A-Za-z0-9_.-]*) die "cannot safely write sudoers policy for account ${nbd_user}" ;; esac
+	sudoers="${TMPDIR_SELF}/asterism-nbd.sudoers"
+	printf '%s ALL=(root) NOPASSWD: %s\n' "$nbd_user" "$nbd_helper" >"$sudoers"
+	have visudo || die "visudo is required to validate Asterism's least-privilege NBD policy"
+	run_root visudo -cf "$sudoers"
+	run_root install -d -m 0750 "${SYSTEM_ROOT}/etc/sudoers.d"
+	run_root install -m 0440 "$sudoers" "${SYSTEM_ROOT}/etc/sudoers.d/asterism-nbd-$(id -u)"
+
+	if ! have setcap; then
+		if have apt-get; then
+			run_root apt-get install -y libcap2-bin
+		elif have dnf; then
+			run_root dnf install -y libcap
+		else
+			die "setcap is required to configure Cloud Hypervisor networking (install libcap, then re-run)."
+		fi
+	fi
+	run_root setcap cap_net_admin+ep "${PREFIX}/bin/cloud-hypervisor"
+	[ -r /dev/kvm ] && [ -w /dev/kvm ] || {
+		err "/dev/kvm is not read-write for this user. Add the user to the kvm group and log in again before starting an instance."
+	}
+}
+
+remove_chv_linux_policy() {
+	[ "$(uname -s)" = "Linux" ] || return 0
+	policy="${SYSTEM_ROOT}/etc/sudoers.d/asterism-nbd-$(id -u)"
+	run_root rm -f "$policy"
+	say "removed ${policy}"
+}
+
+note_chv() {
+	say "Linux instances default to bundled Cloud Hypervisor v53.0 over KVM."
+	say "QEMU is used only when selected explicitly as a compatibility backend."
+}
+
+# Explicit compatibility installs may still use this helper. It is not called
+# by either Linux product install path.
 ensure_qemu_linux() {
 	if have qemu-system-x86_64 || have qemu-system-aarch64; then
 		return 0
@@ -796,6 +977,9 @@ uninstall() {
 	fi
 	files="$(receipt_field files || true)"
 	[ -n "$files" ] || die "the receipt at ${r} lists no files. Refusing to guess what to delete."
+	if receipt_lists bin/cloud-hypervisor; then
+		remove_chv_linux_policy
+	fi
 
 	for rel in $files; do
 		f="${PREFIX}/${rel}"
@@ -809,6 +993,7 @@ uninstall() {
 	rm -f "$r"
 	say "removed ${r}"
 	# Only if empty: someone else's files are not ours to sweep up.
+	rmdir "${PREFIX}/share/asterism/licenses" 2>/dev/null || true
 	rmdir "${PREFIX}/share/asterism" 2>/dev/null || true
 	rmdir "${PREFIX}/libexec/asterism" 2>/dev/null || true
 
