@@ -27,6 +27,12 @@ pub const MIN_ABI_VERSION: u32 = 1;
 pub const MAX_WIRE_FRAME_BYTES: usize = 4 * 1024 * 1024;
 /// The one workload the proof sends to the provider.
 pub const VECTOR_ADD_WORKLOAD_NAME: &str = "asterism.vector_add_f32.v1";
+/// The stable path promised to software inside an attached Linux guest.
+pub const GUEST_DEVICE_PATH: &str = "/dev/nvidia0";
+/// Revocation tombstones improve diagnostics but carry no authority. Bounding
+/// them keeps an attach/revoke workload from becoming an unbounded memory
+/// sink; an evicted token is still refused as unknown.
+const MAX_REVOKED_TOMBSTONES: usize = 4_096;
 
 /// CUDA PTX is the pinned provider-side artifact in the proof. A production
 /// executor may compile it, cache it by its pin, and launch it on a physical
@@ -386,6 +392,833 @@ impl std::fmt::Display for GpuError {
 
 impl std::error::Error for GpuError {}
 
+// ---- production control plane ---------------------------------------------
+
+/// Provider health is an admission decision, not decoration. Only `ready`
+/// providers receive new leases or execute calls from existing ones.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ProviderHealth {
+    Ready,
+    Draining { reason: String },
+    Unhealthy { reason: String },
+    Offline { reason: String },
+}
+
+impl ProviderHealth {
+    pub fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    fn description(&self) -> &str {
+        match self {
+            Self::Ready => "ready",
+            Self::Draining { reason } | Self::Unhealthy { reason } | Self::Offline { reason } => {
+                reason
+            }
+        }
+    }
+}
+
+/// The observed mesh path to a provider. An unreachable provider is retained
+/// in diagnostics, but cannot win placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProviderRoute {
+    Direct { rtt_us: u64 },
+    Relay { rtt_us: u64 },
+    Unreachable,
+}
+
+impl ProviderRoute {
+    fn placement_key(self) -> Option<(u8, u64)> {
+        match self {
+            Self::Direct { rtt_us } => Some((0, rtt_us)),
+            Self::Relay { rtt_us } => Some((1, rtt_us)),
+            Self::Unreachable => None,
+        }
+    }
+}
+
+/// One GPU advertised by an authenticated orbit device.
+///
+/// `device_id` is the stable mesh public identity. `device_name` is only the
+/// human label and never authorizes a session. Live usage is included so a
+/// planner can refuse before asking a provider to mutate its budget.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderAdvertisement {
+    pub device_id: String,
+    pub device_name: String,
+    pub gpu_uuid: String,
+    pub device_name_cuda: String,
+    pub executor: Executor,
+    pub versions: AbiRange,
+    pub total_memory_bytes: u64,
+    pub leased_memory_bytes: u64,
+    pub max_leases: u32,
+    pub active_leases: u32,
+    pub generation: u64,
+    pub health: ProviderHealth,
+    pub route: ProviderRoute,
+    pub observed_at: u64,
+}
+
+/// Constraints for attaching a GPU part. `provider_device` is an explicit
+/// override by orbit device name; without it the deterministic cheapest
+/// eligible provider wins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacementRequest<'a> {
+    pub memory_bytes: u64,
+    pub provider_device: Option<&'a str>,
+    pub require_cuda: bool,
+}
+
+/// The selected provider and the reason surfaced by status/GUI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Placement {
+    pub provider: ProviderAdvertisement,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlErrorCode {
+    InvalidRequest,
+    Unavailable,
+    LimitExceeded,
+    Unauthorized,
+    InvalidLease,
+    Revoked,
+    StaleGeneration,
+    Conflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlError {
+    pub code: ControlErrorCode,
+    pub message: String,
+}
+
+impl ControlError {
+    fn new(code: ControlErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ControlError {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ControlError {}
+
+/// Select a provider without changing any provider or instance state.
+///
+/// Ranking is stable across callers: direct before relay, lower observed RTT,
+/// lower lease pressure, then stable device identity and GPU UUID. An explicit
+/// device remains an override, but never an override of health or quota.
+pub fn place_provider(
+    candidates: &[ProviderAdvertisement],
+    request: PlacementRequest<'_>,
+) -> Result<Placement, ControlError> {
+    if request.memory_bytes == 0 {
+        return Err(ControlError::new(
+            ControlErrorCode::InvalidRequest,
+            "a GPU attachment must reserve at least one byte",
+        ));
+    }
+
+    let named = |candidate: &&ProviderAdvertisement| {
+        request
+            .provider_device
+            .map(|name| candidate.device_name == name)
+            .unwrap_or(true)
+    };
+    let matching = candidates.iter().filter(named).collect::<Vec<_>>();
+    if matching.is_empty() {
+        return Err(ControlError::new(
+            ControlErrorCode::Unavailable,
+            match request.provider_device {
+                Some(name) => format!(
+                    "device {name:?} advertises no GPU — see GPU diagnostics for orbit providers"
+                ),
+                None => "no device in this orbit advertises a GPU".to_owned(),
+            },
+        ));
+    }
+
+    let mut eligible = Vec::new();
+    let mut refusals = Vec::new();
+    for candidate in matching {
+        let available = candidate
+            .total_memory_bytes
+            .saturating_sub(candidate.leased_memory_bytes);
+        let refusal = if !candidate.health.is_ready() {
+            Some(format!(
+                "{} is not ready: {}",
+                candidate.device_name,
+                candidate.health.description()
+            ))
+        } else if candidate.route.placement_key().is_none() {
+            Some(format!("{} is unreachable", candidate.device_name))
+        } else if request.require_cuda && candidate.executor != Executor::Cuda {
+            Some(format!(
+                "{} offers the reference executor, not CUDA",
+                candidate.device_name
+            ))
+        } else if candidate.active_leases >= candidate.max_leases {
+            Some(format!(
+                "{} has all {} GPU lease slots in use",
+                candidate.device_name, candidate.max_leases
+            ))
+        } else if available < request.memory_bytes {
+            Some(format!(
+                "{} has {available} GPU bytes available; {} requested",
+                candidate.device_name, request.memory_bytes
+            ))
+        } else {
+            None
+        };
+        match refusal {
+            Some(refusal) => refusals.push(refusal),
+            None => eligible.push(candidate),
+        }
+    }
+
+    eligible.sort_by_key(|candidate| {
+        let route = candidate.route.placement_key().expect("eligible route");
+        let pressure = u64::from(candidate.active_leases).saturating_mul(1_000_000)
+            / u64::from(candidate.max_leases.max(1));
+        (
+            route.0,
+            route.1,
+            pressure,
+            candidate.device_id.as_str(),
+            candidate.gpu_uuid.as_str(),
+        )
+    });
+    let provider = eligible.first().copied().ok_or_else(|| {
+        ControlError::new(
+            ControlErrorCode::Unavailable,
+            format!(
+                "no GPU provider can satisfy the attachment: {}",
+                refusals.join("; ")
+            ),
+        )
+    })?;
+    let reason = match provider.route {
+        ProviderRoute::Direct { rtt_us } => format!("direct mesh path · {rtt_us} us observed RTT"),
+        ProviderRoute::Relay { rtt_us } => format!("relay mesh path · {rtt_us} us observed RTT"),
+        ProviderRoute::Unreachable => unreachable!("unreachable providers are not eligible"),
+    };
+    Ok(Placement {
+        provider: provider.clone(),
+        reason,
+    })
+}
+
+/// A mesh identity already authenticated by the transport.
+///
+/// This type does not perform the cryptographic handshake. Its constructor is
+/// the narrow adapter seam used *after* the mesh has authenticated the peer;
+/// the control plane then binds every lease and call to this exact key rather
+/// than accepting a diagnostic device name from a GPU frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedPeer {
+    device_id: String,
+}
+
+impl AuthenticatedPeer {
+    pub fn from_mesh_identity(device_id: impl Into<String>) -> Result<Self, ControlError> {
+        let device_id = device_id.into();
+        if device_id.len() != 64 || !device_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ControlError::new(
+                ControlErrorCode::InvalidRequest,
+                "an authenticated GPU peer identity must be a 32-byte public key in hex",
+            ));
+        }
+        Ok(Self {
+            device_id: device_id.to_ascii_lowercase(),
+        })
+    }
+
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+}
+
+/// Provider-enforced production lease limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseLimits {
+    pub total_memory_bytes: u64,
+    pub max_memory_per_lease: u64,
+    pub max_leases: u32,
+    pub lease_ttl_secs: u64,
+}
+
+impl Default for LeaseLimits {
+    fn default() -> Self {
+        Self {
+            total_memory_bytes: 16 * 1024 * 1024 * 1024,
+            max_memory_per_lease: 8 * 1024 * 1024 * 1024,
+            max_leases: 8,
+            lease_ttl_secs: 30,
+        }
+    }
+}
+
+/// A live bearer capability. It belongs in memory in the mesh/GPU adapter;
+/// [`GpuAttachment`] is the token-free durable instance record.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GpuLease {
+    capability: String,
+    pub consumer_device_id: String,
+    pub instance_id: String,
+    pub memory_bytes: u64,
+    pub provider_generation: u64,
+    pub expires_at: u64,
+}
+
+impl std::fmt::Debug for GpuLease {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.debug_struct("GpuLease")
+            .field("capability", &"<redacted>")
+            .field("consumer_device_id", &self.consumer_device_id)
+            .field("instance_id", &self.instance_id)
+            .field("memory_bytes", &self.memory_bytes)
+            .field("provider_generation", &self.provider_generation)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+impl GpuLease {
+    pub fn capability(&self) -> &str {
+        &self.capability
+    }
+}
+
+/// Token-free attachment metadata safe to persist in an instance registry and
+/// expose through CLI/GUI diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuAttachment {
+    pub provider_device: String,
+    pub provider_device_id: String,
+    pub provider_gpu_uuid: String,
+    pub memory_bytes: u64,
+    pub provider_generation: u64,
+    pub attached_at: u64,
+}
+
+impl GpuAttachment {
+    pub fn guest_path(&self) -> &'static str {
+        GUEST_DEVICE_PATH
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderDiagnostics {
+    pub provider_device: String,
+    pub provider_device_id: String,
+    pub gpu_uuid: String,
+    pub generation: u64,
+    pub health: ProviderHealth,
+    pub active_leases: u32,
+    pub leased_memory_bytes: u64,
+    pub total_memory_bytes: u64,
+    pub revoked_capabilities: u64,
+}
+
+/// Provider-side authority for attachment, revocation, quota and restart
+/// fencing. The authenticated mesh owns transport; this owns capability state.
+#[derive(Debug)]
+pub struct LeaseAuthority {
+    provider_device: String,
+    provider_device_id: String,
+    gpu_uuid: String,
+    generation: u64,
+    limits: LeaseLimits,
+    health: ProviderHealth,
+    leased_memory_bytes: u64,
+    leases: HashMap<String, GpuLease>,
+    instances: HashMap<String, String>,
+    revoked: HashSet<String>,
+}
+
+impl LeaseAuthority {
+    pub fn new(
+        provider_device: impl Into<String>,
+        provider_device_id: impl Into<String>,
+        gpu_uuid: impl Into<String>,
+        generation: u64,
+        limits: LeaseLimits,
+    ) -> Result<Self, ControlError> {
+        let provider_device = provider_device.into();
+        let provider_device_id = provider_device_id.into();
+        let gpu_uuid = gpu_uuid.into();
+        if provider_device.trim().is_empty() || gpu_uuid.trim().is_empty() || generation == 0 {
+            return Err(ControlError::new(
+                ControlErrorCode::InvalidRequest,
+                "GPU provider name, GPU UUID and non-zero generation are required",
+            ));
+        }
+        AuthenticatedPeer::from_mesh_identity(provider_device_id.clone())?;
+        if limits.total_memory_bytes == 0
+            || limits.max_memory_per_lease == 0
+            || limits.max_memory_per_lease > limits.total_memory_bytes
+            || limits.max_leases == 0
+            || limits.lease_ttl_secs == 0
+        {
+            return Err(ControlError::new(
+                ControlErrorCode::InvalidRequest,
+                "GPU lease limits must be non-zero and per-lease memory cannot exceed total memory",
+            ));
+        }
+        Ok(Self {
+            provider_device,
+            provider_device_id: provider_device_id.to_ascii_lowercase(),
+            gpu_uuid,
+            generation,
+            limits,
+            health: ProviderHealth::Ready,
+            leased_memory_bytes: 0,
+            leases: HashMap::new(),
+            instances: HashMap::new(),
+            revoked: HashSet::new(),
+        })
+    }
+
+    /// Validate the full request, then make one atomic in-memory mutation.
+    pub fn attach(
+        &mut self,
+        peer: &AuthenticatedPeer,
+        instance_id: &str,
+        memory_bytes: u64,
+        now: u64,
+    ) -> Result<(GpuLease, GpuAttachment), ControlError> {
+        if !self.health.is_ready() {
+            return Err(ControlError::new(
+                ControlErrorCode::Unavailable,
+                format!("GPU provider is not ready: {}", self.health.description()),
+            ));
+        }
+        if instance_id.trim().is_empty() || instance_id.len() > 128 {
+            return Err(ControlError::new(
+                ControlErrorCode::InvalidRequest,
+                "orbit-global instance identity must contain 1..128 bytes",
+            ));
+        }
+        if memory_bytes == 0 || memory_bytes > self.limits.max_memory_per_lease {
+            return Err(ControlError::new(
+                ControlErrorCode::LimitExceeded,
+                format!(
+                    "GPU lease requests {memory_bytes} bytes; provider permits 1..{} per lease",
+                    self.limits.max_memory_per_lease
+                ),
+            ));
+        }
+        if self.instances.contains_key(instance_id) {
+            return Err(ControlError::new(
+                ControlErrorCode::Conflict,
+                format!("instance {instance_id:?} already holds a GPU lease on this provider"),
+            ));
+        }
+        if self.leases.len() >= self.limits.max_leases as usize {
+            return Err(ControlError::new(
+                ControlErrorCode::LimitExceeded,
+                format!(
+                    "provider permits {} live GPU leases",
+                    self.limits.max_leases
+                ),
+            ));
+        }
+        let committed = self
+            .leased_memory_bytes
+            .checked_add(memory_bytes)
+            .filter(|bytes| *bytes <= self.limits.total_memory_bytes)
+            .ok_or_else(|| {
+                ControlError::new(
+                    ControlErrorCode::LimitExceeded,
+                    format!(
+                        "GPU provider has {} bytes free; {memory_bytes} requested",
+                        self.limits
+                            .total_memory_bytes
+                            .saturating_sub(self.leased_memory_bytes)
+                    ),
+                )
+            })?;
+        let expires_at = now.checked_add(self.limits.lease_ttl_secs).ok_or_else(|| {
+            ControlError::new(
+                ControlErrorCode::InvalidRequest,
+                "GPU lease expiry overflows the provider clock",
+            )
+        })?;
+
+        let capability = Uuid::new_v4().to_string();
+        let lease = GpuLease {
+            capability: capability.clone(),
+            consumer_device_id: peer.device_id.clone(),
+            instance_id: instance_id.to_owned(),
+            memory_bytes,
+            provider_generation: self.generation,
+            expires_at,
+        };
+        let attachment = GpuAttachment {
+            provider_device: self.provider_device.clone(),
+            provider_device_id: self.provider_device_id.clone(),
+            provider_gpu_uuid: self.gpu_uuid.clone(),
+            memory_bytes,
+            provider_generation: self.generation,
+            attached_at: now,
+        };
+        self.leases.insert(capability.clone(), lease.clone());
+        self.instances.insert(instance_id.to_owned(), capability);
+        self.leased_memory_bytes = committed;
+        Ok((lease, attachment))
+    }
+
+    /// Authorize one ABI call. Names and session payloads have no authority;
+    /// the live bearer must still be bound to this authenticated peer and the
+    /// current provider generation.
+    pub fn authorize(
+        &self,
+        peer: &AuthenticatedPeer,
+        capability: &str,
+        now: u64,
+    ) -> Result<&GpuLease, ControlError> {
+        if self.revoked.contains(capability) {
+            return Err(ControlError::new(
+                ControlErrorCode::Revoked,
+                "GPU lease was revoked",
+            ));
+        }
+        let lease = self.leases.get(capability).ok_or_else(|| {
+            ControlError::new(ControlErrorCode::InvalidLease, "GPU lease is unknown")
+        })?;
+        if lease.consumer_device_id != peer.device_id {
+            return Err(ControlError::new(
+                ControlErrorCode::Unauthorized,
+                "GPU lease belongs to another authenticated orbit device",
+            ));
+        }
+        if lease.provider_generation != self.generation {
+            return Err(ControlError::new(
+                ControlErrorCode::StaleGeneration,
+                "GPU lease belongs to an earlier provider generation",
+            ));
+        }
+        if now > lease.expires_at {
+            return Err(ControlError::new(
+                ControlErrorCode::Revoked,
+                "GPU lease expired",
+            ));
+        }
+        if !self.health.is_ready() {
+            return Err(ControlError::new(
+                ControlErrorCode::Unavailable,
+                format!("GPU provider is not ready: {}", self.health.description()),
+            ));
+        }
+        Ok(lease)
+    }
+
+    pub fn renew(
+        &mut self,
+        peer: &AuthenticatedPeer,
+        capability: &str,
+        now: u64,
+    ) -> Result<u64, ControlError> {
+        self.authorize(peer, capability, now)?;
+        let expires_at = now.checked_add(self.limits.lease_ttl_secs).ok_or_else(|| {
+            ControlError::new(
+                ControlErrorCode::InvalidRequest,
+                "GPU lease expiry overflows the provider clock",
+            )
+        })?;
+        self.leases
+            .get_mut(capability)
+            .expect("authorize established the lease")
+            .expires_at = expires_at;
+        Ok(expires_at)
+    }
+
+    pub fn revoke_instance(&mut self, instance_id: &str) -> bool {
+        let Some(capability) = self.instances.remove(instance_id) else {
+            return false;
+        };
+        if let Some(lease) = self.leases.remove(&capability) {
+            self.leased_memory_bytes = self.leased_memory_bytes.saturating_sub(lease.memory_bytes);
+        }
+        self.remember_revoked(capability);
+        true
+    }
+
+    /// Removing a device from the orbit cuts every lease authenticated as
+    /// that identity before another GPU frame from it can be served.
+    pub fn revoke_peer(&mut self, device_id: &str) -> u32 {
+        let capabilities = self
+            .leases
+            .iter()
+            .filter(|(_, lease)| lease.consumer_device_id == device_id)
+            .map(|(capability, _)| capability.clone())
+            .collect::<Vec<_>>();
+        for capability in &capabilities {
+            if let Some(lease) = self.leases.remove(capability) {
+                self.instances.remove(&lease.instance_id);
+                self.leased_memory_bytes =
+                    self.leased_memory_bytes.saturating_sub(lease.memory_bytes);
+                self.remember_revoked(capability.clone());
+            }
+        }
+        capabilities.len().min(u32::MAX as usize) as u32
+    }
+
+    /// Fence every live capability on provider loss/restart. Recovery starts
+    /// empty at a new generation; consumers must reattach from their durable,
+    /// token-free [`GpuAttachment`] records.
+    pub fn provider_lost(&mut self, reason: impl Into<String>) -> u32 {
+        let count = self.leases.len().min(u32::MAX as usize) as u32;
+        for capability in self.leases.keys().cloned().collect::<Vec<_>>() {
+            self.remember_revoked(capability);
+        }
+        self.leases.clear();
+        self.instances.clear();
+        self.leased_memory_bytes = 0;
+        self.generation = self.generation.saturating_add(1).max(1);
+        self.health = ProviderHealth::Offline {
+            reason: reason.into(),
+        };
+        count
+    }
+
+    /// Release expired leases. The caller drives this from its bounded health
+    /// loop; request validation itself never performs surprise cleanup.
+    pub fn reap_expired(&mut self, now: u64) -> u32 {
+        let expired = self
+            .leases
+            .iter()
+            .filter(|(_, lease)| now > lease.expires_at)
+            .map(|(capability, _)| capability.clone())
+            .collect::<Vec<_>>();
+        for capability in &expired {
+            if let Some(lease) = self.leases.remove(capability) {
+                self.instances.remove(&lease.instance_id);
+                self.leased_memory_bytes =
+                    self.leased_memory_bytes.saturating_sub(lease.memory_bytes);
+                self.remember_revoked(capability.clone());
+            }
+        }
+        expired.len().min(u32::MAX as usize) as u32
+    }
+
+    pub fn recover(&mut self) -> Result<u64, ControlError> {
+        if !matches!(self.health, ProviderHealth::Offline { .. }) {
+            return Err(ControlError::new(
+                ControlErrorCode::Conflict,
+                "only an offline GPU provider can enter recovery",
+            ));
+        }
+        self.health = ProviderHealth::Ready;
+        Ok(self.generation)
+    }
+
+    pub fn set_health(&mut self, health: ProviderHealth) {
+        self.health = health;
+    }
+
+    pub fn diagnostics(&self) -> ProviderDiagnostics {
+        ProviderDiagnostics {
+            provider_device: self.provider_device.clone(),
+            provider_device_id: self.provider_device_id.clone(),
+            gpu_uuid: self.gpu_uuid.clone(),
+            generation: self.generation,
+            health: self.health.clone(),
+            active_leases: self.leases.len().min(u32::MAX as usize) as u32,
+            leased_memory_bytes: self.leased_memory_bytes,
+            total_memory_bytes: self.limits.total_memory_bytes,
+            revoked_capabilities: self.revoked.len().min(u64::MAX as usize) as u64,
+        }
+    }
+
+    fn remember_revoked(&mut self, capability: String) {
+        if self.revoked.len() >= MAX_REVOKED_TOMBSTONES {
+            if let Some(oldest_available) = self.revoked.iter().next().cloned() {
+                self.revoked.remove(&oldest_available);
+            }
+        }
+        self.revoked.insert(capability);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SessionBinding {
+    capability: String,
+    consumer_device_id: String,
+}
+
+/// The production adapter between authenticated mesh streams, lease policy,
+/// and the versioned GPU ABI state machine.
+///
+/// Callers cannot reach [`Provider::handle`] through this type without first
+/// passing identity/capability authorization. That ordering is the security
+/// property: a refused call cannot consume an ABI sequence, allocate bytes,
+/// or launch work. Revocation closes the ABI session and releases its memory,
+/// rather than merely making the next control-plane renewal fail.
+#[derive(Debug)]
+pub struct ProductionProvider {
+    authority: LeaseAuthority,
+    abi: Provider,
+    sessions: HashMap<String, SessionBinding>,
+}
+
+impl ProductionProvider {
+    pub fn new(authority: LeaseAuthority, abi: Provider) -> Self {
+        Self {
+            authority,
+            abi,
+            sessions: HashMap::new(),
+        }
+    }
+
+    pub fn authority(&self) -> &LeaseAuthority {
+        &self.authority
+    }
+
+    pub fn authority_mut(&mut self) -> &mut LeaseAuthority {
+        &mut self.authority
+    }
+
+    /// Negotiate one ABI session for one live lease. A lease owns at most one
+    /// provider session, keeping its memory/session quota a real upper bound.
+    pub fn open_session(
+        &mut self,
+        peer: &AuthenticatedPeer,
+        capability: &str,
+        versions: AbiRange,
+        now: u64,
+    ) -> Result<Response, ControlError> {
+        let lease = self.authority.authorize(peer, capability, now)?;
+        if self
+            .sessions
+            .values()
+            .any(|binding| binding.capability == capability)
+        {
+            return Err(ControlError::new(
+                ControlErrorCode::Conflict,
+                "GPU lease already has an open ABI session",
+            ));
+        }
+        let consumer = lease.instance_id.clone();
+        let response = self
+            .abi
+            .handle(Request::Hello { versions, consumer })
+            .into_result()
+            .map_err(|error| ControlError::new(ControlErrorCode::Unavailable, error.message))?;
+        let Response::SessionOpened { session, .. } = &response else {
+            unreachable!("hello has one success response")
+        };
+        self.sessions.insert(
+            session.clone(),
+            SessionBinding {
+                capability: capability.to_owned(),
+                consumer_device_id: peer.device_id.clone(),
+            },
+        );
+        Ok(response)
+    }
+
+    /// Apply one post-handshake ABI request after control-plane authorization.
+    pub fn handle(
+        &mut self,
+        peer: &AuthenticatedPeer,
+        capability: &str,
+        request: Request,
+        now: u64,
+    ) -> Result<Reply, ControlError> {
+        let (session, _) = request.session_and_sequence().ok_or_else(|| {
+            ControlError::new(
+                ControlErrorCode::InvalidRequest,
+                "open GPU sessions with ProductionProvider::open_session",
+            )
+        })?;
+        let session = session.to_owned();
+        let binding = self.sessions.get(&session).ok_or_else(|| {
+            ControlError::new(
+                ControlErrorCode::InvalidLease,
+                "GPU ABI session is unknown or revoked",
+            )
+        })?;
+        if binding.capability != capability || binding.consumer_device_id != peer.device_id {
+            return Err(ControlError::new(
+                ControlErrorCode::Unauthorized,
+                "GPU ABI session belongs to another authenticated lease",
+            ));
+        }
+        self.authority.authorize(peer, capability, now)?;
+        let closes = matches!(request, Request::Close { .. });
+        let reply = self.abi.handle(request);
+        if closes
+            && matches!(
+                reply,
+                Reply::Ok {
+                    response: Response::SessionClosed { .. }
+                }
+            )
+        {
+            self.sessions.remove(&session);
+        }
+        Ok(reply)
+    }
+
+    pub fn revoke_instance(&mut self, instance_id: &str) -> bool {
+        let capability = self.authority.instances.get(instance_id).cloned();
+        let revoked = self.authority.revoke_instance(instance_id);
+        if let Some(capability) = capability {
+            self.revoke_abi_capability(&capability);
+        }
+        revoked
+    }
+
+    pub fn revoke_peer(&mut self, device_id: &str) -> u32 {
+        let capabilities = self
+            .authority
+            .leases
+            .iter()
+            .filter(|(_, lease)| lease.consumer_device_id == device_id)
+            .map(|(capability, _)| capability.clone())
+            .collect::<Vec<_>>();
+        let revoked = self.authority.revoke_peer(device_id);
+        for capability in capabilities {
+            self.revoke_abi_capability(&capability);
+        }
+        revoked
+    }
+
+    pub fn provider_lost(&mut self, reason: impl Into<String>) -> u32 {
+        let revoked = self.authority.provider_lost(reason);
+        self.sessions.clear();
+        self.abi.revoke_all_sessions();
+        revoked
+    }
+
+    fn revoke_abi_capability(&mut self, capability: &str) {
+        let sessions = self
+            .sessions
+            .iter()
+            .filter(|(_, binding)| binding.capability == capability)
+            .map(|(session, _)| session.clone())
+            .collect::<Vec<_>>();
+        for session in sessions {
+            self.sessions.remove(&session);
+            self.abi.revoke_session(&session);
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct Session {
     last_sequence: u64,
@@ -423,6 +1256,23 @@ impl Provider {
 
     pub fn capabilities(&self) -> &Capabilities {
         &self.capabilities
+    }
+
+    /// Administrative close used by the authenticated production adapter.
+    /// It has no wire form: a consumer cannot revoke somebody else's session.
+    pub fn revoke_session(&mut self, session_id: &str) -> bool {
+        let Some(session) = self.sessions.remove(session_id) else {
+            return false;
+        };
+        self.committed_bytes = self.committed_bytes.saturating_sub(session.allocated_bytes);
+        true
+    }
+
+    pub fn revoke_all_sessions(&mut self) -> u32 {
+        let count = self.sessions.len().min(u32::MAX as usize) as u32;
+        self.sessions.clear();
+        self.committed_bytes = 0;
+        count
     }
 
     /// Apply one decoded frame. A valid session consumes its sequence number
@@ -850,6 +1700,33 @@ mod base64 {
 mod tests {
     use super::*;
 
+    fn peer(byte: char) -> AuthenticatedPeer {
+        AuthenticatedPeer::from_mesh_identity(byte.to_string().repeat(64)).unwrap()
+    }
+
+    fn advertised(name: &str, route: ProviderRoute) -> ProviderAdvertisement {
+        ProviderAdvertisement {
+            device_id: format!("{name:0<64}"),
+            device_name: name.into(),
+            gpu_uuid: format!("GPU-{name}"),
+            device_name_cuda: "NVIDIA test GPU".into(),
+            executor: Executor::Cuda,
+            versions: AbiRange::ours(),
+            total_memory_bytes: 16 * 1024,
+            leased_memory_bytes: 0,
+            max_leases: 4,
+            active_leases: 0,
+            generation: 1,
+            health: ProviderHealth::Ready,
+            route,
+            observed_at: 100,
+        }
+    }
+
+    fn authority(limits: LeaseLimits) -> LeaseAuthority {
+        LeaseAuthority::new("desktop", "a".repeat(64), "GPU-01234567", 7, limits).unwrap()
+    }
+
     struct Consumer {
         provider: Provider,
         session: String,
@@ -1241,5 +2118,246 @@ mod tests {
         };
         assert!(serde_json::to_vec(&request).unwrap().len() <= MAX_WIRE_FRAME_BYTES);
         assert!(serde_json::to_vec(&reply).unwrap().len() <= MAX_WIRE_FRAME_BYTES);
+    }
+
+    #[test]
+    fn placement_is_deterministic_and_prefers_direct_over_a_faster_relay() {
+        let relay = advertised("relay", ProviderRoute::Relay { rtt_us: 10 });
+        let direct = advertised("direct", ProviderRoute::Direct { rtt_us: 500 });
+        let request = PlacementRequest {
+            memory_bytes: 1024,
+            provider_device: None,
+            require_cuda: true,
+        };
+        let first = place_provider(&[relay.clone(), direct.clone()], request.clone()).unwrap();
+        let reversed = place_provider(&[direct, relay.clone()], request).unwrap();
+        assert_eq!(first.provider.device_name, "direct");
+        assert_eq!(first, reversed);
+
+        let explicit = place_provider(
+            &[relay],
+            PlacementRequest {
+                memory_bytes: 1024,
+                provider_device: Some("relay"),
+                require_cuda: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(explicit.provider.device_name, "relay");
+    }
+
+    #[test]
+    fn placement_refusal_names_every_failed_constraint() {
+        let mut busy = advertised("busy", ProviderRoute::Direct { rtt_us: 5 });
+        busy.active_leases = busy.max_leases;
+        let mut offline = advertised("offline", ProviderRoute::Direct { rtt_us: 1 });
+        offline.health = ProviderHealth::Offline {
+            reason: "heartbeat timed out".into(),
+        };
+        let error = place_provider(
+            &[busy, offline],
+            PlacementRequest {
+                memory_bytes: 1024,
+                provider_device: None,
+                require_cuda: true,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ControlErrorCode::Unavailable);
+        assert!(error
+            .message
+            .contains("busy has all 4 GPU lease slots in use"));
+        assert!(error
+            .message
+            .contains("offline is not ready: heartbeat timed out"));
+    }
+
+    #[test]
+    fn refused_attach_does_not_mutate_quota_or_instance_claims() {
+        let mut provider = authority(LeaseLimits {
+            total_memory_bytes: 8,
+            max_memory_per_lease: 8,
+            max_leases: 1,
+            lease_ttl_secs: 30,
+        });
+        let before = provider.diagnostics();
+        let error = provider
+            .attach(&peer('b'), "instance-a", 9, 100)
+            .unwrap_err();
+        assert_eq!(error.code, ControlErrorCode::LimitExceeded);
+        assert_eq!(provider.diagnostics(), before);
+
+        provider.attach(&peer('b'), "instance-a", 8, 100).unwrap();
+        let full = provider.diagnostics();
+        let error = provider
+            .attach(&peer('c'), "instance-b", 1, 100)
+            .unwrap_err();
+        assert_eq!(error.code, ControlErrorCode::LimitExceeded);
+        assert_eq!(provider.diagnostics(), full);
+        assert!(!provider.revoke_instance("instance-b"));
+    }
+
+    #[test]
+    fn lease_is_bound_to_mesh_identity_and_revocation_cuts_active_calls() {
+        let mut provider = authority(LeaseLimits {
+            total_memory_bytes: 32,
+            max_memory_per_lease: 16,
+            max_leases: 2,
+            lease_ttl_secs: 30,
+        });
+        let owner = peer('b');
+        let stranger = peer('c');
+        let (lease, attachment) = provider
+            .attach(&owner, "orbit-instance-id", 16, 100)
+            .unwrap();
+        assert_eq!(attachment.guest_path(), GUEST_DEVICE_PATH);
+        assert_eq!(attachment.provider_generation, 7);
+        assert!(!serde_json::to_string(&attachment)
+            .unwrap()
+            .contains(lease.capability()));
+
+        let denied = provider
+            .authorize(&stranger, lease.capability(), 101)
+            .unwrap_err();
+        assert_eq!(denied.code, ControlErrorCode::Unauthorized);
+        assert_eq!(provider.diagnostics().active_leases, 1);
+
+        assert_eq!(provider.revoke_peer(owner.device_id()), 1);
+        let revoked = provider
+            .authorize(&owner, lease.capability(), 102)
+            .unwrap_err();
+        assert_eq!(revoked.code, ControlErrorCode::Revoked);
+        assert_eq!(provider.diagnostics().leased_memory_bytes, 0);
+    }
+
+    #[test]
+    fn provider_loss_fences_old_generation_and_recovery_starts_empty() {
+        let mut provider = authority(LeaseLimits {
+            total_memory_bytes: 32,
+            max_memory_per_lease: 16,
+            max_leases: 2,
+            lease_ttl_secs: 30,
+        });
+        let consumer = peer('b');
+        let (old, old_attachment) = provider.attach(&consumer, "instance-a", 16, 100).unwrap();
+        assert_eq!(provider.provider_lost("CUDA context reset"), 1);
+        let lost = provider
+            .authorize(&consumer, old.capability(), 101)
+            .unwrap_err();
+        assert_eq!(lost.code, ControlErrorCode::Revoked);
+        assert_eq!(
+            provider.diagnostics().generation,
+            old_attachment.provider_generation + 1
+        );
+        assert_eq!(provider.diagnostics().active_leases, 0);
+
+        let generation = provider.recover().unwrap();
+        let (fresh, fresh_attachment) = provider.attach(&consumer, "instance-a", 16, 102).unwrap();
+        assert_ne!(fresh.capability(), old.capability());
+        assert_eq!(fresh_attachment.provider_generation, generation);
+        assert!(provider
+            .authorize(&consumer, fresh.capability(), 103)
+            .is_ok());
+    }
+
+    #[test]
+    fn health_and_expiry_refuse_before_renewal_mutates_the_lease() {
+        let mut provider = authority(LeaseLimits {
+            total_memory_bytes: 32,
+            max_memory_per_lease: 16,
+            max_leases: 2,
+            lease_ttl_secs: 10,
+        });
+        let consumer = peer('b');
+        let (lease, _) = provider.attach(&consumer, "instance-a", 16, 100).unwrap();
+        provider.set_health(ProviderHealth::Draining {
+            reason: "operator maintenance".into(),
+        });
+        let before = provider.leases[lease.capability()].expires_at;
+        let error = provider
+            .renew(&consumer, lease.capability(), 101)
+            .unwrap_err();
+        assert_eq!(error.code, ControlErrorCode::Unavailable);
+        assert_eq!(provider.leases[lease.capability()].expires_at, before);
+
+        provider.set_health(ProviderHealth::Ready);
+        let expired = provider
+            .renew(&consumer, lease.capability(), 111)
+            .unwrap_err();
+        assert_eq!(expired.code, ControlErrorCode::Revoked);
+        assert_eq!(provider.leases[lease.capability()].expires_at, before);
+
+        assert_eq!(provider.reap_expired(111), 1);
+        assert_eq!(provider.diagnostics().active_leases, 0);
+        assert_eq!(provider.diagnostics().leased_memory_bytes, 0);
+    }
+
+    #[test]
+    fn bearer_capabilities_are_redacted_from_debug_output() {
+        let mut provider = authority(LeaseLimits::default());
+        let (lease, _) = provider.attach(&peer('b'), "instance-a", 16, 100).unwrap();
+        let debug = format!("{lease:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains(lease.capability()));
+    }
+
+    #[test]
+    fn production_adapter_refuses_before_abi_mutation_and_revocation_frees_memory() {
+        let authority = authority(LeaseLimits {
+            total_memory_bytes: 32,
+            max_memory_per_lease: 32,
+            max_leases: 1,
+            lease_ttl_secs: 30,
+        });
+        let mut production =
+            ProductionProvider::new(authority, Provider::reference("reference-test"));
+        let owner = peer('b');
+        let stranger = peer('c');
+        let (lease, _) = production
+            .authority_mut()
+            .attach(&owner, "instance-a", 32, 100)
+            .unwrap();
+        let Response::SessionOpened { session, .. } = production
+            .open_session(&owner, lease.capability(), AbiRange::ours(), 100)
+            .unwrap()
+        else {
+            panic!("session should open")
+        };
+
+        let allocate = || Request::Allocate {
+            session: session.clone(),
+            sequence: 1,
+            bytes: 8,
+        };
+        let refused = production
+            .handle(&stranger, lease.capability(), allocate(), 101)
+            .unwrap_err();
+        assert_eq!(refused.code, ControlErrorCode::Unauthorized);
+        assert_eq!(production.abi.committed_bytes, 0);
+
+        let response = production
+            .handle(&owner, lease.capability(), allocate(), 101)
+            .unwrap()
+            .into_result()
+            .unwrap();
+        assert!(matches!(response, Response::Allocated { bytes: 8, .. }));
+        assert_eq!(production.abi.committed_bytes, 8);
+
+        assert!(production.revoke_instance("instance-a"));
+        assert_eq!(production.abi.committed_bytes, 0);
+        assert_eq!(production.authority().diagnostics().leased_memory_bytes, 0);
+        let refused = production
+            .handle(
+                &owner,
+                lease.capability(),
+                Request::Read {
+                    session,
+                    sequence: 2,
+                    source: range("irrelevant", 0, 1),
+                },
+                102,
+            )
+            .unwrap_err();
+        assert_eq!(refused.code, ControlErrorCode::InvalidLease);
     }
 }
