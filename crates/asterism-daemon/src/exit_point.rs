@@ -4,7 +4,7 @@
 //! only current mesh observations to `ast status`. The registry is never
 //! mutated with them, matching the remote-volume health seam.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
@@ -80,6 +80,10 @@ struct LocalUdpFlowKey {
 struct ExitTransition {
     expected_exit: bool,
     expected_grants: BTreeMap<String, ExitGrant>,
+    #[serde(default)]
+    pending: BTreeMap<String, ExitGrant>,
+    #[serde(default)]
+    pending_scopes: BTreeSet<String>,
     revoke: BTreeMap<String, ExitGrant>,
 }
 
@@ -87,10 +91,38 @@ pub(crate) fn init(mesh: Option<Arc<Mesh>>) {
     let _ = MESH.set(mesh);
 }
 
+/// Deterministic process-crash coordination for the real acceptance lane.
+/// It is inert unless the daemon owner supplies a private directory and arms
+/// one exact point by creating `<point>.arm`; production has no timing branch
+/// and an unarmed test daemon has only the environment lookup.
+pub(crate) async fn test_pause(point: &str) {
+    let Some(dir) = std::env::var_os("ASTERISM_EXIT_TEST_PAUSE_DIR").map(PathBuf::from) else {
+        return;
+    };
+    let arm = dir.join(format!("{point}.arm"));
+    if std::fs::remove_file(&arm).is_err() {
+        return;
+    }
+    let ready = dir.join(format!("{point}.ready"));
+    let release = dir.join(format!("{point}.release"));
+    if std::fs::create_dir_all(&dir).is_err() || std::fs::write(&ready, b"ready\n").is_err() {
+        return;
+    }
+    while !release.exists() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let _ = std::fs::remove_file(release);
+    let _ = std::fs::remove_file(ready);
+}
+
 /// Obtain every remote provider's durable consent before publishing policy
 /// in the instance shard. A partial failure is rolled back best-effort and
 /// the old policy remains authoritative.
 pub(crate) async fn grant(inst: &Instance, mut exit: ExitPoint) -> Result<ExitPoint> {
+    exit.routes.normalize().map_err(anyhow::Error::msg)?;
+    exit.dns.normalize().map_err(anyhow::Error::msg)?;
+    exit.grants.clear();
+    exit.validate().map_err(anyhow::Error::msg)?;
     let remote: Vec<String> = exit
         .providers
         .iter()
@@ -106,7 +138,32 @@ pub(crate) async fn grant(inst: &Instance, mut exit: ExitPoint) -> Result<ExitPo
                 .context("remote exit providers require the authenticated mesh")?,
         )
     };
+    let mut pending_scopes = BTreeSet::new();
     for provider in remote {
+        if !mesh
+            .expect("remote providers established a mesh")
+            .knows(&provider)
+            .await
+        {
+            let rollback = abort_transition(inst, &exit).await;
+            let error = anyhow::anyhow!("the orbit has no exit provider named {provider:?}");
+            return Err(match rollback {
+                Ok(()) => error,
+                Err(rollback) => error.context(format!(
+                    "also failed to roll back newly issued exit grants: {rollback:#}"
+                )),
+            });
+        }
+        pending_scopes.insert(provider.clone());
+        if let Err(error) = stage_transition_with_scopes(inst, Some(&exit), &pending_scopes) {
+            let rollback = abort_transition(inst, &exit).await;
+            return Err(match rollback {
+                Ok(()) => error,
+                Err(rollback) => error.context(format!(
+                    "also failed to roll back newly issued exit grants: {rollback:#}"
+                )),
+            });
+        }
         match mesh
             .expect("remote providers established a mesh")
             .request_exit_grant(&provider, &inst.id, &exit.routes, &exit.dns)
@@ -114,39 +171,90 @@ pub(crate) async fn grant(inst: &Instance, mut exit: ExitPoint) -> Result<ExitPo
         {
             Ok(grant) => {
                 exit.grants.insert(provider.clone(), grant.clone());
+                if let Err(error) = stage_transition_with_scopes(inst, Some(&exit), &pending_scopes)
+                {
+                    let rollback = abort_transition(inst, &exit).await;
+                    return Err(match rollback {
+                        Ok(()) => error,
+                        Err(rollback) => error.context(format!(
+                            "also failed to roll back newly issued exit grants: {rollback:#}"
+                        )),
+                    });
+                }
             }
             Err(error) => {
-                return Err(error).context("the exit provider did not grant this attachment");
+                let rollback = abort_transition(inst, &exit).await;
+                let error = error.context("the exit provider did not grant this attachment");
+                return Err(match rollback {
+                    Ok(()) => error,
+                    Err(rollback) => error.context(format!(
+                        "also failed to roll back newly issued exit grants: {rollback:#}"
+                    )),
+                });
             }
         }
+    }
+    // Also records removal of old providers when the new policy is entirely
+    // local (and refreshes the final expected map after incremental staging).
+    if let Err(error) = stage_transition_with_scopes(inst, Some(&exit), &pending_scopes) {
+        let rollback = abort_transition(inst, &exit).await;
+        return Err(match rollback {
+            Ok(()) => error,
+            Err(rollback) => error.context(format!(
+                "also failed to roll back newly issued exit grants: {rollback:#}"
+            )),
+        });
     }
     Ok(exit)
 }
 
 pub(crate) fn stage_transition(inst: &Instance, next: Option<&ExitPoint>) -> Result<()> {
+    stage_transition_with_scopes(inst, next, &BTreeSet::new())
+}
+
+fn stage_transition_with_scopes(
+    inst: &Instance,
+    next: Option<&ExitPoint>,
+    pending_scopes: &BTreeSet<String>,
+) -> Result<()> {
     let old = inst
         .exit_point
         .as_ref()
         .map(|exit| exit.grants.clone())
         .unwrap_or_default();
-    let expected = next.map(|exit| exit.grants.clone()).unwrap_or_default();
-    let revoke = old
-        .into_iter()
-        .filter(|(provider, grant)| expected.get(provider) != Some(grant))
-        .collect::<BTreeMap<_, _>>();
-    if revoke.is_empty() {
+    let Some(transition) = plan_transition(&old, next, pending_scopes) else {
         let _ = std::fs::remove_file(transition_path(inst));
         return Ok(());
+    };
+    asterism_core::durable::commit_json_private(&transition_path(inst), &transition)
+        .context("staging exit revocations behind the registry commit")
+}
+
+fn plan_transition(
+    old: &BTreeMap<String, ExitGrant>,
+    next: Option<&ExitPoint>,
+    pending_scopes: &BTreeSet<String>,
+) -> Option<ExitTransition> {
+    let expected = next.map(|exit| exit.grants.clone()).unwrap_or_default();
+    let revoke = old
+        .iter()
+        .filter(|(provider, grant)| expected.get(*provider) != Some(*grant))
+        .map(|(provider, grant)| (provider.clone(), grant.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let pending = expected
+        .into_iter()
+        .filter(|(provider, grant)| old.get(provider) != Some(grant))
+        .collect::<BTreeMap<_, _>>();
+    if revoke.is_empty() && pending.is_empty() && pending_scopes.is_empty() {
+        return None;
     }
-    asterism_core::durable::commit_json_private(
-        &transition_path(inst),
-        &ExitTransition {
-            expected_exit: next.is_some(),
-            expected_grants: expected,
-            revoke,
-        },
-    )
-    .context("staging exit revocations behind the registry commit")
+    Some(ExitTransition {
+        expected_exit: next.is_some(),
+        expected_grants: next.map(|exit| exit.grants.clone()).unwrap_or_default(),
+        pending,
+        pending_scopes: pending_scopes.clone(),
+        revoke,
+    })
 }
 
 fn transition_path(inst: &Instance) -> PathBuf {
@@ -188,20 +296,110 @@ async fn reconcile_transition(inst: &Instance) -> Result<()> {
     if transition.expected_exit != inst.exit_point.is_some()
         || transition.expected_grants != current
     {
+        discard_pending_scopes(inst, &transition.pending_scopes).await?;
+        revoke_grants(
+            inst,
+            &transition.pending,
+            "rolling back uncommitted exit provider",
+        )
+        .await?;
         std::fs::remove_file(&path).context("discarding an uncommitted exit transition")?;
+        return Ok(());
+    }
+    revoke_grants(
+        inst,
+        &transition.revoke,
+        "reconciling removed exit provider",
+    )
+    .await?;
+    std::fs::remove_file(&path).context("clearing reconciled exit transition")?;
+    Ok(())
+}
+
+fn newly_issued(inst: &Instance, next: &ExitPoint) -> BTreeMap<String, ExitGrant> {
+    let old = inst
+        .exit_point
+        .as_ref()
+        .map(|exit| &exit.grants)
+        .cloned()
+        .unwrap_or_default();
+    next.grants
+        .iter()
+        .filter(|(provider, grant)| old.get(*provider) != Some(*grant))
+        .map(|(provider, grant)| (provider.clone(), grant.clone()))
+        .collect()
+}
+
+async fn revoke_grants(
+    inst: &Instance,
+    grants: &BTreeMap<String, ExitGrant>,
+    action: &str,
+) -> Result<()> {
+    if grants.is_empty() {
         return Ok(());
     }
     let mesh = MESH
         .get()
         .and_then(Option::as_ref)
-        .context("staged exit revocation requires the authenticated mesh")?;
-    for (provider, grant) in transition.revoke {
-        mesh.revoke_exit_grant(&provider, &inst.id, grant.generation)
+        .context("exit grant rollback requires the authenticated mesh")?;
+    let mut failures = Vec::new();
+    for (provider, grant) in grants {
+        if let Err(error) = mesh
+            .revoke_exit_grant(provider, &inst.id, grant.generation)
             .await
-            .with_context(|| format!("reconciling removed exit provider {provider:?}"))?;
+        {
+            failures.push(format!("{action} {provider:?}: {error:#}"));
+        }
     }
-    std::fs::remove_file(&path).context("clearing reconciled exit transition")?;
+    if !failures.is_empty() {
+        anyhow::bail!(failures.join("; "));
+    }
     Ok(())
+}
+
+async fn discard_pending_scopes(inst: &Instance, providers: &BTreeSet<String>) -> Result<()> {
+    if providers.is_empty() {
+        return Ok(());
+    }
+    let mesh = MESH
+        .get()
+        .and_then(Option::as_ref)
+        .context("pending exit cleanup requires the authenticated mesh")?;
+    let mut failures = Vec::new();
+    for provider in providers {
+        if let Err(error) = mesh.discard_pending_exit_grants(provider, &inst.id).await {
+            failures.push(format!(
+                "discarding pending exit grants on {provider:?}: {error:#}"
+            ));
+        }
+    }
+    if !failures.is_empty() {
+        anyhow::bail!(failures.join("; "));
+    }
+    Ok(())
+}
+
+/// Undo grants not present in the old durable shard. The transition is
+/// cleared only after every provider confirms revocation; otherwise startup
+/// retains the durable retry record.
+pub(crate) async fn abort_transition(inst: &Instance, next: &ExitPoint) -> Result<()> {
+    let path = transition_path(inst);
+    if let Ok(bytes) = std::fs::read(&path) {
+        let transition: ExitTransition =
+            serde_json::from_slice(&bytes).context("reading exit transition for rollback")?;
+        discard_pending_scopes(inst, &transition.pending_scopes).await?;
+    }
+    revoke_grants(
+        inst,
+        &newly_issued(inst, next),
+        "rolling back newly issued exit provider",
+    )
+    .await?;
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("clearing rolled-back exit transition"),
+    }
 }
 
 /// Provider revocation is part of detach, not eventual cleanup. Returning
@@ -1379,5 +1577,40 @@ mod tests {
         assert!(valid_dns_health_reply(&[
             0x41, 0x53, 0x81, 0x00, 0, 1, 0, 0, 0, 0, 0, 0,
         ]));
+    }
+
+    #[test]
+    fn transition_saga_tracks_new_pending_and_old_active_generations() {
+        let old_grant = ExitGrant {
+            provider_device_id: "old-id".into(),
+            generation: 1,
+        };
+        let new_grant = ExitGrant {
+            provider_device_id: "new-id".into(),
+            generation: 2,
+        };
+        let old = BTreeMap::from([("old".into(), old_grant.clone())]);
+        let mut next = ExitPoint::new(
+            "new".into(),
+            Vec::new(),
+            RoutePolicy::default(),
+            DnsPolicy::ExitPoint,
+        )
+        .unwrap();
+        next.grants.insert("new".into(), new_grant.clone());
+        let scopes = BTreeSet::from(["new".to_owned()]);
+        let transition = plan_transition(&old, Some(&next), &scopes).unwrap();
+        assert_eq!(transition.pending.get("new"), Some(&new_grant));
+        assert_eq!(transition.revoke.get("old"), Some(&old_grant));
+        assert!(transition.pending_scopes.contains("new"));
+
+        // Before the shard commit, recovery sees the old map and revokes
+        // `pending`; after it, recovery sees expected_grants and revokes
+        // `revoke`. Both maps survive serialization across the crash.
+        let encoded = serde_json::to_vec(&transition).unwrap();
+        let decoded: ExitTransition = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.pending, transition.pending);
+        assert_eq!(decoded.revoke, transition.revoke);
+        assert_eq!(decoded.expected_grants, next.grants);
     }
 }

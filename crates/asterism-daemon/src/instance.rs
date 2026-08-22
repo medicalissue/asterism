@@ -307,6 +307,7 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
                 };
             }
             if refresh_exit {
+                crate::exit_point::test_pause("after_shard_save").await;
                 crate::exit_point::update(&instance.name, instance.exit_point.clone());
                 if let Err(error) = crate::exit_point::activate(&instance).await {
                     return Response::Error {
@@ -762,9 +763,19 @@ async fn attach_exit_point(
     let current = reg.get(name)?.clone();
     backend::check_can_network(&current)?;
     let exit = crate::exit_point::grant(&current, exit).await?;
-    crate::exit_point::stage_transition(&current, Some(&exit))?;
-    let instance = reg.attach_exit_point(name, exit)?;
-    Ok(instance)
+    crate::exit_point::test_pause("before_shard_save").await;
+    match reg.attach_exit_point(name, exit.clone()) {
+        Ok(instance) => Ok(instance),
+        Err(error) => {
+            let rollback = crate::exit_point::abort_transition(&current, &exit).await;
+            Err(match rollback {
+                Ok(()) => error,
+                Err(rollback) => error.context(format!(
+                    "also failed to roll back newly issued exit grants: {rollback:#}"
+                )),
+            })
+        }
+    }
 }
 
 /// Restore CPU-device egress behind the same stable guest edge.
