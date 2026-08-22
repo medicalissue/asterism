@@ -46,6 +46,10 @@ KILL="mv-kill"       # the one whose target dies mid-transfer
 FAIL="mv-fail"       # the small one that proves the refusals and --down
 VOL="$RUN/mv-vol"    # a directory volume, stranded by the move
 IMAGE="${E2E_IMAGE:-debian:13}"
+# What that image is called once it is in a store: the tag separator becomes
+# a dash. Derived rather than written out, so an E2E_IMAGE override still
+# names the file this script goes looking for.
+BASE_FILE="$(printf '%s' "$IMAGE" | tr ':/' '--').raw"
 MARKER="marker-$$"
 POST="post-$$"
 
@@ -289,8 +293,13 @@ echo "ok: A's root disk claims $VIRTUAL bytes"
 # the refusal happens before either source fencing or target staging. The
 # first two bytes are saved and restored so the happy-path move below still
 # uses the image this test pulled.
-BASE_A="$(find "$A/images" -maxdepth 1 -type f -name '*.raw' -print | head -1)"
-[ -n "$BASE_A" ] || fail "A has no adopted raw base image to mutate"
+# The base this instance was built from, named — not "some .raw in the
+# store". A home seeded by the harness holds every image the cache has,
+# oci-*.raw among them, and mutating one of those would prove nothing: the
+# move would not look at it, would not refuse, and the refutation below
+# would fail for a reason that has nothing to do with provenance.
+BASE_A="$A/images/$BASE_FILE"
+[ -f "$BASE_A" ] || fail "A has no adopted $BASE_FILE to mutate:"$'\n'"$(ls -la "$A/images" 2>&1)"
 BASE_PREFIX="$RUN/base-prefix"
 MUTATED_PREFIX="$RUN/mutated-prefix"
 dd if="$BASE_A" of="$BASE_PREFIX" bs=1 count=2 >/dev/null 2>&1
@@ -333,8 +342,8 @@ echo "ok: B pulled the base image from A over the mesh and verified it"
 # provenance record, and the peer fetch is the one adoption path that used to
 # write none — leaving an image that passed its digest on arrival and refused
 # to boot a second later.
-BASE_B="$(find "$B/images" -maxdepth 1 -type f -name '*.raw' -print | head -1)"
-[ -n "$BASE_B" ] || fail "B has no base image after the fetch:"$'\n'"$(ls -la "$B/images" 2>&1)"
+BASE_B="$B/images/$BASE_FILE"
+[ -f "$BASE_B" ] || fail "B has no $BASE_FILE after the fetch:"$'\n'"$(ls -la "$B/images" 2>&1)"
 [ -f "$BASE_B.provenance" ] \
   || fail "the fetched base has no provenance record, so it cannot be booted from"
 grep -q "^kind base-image$" "$BASE_B.provenance" \
