@@ -17,6 +17,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::backup::{ExportReport, RestoreReport};
+use crate::device_shell::{
+    ShellData, ShellExit, ShellOpen, ShellOutput, ShellPolicyAction, ShellPolicyStatus,
+};
 use crate::instance::{Instance, PortForward, Restart, Shape};
 use crate::orbit::{Device, DeviceStatus, WakeFacts};
 use crate::registry::OrbitRow;
@@ -273,6 +276,27 @@ pub enum Request {
     SshEndpoint {
         name: String,
     },
+    /// Open the user shell offered by one device. Unlike guest SSH this is a
+    /// framed conversation on the existing unix socket and mesh stream; it
+    /// never creates a TCP listener or invokes sshd.
+    DeviceShellOpen {
+        device: String,
+        open: ShellOpen,
+    },
+    /// Frames sent after [`Request::DeviceShellOpen`] on the same local
+    /// connection. They are invalid as standalone RPC requests.
+    DeviceShellInput {
+        data: ShellData,
+    },
+    DeviceShellEof,
+    DeviceShellResize {
+        cols: u16,
+        rows: u16,
+    },
+    DeviceShellSignal {
+        signal: i32,
+    },
+    DeviceShellClose,
 
     // ---- the mesh ----------------------------------------------------------
     //
@@ -322,6 +346,12 @@ pub enum Request {
     /// Drop a device from this orbit. Its key stops being trusted at once.
     DeviceRemove {
         name: String,
+    },
+    /// Read or change this device's shell offer. The daemon accepts this only
+    /// from its private local control socket; a mesh RPC is explicitly
+    /// refused even though the enum remains parseable across versions.
+    DeviceShellPolicy {
+        action: ShellPolicyAction,
     },
     /// Round-trip a mesh stream to one device and time it.
     DevicePing {
@@ -613,7 +643,14 @@ impl Request {
             | Request::DeviceAdd { .. }
             | Request::PairConfirm { .. }
             | Request::DeviceRemove { .. }
-            | Request::DevicePing { .. } => None,
+            | Request::DevicePing { .. }
+            | Request::DeviceShellPolicy { .. }
+            | Request::DeviceShellOpen { .. }
+            | Request::DeviceShellInput { .. }
+            | Request::DeviceShellEof
+            | Request::DeviceShellResize { .. }
+            | Request::DeviceShellSignal { .. }
+            | Request::DeviceShellClose => None,
 
             // About devices, not instances. `ast device wake desktop` names a
             // device on purpose — it is the one command whose subject really
@@ -687,6 +724,13 @@ impl Request {
         match self {
             Request::Compat => 2,
             Request::BackupExport { .. } | Request::BackupImport { .. } => 3,
+            Request::DeviceShellPolicy { .. }
+            | Request::DeviceShellOpen { .. }
+            | Request::DeviceShellInput { .. }
+            | Request::DeviceShellEof
+            | Request::DeviceShellResize { .. }
+            | Request::DeviceShellSignal { .. }
+            | Request::DeviceShellClose => 4,
             _ => crate::compat::FIRST_PROTOCOL,
         }
     }
@@ -703,6 +747,13 @@ impl Request {
             Request::Compat => Some("compat"),
             Request::BackupExport { .. } => Some("backup_export"),
             Request::BackupImport { .. } => Some("backup_import"),
+            Request::DeviceShellPolicy { .. }
+            | Request::DeviceShellOpen { .. }
+            | Request::DeviceShellInput { .. }
+            | Request::DeviceShellEof
+            | Request::DeviceShellResize { .. }
+            | Request::DeviceShellSignal { .. }
+            | Request::DeviceShellClose => Some("device shell"),
             _ => None,
         }
     }
@@ -828,6 +879,31 @@ pub enum Response {
         host: String,
         port: u16,
         identity: String,
+    },
+    /// Read model for `ast device shell status`.
+    DeviceShellStatus {
+        status: ShellPolicyStatus,
+        #[serde(default)]
+        revoked: usize,
+    },
+    /// The first successful reply to [`Request::DeviceShellOpen`].
+    DeviceShellAccepted {
+        session_id: String,
+    },
+    /// A policy/protocol/capacity refusal with a stable code for clients.
+    DeviceShellRefused {
+        code: String,
+        message: String,
+    },
+    /// One bounded output frame. PTY output is merged; non-PTY output keeps
+    /// stdout and stderr distinct.
+    DeviceShellOutput {
+        stream: ShellOutput,
+        data: ShellData,
+    },
+    /// Exactly one terminal result for an accepted session.
+    DeviceShellExit {
+        exit: ShellExit,
     },
 
     // ---- the mesh ----------------------------------------------------------
@@ -1015,6 +1091,11 @@ impl Response {
         match self {
             Response::Compat { .. } => 2,
             Response::BackupExported { .. } | Response::BackupRestored { .. } => 3,
+            Response::DeviceShellStatus { .. }
+            | Response::DeviceShellAccepted { .. }
+            | Response::DeviceShellRefused { .. }
+            | Response::DeviceShellOutput { .. }
+            | Response::DeviceShellExit { .. } => 4,
             _ => crate::compat::FIRST_PROTOCOL,
         }
     }
@@ -1047,6 +1128,13 @@ pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
             Request::BackupImport {
                 source: String::new(),
                 name: String::new(),
+            }
+            .since(),
+        ),
+        (
+            "device-shell",
+            Request::DeviceShellPolicy {
+                action: ShellPolicyAction::Status,
             }
             .since(),
         ),

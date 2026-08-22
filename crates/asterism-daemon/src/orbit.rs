@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
+use asterism_core::device_shell::ShellPolicyAction;
 use asterism_core::protocol::{Request, Response};
 use asterism_core::registry::OrbitRow;
 
@@ -44,6 +45,7 @@ pub(crate) fn claims(req: &Request) -> bool {
             | Request::DeviceWake { .. }
             | Request::DevicePing { .. }
             | Request::DeviceRemove { .. }
+            | Request::DeviceShellPolicy { .. }
             | Request::PairConfirm { .. }
             | Request::ListOrbit
     )
@@ -98,13 +100,55 @@ pub(crate) async fn serve(req: Request, node: &Node, mesh: Option<&Arc<Mesh>>) -
         },
         Request::DeviceRemove { name } => match mesh {
             Some(mesh) => match mesh.remove_device(&name).await {
-                Ok(_) => Response::Ok,
+                Ok(removed) => {
+                    node.shell.revoke_peer(
+                        &removed.device_id,
+                        &format!("peer {name:?} was removed from this orbit"),
+                    );
+                    Response::Ok
+                }
                 Err(e) => Response::Error {
                     message: format!("{e:#}"),
                 },
             },
             None => no_mesh(),
         },
+        Request::DeviceShellPolicy { action } => {
+            match action {
+                ShellPolicyAction::Status => Response::DeviceShellStatus {
+                    status: node.shell.status(mesh.is_some()),
+                    revoked: 0,
+                },
+                ShellPolicyAction::Enable => {
+                    let Some(mesh) = mesh else {
+                        return Response::Error {
+                        message: "device shell cannot be enabled while the mesh endpoint is unavailable".into(),
+                    };
+                    };
+                    let mut ids = vec![mesh.device_id().to_string()];
+                    ids.extend(
+                        node.orbit
+                            .lock()
+                            .await
+                            .devices()
+                            .iter()
+                            .map(|device| device.device_id.clone()),
+                    );
+                    match node.shell.enable(ids) {
+                        Ok(status) => Response::DeviceShellStatus { status, revoked: 0 },
+                        Err(e) => Response::Error {
+                            message: format!("{e:#}"),
+                        },
+                    }
+                }
+                ShellPolicyAction::Disable => match node.shell.disable() {
+                    Ok((status, revoked)) => Response::DeviceShellStatus { status, revoked },
+                    Err(e) => Response::Error {
+                        message: format!("{e:#}"),
+                    },
+                },
+            }
+        }
         // Only ever arrives inside a pairing conversation, which handles it
         // there; on its own it is a CLI that lost its place.
         Request::PairConfirm { .. } => Response::Error {
@@ -188,6 +232,9 @@ mod tests {
             },
             Request::DeviceRemove {
                 name: "desktop".into(),
+            },
+            Request::DeviceShellPolicy {
+                action: ShellPolicyAction::Status,
             },
             Request::DeviceFacts,
             Request::DeviceCheck,

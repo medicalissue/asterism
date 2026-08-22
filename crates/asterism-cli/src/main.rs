@@ -25,6 +25,10 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
 use asterism_core::compat;
+use asterism_core::device_shell::{
+    ShellData, ShellEnv, ShellOpen, ShellOutput, ShellPolicyAction, ShellPolicyState,
+    MAX_DATA_BYTES,
+};
 use asterism_core::hv::ImageKind;
 use asterism_core::instance::{now_unix, Instance, PortForward, Restart, Shape};
 use asterism_core::ipc;
@@ -165,10 +169,18 @@ enum Command {
     /// in front of you answers with a loopback address, whether the guest
     /// is here or on the far side of the mesh.
     Ssh {
-        /// The instance to connect to.
-        name: String,
+        /// The instance to connect to. Omit it and say --host to open a
+        /// device's own explicitly enabled user shell.
+        #[arg(required_unless_present = "host", conflicts_with = "host")]
+        name: Option<String>,
+        /// A device in this orbit, by the name ast devices shows.
+        #[arg(long, value_name = "DEVICE")]
+        host: Option<String>,
+        /// Force a pty for a remote command, like ssh -t.
+        #[arg(short = 't', long)]
+        tty: bool,
         /// A command to run instead of opening a shell, and its arguments.
-        #[arg(trailing_var_arg = true)]
+        #[arg(last = true)]
         command: Vec<String>,
     },
     /// Print an instance's guest console log.
@@ -601,6 +613,25 @@ enum DeviceCommand {
     },
     /// Report whether this device could be woken, and what cannot be checked.
     Check,
+    /// Enable, disable or inspect this device's opt-in shell offer.
+    ///
+    /// Enabling grants every device currently paired into this orbit the
+    /// authority of this user account. A later pairing is not included until
+    /// enable is run locally again.
+    Shell {
+        #[command(subcommand)]
+        action: Option<DeviceShellCommand>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DeviceShellCommand {
+    /// Show policy and active sessions (the default).
+    Status,
+    /// Locally approve the devices currently in this orbit.
+    Enable,
+    /// Refuse new sessions and terminate every tracked active session.
+    Disable,
 }
 
 fn main() -> Result<()> {
@@ -821,9 +852,21 @@ fn main() -> Result<()> {
         // Which device is running the guest is the daemon's problem, not the
         // user's and not this process's: it answers with a loopback port
         // either way.
-        Command::Ssh { name, command } => {
+        Command::Ssh {
+            name,
+            host,
+            tty,
+            command,
+        } => {
             local_only("ssh", device.as_deref())?;
-            return ssh(&name, &command);
+            return match host {
+                None => ssh(
+                    name.as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("an instance name is required"))?,
+                    &command,
+                ),
+                Some(host) => device_shell(&host, &command, tty),
+            };
         }
         Command::Devices | Command::Device(DeviceCommand::Ls) => {
             local_only("devices", device.as_deref())?;
@@ -953,6 +996,11 @@ fn main() -> Result<()> {
         Response::Snapshots { .. }
         | Response::Log { .. }
         | Response::SshEndpoint { .. }
+        | Response::DeviceShellStatus { .. }
+        | Response::DeviceShellAccepted { .. }
+        | Response::DeviceShellRefused { .. }
+        | Response::DeviceShellOutput { .. }
+        | Response::DeviceShellExit { .. }
         | Response::Pong { .. }
         | Response::Compat { .. }
         | Response::Devices { .. }
@@ -1305,9 +1353,58 @@ fn device_command(cmd: DeviceCommand) -> Result<()> {
         ),
         DeviceCommand::Add { ticket, name, yes } => pair(Request::DeviceAdd { ticket, name }, yes),
         DeviceCommand::Wake { name } => wake(&name),
+        DeviceCommand::Shell { action } => device_shell_policy(action),
         // Routed before this, so that `--device` can aim it.
         DeviceCommand::Check => device_check(None),
     }
+}
+
+fn device_shell_policy(action: Option<DeviceShellCommand>) -> Result<()> {
+    let action = match action.unwrap_or(DeviceShellCommand::Status) {
+        DeviceShellCommand::Status => ShellPolicyAction::Status,
+        DeviceShellCommand::Enable => ShellPolicyAction::Enable,
+        DeviceShellCommand::Disable => ShellPolicyAction::Disable,
+    };
+    let (status, revoked) = match send(&Request::DeviceShellPolicy { action })? {
+        Response::DeviceShellStatus { status, revoked } => (status, revoked),
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected reply from astd: {other:?}"),
+    };
+    let state = match status.state {
+        ShellPolicyState::Disabled => "disabled",
+        ShellPolicyState::EnabledOrbit => "enabled for the approved orbit",
+        ShellPolicyState::Active => "active",
+        ShellPolicyState::Unavailable => "unavailable",
+    };
+    println!("device shell: {state}  epoch {}", status.epoch);
+    if let Some(reason) = status.unavailable_reason {
+        println!("{reason}");
+    }
+    if matches!(action, ShellPolicyAction::Enable) {
+        println!(
+            "warning: every device currently in this orbit now has this user account's full \
+             authority. Disabling terminates sessions Asterism tracks; it cannot undo files \
+             copied, commands already run, or persistence installed by a trusted peer."
+        );
+    }
+    if revoked != 0 {
+        println!("device shell disabled — {revoked} active session(s) cut");
+    }
+    for session in status
+        .active
+        .into_iter()
+        .filter(|_| !matches!(action, ShellPolicyAction::Disable))
+    {
+        println!(
+            "{}  {} ({})  since {}  {}",
+            session.session_id,
+            session.peer_name,
+            session.peer_device_id,
+            session.started_at,
+            if session.pty { "pty" } else { "command" }
+        );
+    }
+    Ok(())
 }
 
 // ---- parts -----------------------------------------------------------------
@@ -1820,6 +1917,233 @@ fn volume_path(volume: &str, host: Option<&str>) -> Result<String> {
 }
 
 // ---- ssh -------------------------------------------------------------------
+
+/// Open the explicitly enabled user shell of one device over the existing
+/// daemon connection and mesh. No TCP socket and no ssh process is involved.
+fn device_shell(device: &str, words: &[String], force_pty: bool) -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+
+    let stdin_is_terminal = std::io::stdin().is_terminal();
+    let pty = force_pty || (words.is_empty() && stdin_is_terminal);
+    let (cols, rows) = if pty {
+        terminal_size(libc::STDIN_FILENO)
+    } else {
+        (0, 0)
+    };
+    let command = (!words.is_empty()).then(|| words.join(" "));
+    let open = ShellOpen {
+        command,
+        pty,
+        cols,
+        rows,
+        env: shell_environment(),
+    };
+    let mut conn = Conversation::open(&Request::DeviceShellOpen {
+        device: device.to_owned(),
+        open,
+    })?;
+    match conn.next()? {
+        Response::DeviceShellAccepted { .. } => {}
+        Response::DeviceShellRefused { code, message } => bail!("{code}: {message}"),
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected reply opening a device shell: {other:?}"),
+    }
+
+    let raw = if pty && stdin_is_terminal {
+        Some(RawTerminal::enter(libc::STDIN_FILENO)?)
+    } else {
+        None
+    };
+    let Conversation {
+        mut write,
+        mut read,
+    } = conn;
+    let (requests, request_rx) = mpsc::sync_channel::<Request>(8);
+    let _writer = std::thread::spawn(move || {
+        while let Ok(request) = request_rx.recv() {
+            if write_line(&mut write, &request).is_err() {
+                break;
+            }
+        }
+    });
+
+    let input_requests = requests.clone();
+    std::thread::spawn(move || {
+        let mut stdin = std::io::stdin();
+        let mut buf = vec![0u8; MAX_DATA_BYTES];
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) => {
+                    let _ = input_requests.send(Request::DeviceShellEof);
+                    return;
+                }
+                Ok(n) => {
+                    let data = ShellData::new(buf[..n].to_vec()).expect("stdin reader obeyed cap");
+                    if input_requests
+                        .send(Request::DeviceShellInput { data })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(_) => {
+                    let _ = input_requests.send(Request::DeviceShellClose);
+                    return;
+                }
+            }
+        }
+    });
+
+    let stop_resize = Arc::new(AtomicBool::new(false));
+    if pty && stdin_is_terminal {
+        let resize_requests = requests.clone();
+        let stop = stop_resize.clone();
+        std::thread::spawn(move || {
+            let mut previous = terminal_size(libc::STDIN_FILENO);
+            while !stop.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(100));
+                let now = terminal_size(libc::STDIN_FILENO);
+                if now != previous {
+                    previous = now;
+                    let _ = resize_requests.try_send(Request::DeviceShellResize {
+                        cols: now.0,
+                        rows: now.1,
+                    });
+                }
+            }
+        });
+    }
+
+    let exit = loop {
+        let response = match read_frame(&mut read)? {
+            Some(line) => serde_json::from_str::<Response>(&line)?,
+            None => bail!("astd closed the device-shell connection without an exit status"),
+        };
+        match response {
+            Response::DeviceShellOutput { stream, data } => {
+                let written = match stream {
+                    ShellOutput::Pty | ShellOutput::Stdout => {
+                        let mut stdout = std::io::stdout();
+                        stdout
+                            .write_all(data.as_bytes())
+                            .and_then(|()| stdout.flush())
+                    }
+                    ShellOutput::Stderr => {
+                        let mut stderr = std::io::stderr();
+                        stderr
+                            .write_all(data.as_bytes())
+                            .and_then(|()| stderr.flush())
+                    }
+                };
+                if let Err(e) = written {
+                    if e.kind() == std::io::ErrorKind::BrokenPipe {
+                        let _ = requests.send(Request::DeviceShellClose);
+                        break asterism_core::device_shell::ShellExit {
+                            code: Some(0),
+                            signal: None,
+                            core_dumped: false,
+                            reason: None,
+                        };
+                    }
+                    return Err(e).context("writing device-shell output");
+                }
+            }
+            Response::DeviceShellExit { exit } => break exit,
+            Response::DeviceShellRefused { code, message } => bail!("{code}: {message}"),
+            Response::Error { message } => bail!(message),
+            other => bail!("unexpected reply during a device shell: {other:?}"),
+        }
+    };
+
+    stop_resize.store(true, Ordering::Relaxed);
+    drop(requests);
+    // stdin may legitimately still be blocked on an interactive terminal
+    // after a remote command exits. The process is about to return the remote
+    // status, so waiting for that reader (and therefore for the writer's last
+    // sender) would turn a completed command into a hang.
+    drop(raw);
+    if let Some(reason) = &exit.reason {
+        eprintln!("device shell ended: {reason}");
+    }
+    let code = exit
+        .code
+        .or_else(|| exit.signal.map(|signal| 128 + signal))
+        .unwrap_or(1)
+        .clamp(0, 255);
+    std::process::exit(code);
+}
+
+fn shell_environment() -> Vec<ShellEnv> {
+    let mut result = Vec::new();
+    let mut bytes = 0usize;
+    for (name, value) in std::env::vars() {
+        let allowed =
+            matches!(name.as_str(), "TERM" | "COLORTERM" | "LANG") || name.starts_with("LC_");
+        let next = name.len().saturating_add(value.len());
+        if allowed
+            && value.len() <= asterism_core::device_shell::MAX_ENV_VALUE_BYTES
+            && result.len() < asterism_core::device_shell::MAX_ENV_VARS
+            && bytes.saturating_add(next) <= asterism_core::device_shell::MAX_ENV_BYTES
+        {
+            bytes += next;
+            result.push(ShellEnv { name, value });
+        }
+    }
+    result
+}
+
+fn terminal_size(fd: libc::c_int) -> (u16, u16) {
+    let mut size = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: size is writable and fd is only queried.
+    if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ as _, &mut size) } == 0
+        && (1..=1000).contains(&size.ws_col)
+        && (1..=1000).contains(&size.ws_row)
+    {
+        (size.ws_col, size.ws_row)
+    } else {
+        (80, 24)
+    }
+}
+
+struct RawTerminal {
+    fd: libc::c_int,
+    saved: libc::termios,
+}
+
+impl RawTerminal {
+    fn enter(fd: libc::c_int) -> Result<Self> {
+        let mut saved = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: saved points to valid storage and fd is the terminal already
+        // identified by IsTerminal.
+        if unsafe { libc::tcgetattr(fd, saved.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("reading terminal mode");
+        }
+        let saved = unsafe { saved.assume_init() };
+        let mut raw = saved;
+        unsafe {
+            libc::cfmakeraw(&mut raw);
+        }
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("entering raw terminal mode");
+        }
+        Ok(Self { fd, saved })
+    }
+}
+
+impl Drop for RawTerminal {
+    fn drop(&mut self) {
+        // SAFETY: saved came from this descriptor and remains initialized.
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSANOW, &self.saved);
+        }
+    }
+}
 
 /// `ast ssh <name>`, from anywhere in the orbit.
 ///
@@ -3310,6 +3634,51 @@ fn service_command(cmd: ServiceCommand) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssh_guest_and_device_forms_remain_unambiguous() {
+        let guest = Cli::try_parse_from(["ast", "ssh", "guest", "--", "uname", "-a"])
+            .expect("the existing guest ssh form must keep parsing");
+        match guest.command {
+            Command::Ssh {
+                name,
+                host,
+                command,
+                ..
+            } => {
+                assert_eq!(name.as_deref(), Some("guest"));
+                assert!(host.is_none());
+                assert_eq!(command, ["uname", "-a"]);
+            }
+            _ => panic!("parsed the wrong command"),
+        }
+
+        let device = Cli::try_parse_from([
+            "ast",
+            "ssh",
+            "--host",
+            "laptop",
+            "--",
+            "printf",
+            "hello world",
+        ])
+        .expect("the device shell form must parse without an instance name");
+        match device.command {
+            Command::Ssh {
+                name,
+                host,
+                command,
+                ..
+            } => {
+                assert!(name.is_none());
+                assert_eq!(host.as_deref(), Some("laptop"));
+                assert_eq!(command, ["printf", "hello world"]);
+            }
+            _ => panic!("parsed the wrong command"),
+        }
+
+        assert!(Cli::try_parse_from(["ast", "ssh", "guest", "--host", "laptop"]).is_err());
+    }
 
     /// A reply is a line, and a line the daemon never ends is not a reply.
     /// `read_line` would grow until the newline arrived or the process ran

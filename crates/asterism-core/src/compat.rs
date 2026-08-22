@@ -106,7 +106,8 @@ use crate::VERSION;
 ///   the daemon's, mesh frames carry both, and [`crate::protocol::Request::Compat`]
 ///   exists.
 /// * **3** — portable backup export/import frames and their reports.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// * **4** — the opt-in, framed device-shell policy and session wire.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The wire as it was before it carried a version.
 ///
@@ -413,6 +414,7 @@ pub fn stores() -> BTreeMap<String, u32> {
         ("volumes", crate::volume::VOLUME_VERSION),
         ("secrets", CATALOG_VERSION),
         ("seed", crate::seed::SEED_TEMPLATE_VERSION),
+        ("device-shell", crate::device_shell::POLICY_VERSION),
     ]
     .into_iter()
     .map(|(name, version)| (name.to_owned(), version))

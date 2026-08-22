@@ -43,6 +43,16 @@ pub fn daemon_pid_path() -> PathBuf {
     home_dir().join("astd.pid")
 }
 
+/// This device's opt-in shell offer. Absence means disabled.
+pub fn device_shell_policy_path() -> PathBuf {
+    home_dir().join("shell.json")
+}
+
+/// Operational audit for device-shell decisions and session lifetimes.
+pub fn device_shell_audit_path() -> PathBuf {
+    home_dir().join("shell-audit.jsonl")
+}
+
 /// The file whose `flock(2)` is this home's daemon election.
 ///
 /// Held by `astd` for as long as it runs, which is what makes "one daemon per

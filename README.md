@@ -92,6 +92,9 @@ The versioned CUDA-semantic boundary and its runnable two-role fake
 `/dev/nvidia0` proof are documented in
 [docs/remote-gpu-abi.md](docs/remote-gpu-abi.md).
 
+The opt-in device shell, including its full-account authority and revocation
+limits, is documented in [docs/device-shell.md](docs/device-shell.md).
+
 ## Building
 
 ```console

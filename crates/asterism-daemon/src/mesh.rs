@@ -47,6 +47,7 @@ use tokio::sync::{mpsc, Mutex};
 
 use asterism_core::compat;
 use asterism_core::cow;
+use asterism_core::device_shell::{ShellFrame, ShellOpen};
 use asterism_core::durable;
 use asterism_core::instance::Instance;
 use asterism_core::orbit::{self, Device, DeviceStatus, Orbit, WakeFacts};
@@ -159,6 +160,9 @@ enum MeshRequest {
     /// after that the stream carries ssh's own bytes in both directions until
     /// either end hangs up.
     SshSplice { name: String },
+    /// Open the target daemon user's explicitly enabled shell. The opening
+    /// frame is followed by bounded [`ShellFrame`]s, never a raw pipe.
+    DeviceShell { open: ShellOpen },
     /// Hand this stream to a block volume's NBD export and stop framing it.
     ///
     /// The other pipe, and the fenced one: the far side checks `holder` and
@@ -216,6 +220,7 @@ impl MeshRequest {
     fn since(&self) -> u32 {
         match self {
             MeshRequest::Rpc { request } => request.since(),
+            MeshRequest::DeviceShell { .. } => 4,
             _ => compat::FIRST_PROTOCOL,
         }
     }
@@ -243,6 +248,7 @@ impl MeshRequest {
             MeshRequest::Ping => "a ping",
             MeshRequest::GuestKey => "a guest key",
             MeshRequest::SshSplice { .. } => "an ssh connection",
+            MeshRequest::DeviceShell { .. } => "a device shell",
             MeshRequest::VolumeSplice { .. } => "a volume connection",
             MeshRequest::MoveExport { .. } => "an instance export",
             MeshRequest::MoveBase { .. } => "a base image",
@@ -552,6 +558,27 @@ impl Mesh {
             MeshReply::Rpc { response } => Ok(response),
             other => bail!("device {name:?} answered a request with {other:?}"),
         }
+    }
+
+    /// Carry one local CLI conversation to a device's shell stream. The self
+    /// case enters the same policy/session implementation without inventing a
+    /// loopback network path.
+    pub async fn device_shell<'a, 'b>(
+        self: &Arc<Self>,
+        device: &str,
+        open: ShellOpen,
+        node: &Node,
+        io: &'a mut ClientIo<'b>,
+    ) -> Result<()> {
+        let here = self.self_name().await;
+        if device == here {
+            return crate::device_shell::serve_self(open, self.device_id(), here, node, io).await;
+        }
+        let peer = self.device(device).await?;
+        let connection = self.live_connection(&peer).await?;
+        let mut stream = connection.open_stream().await?;
+        open_stream_with(&mut stream.send, &MeshRequest::DeviceShell { open }).await?;
+        crate::device_shell::bridge_client(stream, io).await
     }
 
     // ---- wake ---------------------------------------------------------------
@@ -2561,7 +2588,8 @@ async fn accept_loop(mesh: Arc<Mesh>, node: Node) {
 
 /// Serves streams from one trusted peer until it goes away.
 async fn serve_peer(connection: MeshConnection, node: Node) {
-    let peer = connection.remote_device_id().short();
+    let peer_id = connection.remote_device_id();
+    let peer = peer_id.short();
     loop {
         let stream = match connection.accept_stream().await {
             Ok(s) => s,
@@ -2571,7 +2599,7 @@ async fn serve_peer(connection: MeshConnection, node: Node) {
         let node = node.clone();
         let peer = peer.clone();
         tokio::spawn(async move {
-            if let Err(e) = serve_stream(stream, node).await {
+            if let Err(e) = serve_stream(stream, node, peer_id).await {
                 eprintln!("astd: mesh stream from {peer} failed: {e:#}");
             }
         });
@@ -2580,7 +2608,11 @@ async fn serve_peer(connection: MeshConnection, node: Node) {
 
 /// One request frame in, one reply frame out — except a splice, which answers
 /// once and then stops being a request/reply stream at all.
-async fn serve_stream(mut stream: asterism_mesh::MeshStream, node: Node) -> Result<()> {
+async fn serve_stream(
+    mut stream: asterism_mesh::MeshStream,
+    node: Node,
+    peer: DeviceId,
+) -> Result<()> {
     let arriving = read_frame::<Arriving>(&mut stream.recv).await?;
 
     // What version this stream is spoken at, settled before the request is
@@ -2591,7 +2623,20 @@ async fn serve_stream(mut stream: asterism_mesh::MeshStream, node: Node) -> Resu
     let spoken = match settle(&arriving) {
         Ok(spoken) => spoken,
         Err(refusal) => {
-            if !arriving.request.answered_in_bulk() {
+            if matches!(arriving.request, MeshRequest::DeviceShell { .. }) {
+                let message = match &*refusal {
+                    MeshReply::Incompatible { message, .. } => message.clone(),
+                    _ => "the device-shell stream is incompatible".to_owned(),
+                };
+                crate::device_shell::write_shell_frame(
+                    &mut stream.send,
+                    &ShellFrame::Refused {
+                        code: "incompatible".into(),
+                        message,
+                    },
+                )
+                .await?;
+            } else if !arriving.request.answered_in_bulk() {
                 write_frame(&mut stream.send, &*refusal).await?;
             } else if let MeshReply::Incompatible { message, .. } = &*refusal {
                 write_frame(
@@ -2617,6 +2662,9 @@ async fn serve_stream(mut stream: asterism_mesh::MeshStream, node: Node) -> Resu
             }
         }
         MeshRequest::SshSplice { name } => return serve_splice(stream, &node, &name).await,
+        MeshRequest::DeviceShell { open } => {
+            return crate::device_shell::serve_mesh(stream, peer, &node, open).await
+        }
         MeshRequest::VolumeSplice {
             volume,
             holder,
@@ -2649,6 +2697,9 @@ async fn serve_stream(mut stream: asterism_mesh::MeshStream, node: Node) -> Resu
                 // request from resolving all over again when it lands.
                 Request::Proxy { device, .. } => Response::Error {
                     message: format!("this device cannot pass a request on to {device:?}"),
+                },
+                request if crate::device_shell::local_only_request(&request) => Response::Error {
+                    message: "device-shell policy and sessions are accepted only on the target's local control socket or a dedicated shell stream".into(),
                 },
                 // About this device's NIC rather than about its shard, so
                 // they stop here instead of going on to `crate::handle`. The
@@ -2808,7 +2859,7 @@ impl ClientIo<'_> {
     }
 
     /// Reads the CLI's next request.
-    async fn next_request(&mut self) -> Result<Request> {
+    pub(crate) async fn next_request(&mut self) -> Result<Request> {
         use crate::transport::Framing;
         loop {
             let line = match self.frames.next().await? {
@@ -3205,6 +3256,7 @@ mod tests {
             orbit: Arc::new(Mutex::new(
                 Orbit::load(&dir.path().join("orbit.json")).unwrap(),
             )),
+            shell: crate::device_shell::Manager::load_at(dir.path()),
         };
 
         let server = MeshEndpoint::bind(&DeviceIdentity::generate(), MeshMode::LocalOnly)

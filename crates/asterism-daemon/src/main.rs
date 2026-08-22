@@ -56,6 +56,7 @@ use asterism_core::{paths, VERSION};
 use transport::{Admitted, Framing};
 
 mod backend;
+mod device_shell;
 mod egress;
 mod instance;
 mod mesh;
@@ -83,6 +84,7 @@ use mesh::{ClientIo, Mesh, Splice};
 pub(crate) struct Node {
     pub shard: Arc<Mutex<Shard>>,
     pub orbit: Arc<Mutex<Orbit>>,
+    pub shell: Arc<device_shell::Manager>,
 }
 
 impl Node {
@@ -133,6 +135,7 @@ async fn main() -> Result<()> {
     let node = Node {
         shard: Arc::new(Mutex::new(Shard::load(&paths::state_path())?)),
         orbit: Arc::new(Mutex::new(Orbit::load(&paths::orbit_path())?)),
+        shell: device_shell::Manager::load(),
     };
 
     // The election, the stale-socket sweep and the bind, in that order and
@@ -249,6 +252,7 @@ async fn main() -> Result<()> {
                 });
             }
             _ = stop.next() => {
+                node.shell.revoke_all("astd is shutting down");
                 let _ = std::fs::remove_file(&sock);
                 let _ = std::fs::remove_file(&pidfile);
                 eprintln!("astd: shutting down");
@@ -511,6 +515,32 @@ async fn serve(conn: Admitted, node: Node, mesh: Option<Arc<Mesh>>) -> Result<()
             continue;
         }
 
+        // A device shell is a framed conversation for the life of one
+        // process. It borrows this private unix-socket connection and either
+        // enters the local target through the same policy path or bridges it
+        // to one dedicated authenticated mesh stream.
+        if let Request::DeviceShellOpen { device, open } = &request {
+            let mut io = ClientIo {
+                frames: &mut frames,
+                write: &mut write,
+            };
+            let served = match mesh.as_ref() {
+                Some(mesh) => {
+                    mesh.device_shell(device, open.clone(), &node, &mut io)
+                        .await
+                }
+                None => Err(anyhow::anyhow!("{}", orbit::NO_MESH)),
+            };
+            if let Err(e) = served {
+                io.send(&Response::DeviceShellRefused {
+                    code: "unreachable".into(),
+                    message: format!("{e:#}"),
+                })
+                .await?;
+            }
+            continue;
+        }
+
         // Pairing is a conversation, not a question — a ticket to print, a
         // code to compare, a verdict to take — so it borrows the connection
         // for as many frames as it needs.
@@ -746,6 +776,7 @@ mod tests {
         Node {
             shard: Arc::new(Mutex::new(Shard::load(&home.join("state.json")).unwrap())),
             orbit: Arc::new(Mutex::new(Orbit::load(&home.join("orbit.json")).unwrap())),
+            shell: device_shell::Manager::load_at(home),
         }
     }
 

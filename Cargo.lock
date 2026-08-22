@@ -178,6 +178,7 @@ dependencies = [
  "anyhow",
  "asterism-core",
  "clap",
+ "libc",
  "serde_json",
 ]
 
@@ -214,6 +215,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "rcgen",
  "reqwest",
  "rustls",
@@ -224,6 +226,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls",
+ "uuid",
  "zeroize",
 ]
 
