@@ -2416,27 +2416,28 @@ async fn ask(connection: &MeshConnection, request: &MeshRequest) -> Result<MeshR
 /// The unix socket, for the requests that are a conversation rather than a
 /// question: `ast device invite` prints a ticket, then a code, then asks.
 pub struct ClientIo<'a> {
-    /// Lines the CLI has yet to send.
-    pub lines: &'a mut tokio::io::Lines<tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>>,
+    /// Frames the CLI has yet to send, bounded and deadlined by the same
+    /// seam every other request comes through — a conversation is a longer
+    /// visit through the same door, not a second door.
+    pub frames: &'a mut crate::transport::Frames,
     /// The reply half.
-    pub write: &'a mut tokio::net::unix::OwnedWriteHalf,
+    pub write: &'a mut crate::transport::Writer,
 }
 
 impl ClientIo<'_> {
     /// Sends one response line.
     pub async fn send(&mut self, response: &Response) -> Result<()> {
-        use tokio::io::AsyncWriteExt;
-        let mut out = serde_json::to_vec(response)?;
-        out.push(b'\n');
-        self.write.write_all(&out).await?;
-        Ok(())
+        self.write.send(response).await
     }
 
     /// Reads the CLI's next request.
     async fn next_request(&mut self) -> Result<Request> {
+        use crate::transport::Framing;
         loop {
-            let Some(line) = self.lines.next_line().await? else {
-                bail!("ast closed the connection mid-pairing");
+            let line = match self.frames.next().await? {
+                Framing::Frame(line) => line,
+                Framing::Eof => bail!("ast closed the connection mid-pairing"),
+                Framing::Refused(why) => bail!("{why}"),
             };
             if line.trim().is_empty() {
                 continue;

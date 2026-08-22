@@ -20,6 +20,7 @@
 //! this is deliberately the shard-local end of the world — which is also what
 //! stops a forwarded request from fanning out again on arrival.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -561,23 +562,126 @@ fn resolve_volume_path(path: &str, host: &str) -> Result<String> {
 
 /// The last `lines` lines of a guest's console, and whether older ones were
 /// left behind. `lines` of 0 means all of it.
+/// The most of a console log that will ever be put in one reply.
+///
+/// A console is the one thing in this protocol whose size the guest chooses,
+/// and it chooses it over months: an agent that logs a line a second leaves
+/// gigabytes behind. Reading all of that to answer `ast logs` made the reply
+/// frame, and the daemon's memory alongside it, something a guest could grow
+/// without limit — so the file is read from its end, and only this much of
+/// it. Well inside [`ipc::MAX_RESPONSE_FRAME`] even after JSON escaping
+/// doubles every newline in it.
+const CONSOLE_TAIL_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The end of an instance's console log, and whether anything was left out.
+///
+/// Two things can leave something out and both report it the same way,
+/// because from the reader's side they are the same fact: `--lines` asked for
+/// fewer lines than there are, or the file is longer than
+/// [`CONSOLE_TAIL_BYTES`]. `ast` turns either into the same offer of
+/// `--lines`, and `ast logs -f` — which reads the file directly — is the
+/// answer for anyone who wants all of it.
 fn console_tail(name: &str, lines: u32) -> Result<(String, bool)> {
     let path = paths::instance_dir(name).join("console.log");
-    let text = std::fs::read_to_string(&path).map_err(|_| {
+    tail_of(&path, lines).map_err(|_| {
         anyhow::anyhow!("no console log for {name:?} yet — `ast up {name}` starts one")
-    })?;
+    })
+}
+
+fn tail_of(path: &Path, lines: u32) -> Result<(String, bool)> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path)?;
+    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let from = size.saturating_sub(CONSOLE_TAIL_BYTES);
+    let mut clipped = from > 0;
+    if clipped {
+        file.seek(SeekFrom::Start(from))
+            .with_context(|| format!("reading the end of {}", path.display()))?;
+    }
+    let mut bytes = Vec::new();
+    file.take(CONSOLE_TAIL_BYTES)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("reading {}", path.display()))?;
+    // Lossy, not strict: a console carries whatever the guest's firmware put
+    // on the serial line, which is not always utf-8 and is never a reason to
+    // tell the user there is no log. Starting mid-file makes that certain
+    // rather than merely likely, since the seek lands wherever it lands.
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    // The first line of a clipped read is half a line. Dropping it is what
+    // makes "the rest of this is real" true.
+    let text = match clipped {
+        true => text.split_once('\n').map(|(_, rest)| rest.to_owned()).unwrap_or_default(),
+        false => text,
+    };
     if lines == 0 {
-        return Ok((text, false));
+        return Ok((text, clipped));
     }
     let all: Vec<&str> = text.lines().collect();
     let keep = all.len().min(lines as usize);
+    clipped |= keep < all.len();
     let tail = all[all.len() - keep..].join("\n");
-    Ok((tail, keep < all.len()))
+    Ok((tail, clipped))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A console is the one thing in this protocol whose size the guest
+    /// chooses, and it chooses it over months. Reading all of it to answer
+    /// `ast logs` put the size of a reply frame — and of the daemon's own
+    /// allocation — in the hands of whatever is running in the guest.
+    #[test]
+    fn a_console_longer_than_the_cap_is_answered_from_its_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("console.log");
+        let line = "the guest said something\n";
+        let mut written = String::new();
+        while written.len() < (CONSOLE_TAIL_BYTES as usize) + (1 << 20) {
+            written.push_str(line);
+        }
+        written.push_str("this is the last thing it said\n");
+        std::fs::write(&log, &written).unwrap();
+
+        let (text, clipped) = tail_of(&log, 0).unwrap();
+        assert!(clipped, "a clipped read did not say so");
+        assert!(
+            text.len() as u64 <= CONSOLE_TAIL_BYTES,
+            "answered with {} bytes, cap is {CONSOLE_TAIL_BYTES}",
+            text.len()
+        );
+        assert!(text.ends_with("this is the last thing it said\n"), "it is not the end");
+        // Starting mid-file lands mid-line; the half-line is dropped rather
+        // than presented as something the guest wrote.
+        assert!(text.starts_with(line), "a partial first line was kept: {:?}", &text[..40]);
+    }
+
+    /// The ordinary case still reads the whole file and says nothing was
+    /// left out, and `--lines` still means what it meant.
+    #[test]
+    fn a_short_console_is_answered_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("console.log");
+        std::fs::write(&log, "one\ntwo\nthree\n").unwrap();
+
+        assert_eq!(tail_of(&log, 0).unwrap(), ("one\ntwo\nthree\n".to_owned(), false));
+        assert_eq!(tail_of(&log, 2).unwrap(), ("two\nthree".to_owned(), true));
+        assert_eq!(tail_of(&log, 9).unwrap(), ("one\ntwo\nthree".to_owned(), false));
+    }
+
+    /// Firmware puts whatever it likes on a serial line, and a stray byte
+    /// that is not utf-8 is not a reason to tell the user there is no log —
+    /// which is what `read_to_string` made it, since both failures came back
+    /// as the same error.
+    #[test]
+    fn a_console_that_is_not_utf8_is_still_a_console() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("console.log");
+        std::fs::write(&log, b"before\n\xff\xfe\nafter\n").unwrap();
+        let (text, _) = tail_of(&log, 0).unwrap();
+        assert!(text.contains("before") && text.contains("after"), "{text:?}");
+    }
 
     /// Claiming and resolving are different questions, and a rename asks
     /// both — the old name is resolved, the new one is claimed. Getting that

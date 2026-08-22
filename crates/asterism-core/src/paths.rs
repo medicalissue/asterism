@@ -43,6 +43,26 @@ pub fn daemon_pid_path() -> PathBuf {
     home_dir().join("astd.pid")
 }
 
+/// The file whose `flock(2)` is this home's daemon election.
+///
+/// Held by `astd` for as long as it runs, which is what makes "one daemon per
+/// home" a fact the kernel enforces rather than a race between a socket probe
+/// and an unlink. See [`crate::ipc::Door::open`].
+pub fn daemon_lock_path() -> PathBuf {
+    home_dir().join("astd.lock")
+}
+
+/// The file whose `flock(2)` serialises `ast`'s "nothing is listening, start
+/// one".
+///
+/// A different file from [`daemon_lock_path`] on purpose: that one is held
+/// for the daemon's whole life, so waiting on it would mean waiting for the
+/// daemon to exit. This one is held for the length of one spawn, and it is
+/// what turns ten commands typed at once into one `astd` rather than ten.
+pub fn spawn_lock_path() -> PathBuf {
+    home_dir().join("astd.spawn.lock")
+}
+
 /// QMP control socket for one instance's QEMU.
 pub fn qmp_socket_path(name: &str) -> PathBuf {
     short_socket(instance_dir(name).join("qmp.sock"))
@@ -120,18 +140,44 @@ pub fn volume_bridge_socket(instance: &str, host: &str, volume: &str) -> PathBuf
     )
 }
 
+/// Where a socket goes when its preferred path is too long to bind.
+///
+/// One directory, `0700`, one per uid, so that the fallback is as private as
+/// the home it stands in for. The bare temp dir is not: `/tmp` is writable by
+/// everyone on the machine, and a socket path derived from a hash is a path
+/// anybody can compute — so the old fallback let a second user create
+/// `astd.sock` *first* and be talked to by `ast`. `$TMPDIR` on macOS is
+/// already per-user; on Linux it is `/tmp`, and this is what makes the two
+/// the same shape.
+///
+/// Created by whoever binds — [`crate::ipc::Door::open`] for the daemon's
+/// own socket, and `astd` at startup for the per-instance ones it hands to a
+/// hypervisor. Nothing here creates it, because a path function that touches
+/// the filesystem is a path function a refusal path cannot call.
+pub fn runtime_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("asterism-{}", crate::ipc::own_uid()))
+}
+
+/// The longest preferred socket path that is bound where it belongs.
+///
+/// `sockaddr_un.sun_path` is 104 bytes on Apple platforms and 108 on Linux,
+/// including the terminator. The margin under that is not decoration: the
+/// daemon's own socket is the *short* one, and every other socket in this
+/// file is a sibling of a file whose name a user chose.
+const SOCKET_PATH_BUDGET: usize = 100;
+
 /// Unix socket paths are capped at ~104 bytes (SUN_LEN); when the
-/// preferred path is deep, fall back to a short hashed path in the temp
-/// dir. The hash covers the full preferred path, so distinct homes (and
-/// distinct instances) never collide.
+/// preferred path is deep, fall back to a short hashed path in this user's
+/// [`runtime_dir`]. The hash covers the full preferred path, so distinct
+/// homes (and distinct instances) never collide.
 fn short_socket(preferred: PathBuf) -> PathBuf {
-    if preferred.as_os_str().len() <= 100 {
+    if preferred.as_os_str().len() <= SOCKET_PATH_BUDGET {
         return preferred;
     }
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     preferred.hash(&mut h);
-    std::env::temp_dir().join(format!("asterism-{:016x}.sock", h.finish()))
+    runtime_dir().join(format!("{:016x}.sock", h.finish()))
 }
 
 pub fn images_dir() -> PathBuf {

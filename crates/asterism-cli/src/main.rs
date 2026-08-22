@@ -26,6 +26,7 @@ use clap::{Parser, Subcommand};
 
 use asterism_core::hv::ImageKind;
 use asterism_core::instance::{now_unix, Instance, PortForward, Restart, Shape};
+use asterism_core::ipc;
 use asterism_core::proc::{ProcId, Signal};
 use asterism_core::protocol::{self, Request, Response};
 use asterism_core::registry::OrbitRow;
@@ -1702,26 +1703,146 @@ fn send(request: &Request) -> Result<Response> {
 
 /// Connect to astd, spawning it first if the socket is not answering.
 fn send_once(request: &Request) -> Result<Response> {
-    let sock = paths::socket_path();
-    let stream = match UnixStream::connect(&sock) {
-        Ok(s) => s,
-        Err(_) => {
-            spawn_daemon()?;
-            wait_for_socket(&sock)?
-        }
-    };
+    exchange(request, None)
+}
+
+/// One request, one reply, optionally with a limit on how long the reply may
+/// take to start arriving.
+///
+/// Only the handshake passes a deadline. Everything else is a command whose
+/// honest duration is whatever the work takes — `ast up` on an image that has
+/// to be converted is minutes — so a deadline on those would be a timeout on
+/// success.
+fn exchange(request: &Request, patience: Option<Duration>) -> Result<Response> {
+    let stream = connect()?;
+    stream.set_read_timeout(patience)?;
 
     let mut writer = stream.try_clone()?;
     let mut line = serde_json::to_string(request)?;
     line.push('\n');
     writer.write_all(line.as_bytes())?;
 
-    let mut reply = String::new();
-    BufReader::new(stream).read_line(&mut reply)?;
-    if reply.trim().is_empty() {
-        bail!("astd closed the connection without answering");
+    let mut reader = BufReader::new(stream);
+    match read_frame(&mut reader) {
+        Ok(Some(reply)) => Ok(serde_json::from_str(&reply)?),
+        Ok(None) => bail!("astd closed the connection without answering"),
+        Err(e) if patience.is_some() && timed_out(&e) => Err(wedged(patience.unwrap_or_default())),
+        Err(e) => Err(e),
     }
-    Ok(serde_json::from_str(&reply)?)
+}
+
+/// Open a connection to this home's daemon, starting one if there is none.
+///
+/// The socket is looked at before it is spoken to. `ast` is about to send it
+/// this device's secrets, its orbit membership and every instance command
+/// there is, and the socket is a path — so what is at that path being *our*
+/// daemon, rather than something a second user on the machine put there, is a
+/// thing to establish rather than assume. See
+/// [`asterism_core::ipc::audit_socket`].
+fn connect() -> Result<UnixStream> {
+    let sock = paths::socket_path();
+    if ipc::audit_socket(&sock)? == ipc::SocketState::Ready {
+        if let Ok(stream) = UnixStream::connect(&sock) {
+            return Ok(stream);
+        }
+        // A socket file with nobody behind it: a daemon died without tidying
+        // up. Starting one is the recovery — its election clears the
+        // leftover path before it binds.
+    }
+    start_daemon(&sock)
+}
+
+/// Start this home's daemon, and be the only `ast` doing so.
+///
+/// Ten commands typed at once used to find no socket and start ten daemons.
+/// One won and the other nine were harmless only by luck: each probed the
+/// socket, found nobody, and unlinked the path the winner had just bound.
+/// astd's own election closes that from its side; this closes it from ours,
+/// so the storm never leaves the ground. Whoever holds this lock starts the
+/// daemon and waits for it, and everyone behind them finds it already up.
+fn start_daemon(sock: &std::path::Path) -> Result<UnixStream> {
+    let _turn = spawn_turn();
+    // Whoever held the lock before us has already started one.
+    if let Ok(stream) = UnixStream::connect(sock) {
+        return Ok(stream);
+    }
+    spawn_daemon()?;
+    wait_for_socket(sock)
+}
+
+/// The lock that makes a spawn storm one spawn.
+///
+/// Best effort, and deliberately so: it is an optimisation, not a guarantee —
+/// astd's own election is the guarantee — so a home that cannot hold a lock
+/// file still gets a daemon rather than a refusal.
+fn spawn_turn() -> Option<File> {
+    ipc::private_dir(&paths::home_dir()).ok()?;
+    // Waiting is the point: whoever holds this is already starting one.
+    ipc::lock_file(&paths::spawn_lock_path(), ipc::Wait::Yes).ok().flatten()
+}
+
+/// One reply frame, bounded.
+///
+/// `read_line` is not this: it grows until it finds a newline, so a daemon
+/// that has gone wrong — or something that is not a daemon — would choose how
+/// much memory `ast` allocates before it fails.
+fn read_frame(reader: &mut impl BufRead) -> Result<Option<String>> {
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            bail!("astd stopped in the middle of a reply");
+        }
+        // What this reply would be if it ended in this chunk: everything kept
+        // so far, plus the part of this chunk before its newline. Checked on
+        // *both* paths below — the newline path used to skip it, so a reply
+        // that reached exactly the cap and then sent its last byte and
+        // terminator together came back one byte over. See the daemon's
+        // `Frames::next`, which had the same ordering.
+        let ends_here = chunk.iter().position(|b| *b == b'\n');
+        if buf.len() + ends_here.unwrap_or(chunk.len()) > ipc::MAX_RESPONSE_FRAME {
+            bail!("astd sent more than {} bytes without ending a reply", ipc::MAX_RESPONSE_FRAME);
+        }
+        if let Some(at) = ends_here {
+            buf.extend_from_slice(&chunk[..at]);
+            reader.consume(at + 1);
+            let line = String::from_utf8(buf).context("astd sent a reply that is not utf-8")?;
+            return Ok(if line.trim().is_empty() { None } else { Some(line) });
+        }
+        let taken = chunk.len();
+        buf.extend_from_slice(chunk);
+        reader.consume(taken);
+    }
+}
+
+/// The daemon is there and will not answer the one question that has no work
+/// behind it.
+///
+/// astd answers the handshake without touching its registry, so this is not
+/// "busy": something is wrong with the process itself. The message names it,
+/// because that is the only thing the user can act on.
+fn wedged(waited: Duration) -> anyhow::Error {
+    let who = match daemon_proc() {
+        Some(proc) => format!("astd (pid {})", proc.pid),
+        None => "astd".to_owned(),
+    };
+    anyhow::anyhow!(
+        "{who} is listening on {} but did not answer the version handshake in {}s. \
+         It is wedged rather than busy — the handshake waits on nothing. Stop it and \
+         run this again.",
+        paths::socket_path().display(),
+        waited.as_secs()
+    )
+}
+
+fn timed_out(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<std::io::Error>().map(|e| e.kind()),
+        Some(std::io::ErrorKind::WouldBlock) | Some(std::io::ErrorKind::TimedOut)
+    )
 }
 
 /// A request the daemon answers with more than one line.
@@ -1738,14 +1859,7 @@ struct Conversation {
 impl Conversation {
     fn open(request: &Request) -> Result<Self> {
         ensure_current_daemon()?;
-        let sock = paths::socket_path();
-        let stream = match UnixStream::connect(&sock) {
-            Ok(s) => s,
-            Err(_) => {
-                spawn_daemon()?;
-                wait_for_socket(&sock)?
-            }
-        };
+        let stream = connect()?;
         let mut conn = Self { write: stream.try_clone()?, read: BufReader::new(stream) };
         conn.send(request)?;
         Ok(conn)
@@ -1759,12 +1873,10 @@ impl Conversation {
     }
 
     fn next(&mut self) -> Result<Response> {
-        let mut line = String::new();
-        self.read.read_line(&mut line)?;
-        if line.trim().is_empty() {
-            bail!("astd closed the connection without answering");
+        match read_frame(&mut self.read)? {
+            Some(line) => Ok(serde_json::from_str(&line)?),
+            None => bail!("astd closed the connection without answering"),
         }
-        Ok(serde_json::from_str(&line)?)
     }
 }
 
@@ -1819,7 +1931,12 @@ fn ensure_current_daemon() -> Result<()> {
 /// The version of the running daemon if it disagrees with ours, or `None`
 /// if it matches. Spawns a daemon if none is running.
 fn stale_version() -> Result<Option<String>> {
-    match send_once(&Request::Ping)? {
+    // The one exchange `ast` puts a clock on. astd answers the handshake
+    // without touching its registry, so a daemon that will not answer *this*
+    // is wedged rather than busy — and since the handshake goes in front of
+    // every command, a hang here is a hang everywhere, with nothing on the
+    // screen to say so.
+    match exchange(&Request::Ping, Some(ipc::HANDSHAKE_DEADLINE))? {
         Response::Pong { version } if version == VERSION => Ok(None),
         Response::Pong { version } => Ok(Some(version)),
         // A daemon older than the Pong reply answers Ping with plain Ok.
@@ -2264,4 +2381,74 @@ fn service_command(cmd: ServiceCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A reply is a line, and a line the daemon never ends is not a reply.
+    /// `read_line` would grow until the newline arrived or the process ran
+    /// out of memory, which puts the size of that allocation on the other end
+    /// of the socket rather than here.
+    #[test]
+    fn a_reply_is_bounded_even_when_nothing_ends_it() {
+        let one = b"{\"result\":\"pong\"}\nleftovers".to_vec();
+        let mut reader = BufReader::new(std::io::Cursor::new(one));
+        assert_eq!(read_frame(&mut reader).unwrap().as_deref(), Some(r#"{"result":"pong"}"#));
+
+        let endless = vec![b'x'; ipc::MAX_RESPONSE_FRAME + 4096];
+        let mut reader = BufReader::new(std::io::Cursor::new(endless));
+        let refusal = format!("{:#}", read_frame(&mut reader).unwrap_err());
+        assert!(refusal.contains("without ending a reply"), "{refusal}");
+    }
+
+    /// Exactly the limit is a reply, and one byte past it is not — with the
+    /// newline landing in the final buffer, which is where the check used to
+    /// be skipped. `read_frame` had the same ordering bug as the daemon's
+    /// `Frames::next`: the cap was consulted only on the path where a chunk
+    /// carried no newline, so a reply that reached the cap and then sent its
+    /// last byte and terminator together came back one byte over.
+    ///
+    /// The arithmetic is deliberate. `BufReader`'s buffer is 8 KiB and
+    /// divides `MAX_RESPONSE_FRAME`, so a payload of exactly the limit fills
+    /// whole chunks and the terminator arrives alone; a payload of limit+1
+    /// puts the last byte and the terminator in the same final chunk, which
+    /// is precisely the case under test.
+    #[test]
+    fn a_reply_is_measured_up_to_its_newline_and_not_past_it() {
+        let mut exact = Vec::with_capacity(ipc::MAX_RESPONSE_FRAME + 1);
+        exact.resize(ipc::MAX_RESPONSE_FRAME, b'a');
+        exact.push(b'\n');
+        let mut reader = BufReader::new(std::io::Cursor::new(exact));
+        let line = read_frame(&mut reader).unwrap().expect("a reply at the limit is a reply");
+        assert_eq!(line.len(), ipc::MAX_RESPONSE_FRAME);
+
+        let mut over = Vec::with_capacity(ipc::MAX_RESPONSE_FRAME + 2);
+        over.resize(ipc::MAX_RESPONSE_FRAME + 1, b'a');
+        over.push(b'\n');
+        let mut reader = BufReader::new(std::io::Cursor::new(over));
+        let refusal = format!("{:#}", read_frame(&mut reader).unwrap_err());
+        assert!(refusal.contains("without ending a reply"), "{refusal}");
+    }
+
+    /// Nothing at all, and nothing but a newline, are both "astd said
+    /// nothing" rather than a reply to parse.
+    #[test]
+    fn an_empty_reply_is_not_a_reply() {
+        let mut nothing = BufReader::new(std::io::Cursor::new(Vec::new()));
+        assert!(read_frame(&mut nothing).unwrap().is_none());
+        let mut blank = BufReader::new(std::io::Cursor::new(b"\n".to_vec()));
+        assert!(read_frame(&mut blank).unwrap().is_none());
+    }
+
+    /// A reply that ends in the middle is a broken daemon, not an empty
+    /// answer — the difference matters because one of them is a message the
+    /// user can act on and the other reads as "nothing is wrong".
+    #[test]
+    fn a_reply_cut_off_mid_line_is_an_error() {
+        let mut cut = BufReader::new(std::io::Cursor::new(b"{\"result\":".to_vec()));
+        let refusal = format!("{:#}", read_frame(&mut cut).unwrap_err());
+        assert!(refusal.contains("middle of a reply"), "{refusal}");
+    }
 }
