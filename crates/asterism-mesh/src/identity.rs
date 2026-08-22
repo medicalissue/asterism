@@ -16,7 +16,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use iroh::{PublicKey, SecretKey};
+use iroh::{PublicKey, SecretKey, Signature};
 
 /// Magic line prefix for the on-disk key file, so a stray file is never
 /// mistaken for a key and a future format change is detectable.
@@ -61,6 +61,13 @@ impl DeviceId {
     /// enough to fit in a table. Never use it for a trust decision.
     pub fn short(&self) -> String {
         self.to_string().chars().take(12).collect()
+    }
+
+    /// Verifies a proof made by this device's private key.  Hosted services
+    /// use this only to bind an account enrollment to the key the mesh will
+    /// authenticate later; it grants no trust inside an orbit.
+    pub fn verify(&self, message: &[u8], signature: &Signature) -> bool {
+        self.0.verify(message, signature).is_ok()
     }
 }
 
@@ -156,6 +163,15 @@ impl DeviceIdentity {
     /// Wraps an existing secret key.
     pub fn from_secret_key(secret: SecretKey) -> Self {
         Self { secret }
+    }
+
+    /// Signs a short-lived, domain-separated enrollment challenge.
+    ///
+    /// This deliberately exposes signing rather than the private key: an
+    /// optional coordinator can prove possession of a device identity without
+    /// becoming part of the mesh's trust or pairing path.
+    pub fn sign(&self, message: &[u8]) -> Signature {
+        self.secret.sign(message)
     }
 
     /// Loads the device key from `path`, generating and persisting one if the
