@@ -26,13 +26,14 @@
 //! byte is fetched — because there would be nothing to compare the download
 //! to, and "downloaded successfully" is not a check.
 //!
-//! **Base images in the store are raw** (BACKENDS.md §4). Cloud images ship
-//! as qcow2, so a pull downloads one and converts it: `<slug>.qcow2` is a
-//! staging file, `<slug>.raw` is the image. Raw is what
+//! **The portable base-image form in the store is raw** (BACKENDS.md §4).
+//! Cloud images ship as qcow2: `<slug>.qcow2` is the verified published
+//! download and `<slug>.raw` is its portable materialisation. Raw is what
 //! Virtualization.framework can attach at all, what `clonefile(2)` can share
 //! blocks of, and what QEMU reads fastest — the compression qcow2 bought us
 //! is worth less than any of those, and a sparse raw file on APFS occupies
-//! about what the qcow2 did anyway.
+//! about what the qcow2 did anyway. A native backend that reads qcow2 may use
+//! the verified download directly, avoiding a converter dependency entirely.
 //!
 //! Nothing is converted eagerly on upgrade: a store left full of qcow2 by an
 //! older Asterism keeps working, and each image is converted the first time
@@ -161,7 +162,29 @@ impl Resolved {
         }
         verify::check_recorded(&self.path, &self.record, Depth::from_env())
             .with_context(|| format!("{} cannot be booted from", self.name))?;
-        self.pin_satisfied()
+        self.pin_satisfied(&self.record)
+    }
+
+    /// Use the verified download in its published format when the selected
+    /// backend can read it directly.
+    pub fn retained_download(
+        &self,
+        accepted: &[DiskFormat],
+    ) -> Result<Option<(PathBuf, DiskFormat)>> {
+        if self.path.exists() {
+            return Ok(None);
+        }
+        let Some(staging) = self.staging.as_ref().filter(|path| path.exists()) else {
+            return Ok(None);
+        };
+        let format = detect_format(staging)?;
+        if !accepted.contains(&format) {
+            return Ok(None);
+        }
+        verify::check_recorded(staging, staging, Depth::from_env())
+            .with_context(|| format!("{} cannot be booted from", self.name))?;
+        self.pin_satisfied(staging)?;
+        Ok(Some((staging.clone(), format)))
     }
 
     /// The store is holding the bytes *this reference* asked for, and not
@@ -179,11 +202,11 @@ impl Resolved {
     /// bytes upstream published, and what is on disk is usually a raw image
     /// converted out of them. The published digest is the record's parent,
     /// which is exactly what `derived_from` is for.
-    fn pin_satisfied(&self) -> Result<()> {
+    fn pin_satisfied(&self, record_at: &Path) -> Result<()> {
         let Some(want) = &self.expected else {
             return Ok(());
         };
-        let Some(record) = verify::provenance(&self.record) else {
+        let Some(record) = verify::provenance(record_at) else {
             return Ok(());
         };
         let want = want.to_string();
@@ -228,7 +251,7 @@ impl Resolved {
             return Ok(());
         }
         if verify::check_recorded(&self.path, &self.record, Depth::Quick).is_ok()
-            && self.pin_satisfied().is_ok()
+            && self.pin_satisfied(&self.record).is_ok()
         {
             return Ok(());
         }
@@ -1704,6 +1727,49 @@ mod tests {
             "the staging copy is not kept"
         );
         assert!(!r.materialise().unwrap(), "and again is a no-op");
+    }
+
+    /// A backend that reads qcow2 can consume the verified published bytes
+    /// without the converter used by raw-only backends.
+    #[test]
+    fn a_qcow2_capable_backend_uses_the_verified_download_without_qemu_img() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ubuntu-24.04.raw");
+        let staging = dir.path().join("ubuntu-24.04.qcow2");
+        let part = dir.path().join("ubuntu-24.04.part");
+        std::fs::write(&part, b"QFI\xfb verified cloud image").unwrap();
+        verify::adopt(
+            &part,
+            &staging,
+            None,
+            Source::new("download", "https://example.invalid/ubuntu.qcow2"),
+        )
+        .unwrap();
+        let r = Resolved {
+            name: "ubuntu:24.04".into(),
+            url: Some("https://example.invalid/ubuntu.qcow2".into()),
+            record: path.clone(),
+            path,
+            format: DiskFormat::Raw,
+            staging: Some(staging.clone()),
+            oci: None,
+            expected: None,
+        };
+
+        assert_eq!(
+            r.retained_download(&[DiskFormat::Raw, DiskFormat::Qcow2])
+                .unwrap(),
+            Some((staging.clone(), DiskFormat::Qcow2))
+        );
+        assert_eq!(r.retained_download(&[DiskFormat::Raw]).unwrap(), None);
+        assert!(!r.path.exists(), "no raw conversion was attempted");
+
+        std::fs::write(&staging, b"QFI\xfb substituted bytes").unwrap();
+        assert!(r
+            .retained_download(&[DiskFormat::Qcow2])
+            .unwrap_err()
+            .to_string()
+            .contains("cannot be booted"));
     }
 
     #[test]

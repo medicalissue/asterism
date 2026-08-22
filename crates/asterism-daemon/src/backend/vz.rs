@@ -1834,6 +1834,8 @@ mod tests {
         let dead = ProcId {
             pid: dead_pid(),
             started_us: 1,
+            boot_id: None,
+            started_ticks: None,
             exec: None,
         };
         let h = owning(&sock, Some(dead.clone()));
@@ -1857,10 +1859,12 @@ mod tests {
 
         let mut sleeper = Command::new("sleep").arg("30").spawn().unwrap();
         let real = ProcId::capture(sleeper.id()).unwrap();
-        let stale = ProcId {
-            started_us: real.started_us - 1,
-            ..real.clone()
-        };
+        let mut stale = real.clone();
+        if let Some(ticks) = stale.started_ticks.as_mut() {
+            *ticks -= 1;
+        } else {
+            stale.started_us -= 1;
+        }
         let h = owning(&sock, Some(stale));
 
         assert_eq!(hv.state(&h).unwrap(), RunState::Stopped);
@@ -2127,6 +2131,8 @@ mod tests {
             Some(ProcId {
                 pid: 1,
                 started_us: 1,
+                boot_id: None,
+                started_ticks: None,
                 exec: None,
             }),
         );
