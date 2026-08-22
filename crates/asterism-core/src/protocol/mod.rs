@@ -680,15 +680,19 @@ impl Request {
 
     /// Whether an instance in conflict will answer this request.
     ///
-    /// `rename` is the remedy, so it must go through. `status` and `down` go
-    /// through because refusing them would be a trap: `rename` will not touch
-    /// a running guest, so an instance that is both conflicted and running
-    /// would have no legal move at all, and a user told to rename something
-    /// deserves to be able to look at it first.
+    /// `rename` is the remedy, so it must go through. `status`, `logs`, and
+    /// `down` go through because refusing them would be a trap: `rename` will
+    /// not touch a running guest, so an instance that is both conflicted and
+    /// running would have no legal move at all, and a user told to rename
+    /// something deserves to be able to inspect its state and diagnostic
+    /// console output first.
     pub fn survives_a_conflict(&self) -> bool {
         matches!(
             self,
-            Request::Rename { .. } | Request::Status { .. } | Request::Down { .. }
+            Request::Rename { .. }
+                | Request::Status { .. }
+                | Request::Logs { .. }
+                | Request::Down { .. }
         )
     }
 
@@ -1429,16 +1433,21 @@ mod tests {
         );
     }
 
-    /// A conflicted instance has to leave a way out, and looking before you
-    /// rename is part of the way out.
+    /// A conflicted instance has to leave a way out, and looking at its state
+    /// and console before a rename is part of that way out.
     #[test]
-    fn a_conflict_lets_exactly_the_commands_that_resolve_it_through() {
+    fn a_conflict_admits_its_remedy_and_diagnostic_reads() {
         assert!(Request::Rename {
             name: "d".into(),
             new_name: "e".into()
         }
         .survives_a_conflict());
         assert!(Request::Status { name: "d".into() }.survives_a_conflict());
+        assert!(Request::Logs {
+            name: "d".into(),
+            lines: 10
+        }
+        .survives_a_conflict());
         assert!(Request::Down { name: "d".into() }.survives_a_conflict());
         assert!(!Request::Up {
             name: "d".into(),
