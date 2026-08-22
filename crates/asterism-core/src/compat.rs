@@ -107,7 +107,8 @@ use crate::VERSION;
 ///   exists.
 /// * **3** — portable backup export/import frames and their reports.
 /// * **4** — the opt-in, framed device-shell policy and session wire.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// * **5** — mesh-safe, read-only device-shell policy status.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// The wire as it was before it carried a version.
 ///
@@ -118,10 +119,9 @@ pub const PROTOCOL_VERSION: u32 = 4;
 /// into a thing to be spoken to.
 pub const FIRST_PROTOCOL: u32 = 1;
 
-/// How many versions back this build still serves. Protocol 4 widens the
-/// window by one so the unnumbered first wire remains usable while the new
-/// device-shell frames are negotiated independently of protocol 3.
-pub const SUPPORTED_BACK: u32 = 3;
+/// How many versions back this build still serves. Keep the unnumbered first
+/// wire usable while newer device-shell capabilities negotiate independently.
+pub const SUPPORTED_BACK: u32 = 4;
 
 /// Format version of the home stamp document itself.
 pub const STAMP_VERSION: u32 = 1;

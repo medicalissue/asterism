@@ -181,6 +181,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         // The main window: three sections, read one at a time.
         main::instances,
         main::device_rows,
+        main::set_device_shell,
         main::settings_rows,
         main::volume_rows,
         main::snapshots,

@@ -27,10 +27,11 @@ use anyhow::{bail, Context, Result};
 
 use asterism_core::backup::{ExportReport, RestoreReport};
 use asterism_core::compat;
+use asterism_core::device_shell::{ShellPolicyAction, ShellPolicyStatus};
 use asterism_core::instance::{Instance, Shape};
 use asterism_core::orbit::DeviceStatus;
 use asterism_core::paths;
-use asterism_core::protocol::{Request, Response};
+use asterism_core::protocol::{self, Request, Response};
 use asterism_core::registry::OrbitRow;
 use asterism_core::snapshot::Snapshot;
 use asterism_core::volume::BlockVolume;
@@ -86,6 +87,48 @@ pub fn list_orbit() -> Result<Vec<OrbitRow>> {
 pub fn devices() -> Result<Vec<DeviceStatus>> {
     match send_with(&Request::Devices, ORBIT_TIMEOUT)? {
         Response::Devices { devices } => Ok(devices),
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected reply from astd: {other:?}"),
+    }
+}
+
+/// Read one target's device-shell offer. The inner frame is read-only and
+/// may cross the authenticated mesh; policy mutation has no corresponding
+/// remote helper.
+pub fn device_shell_status(device: Option<&str>) -> Result<ShellPolicyStatus> {
+    let request = match device {
+        Some(device) => Request::Proxy {
+            device: device.to_owned(),
+            inner: Box::new(Request::DeviceShellStatus),
+        },
+        None => Request::DeviceShellStatus,
+    };
+    let mut response = send_with(&request, ORBIT_TIMEOUT)?;
+    // Protocol 4 exposed local status through the policy frame. Preserve
+    // that read during a rolling upgrade, but never use the local-only frame
+    // as a fallback for a remote target.
+    if device.is_none()
+        && matches!(&response, Response::Error { message } if protocol::is_unknown_variant_error(message))
+    {
+        response = send(&Request::DeviceShellPolicy { action: ShellPolicyAction::Status })?;
+    }
+    match response {
+        Response::DeviceShellStatus { status, .. } => Ok(status),
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected reply from astd: {other:?}"),
+    }
+}
+
+/// Change only the daemon behind this app's private local socket. Keeping
+/// the target out of this API makes remote enable structurally impossible.
+pub fn set_device_shell(enabled: bool) -> Result<ShellPolicyStatus> {
+    let action = if enabled {
+        ShellPolicyAction::Enable
+    } else {
+        ShellPolicyAction::Disable
+    };
+    match send(&Request::DeviceShellPolicy { action })? {
+        Response::DeviceShellStatus { status, .. } => Ok(status),
         Response::Error { message } => bail!(message),
         other => bail!("unexpected reply from astd: {other:?}"),
     }

@@ -57,3 +57,17 @@ and result. Commands, environment values, input, output, and terminal
 transcripts are not logged. Because the shell has the same UID, this file is an
 operational trail rather than tamper-proof evidence; immutable audit needs a
 separate remote sink.
+
+## Management read model
+
+The daemon exposes device-shell status as a read-only, authenticated mesh
+capability for GUI and hosted management consumers. It returns the same
+`ShellPolicyStatus` JSON model everywhere: `disabled`, `enabled_orbit`,
+`active` (with the active session rows), or `unavailable`, plus `changed_at`
+as Unix seconds when the visible state last changed. A missing `changed_at`
+means an older daemon or a target whose status could not be read.
+
+Policy mutation is a different request and remains local-control-socket only.
+The local GUI mutation command deliberately accepts only `enabled: boolean`
+and no device target; remote device rows and browser-hosted consumers are
+read-only by construction.
