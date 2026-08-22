@@ -1269,13 +1269,17 @@ fn init_script_with_parts(
          # the kernel cmdline: either its address or the identity used for\n\
          # DHCP, plus the time (no RTC driver is loaded this early, and without\n\
          # it every line the image logs is dated 1970).\n\
-         ip= gw= dns= hostname=\n\
+         ip= gw= dns= hostname= edge_mac= edge_ip= edge_gw= edge_dns=\n\
          for w in $($BB cat /proc/cmdline); do\n\
          \x20 case \"$w\" in\n\
          \x20   asterism.ip=*)   ip=${w#asterism.ip=} ;;\n\
          \x20   asterism.gw=*)   gw=${w#asterism.gw=} ;;\n\
          \x20   asterism.dns=*)  dns=${w#asterism.dns=} ;;\n\
          \x20   asterism.hostname=*) hostname=${w#asterism.hostname=} ;;\n\
+         \x20   asterism.edge_mac=*) edge_mac=${w#asterism.edge_mac=} ;;\n\
+         \x20   asterism.edge_ip=*) edge_ip=${w#asterism.edge_ip=} ;;\n\
+         \x20   asterism.edge_gw=*) edge_gw=${w#asterism.edge_gw=} ;;\n\
+         \x20   asterism.edge_dns=*) edge_dns=${w#asterism.edge_dns=} ;;\n\
          \x20   asterism.time=*) $BB date -s \"@${w#asterism.time=}\" >/dev/null 2>&1 ;;\n\
          \x20 esac\n\
          done\n\
@@ -1283,6 +1287,7 @@ fn init_script_with_parts(
          for d in /sys/class/net/*; do\n\
          \x20 n=${d##*/}\n\
          \x20 [ \"$n\" = lo ] && continue\n\
+         \x20 [ -n \"$edge_mac\" ] && [ \"$($BB cat \"$d/address\")\" = \"$edge_mac\" ] && continue\n\
          \x20 nic=$n\n\
          \x20 break\n\
          done\n\
@@ -1301,6 +1306,23 @@ fn init_script_with_parts(
          \x20 fi\n\
          fi\n\
          [ -n \"$dns\" ] && echo \"nameserver $dns\" > /etc/resolv.conf 2>/dev/null\n\
+         edge_nic=\n\
+         if [ -n \"$edge_mac\" ]; then\n\
+         \x20 for d in /sys/class/net/*; do\n\
+         \x20   [ \"$($BB cat \"$d/address\" 2>/dev/null)\" = \"$edge_mac\" ] || continue\n\
+         \x20   edge_nic=${d##*/}\n\
+         \x20   break\n\
+         \x20 done\n\
+         fi\n\
+         if [ -n \"$edge_nic\" ] && [ -n \"$edge_ip\" ] && [ -n \"$edge_gw\" ]; then\n\
+         \x20 $BB ip link set \"$edge_nic\" up\n\
+         \x20 $BB ip address replace \"$edge_ip\" dev \"$edge_nic\"\n\
+         \x20 $BB ip route replace default via \"$edge_gw\" dev \"$edge_nic\" metric 10\n\
+         \x20 [ -n \"$edge_dns\" ] && echo \"nameserver $edge_dns\" > /etc/resolv.conf\n\
+         elif [ -n \"$edge_mac\" ]; then\n\
+         \x20 echo \"asterism: stable packet edge $edge_mac is missing\"\n\
+         \x20 $BB poweroff -f\n\
+         fi\n\
          \n\
          # `ast down` asks for a power button; with no init system in the image,\n\
          # this is what hears it. One evdev read blocks until it is pressed.\n\

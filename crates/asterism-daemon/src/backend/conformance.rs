@@ -122,6 +122,7 @@ impl Fixture {
             seed: self.dir.join("seed.iso"),
             shares: Vec::new(),
             egress: Default::default(),
+            network: None,
             bootstrap: Default::default(),
             extra_disks: Vec::new(),
             // Logs are an input to the mandatory boot method, not something
@@ -176,6 +177,7 @@ fn expected_support(caps: &Caps, capability: Capability) -> bool {
         Capability::DirectKernelBoot => caps.direct_kernel,
         Capability::PortForward => caps.port_forward,
         Capability::GuestEgress => caps.guest_egress.is_some(),
+        Capability::GuestPacketNetwork => caps.guest_packet_network,
     }
 }
 

@@ -398,6 +398,7 @@ impl Hypervisor for Vz {
             // the secrets data plane refuses to bind on vz rather than
             // opening an unauthenticated proxy for somebody's API keys.
             guest_egress: None,
+            guest_packet_network: false,
             disk_formats: &[DiskFormat::Raw],
         }
     }
@@ -1290,6 +1291,7 @@ mod tests {
             seed: dir.join("seed.iso"),
             shares: Vec::new(),
             egress: Default::default(),
+            network: None,
             bootstrap: Default::default(),
             extra_disks: Vec::new(),
             console: dir.join("console.log"),

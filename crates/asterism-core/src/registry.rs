@@ -38,6 +38,7 @@ use crate::hv::{Handle, ImageKind, Machine};
 use crate::instance::{
     self, now_unix, Conflict, Instance, Moving, Policy, PortForward, Restart, Shape, Status, Volume,
 };
+use crate::network::ExitPoint;
 use crate::proc::ProcId;
 use crate::secret::Binding;
 
@@ -573,6 +574,31 @@ impl Shard {
         Ok(inst.clone())
     }
 
+    /// Attach or replace the device policy behind the guest's stable network
+    /// edge. This is deliberately valid while the guest is running: the
+    /// backend-facing gateway and DNS addresses do not change, only the orbit
+    /// device selected behind them does.
+    pub fn attach_exit_point(&mut self, name: &str, mut exit: ExitPoint) -> Result<Instance> {
+        exit.validate().map_err(anyhow::Error::msg)?;
+        // Runtime observations arriving on a hand-written wire frame are not
+        // configuration and must never enter the durable shard.
+        exit.runtime = None;
+        let inst = self.get_mut(name)?;
+        inst.exit_point = Some(exit);
+        Ok(inst.clone())
+    }
+
+    /// Return network exit to its default placement on the CPU device.
+    /// Guest configuration is intentionally untouched; see
+    /// [`crate::network::GUEST_GATEWAY`] and [`crate::network::GUEST_DNS`].
+    pub fn detach_exit_point(&mut self, name: &str) -> Result<Instance> {
+        let inst = self.get_mut(name)?;
+        if inst.exit_point.take().is_none() {
+            bail!("{name:?} has no explicit exit point — its network already follows cpu");
+        }
+        Ok(inst.clone())
+    }
+
     /// Take a secret off an instance, by its orbit name.
     ///
     /// Returns the binding, because revoking one is more than forgetting a
@@ -692,6 +718,7 @@ pub fn check_name(name: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::hv::{ControlChannel, GuestEndpoint};
+    use crate::network::{DnsPolicy, ExitPoint, RoutePolicy, GUEST_DNS, GUEST_GATEWAY};
 
     fn handle(pid: u32, ssh_port: u16) -> Handle {
         Handle {
@@ -897,6 +924,38 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("as a directory"), "{err}");
+    }
+
+    /// The guest always talks to one Asterism-owned virtual edge. Selecting a
+    /// remote provider and detaching it again changes only the policy behind
+    /// that edge; a live guest keeps its endpoint, gateway and DNS address.
+    #[test]
+    fn exit_point_detach_needs_no_guest_reconfiguration() {
+        let mut shard = Shard::load(&scratch()).unwrap();
+        shard
+            .create("dev", "laptop", "ubuntu:24.04", Shape::default(), machine())
+            .unwrap();
+        let running = handle(42, 2222);
+        shard.set_running("dev", running.clone()).unwrap();
+
+        let exit = ExitPoint::new(
+            "desktop".into(),
+            vec!["phone".into()],
+            RoutePolicy::default(),
+            DnsPolicy::ExitPoint,
+        )
+        .unwrap();
+        let attached = shard.attach_exit_point("dev", exit).unwrap();
+        assert_eq!(attached.handle.as_ref(), Some(&running));
+        assert_eq!(attached.exit_point.as_ref().unwrap().primary(), "desktop");
+        assert_eq!(GUEST_GATEWAY.to_string(), "100.64.0.1");
+        assert_eq!(GUEST_DNS.to_string(), "100.64.0.53");
+
+        let detached = shard.detach_exit_point("dev").unwrap();
+        assert!(detached.exit_point.is_none());
+        assert_eq!(detached.status, Status::Running);
+        assert_eq!(detached.handle.as_ref(), Some(&running));
+        assert!(shard.detach_exit_point("dev").is_err());
     }
 
     /// A cpu-part swap changes one line of an instance's parts table. The

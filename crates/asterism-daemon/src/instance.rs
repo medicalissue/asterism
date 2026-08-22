@@ -74,6 +74,7 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
                 Ok(instance) => {
                     let mut instance = instance.clone();
                     volume::annotate_runtime(&mut instance).await;
+                    crate::exit_point::annotate_runtime(&mut instance).await;
                     status_response(instance)
                 }
                 Err(e) => Response::Error {
@@ -134,6 +135,7 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
         Request::Down { name } => {
             let stopped = down(reg, &name);
             volume::take_down(&name).await;
+            crate::exit_point::take_down(&name);
             // The egress proxy exists for a guest, so it goes when the guest
             // does. Its port is remembered, so the next boot puts it back
             // where the seed already says it is.
@@ -149,6 +151,7 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             // because a NAS is asleep.
             if let Ok(inst) = reg.get(&name).cloned() {
                 volume::take_down(&name).await;
+                crate::exit_point::take_down(&name);
                 volume::release_all(&inst).await;
                 // The instance directory goes below, and this instance's CA
                 // private key is in it.
@@ -235,6 +238,8 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             .await
         }
         Request::DetachSecret { name, secret } => detach_secret(reg, &name, &secret),
+        Request::AttachExitPoint { name, exit } => attach_exit_point(reg, &name, *exit),
+        Request::DetachExitPoint { name } => detach_exit_point(reg, &name),
         Request::BackupExport { name, destination } => {
             let exported = reg.get(&name).cloned().and_then(|inst| {
                 let provenance = backup::image_provenance(&inst)?;
@@ -714,6 +719,28 @@ fn detach_secret(reg: &mut Shard, name: &str, secret: &str) -> Result<Instance> 
     let (inst, _revoked) = reg.detach_secret(name, secret)?;
     egress::refresh_bindings(&inst);
     Ok(inst)
+}
+
+/// Record a provider policy only when this instance's backend has the packet
+/// edge needed to enforce it. A running plane observes the new policy without
+/// changing either guest NIC.
+fn attach_exit_point(
+    reg: &mut Shard,
+    name: &str,
+    exit: asterism_core::network::ExitPoint,
+) -> Result<Instance> {
+    let current = reg.get(name)?.clone();
+    backend::check_can_network(&current)?;
+    let instance = reg.attach_exit_point(name, exit)?;
+    crate::exit_point::update(name, instance.exit_point.clone());
+    Ok(instance)
+}
+
+/// Restore CPU-device egress behind the same stable guest edge.
+fn detach_exit_point(reg: &mut Shard, name: &str) -> Result<Instance> {
+    let instance = reg.detach_exit_point(name)?;
+    crate::exit_point::update(name, None);
+    Ok(instance)
 }
 
 /// Take a volume off an instance, handing back a block volume's lease.

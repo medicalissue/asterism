@@ -58,6 +58,7 @@ use transport::{Admitted, Framing};
 mod backend;
 mod device_shell;
 mod egress;
+mod exit_point;
 mod instance;
 mod mesh;
 mod orbit;
@@ -192,6 +193,7 @@ async fn main() -> Result<()> {
             None
         }
     };
+    exit_point::init(mesh.clone());
 
     // Metadata lives in ASTERISM_HOME; values live behind the platform store
     // (the macOS login Keychain). There is intentionally no file fallback.
@@ -683,6 +685,25 @@ async fn dispatch(request: Request, node: &Node, mesh: Option<&Arc<Mesh>>) -> Re
     }
     if orbit::claims(&request) {
         return orbit::serve(request, node, mesh).await;
+    }
+    // A sleeping exit point is valid — policy has to survive laptops closing
+    // their lids — but an unknown one is almost certainly a typo. Membership
+    // is durable and local, so validate every primary/failover without
+    // requiring any provider to answer right now.
+    if let Request::AttachExitPoint { exit, .. } = &request {
+        let orbit = node.orbit.lock().await;
+        let unknown = exit.providers.iter().find(|provider| {
+            *provider != orbit.self_name()
+                && !orbit
+                    .devices()
+                    .iter()
+                    .any(|device| device.name == **provider)
+        });
+        if let Some(provider) = unknown {
+            return Response::Error {
+                message: format!("no device named {provider:?} in this orbit — see: ast devices"),
+            };
+        }
     }
     // A name is claimed before anything is written down, and a claim that
     // fails ends the request here: an instance that could not have the name
