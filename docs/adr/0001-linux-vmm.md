@@ -16,10 +16,9 @@
    not own a device model. QEMU/KVM remains the compatibility floor
    (foreign-arch guests, user-mode NAT `-p` publishing, anything `chv` refuses
    by capability), reached by refusal, never by name.
-2. **Firecracker is not a general backend and will not become one by default.**
-   It may only enter the tree as a separate *OCI fast lane* — an `ImageKind::OciRootfs`-only
-   backend — and only after the benchmark gate in §6 is passed on a
-   non-nested host. Until then as-lvf.19 stays open and unworked.
+2. **Firecracker is not a general backend and will not become one.** Its only
+   proposed role was a separate *OCI fast lane*. The as-lvf.19 measurements in
+   §6.1 rejected that lane, so no Firecracker backend enters the tree.
 3. **Direct KVM is rejected.** Writing against `/dev/kvm` would make Asterism own
    a VMM and a device model, which is the one thing this decision exists to
    avoid.
@@ -246,6 +245,31 @@ Any one failing ends the lane. If the gate passes, the lane is an
 `OciRootfs`-only backend: `Caps { shared_dir: None, live_migration: false,
 direct_kernel: true, … }`, selected only when the request is an OCI image
 *and* the create asks for the lane, never as a fallback for a cloud image.
+
+### 6.1 Final gate result
+
+as-lvf.19's dispatched acceptance criterion also supplied a less restrictive
+performance disjunction: Firecracker must be at least 30% faster to readiness
+**or** use at least 40% less VMM overhead, then retain required secrets, logs,
+snapshots, block-volume, networking and recovery semantics. The five-round
+pinned OCI run rejected it before implementation:
+
+| | Cloud Hypervisor | Firecracker | Firecracker delta |
+|---|---:|---:|---:|
+| Median boot-to-vsock-ready | 14,322 ms | 36,670 ms | 156.0% slower |
+| Median idle VMM RSS | 231,776 KiB | 215,912 KiB | 6.8% lower |
+| Four-instance burst, all ready | 26,252 ms | 87,363 ms | 232.8% slower |
+| Burst summed VMM RSS | 914,520 KiB | 867,596 KiB | 5.1% lower |
+| VMM + required launcher bytes | 5,468,264 | 5,171,168 | 5.4% lower |
+| Crash restart with block marker intact | 9,325 ms | 15,559 ms | 66.9% slower |
+
+Both VMMs returned the same workload result over vsock and recovered the same
+writable block marker after `SIGKILL`. Firecracker nevertheless misses both
+performance thresholds by a wide margin. The lane is therefore **rejected**;
+Cloud Hypervisor remains the one native Linux backend, and no Firecracker
+implementation or host-specific selection logic is added. Full captured
+evidence and its host limitation are in
+`docs/evidence/firecracker-oci-gate-2026-08-22/`.
 
 ## 7. Consequences
 

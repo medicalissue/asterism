@@ -8,7 +8,11 @@
 #                         AF_VSOCK connection reaches the host ("ready")
 #   idle RSS              VmRSS of the VMM process (plus virtiofsd where one
 #                         runs) 10 s after ready
+#   launch burst          wall time until every member of a concurrent OCI
+#                         burst is ready, plus their summed steady-state RSS
 #   artifact footprint    bytes of the binaries the product would have to ship
+#   failure recovery      SIGKILL and restart with a marker on an attached
+#                         writable block device surviving the failed VMM
 # and then proves, or records the refusal for, each row of the matrix the
 # product needs: vsock both ways, local directory sharing, local block,
 # remote block (an NBD export consumed as a host block device), snapshot /
@@ -38,6 +42,7 @@ ARCH="$(uname -m)"
 MEM_MIB="${MEM_MIB:-1024}"
 VCPUS="${VCPUS:-2}"
 ROUNDS="${ROUNDS:-3}"
+BURST="${BURST:-4}"
 READY_TIMEOUT="${READY_TIMEOUT:-240}"
 CHV="$BENCH/cloud-hypervisor"
 CHR="$BENCH/ch-remote"
@@ -510,8 +515,9 @@ PY
 # builder. Its init mounts the minimum pseudo-filesystems, loads the Ubuntu
 # kernel's vsock transport, and starts the same Python ready agent on both VMMs.
 # The root is read-only so every round consumes byte-identical input.
-chv_oci_spawn() { # chv_oci_spawn <dir>
+chv_oci_spawn() { # chv_oci_spawn <dir> [extra Cloud Hypervisor args...]
   local d="$1"
+  shift
   rm -f "$d/api.sock" "$d/vsock.sock"
   setsid "$CHV" --api-socket "$d/api.sock" \
     --kernel "$KERNEL" --initramfs "$INITRD" \
@@ -520,15 +526,16 @@ chv_oci_spawn() { # chv_oci_spawn <dir>
     --disk "path=$OCI,readonly=on,image_type=raw" \
     --vsock "cid=3,socket=$d/vsock.sock" \
     --serial "file=$d/serial.log" --console off \
+    "$@" \
     > "$d/chv.log" 2>&1 &
   echo $!
 }
 
-fc_oci_config() { # fc_oci_config <dir> <out.json>
-  local d="$1" out="$2"
-  python3 - "$d" "$out" "$KERNEL" "$INITRD" "$FC_CONSOLE" "$VCPUS" "$MEM_MIB" "$OCI" <<'PY'
+fc_oci_config() { # fc_oci_config <dir> <out.json> [writable-data-disk]
+  local d="$1" out="$2" data="${3:-}"
+  python3 - "$d" "$out" "$KERNEL" "$INITRD" "$FC_CONSOLE" "$VCPUS" "$MEM_MIB" "$OCI" "$data" <<'PY'
 import json, sys
-d, out, kernel, initrd, con, vcpus, mem, root = sys.argv[1:]
+d, out, kernel, initrd, con, vcpus, mem, root, data = sys.argv[1:]
 cfg = {
   "boot-source": {"kernel_image_path": kernel, "initrd_path": initrd,
                   "boot_args": f"console={con} root=/dev/vda ro init=/sbin/asterism-bench-init panic=1"},
@@ -537,7 +544,143 @@ cfg = {
   "machine-config": {"vcpu_count": int(vcpus), "mem_size_mib": int(mem)},
   "vsock": {"guest_cid": 3, "uds_path": f"{d}/vsock.sock"},
 }
+if data:
+    cfg["drives"].append({"drive_id": "data", "path_on_host": data,
+                          "is_root_device": False, "is_read_only": False})
 json.dump(cfg, open(out, "w"), indent=1)
+PY
+}
+
+stop_oci_vmm() { # stop_oci_vmm <vmm> <dir> <pid>
+  local vmm="$1" d="$2" pid="$3"
+  if [ "$vmm" = chv ] && [ -S "$d/api.sock" ]; then
+    "$CHR" --api-socket "$d/api.sock" shutdown-vmm >/dev/null 2>&1 || true
+  fi
+  sleep 0.2
+  kill -9 "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
+bench_oci_burst() {
+  local vmm="$1" d="$OUT/oci/burst-$1" i t0 t1 pid lpid total_rss=0
+  local -a pids=() listeners=()
+  rm -rf "$d"
+  mkdir -p "$d"
+  t0=$(now)
+  for i in $(seq 1 "$BURST"); do
+    mkdir -p "$d/$i"
+    lpid=$(ready_listener "$d/$i/vsock.sock_5000" "$d/$i/ready")
+    listeners+=("$lpid")
+    if [ "$vmm" = chv ]; then
+      pid=$(chv_oci_spawn "$d/$i")
+    else
+      fc_oci_config "$d/$i" "$d/$i/cfg.json"
+      pid=$(fc_spawn "$d/$i" "$d/$i/cfg.json")
+    fi
+    pids+=("$pid")
+  done
+  for i in $(seq 1 "$BURST"); do
+    if ! wait_ready "$d/$i/ready" >/dev/null; then
+      say "oci $vmm burst: instance $i NOT READY in ${READY_TIMEOUT}s"
+      for pid in "${pids[@]}"; do kill -9 "$pid" 2>/dev/null || true; done
+      for lpid in "${listeners[@]}"; do kill "$lpid" 2>/dev/null || true; done
+      return 1
+    fi
+  done
+  t1=$(awk 'BEGIN { m=0 } { if ($1 > m) m=$1 } END { printf "%.6f", m }' "$d"/*/ready)
+  sleep 10
+  for pid in "${pids[@]}"; do total_rss=$((total_rss + $(rss_kib "$pid"))); done
+  for i in $(seq 1 "$BURST"); do
+    say "oci $vmm burst workload $i: $(vs_cmd "$d/$i/vsock.sock" 'python3 -c "print(6 * 7)"' | head -1)"
+  done
+  say "oci $vmm launch burst: count=$BURST all-ready=$(ms "$t1" "$t0") ms; summed idle RSS=$total_rss KiB; runtime files=$(du -sk "$d" | awk '{print $1}') KiB"
+  for i in $(seq 1 "$BURST"); do stop_oci_vmm "$vmm" "$d/$i" "${pids[$((i-1))]}"; done
+  for lpid in "${listeners[@]}"; do wait "$lpid" 2>/dev/null || true; done
+}
+
+bench_oci_recovery() {
+  local vmm="$1" d="$OUT/oci/recovery-$1" pid lpid t0 t1 after
+  rm -rf "$d"
+  mkdir -p "$d"
+  truncate -s 64M "$d/data.raw"
+  mkfs.ext4 -q -F "$d/data.raw"
+  rm -f "$d/ready"
+  lpid=$(ready_listener "$d/vsock.sock_5000" "$d/ready")
+  sleep 0.2
+  if [ "$vmm" = chv ]; then
+    pid=$(chv_oci_spawn "$d" --disk "path=$d/data.raw,image_type=raw")
+  else
+    fc_oci_config "$d" "$d/cfg.json" "$d/data.raw"
+    pid=$(fc_spawn "$d" "$d/cfg.json")
+  fi
+  if ! wait_ready "$d/ready" >/dev/null; then
+    say "oci $vmm recovery: initial boot NOT READY in ${READY_TIMEOUT}s"
+    kill -9 "$pid" "$lpid" 2>/dev/null || true
+    return 1
+  fi
+  after=$(vs_cmd "$d/vsock.sock" 'mkdir -p /mnt; mount /dev/vdb /mnt && echo survived-vmm-crash > /mnt/marker && sync && umount /mnt && echo written' | head -1)
+  [ "$after" = written ] || { say "oci $vmm recovery: marker write FAILED ($after)"; stop_oci_vmm "$vmm" "$d" "$pid"; return 1; }
+  kill -9 "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  rm -f "$d/ready"
+  lpid=$(ready_listener "$d/vsock.sock_5000" "$d/ready")
+  sleep 0.2
+  t0=$(now)
+  if [ "$vmm" = chv ]; then
+    pid=$(chv_oci_spawn "$d" --disk "path=$d/data.raw,image_type=raw")
+  else
+    fc_oci_config "$d" "$d/cfg.json" "$d/data.raw"
+    pid=$(fc_spawn "$d" "$d/cfg.json")
+  fi
+  if ! t1=$(wait_ready "$d/ready"); then
+    say "oci $vmm failure recovery: restart NOT READY in ${READY_TIMEOUT}s"
+    kill -9 "$pid" "$lpid" 2>/dev/null || true
+    return 1
+  fi
+  after=$(vs_cmd "$d/vsock.sock" 'mkdir -p /mnt; mount /dev/vdb /mnt && cat /mnt/marker && umount /mnt' | head -1)
+  if [ "$after" = survived-vmm-crash ]; then
+    say "oci $vmm failure recovery: PROVEN, ready in $(ms "$t1" "$t0") ms; block marker=$after; data disk=$(stat -c %s "$d/data.raw") B"
+  else
+    say "oci $vmm failure recovery: FAILED, block marker=$after"
+    stop_oci_vmm "$vmm" "$d" "$pid"
+    return 1
+  fi
+  stop_oci_vmm "$vmm" "$d" "$pid"
+  wait "$lpid" 2>/dev/null || true
+}
+
+report_oci_gate() {
+  python3 - "$OUT/summary.txt" <<'PY' | tee -a "$OUT/summary.txt"
+import re
+import statistics
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read()
+samples = {}
+for vmm in ("chv", "fc"):
+    rows = re.findall(
+        rf"^oci {vmm} round \d+: boot-to-vsock-ready (\d+) ms; idle RSS (\d+) KiB",
+        text,
+        re.MULTILINE,
+    )
+    if not rows:
+        raise SystemExit(f"no completed OCI rounds for {vmm}")
+    samples[vmm] = ([int(row[0]) for row in rows], [int(row[1]) for row in rows])
+
+chv_boot = statistics.median(samples["chv"][0])
+fc_boot = statistics.median(samples["fc"][0])
+chv_rss = statistics.median(samples["chv"][1])
+fc_rss = statistics.median(samples["fc"][1])
+boot_delta = (fc_boot / chv_boot - 1) * 100
+rss_saving = (1 - fc_rss / chv_rss) * 100
+boot_pass = fc_boot <= chv_boot * 0.70
+rss_pass = fc_rss <= chv_rss * 0.60
+decision = "PASS" if boot_pass or rss_pass else "REJECT"
+print(
+    f"== OCI PERFORMANCE GATE: {decision}; median ready chv={chv_boot:g} ms "
+    f"fc={fc_boot:g} ms ({boot_delta:+.1f}%); median idle RSS chv={chv_rss:g} KiB "
+    f"fc={fc_rss:g} KiB ({rss_saving:.1f}% lower); requires >=30% faster OR >=40% lower"
+)
 PY
 }
 
@@ -577,13 +720,17 @@ bench_oci() {
       fi
       wait "$pid" 2>/dev/null || true
     done
+    bench_oci_burst "$vmm"
+    bench_oci_recovery "$vmm"
   done
+  report_oci_gate
 }
 
 # ---- footprint ---------------------------------------------------------------
 say "== host: $(uname -srm); $(grep -m1 PRETTY /etc/os-release); nested=$(systemd-detect-virt 2>/dev/null || echo ?); kvm=$(stat -c %A /dev/kvm)"
 say "== inputs: base.raw $(stat -c %s "$BASE") B sha256 $(sha256sum "$BASE" | cut -c1-16)…; Image $(stat -c %s "$KERNEL") B; initrd $(stat -L -c %s "$INITRD") B"
 say "== artifacts: cloud-hypervisor $(stat -L -c %s "$CHV") B, ch-remote $(stat -L -c %s "$CHR") B, virtiofsd $(stat -c %s /usr/libexec/virtiofsd) B ($(dpkg-query -W -f='${Version}' virtiofsd)); firecracker $(stat -L -c %s "$FC") B, jailer $(stat -L -c %s "$BENCH/jailer") B"
+say "== OCI common disk: rootfs $(stat -c %s "$OCI" 2>/dev/null || echo absent) B, kernel $(stat -c %s "$KERNEL") B, initrd $(stat -L -c %s "$INITRD") B; VMM shipped bytes: chv $(stat -L -c %s "$CHV") B, firecracker+jailer $(( $(stat -L -c %s "$FC") + $(stat -L -c %s "$BENCH/jailer") )) B"
 
 case "$MODE" in
   chv) bench_chv ;;
