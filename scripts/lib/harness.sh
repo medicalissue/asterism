@@ -512,12 +512,51 @@ harness_assert_same_build() {
   printf '%s\n' "$first"
 }
 
-# <ast-binary>: the build id it reports, or nothing.
+# <ast> <astd-vz>: the installed VZ helper is part of this exact build and
+# carries a valid signature with the entitlement the framework requires.
+#
+# This is deliberately one assertion rather than three optional observations.
+# A release with no helper cannot exercise VZ; a helper from another build is
+# not the artifact under test; and an unsigned or unentitled helper cannot
+# create a VZVirtualMachine. Any one of those makes an exact-artifact VZ lane
+# unavailable, which is a failed release candidate rather than a reason to
+# substitute a binary from the source tree.
+harness_assert_vz_helper() {
+  local ast="$1" helper="$2" ast_build helper_build
+  if [ ! -x "$helper" ]; then
+    echo "harness: the installed artifact has no executable astd-vz at $helper" >&2
+    return 1
+  fi
+  ast_build="$(harness_build_id "$ast")" || return 1
+  helper_build="$(harness_build_id "$helper" --version)" || return 1
+  if [ "$helper_build" != "$ast_build" ]; then
+    echo "harness: ${helper} is build ${helper_build}, but ${ast} is build ${ast_build}" >&2
+    return 1
+  fi
+  command -v codesign >/dev/null 2>&1 || {
+    echo "harness: codesign is required to verify the installed astd-vz" >&2
+    return 1
+  }
+  codesign --verify --strict "$helper" >/dev/null 2>&1 || {
+    echo "harness: the installed astd-vz does not have a valid code signature" >&2
+    return 1
+  }
+  codesign -d --entitlements - "$helper" 2>&1 |
+    grep -q 'com.apple.security.virtualization' || {
+      echo "harness: the installed astd-vz has no virtualization entitlement" >&2
+      return 1
+    }
+  printf '%s\n' "$helper_build"
+}
+
+# <binary> [identity-command]: the build id it reports, or nothing. `ast`
+# uses the `version` subcommand; the helper uses `--version` because it has no
+# user-facing subcommands of its own.
 harness_build_id() {
-  local out
-  out="$("$1" version 2>/dev/null | sed -n 's/^build  *//p')"
+  local binary="$1" command="${2:-version}" out
+  out="$("$binary" "$command" 2>/dev/null | sed -n 's/^build  *//p')"
   if [ -z "$out" ]; then
-    echo "harness: $1 does not report a build id" >&2
+    echo "harness: $binary does not report a build id" >&2
     return 1
   fi
   printf '%s\n' "$out"

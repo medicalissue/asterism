@@ -66,9 +66,8 @@ cd "$ROOT"
 #   any    — runs on any machine, and is what CI runs
 #   vm     — boots a real guest, so it needs a hypervisor this device can use
 #   net    — talks to a public relay, so it needs working internet
-#   helper — needs `astd-vz` beside the binaries under test. The release
-#            carries no helper today (as-n6x), so this lane falls back to the
-#            tree and says so rather than silently proving nothing
+#   helper — needs a signed, entitled `astd-vz` from the installed artifact,
+#            with the same build id as ast. Absence or mismatch is red.
 #   gui    — the desktop app has to have been built
 SUITES="
 identity   any    180   rc_suite_identity
@@ -370,27 +369,13 @@ rc_suite_identity() {
     || { echo "the running astd is build $daemon, but ast is $ast_build" >&2; return 1; }
   echo "ok: the running astd is the same build"
 
-  # 5. The vz helper, when the artifact carries one. It is the fourth binary
-  #    in the set and the only one that also has to be code-signed — an
-  #    unsigned helper is a `--backend vz` that refuses at create time, which
-  #    is a release bug nothing else here would see.
+  # 5. The vz helper. It is the fourth binary in the set and the only one that
+  #    also has to be code-signed. Missing, mismatched or unsigned all mean
+  #    the installed artifact cannot run VZ, so all are release failures.
   local helper="$PREFIX/bin/astd-vz"
-  if [ -x "$helper" ]; then
-    local helper_build
-    helper_build="$(harness_build_id "$helper")" || return 1
-    [ "$helper_build" = "$ast_build" ] \
-      || { echo "the vz helper is build $helper_build, but ast is $ast_build" >&2; return 1; }
-    codesign -d --entitlements - "$helper" 2>&1 |
-      grep -q 'com.apple.security.virtualization' \
-      || { echo "the vz helper carries no virtualization entitlement" >&2; return 1; }
-    echo "ok: the vz helper is the same build, and is signed for it"
-  else
-    # Said, rather than skipped in silence: this is the difference between
-    # "vz works for people who install a release" and "vz works for people
-    # who build from source", and it is invisible from anywhere else.
-    echo "note: this artifact carries no astd-vz, so --backend vz is not"
-    echo "      reachable from it — the vz lane needs a build from source"
-  fi
+  local helper_build
+  helper_build="$(harness_assert_vz_helper "$AST_BIN" "$helper")" || return 1
+  echo "ok: the installed astd-vz is signed, entitled, and build $helper_build"
 
   # 6. The app, when there is one. It is a separate download, so its absence
   #    is not a failure — but a mismatched one is exactly the failure this
@@ -497,35 +482,33 @@ for suite in $WANTED; do
     continue
   fi
 
-  # A lane that needs the vz helper, against an artifact that carries none,
-  # runs against this tree instead — after saying so. The alternative was to
-  # skip it, which on today's releases means the vz backend is never
-  # exercised by anything; the alternative to *that* was to fail, which
-  # would be red for a packaging decision (as-n6x) rather than for a bug.
-  # Either way the runner says which binaries the lane actually used.
   against="the installed artifact"
-  from_tree=
-  if [ "$needs" = helper ] && [ ! -x "$(dirname "$AST_BIN")/astd-vz" ]; then
-    against="this tree (the artifact carries no astd-vz — see the identity suite)"
-    from_tree=1
-  fi
-
   say "---- $suite (bound ${bound}s, against $against)"
   log="$EVIDENCE/$suite.log"
+  # The VZ lane has a hard preflight because failing deep in `ast create`
+  # would diagnose only availability, not whether the installed helper was
+  # absent, from another build, or had lost its signature. This check never
+  # consults the source tree and never changes AST_BIN/ASTD_BIN.
+  if [ "$needs" = helper ]; then
+    helper="$(dirname "$AST_BIN")/astd-vz"
+    if helper_build="$(harness_assert_vz_helper "$AST_BIN" "$helper" 2>&1)"; then
+      say "exact-artifact helper gate: $helper_build" | tee "$log"
+    else
+      printf '%s\n' "$helper_build" | tee "$log" >&2
+      say "---- $suite: FAILED (installed artifact helper gate)"
+      FAILED="$FAILED $suite"
+      continue
+    fi
+  fi
   # A row either names a function defined above or a command to run. Both are
   # split on whitespace, which is what the table's last column is written
   # for.
   # shellcheck disable=SC2206  # the split is the point
   cmd=($runs)
-  # `env -u` rather than a subshell that unsets, so the override is visible
-  # in the command the runner reports and in the process table. Built as a
-  # whole array because macOS ships bash 3.2, where expanding an *empty*
-  # array under `set -u` is an error rather than nothing.
-  if [ -n "$from_tree" ]; then
-    run=(env -u AST_BIN -u ASTD_BIN "${cmd[@]}")
-  else
-    run=("${cmd[@]}")
-  fi
+  # Built as a whole array because macOS ships bash 3.2, where expanding an
+  # empty array under `set -u` is an error rather than nothing. AST_BIN and
+  # ASTD_BIN remain exported: every lane runs the installed artifact.
+  run=("${cmd[@]}")
   # Live output, because a suite that boots guests takes minutes and silence
   # for minutes is indistinguishable from a hang. The tee keeps a copy for
   # the evidence directory whether it passed or not.

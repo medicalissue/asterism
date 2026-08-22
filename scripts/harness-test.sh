@@ -247,4 +247,53 @@ if harness_build_id "$WORK/bin/mute" >/dev/null 2>&1; then
 fi
 ok "a binary that will not say which build it is, is not accepted as any"
 
+# ---- 11. the exact-artifact VZ gate has no source fallback -----------------
+
+make_helper() {
+  cat >"$WORK/bin/$1" <<EOF
+#!/bin/sh
+[ "\${1:-}" = --version ] || exit 2
+echo "version   0.0.2"
+echo "build     $2"
+EOF
+  chmod +x "$WORK/bin/$1"
+}
+make_helper vz-good 0.0.2+aaaaaaaaaaaa
+make_helper vz-other 0.0.2+bbbbbbbbbbbb
+make_helper vz-unsigned 0.0.2+aaaaaaaaaaaa
+
+# A codesign stand-in makes signature behavior testable on Linux too. It
+# treats exactly one helper as unsigned and prints the entitlement only for
+# binaries whose signature verifies.
+cat >"$WORK/bin/codesign" <<'SH'
+#!/bin/sh
+for arg in "$@"; do helper="$arg"; done
+case "$helper" in
+  *vz-unsigned) exit 1 ;;
+esac
+case " $* " in
+  *" --entitlements "*)
+    echo '<key>com.apple.security.virtualization</key>' >&2
+    ;;
+esac
+exit 0
+SH
+chmod +x "$WORK/bin/codesign"
+export PATH="$WORK/bin:$PATH"
+
+if harness_assert_vz_helper "$WORK/bin/one" "$WORK/bin/not-there" >/dev/null 2>&1; then
+  fail "an artifact with no helper passed the VZ gate"
+fi
+if harness_assert_vz_helper "$WORK/bin/one" "$WORK/bin/vz-other" >/dev/null 2>&1; then
+  fail "a helper from another build passed the VZ gate"
+fi
+if harness_assert_vz_helper "$WORK/bin/one" "$WORK/bin/vz-unsigned" >/dev/null 2>&1; then
+  fail "an unsigned helper passed the VZ gate"
+fi
+vz_build="$(harness_assert_vz_helper "$WORK/bin/one" "$WORK/bin/vz-good")" \
+  || fail "the signed, entitled helper from the same build failed the VZ gate"
+[ "$vz_build" = 0.0.2+aaaaaaaaaaaa ] \
+  || fail "the VZ gate returned the wrong build: $vz_build"
+ok "the VZ gate accepts only the installed signed helper from the exact build"
+
 echo "HARNESS-TEST GREEN ($pass assertions)"
