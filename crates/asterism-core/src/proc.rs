@@ -726,7 +726,7 @@ fn boot_time_us() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Child, Command};
 
     /// A process that has exec'd `sleep` and will stay there for the test.
     ///
@@ -1027,27 +1027,60 @@ mod tests {
     ///
     /// `sleep 30 <path>` is not a fixture: GNU sleep treats the path as an
     /// invalid second duration and exits immediately, while other sleep
-    /// implementations disagree about extra operands. `tail -f` is a
-    /// portable Unix long-lived helper and keeps the path in its own argv.
-    /// Return the executable name observed from the kernel as well, since
-    /// `/usr/bin/tail` and `/bin/tail` are both valid installations.
+    /// implementations disagree about extra operands. The shell keeps the
+    /// path as its own argument while its short-lived `sleep` child receives
+    /// only a valid duration, which works with BSD and GNU `sleep`.
+    ///
+    /// `Command::spawn` returns before its child has necessarily exec'd. Do
+    /// not capture the fixture until the kernel reports both the resolved
+    /// shell executable and the instance-owned marker in its argv.
     fn holder(path: &Path) -> (Child, String) {
-        let child = Command::new("tail")
-            .args(["-f", "/dev/null"])
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "while :; do sleep 1; done", "asterism-proc-fixture"])
             .arg(path)
-            .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        let exec = ProcId::capture(child.id())
-            .unwrap()
-            .exec
-            .expect("the fixture executable should be readable");
-        let exec = exec
-            .file_name()
-            .and_then(|name| name.to_str())
-            .expect("the fixture executable should have a UTF-8 name")
-            .to_owned();
-        (child, exec)
+        let pid = child.id();
+        let shell = std::fs::canonicalize("/bin/sh")
+            .expect("the portable shell fixture should resolve its executable");
+        let marker = path.to_string_lossy().into_owned();
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        let failure = loop {
+            if let Ok(id) = ProcId::capture(pid) {
+                let is_shell = id.exec.as_deref() == Some(shell.as_path());
+                let holds_marker =
+                    argv(pid).is_some_and(|args| args.iter().any(|arg| arg == &marker));
+                if is_shell && holds_marker && id.check().is_ours() {
+                    let exec = id
+                        .exec
+                        .as_deref()
+                        .and_then(Path::file_name)
+                        .and_then(|name| name.to_str())
+                        .expect("the fixture executable should have a UTF-8 name")
+                        .to_owned();
+                    return (child, exec);
+                }
+            }
+
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    break format!("adoption fixture exited before readiness: {status}")
+                }
+                Ok(None) => {}
+                Err(error) => break format!("checking adoption fixture {pid}: {error}"),
+            }
+            if Instant::now() >= deadline {
+                break format!(
+                    "adoption fixture {pid} did not exec with its instance-owned argv marker within five seconds"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("{failure}");
     }
 
     fn evidence<'a>(exec: &'a [&'a str], names: &'a [&'a Path]) -> Evidence<'a> {
@@ -1084,7 +1117,7 @@ mod tests {
         let legacy_started_at = crate::instance::now_unix();
 
         // Somebody else's qemu, started 30s later, serving its own instance.
-        // `tail` stands in for the binary; the executable family is checked
+        // The shell stands in for the binary; the executable family is checked
         // separately and is not what this test turns on.
         let theirs = PathBuf::from("/tmp/asterism-adopt-test/instances/theirs/qmp.sock");
         let (mut foreign, exec) = holder(&theirs);
