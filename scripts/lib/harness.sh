@@ -63,7 +63,10 @@ harness_cache_dir() {
 # The directory a failing suite leaves its evidence in. Overridable so a
 # runner can collect every suite's under one root and upload the lot.
 harness_artifacts_dir() {
-  local base="${ASTERISM_TEST_ARTIFACTS:-${TMPDIR:-/tmp}/asterism-harness-artifacts}"
+  # A direct suite run gets a directory owned by that one shell. Without the
+  # pid, two lifecycle runs both called their evidence `.../lifecycle`, and
+  # the second one's harness_begin removed the first one's diagnostics.
+  local base="${ASTERISM_TEST_ARTIFACTS:-${TMPDIR:-/tmp}/asterism-harness-artifacts-$$}"
   # $TMPDIR ends in a slash on macOS, and a path printed with two of them in
   # the middle reads as a bug in whatever printed it.
   printf '%s\n' "${base%/}"
