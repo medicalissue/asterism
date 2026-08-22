@@ -22,3 +22,8 @@ Files:
 
 The harness is `scripts/bench-linux-vmm.sh`; the OCI builder and complete pins
 are in `scripts/build-linux-vmm-oci-rootfs.sh`.
+
+The bounded as-lvf.19 follow-up is preserved in
+`../firecracker-oci-gate-2026-08-22/`. It adds launch-burst and block-backed
+failure-recovery measurements and records the final decision to reject a
+Firecracker OCI lane.

@@ -1,0 +1,40 @@
+== host: Linux 6.8.0-137-generic aarch64; PRETTY_NAME="Ubuntu 24.04.4 LTS"; nested=apple; kvm=crw-rw-rw-
+== inputs: base.raw 3758096384 B sha256 63cb4783adb9c4de…; Image 59079048 B; initrd 29239653 B
+== artifacts: cloud-hypervisor 5468264 B, ch-remote 1490952 B, virtiofsd 2951472 B (1.10.0-1ubuntu0.1); firecracker 3254360 B, jailer 1916808 B
+== OCI common disk: rootfs 805306368 B, kernel 59079048 B, initrd 29239653 B; VMM shipped bytes: chv 5468264 B, firecracker+jailer 5171168 B
+== identical OCI workload: image=docker.io/library/python@sha256:d09d15e60962ca365d1cd544a48773bac9d33f2fb1b00f2aa0deec78ade7dc31 platform=linux/arm64 platform_manifest=sha256:c95cd47204b8f236725fc8cf94726abe3f32755a062393597efadd9a5d24fbe1 config=sha256:cb9af8d170f77f291e66758095a4ded08c37643ae7b1793f386a7d6b5f090487 kernel_modules=6.8.0-137-generic
+oci.rootfs: 805306368 B sha256 cbaaeacbb15130c7…; read-only; init=/sbin/asterism-bench-init
+oci chv round 1: boot-to-vsock-ready 15665 ms; idle RSS 235864 KiB (guest 1024 MiB, 2 vcpu)
+oci chv workload: 42
+oci chv round 2: boot-to-vsock-ready 14322 ms; idle RSS 231776 KiB (guest 1024 MiB, 2 vcpu)
+oci chv workload: 42
+oci chv round 3: boot-to-vsock-ready 11220 ms; idle RSS 231780 KiB (guest 1024 MiB, 2 vcpu)
+oci chv workload: 42
+oci chv round 4: boot-to-vsock-ready 14780 ms; idle RSS 231776 KiB (guest 1024 MiB, 2 vcpu)
+oci chv workload: 42
+oci chv round 5: boot-to-vsock-ready 9302 ms; idle RSS 227684 KiB (guest 1024 MiB, 2 vcpu)
+oci chv workload: 42
+oci chv burst workload 1: 42
+oci chv burst workload 2: 42
+oci chv burst workload 3: 42
+oci chv burst workload 4: 42
+oci chv launch burst: count=4 all-ready=26252 ms; summed idle RSS=914520 KiB; runtime files=148 KiB
+oci chv failure recovery: PROVEN, ready in 9325 ms; block marker=survived-vmm-crash; data disk=67108864 B
+oci fc round 1: boot-to-vsock-ready 17300 ms; idle RSS 213472 KiB (guest 1024 MiB, 2 vcpu)
+oci fc workload: 42
+oci fc round 2: boot-to-vsock-ready 16640 ms; idle RSS 213468 KiB (guest 1024 MiB, 2 vcpu)
+oci fc workload: 42
+oci fc round 3: boot-to-vsock-ready 36670 ms; idle RSS 215976 KiB (guest 1024 MiB, 2 vcpu)
+oci fc workload: 42
+oci fc round 4: boot-to-vsock-ready 54176 ms; idle RSS 215912 KiB (guest 1024 MiB, 2 vcpu)
+oci fc workload: 42
+oci fc round 5: boot-to-vsock-ready 50826 ms; idle RSS 216720 KiB (guest 1024 MiB, 2 vcpu)
+oci fc workload: 42
+oci fc burst workload 1: 42
+oci fc burst workload 2: 42
+oci fc burst workload 3: 42
+oci fc burst workload 4: 42
+oci fc launch burst: count=4 all-ready=87363 ms; summed idle RSS=867596 KiB; runtime files=164 KiB
+oci fc failure recovery: PROVEN, ready in 15559 ms; block marker=survived-vmm-crash; data disk=67108864 B
+== OCI PERFORMANCE GATE: REJECT; median ready chv=14322 ms fc=36670 ms (+156.0%); median idle RSS chv=231776 KiB fc=215912 KiB (6.8% lower); requires >=30% faster OR >=40% lower
+== done; raw logs under /home/medicalissue.guest/bench/out
