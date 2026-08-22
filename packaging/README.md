@@ -14,6 +14,26 @@ the daemon somewhere `brew upgrade` could not reach, and shipping the app
 through a tarball would strip the signature people are relying on. The
 installer never touches the DMG and the DMG never writes to `~/.local/bin`.
 
+After installation they do, however, upgrade as one compatible unit. Both the
+desktop app's Updates controls and `ast update` invoke the same updater and the
+same signed manifest. The updater verifies exact build identities for `ast`,
+`astd`, `astd-vz`, and the app before replacing anything; it then activates
+them with same-filesystem renames. Any partial replacement or daemon restart
+failure restores the entire previous unit. Running guests are left alive for
+the restarted daemon to re-adopt, and a signed channel is never allowed to
+downgrade an installed release.
+
+```console
+$ ast update status
+$ ast update channel stable       # also beta or nightly
+$ ast update check                # verifies metadata only
+$ ast update apply --yes          # downloads, verifies, activates atomically
+```
+
+Homebrew remains a separate ownership lane: status reports `manager homebrew`,
+check may report an available signed release, and apply refuses with the exact
+`brew upgrade asterism` command instead of writing into the Cellar.
+
 ## What an install resolves to
 
 `install.sh` installs **one tagged release**, always:
@@ -63,7 +83,10 @@ $ sh install.sh --uninstall
 
 ```
 v0.1.0/
-  asterism-v0.1.0-darwin-arm64.tar.gz   # ast, astd, astd-vz — flat, no directory prefix
+  asterism-v0.1.0-darwin-arm64.tar.gz   # ast, astd, astd-vz, asterism-update — flat
+  Asterism-v0.1.0-darwin-arm64.tar.gz   # signed app; notarized with Developer ID credentials
+  RELEASE.json                          # exact build, URLs, digests, minimum updater
+  RELEASE.json.sig                      # mandatory detached update signature
   asterism.rb                           # the Homebrew formula for this tag
   SHA256SUMS                            # shasum -a 256 of both of the above
   SHA256SUMS.sig                        # when a signing key exists
@@ -133,7 +156,7 @@ The source path still builds a **tag** by default. `ASTERISM_REF=main` is the
 only way to get the moving branch, and the script says out loud that that is
 what you asked for.
 
-### Signatures
+### Installer signatures
 
 Asterism does not publish a signing key yet, so the signature check is a seam
 rather than a promise: if `SHA256SUMS.sig` is published and both a verifier
@@ -144,6 +167,21 @@ refusal — which is the flag to make the default once a key exists.
 Until then, `ASTERISM_SHA256` is the strong option: it verifies the download
 against a digest you brought yourself, so nothing the release host says is
 trusted.
+
+### Update-channel signatures
+
+In-app updates are stricter than the bootstrap installer: `RELEASE.json.sig`
+and an embedded minisign/signify public key are mandatory. The release workflow
+renders the flat manifest only after both archives have been assembled and
+hashed, signs it with the base64-encoded `UPDATE_MINISIGN_SECRET_KEY`, and compiles
+`ASTERISM_UPDATE_PUBKEY` into both CLI and app-facing builds. A missing key or
+signature is a refusal, as are a digest mismatch, wrong target, build-identity
+mismatch, unsupported minimum updater, or downgrade. Tagged publishing fails
+closed when the signing secret is absent.
+Verification uses `minisign` (or the compatible `signify` command); its
+absence is a fail-closed refusal. The Homebrew formula installs `minisign` as
+a runtime dependency, while other installation lanes must provide one of the
+two verifiers.
 
 ## Homebrew
 
@@ -204,12 +242,16 @@ any of that fails, there is no release.
 
 ```console
 $ bash scripts/install-test.sh
+$ bash scripts/update-test.sh
 ```
 
-Hermetic: it builds a fake release on disk, serves it over `file://`, and
+Both are hermetic. The ten-check update suite covers signature and artifact tampering,
+metadata-only checks, full app/CLI/daemon/helper activation, injected partial
+activation rollback, downgrade refusal, and Homebrew delegation. The installer
+suite builds a fake release on disk, serves it over `file://`, and
 shims `uname`, `git` and `cargo` where a test needs the machine to be a
 machine it is not. No network, and nothing is written outside one temp
-directory. Thirty-two checks: the default install, an explicit version,
+directory. Thirty-eight checks: the default install, an explicit version,
 a pinned digest, upgrade, downgrade, reinstall, `ASTERISM_FORCE`, uninstall
 and uninstalling twice, a tampered tarball, an unlisted artifact, a missing
 `SHA256SUMS`, an unreachable index, unreachable assets, four unsupported
@@ -235,3 +277,5 @@ no `master` branch, and still has exactly one `sudo` in it.
 `depends_on "qemu"` asks Homebrew to install QEMU under its own terms.
 Asterism never ships a QEMU binary and never links QEMU code; on the release
 path QEMU is not installed at all, only mentioned when it is missing.
+The formula likewise obtains the standalone `minisign` verifier from Homebrew;
+neither verifier code nor its binary is bundled into Asterism.

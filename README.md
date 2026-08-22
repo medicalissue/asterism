@@ -28,6 +28,20 @@ Building it yourself, from a tag or from a branch you name, is
 `ASTERISM_METHOD=source` — see [packaging/README.md](packaging/README.md) for
 that and for the Homebrew tap.
 
+Installed releases share one signed update channel across the CLI and menu-bar
+app. `ast update check` authenticates its manifest without downloading
+artifacts; `ast update apply --yes` verifies and activates the matching app,
+CLI, daemon, and helper as one build, rolling all of them back if activation
+fails. Homebrew installations remain owned by Homebrew and are directed to
+`brew upgrade asterism`.
+
+```console
+$ ast update status
+$ ast update channel stable       # stable, beta, or nightly
+$ ast update check
+$ ast update apply --yes
+```
+
 macOS today. Asterism probes the host when an instance is created and uses
 Virtualization.framework (VZ) when it can satisfy the request, otherwise QEMU.
 Pass `--backend vz` or `--backend qemu` to force one and get its exact probe or

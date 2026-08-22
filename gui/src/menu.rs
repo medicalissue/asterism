@@ -188,6 +188,7 @@ impl MenuModel {
             if self.autostart { "[x]" } else { "[ ]" }
         ));
         out.push(item(0, &Action::Website, "Open asterism.run", true));
+        out.push(item(0, &Action::UpdateCheck, "Check for Updates…", true));
         out.push("[separator]".to_owned());
         out.push(item(0, &Action::Quit, "Quit Asterism", true));
         out.push(format!("[disabled] {}", version()));
@@ -225,12 +226,14 @@ pub fn build(app: &AppHandle, model: &MenuModel) -> tauri::Result<Menu<tauri::Wr
         .checked(model.autostart)
         .build(app)?;
     let website = clickable(app, &Action::Website, "Open asterism.run", true)?;
+    let update = clickable(app, &Action::UpdateCheck, "Check for Updates…", true)?;
     let quit = MenuItemBuilder::with_id(Action::Quit.id(), "Quit Asterism")
         .accelerator("CmdOrCtrl+Q")
         .build(app)?;
     menu.separator()
         .item(&autostart)
         .item(&website)
+        .item(&update)
         .separator()
         .item(&quit)
         .item(&disabled(app, "version", &version())?)
@@ -385,6 +388,7 @@ mod tests {
                 if autostart { "[x]" } else { "[ ]" }
             ),
             "[website] Open asterism.run  (enabled)".to_owned(),
+            "[update:check] Check for Updates…  (enabled)".to_owned(),
             "[separator]".to_owned(),
             "[quit] Quit Asterism  (enabled)".to_owned(),
             format!("[disabled] Asterism {}", env!("CARGO_PKG_VERSION")),
@@ -610,9 +614,9 @@ mod tests {
             assert!(!action.describe().is_empty());
             seen += 1;
         }
-        // main, new, up/down/term/snap ×2, one restore, autostart, website,
-        // quit.
-        assert_eq!(seen, 14);
+        // main, new, up/down/term/snap ×2, one restore, autostart, update,
+        // website, quit.
+        assert_eq!(seen, 15);
     }
 
     #[test]

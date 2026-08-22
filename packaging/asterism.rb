@@ -31,6 +31,7 @@ class Asterism < Formula
   # release:stable-block
 
   depends_on "rust" => :build
+  depends_on "minisign"
   depends_on "qemu"
 
   def install
@@ -58,6 +59,10 @@ class Asterism < Formula
     # belong in the same bin.
     bin.install "target/release/ast"
     bin.install "target/release/astd"
+    # Homebrew owns these binaries, so the updater only reports that lane and
+    # sends activation back to `brew upgrade`. Shipping the same checker still
+    # gives the app and CLI one signed-channel/status implementation.
+    (libexec/"asterism").install "packaging/update.sh" => "asterism-update"
 
     # `astd` finds `astd-vz` the same way, and without it every guest runs
     # on QEMU no matter what the machine could do. Building it is not

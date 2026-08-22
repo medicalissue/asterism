@@ -88,7 +88,7 @@ const USAGE: &str = "usage: [--dump-menu | --dump-form | --dump-main [section] |
                      | --main [--section <name>] | --new-instance | --theme dark|light \
                      | --create-via-window <json> \
                      | --pair-via-window invite|add:<ticket> [--as <name>] \
-                     | --wake-via-window <device>]";
+                     | --wake-via-window <device> | --version]";
 
 /// How the app was asked to start.
 enum Argv {
@@ -106,6 +106,9 @@ enum Argv {
     PairViaWindow(devices::Invitation),
     /// Run the Wake button's conversation without a window, and exit.
     WakeViaWindow(String),
+    /// Print an identity the transactional updater can validate without
+    /// starting a tray, a webview, or a daemon.
+    Version,
 }
 
 impl Argv {
@@ -180,6 +183,7 @@ impl Argv {
                     Some(name) if !name.is_empty() => return Argv::WakeViaWindow(name),
                     _ => die("--wake-via-window: name a device"),
                 },
+                "-V" | "--version" => return Argv::Version,
                 "--click" => {
                     let id = args.next().unwrap_or_default();
                     match Action::parse(&id) {
@@ -246,6 +250,10 @@ fn main() {
                 eprintln!("wake failed: {e:#}");
                 std::process::exit(1);
             }
+        }
+        Argv::Version => {
+            println!("version   {}", env!("CARGO_PKG_VERSION"));
+            println!("build     {}", asterism_core::BUILD_ID);
         }
         Argv::Run(click) => run(click),
     }
@@ -453,6 +461,19 @@ fn perform(app: &AppHandle, action: &Action) -> bool {
         Action::ToggleAutostart => feedback::report(app, &what, toggle_autostart(app)),
         Action::ServiceInstall => feedback::report(app, &what, settings::install()),
         Action::ServiceUninstall => feedback::report(app, &what, settings::uninstall()),
+        Action::UpdateCheck => feedback::report(app, &what, settings::update_check()),
+        Action::UpdateApply => match applescript::confirm(
+            "Install Asterism update",
+            "Replace the app, CLI, daemon and VZ helper with the authenticated channel release? Running guests stay up.",
+            "Install Update",
+        ) {
+            Ok(true) => feedback::report(app, &what, settings::update_apply()),
+            Ok(false) => true,
+            Err(e) => {
+                feedback::failed(app, &format!("asking about {what}"), &format!("{e:#}"));
+                false
+            }
+        },
         Action::Website => feedback::report(app, &what, open_website()),
         // Handled before the thread was ever spawned.
         Action::Quit => return true,

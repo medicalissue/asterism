@@ -65,6 +65,13 @@ EOF
 		chmod +x "${stage}/astd-vz"
 		members=(ast astd astd-vz)
 	fi
+	# The first release predates self-update; current releases ship the updater
+	# that `ast update` keeps alive while replacing ast itself.
+	if [ "$version" != v0.0.9 ]; then
+		cp "${ROOT}/packaging/update.sh" "${stage}/asterism-update"
+		chmod +x "${stage}/asterism-update"
+		members+=(asterism-update)
+	fi
 	tar -czf "${dir}/asterism-${version}-${target}.tar.gz" -C "$stage" "${members[@]}"
 	# A release also publishes the rendered Homebrew formula, and it is
 	# listed in SHA256SUMS like everything else — the installer checks it
@@ -123,9 +130,10 @@ if [ "\$1" = "clone" ]; then
 	mkdir -p "\$dst/.git"
 	# A clone carries the repository's scripts, and the source path signs
 	# the vz helper with one of them.
-	mkdir -p "\$dst/scripts" "\$dst/crates/asterism-vz"
+	mkdir -p "\$dst/scripts" "\$dst/crates/asterism-vz" "\$dst/packaging"
 	cp "${ROOT}/scripts/sign-vz.sh" "\$dst/scripts/sign-vz.sh"
 	cp "${ROOT}/crates/asterism-vz/vz.entitlements" "\$dst/crates/asterism-vz/vz.entitlements"
+	cp "${ROOT}/packaging/update.sh" "\$dst/packaging/update.sh"
 	printf '%s' "\$ref" >"${WORK}/cloned-ref"
 	exit 0
 fi
@@ -368,6 +376,7 @@ says "installed ${PREFIX}/bin/astd"
 [ "$(installed_version)" = "ast 0.1.0" ] || fail "wrong version installed: $(installed_version)"
 grep -q '^version=v0.1.0$' <<<"$(receipt)" || fail "receipt does not record the version:"$'\n'"$(receipt)"
 grep -q '^method=release$' <<<"$(receipt)" || fail "receipt does not record the method"
+[ -x "${PREFIX}/libexec/asterism/asterism-update" ] || fail "the signed updater was not installed"
 ok "the default install resolves the latest tag and verifies it"
 
 # The helper is the difference between a machine that can run
@@ -377,7 +386,7 @@ says "installed ${PREFIX}/bin/astd-vz"
 [ -x "${PREFIX}/bin/astd-vz" ] || fail "astd-vz was not installed"
 [ "$("${PREFIX}/bin/astd-vz" --version)" = "astd-vz 0.1.0" ] \
 	|| fail "astd-vz is not the version that was installed: $("${PREFIX}/bin/astd-vz" --version)"
-grep -q '^files=bin/ast bin/astd bin/astd-vz$' <<<"$(receipt)" \
+grep -q '^files=bin/ast bin/astd bin/astd-vz libexec/asterism/asterism-update$' <<<"$(receipt)" \
 	|| fail "the receipt does not record the helper:"$'\n'"$(receipt)"
 never_says "does not carry the virtualization"
 ok "the vz helper is installed beside the daemon and recorded in the receipt"
@@ -465,6 +474,7 @@ run_install ok -- --uninstall
 [ ! -e "${PREFIX}/bin/ast" ] || fail "ast survived the uninstall"
 [ ! -e "${PREFIX}/bin/astd" ] || fail "astd survived the uninstall"
 [ ! -e "${PREFIX}/bin/astd-vz" ] || fail "astd-vz survived the uninstall"
+[ ! -e "${PREFIX}/libexec/asterism/asterism-update" ] || fail "asterism-update survived the uninstall"
 [ ! -e "${PREFIX}/share/asterism/install-receipt.env" ] || fail "the receipt survived the uninstall"
 [ -e "${PREFIX}/bin/somebody-elses-tool" ] || fail "uninstall deleted a file it did not install"
 says "left alone"
@@ -572,7 +582,7 @@ says "building and signing astd-vz"
 [ -x "${PREFIX}/bin/astd-vz" ] || fail "the source build installed no vz helper"
 grep -q -- "--entitlements" "${WORK}/codesign-args" \
 	|| fail "the helper was installed without being signed with its entitlements"
-grep -q '^files=bin/ast bin/astd bin/astd-vz$' <<<"$(receipt)" \
+grep -q '^files=bin/ast bin/astd bin/astd-vz libexec/asterism/asterism-update$' <<<"$(receipt)" \
 	|| fail "the receipt does not record the helper the source build installed:"$'\n'"$(receipt)"
 ok "a source install signs the vz helper and lands it beside the daemon"
 
