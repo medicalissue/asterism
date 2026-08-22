@@ -108,7 +108,8 @@ use crate::VERSION;
 /// * **3** — portable backup export/import frames and their reports.
 /// * **4** — the opt-in, framed device-shell policy and session wire.
 /// * **5** — mesh-safe, read-only device-shell policy status.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// * **6** — device-local structured image catalog and pull results.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// The wire as it was before it carried a version.
 ///

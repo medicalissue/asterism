@@ -21,6 +21,7 @@ use crate::device_shell::{
     ShellData, ShellExit, ShellOpen, ShellOutput, ShellPolicyAction, ShellPolicyStatus,
 };
 use crate::hv::GuestHealth;
+use crate::image::{ImagePullResult, ImageRow};
 use crate::instance::{Instance, PortForward, Restart, Shape};
 use crate::orbit::{Device, DeviceStatus, WakeFacts};
 use crate::registry::OrbitRow;
@@ -396,6 +397,13 @@ pub enum Request {
     /// This device's wake readiness, honestly reported: `ast device check`.
     DeviceCheck,
 
+    // ---- device-local images -----------------------------------------------
+    /// Read this device's structured cloud/OCI image catalog.
+    ImageList,
+    /// Pull an image into this device's store. The daemon owns the network,
+    /// credentials, integrity checks, and atomic adoption.
+    ImagePull { reference: String },
+
     // ---- block volumes ------------------------------------------------------
     //
     // Volumes are a *device's* part of the pool, not an instance's, so none of
@@ -667,7 +675,9 @@ impl Request {
             Request::DeviceWake { .. }
             | Request::WakeBroadcast { .. }
             | Request::DeviceFacts
-            | Request::DeviceCheck => None,
+            | Request::DeviceCheck
+            | Request::ImageList
+            | Request::ImagePull { .. } => None,
 
             // A volume belongs to a device, not to an instance, and volume
             // names are not orbit-global — two devices may each have a
@@ -733,6 +743,7 @@ impl Request {
             Request::Compat => 2,
             Request::BackupExport { .. } | Request::BackupImport { .. } => 3,
             Request::DeviceShellStatus => 5,
+            Request::ImageList | Request::ImagePull { .. } => 6,
             Request::DeviceShellPolicy { .. }
             | Request::DeviceShellOpen { .. }
             | Request::DeviceShellInput { .. }
@@ -764,6 +775,8 @@ impl Request {
             | Request::DeviceShellResize { .. }
             | Request::DeviceShellSignal { .. }
             | Request::DeviceShellClose => Some("device shell"),
+            Request::ImageList => Some("image_list"),
+            Request::ImagePull { .. } => Some("image_pull"),
             _ => None,
         }
     }
@@ -859,6 +872,12 @@ pub enum Response {
     Instances {
         instances: Vec<Instance>,
     },
+    /// Reply to [`Request::ImageList`]. These rows are from the answering
+    /// device, even when the request arrived through `Proxy`.
+    Images { images: Vec<ImageRow> },
+    /// Reply to [`Request::ImagePull`] after durable adoption. A failed pull
+    /// is always [`Response::Error`].
+    ImagePulled { result: Box<ImagePullResult> },
     /// Reply to [`Request::ListOrbit`]: the orbit registry, assembled from
     /// every shard that answered plus the cached rows of those that did not.
     Orbit {
@@ -1106,6 +1125,7 @@ impl Response {
         match self {
             Response::Compat { .. } => 2,
             Response::BackupExported { .. } | Response::BackupRestored { .. } => 3,
+            Response::Images { .. } | Response::ImagePulled { .. } => 6,
             Response::DeviceShellStatus { .. }
             | Response::DeviceShellAccepted { .. }
             | Response::DeviceShellRefused { .. }
@@ -1154,6 +1174,14 @@ pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
             .since(),
         ),
         ("device_shell_status", Request::DeviceShellStatus.since()),
+        ("image_list", Request::ImageList.since()),
+        (
+            "image_pull",
+            Request::ImagePull {
+                reference: String::new(),
+            }
+            .since(),
+        ),
     ]
     .into_iter()
     .map(|(name, version)| (name.to_owned(), version))
@@ -1305,6 +1333,41 @@ mod tests {
             serde_json::to_string(&Request::DeviceShellStatus).unwrap(),
             r#"{"cmd":"device_shell_status"}"#
         );
+        assert_eq!(Request::ImageList.since(), 6);
+        assert_eq!(
+            serde_json::to_string(&Request::ImagePull {
+                reference: "ubuntu:24.04".into(),
+            })
+            .unwrap(),
+            r#"{"cmd":"image_pull","reference":"ubuntu:24.04"}"#
+        );
+    }
+
+    #[test]
+    fn image_frames_are_structured_and_have_a_single_pull_success_reply() {
+        let request = Request::ImagePull {
+            reference: "ubuntu:24.04".into(),
+        };
+        let wire = serde_json::to_string(&request).unwrap();
+        assert_eq!(wire, r#"{"cmd":"image_pull","reference":"ubuntu:24.04"}"#);
+        let response = Response::ImagePulled {
+            result: Box::new(ImagePullResult {
+                reference: "ubuntu:24.04".into(),
+                kind: crate::hv::ImageKind::Disk,
+                bytes: 42,
+                digest: Some("sha256:abc".into()),
+                progress: vec![crate::image::ImageProgress {
+                    phase: "stored".into(),
+                    bytes: 42,
+                    total_bytes: Some(42),
+                    done: true,
+                }],
+                changed: true,
+            }),
+        };
+        let decoded: Response = serde_json::from_str(&serde_json::to_string(&response).unwrap()).unwrap();
+        assert!(matches!(decoded, Response::ImagePulled { .. }));
+        assert_eq!(response.since(), 6);
     }
 
     /// The table `ast compat` prints and the rule the code follows are the
