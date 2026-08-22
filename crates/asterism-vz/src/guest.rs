@@ -86,6 +86,15 @@ pub const PORT: u32 = 1023;
 /// Protocol versions this build of the helper can speak, newest last.
 pub const VERSIONS: &[u32] = &[1];
 
+/// The most bytes either side will retain for one JSON frame, excluding its
+/// newline.
+///
+/// Every v1 message is normally below a few kilobytes. This leaves generous
+/// room for additive status fields while making the memory cost of a peer
+/// that never sends a newline a property of the protocol rather than a value
+/// that peer gets to choose. The embedded guest agent carries the same cap.
+pub const MAX_FRAME_BYTES: usize = 64 * 1024;
+
 /// Where the guest keeps its copy of the key. Root-only, written by the
 /// seed's `bootcmd` on every boot.
 pub const GUEST_KEY_PATH: &str = "/etc/asterism/agent.key";
@@ -503,13 +512,49 @@ pub fn pick_version(theirs: &[u32]) -> Option<u32> {
 }
 
 fn read_line<T: serde::de::DeserializeOwned>(reader: &mut impl BufRead) -> Result<T> {
-    let mut line = String::new();
-    let n = reader.read_line(&mut line)?;
-    if n == 0 {
-        bail!("the guest agent closed the connection");
-    }
+    let line = read_frame(reader)?;
+    let line = std::str::from_utf8(&line)
+        .context("the guest agent sent a frame that was not utf-8")?;
     serde_json::from_str(line.trim())
         .with_context(|| format!("the guest agent sent {:?}", truncate(line.trim())))
+}
+
+/// Read one frame without first letting `BufRead::read_line` grow a `String`
+/// to a size chosen by the peer.
+///
+/// The prospective size is checked before a chunk is retained. In
+/// particular, the chunk containing the newline is checked too: a peer
+/// cannot fill the buffer to the limit and smuggle one more byte beside the
+/// terminator.
+fn read_frame(reader: &mut impl BufRead) -> Result<Vec<u8>> {
+    let mut frame = Vec::new();
+    loop {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            if frame.is_empty() {
+                bail!("the guest agent closed the connection");
+            }
+            // Preserve the old EOF-after-a-line behaviour for scripted and
+            // older agents. A live socket does not reach this path until its
+            // writer closes.
+            return Ok(frame);
+        }
+        let newline = chunk.iter().position(|byte| *byte == b'\n');
+        let would_be = frame.len() + newline.unwrap_or(chunk.len());
+        if would_be > MAX_FRAME_BYTES {
+            bail!(
+                "the guest agent sent more than {MAX_FRAME_BYTES} bytes before ending a frame"
+            );
+        }
+        if let Some(at) = newline {
+            frame.extend_from_slice(&chunk[..at]);
+            reader.consume(at + 1);
+            return Ok(frame);
+        }
+        let taken = chunk.len();
+        frame.extend_from_slice(chunk);
+        reader.consume(taken);
+    }
 }
 
 fn write_line(writer: &mut impl Write, value: &impl Serialize) -> Result<()> {
@@ -656,6 +701,10 @@ KEY_PATH = os.environ.get("ASTERISM_AGENT_KEY", "/etc/asterism/agent.key")
 # A connection nobody has said anything on for this long is gone. The host
 # reconnects rather than resuming, so holding it open serves nobody.
 IDLE_TIMEOUT = 300
+# Maximum bytes in one JSON object, not counting its newline. Kept in step
+# with MAX_FRAME_BYTES in the Rust half. `recv` checks it before JSON or the
+# authentication proof sees the frame.
+MAX_FRAME_BYTES = 65536
 
 
 def log(message):
@@ -856,8 +905,15 @@ def send(out, obj):
 
 
 def recv(inp):
-    line = inp.readline()
+    # The extra byte distinguishes an exactly-full frame from one that has
+    # crossed the limit. Unlike bare readline(), this never allocates in
+    # proportion to a peer that withholds its newline.
+    line = inp.readline(MAX_FRAME_BYTES + 1)
     if not line:
+        return None
+    payload_len = len(line) - (1 if line.endswith(b"\n") else 0)
+    if payload_len > MAX_FRAME_BYTES:
+        log("closing a connection whose frame exceeded %d bytes" % MAX_FRAME_BYTES)
         return None
     try:
         return json.loads(line.decode().strip())
@@ -1212,6 +1268,46 @@ mod tests {
         );
     }
 
+    /// The first thing on a connection is wholly unauthenticated. It must
+    /// not get an unbounded allocation merely because it is valid JSON that
+    /// serde would otherwise accept.
+    #[test]
+    fn an_oversized_unauthenticated_hello_is_refused_before_it_is_parsed() {
+        let hello = format!(
+            r#"{{"agent":"asterism","versions":[1],"nonce":"aaaa","padding":"{}"}}"#,
+            "x".repeat(MAX_FRAME_BYTES)
+        );
+        let err = one_shot(&hello, "bbbb");
+        assert!(err.contains(&MAX_FRAME_BYTES.to_string()), "{err}");
+        assert!(err.contains("before ending a frame"), "{err}");
+    }
+
+    /// The cap excludes the newline and applies even when the byte that
+    /// crosses it arrives in the same buffered chunk as that newline.
+    #[test]
+    fn the_frame_cap_is_incremental_and_exact() {
+        let frame = |len: usize| {
+            let mut bytes = b"{}".to_vec();
+            bytes.resize(len, b' ');
+            bytes.push(b'\n');
+            bytes
+        };
+        let mut exact = BufReader::with_capacity(
+            1024,
+            std::io::Cursor::new(frame(MAX_FRAME_BYTES)),
+        );
+        let value: serde_json::Value = read_line(&mut exact).expect("exactly the cap is valid");
+        assert_eq!(value, serde_json::json!({}));
+
+        let mut over = BufReader::with_capacity(
+            1024,
+            std::io::Cursor::new(frame(MAX_FRAME_BYTES + 1)),
+        );
+        let err = read_line::<serde_json::Value>(&mut over).unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains(&MAX_FRAME_BYTES.to_string()), "{err}");
+    }
+
     #[test]
     fn version_negotiation_takes_the_newest_in_common_and_refuses_none() {
         assert_eq!(pick_version(&[1]), Some(1));
@@ -1477,6 +1573,25 @@ mod tests {
         assert!(err.contains("97"), "{err}");
     }
 
+    /// Authentication does not turn the guest into a trusted allocator.
+    /// Additive JSON fields are ignored by serde, so without a framing cap
+    /// this otherwise-valid answer would be accepted after retaining all of
+    /// it.
+    #[test]
+    fn an_oversized_answer_is_refused_after_authentication_too() {
+        let answer = format!(
+            r#"{{"id":1,"ok":true,"padding":"{}"}}"#,
+            "x".repeat(MAX_FRAME_BYTES)
+        );
+        let mut session = scripted(&[&answer]);
+        let err = match session.ping() {
+            Ok(()) => panic!("an oversized answer crossed the frame boundary"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains(&MAX_FRAME_BYTES.to_string()), "{err}");
+        assert!(err.contains("before ending a frame"), "{err}");
+    }
+
     /// The case the whole handshake exists for: something is answering on
     /// the port, and it does not hold this instance's key.
     #[test]
@@ -1491,6 +1606,40 @@ mod tests {
         };
         assert!(err.contains("refused this helper"), "{err}");
         assert!(err.contains("did not prove it holds"), "{err}");
+    }
+
+    /// The Python half applies the same ceiling to established sessions.
+    /// The padding is valid, ignorable JSON, so an agent that parses before
+    /// enforcing its frame boundary would answer it.
+    #[test]
+    fn the_real_agent_closes_on_an_oversized_post_auth_request() {
+        let k = key();
+        let Some((_agent, mut out, mut inp)) = spawn_agent(&k) else {
+            return;
+        };
+        let hello: Hello = read_line(&mut out).expect("hello");
+        let host_nonce = "bbbb";
+        write_line(
+            &mut inp,
+            &Accept {
+                version: 1,
+                nonce: host_nonce.into(),
+                proof: k.proof(1, "host", &hello.nonce, host_nonce),
+            },
+        )
+        .unwrap();
+        let welcome: Welcome = read_line(&mut out).expect("welcome");
+        assert!(welcome.ok, "the test handshake authenticates");
+
+        let request = format!(
+            r#"{{"id":1,"op":"ping","padding":"{}"}}\n"#,
+            "x".repeat(MAX_FRAME_BYTES)
+        );
+        inp.write_all(request.as_bytes()).unwrap();
+        inp.flush().unwrap();
+        let mut reply = String::new();
+        let received = out.read_line(&mut reply).unwrap();
+        assert_eq!(received, 0, "the oversized frame was answered: {reply:?}");
     }
 
     /// ...and the mirror image: a guest whose proof does not check out is
