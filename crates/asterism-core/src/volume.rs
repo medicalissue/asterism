@@ -316,6 +316,31 @@ impl Store {
             Some(current) => bail!("{}", held_by(name, current)),
         }
     }
+
+    /// Revoke every lease whose writer lives on `device`.
+    ///
+    /// Device membership is the authority under a remote volume stream. Once
+    /// that membership is removed, leaving its lease behind would let a later
+    /// device with the same human name resume an epoch it never received.
+    /// Clearing the holder while preserving the volume's monotonic epoch is
+    /// the durable half of live device revocation; the daemon stops each
+    /// returned export after committing this state.
+    pub fn revoke_device(&mut self, device: &str) -> Vec<(String, Lease)> {
+        let mut revoked = Vec::new();
+        for (name, volume) in &mut self.volumes {
+            if volume
+                .lease
+                .as_ref()
+                .is_some_and(|lease| lease.holder_device == device)
+            {
+                revoked.push((
+                    name.clone(),
+                    volume.lease.take().expect("lease just matched"),
+                ));
+            }
+        }
+        revoked
+    }
 }
 
 /// What this device says when it is asked about a volume it does not have.
@@ -558,6 +583,43 @@ mod tests {
         s.release("tank", "dev").unwrap();
         assert_eq!(s.remove("tank").unwrap().name, "tank");
         assert!(s.get("tank").is_err());
+    }
+
+    #[test]
+    fn removing_a_device_revokes_all_of_its_leases_without_rewinding_epochs() {
+        let mut s = store();
+        s.create("tank", 1 << 30).unwrap();
+        s.create("cache", 1 << 30).unwrap();
+        s.create("other", 1 << 30).unwrap();
+        s.lease("tank", "dev", "laptop").unwrap();
+        s.lease("cache", "build", "laptop").unwrap();
+        s.lease("other", "db", "desktop").unwrap();
+
+        let mut revoked = s.revoke_device("laptop");
+        revoked.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(revoked.len(), 2);
+        assert_eq!(revoked[0].0, "cache");
+        assert_eq!(revoked[1].0, "tank");
+        assert!(s.get("tank").unwrap().lease.is_none());
+        assert!(s.get("cache").unwrap().lease.is_none());
+        assert_eq!(
+            s.get("tank").unwrap().epoch,
+            1,
+            "revocation never rewinds a fence"
+        );
+        assert_eq!(
+            s.get("other")
+                .unwrap()
+                .lease
+                .as_ref()
+                .unwrap()
+                .holder_device,
+            "desktop",
+            "another device's lease is untouched"
+        );
+
+        let next = s.lease("tank", "new", "desktop").unwrap();
+        assert_eq!(next.epoch, 2, "the next writer gets a new door");
     }
 
     #[test]

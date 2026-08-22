@@ -135,6 +135,19 @@ pub fn is_plane_request(req: &Request) -> bool {
 
 /// Answer one volume request against this device's own volumes.
 pub async fn serve(req: Request) -> Response {
+    serve_for(req, None).await
+}
+
+/// Answer a volume request which arrived from an authenticated mesh peer.
+///
+/// Volume administration is orbit-wide, but a writer lease is narrower: its
+/// device field says which authenticated peer may renew, release, or open the
+/// export.  The peer does not get to supply that identity for itself.
+pub async fn serve_authenticated(req: Request, requester_device: &str) -> Response {
+    serve_for(req, Some(requester_device)).await
+}
+
+async fn serve_for(req: Request, requester_device: Option<&str>) -> Response {
     let result = match req {
         Request::VolumeCreate { name, size_bytes } => create(&name, size_bytes).await,
         Request::VolumeList => list().await,
@@ -143,13 +156,28 @@ pub async fn serve(req: Request) -> Response {
             volume,
             holder,
             holder_device,
-        } => grant(&volume, &holder, &holder_device).await,
+        } => {
+            let holder_device = match requester_device {
+                Some(authenticated) if authenticated != holder_device => Err(anyhow!(
+                    "authenticated device {authenticated:?} cannot request a volume lease for \
+                     device {holder_device:?}"
+                )),
+                Some(authenticated) => Ok(authenticated),
+                None => Ok(holder_device.as_str()),
+            };
+            match holder_device {
+                Ok(holder_device) => grant(&volume, &holder, holder_device).await,
+                Err(e) => Err(e),
+            }
+        }
         Request::VolumeReconnect {
             volume,
             holder,
             epoch,
-        } => resume(&volume, &holder, epoch).await,
-        Request::VolumeRelease { volume, holder } => release(&volume, &holder).await,
+        } => resume(&volume, &holder, epoch, requester_device).await,
+        Request::VolumeRelease { volume, holder } => {
+            release(&volume, &holder, requester_device).await
+        }
         other => Err(anyhow!("{other:?} is not a volume request")),
     };
     match result {
@@ -246,11 +274,17 @@ async fn grant(name: &str, holder: &str, holder_device: &str) -> Result<Response
 /// the consumer is holding this very one. The export may still need
 /// starting, for the same reason [`open_export`] may find it missing: a
 /// provider that restarted has a lease on disk and no process behind it.
-async fn resume(name: &str, holder: &str, epoch: u64) -> Result<Response> {
+async fn resume(
+    name: &str,
+    holder: &str,
+    epoch: u64,
+    requester_device: Option<&str>,
+) -> Result<Response> {
     let plane = plane()?;
     let mut store = plane.store.lock().await;
     let vol = store.reconnect(name, holder, epoch)?;
     let lease = vol.lease.clone().expect("reconnect checked the lease");
+    authorize_lease_device(name, &lease, requester_device)?;
 
     let socket = paths::volume_export_socket(name, lease.epoch);
     if !export_alive(lease.proc.as_ref(), &socket) {
@@ -267,9 +301,16 @@ async fn resume(name: &str, holder: &str, epoch: u64) -> Result<Response> {
     })
 }
 
-async fn release(name: &str, holder: &str) -> Result<Response> {
+async fn release(name: &str, holder: &str, requester_device: Option<&str>) -> Result<Response> {
     let plane = plane()?;
     let mut store = plane.store.lock().await;
+    if let Some(lease) = store.get(name)?.lease.as_ref() {
+        // Preserve Store::release's useful holder mismatch below.  The device
+        // check applies once this request names the actual holder.
+        if lease.holder == holder {
+            authorize_lease_device(name, lease, requester_device)?;
+        }
+    }
     let released = store.release(name, holder)?;
     store.save()?;
     if let Some(lease) = released {
@@ -280,6 +321,48 @@ async fn release(name: &str, holder: &str) -> Result<Response> {
     })
 }
 
+fn authorize_lease_device(
+    volume: &str,
+    lease: &volume::Lease,
+    requester_device: Option<&str>,
+) -> Result<()> {
+    if let Some(requester) = requester_device {
+        if lease.holder_device != requester {
+            bail!(
+                "volume {volume:?} is leased to device {:?}, not authenticated device \
+                 {requester:?}",
+                lease.holder_device
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Revoke every local volume lease whose writer was on a removed device.
+///
+/// The store is committed before an export is stopped: after a crash, a
+/// stopped export may safely be stopped again, while a live export backed by
+/// a lease that came back from disk would reopen a revoked writer's door.
+pub async fn revoke_device(device: &str) -> Result<usize> {
+    let Some(plane) = PLANE.get() else {
+        // Startup has not installed the plane yet, so there cannot be a mesh
+        // request holding one of its leases or exports.
+        return Ok(0);
+    };
+    let mut store = plane.store.lock().await;
+    let revoked = store.revoke_device(device);
+    if revoked.is_empty() {
+        return Ok(0);
+    }
+    store.save()?;
+    drop(store);
+
+    for (volume, lease) in &revoked {
+        stop_export(volume, lease.epoch, lease.proc.as_ref());
+    }
+    Ok(revoked.len())
+}
+
 /// Connect to the export serving `volume` at `epoch`, on behalf of `holder`.
 ///
 /// This is the far end of a splice, and it is where the fence is checked: a
@@ -287,7 +370,12 @@ async fn release(name: &str, holder: &str) -> Result<Response> {
 /// current one, gets a refusal rather than a pipe. Nothing about the reply
 /// tells a stale consumer what the new epoch is; it has to go and ask for a
 /// lease, which is the code path that decides whether it may have one.
-pub async fn open_export(volume: &str, holder: &str, epoch: u64) -> Result<tokio::net::UnixStream> {
+pub async fn open_export(
+    volume: &str,
+    holder: &str,
+    epoch: u64,
+    requester_device: &str,
+) -> Result<tokio::net::UnixStream> {
     let plane = plane()?;
     let mut store = plane.store.lock().await;
     let vol = store.get(volume)?.clone();
@@ -296,6 +384,13 @@ pub async fn open_export(volume: &str, holder: &str, epoch: u64) -> Result<tokio
     };
     if lease.holder != holder {
         bail!("{}", volume::held_by(volume, &lease));
+    }
+    if lease.holder_device != requester_device {
+        bail!(
+            "volume {volume:?} is leased to device {:?}, not authenticated device {:?}",
+            lease.holder_device,
+            requester_device
+        );
     }
     if lease.epoch != epoch {
         bail!("{}", volume::fenced(volume, holder, epoch, lease.epoch));
@@ -830,12 +925,13 @@ async fn splice_one(
     mut stream: tokio::net::UnixStream,
 ) -> Result<()> {
     let plane = plane()?;
-    if device == plane.node.device_name().await {
+    let local_device = plane.node.device_name().await;
+    if device == local_device {
         // The provider is this device. There is nothing for the mesh to do:
         // connect the guest's socket to the export socket directly. Same
         // lease, same epoch check, one less hop — `fast and light` is a rule,
         // not a preference (docs/MODEL.md).
-        let mut export = open_export(volume, holder, epoch).await?;
+        let mut export = open_export(volume, holder, epoch, &local_device).await?;
         tokio::io::copy_bidirectional(&mut stream, &mut export).await?;
         return Ok(());
     }
@@ -940,6 +1036,52 @@ mod tests {
             volume: "tank".into(),
             device: "desktop".into(),
         }));
+    }
+
+    #[tokio::test]
+    async fn a_mesh_peer_cannot_mint_a_lease_in_another_devices_name() {
+        let response = serve_authenticated(
+            Request::VolumeLease {
+                volume: "tank".into(),
+                holder: "dev".into(),
+                holder_device: "victim".into(),
+            },
+            "attacker",
+        )
+        .await;
+        match response {
+            Response::Error { message } => {
+                assert!(
+                    message.contains("authenticated device \"attacker\""),
+                    "{message}"
+                );
+                assert!(message.contains("device \"victim\""), "{message}");
+            }
+            other => panic!("an impersonated lease returned {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_existing_lease_accepts_only_its_authenticated_device() {
+        let lease = volume::Lease {
+            holder: "dev".into(),
+            holder_device: "laptop".into(),
+            epoch: 1,
+            granted_at: 0,
+            export: "tank-e1".into(),
+            pid: None,
+            proc: None,
+        };
+        assert!(authorize_lease_device("tank", &lease, None).is_ok());
+        assert!(authorize_lease_device("tank", &lease, Some("laptop")).is_ok());
+        let error = authorize_lease_device("tank", &lease, Some("desktop"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("leased to device \"laptop\""), "{error}");
+        assert!(
+            error.contains("authenticated device \"desktop\""),
+            "{error}"
+        );
     }
 
     /// A dead export leaves its socket file behind, so liveness is never the
