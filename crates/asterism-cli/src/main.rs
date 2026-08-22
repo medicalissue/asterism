@@ -1428,7 +1428,24 @@ fn device_shell_policy(action: Option<DeviceShellCommand>) -> Result<()> {
         DeviceShellCommand::Enable => ShellPolicyAction::Enable,
         DeviceShellCommand::Disable => ShellPolicyAction::Disable,
     };
-    let (status, revoked) = match send(&Request::DeviceShellPolicy { action })? {
+    let response = match action {
+        ShellPolicyAction::Status => {
+            let mut client = Client::open()?;
+            // Protocol 4 already had a local status action. Prefer the new
+            // read-only capability, but keep status useful during a rolling
+            // upgrade where the local daemon is one version behind.
+            let request = if Request::DeviceShellStatus.speakable_at(client.spoken) {
+                Request::DeviceShellStatus
+            } else {
+                Request::DeviceShellPolicy { action }
+            };
+            client.ask(&request)?
+        }
+        ShellPolicyAction::Enable | ShellPolicyAction::Disable => {
+            send(&Request::DeviceShellPolicy { action })?
+        }
+    };
+    let (status, revoked) = match response {
         Response::DeviceShellStatus { status, revoked } => (status, revoked),
         Response::Error { message } => bail!(message),
         other => bail!("unexpected reply from astd: {other:?}"),

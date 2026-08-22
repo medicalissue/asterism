@@ -3090,6 +3090,10 @@ async fn serve_stream(
                     device: node.device_name().await,
                     rows: crate::wake::check(),
                 },
+                Request::DeviceShellStatus => Response::DeviceShellStatus {
+                    status: node.shell.status(true),
+                    revoked: 0,
+                },
                 request if crate::volume::is_plane_request(&request) => {
                     crate::volume::serve_authenticated(
                         request,

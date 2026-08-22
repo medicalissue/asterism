@@ -137,6 +137,10 @@
   .future-slot p { color: var(--color-text-secondary); font-size: 11px; line-height: 1.5; }
 
   .device-facts { margin-top: 24px; }
+  .shell-policy-row { display: flex; min-height: 58px; align-items: center; gap: 12px; padding: 10px 12px; border: var(--hairline); border-radius: 8px; background: var(--app-subtle); }
+  .shell-policy-row .data-primary strong { font-size: 12px; }
+  .read-only-label { color: var(--color-text-secondary); font-size: 10px; }
+  .shell-session-list { margin-top: 8px; overflow: hidden; border: var(--hairline); border-radius: 8px; }
   .pair-sheet { width: min(460px, 70%); }
   .pair-body { display: flex; flex-direction: column; align-items: flex-start; gap: 14px; padding: 24px; }
   .pair-body.centered { align-items: center; justify-content: center; flex: 1; text-align: center; }

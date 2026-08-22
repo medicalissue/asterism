@@ -1,8 +1,9 @@
 import {useEffect, useState} from 'react';
 import {Button} from '@astryxdesign/core/Button';
 
-import type {DeviceRow, Devices as Model, Pairing} from './bridge';
-import {copy, onPairing, onWake, pairCancel, pairConfirm, pairStart, wake} from './bridge';
+import type {DeviceRow, DeviceShell, Devices as Model, Pairing} from './bridge';
+import {copy, onPairing, onWake, pairCancel, pairConfirm, pairStart, setDeviceShell, wake} from './bridge';
+import {canSetDeviceShell, changedAtIso, shellStateLabel} from './deviceShellView';
 import {CloseIcon, CopyIcon, DevicesIcon, PlusIcon} from './Icons';
 
 export function Devices({
@@ -81,7 +82,7 @@ export function Devices({
               onClick={() => setSelectedName(row.name)}
             >
               <span className={`status-dot ${row.online ? 'running' : 'stopped'}`} />
-              <span className="row-main"><strong>{row.name}</strong><small>{row.is_self ? 'this device' : row.short_id}</small></span>
+              <span className="row-main"><strong>{row.name}</strong><small>{row.is_self ? 'this device' : row.short_id} · {shellStateLabel(row.shell.status)}</small></span>
               <span className="row-source">{row.path || '—'}</span>
             </button>
           ))}
@@ -93,6 +94,8 @@ export function Devices({
           <DeviceDetail
             row={selected}
             waking={waking === selected.name}
+            onSay={onSay}
+            refresh={refresh}
             onWake={() => {
               setWaking(selected.name);
               onSay(`Waking ${selected.name}…`);
@@ -123,8 +126,40 @@ export function Devices({
   );
 }
 
-function DeviceDetail({row, waking, onWake}: {row: DeviceRow; waking: boolean; onWake: () => void}) {
+function DeviceDetail({
+  row,
+  waking,
+  onWake,
+  onSay,
+  refresh,
+}: {
+  row: DeviceRow;
+  waking: boolean;
+  onWake: () => void;
+  onSay: (line: string, bad?: boolean) => void;
+  refresh: () => void;
+}) {
   const canWake = row.wakeable && !row.online && !row.is_self;
+  const [shell, setShell] = useState<DeviceShell>(row.shell);
+  const [shellBusy, setShellBusy] = useState(false);
+
+  useEffect(() => setShell(row.shell), [row.short_id, row.shell]);
+
+  const changeShell = (enabled: boolean) => {
+    if (!canSetDeviceShell({...row, shell})) return;
+    setShellBusy(true);
+    onSay(`${enabled ? 'Enabling' : 'Disabling'} device shell on this device…`);
+    setDeviceShell(enabled).then(
+      authoritative => {
+        // Render only the daemon's reply; never optimistically invent policy.
+        setShell(authoritative);
+        onSay(`Device shell ${enabled ? 'enabled' : 'disabled'} on this device.`);
+        refresh();
+      },
+      error => onSay(String(error), true),
+    ).finally(() => setShellBusy(false));
+  };
+
   return (
     <div className="device-detail">
       <div className="detail-title-row">
@@ -141,8 +176,67 @@ function DeviceDetail({row, waking, onWake}: {row: DeviceRow; waking: boolean; o
         <div className="section-heading"><span>Presence</span><small>live daemon probe</small></div>
         <p className="quiet-copy">{row.online ? `${row.name} answered through ${row.path || 'the current mesh path'}.` : `${row.name} did not answer this probe. Its trusted identity remains in the orbit.`}</p>
       </section>
+      <DeviceShellSection row={{...row, shell}} busy={shellBusy} onChange={changeShell} />
     </div>
   );
+}
+
+function DeviceShellSection({row, busy, onChange}: {row: DeviceRow; busy: boolean; onChange: (enabled: boolean) => void}) {
+  const status = row.shell.status;
+  const changedIso = changedAtIso(status.changed_at);
+  const mutable = canSetDeviceShell(row);
+  const enabled = status.state === 'enabled_orbit' || status.state === 'active';
+
+  return (
+    <section className="detail-section device-shell-section" aria-label="Device shell policy">
+      <div className="section-heading">
+        <span>Device shell</span>
+        <small>{row.shell.access === 'local_only' ? 'local control' : 'read-only'}</small>
+      </div>
+      <div className="shell-policy-row">
+        <div className="data-primary">
+          <strong>{shellStateLabel(status)}</strong>
+          <small>
+            {changedIso && status.changed_at !== undefined ? (
+              <>Changed <time dateTime={changedIso}>{formatTime(status.changed_at)}</time></>
+            ) : 'Change time unavailable'}
+          </small>
+        </div>
+        {mutable ? (
+          <Button
+            label={enabled ? 'Disable' : 'Enable'}
+            size="sm"
+            variant={enabled ? 'secondary' : 'primary'}
+            isLoading={busy}
+            onClick={() => onChange(!enabled)}
+          />
+        ) : <span className="read-only-label">Read-only</span>}
+      </div>
+      {status.unavailable_reason ? <p className="inline-error">{status.unavailable_reason}</p> : null}
+      {status.active.length > 0 ? (
+        <div className="shell-session-list" aria-label="Active device shell sessions">
+          {status.active.map(session => (
+            <div className="data-row" key={session.session_id}>
+              <div className="data-primary">
+                <strong>{session.peer_name}</strong>
+                <small>{session.peer_device_id} · {session.pty ? 'PTY' : 'command'}</small>
+              </div>
+              <time className="data-meta" dateTime={changedAtIso(session.started_at) ?? undefined}>
+                Since {formatTime(session.started_at)}
+              </time>
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function formatTime(unixSeconds: number): string {
+  const iso = changedAtIso(unixSeconds);
+  if (iso === null) return 'time unavailable';
+  return new Intl.DateTimeFormat(undefined, {dateStyle: 'medium', timeStyle: 'short'})
+    .format(new Date(iso));
 }
 
 function PairSheet({

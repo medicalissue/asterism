@@ -65,6 +65,8 @@ struct PolicyFile {
     #[serde(default)]
     enabled_at: u64,
     #[serde(default)]
+    changed_at: u64,
+    #[serde(default)]
     epoch: u64,
     /// Full Ed25519 public keys. Names and short ids are never authority.
     #[serde(default)]
@@ -77,6 +79,7 @@ impl Default for PolicyFile {
             version: POLICY_VERSION,
             enabled: false,
             enabled_at: 0,
+            changed_at: 0,
             epoch: 0,
             allowed_device_ids: Vec::new(),
         }
@@ -171,7 +174,12 @@ impl Manager {
                 "the mesh endpoint is unavailable, so no authenticated device-shell stream can be served".to_owned()
             })
         });
-        let active: Vec<_> = state.sessions.values().map(|s| s.status.clone()).collect();
+        let mut active: Vec<_> = state.sessions.values().map(|s| s.status.clone()).collect();
+        active.sort_by(|a, b| {
+            a.started_at
+                .cmp(&b.started_at)
+                .then_with(|| a.session_id.cmp(&b.session_id))
+        });
         let policy_state = if unavailable.is_some() {
             ShellPolicyState::Unavailable
         } else if state.policy.enabled && !active.is_empty() {
@@ -184,6 +192,9 @@ impl Manager {
         ShellPolicyStatus {
             state: policy_state,
             epoch: state.policy.epoch,
+            changed_at: (state.policy.changed_at != 0)
+                .then_some(state.policy.changed_at)
+                .or_else(|| (state.policy.enabled_at != 0).then_some(state.policy.enabled_at)),
             enabled_at: (state.policy.enabled_at != 0).then_some(state.policy.enabled_at),
             active,
             unavailable_reason: unavailable,
@@ -202,10 +213,12 @@ impl Manager {
         if let Some(why) = &state.unavailable {
             bail!(why.clone());
         }
+        let changed_at = now_unix();
         let next = PolicyFile {
             version: POLICY_VERSION,
             enabled: true,
-            enabled_at: now_unix(),
+            enabled_at: changed_at,
+            changed_at,
             epoch: state.policy.epoch.saturating_add(1),
             allowed_device_ids,
         };
@@ -228,6 +241,7 @@ impl Manager {
             version: POLICY_VERSION,
             enabled: false,
             enabled_at: 0,
+            changed_at: now_unix(),
             epoch: state.policy.epoch.saturating_add(1),
             allowed_device_ids: Vec::new(),
         };
@@ -387,6 +401,7 @@ impl Manager {
             started_at: now_unix(),
             pty,
         };
+        state.policy.changed_at = status.started_at;
         let (revoke, revoked) = watch::channel(None);
         let epoch = state.policy.epoch;
         state.sessions.insert(
@@ -514,12 +529,14 @@ impl Lease {
 impl Drop for Lease {
     fn drop(&mut self) {
         if let Some(manager) = self.manager.upgrade() {
-            manager
+            let mut state = manager
                 .state
                 .lock()
-                .expect("device-shell policy lock poisoned")
-                .sessions
-                .remove(&self.status.session_id);
+                .expect("device-shell policy lock poisoned");
+            if state.sessions.remove(&self.status.session_id).is_some() {
+                state.policy.changed_at = now_unix();
+            }
+            drop(state);
             if !self.finished {
                 manager.audit_best_effort(AuditRecord::session(
                     "end",
@@ -1464,11 +1481,19 @@ mod tests {
     fn missing_policy_is_disabled_and_new_pairings_do_not_inherit_approval() {
         let tmp = tempfile::tempdir().unwrap();
         let manager = manager(tmp.path());
-        assert_eq!(manager.status(true).state, ShellPolicyState::Disabled);
-        manager.enable(vec!["peer-a".into()]).unwrap();
+        let missing = manager.status(true);
+        assert_eq!(missing.state, ShellPolicyState::Disabled);
+        assert_eq!(missing.changed_at, None);
+        let enabled = manager.enable(vec!["peer-a".into()]).unwrap();
+        assert_eq!(enabled.changed_at, enabled.enabled_at);
         let approved = manager.reserve("peer-a", "laptop", false).unwrap();
+        let active = manager.status(true);
+        assert_eq!(active.state, ShellPolicyState::Active);
+        assert_eq!(active.active_sessions(), 1);
+        assert!(active.changed_at.is_some());
         assert!(manager.reserve("peer-b", "new-laptop", false).is_err());
         drop(approved);
+        assert!(manager.status(true).changed_at.is_some());
         let mode = std::fs::metadata(tmp.path().join("shell.json"))
             .unwrap()
             .permissions()
@@ -1613,6 +1638,7 @@ mod tests {
             },
         }));
         assert!(local_only_request(&Request::DeviceShellEof));
+        assert!(!local_only_request(&Request::DeviceShellStatus));
         assert!(!local_only_request(&Request::List));
     }
 
