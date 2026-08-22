@@ -32,6 +32,10 @@ pub enum Action {
     /// Hand `astd` to launchd, by running the command that does it.
     ServiceInstall,
     ServiceUninstall,
+    /// Authenticate the selected release channel without changing files.
+    UpdateCheck,
+    /// Ask the shared updater to activate the authenticated compatible unit.
+    UpdateApply,
     Website,
     Quit,
 }
@@ -50,6 +54,8 @@ impl Action {
             Action::ToggleAutostart => "autostart".to_owned(),
             Action::ServiceInstall => "service:install".to_owned(),
             Action::ServiceUninstall => "service:uninstall".to_owned(),
+            Action::UpdateCheck => "update:check".to_owned(),
+            Action::UpdateApply => "update:apply".to_owned(),
             Action::Website => "website".to_owned(),
             Action::Quit => "quit".to_owned(),
         }
@@ -81,6 +87,11 @@ impl Action {
                 "uninstall" => Action::ServiceUninstall,
                 _ => return None,
             },
+            "update" => match rest {
+                "check" => Action::UpdateCheck,
+                "apply" => Action::UpdateApply,
+                _ => return None,
+            },
             "restore" => {
                 let (name, tag) = rest.split_once(':')?;
                 Action::Restore { name: name.to_owned(), tag: tag.to_owned() }
@@ -102,6 +113,8 @@ impl Action {
             Action::ToggleAutostart => "changing start at login".to_owned(),
             Action::ServiceInstall => "installing the astd service".to_owned(),
             Action::ServiceUninstall => "removing the astd service".to_owned(),
+            Action::UpdateCheck => "checking the signed update channel".to_owned(),
+            Action::UpdateApply => "installing the signed Asterism update".to_owned(),
             Action::Website => format!("opening {WEBSITE}"),
             Action::Quit => "quitting".to_owned(),
         }
@@ -133,6 +146,8 @@ mod tests {
             Action::ToggleAutostart,
             Action::ServiceInstall,
             Action::ServiceUninstall,
+            Action::UpdateCheck,
+            Action::UpdateApply,
             Action::Website,
             Action::Quit,
         ];

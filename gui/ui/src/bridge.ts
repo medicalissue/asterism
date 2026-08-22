@@ -279,6 +279,11 @@ export interface Settings {
   daemon_error: string | null;
   daemon_build: string | null;
   app_build: string;
+  update_channel: string;
+  update_version: string;
+  update_build: string;
+  update_manager: string;
+  update_error: string | null;
   home: string;
   service: Service;
 }
@@ -361,6 +366,11 @@ const PREVIEW_SETTINGS: Settings = {
   daemon_error: null,
   daemon_build: '0.0.2+0123456789ab',
   app_build: '0.0.2+0123456789ab',
+  update_channel: 'stable',
+  update_version: '0.0.2',
+  update_build: '0.0.2+0123456789ab',
+  update_manager: 'asterism',
+  update_error: null,
   home: '~/.asterism',
   service: {mechanism: 'LaunchAgent', summary: 'Running for this user', installed: true, unit: 'run.asterism.astd'},
 };

@@ -1189,6 +1189,7 @@ mod tests {
 
     use asterism_core::hv::ImageRef;
     use asterism_core::instance::{local_host, Instance, Shape};
+    use std::process::{Child, Command};
 
     /// An instance record, without a registry file to keep it in.
     fn instance(disk_gib: u32) -> Instance {
@@ -1897,10 +1898,33 @@ mod tests {
 
     /// A pid nothing is holding: a child that has already been waited for.
     fn dead_pid() -> u32 {
-        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let mut child = Command::new("true").spawn().unwrap();
         let pid = child.id();
         let _ = child.wait();
         pid
+    }
+
+    /// A process that stays available while the stale identity is exercised.
+    /// Keeping the child behind a guard makes the final liveness assertion
+    /// meaningful and ensures a failed assertion cannot leak a foreign
+    /// process into the rest of the test suite.
+    struct Sleeper(Child);
+
+    impl Sleeper {
+        fn spawn() -> Self {
+            Self(Command::new("sleep").arg("30").spawn().unwrap())
+        }
+
+        fn identity(&self) -> ProcId {
+            ProcId::capture(self.0.id()).unwrap()
+        }
+    }
+
+    impl Drop for Sleeper {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 
     /// The `pid: None` case, which used to be an error and is now the plain
@@ -1943,11 +1967,12 @@ mod tests {
     #[test]
     fn a_recycled_pid_is_stopped_and_refuses_the_signals() {
         let hv = Qemu::new();
-        let mut sleeper = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
-        let real = ProcId::capture(sleeper.id()).unwrap();
+        let sleeper = Sleeper::spawn();
+        let real = sleeper.identity();
+        assert!(
+            real.alive(),
+            "the foreign process is alive before the check"
+        );
         let stale = ProcId {
             started_us: real.started_us - 1,
             ..real.clone()
@@ -1960,10 +1985,10 @@ mod tests {
         // `stop` sent it SIGTERM and then SIGKILL.
         assert!(hv.stop(&h, Duration::from_millis(10)).is_ok());
         assert!(hv.kill(&h).is_ok());
-        assert!(real.alive(), "the process that owns that pid is untouched");
-
-        let _ = sleeper.kill();
-        let _ = sleeper.wait();
+        assert!(
+            real.alive(),
+            "the process that owns that pid is alive and untouched through the assertion"
+        );
     }
 
     /// Crash cleanup: the guest is gone, so every path is a no-op that

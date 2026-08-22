@@ -152,11 +152,18 @@ ensure_writable_prefix() {
 # — and so replacing a running `astd` is a rename, not a truncation.
 place() {
 	# $1 file to install, $2 name under bin/
-	staged="${PREFIX}/bin/.${2}.new.$$"
+	place_at "$1" "bin/$2"
+}
+
+place_at() {
+	# $1 source, $2 prefix-relative destination
+	dest="${PREFIX}/$2"
+	mkdir -p "$(dirname "$dest")"
+	staged="$(dirname "$dest")/.$(basename "$dest").new.$$"
 	cp "$1" "$staged"
 	chmod 755 "$staged"
-	mv -f "$staged" "${PREFIX}/bin/${2}"
-	say "installed ${PREFIX}/bin/${2}"
+	mv -f "$staged" "$dest"
+	say "installed ${dest}"
 }
 
 # macOS marks a file a *browser* downloaded with com.apple.quarantine, and
@@ -422,18 +429,30 @@ install_release() {
 	else
 		vz=0
 	fi
+	if [ -f "${unpack}/asterism-update" ]; then updater=1; else updater=0; fi
 
 	ensure_writable_prefix
 	place "${unpack}/ast" ast
 	place "${unpack}/astd" astd
+	if [ "$updater" = "1" ]; then
+		place_at "${unpack}/asterism-update" libexec/asterism/asterism-update
+	fi
 	if [ "$vz" = "1" ]; then
 		place "${unpack}/astd-vz" astd-vz
 		unquarantine "${PREFIX}/bin/ast" "${PREFIX}/bin/astd" "${PREFIX}/bin/astd-vz"
-		write_receipt "$version" "$target" release "$got" bin/ast bin/astd bin/astd-vz
+		if [ "$updater" = "1" ]; then
+			write_receipt "$version" "$target" release "$got" bin/ast bin/astd bin/astd-vz libexec/asterism/asterism-update
+		else
+			write_receipt "$version" "$target" release "$got" bin/ast bin/astd bin/astd-vz
+		fi
 	else
 		unquarantine "${PREFIX}/bin/ast" "${PREFIX}/bin/astd"
 		drop_stale_helper
-		write_receipt "$version" "$target" release "$got" bin/ast bin/astd
+		if [ "$updater" = "1" ]; then
+			write_receipt "$version" "$target" release "$got" bin/ast bin/astd libexec/asterism/asterism-update
+		else
+			write_receipt "$version" "$target" release "$got" bin/ast bin/astd
+		fi
 	fi
 
 	if [ "$installed" != "" ] && [ "$installed" != "$version" ]; then
@@ -511,12 +530,13 @@ install_source() {
 	# they install together.
 	place "${src}/target/release/ast" ast
 	place "${src}/target/release/astd" astd
+	place_at "${src}/packaging/update.sh" libexec/asterism/asterism-update
 	if [ "$vz" = "1" ]; then
 		place "${src}/target/release/astd-vz" astd-vz
-		write_receipt "$ref" "source" source "" bin/ast bin/astd bin/astd-vz
+		write_receipt "$ref" "source" source "" bin/ast bin/astd bin/astd-vz libexec/asterism/asterism-update
 	else
 		drop_stale_helper
-		write_receipt "$ref" "source" source "" bin/ast bin/astd
+		write_receipt "$ref" "source" source "" bin/ast bin/astd libexec/asterism/asterism-update
 	fi
 	note_vz "$vz"
 	note_qemu
@@ -790,6 +810,7 @@ uninstall() {
 	say "removed ${r}"
 	# Only if empty: someone else's files are not ours to sweep up.
 	rmdir "${PREFIX}/share/asterism" 2>/dev/null || true
+	rmdir "${PREFIX}/libexec/asterism" 2>/dev/null || true
 
 	say "instance state in ${ASTERISM_HOME:-${HOME}/.asterism} was left alone."
 	say "delete it by hand if you want it gone."

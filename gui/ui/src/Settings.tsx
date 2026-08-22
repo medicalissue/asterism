@@ -42,6 +42,17 @@ export function Settings({
       </section>
 
       <section className="settings-group">
+        <div className="settings-heading"><h2>Updates</h2><p>One signed channel for the app, CLI, daemon and VZ helper.</p></div>
+        <div className="setting-row">
+          <div><strong>{model.update_channel} channel</strong><p>{model.update_error ?? `${model.update_version} · ${model.update_build} · ${model.update_manager}`}</p></div>
+          <div className="button-row">
+            <Button label="Check" size="sm" variant="secondary" onClick={() => onAct('update:check', 'Checking the signed update channel')} />
+            <Button label="Install" size="sm" variant="primary" onClick={() => onAct('update:apply', 'Installing the signed update')} />
+          </div>
+        </div>
+      </section>
+
+      <section className="settings-group">
         <div className="settings-heading"><h2>Daemon service</h2><p>The background process that owns this device's parts.</p></div>
         <div className="setting-row">
           <div><strong>{model.service.mechanism}</strong><p title={model.service.unit}>{model.service.summary}</p></div>
