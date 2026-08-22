@@ -288,7 +288,7 @@ refute "a move refuses a mutated adopted source" "has changed since it was pulle
   env ASTERISM_HOME="$A" "$AST" move "$INST" "$B_NAME"
 cmp -s "$A/state.json" "$RUN/state-before-mutated-move.json" \
   || fail "the refused move fenced or otherwise changed A's source row"
-[ ! -e "$B/instances/$INST" ] \
+[ -z "$(ls "$B/instances" 2>/dev/null || true)" ] \
   || fail "the refused move staged an instance directory on B"
 [ -z "$(ls "$B/images" 2>/dev/null || true)" ] \
   || fail "the refused move changed B's image store"
