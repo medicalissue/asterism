@@ -782,27 +782,28 @@ impl Machine {
         let slot: Rc<RefCell<Option<Connected>>> = Rc::default();
         let handler = {
             let slot = slot.clone();
-            RcBlock::new(move |conn: *mut VZVirtioSocketConnection, err: *mut NSError| {
-                let outcome = match unsafe { err.as_ref() } {
-                    Some(err) => Err(err.localizedDescription().to_string()),
-                    None => match unsafe { Retained::retain(conn) } {
-                        None => Err("VZ reported neither a connection nor an error".to_owned()),
-                        Some(conn) => {
-                            // Duped rather than borrowed: VZ closes its own
-                            // descriptor when this object is released, and
-                            // the session thread must not be reading a
-                            // descriptor somebody else can close.
-                            match unsafe { dup(conn.fileDescriptor()) } {
-                                -1 => Err(
-                                    "could not duplicate the connection's descriptor".to_owned(),
-                                ),
-                                fd => Ok((conn, fd)),
+            RcBlock::new(
+                move |conn: *mut VZVirtioSocketConnection, err: *mut NSError| {
+                    let outcome = match unsafe { err.as_ref() } {
+                        Some(err) => Err(err.localizedDescription().to_string()),
+                        None => match unsafe { Retained::retain(conn) } {
+                            None => Err("VZ reported neither a connection nor an error".to_owned()),
+                            Some(conn) => {
+                                // Duped rather than borrowed: VZ closes its own
+                                // descriptor when this object is released, and
+                                // the session thread must not be reading a
+                                // descriptor somebody else can close.
+                                match unsafe { dup(conn.fileDescriptor()) } {
+                                    -1 => Err("could not duplicate the connection's descriptor"
+                                        .to_owned()),
+                                    fd => Ok((conn, fd)),
+                                }
                             }
-                        }
-                    },
-                };
-                *slot.borrow_mut() = Some(outcome);
-            })
+                        },
+                    };
+                    *slot.borrow_mut() = Some(outcome);
+                },
+            )
         };
         device.connectToPort_completionHandler(port, &handler);
         *self.connecting.borrow_mut() = Some(slot);

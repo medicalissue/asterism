@@ -170,7 +170,13 @@ impl Reference {
     pub fn slug(&self) -> String {
         self.canonical()
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '.' { c } else { '-' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '.' {
+                    c
+                } else {
+                    '-'
+                }
+            })
             .collect()
     }
 
@@ -247,7 +253,11 @@ pub fn parse(reference: &str) -> Option<Reference> {
     if !repository.split('/').all(is_path_component) {
         return None;
     }
-    Some(Reference { registry, repository, version })
+    Some(Reference {
+        registry,
+        repository,
+        version,
+    })
 }
 
 /// One path component of a repository name, per the distribution spec:
@@ -281,7 +291,8 @@ fn is_tag(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 128
         && s.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
 }
 
 fn is_digest(s: &str) -> bool {
@@ -289,7 +300,9 @@ fn is_digest(s: &str) -> bool {
         Some((algo, hex)) => {
             !algo.is_empty()
                 && hex.len() >= 32
-                && hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+                && hex
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
         }
         None => false,
     }
@@ -315,7 +328,11 @@ impl Config {
         let strings = |key: &str| -> Vec<String> {
             c[key]
                 .as_array()
-                .map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_owned)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|s| s.as_str().map(str::to_owned))
+                        .collect()
+                })
                 .unwrap_or_default()
         };
         let text = |key: &str| -> Option<String> {
@@ -390,7 +407,13 @@ fn pointer_path(reference: &Reference) -> PathBuf {
 }
 
 fn short(digest: &str) -> String {
-    digest.rsplit(':').next().unwrap_or(digest).chars().take(16).collect()
+    digest
+        .rsplit(':')
+        .next()
+        .unwrap_or(digest)
+        .chars()
+        .take(16)
+        .collect()
 }
 
 /// The built image for this reference, if this device has one.
@@ -428,7 +451,9 @@ pub fn built() -> Result<Vec<String>> {
         if path.extension().is_none_or(|e| e != "digest") {
             continue;
         }
-        let Ok(pointer) = std::fs::read_to_string(&path) else { continue };
+        let Ok(pointer) = std::fs::read_to_string(&path) else {
+            continue;
+        };
         let mut lines = pointer.lines();
         // Digest first, then the reference it was written for: the file
         // *name* is a slug, and a slug is not a reference.
@@ -446,7 +471,9 @@ pub fn built() -> Result<Vec<String>> {
 /// The config the stored image was built from, for `ast status`.
 pub fn stored_config(reference: &Reference) -> Option<Config> {
     let text = std::fs::read_to_string(config_path(&pointed_digest(reference)?)).ok()?;
-    Some(Config::from_json(&serde_json::from_str::<Value>(&text).ok()?))
+    Some(Config::from_json(
+        &serde_json::from_str::<Value>(&text).ok()?,
+    ))
 }
 
 // ---- pulling ---------------------------------------------------------------
@@ -476,15 +503,20 @@ pub fn pull(reference: &Reference, progress: bool) -> Result<Pulled> {
     if image.exists() && verify::check(&image, Depth::from_env()).is_ok() {
         let config = stored_config(reference).unwrap_or_default();
         write_pointer(reference, &digest)?;
-        return Ok(Pulled { digest, image, config, built: false });
+        return Ok(Pulled {
+            digest,
+            image,
+            config,
+            built: false,
+        });
     }
 
     let config_digest = manifest["config"]["digest"]
         .as_str()
         .context("image manifest names no config")?;
-    let config = Config::from_json(&serde_json::from_str::<Value>(
-        &std::fs::read_to_string(registry.blob(config_digest, progress)?)?,
-    )?);
+    let config = Config::from_json(&serde_json::from_str::<Value>(&std::fs::read_to_string(
+        registry.blob(config_digest, progress)?,
+    )?)?);
 
     let layers: Vec<&Value> = manifest["layers"]
         .as_array()
@@ -519,9 +551,17 @@ pub fn pull(reference: &Reference, progress: bool) -> Result<Pulled> {
     let _ = std::fs::remove_dir_all(&stage);
     built?;
 
-    std::fs::write(config_path(&digest), serde_json::to_vec_pretty(&config.to_json())?)?;
+    std::fs::write(
+        config_path(&digest),
+        serde_json::to_vec_pretty(&config.to_json())?,
+    )?;
     write_pointer(reference, &digest)?;
-    Ok(Pulled { digest, image, config, built: true })
+    Ok(Pulled {
+        digest,
+        image,
+        config,
+        built: true,
+    })
 }
 
 fn write_pointer(reference: &Reference, digest: &str) -> Result<()> {
@@ -655,10 +695,16 @@ impl<'a> Registry<'a> {
         // cannot compute means this image cannot be verified here at all, and
         // saying so before spending the network is the honest order.
         let want = Digest::parse(digest).with_context(|| {
-            format!("{} names its manifest with a digest Asterism cannot check", self.reference)
+            format!(
+                "{} names its manifest with a digest Asterism cannot check",
+                self.reference
+            )
         })?;
         let body = self.get(url, accept)?;
-        want.verify_bytes(body.as_bytes(), &format!("the manifest for {}", self.reference))?;
+        want.verify_bytes(
+            body.as_bytes(),
+            &format!("the manifest for {}", self.reference),
+        )?;
         Ok(body)
     }
 
@@ -715,7 +761,9 @@ impl<'a> Registry<'a> {
                     have.join(", ")
                 )
             })?;
-        let digest = picked["digest"].as_str().context("index entry has no digest")?;
+        let digest = picked["digest"]
+            .as_str()
+            .context("index entry has no digest")?;
         let url = format!(
             "https://{}/v2/{}/manifests/{}",
             self.reference.api_host(),
@@ -735,15 +783,13 @@ impl<'a> Registry<'a> {
         // Before the directory is even made: a blob whose algorithm we
         // cannot compute is an unverifiable source, and this refuses it
         // ahead of any mutation of the store.
-        let want = Digest::parse(digest).with_context(|| {
-            format!("{} lists a blob Asterism cannot verify", self.reference)
-        })?;
+        let want = Digest::parse(digest)
+            .with_context(|| format!("{} lists a blob Asterism cannot verify", self.reference))?;
         std::fs::create_dir_all(&self.blobs)?;
         let path = self.blobs.join(digest.replace(':', "-"));
         if path.exists() {
-            return cached_blob(&path, &want).with_context(|| {
-                format!("reusing the cached blob {digest}")
-            });
+            return cached_blob(&path, &want)
+                .with_context(|| format!("reusing the cached blob {digest}"));
         }
         let part = path.with_extension("part");
         let url = format!(
@@ -755,9 +801,7 @@ impl<'a> Registry<'a> {
         let _ = std::fs::remove_file(&part);
         self.transport
             .fetch(&url, self.token.as_deref(), &part, progress)
-            .with_context(|| {
-                format!("downloading {digest} from {}", self.reference.registry)
-            })?;
+            .with_context(|| format!("downloading {digest} from {}", self.reference.registry))?;
         // The registry named these bytes; this is where that claim is
         // settled. A truncated transfer and a substituted layer are the same
         // failure here, and neither takes the cache's name — and adoption
@@ -849,15 +893,23 @@ impl Tree {
     /// A whiteout removes the record along with the files.
     fn forget(&mut self, prefix: &str) {
         let below = format!("{prefix}/");
-        self.owners.retain(|p, _| p != prefix && !p.starts_with(&below));
-        self.dir_modes.retain(|p, _| p != prefix && !p.starts_with(&below));
+        self.owners
+            .retain(|p, _| p != prefix && !p.starts_with(&below));
+        self.dir_modes
+            .retain(|p, _| p != prefix && !p.starts_with(&below));
     }
 
     /// An opaque whiteout empties a directory but keeps the directory.
     fn forget_children(&mut self, dir: &str) {
-        let below = if dir.is_empty() { String::new() } else { format!("{dir}/") };
-        self.owners.retain(|p, _| !p.starts_with(&below) || p == dir);
-        self.dir_modes.retain(|p, _| !p.starts_with(&below) || p == dir);
+        let below = if dir.is_empty() {
+            String::new()
+        } else {
+            format!("{dir}/")
+        };
+        self.owners
+            .retain(|p, _| !p.starts_with(&below) || p == dir);
+        self.dir_modes
+            .retain(|p, _| !p.starts_with(&below) || p == dir);
     }
 }
 
@@ -1015,7 +1067,8 @@ fn furnish(root: &Path, config: &Config, tree: &mut Tree) -> Result<()> {
         if !path.exists() {
             std::fs::create_dir_all(&path)?;
             set_mode(&path, if dir == "tmp" { 0o1777 } else { 0o755 })?;
-            tree.dir_modes.insert(dir.to_owned(), if dir == "tmp" { 0o1777 } else { 0o755 });
+            tree.dir_modes
+                .insert(dir.to_owned(), if dir == "tmp" { 0o1777 } else { 0o755 });
             tree.note(dir, 0, 0);
         }
     }
@@ -1067,7 +1120,10 @@ fn busybox_binary() -> Result<PathBuf> {
     std::fs::create_dir_all(&stage)?;
     let lifted = (|| -> Result<()> {
         let mut tree = Tree::default();
-        for layer in manifest["layers"].as_array().context("busybox has no layers")? {
+        for layer in manifest["layers"]
+            .as_array()
+            .context("busybox has no layers")?
+        {
             let digest = layer["digest"].as_str().context("layer has no digest")?;
             unpack_layer(&registry.blob(digest, false)?, &stage, &mut tree)?;
         }
@@ -1176,7 +1232,10 @@ pub fn init_script(config: &Config) -> String {
         }
     }
     if let Some(dir) = &config.workdir {
-        s.push_str(&format!("$BB mkdir -p {0} 2>/dev/null\ncd {0} || exit 1\n", sh_quote(dir)));
+        s.push_str(&format!(
+            "$BB mkdir -p {0} 2>/dev/null\ncd {0} || exit 1\n",
+            sh_quote(dir)
+        ));
     }
 
     let argv = config.argv();
@@ -1305,7 +1364,10 @@ fn apply_ownership(tree: &Tree, image: &Path) -> Result<()> {
         // the directory bit goes back in: without it the kernel reads the
         // inode as a corrupt file and refuses the whole tree with "bogus
         // i_mode".
-        script.push_str(&format!("sif \"/{path}\" mode 0{:o}\n", S_IFDIR | (mode & 0o7777)));
+        script.push_str(&format!(
+            "sif \"/{path}\" mode 0{:o}\n",
+            S_IFDIR | (mode & 0o7777)
+        ));
     }
     if script.is_empty() {
         return Ok(());
@@ -1350,7 +1412,10 @@ fn e2fs_tool(name: &str) -> Result<PathBuf> {
 pub fn kernel_paths() -> (PathBuf, PathBuf) {
     let dir = paths::images_dir().join("kernel");
     let arch = host_arch();
-    (dir.join(format!("{arch}-vmlinuz")), dir.join(format!("{arch}-initrd")))
+    (
+        dir.join(format!("{arch}-vmlinuz")),
+        dir.join(format!("{arch}-initrd")),
+    )
 }
 
 /// The kernel an OCI instance boots, or why this device has not got one.
@@ -1448,7 +1513,10 @@ mod tests {
     fn bare_names_are_docker_hub_library_images() {
         assert_eq!(r("nginx").canonical(), "docker.io/library/nginx:latest");
         assert_eq!(r("nginx:1.27").canonical(), "docker.io/library/nginx:1.27");
-        assert_eq!(r("bitnami/redis").canonical(), "docker.io/bitnami/redis:latest");
+        assert_eq!(
+            r("bitnami/redis").canonical(),
+            "docker.io/bitnami/redis:latest"
+        );
         assert_eq!(
             r("docker.io/library/nginx:latest").canonical(),
             "docker.io/library/nginx:latest"
@@ -1456,7 +1524,10 @@ mod tests {
         assert_eq!(r("ghcr.io/owner/app:v1").registry, "ghcr.io");
         assert_eq!(r("ghcr.io/owner/app:v1").repository, "owner/app");
         // A scheme is a way to say "this is an image" out loud.
-        assert_eq!(r("docker://busybox").canonical(), "docker.io/library/busybox:latest");
+        assert_eq!(
+            r("docker://busybox").canonical(),
+            "docker.io/library/busybox:latest"
+        );
         // Docker Hub is not where Docker Hub's registry is.
         assert_eq!(r("nginx").api_host(), "registry-1.docker.io");
         assert_eq!(r("ghcr.io/o/a").api_host(), "ghcr.io");
@@ -1467,7 +1538,10 @@ mod tests {
         let digest = format!("sha256:{}", "a".repeat(64));
         let by_digest = r(&format!("nginx@{digest}"));
         assert_eq!(by_digest.version, Version::Digest(digest.clone()));
-        assert_eq!(by_digest.canonical(), format!("docker.io/library/nginx@{digest}"));
+        assert_eq!(
+            by_digest.canonical(),
+            format!("docker.io/library/nginx@{digest}")
+        );
         assert_eq!(by_digest.reference(), digest);
 
         // A colon in the registry is a port; the tag still defaults.
@@ -1523,7 +1597,10 @@ mod tests {
         )
         .unwrap();
         let config = Config::from_json(&doc);
-        assert_eq!(config.argv(), ["/docker-entrypoint.sh", "nginx", "-g", "daemon off;"]);
+        assert_eq!(
+            config.argv(),
+            ["/docker-entrypoint.sh", "nginx", "-g", "daemon off;"]
+        );
         assert_eq!(config.tcp_ports(), [80]);
         assert_eq!(config.workdir, None, "an empty string is not a directory");
         assert_eq!(config.user, None);
@@ -1544,7 +1621,11 @@ mod tests {
         let config = Config {
             entrypoint: vec!["/docker-entrypoint.sh".into()],
             cmd: vec!["nginx".into(), "-g".into(), "daemon off;".into()],
-            env: vec!["PATH=/bin".into(), "GREETING=it's here".into(), "bad name=x".into()],
+            env: vec![
+                "PATH=/bin".into(),
+                "GREETING=it's here".into(),
+                "bad name=x".into(),
+            ],
             workdir: Some("/srv".into()),
             user: None,
             exposed_ports: vec!["80/tcp".into()],
@@ -1575,7 +1656,10 @@ mod tests {
             user: Some("redis".into()),
             ..Default::default()
         });
-        assert!(dropped.contains("setuidgid 'redis' 'redis-server' &"), "{dropped}");
+        assert!(
+            dropped.contains("setuidgid 'redis' 'redis-server' &"),
+            "{dropped}"
+        );
 
         // An image with nothing to run says so on the console.
         let empty = init_script(&Config::default());
@@ -1587,7 +1671,10 @@ mod tests {
     #[test]
     fn layer_paths_cannot_escape_the_rootfs() {
         assert_eq!(guest_path(Path::new("usr/bin/env")).unwrap(), "usr/bin/env");
-        assert_eq!(guest_path(Path::new("./usr/bin/env")).unwrap(), "usr/bin/env");
+        assert_eq!(
+            guest_path(Path::new("./usr/bin/env")).unwrap(),
+            "usr/bin/env"
+        );
         assert!(guest_path(Path::new("../../etc/passwd")).is_none());
         assert!(guest_path(Path::new("/etc/passwd")).is_none());
         assert!(guest_path(Path::new("")).is_none());
@@ -1619,7 +1706,10 @@ mod tests {
         std::fs::write(root.join("var/log/new.log"), b"x").unwrap();
         tree.note("var/log/new.log", 0, 0);
         tree.forget_children("var/log");
-        assert!(tree.owners.contains_key("var/log"), "the directory itself stays");
+        assert!(
+            tree.owners.contains_key("var/log"),
+            "the directory itself stays"
+        );
         assert!(!tree.owners.contains_key("var/log/new.log"));
     }
 
@@ -1630,7 +1720,6 @@ mod tests {
         assert_eq!(sh_quote("$(rm -rf /)"), "'$(rm -rf /)'");
         assert_eq!(sh_quote("it's"), r"'it'\''s'");
     }
-
 
     // ---- verification ------------------------------------------------------
     //
@@ -1667,7 +1756,9 @@ mod tests {
 
         /// The tail of a url, which is all this fake keys on.
         fn key(url: &str) -> String {
-            url.rsplit_once("/v2/").map(|(_, r)| r.to_owned()).unwrap_or_else(|| url.to_owned())
+            url.rsplit_once("/v2/")
+                .map(|(_, r)| r.to_owned())
+                .unwrap_or_else(|| url.to_owned())
         }
     }
 
@@ -1735,8 +1826,14 @@ mod tests {
         let err = format!("{:#}", registry.blob(&digest, false).unwrap_err());
         assert!(err.contains("does not match its published digest"), "{err}");
         let cached = h.blobs.join(digest.replace(':', "-"));
-        assert!(!cached.exists(), "the substituted layer must not take the cache's name");
-        assert!(!cached.with_extension("part").exists(), "nor be left to be resumed");
+        assert!(
+            !cached.exists(),
+            "the substituted layer must not take the cache's name"
+        );
+        assert!(
+            !cached.with_extension("part").exists(),
+            "nor be left to be resumed"
+        );
     }
 
     /// The config blob decides what pid 1 runs, and it travels the same way
@@ -1771,7 +1868,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("cannot verify"), "{err}");
-        assert!(!h.blobs.exists(), "not even the cache directory was created");
+        assert!(
+            !h.blobs.exists(),
+            "not even the cache directory was created"
+        );
     }
 
     /// A cache written by an older Asterism has no provenance beside it. It
@@ -1802,7 +1902,10 @@ mod tests {
         let registry = h2.registry(&reference, Fake::default());
         let err = format!("{:#}", registry.blob(&digest, false).unwrap_err());
         assert!(err.contains("corrupted or tampered with"), "{err}");
-        assert!(!poisoned.exists(), "a poisoned blob is deleted, not left to be hit again");
+        assert!(
+            !poisoned.exists(),
+            "a poisoned blob is deleted, not left to be hit again"
+        );
     }
 
     /// A cache poisoned *after* Asterism adopted it — the provenance record
@@ -1818,7 +1921,10 @@ mod tests {
 
         std::fs::write(&path, b"tampered with, at a different length").unwrap();
         let err = format!("{:#}", registry.blob(&digest, false).unwrap_err());
-        assert!(err.contains("truncated or replaced") || err.contains("has changed"), "{err}");
+        assert!(
+            err.contains("truncated or replaced") || err.contains("has changed"),
+            "{err}"
+        );
     }
 
     /// Offline reuse: a blob that was verified when it was fetched is served
@@ -1902,7 +2008,11 @@ mod tests {
     #[test]
     fn an_image_with_no_build_for_this_architecture_is_refused_by_name() {
         let reference = r("nginx");
-        let other = if platform_arch() == "arm64" { "amd64" } else { "arm64" };
+        let other = if platform_arch() == "arm64" {
+            "amd64"
+        } else {
+            "arm64"
+        };
         let index = format!(
             r#"{{"manifests":[
                 {{"digest":"sha256:{}","platform":{{"os":"linux","architecture":"{other}"}}}},
@@ -1914,8 +2024,14 @@ mod tests {
         let h = Harness::new();
         let fake = Fake::default().doc("library/nginx/manifests/latest", &index);
         let text = format!("{:#}", h.registry(&reference, fake).manifest().unwrap_err());
-        assert!(text.contains(&format!("no linux/{}", platform_arch())), "{text}");
-        assert!(text.contains(other), "the error has to say what it does publish: {text}");
+        assert!(
+            text.contains(&format!("no linux/{}", platform_arch())),
+            "{text}"
+        );
+        assert!(
+            text.contains(other),
+            "the error has to say what it does publish: {text}"
+        );
         assert!(text.contains("riscv64"), "{text}");
     }
 
@@ -1931,7 +2047,10 @@ mod tests {
         let fake = Fake::default().doc("library/nginx/manifests/latest", body);
         let (digest, _) = h.registry(&reference, fake).manifest().unwrap();
         assert_eq!(digest, sha(body.as_bytes()));
-        assert!(digest.starts_with("sha256:"), "never a fallback hash: {digest}");
+        assert!(
+            digest.starts_with("sha256:"),
+            "never a fallback hash: {digest}"
+        );
         assert_eq!(Digest::parse(&digest).unwrap().hex().len(), 64);
     }
 
@@ -1952,8 +2071,14 @@ mod tests {
         })
         .unwrap_err();
         let text = format!("{err:#}");
-        assert!(text.contains("does not match its published digest"), "{text}");
-        assert!(text.contains(pinned.kernel.digest), "the error names what was expected: {text}");
+        assert!(
+            text.contains("does not match its published digest"),
+            "{text}"
+        );
+        assert!(
+            text.contains(pinned.kernel.digest),
+            "the error names what was expected: {text}"
+        );
         assert!(!kernel.exists(), "nothing was adopted");
         assert!(!initrd.exists());
         assert!(!verify::provenance_path(&kernel).exists());
@@ -1977,11 +2102,21 @@ mod tests {
         let id = sha(ibytes);
         let pinned = GuestKernel {
             arch: "test",
-            kernel: Pinned { url: "https://example/vmlinuz", digest: leak(kd) },
-            initrd: Pinned { url: "https://example/initrd", digest: leak(id) },
+            kernel: Pinned {
+                url: "https://example/vmlinuz",
+                digest: leak(kd),
+            },
+            initrd: Pinned {
+                url: "https://example/initrd",
+                digest: leak(id),
+            },
         };
         let serve = |url: &str, dest: &Path| -> Result<()> {
-            let bytes = if url.ends_with("vmlinuz") { kbytes } else { ibytes };
+            let bytes = if url.ends_with("vmlinuz") {
+                kbytes
+            } else {
+                ibytes
+            };
             std::fs::write(dest, bytes)?;
             Ok(())
         };
@@ -2049,7 +2184,11 @@ mod tests {
             // A dated serial, not the `release/` name that republishes over
             // itself: a pinned digest is only a pin if the url cannot move.
             for p in [&k.kernel, &k.initrd] {
-                assert!(p.url.contains("/release-2"), "{} is not an immutable url", p.url);
+                assert!(
+                    p.url.contains("/release-2"),
+                    "{} is not an immutable url",
+                    p.url
+                );
             }
         }
         assert!(KERNELS.iter().any(|k| k.arch == host_arch()));

@@ -133,8 +133,12 @@ impl Resolved {
     /// converted out of them. The published digest is the record's parent,
     /// which is exactly what `derived_from` is for.
     fn pin_satisfied(&self) -> Result<()> {
-        let Some(want) = &self.expected else { return Ok(()) };
-        let Some(record) = verify::provenance(&self.record) else { return Ok(()) };
+        let Some(want) = &self.expected else {
+            return Ok(());
+        };
+        let Some(record) = verify::provenance(&self.record) else {
+            return Ok(());
+        };
         let want = want.to_string();
         if record.content.to_string() == want || record.derived_from.contains(&want) {
             return Ok(());
@@ -187,9 +191,8 @@ impl Resolved {
         let origin = self.path.display().to_string();
         let mut source = Source::new("local-image", &origin);
         if let Some(want) = &self.expected {
-            want.verify_file(&self.path, "it").with_context(|| {
-                format!("{} is not the file {want} names", self.path.display())
-            })?;
+            want.verify_file(&self.path, "it")
+                .with_context(|| format!("{} is not the file {want} names", self.path.display()))?;
             source = source.derived_from([want.to_string()]);
         }
         verify::record(&self.path, &self.record, source)?;
@@ -275,8 +278,7 @@ impl Resolved {
             }
             None => Digest::of_file(verify::OWN_ALGO, staging)?,
         };
-        let source = Source::new("base-image", &self.name)
-            .derived_from([parent.to_string()]);
+        let source = Source::new("base-image", &self.name).derived_from([parent.to_string()]);
 
         let from = detect_format(staging)?;
         if from == DiskFormat::Raw {
@@ -334,8 +336,8 @@ fn convert_to_raw(src: &Path, from: DiskFormat, part: &Path) -> Result<()> {
 pub fn detect_format(path: &Path) -> Result<DiskFormat> {
     use std::io::Read;
     let mut magic = [0u8; 4];
-    let mut file = std::fs::File::open(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
     match file.read_exact(&mut magic) {
         Ok(()) if &magic == b"QFI\xfb" => Ok(DiskFormat::Qcow2),
         _ => Ok(DiskFormat::Raw),
@@ -522,7 +524,11 @@ pub fn resolve(reference: &str) -> Result<Resolved> {
             Some(d) => d.clone(),
             None => published.expected(reference)?,
         };
-        return Ok(stored(reference, Some(published.url.to_owned()), Some(expected)));
+        return Ok(stored(
+            reference,
+            Some(published.url.to_owned()),
+            Some(expected),
+        ));
     }
 
     if reference.starts_with("http://") || reference.starts_with("https://") {
@@ -549,7 +555,11 @@ pub fn resolve(reference: &str) -> Result<Resolved> {
                  or an OCI reference like docker.io/library/nginx:latest."
             );
         };
-        return Ok(stored(reference, Some(reference.to_owned()), Some(expected)));
+        return Ok(stored(
+            reference,
+            Some(reference.to_owned()),
+            Some(expected),
+        ));
     }
 
     let path = PathBuf::from(shellexpand_home(reference));
@@ -641,7 +651,13 @@ fn stored(reference: &str, url: Option<String>, expected: Option<Digest>) -> Res
 fn slug(s: &str) -> String {
     let mut out: String = s
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '.' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     // Keep url-derived names unique without keeping the whole url around.
     if s.contains("://") {
@@ -685,7 +701,11 @@ mod tests {
         let pinned = format!("https://example.com/x.qcow2#sha256:{}", "a".repeat(64));
         let r = resolve(&pinned).unwrap();
         assert_eq!(r.url.as_deref(), Some("https://example.com/x.qcow2"));
-        assert_eq!(r.format, DiskFormat::Raw, "the store keeps raw, whatever the url says");
+        assert_eq!(
+            r.format,
+            DiskFormat::Raw,
+            "the store keeps raw, whatever the url says"
+        );
     }
 
     /// A string that is none of the things this device knows about is a name
@@ -697,7 +717,10 @@ mod tests {
         let r = resolve("nginx").unwrap();
         assert_eq!(r.name, "docker.io/library/nginx:latest");
         assert_eq!(r.kind(), ImageKind::OciRootfs);
-        assert!(r.url.is_none(), "an image is pulled from a registry, not downloaded");
+        assert!(
+            r.url.is_none(),
+            "an image is pulled from a registry, not downloaded"
+        );
         assert!(r.staging.is_none());
 
         // Whether `nginx` is *pulled* is a fact about whichever store this
@@ -709,7 +732,10 @@ mod tests {
         let unbuilt = resolve(&format!("nginx@sha256:{}", "0".repeat(64))).unwrap();
         assert_eq!(unbuilt.kind(), ImageKind::OciRootfs);
         assert!(unbuilt.url.is_none());
-        assert!(!unbuilt.is_pulled(), "nothing has been built for that digest");
+        assert!(
+            !unbuilt.is_pulled(),
+            "nothing has been built for that digest"
+        );
 
         assert_eq!(
             resolve("docker.io/library/nginx:latest").unwrap().name,
@@ -781,7 +807,10 @@ mod tests {
         let hex = "a".repeat(64);
         let r = resolve(&format!("https://mirror.example/x.qcow2#sha256:{hex}")).unwrap();
         assert_eq!(r.url.as_deref(), Some("https://mirror.example/x.qcow2"));
-        assert_eq!(r.expected.as_ref().unwrap().to_string(), format!("sha256:{hex}"));
+        assert_eq!(
+            r.expected.as_ref().unwrap().to_string(),
+            format!("sha256:{hex}")
+        );
         // The pin is not part of the name, so re-pinning the same url to a
         // digest of a different algorithm is still the same image in the
         // store rather than a second copy of it.
@@ -802,7 +831,10 @@ mod tests {
         // publisher has moved the url out from under the entry.
         let pinned = resolve(&format!("ubuntu:24.04#blake3:{hex}")).unwrap();
         assert_eq!(pinned.name, "ubuntu:24.04");
-        assert_eq!(pinned.expected.as_ref().unwrap().algo(), verify::Algo::Blake3);
+        assert_eq!(
+            pinned.expected.as_ref().unwrap().algo(),
+            verify::Algo::Blake3
+        );
     }
 
     /// A pin Asterism cannot check is refused when the reference is read —
@@ -810,11 +842,15 @@ mod tests {
     /// anything in the store has changed.
     #[test]
     fn an_unverifiable_pin_refuses_the_reference_outright() {
-        let text = match resolve("https://mirror.example/x.qcow2#md5:d41d8cd98f00b204e9800998ecf8427e") {
-            Err(e) => format!("{e:#}"),
-            Ok(r) => panic!("a digest nothing can compute resolved to {}", r.name),
-        };
-        assert!(text.contains("pins a digest Asterism will not accept"), "{text}");
+        let text =
+            match resolve("https://mirror.example/x.qcow2#md5:d41d8cd98f00b204e9800998ecf8427e") {
+                Err(e) => format!("{e:#}"),
+                Ok(r) => panic!("a digest nothing can compute resolved to {}", r.name),
+            };
+        assert!(
+            text.contains("pins a digest Asterism will not accept"),
+            "{text}"
+        );
         assert!(text.contains("nothing was pulled"), "{text}");
         assert!(text.contains("unsupported digest algorithm"), "{text}");
 
@@ -858,7 +894,12 @@ mod tests {
                 );
                 // A pin is only a pin if the url cannot move under it. These
                 // are the two names that republish over themselves.
-                assert!(!p.url.contains("/latest/"), "{} {arch}: {}", entry.alias, p.url);
+                assert!(
+                    !p.url.contains("/latest/"),
+                    "{} {arch}: {}",
+                    entry.alias,
+                    p.url
+                );
                 assert!(
                     !p.url.contains("/release/"),
                     "{} {arch} points at a name that republishes: {}",
@@ -923,9 +964,18 @@ mod tests {
             )
             .unwrap_err()
         );
-        assert!(text.contains("does not match its published digest"), "{text}");
-        assert!(text.contains(published.digest), "the error names the pin: {text}");
-        assert!(!staging.exists(), "the substituted download was not adopted");
+        assert!(
+            text.contains("does not match its published digest"),
+            "{text}"
+        );
+        assert!(
+            text.contains(published.digest),
+            "the error names the pin: {text}"
+        );
+        assert!(
+            !staging.exists(),
+            "the substituted download was not adopted"
+        );
         assert!(!part.exists(), "nor left where a retry would resume it");
 
         // And the conversion stage refuses the same bytes, so a store left
@@ -947,7 +997,12 @@ mod tests {
             let entry = CATALOG.iter().find(|c| c.alias == alias).unwrap();
             for arch in ["aarch64", "x86_64"] {
                 assert_eq!(
-                    entry.for_arch(arch).unwrap().expected(alias).unwrap().algo(),
+                    entry
+                        .for_arch(arch)
+                        .unwrap()
+                        .expected(alias)
+                        .unwrap()
+                        .algo(),
                     algo,
                     "{alias} {arch}"
                 );
@@ -1090,7 +1145,10 @@ mod tests {
         // into it.
         r.record = store.clone();
         r.record_local().unwrap();
-        assert!(!verify::provenance_path(&theirs).exists(), "nothing is written beside it");
+        assert!(
+            !verify::provenance_path(&theirs).exists(),
+            "nothing is written beside it"
+        );
         r.verify_bootable().unwrap();
 
         // A user who replaces their image replaces its length too, which is
@@ -1127,7 +1185,10 @@ mod tests {
         std::fs::write(&theirs, vec![8u8; 128]).unwrap();
         let local = resolve(&theirs.display().to_string()).unwrap();
         assert!(!local.is_ours());
-        assert!(!local.discard(), "a file the user pointed at is not ours to throw away");
+        assert!(
+            !local.discard(),
+            "a file the user pointed at is not ours to throw away"
+        );
         assert!(theirs.exists(), "and it is still there");
 
         // An image the store downloaded is ours, and goes when it is told to.
@@ -1188,8 +1249,14 @@ mod tests {
         r.expected = Some(other.clone());
         let text = format!("{:#}", r.verify_bootable().unwrap_err());
         assert!(text.contains("published a different digest"), "{text}");
-        assert!(text.contains(&other.to_string()), "it names what was asked for: {text}");
-        assert!(text.contains(&published.to_string()), "and what is here: {text}");
+        assert!(
+            text.contains(&other.to_string()),
+            "it names what was asked for: {text}"
+        );
+        assert!(
+            text.contains(&published.to_string()),
+            "and what is here: {text}"
+        );
         assert!(text.contains("pull again"), "{text}");
 
         // Which is what makes `ast pull` fetch it: the copy here is the
@@ -1298,7 +1365,10 @@ mod tests {
         // answering the pin.
         verify::record(&r.path, &r.record, Source::new("base-image", "debian:13")).unwrap();
         let text = format!("{:#}", r.verify_bootable().unwrap_err());
-        assert!(text.contains("a different digest than the one asked for"), "{text}");
+        assert!(
+            text.contains("a different digest than the one asked for"),
+            "{text}"
+        );
     }
 
     /// Migration is lazy: an image that only exists as the qcow2 an older
@@ -1326,7 +1396,10 @@ mod tests {
         assert!(r.is_pulled());
         assert!(r.materialise().unwrap());
         assert!(r.path.exists());
-        assert!(!r.staging.as_ref().unwrap().exists(), "the staging copy is not kept");
+        assert!(
+            !r.staging.as_ref().unwrap().exists(),
+            "the staging copy is not kept"
+        );
         assert!(!r.materialise().unwrap(), "and again is a no-op");
     }
 }

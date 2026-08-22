@@ -55,7 +55,7 @@ use asterism_core::proc::{ProcId, Signal};
 use asterism_core::snapshot::{self, Snapshot};
 use asterism_core::{cow, paths, tools};
 use asterism_vz::guest;
-use asterism_vz::{Command as VzCommand, Config, Disk as VzDisk, Discovery, Reply, StopReason};
+use asterism_vz::{Command as VzCommand, Config, Discovery, Disk as VzDisk, Reply, StopReason};
 
 use super::{alive, grow, owned};
 
@@ -498,8 +498,7 @@ impl Hypervisor for Vz {
             // an instance whose seed predates the agent has no key file,
             // and telling the helper to look for one would be a boot that
             // complains instead of one that falls back.
-            agent_key: Some(paths::guest_agent_key_path(&inst.name))
-                .filter(|path| path.exists()),
+            agent_key: Some(paths::guest_agent_key_path(&inst.name)).filter(|path| path.exists()),
         };
         let config_path = req.dir.join("vz.json");
         config.write(&config_path)?;
@@ -573,7 +572,9 @@ impl Hypervisor for Vz {
             // or is reported — never quietly reported as a stop.
             return take_down_over_the_socket(
                 h,
-                VzCommand::Stop { timeout_secs: Some(deadline.mul_f32(0.75).as_secs()) },
+                VzCommand::Stop {
+                    timeout_secs: Some(deadline.mul_f32(0.75).as_secs()),
+                },
                 deadline,
             );
         };
@@ -850,7 +851,9 @@ fn take_down_over_the_socket(h: &Handle, command: VzCommand, budget: Duration) -
          it is, so it cannot be signalled. It was recorded at pid {}. Check that pid is \
          really the helper and stop it by hand.",
         ctl.display(),
-        h.pid.map(|p| p.to_string()).unwrap_or_else(|| "none".into())
+        h.pid
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "none".into())
     )
 }
 
@@ -1675,7 +1678,11 @@ mod tests {
         fake_helper_going_quiet(&sock, helper_info(asterism_vz::State::Running, None), 0);
         let hv = Vz::new();
 
-        let dead = ProcId { pid: dead_pid(), started_us: 1, exec: None };
+        let dead = ProcId {
+            pid: dead_pid(),
+            started_us: 1,
+            exec: None,
+        };
         let h = owning(&sock, Some(dead.clone()));
         assert!(!dead.alive(), "the pid really is nobody's");
         assert_eq!(hv.state(&h).unwrap(), RunState::Stopped);
@@ -1697,7 +1704,10 @@ mod tests {
 
         let mut sleeper = Command::new("sleep").arg("30").spawn().unwrap();
         let real = ProcId::capture(sleeper.id()).unwrap();
-        let stale = ProcId { started_us: real.started_us - 1, ..real.clone() };
+        let stale = ProcId {
+            started_us: real.started_us - 1,
+            ..real.clone()
+        };
         let h = owning(&sock, Some(stale));
 
         assert_eq!(hv.state(&h).unwrap(), RunState::Stopped);
@@ -1722,7 +1732,9 @@ mod tests {
         // Nothing bound at all: nothing of this guest is left, and saying so
         // is not a failure.
         let absent = dir.path().join("absent.sock");
-        assert!(hv.stop(&owning(&absent, None), Duration::from_millis(50)).is_ok());
+        assert!(hv
+            .stop(&owning(&absent, None), Duration::from_millis(50))
+            .is_ok());
         assert!(hv.kill(&owning(&absent, None)).is_ok());
 
         // A helper that answers `stop` the way a real one does. It is asked,
@@ -1731,7 +1743,11 @@ mod tests {
         let sock = dir.path().join("obliging.sock");
         obliging_helper(&sock);
         let h = owning(&sock, None);
-        assert_eq!(hv.state(&h).unwrap(), RunState::Stopped, "no live info reply");
+        assert_eq!(
+            hv.state(&h).unwrap(),
+            RunState::Stopped,
+            "no live info reply"
+        );
         assert!(hv.stop(&h, Duration::from_millis(500)).is_ok());
     }
 
@@ -1744,7 +1760,9 @@ mod tests {
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
-                let Ok(reading) = stream.try_clone() else { continue };
+                let Ok(reading) = stream.try_clone() else {
+                    continue;
+                };
                 let mut asked = String::new();
                 if BufReader::new(reading).read_line(&mut asked).is_err() {
                     continue;
@@ -1953,7 +1971,11 @@ mod tests {
         let hv = Vz::new();
         let h = owning(
             Path::new("/tmp/x.sock"),
-            Some(ProcId { pid: 1, started_us: 1, exec: None }),
+            Some(ProcId {
+                pid: 1,
+                started_us: 1,
+                exec: None,
+            }),
         );
         let err = hv.snapshot(&h, "t").unwrap_err().to_string();
         assert!(err.contains("vz"), "{err}");

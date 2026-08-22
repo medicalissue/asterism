@@ -620,7 +620,11 @@ mod tests {
 
         assert_eq!(o.remove("desktop").unwrap().device_id, "aa");
         assert!(!o.trusts("aa"), "a removed key must not still be trusted");
-        assert!(o.remove("desktop").unwrap_err().to_string().contains("no device named"));
+        assert!(o
+            .remove("desktop")
+            .unwrap_err()
+            .to_string()
+            .contains("no device named"));
     }
 
     #[test]
@@ -684,11 +688,18 @@ mod tests {
         // working ones survive while the relay hint and the clock move.
         assert!(o.refresh_addrs("aa", vec![], vec!["https://relay.example./".into()], 2_000));
         let d = o.get("desktop").unwrap();
-        assert_eq!(d.addrs, ["10.0.0.4:41641"], "a relay is not evidence of no IP");
+        assert_eq!(
+            d.addrs,
+            ["10.0.0.4:41641"],
+            "a relay is not evidence of no IP"
+        );
         assert_eq!(d.relays, ["https://relay.example./"]);
         assert_eq!(d.addrs_seen_at, 2_000);
 
-        assert!(!o.refresh_addrs("bb", vec!["1.2.3.4:5".into()], vec![], 9), "unknown peer");
+        assert!(
+            !o.refresh_addrs("bb", vec!["1.2.3.4:5".into()], vec![], 9),
+            "unknown peer"
+        );
     }
 
     #[test]
@@ -699,7 +710,10 @@ mod tests {
         assert!(o.set_wake("aa", facts("lan-1", "de:ad:be:ef:00:01")));
         // The same facts twice is not a change, so nothing needs saving.
         assert!(!o.set_wake("aa", facts("lan-1", "de:ad:be:ef:00:01")));
-        assert!(!o.set_wake("bb", facts("lan-1", "de:ad:be:ef:00:02")), "unknown peer");
+        assert!(
+            !o.set_wake("bb", facts("lan-1", "de:ad:be:ef:00:02")),
+            "unknown peer"
+        );
         o.save().unwrap();
 
         let reloaded = Orbit::load(&dir.path().join("orbit.json")).unwrap();
@@ -719,12 +733,18 @@ mod tests {
         o.set_wake("aa", facts("lan-1", "de:ad:be:ef:00:01"));
 
         o.add(peer("desktop", "aa")).unwrap();
-        assert_eq!(o.get("desktop").unwrap().wake.lan_id.as_deref(), Some("lan-1"));
+        assert_eq!(
+            o.get("desktop").unwrap().wake.lan_id.as_deref(),
+            Some("lan-1")
+        );
 
         let mut moved = peer("desktop", "aa");
         moved.wake = facts("lan-2", "de:ad:be:ef:00:01");
         o.add(moved).unwrap();
-        assert_eq!(o.get("desktop").unwrap().wake.lan_id.as_deref(), Some("lan-2"));
+        assert_eq!(
+            o.get("desktop").unwrap().wake.lan_id.as_deref(),
+            Some("lan-2")
+        );
     }
 
     /// The question `ast device wake` actually asks: who is on the sleeper's
@@ -733,14 +753,22 @@ mod tests {
     fn only_a_matching_known_lan_id_counts_as_sharing_a_network() {
         let dir = tempfile::tempdir().unwrap();
         let mut o = orbit(dir.path());
-        for (name, id, lan) in [("a", "aa", "lan-1"), ("b", "bb", "lan-2"), ("c", "cc", "lan-1")] {
+        for (name, id, lan) in [
+            ("a", "aa", "lan-1"),
+            ("b", "bb", "lan-2"),
+            ("c", "cc", "lan-1"),
+        ] {
             o.add(peer(name, id)).unwrap();
             o.set_wake(id, facts(lan, "de:ad:be:ef:00:01"));
         }
         o.add(peer("d", "dd")).unwrap(); // never said
 
         let target = facts("lan-1", "de:ad:be:ef:00:09");
-        let on_lan: Vec<&str> = o.on_lan_with(&target).iter().map(|d| d.name.as_str()).collect();
+        let on_lan: Vec<&str> = o
+            .on_lan_with(&target)
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
         assert_eq!(on_lan, ["a", "c"]);
 
         assert!(!WakeFacts::default().shares_lan_with(&target));
@@ -754,13 +782,22 @@ mod tests {
         let home = lan_fingerprint(Some("58:86:94:ac:56:d0"), Some("192.168.0.0/24"));
         // Same router, same subnet, different host address — the host address
         // was never an input, so this is the same LAN.
-        assert_eq!(home, lan_fingerprint(Some("58-86-94-AC-56-D0"), Some("192.168.0.0/24")));
+        assert_eq!(
+            home,
+            lan_fingerprint(Some("58-86-94-AC-56-D0"), Some("192.168.0.0/24"))
+        );
         // Same router, second VLAN: a different broadcast domain, and a
         // broadcast on one does not reach the other.
-        assert_ne!(home, lan_fingerprint(Some("58:86:94:ac:56:d0"), Some("192.168.9.0/24")));
+        assert_ne!(
+            home,
+            lan_fingerprint(Some("58:86:94:ac:56:d0"), Some("192.168.9.0/24"))
+        );
         // Different router, identical subnet numbers — the common case for
         // two houses, and the one a subnet-only id would get wrong.
-        assert_ne!(home, lan_fingerprint(Some("00:11:22:33:44:55"), Some("192.168.0.0/24")));
+        assert_ne!(
+            home,
+            lan_fingerprint(Some("00:11:22:33:44:55"), Some("192.168.0.0/24"))
+        );
 
         // With no gateway MAC the id is honestly weaker, and says so.
         let weak = lan_fingerprint(None, Some("192.168.0.0/24")).unwrap();
@@ -769,7 +806,10 @@ mod tests {
         // Knowing nothing produces nothing, rather than a constant that would
         // make every unlocatable device look like a neighbour.
         assert_eq!(lan_fingerprint(None, None), None);
-        assert_eq!(lan_fingerprint(Some("not-a-mac"), Some("192.168.0.0/24")), None);
+        assert_eq!(
+            lan_fingerprint(Some("not-a-mac"), Some("192.168.0.0/24")),
+            None
+        );
     }
 
     #[test]
@@ -779,7 +819,12 @@ mod tests {
             assert_eq!(parse_mac(spelling), Some(want), "{spelling}");
         }
         assert_eq!(format_mac(want), "de:ad:be:ef:00:01");
-        for junk in ["", "de:ad:be:ef:00", "de:ad:be:ef:00:01:02", "zz:ad:be:ef:00:01"] {
+        for junk in [
+            "",
+            "de:ad:be:ef:00",
+            "de:ad:be:ef:00:01:02",
+            "zz:ad:be:ef:00:01",
+        ] {
             assert_eq!(parse_mac(junk), None, "{junk}");
         }
     }
@@ -804,11 +849,17 @@ mod tests {
         );
         assert!(o.save().is_err());
         drop(armed);
-        assert_eq!(durable::sweep_temporaries(dir.path()), vec![durable::tmp_path(&path)]);
+        assert_eq!(
+            durable::sweep_temporaries(dir.path()),
+            vec![durable::tmp_path(&path)]
+        );
 
         let reloaded = Orbit::load(&path).unwrap();
         assert!(reloaded.trusts("aa"));
-        assert!(!reloaded.trusts("bb"), "a pairing that did not commit is not a pairing");
+        assert!(
+            !reloaded.trusts("bb"),
+            "a pairing that did not commit is not a pairing"
+        );
     }
 
     /// A torn orbit store is repaired from the last-known-good copy rather
@@ -828,7 +879,10 @@ mod tests {
         std::fs::write(&path, &whole[..whole.len() / 2]).unwrap();
 
         let reloaded = Orbit::load(&path).unwrap();
-        assert!(reloaded.trusts("aa"), "the devices from the commit before are still trusted");
+        assert!(
+            reloaded.trusts("aa"),
+            "the devices from the commit before are still trusted"
+        );
     }
 
     #[test]

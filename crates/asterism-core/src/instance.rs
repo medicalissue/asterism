@@ -132,7 +132,10 @@ impl Volume {
     /// told about survives daemon restarts and toolchain upgrades. Tags
     /// are capped at 31 bytes by virtio-9p; this is 15.
     pub fn mount_tag(&self) -> String {
-        format!("ast{:012x}", fnv1a(&format!("{}:{}", self.host, self.path)) >> 16)
+        format!(
+            "ast{:012x}",
+            fnv1a(&format!("{}:{}", self.host, self.path)) >> 16
+        )
     }
 }
 
@@ -144,7 +147,13 @@ pub fn default_mount_point(path: &str) -> String {
         .next()
         .unwrap_or("")
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     let base = base.trim_matches('-');
     if base.is_empty() {
@@ -198,7 +207,10 @@ impl std::str::FromStr for PortForward {
         let bad = || format!("{s:?} is not a port mapping — write it as HOST:GUEST, e.g. 8080:80");
         let (host, guest) = s.split_once(':').unwrap_or((s, s));
         let port = |p: &str| p.parse::<u16>().ok().filter(|p| *p != 0).ok_or_else(bad);
-        Ok(PortForward { host: port(host)?, guest: port(guest)? })
+        Ok(PortForward {
+            host: port(host)?,
+            guest: port(guest)?,
+        })
     }
 }
 
@@ -264,7 +276,10 @@ fn max_attempts() -> u32 {
 
 impl Default for Policy {
     fn default() -> Self {
-        Policy { restart: Restart::Always, max_attempts: MAX_ATTEMPTS }
+        Policy {
+            restart: Restart::Always,
+            max_attempts: MAX_ATTEMPTS,
+        }
     }
 }
 
@@ -277,7 +292,10 @@ impl Policy {
     /// must not be restarted three times on a backoff, and Asterism cannot
     /// tell "finished" from "fell over" without asking the guest.
     pub fn never() -> Self {
-        Policy { restart: Restart::Never, ..Policy::default() }
+        Policy {
+            restart: Restart::Never,
+            ..Policy::default()
+        }
     }
 }
 
@@ -291,7 +309,11 @@ pub struct Shape {
 
 impl Default for Shape {
     fn default() -> Self {
-        Shape { cpus: 2, mem_mib: 2048, disk_gib: 20 }
+        Shape {
+            cpus: 2,
+            mem_mib: 2048,
+            disk_gib: 20,
+        }
     }
 }
 
@@ -451,13 +473,7 @@ pub struct Instance {
 impl Instance {
     /// A newly defined instance. The legacy fields exist only to be read
     /// off older registries, so this is the only way to build one.
-    pub fn new(
-        name: &str,
-        cpu_device: &str,
-        image: &str,
-        shape: Shape,
-        machine: Machine,
-    ) -> Self {
+    pub fn new(name: &str, cpu_device: &str, image: &str, shape: Shape, machine: Machine) -> Self {
         Instance {
             id: uuid::Uuid::new_v4().to_string(),
             name: name.to_owned(),
@@ -507,7 +523,9 @@ impl Instance {
             // (`backend::adopt_identities`), and until then nothing signals
             // it.
             proc: None,
-            ctl: ControlChannel::Qmp { path: crate::paths::qmp_socket_path(&self.name) },
+            ctl: ControlChannel::Qmp {
+                path: crate::paths::qmp_socket_path(&self.name),
+            },
             endpoint: GuestEndpoint::HostForward { ssh_port },
             started_at: self.created_at,
         });
@@ -541,12 +559,12 @@ impl Instance {
             Part {
                 kind: "cpu/ram".into(),
                 source: self.cpu_device.clone(),
-                detail: format!(
-                    "{} cores · {} MiB",
-                    self.shape.cpus, self.shape.mem_mib
-                ),
+                detail: format!("{} cores · {} MiB", self.shape.cpus, self.shape.mem_mib),
                 note: self.moving.as_ref().map(|m| {
-                    format!("moving to {} — this copy will not boot until it lands", m.to_device)
+                    format!(
+                        "moving to {} — this copy will not boot until it lands",
+                        m.to_device
+                    )
                 }),
             },
             Part {
@@ -582,9 +600,8 @@ impl Instance {
                             v.host
                         ))
                     } else {
-                        (!v.is_local()).then(|| {
-                            format!("a directory on {} — same-device shares only", v.host)
-                        })
+                        (!v.is_local())
+                            .then(|| format!("a directory on {} — same-device shares only", v.host))
                     },
                 ),
                 VolumeKind::Block => (
@@ -694,7 +711,10 @@ mod tests {
     fn mount_points_come_from_the_basename() {
         assert_eq!(default_mount_point("/tank/media"), "/mnt/ast/media");
         assert_eq!(default_mount_point("/tank/media/"), "/mnt/ast/media");
-        assert_eq!(default_mount_point("/Users/me/My Stuff"), "/mnt/ast/My-Stuff");
+        assert_eq!(
+            default_mount_point("/Users/me/My Stuff"),
+            "/mnt/ast/My-Stuff"
+        );
         assert!(default_mount_point("/").starts_with("/mnt/ast/vol-"));
     }
 
@@ -720,7 +740,11 @@ mod tests {
 
         inst.seed_device = Some("laptop".into());
         inst.cpu_device = "desktop".into();
-        assert_eq!(inst.seeded_by(), "laptop", "the seed did not move with the cpu");
+        assert_eq!(
+            inst.seeded_by(),
+            "laptop",
+            "the seed did not move with the cpu"
+        );
     }
 
     #[test]
@@ -792,16 +816,24 @@ mod tests {
             machine(),
         );
         inst.image_kind = ImageKind::OciRootfs;
-        inst.publish = vec![PortForward { host: 8080, guest: 80 }];
+        inst.publish = vec![PortForward {
+            host: 8080,
+            guest: 80,
+        }];
 
         let parts = inst.parts();
         let find = |kind: &str| parts.iter().find(|p| p.kind == kind).expect(kind).clone();
-        assert!(find("disk").detail.contains("docker.io/library/nginx:latest"));
+        assert!(find("disk")
+            .detail
+            .contains("docker.io/library/nginx:latest"));
         assert_eq!(
             find("disk").note.as_deref(),
             Some("follows cpu · oci rootfs, direct kernel boot")
         );
-        assert_eq!(find("network").detail, "user-mode NAT · 127.0.0.1:8080 -> :80");
+        assert_eq!(
+            find("network").detail,
+            "user-mode NAT · 127.0.0.1:8080 -> :80"
+        );
 
         // ...and it survives the registry, kind and ports both.
         let json = serde_json::to_string(&inst).unwrap();
@@ -827,19 +859,42 @@ mod tests {
     #[test]
     fn port_mappings_are_read_the_way_people_write_them() {
         use std::str::FromStr;
-        assert_eq!(PortForward::from_str("8080:80").unwrap(), PortForward { host: 8080, guest: 80 });
+        assert_eq!(
+            PortForward::from_str("8080:80").unwrap(),
+            PortForward {
+                host: 8080,
+                guest: 80
+            }
+        );
         // One number is the same port on both sides.
-        assert_eq!(PortForward::from_str("5432").unwrap(), PortForward { host: 5432, guest: 5432 });
-        assert_eq!(PortForward::from_str("8080:80").unwrap().to_string(), "127.0.0.1:8080 -> :80");
-        for junk in ["", "80:", ":80", "0:80", "80:0", "http:80", "99999:80", "8080:80:8080"] {
+        assert_eq!(
+            PortForward::from_str("5432").unwrap(),
+            PortForward {
+                host: 5432,
+                guest: 5432
+            }
+        );
+        assert_eq!(
+            PortForward::from_str("8080:80").unwrap().to_string(),
+            "127.0.0.1:8080 -> :80"
+        );
+        for junk in [
+            "",
+            "80:",
+            ":80",
+            "0:80",
+            "80:0",
+            "http:80",
+            "99999:80",
+            "8080:80:8080",
+        ] {
             assert!(PortForward::from_str(junk).is_err(), "{junk:?}");
         }
     }
 
     #[test]
     fn volumes_without_a_mount_point_still_deserialize() {
-        let v: Volume =
-            serde_json::from_str(r#"{"path":"/tank/media","host":"desktop"}"#).unwrap();
+        let v: Volume = serde_json::from_str(r#"{"path":"/tank/media","host":"desktop"}"#).unwrap();
         assert_eq!(v.mount_point, None);
         assert_eq!(v.guest_path(), "/mnt/ast/media");
         // A record written before block volumes existed is a directory
@@ -854,11 +909,19 @@ mod tests {
     #[test]
     fn a_block_volume_reads_as_a_disk_with_a_lease() {
         let mut inst = Instance::new("dev", "laptop", "debian:13", Shape::default(), machine());
-        inst.volumes.push(Volume::block("tank", "desktop", 7, 10 << 30));
-        let part = inst.parts().into_iter().find(|p| p.kind == "volume").expect("volume");
+        inst.volumes
+            .push(Volume::block("tank", "desktop", 7, 10 << 30));
+        let part = inst
+            .parts()
+            .into_iter()
+            .find(|p| p.kind == "volume")
+            .expect("volume");
         assert_eq!(part.source, "desktop");
         assert_eq!(part.detail, "tank (10G) -> a disk in the guest");
-        assert_eq!(part.note.as_deref(), Some("nbd over the mesh · lease epoch 7"));
+        assert_eq!(
+            part.note.as_deref(),
+            Some("nbd over the mesh · lease epoch 7")
+        );
 
         // ...and it round-trips, epoch and all.
         let json = serde_json::to_string(&inst.volumes[0]).unwrap();

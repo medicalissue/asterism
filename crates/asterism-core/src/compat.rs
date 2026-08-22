@@ -167,7 +167,10 @@ pub struct Speaks {
 
 impl Speaks {
     pub fn new(min: u32, max: u32) -> Self {
-        Speaks { min: min.min(max), max }
+        Speaks {
+            min: min.min(max),
+            max,
+        }
     }
 
     /// What a peer that said nothing about versions speaks.
@@ -176,7 +179,10 @@ impl Speaks {
     /// only builds that say nothing are the ones from before the field
     /// existed, and their wire is the one this constant names.
     pub fn unversioned() -> Self {
-        Speaks { min: FIRST_PROTOCOL, max: FIRST_PROTOCOL }
+        Speaks {
+            min: FIRST_PROTOCOL,
+            max: FIRST_PROTOCOL,
+        }
     }
 
     /// The range a peer claimed, given the two numbers off the wire.
@@ -223,8 +229,12 @@ pub fn min_supported() -> u32 {
     use std::sync::OnceLock;
     static RESOLVED: OnceLock<u32> = OnceLock::new();
     *RESOLVED.get_or_init(|| {
-        let floor = protocol_version().saturating_sub(SUPPORTED_BACK).max(FIRST_PROTOCOL);
-        env_version(MIN_ENV).unwrap_or(floor).min(protocol_version())
+        let floor = protocol_version()
+            .saturating_sub(SUPPORTED_BACK)
+            .max(FIRST_PROTOCOL);
+        env_version(MIN_ENV)
+            .unwrap_or(floor)
+            .min(protocol_version())
     })
 }
 
@@ -451,13 +461,18 @@ impl HomeStamp {
         let mut ahead = Vec::new();
         let ours = protocol_version();
         if self.protocol > ours {
-            ahead.push(format!("protocol {} (this build speaks {ours})", self.protocol));
+            ahead.push(format!(
+                "protocol {} (this build speaks {ours})",
+                self.protocol
+            ));
         }
         let mine = stores();
         for (name, found) in &self.stores {
             match mine.get(name) {
                 Some(current) if found > current => {
-                    ahead.push(format!("{name} format {found} (this build writes {current})"));
+                    ahead.push(format!(
+                        "{name} format {found} (this build writes {current})"
+                    ));
                 }
                 // A store this build does not have. It is not something this
                 // build can corrupt — it will never open it — so it is not a
@@ -486,13 +501,14 @@ pub fn stamp_path(home: &Path) -> PathBuf {
 pub fn stamp_home(home: &Path) -> Result<Option<String>> {
     let path = stamp_path(home);
     let what = "this device's Asterism home stamp";
-    let found: Option<HomeStamp> = durable::load_json_versioned(&path, what, STAMP_VERSION)?
-        .map(|Loaded { value, repaired }| {
+    let found: Option<HomeStamp> = durable::load_json_versioned(&path, what, STAMP_VERSION)?.map(
+        |Loaded { value, repaired }| {
             if let Some(why) = repaired {
                 eprintln!("astd: {why}");
             }
             value
-        });
+        },
+    );
 
     let note = match &found {
         Some(stamp) => {
@@ -740,10 +756,22 @@ mod tests {
 
     #[test]
     fn the_newest_version_both_ends_have_is_the_one_chosen() {
-        assert_eq!(select_between(OURS, Speaks::new(1, 3)), Selection::Common(3));
-        assert_eq!(select_between(OURS, Speaks::new(1, 2)), Selection::Common(2));
-        assert_eq!(select_between(OURS, Speaks::new(2, 2)), Selection::Common(2));
-        assert_eq!(select_between(OURS, Speaks::new(1, 1)), Selection::Common(1));
+        assert_eq!(
+            select_between(OURS, Speaks::new(1, 3)),
+            Selection::Common(3)
+        );
+        assert_eq!(
+            select_between(OURS, Speaks::new(1, 2)),
+            Selection::Common(2)
+        );
+        assert_eq!(
+            select_between(OURS, Speaks::new(2, 2)),
+            Selection::Common(2)
+        );
+        assert_eq!(
+            select_between(OURS, Speaks::new(1, 1)),
+            Selection::Common(1)
+        );
     }
 
     /// The whole difference between negotiating and comparing. A peer that
@@ -751,8 +779,14 @@ mod tests {
     /// as it still serves one this build has.
     #[test]
     fn a_newer_peer_that_still_serves_our_wire_is_spoken_to_at_our_wire() {
-        assert_eq!(select_between(OURS, Speaks::new(1, 9)), Selection::Common(3));
-        assert_eq!(select_between(OURS, Speaks::new(3, 9)), Selection::Common(3));
+        assert_eq!(
+            select_between(OURS, Speaks::new(1, 9)),
+            Selection::Common(3)
+        );
+        assert_eq!(
+            select_between(OURS, Speaks::new(3, 9)),
+            Selection::Common(3)
+        );
     }
 
     #[test]
@@ -764,20 +798,29 @@ mod tests {
             .into_iter()
             .find(|r| r.verdict == "too_new")
             .expect("the matrix covers a build whose floor has passed this one");
-        assert_eq!(row.daemon_action, "refuse", "the newer half is never the half restarted");
+        assert_eq!(
+            row.daemon_action, "refuse",
+            "the newer half is never the half restarted"
+        );
         assert_eq!(row.peer_action, "refuse");
     }
 
     #[test]
     fn a_peer_below_everything_we_serve_is_replaced_rather_than_spoken_to() {
         let ours = Speaks::new(4, 6);
-        assert!(matches!(select_between(ours, Speaks::new(1, 3)), Selection::TooOld { .. }));
+        assert!(matches!(
+            select_between(ours, Speaks::new(1, 3)),
+            Selection::TooOld { .. }
+        ));
         let row = matrix(ours)
             .into_iter()
             .find(|r| r.verdict == "too_old")
             .expect("the matrix covers a build older than anything this one serves");
         assert_eq!(row.daemon_action, "replace");
-        assert_eq!(row.peer_action, "refuse", "nothing here can upgrade another device");
+        assert_eq!(
+            row.peer_action, "refuse",
+            "nothing here can upgrade another device"
+        );
     }
 
     /// A daemon from before this module answers `Ping` with no `protocol`
@@ -857,7 +900,10 @@ mod tests {
             );
         }
         for row in &matrix {
-            assert!(!row.note.is_empty(), "every row says what it is there to prove");
+            assert!(
+                !row.note.is_empty(),
+                "every row says what it is there to prove"
+            );
             assert!(row.peer_max >= FIRST_PROTOCOL, "version 0 is not a version");
             assert!(row.peer_min >= FIRST_PROTOCOL, "version 0 is not a version");
         }
@@ -886,7 +932,10 @@ mod tests {
         assert_eq!(row.daemon_action, "replace");
         assert_eq!(row.peer_action, "refuse");
         assert_eq!(row.speaks, None);
-        assert!(row.peer_max < 4, "the example really is below that build's floor");
+        assert!(
+            row.peer_max < 4,
+            "the example really is below that build's floor"
+        );
     }
 
     /// No row is printed twice. Two cases coincide at some vintages, and one
@@ -909,7 +958,10 @@ mod tests {
     fn every_versioned_store_is_in_the_table() {
         let table = stores();
         for name in ["registry", "orbit", "volumes", "secrets", "seed"] {
-            assert!(table.contains_key(name), "{name} is versioned on disk and not in the table");
+            assert!(
+                table.contains_key(name),
+                "{name} is versioned on disk and not in the table"
+            );
         }
     }
 
@@ -957,11 +1009,20 @@ mod tests {
     #[test]
     fn stamping_a_home_this_build_already_owns_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(stamp_home(dir.path()).unwrap().is_some(), "the first stamp is worth a line");
-        let written = std::fs::metadata(stamp_path(dir.path())).unwrap().modified().unwrap();
+        assert!(
+            stamp_home(dir.path()).unwrap().is_some(),
+            "the first stamp is worth a line"
+        );
+        let written = std::fs::metadata(stamp_path(dir.path()))
+            .unwrap()
+            .modified()
+            .unwrap();
         assert!(stamp_home(dir.path()).unwrap().is_none());
         assert_eq!(
-            std::fs::metadata(stamp_path(dir.path())).unwrap().modified().unwrap(),
+            std::fs::metadata(stamp_path(dir.path()))
+                .unwrap()
+                .modified()
+                .unwrap(),
             written,
             "a home that is only ever read stays untouched"
         );

@@ -161,7 +161,10 @@ mod tests {
         // trailing bytes as a MAC would match the wrong guest.
         let hw = "ff,f1:f5:dd:7f:0:2:0:0:ab:11:5f:eb:70:8:c6:9f:8c:b7";
         assert!(hw.strip_prefix("1,").is_none());
-        assert_eq!("1,a:b:c:1:2:3".strip_prefix("1,").map(normalize).as_deref(), Some("a:b:c:1:2:3"));
+        assert_eq!(
+            "1,a:b:c:1:2:3".strip_prefix("1,").map(normalize).as_deref(),
+            Some("a:b:c:1:2:3")
+        );
     }
 
     /// Taken verbatim from /var/db/dhcpd_leases mid-spike: two generations

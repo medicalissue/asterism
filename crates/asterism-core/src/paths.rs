@@ -132,12 +132,16 @@ pub fn volume_export_pid(name: &str, epoch: u64) -> PathBuf {
 pub fn volume_bridge_socket(instance: &str, host: &str, volume: &str) -> PathBuf {
     let safe = |s: &str| -> String {
         s.chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
             .collect()
     };
-    short_socket(
-        instance_dir(instance).join(format!("vol-{}-{}.sock", safe(host), safe(volume))),
-    )
+    short_socket(instance_dir(instance).join(format!("vol-{}-{}.sock", safe(host), safe(volume))))
 }
 
 /// Where a socket goes when its preferred path is too long to bind.
@@ -227,7 +231,15 @@ pub fn guest_key_cache(device: &str) -> PathBuf {
     // anything that is not a letter, digit or dash is flattened.
     let safe: String = device
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
-    home_dir().join("guest-keys").join(format!("{safe}.id_ed25519"))
+    home_dir()
+        .join("guest-keys")
+        .join(format!("{safe}.id_ed25519"))
 }

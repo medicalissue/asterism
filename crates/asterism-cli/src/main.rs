@@ -24,9 +24,9 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
+use asterism_core::compat;
 use asterism_core::hv::ImageKind;
 use asterism_core::instance::{now_unix, Instance, PortForward, Restart, Shape};
-use asterism_core::compat;
 use asterism_core::ipc;
 use asterism_core::proc::{ProcId, Signal};
 use asterism_core::protocol::{self, Request, Response};
@@ -544,7 +544,15 @@ fn main() -> Result<()> {
     let device = cli.device;
 
     let request = match cli.command {
-        Command::Create { name, image, publish, cpus, mem, disk, backend } => {
+        Command::Create {
+            name,
+            image,
+            publish,
+            cpus,
+            mem,
+            disk,
+            backend,
+        } => {
             // An image for another device has to be on that device: pulling it
             // here would fill this disk and still leave the far one without it.
             let resolved = match &device {
@@ -582,50 +590,69 @@ fn main() -> Result<()> {
         // because the user already said which they meant by how they wrote
         // it — and because a directory on another device has always had to be
         // an absolute path, so there is nothing ambiguous left over.
-        Command::Attach { name, volume, host, at, secret, to, placement, env, from } => {
-            match attaching(volume, secret)? {
-                Attaching::Secret(secret) => Request::AttachSecret {
-                    name,
-                    secret,
-                    authority: to.ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "a secret is bound to one authority — say which with --to, \
+        Command::Attach {
+            name,
+            volume,
+            host,
+            at,
+            secret,
+            to,
+            placement,
+            env,
+            from,
+        } => match attaching(volume, secret)? {
+            Attaching::Secret(secret) => Request::AttachSecret {
+                name,
+                secret,
+                authority: to.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "a secret is bound to one authority — say which with --to, \
                              e.g. --to api.anthropic.com"
-                        )
-                    })?,
-                    placement: placement
-                        .as_deref()
-                        .map(asterism_core::secret::Placement::parse)
-                        .transpose()?,
-                    env,
-                    source_device: from,
-                },
-                Attaching::Volume(volume) => match block_ref(&volume, host.as_deref()) {
-                    Some((device, volume)) => {
-                        if at.is_some() {
-                            bail!(
-                                "--at is for directory volumes; a block volume arrives as a \
-                                 disk and the guest mounts it wherever it likes"
-                            );
-                        }
-                        warn_if_far(&device);
-                        Request::AttachBlock { name, volume, device }
-                    }
-                    None => Request::AttachVolume {
-                        name,
-                        path: volume_path(&volume, host.as_deref())?,
-                        host,
-                        mount_point: at,
-                    },
-                },
-            }
-        }
-        Command::Detach { name, volume, host, secret } => match attaching(volume, secret)? {
-            Attaching::Secret(secret) => Request::DetachSecret { name, secret },
+                    )
+                })?,
+                placement: placement
+                    .as_deref()
+                    .map(asterism_core::secret::Placement::parse)
+                    .transpose()?,
+                env,
+                source_device: from,
+            },
             Attaching::Volume(volume) => match block_ref(&volume, host.as_deref()) {
                 Some((device, volume)) => {
-                    Request::Detach { name, volume, host: Some(device) }
+                    if at.is_some() {
+                        bail!(
+                            "--at is for directory volumes; a block volume arrives as a \
+                                 disk and the guest mounts it wherever it likes"
+                        );
+                    }
+                    warn_if_far(&device);
+                    Request::AttachBlock {
+                        name,
+                        volume,
+                        device,
+                    }
                 }
+                None => Request::AttachVolume {
+                    name,
+                    path: volume_path(&volume, host.as_deref())?,
+                    host,
+                    mount_point: at,
+                },
+            },
+        },
+        Command::Detach {
+            name,
+            volume,
+            host,
+            secret,
+        } => match attaching(volume, secret)? {
+            Attaching::Secret(secret) => Request::DetachSecret { name, secret },
+            Attaching::Volume(volume) => match block_ref(&volume, host.as_deref()) {
+                Some((device, volume)) => Request::Detach {
+                    name,
+                    volume,
+                    host: Some(device),
+                },
                 None => Request::Detach {
                     name,
                     volume: volume_path(&volume, host.as_deref())?,
@@ -635,7 +662,12 @@ fn main() -> Result<()> {
         },
         // A move reports as it goes — a preflight, a fence, a disk crossing a
         // network — so it takes the connection the way pairing and wake do.
-        Command::Set { name, part, to, down } => {
+        Command::Set {
+            name,
+            part,
+            to,
+            down,
+        } => {
             local_only("set", device.as_deref())?;
             return set_part(&name, &part, &to, down);
         }
@@ -652,7 +684,11 @@ fn main() -> Result<()> {
         Command::Volume(VolumeCommand::Ls) => Request::VolumeList,
         Command::Volume(VolumeCommand::Rm { name }) => Request::VolumeRemove { name },
         Command::Secret(cmd) => return secret_command(cmd, device.as_deref()),
-        Command::Logs { name, follow, lines } => {
+        Command::Logs {
+            name,
+            follow,
+            lines,
+        } => {
             local_only("logs", device.as_deref())?;
             return logs(&name, follow, lines);
         }
@@ -664,9 +700,7 @@ fn main() -> Result<()> {
             return take_snapshot(name, tag, device.as_deref());
         }
         Command::Snapshots { name } => return print_snapshots(&name, device.as_deref()),
-        Command::Restore { name, tag } => {
-            return restore_snapshot(&name, &tag, device.as_deref())
-        }
+        Command::Restore { name, tag } => return restore_snapshot(&name, &tag, device.as_deref()),
         // The image store is per device, so both of these are about this one.
         Command::Images { verify } => {
             local_only("images", device.as_deref())?;
@@ -906,7 +940,10 @@ fn print_secrets(secrets: &[asterism_core::secret::Secret]) {
 /// implementation to become remote.
 fn aimed(request: Request, device: Option<&str>) -> Request {
     match device {
-        Some(name) => Request::Proxy { device: name.to_owned(), inner: Box::new(request) },
+        Some(name) => Request::Proxy {
+            device: name.to_owned(),
+            inner: Box::new(request),
+        },
         None => request,
     }
 }
@@ -949,8 +986,15 @@ fn print_devices() -> Result<()> {
 }
 
 fn ping(device: &str) -> Result<()> {
-    match send(&Request::DevicePing { device: device.into() })? {
-        Response::DevicePong { device, device_id, path, millis } => {
+    match send(&Request::DevicePing {
+        device: device.into(),
+    })? {
+        Response::DevicePong {
+            device,
+            device_id,
+            path,
+            millis,
+        } => {
             let short: String = device_id.chars().take(12).collect();
             println!("pong from {device} ({short}) via {path} in {millis:.1}ms");
             Ok(())
@@ -1020,7 +1064,11 @@ fn print_compat(json: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!("ast {}  speaks {}", table.asterism, describe(table.min_supported, table.protocol));
+    println!(
+        "ast {}  speaks {}",
+        table.asterism,
+        describe(table.min_supported, table.protocol)
+    );
     match &table.daemon {
         Some(daemon) => println!(
             "astd {}  speaks {}  —  talking at protocol {}",
@@ -1043,7 +1091,10 @@ fn print_compat(json: bool) -> Result<()> {
         println!("  {name:<20} version {version}");
     }
     println!("\nwhat this build does about a peer that speaks:");
-    println!("  {:<18} {:<9} {:<9} then", "peer speaks", "as daemon", "as peer");
+    println!(
+        "  {:<18} {:<9} {:<9} then",
+        "peer speaks", "as daemon", "as peer"
+    );
     for row in &table.matrix {
         println!(
             "  {:<18} {:<9} {:<9} {}",
@@ -1075,12 +1126,14 @@ fn device_command(cmd: DeviceCommand) -> Result<()> {
             println!("{name}  removed from this orbit");
             Ok(())
         }
-        DeviceCommand::Invite { name, ttl, yes } => {
-            pair(Request::DeviceInvite { name, ttl_secs: ttl }, yes)
-        }
-        DeviceCommand::Add { ticket, name, yes } => {
-            pair(Request::DeviceAdd { ticket, name }, yes)
-        }
+        DeviceCommand::Invite { name, ttl, yes } => pair(
+            Request::DeviceInvite {
+                name,
+                ttl_secs: ttl,
+            },
+            yes,
+        ),
+        DeviceCommand::Add { ticket, name, yes } => pair(Request::DeviceAdd { ticket, name }, yes),
         DeviceCommand::Wake { name } => wake(&name),
         // Routed before this, so that `--device` can aim it.
         DeviceCommand::Check => device_check(None),
@@ -1189,7 +1242,10 @@ fn pair(request: Request, yes: bool) -> Result<()> {
     let mut conn = Conversation::open(&request)?;
     loop {
         match conn.next()? {
-            Response::Ticket { ticket, expires_in_secs } => {
+            Response::Ticket {
+                ticket,
+                expires_in_secs,
+            } => {
                 println!("give this to the other device, within {expires_in_secs}s:\n");
                 println!("  ast device add {ticket}\n");
                 println!("waiting for a device to redeem it ...");
@@ -1343,7 +1399,10 @@ fn pull_oci(image: &oci::Reference) -> Result<String> {
             pulled.image.display(),
             pulled.digest
         ),
-        false => eprintln!("{image} is already built on this device ({})", pulled.digest),
+        false => eprintln!(
+            "{image} is already built on this device ({})",
+            pulled.digest
+        ),
     }
     // What the machine will actually run, said out loud: it is the one thing
     // about a container image that decides whether the instance does anything.
@@ -1401,11 +1460,20 @@ fn download(url: &str, dest: &std::path::Path) -> Result<()> {
 }
 
 fn print_images(full: bool) -> Result<()> {
-    let depth = if full { verify::Depth::Full } else { verify::Depth::Quick };
+    let depth = if full {
+        verify::Depth::Full
+    } else {
+        verify::Depth::Quick
+    };
     let mut unsound = 0usize;
     // `PULLED` answers two questions at once, because they are the same
     // question to the person reading it: is it here, and can it be booted.
-    println!("{:<14} {:<8} SOURCE ({})", "NAME", "PULLED", image::host_arch());
+    println!(
+        "{:<14} {:<8} SOURCE ({})",
+        "NAME",
+        "PULLED",
+        image::host_arch()
+    );
     for entry in image::CATALOG {
         let r = image::resolve(entry.alias)?;
         // An image pulled by an older Asterism is still on this device even
@@ -1422,22 +1490,26 @@ fn print_images(full: bool) -> Result<()> {
                 }
             },
         };
-        println!("{:<14} {:<8} {}", entry.alias, pulled, r.url.as_deref().unwrap_or("-"));
+        println!(
+            "{:<14} {:<8} {}",
+            entry.alias,
+            pulled,
+            r.url.as_deref().unwrap_or("-")
+        );
     }
     // Container images are not a catalog — the catalog is Docker Hub — but
     // the ones this device has built are as real as any row above, and
     // nothing else would tell the user what is taking up the space.
     for reference in oci::built()? {
-        let state = match image::resolve(&reference)
-            .and_then(|r| verify_row(&r.path, &r.record, depth))
-        {
-            Ok(()) => "yes".to_owned(),
-            Err(e) => {
-                unsound += 1;
-                eprintln!("{reference}: {e:#}");
-                "BAD".to_owned()
-            }
-        };
+        let state =
+            match image::resolve(&reference).and_then(|r| verify_row(&r.path, &r.record, depth)) {
+                Ok(()) => "yes".to_owned(),
+                Err(e) => {
+                    unsound += 1;
+                    eprintln!("{reference}: {e:#}");
+                    "BAD".to_owned()
+                }
+            };
         println!("{:<14} {:<8} {}", short_image(&reference), state, reference);
     }
     if unsound > 0 {
@@ -1459,7 +1531,11 @@ fn print_images(full: bool) -> Result<()> {
 /// An image only half-migrated by an older Asterism — the qcow2 is there and
 /// the raw is not — has nothing to check yet, and saying so is not a
 /// complaint about it.
-fn verify_row(path: &std::path::Path, record: &std::path::Path, depth: verify::Depth) -> Result<()> {
+fn verify_row(
+    path: &std::path::Path,
+    record: &std::path::Path,
+    depth: verify::Depth,
+) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
@@ -1499,9 +1575,9 @@ const SLOW_LINK_MS: f64 = 5.0;
 /// knows which this is. Silent if the device cannot be reached — the attach
 /// itself is about to say so much better than a ping could.
 fn warn_if_far(device: &str) {
-    let Ok(Response::DevicePong { millis, .. }) =
-        send(&Request::DevicePing { device: device.to_owned() })
-    else {
+    let Ok(Response::DevicePong { millis, .. }) = send(&Request::DevicePing {
+        device: device.to_owned(),
+    }) else {
         return;
     };
     if millis > SLOW_LINK_MS {
@@ -1590,7 +1666,11 @@ fn ssh(name: &str, command: &[String]) -> Result<()> {
     refuse_ssh_to_an_oci_guest(name)?;
     let mut conn = Conversation::open(&Request::SshEndpoint { name: name.into() })?;
     let (host, port, identity) = match conn.next()? {
-        Response::SshEndpoint { host, port, identity } => (host, port, identity),
+        Response::SshEndpoint {
+            host,
+            port,
+            identity,
+        } => (host, port, identity),
         Response::Error { message } => bail!(message),
         other => bail!("unexpected reply from astd: {other:?}"),
     };
@@ -1612,12 +1692,14 @@ fn ssh(name: &str, command: &[String]) -> Result<()> {
     }
 
     let status = std::process::Command::new("ssh")
-        .arg("-i").arg(&identity)
+        .arg("-i")
+        .arg(&identity)
         .args(["-o", "StrictHostKeyChecking=no"])
         .args(["-o", "UserKnownHostsFile=/dev/null"])
         .args(["-o", "LogLevel=ERROR"])
         .args(["-o", "ConnectionAttempts=30"])
-        .arg("-p").arg(port.to_string())
+        .arg("-p")
+        .arg(port.to_string())
         .arg(format!("ast@{host}"))
         .args(command)
         .status()
@@ -1663,9 +1745,10 @@ fn ssh_banner_up(host: &str, port: u16) -> bool {
     let Ok(mut addrs) = (host, port).to_socket_addrs() else {
         return false;
     };
-    let Some(addr) = addrs.next() else { return false };
-    let Ok(stream) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500))
-    else {
+    let Some(addr) = addrs.next() else {
+        return false;
+    };
+    let Ok(stream) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)) else {
         return false;
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
@@ -1708,7 +1791,10 @@ fn snapshot_target(words: &[String]) -> Result<(&str, Option<String>)> {
 fn take_snapshot(name: &str, tag: Option<String>, device: Option<&str>) -> Result<()> {
     let tag = tag.unwrap_or_else(snapshot::timestamped_tag);
     send_ok(&aimed(
-        Request::Snapshot { name: name.into(), tag: tag.clone() },
+        Request::Snapshot {
+            name: name.into(),
+            tag: tag.clone(),
+        },
         device,
     ))?;
     println!("{name}  snapshot {tag}");
@@ -1717,7 +1803,10 @@ fn take_snapshot(name: &str, tag: Option<String>, device: Option<&str>) -> Resul
 
 fn restore_snapshot(name: &str, tag: &str, device: Option<&str>) -> Result<()> {
     send_ok(&aimed(
-        Request::SnapshotRestore { name: name.into(), tag: tag.into() },
+        Request::SnapshotRestore {
+            name: name.into(),
+            tag: tag.into(),
+        },
         device,
     ))?;
     println!("{name}  restored to {tag}");
@@ -1726,7 +1815,10 @@ fn restore_snapshot(name: &str, tag: &str, device: Option<&str>) -> Result<()> {
 
 fn remove_snapshot(name: &str, tag: &str, device: Option<&str>) -> Result<()> {
     send_ok(&aimed(
-        Request::SnapshotRemove { name: name.into(), tag: tag.into() },
+        Request::SnapshotRemove {
+            name: name.into(),
+            tag: tag.into(),
+        },
         device,
     ))?;
     println!("{name}  snapshot {tag} deleted");
@@ -1748,7 +1840,10 @@ fn print_snapshots(name: &str, device: Option<&str>) -> Result<()> {
     // starts near zero and grows only as the live disk moves away from it.
     println!("{:<6} {:<26} {:<9} DATE", "ID", "TAG", "SIZE");
     for snap in &snapshots {
-        println!("{:<6} {:<26} {:<9} {}", snap.id, snap.tag, snap.size, snap.date);
+        println!(
+            "{:<6} {:<26} {:<9} {}",
+            snap.id, snap.tag, snap.size, snap.date
+        );
     }
     Ok(())
 }
@@ -1770,7 +1865,10 @@ fn logs(name: &str, follow: bool, lines: u32) -> Result<()> {
                  `ast logs {name}` prints the last lines of it"
             );
         }
-        return match send(&Request::Logs { name: name.into(), lines })? {
+        return match send(&Request::Logs {
+            name: name.into(),
+            lines,
+        })? {
             Response::Log { text, truncated } => {
                 if truncated {
                     eprintln!("(last {lines} lines — more with: ast logs {name} -n 0)");
@@ -1881,7 +1979,11 @@ impl Client {
         let (stream, facts) = handshake()?;
         let ours = compat::ours();
         match compat::select(facts.speaks) {
-            compat::Selection::Common(spoken) => Ok(Client { stream, spoken, daemon: facts }),
+            compat::Selection::Common(spoken) => Ok(Client {
+                stream,
+                spoken,
+                daemon: facts,
+            }),
             // Older than anything this build serves. Replace it once, and
             // then insist: a daemon that comes back still too old is a
             // situation only a human can end, and killing it repeatedly is
@@ -1897,9 +1999,11 @@ impl Client {
                 retire_stale_daemon()?;
                 let (stream, facts) = handshake()?;
                 match compat::select(facts.speaks) {
-                    compat::Selection::Common(spoken) => {
-                        Ok(Client { stream, spoken, daemon: facts })
-                    }
+                    compat::Selection::Common(spoken) => Ok(Client {
+                        stream,
+                        spoken,
+                        daemon: facts,
+                    }),
                     _ => bail!(
                         "astd {} speaks {} after a restart, and this is ast {VERSION} \
                          speaking {}. Stop astd by hand and try again.",
@@ -1970,7 +2074,13 @@ fn handshake() -> Result<(UnixStream, DaemonFacts)> {
     let stream = connect()?;
     stream.set_read_timeout(Some(ipc::HANDSHAKE_DEADLINE))?;
     let ours = compat::ours();
-    write_line(&stream, &Request::Ping { protocol: ours.max, min_protocol: ours.min })?;
+    write_line(
+        &stream,
+        &Request::Ping {
+            protocol: ours.max,
+            min_protocol: ours.min,
+        },
+    )?;
 
     let mut reader = BufReader::new(stream.try_clone()?);
     let reply = match read_frame(&mut reader) {
@@ -1980,7 +2090,12 @@ fn handshake() -> Result<(UnixStream, DaemonFacts)> {
         Err(e) => return Err(e),
     };
     let facts = match serde_json::from_str::<Response>(&reply)? {
-        Response::Pong { version, protocol, min_protocol, .. } => DaemonFacts {
+        Response::Pong {
+            version,
+            protocol,
+            min_protocol,
+            ..
+        } => DaemonFacts {
             version,
             speaks: compat::Speaks::claimed(protocol, min_protocol),
         },
@@ -1988,11 +2103,15 @@ fn handshake() -> Result<(UnixStream, DaemonFacts)> {
         // `Ok`, and one older still rejects the variant. Both are the wire
         // that predates the number, which this build serves — so both are
         // spoken to rather than replaced.
-        Response::Ok => {
-            DaemonFacts { version: "(older)".to_owned(), speaks: compat::Speaks::unversioned() }
-        }
+        Response::Ok => DaemonFacts {
+            version: "(older)".to_owned(),
+            speaks: compat::Speaks::unversioned(),
+        },
         Response::Error { message } if protocol::is_unknown_variant_error(&message) => {
-            DaemonFacts { version: "(older)".to_owned(), speaks: compat::Speaks::unversioned() }
+            DaemonFacts {
+                version: "(older)".to_owned(),
+                speaks: compat::Speaks::unversioned(),
+            }
         }
         // The daemon refused the handshake in words. That is a sentence
         // written for the user — a peer out of the window says why here —
@@ -2057,7 +2176,9 @@ fn start_daemon(sock: &std::path::Path) -> Result<UnixStream> {
 fn spawn_turn() -> Option<File> {
     ipc::private_dir(&paths::home_dir()).ok()?;
     // Waiting is the point: whoever holds this is already starting one.
-    ipc::lock_file(&paths::spawn_lock_path(), ipc::Wait::Yes).ok().flatten()
+    ipc::lock_file(&paths::spawn_lock_path(), ipc::Wait::Yes)
+        .ok()
+        .flatten()
 }
 
 /// One reply frame, bounded.
@@ -2083,13 +2204,20 @@ fn read_frame(reader: &mut impl BufRead) -> Result<Option<String>> {
         // `Frames::next`, which had the same ordering.
         let ends_here = chunk.iter().position(|b| *b == b'\n');
         if buf.len() + ends_here.unwrap_or(chunk.len()) > ipc::MAX_RESPONSE_FRAME {
-            bail!("astd sent more than {} bytes without ending a reply", ipc::MAX_RESPONSE_FRAME);
+            bail!(
+                "astd sent more than {} bytes without ending a reply",
+                ipc::MAX_RESPONSE_FRAME
+            );
         }
         if let Some(at) = ends_here {
             buf.extend_from_slice(&chunk[..at]);
             reader.consume(at + 1);
             let line = String::from_utf8(buf).context("astd sent a reply that is not utf-8")?;
-            return Ok(if line.trim().is_empty() { None } else { Some(line) });
+            return Ok(if line.trim().is_empty() {
+                None
+            } else {
+                Some(line)
+            });
         }
         let taken = chunk.len();
         buf.extend_from_slice(chunk);
@@ -2144,7 +2272,10 @@ impl Conversation {
         client.refuse_unspeakable(request)?;
         client.stream.set_read_timeout(None)?;
         let stream = client.stream;
-        let mut conn = Self { write: stream.try_clone()?, read: BufReader::new(stream) };
+        let mut conn = Self {
+            write: stream.try_clone()?,
+            read: BufReader::new(stream),
+        };
         conn.send(request)?;
         Ok(conn)
     }
@@ -2195,7 +2326,13 @@ fn retire_stale_daemon() -> Result<()> {
         // one thing this can hand a human who now has to do it themselves.
         let claimed = std::fs::read_to_string(paths::daemon_pid_path())
             .ok()
-            .map(|s| format!(" It last wrote pid {} to {}.", s.trim(), paths::daemon_pid_path().display()))
+            .map(|s| {
+                format!(
+                    " It last wrote pid {} to {}.",
+                    s.trim(),
+                    paths::daemon_pid_path().display()
+                )
+            })
             .unwrap_or_default();
         format!(
             "cannot tell which process is serving the astd socket, so it will not be \
@@ -2369,7 +2506,9 @@ fn running_daemon() -> Option<(String, Option<String>)> {
     let mut reply = String::new();
     BufReader::new(stream).read_line(&mut reply).ok()?;
     match serde_json::from_str(&reply).ok()? {
-        Response::Pong { version, build_id, .. } => Some((version, build_id)),
+        Response::Pong {
+            version, build_id, ..
+        } => Some((version, build_id)),
         // A daemon too old to send a `Pong` still answered, which is the
         // fact that matters: it is running, and it is old.
         Response::Ok => Some((format!("older than {VERSION}"), None)),
@@ -2387,7 +2526,9 @@ fn running_daemon() -> Option<(String, Option<String>)> {
 fn send_to_running(request: &Request) -> Option<Response> {
     let mut stream = UnixStream::connect(paths::socket_path()).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
-    stream.set_write_timeout(Some(Duration::from_secs(3))).ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .ok()?;
     write_line(&mut stream, request).ok()?;
     let mut reader = BufReader::new(stream);
     let reply = read_frame(&mut reader).ok()??;
@@ -2488,7 +2629,10 @@ fn print_bugreport() -> Result<()> {
         }
         Some(Response::Instances { instances }) => {
             for i in instances {
-                println!("{:<16} {:<9} {:<14} {}", i.name, i.status, i.image_kind, i.id);
+                println!(
+                    "{:<16} {:<9} {:<14} {}",
+                    i.name, i.status, i.image_kind, i.id
+                );
             }
         }
         _ => println!("no daemon to ask"),
@@ -2612,7 +2756,10 @@ fn print_detail(inst: &Instance) {
     // Only worth a line once it has happened: an instance that has never had
     // its cpu part swapped is the ordinary case and does not need telling.
     if inst.move_epoch > 0 {
-        println!("moves:   {} (cpu/ram has been re-sourced that many times)", inst.move_epoch);
+        println!(
+            "moves:   {} (cpu/ram has been re-sourced that many times)",
+            inst.move_epoch
+        );
     }
     // Worth a line only when it is not the obvious answer: a guest trusts
     // the key in its seed, and after a move that is not the device running it.
@@ -2638,8 +2785,15 @@ fn print_detail(inst: &Instance) {
     let kind = parts.iter().map(|p| p.kind.len()).max().unwrap_or(0);
     let source = parts.iter().map(|p| p.source.len()).max().unwrap_or(0);
     for p in &parts {
-        let note = p.note.as_ref().map(|n| format!("  ({n})")).unwrap_or_default();
-        println!("  {:<kind$}  {:<source$}  {}{note}", p.kind, p.source, p.detail);
+        let note = p
+            .note
+            .as_ref()
+            .map(|n| format!("  ({n})"))
+            .unwrap_or_default();
+        println!(
+            "  {:<kind$}  {:<source$}  {}{note}",
+            p.kind, p.source, p.detail
+        );
     }
 }
 
@@ -2731,7 +2885,13 @@ fn print_bound(inst: &Instance, secret: &str) {
 /// Report on the volume that was just attached — the one at the end.
 fn print_attached(inst: &Instance) {
     let Some(v) = inst.volumes.last() else { return };
-    println!("{}  {}:{}  ->  {}", inst.name, v.host, v.path, volume_destination(v));
+    println!(
+        "{}  {}:{}  ->  {}",
+        inst.name,
+        v.host,
+        v.path,
+        volume_destination(v)
+    );
     if v.is_block() {
         // The guest sees a disk and nothing else — no mount, no share, no
         // hint that the bytes are elsewhere. Saying so here is the difference
@@ -2741,8 +2901,11 @@ fn print_attached(inst: &Instance) {
             "the guest gets a plain disk (/dev/vdb, /dev/vdc, ...); format and \
              mount it there once:"
         );
-        println!("  ast ssh {} -- 'sudo mkfs.ext4 /dev/vdb && sudo mkdir -p /data && \
-                  sudo mount /dev/vdb /data'", inst.name);
+        println!(
+            "  ast ssh {} -- 'sudo mkfs.ext4 /dev/vdb && sudo mkdir -p /data && \
+                  sudo mount /dev/vdb /data'",
+            inst.name
+        );
     } else if !v.is_local() {
         println!(
             "recorded only — a directory on another device cannot be shared into a \
@@ -2751,7 +2914,10 @@ fn print_attached(inst: &Instance) {
         );
     }
     if inst.status == asterism_core::instance::Status::Running {
-        println!("appears in the guest on the next boot: ast down {0} && ast up {0}", inst.name);
+        println!(
+            "appears in the guest on the next boot: ast down {0} && ast up {0}",
+            inst.name
+        );
     }
 }
 
@@ -2763,7 +2929,11 @@ fn volume_destination(v: &asterism_core::instance::Volume) -> String {
     if v.is_local() {
         v.guest_path()
     } else {
-        format!("{} (a directory on {}, not reachable from here)", v.guest_path(), v.host)
+        format!(
+            "{} (a directory on {}, not reachable from here)",
+            v.guest_path(),
+            v.host
+        )
     }
 }
 
@@ -2849,7 +3019,10 @@ mod tests {
     fn a_reply_is_bounded_even_when_nothing_ends_it() {
         let one = b"{\"result\":\"pong\"}\nleftovers".to_vec();
         let mut reader = BufReader::new(std::io::Cursor::new(one));
-        assert_eq!(read_frame(&mut reader).unwrap().as_deref(), Some(r#"{"result":"pong"}"#));
+        assert_eq!(
+            read_frame(&mut reader).unwrap().as_deref(),
+            Some(r#"{"result":"pong"}"#)
+        );
 
         let endless = vec![b'x'; ipc::MAX_RESPONSE_FRAME + 4096];
         let mut reader = BufReader::new(std::io::Cursor::new(endless));
@@ -2875,7 +3048,9 @@ mod tests {
         exact.resize(ipc::MAX_RESPONSE_FRAME, b'a');
         exact.push(b'\n');
         let mut reader = BufReader::new(std::io::Cursor::new(exact));
-        let line = read_frame(&mut reader).unwrap().expect("a reply at the limit is a reply");
+        let line = read_frame(&mut reader)
+            .unwrap()
+            .expect("a reply at the limit is a reply");
         assert_eq!(line.len(), ipc::MAX_RESPONSE_FRAME);
 
         let mut over = Vec::with_capacity(ipc::MAX_RESPONSE_FRAME + 2);

@@ -123,7 +123,8 @@ pub fn init(mesh: Option<Arc<Mesh>>) {
 }
 
 fn ctx() -> Result<&'static Ctx> {
-    CTX.get().context("this daemon's move machinery was never started")
+    CTX.get()
+        .context("this daemon's move machinery was never started")
 }
 
 /// This device's mesh presence, for the half of a move that is reached from
@@ -155,7 +156,9 @@ pub fn staging_dir(name: &str, epoch: u64) -> PathBuf {
 /// would not be called this any more.
 pub fn sweep_staging() {
     let dir = paths::home_dir().join("instances");
-    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
@@ -300,7 +303,10 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<MoveFile>) -> Result<()> {
 /// that means for it.
 fn base_image(inst: &Instance) -> Result<BaseImage> {
     let Some(reference) = inst.image.clone() else {
-        bail!("instance {:?} has no image recorded — there is nothing to move it to", inst.name);
+        bail!(
+            "instance {:?} has no image recorded — there is nothing to move it to",
+            inst.name
+        );
     };
     let base = match image::resolve(&reference) {
         Ok(base) => base,
@@ -359,8 +365,11 @@ fn base_image(inst: &Instance) -> Result<BaseImage> {
 /// anything is adopted, which is [`asterism_core::verify::Digest::parse`]'s
 /// job and the reason this is not a `format!` at the call site.
 pub fn wire_digest(digest: &str) -> Result<Digest> {
-    let spelled =
-        if digest.contains(':') { digest.to_owned() } else { format!("blake3:{digest}") };
+    let spelled = if digest.contains(':') {
+        digest.to_owned()
+    } else {
+        format!("blake3:{digest}")
+    };
     Digest::parse(&spelled).with_context(|| {
         format!("the base image's content address {digest:?} is not one Asterism can check")
     })
@@ -401,9 +410,11 @@ pub(crate) fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Response
             let already_here = reg.holds(&manifest.instance.name);
             tokio::task::block_in_place(|| probe(&manifest, cpu_device, already_here))
         }
-        Request::MovePrepare { name, to_device, epoch } => {
-            tokio::task::block_in_place(|| prepare(reg, &name, &to_device, epoch))
-        }
+        Request::MovePrepare {
+            name,
+            to_device,
+            epoch,
+        } => tokio::task::block_in_place(|| prepare(reg, &name, &to_device, epoch)),
         Request::MoveCommitTarget { manifest, epoch } => {
             tokio::task::block_in_place(|| commit_target(reg, &manifest, epoch, cpu_device))
         }
@@ -427,9 +438,15 @@ pub(crate) fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Response
 /// — and the preflight has to be able to see the instance before it can tell
 /// the user what it would take.
 pub fn offer(reg: &Shard, name: &str) -> Response {
-    match reg.get(name).cloned().and_then(|inst| unconflicted(&inst).map(|()| inst)) {
+    match reg
+        .get(name)
+        .cloned()
+        .and_then(|inst| unconflicted(&inst).map(|()| inst))
+    {
         Ok(inst) => match manifest(&inst) {
-            Ok(manifest) => Response::MoveOffer { manifest: Box::new(manifest) },
+            Ok(manifest) => Response::MoveOffer {
+                manifest: Box::new(manifest),
+            },
             Err(e) => error(e),
         },
         Err(e) => error(e),
@@ -443,7 +460,11 @@ pub fn offer(reg: &Shard, name: &str) -> Response {
 /// ever goes up, so a move that was interrupted with nobody left to abort it
 /// does not strand the instance for good.
 pub fn prepare(reg: &mut Shard, name: &str, to_device: &str, epoch: u64) -> Response {
-    let inst = match reg.get(name).cloned().and_then(|inst| movable(&inst).map(|()| inst)) {
+    let inst = match reg
+        .get(name)
+        .cloned()
+        .and_then(|inst| movable(&inst).map(|()| inst))
+    {
         Ok(inst) => inst,
         Err(e) => return error(e),
     };
@@ -464,12 +485,18 @@ pub fn prepare(reg: &mut Shard, name: &str, to_device: &str, epoch: u64) -> Resp
     };
     let fenced = reg.set_moving(
         name,
-        Some(Moving { to_device: to_device.to_owned(), epoch, started_at: now_unix() }),
+        Some(Moving {
+            to_device: to_device.to_owned(),
+            epoch,
+            started_at: now_unix(),
+        }),
     );
     match fenced.and_then(|inst| reg.save().map(|()| inst)) {
         Ok(inst) => {
             manifest.instance = inst;
-            Response::MoveOffer { manifest: Box::new(manifest) }
+            Response::MoveOffer {
+                manifest: Box::new(manifest),
+            }
         }
         Err(e) => error(e),
     }
@@ -567,7 +594,12 @@ pub fn probe(manifest: &MoveManifest, device: &str, already_here: bool) -> Respo
     } else {
         false
     };
-    Response::MoveProbe { device: device.to_owned(), refusal, notes, needs_base }
+    Response::MoveProbe {
+        device: device.to_owned(),
+        refusal,
+        notes,
+        needs_base,
+    }
 }
 
 fn probe_base(base: &BaseImage, device: &str) -> (Option<String>, bool) {
@@ -613,7 +645,12 @@ fn probe_refusal(
     let machine = &inst.machine;
     let hv = match backend::by_id(&machine.backend) {
         Ok(hv) => hv,
-        Err(e) => return Some(format!("device {device} has no {} backend: {e:#}", machine.backend)),
+        Err(e) => {
+            return Some(format!(
+                "device {device} has no {} backend: {e:#}",
+                machine.backend
+            ))
+        }
     };
     match hv.probe() {
         Ok(ready) => {
@@ -788,7 +825,10 @@ pub fn commit_target(
     adopted.conflict = None;
     adopted.move_epoch = epoch;
     adopted.stranded = manifest.local_volumes.clone();
-    match reg.adopt(adopted).and_then(|inst| reg.save().map(|()| inst)) {
+    match reg
+        .adopt(adopted)
+        .and_then(|inst| reg.save().map(|()| inst))
+    {
         Ok(instance) => Response::Instance { instance },
         Err(e) => error(e),
     }
@@ -813,8 +853,8 @@ fn verify(staging: &Path, manifest: &MoveManifest, epoch: u64) -> Result<()> {
     }
     for file in &manifest.files {
         let path = staging.join(&file.path);
-        let meta = std::fs::metadata(&path)
-            .with_context(|| format!("{} did not arrive", file.path))?;
+        let meta =
+            std::fs::metadata(&path).with_context(|| format!("{} did not arrive", file.path))?;
         if meta.len() != file.len {
             bail!(
                 "{} arrived {} bytes long and should be {}",
@@ -835,7 +875,10 @@ fn verify(staging: &Path, manifest: &MoveManifest, epoch: u64) -> Result<()> {
     }
     let expected = manifest.allocated();
     if receipt.bytes != expected {
-        bail!("{} bytes arrived and {expected} were expected", receipt.bytes);
+        bail!(
+            "{} bytes arrived and {expected} were expected",
+            receipt.bytes
+        );
     }
     Ok(())
 }
@@ -874,7 +917,11 @@ fn remember_move(name: &str, to_device: &str, epoch: u64) {
     notes.retain(|_, note| now.saturating_sub(note.at) < NOTE_TTL_SECS);
     notes.insert(
         name.to_owned(),
-        MovedNote { to_device: to_device.to_owned(), epoch, at: now },
+        MovedNote {
+            to_device: to_device.to_owned(),
+            epoch,
+            at: now,
+        },
     );
     // Best effort by design: a note is a courtesy to whoever types
     // `ast status` at the old device, and losing it costs a redirect, not an
@@ -953,17 +1000,40 @@ pub async fn run(
                  down first"
             );
         }
-        io.send(&line(format!("shutting {name} down on {source} first"))).await?;
-        expect_ok(ask(&source, Request::Down { name: name.to_owned() }, node, mesh).await?)
-            .with_context(|| format!("could not shut {name:?} down on {source}"))?;
+        io.send(&line(format!("shutting {name} down on {source} first")))
+            .await?;
+        expect_ok(
+            ask(
+                &source,
+                Request::Down {
+                    name: name.to_owned(),
+                },
+                node,
+                mesh,
+            )
+            .await?,
+        )
+        .with_context(|| format!("could not shut {name:?} down on {source}"))?;
         manifest = offer_of(name, &source, node, mesh).await?;
     }
 
-    let probed = ask(device, Request::MoveProbe { manifest: Box::new(manifest.clone()) }, node, mesh)
-        .await?;
+    let probed = ask(
+        device,
+        Request::MoveProbe {
+            manifest: Box::new(manifest.clone()),
+        },
+        node,
+        mesh,
+    )
+    .await?;
     let needs_base = match probed {
-        Response::MoveProbe { refusal: Some(refusal), .. } => bail!("{refusal}"),
-        Response::MoveProbe { notes, needs_base, .. } => {
+        Response::MoveProbe {
+            refusal: Some(refusal),
+            ..
+        } => bail!("{refusal}"),
+        Response::MoveProbe {
+            notes, needs_base, ..
+        } => {
             for note in notes {
                 io.send(&line(format!("note: {note}"))).await?;
             }
@@ -985,14 +1055,16 @@ pub async fn run(
         manifest.files.len(),
         manifest.allocated(),
         manifest.virtual_size(),
-    ))).await?;
+    )))
+    .await?;
     if needs_base {
         io.send(&line(format!(
             "{device} does not have base image {} ({}) — it will fetch it from {source} \
              rather than from the internet",
             manifest.base.reference,
             cow::human(manifest.base.cost()),
-        ))).await?;
+        )))
+        .await?;
     }
 
     // ---- phase one: fence the source, then move the bytes ------------------
@@ -1013,7 +1085,10 @@ pub async fn run(
         Response::Error { message } => bail!(message),
         other => bail!("device {source:?} answered a move prepare with {other:?}"),
     };
-    io.send(&line(format!("{source} is holding {name} at move epoch {epoch}"))).await?;
+    io.send(&line(format!(
+        "{source} is holding {name} at move epoch {epoch}"
+    )))
+    .await?;
 
     let outcome = transfer_and_commit(&manifest, &source, device, epoch, node, mesh, io).await;
     if let Err(e) = outcome {
@@ -1021,21 +1096,28 @@ pub async fn run(
         // to its shard, so this is a tidy-up rather than a rollback.
         let _ = ask(
             device,
-            Request::MoveAbortTarget { name: name.to_owned(), epoch },
+            Request::MoveAbortTarget {
+                name: name.to_owned(),
+                epoch,
+            },
             node,
             mesh,
         )
         .await;
         let _ = ask(
             &source,
-            Request::MoveAbortSource { name: name.to_owned(), epoch },
+            Request::MoveAbortSource {
+                name: name.to_owned(),
+                epoch,
+            },
             node,
             mesh,
         )
         .await;
         io.send(&line(format!(
             "the move did not happen — {source} still supplies {name}'s cpu"
-        ))).await?;
+        )))
+        .await?;
         return Err(e);
     }
 
@@ -1062,28 +1144,43 @@ async fn transfer_and_commit(
 ) -> Result<()> {
     let name = manifest.instance.name.clone();
 
-    mesh.move_import(device, source, manifest, epoch, io).await?;
+    mesh.move_import(device, source, manifest, epoch, io)
+        .await?;
 
     // The target checks what arrived against the manifest and only then does
     // a second copy of this instance exist anywhere.
     expect_instance(
         ask(
             device,
-            Request::MoveCommitTarget { manifest: Box::new(manifest.clone()), epoch },
+            Request::MoveCommitTarget {
+                manifest: Box::new(manifest.clone()),
+                epoch,
+            },
             node,
             mesh,
         )
         .await?,
     )
     .with_context(|| format!("{device} would not adopt {name:?}"))?;
-    io.send(&line(format!("{device} has it, verified against the manifest"))).await?;
+    io.send(&line(format!(
+        "{device} has it, verified against the manifest"
+    )))
+    .await?;
 
     // Past this point the move has happened. A source that will not answer
     // now leaves a stale copy rather than losing one, and the epoch on the
     // target's row is what settles which is which.
     expect_ok(
-        ask(source, Request::MoveCommitSource { name: name.clone(), epoch }, node, mesh)
-            .await?,
+        ask(
+            source,
+            Request::MoveCommitSource {
+                name: name.clone(),
+                epoch,
+            },
+            node,
+            mesh,
+        )
+        .await?,
     )
     .with_context(|| {
         format!(
@@ -1091,7 +1188,8 @@ async fn transfer_and_commit(
              its copy — the higher epoch is the live one, and {source}'s copy is stale"
         )
     })?;
-    io.send(&line(format!("{source} has dropped its copy"))).await?;
+    io.send(&line(format!("{source} has dropped its copy")))
+        .await?;
     Ok(())
 }
 
@@ -1105,13 +1203,17 @@ async fn locate(name: &str, node: &Node, mesh: &Arc<Mesh>) -> Result<String> {
         .ok_or_else(|| anyhow!("no instance named {name:?} in this orbit"))
 }
 
-async fn offer_of(
-    name: &str,
-    source: &str,
-    node: &Node,
-    mesh: &Arc<Mesh>,
-) -> Result<MoveManifest> {
-    match ask(source, Request::MoveOffer { name: name.to_owned() }, node, mesh).await? {
+async fn offer_of(name: &str, source: &str, node: &Node, mesh: &Arc<Mesh>) -> Result<MoveManifest> {
+    match ask(
+        source,
+        Request::MoveOffer {
+            name: name.to_owned(),
+        },
+        node,
+        mesh,
+    )
+    .await?
+    {
         Response::MoveOffer { manifest } => Ok(*manifest),
         Response::Error { message } => bail!(message),
         other => bail!("device {source:?} answered a move offer with {other:?}"),
@@ -1160,7 +1262,9 @@ pub(crate) fn line(text: String) -> Response {
 }
 
 fn error(e: anyhow::Error) -> Response {
-    Response::Error { message: format!("{e:#}") }
+    Response::Error {
+        message: format!("{e:#}"),
+    }
 }
 
 #[cfg(test)]
@@ -1183,7 +1287,10 @@ mod tests {
         let staged = staging_dir("dev", 7);
         let leaf = staged.file_name().unwrap().to_string_lossy().into_owned();
         assert_eq!(leaf, "dev.moving-7");
-        assert!(asterism_core::registry::check_name(&leaf).is_err(), "{leaf}");
+        assert!(
+            asterism_core::registry::check_name(&leaf).is_err(),
+            "{leaf}"
+        );
         assert_ne!(staged, paths::instance_dir("dev"));
         // Same parent, so the commit is a rename rather than a copy.
         assert_eq!(staged.parent(), paths::instance_dir("dev").parent());
@@ -1199,13 +1306,23 @@ mod tests {
 
         let hex = "ab".repeat(32);
         let parsed = wire_digest(&hex).unwrap();
-        assert_eq!(parsed.algo(), Algo::Blake3, "bare hex is what digest_of computes");
+        assert_eq!(
+            parsed.algo(),
+            Algo::Blake3,
+            "bare hex is what digest_of computes"
+        );
         assert_eq!(parsed.hex(), hex);
-        assert_eq!(wire_digest(&format!("sha256:{hex}")).unwrap().algo(), Algo::Sha256);
+        assert_eq!(
+            wire_digest(&format!("sha256:{hex}")).unwrap().algo(),
+            Algo::Sha256
+        );
 
         // And one this build cannot compute is refused here, which is before
         // a byte of a multi-gigabyte base image has been asked for.
-        let err = format!("{:#}", wire_digest(&format!("md5:{}", "a".repeat(32))).unwrap_err());
+        let err = format!(
+            "{:#}",
+            wire_digest(&format!("md5:{}", "a".repeat(32))).unwrap_err()
+        );
         assert!(err.contains("is not one Asterism can check"), "{err}");
     }
 
@@ -1230,8 +1347,14 @@ mod tests {
         let (refusal, needs_base) = probe_base(&base, "desktop");
         assert!(!needs_base, "an unsafe landing is a refusal, not a fetch");
         let wanted = refusal.unwrap();
-        assert!(wanted.contains("device desktop cannot receive base image"), "{wanted}");
-        assert!(wanted.contains("outside Asterism's replaceable image store"), "{wanted}");
+        assert!(
+            wanted.contains("device desktop cannot receive base image"),
+            "{wanted}"
+        );
+        assert!(
+            wanted.contains("outside Asterism's replaceable image store"),
+            "{wanted}"
+        );
         assert!(wanted.contains("will not overwrite it"), "{wanted}");
         assert!(wanted.contains("put that image at"), "{wanted}");
         assert!(wanted.contains(&reference), "{wanted}");
@@ -1246,7 +1369,10 @@ mod tests {
         // The adoption boundary repeats the ownership check, closing the
         // race where the path changes after the probe but before transfer.
         let landing = format!("{:#}", base_landing(&reference).unwrap_err());
-        assert!(landing.contains("will not overwrite that path"), "{landing}");
+        assert!(
+            landing.contains("will not overwrite that path"),
+            "{landing}"
+        );
         assert!(landing.contains("retry the move"), "{landing}");
         assert_eq!(std::fs::read(&path).unwrap(), original);
     }
@@ -1260,10 +1386,23 @@ mod tests {
     fn every_step_of_a_move_is_claimed_by_the_module_that_runs_it() {
         for req in [
             Request::MoveOffer { name: "dev".into() },
-            Request::MovePrepare { name: "dev".into(), to_device: "desktop".into(), epoch: 1 },
-            Request::MoveCommitSource { name: "dev".into(), epoch: 1 },
-            Request::MoveAbortSource { name: "dev".into(), epoch: 1 },
-            Request::MoveAbortTarget { name: "dev".into(), epoch: 1 },
+            Request::MovePrepare {
+                name: "dev".into(),
+                to_device: "desktop".into(),
+                epoch: 1,
+            },
+            Request::MoveCommitSource {
+                name: "dev".into(),
+                epoch: 1,
+            },
+            Request::MoveAbortSource {
+                name: "dev".into(),
+                epoch: 1,
+            },
+            Request::MoveAbortTarget {
+                name: "dev".into(),
+                epoch: 1,
+            },
         ] {
             assert!(is_step(&req), "{req:?}");
         }
@@ -1274,7 +1413,10 @@ mod tests {
             device: "desktop".into(),
             down: false,
         }));
-        assert!(!is_step(&Request::Up { name: "dev".into(), restart: None }));
+        assert!(!is_step(&Request::Up {
+            name: "dev".into(),
+            restart: None
+        }));
     }
 
     #[test]
@@ -1287,9 +1429,18 @@ mod tests {
             "egress-ca.key.bak",
             ".move-receipt.json",
         ] {
-            assert!(is_plumbing(junk), "{junk} belongs to this device, not to the guest");
+            assert!(
+                is_plumbing(junk),
+                "{junk} belongs to this device, not to the guest"
+            );
         }
-        for carried in ["disk.raw", "efi-vars.fd", "seed.iso", "seed.stamp", "clean.raw"] {
+        for carried in [
+            "disk.raw",
+            "efi-vars.fd",
+            "seed.iso",
+            "seed.stamp",
+            "clean.raw",
+        ] {
             assert!(!is_plumbing(carried), "{carried} has to travel");
         }
     }
@@ -1365,7 +1516,9 @@ mod tests {
         assert!(err.contains("did not arrive"), "{err}");
 
         // A staging directory that is not there is the crashed-mid-move case.
-        let err = verify(&dir.path().join("nope"), &manifest, 1).unwrap_err().to_string();
+        let err = verify(&dir.path().join("nope"), &manifest, 1)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("no staging directory"), "{err}");
     }
 }

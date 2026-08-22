@@ -1026,9 +1026,7 @@ mod tests {
             r#"{"result":"pong","version":"0.0.2","build_id":"0.0.2+abc123"}"#,
         )
         .unwrap();
-        assert!(
-            matches!(both, Response::Pong { build_id: Some(id), .. } if id == "0.0.2+abc123")
-        );
+        assert!(matches!(both, Response::Pong { build_id: Some(id), .. } if id == "0.0.2+abc123"));
 
         let new: Response =
             serde_json::from_str(r#"{"result":"pong","version":"0.0.2","protocol":2}"#).unwrap();
@@ -1045,8 +1043,14 @@ mod tests {
         // A daemon that predates the range answers with a version and no
         // numbers. That is not an unknown quantity — it is the wire this
         // build grew out of, and `Speaks::claimed` says so.
-        let pong: Response = serde_json::from_str(r#"{"result":"pong","version":"0.0.1"}"#).unwrap();
-        let Response::Pong { protocol, min_protocol, .. } = pong else {
+        let pong: Response =
+            serde_json::from_str(r#"{"result":"pong","version":"0.0.1"}"#).unwrap();
+        let Response::Pong {
+            protocol,
+            min_protocol,
+            ..
+        } = pong
+        else {
             panic!("a pong is a pong")
         };
         assert_eq!(
@@ -1057,18 +1061,35 @@ mod tests {
         // And a `Ping` carrying the range is still the bare `Ping` an older
         // daemon reads, because the fields hang off a variant it already
         // parses as a map.
-        let wire = serde_json::to_string(&Request::Ping { protocol: 2, min_protocol: 1 }).unwrap();
+        let wire = serde_json::to_string(&Request::Ping {
+            protocol: 2,
+            min_protocol: 1,
+        })
+        .unwrap();
         assert_eq!(wire, r#"{"cmd":"ping","protocol":2,"min_protocol":1}"#);
         // A build with no fields on the variant sees the tag and ignores the
         // rest, which is what this stands in for.
         let back: Request = serde_json::from_str(r#"{"cmd":"ping"}"#).unwrap();
-        assert!(matches!(back, Request::Ping { protocol: 0, min_protocol: 0 }));
+        assert!(matches!(
+            back,
+            Request::Ping {
+                protocol: 0,
+                min_protocol: 0
+            }
+        ));
     }
 
     #[test]
     fn a_frame_is_as_old_as_the_wire_unless_it_says_otherwise() {
         assert_eq!(Request::List.since(), crate::compat::FIRST_PROTOCOL);
-        assert_eq!(Request::Ping { protocol: 0, min_protocol: 0 }.since(), 1);
+        assert_eq!(
+            Request::Ping {
+                protocol: 0,
+                min_protocol: 0
+            }
+            .since(),
+            1
+        );
         assert_eq!(Request::Compat.since(), 2);
         assert!(!Request::Compat.speakable_at(1));
         assert!(Request::Compat.speakable_at(2));

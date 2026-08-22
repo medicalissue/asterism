@@ -133,7 +133,11 @@ pub(crate) async fn admit(stream: UnixStream, slots: Arc<Semaphore>) -> Result<O
         }
     };
 
-    Ok(Some(Admitted { frames: Frames::new(read), write, _slot: slot }))
+    Ok(Some(Admitted {
+        frames: Frames::new(read),
+        write,
+        _slot: slot,
+    }))
 }
 
 // ---- reading -----------------------------------------------------------------
@@ -163,7 +167,10 @@ pub(crate) struct Frames {
 
 impl Frames {
     fn new(read: OwnedReadHalf) -> Frames {
-        Frames { reader: BufReader::new(read), buf: Vec::new() }
+        Frames {
+            reader: BufReader::new(read),
+            buf: Vec::new(),
+        }
     }
 
     /// The next request line.
@@ -189,9 +196,7 @@ impl Frames {
                 return Ok(if self.buf.is_empty() {
                     Framing::Eof
                 } else {
-                    Framing::Refused(
-                        "the connection ended in the middle of a request".to_owned(),
-                    )
+                    Framing::Refused("the connection ended in the middle of a request".to_owned())
                 });
             }
             // What this frame would be if it ended in this chunk: everything
@@ -275,7 +280,11 @@ impl Writer {
     /// Say why, on the way out. A peer already being turned away cannot be
     /// told twice, so a failure here is nothing to report.
     pub(crate) async fn refuse(&mut self, message: &str) {
-        let _ = self.send(&Response::Error { message: message.to_owned() }).await;
+        let _ = self
+            .send(&Response::Error {
+                message: message.to_owned(),
+            })
+            .await;
     }
 }
 
@@ -296,7 +305,10 @@ mod tests {
     #[tokio::test]
     async fn a_line_is_a_frame() {
         let (mut theirs, mut frames) = pair().await;
-        theirs.write_all(b"{\"cmd\":\"ping\"}\n{\"cmd\":\"list\"}\n").await.unwrap();
+        theirs
+            .write_all(b"{\"cmd\":\"ping\"}\n{\"cmd\":\"list\"}\n")
+            .await
+            .unwrap();
         for want in ["{\"cmd\":\"ping\"}", "{\"cmd\":\"list\"}"] {
             match frames.next().await.unwrap() {
                 Framing::Frame(line) => assert_eq!(line, want),
@@ -351,7 +363,10 @@ mod tests {
     async fn a_frame_of_exactly_the_limit_is_a_frame() {
         let (mut theirs, mut frames) = pair().await;
         let writer = tokio::spawn(async move {
-            theirs.write_all(&vec![b'a'; ipc::MAX_REQUEST_FRAME]).await.unwrap();
+            theirs
+                .write_all(&vec![b'a'; ipc::MAX_REQUEST_FRAME])
+                .await
+                .unwrap();
             theirs.write_all(b"\n").await.unwrap();
             theirs
         });
@@ -379,14 +394,20 @@ mod tests {
             // the reader has taken it, which is the "waited for consumption"
             // half of the repro: the buffer now holds exactly the limit and
             // the next chunk is the one with the newline in it.
-            theirs.write_all(&vec![b'a'; ipc::MAX_REQUEST_FRAME]).await.unwrap();
+            theirs
+                .write_all(&vec![b'a'; ipc::MAX_REQUEST_FRAME])
+                .await
+                .unwrap();
             theirs.write_all(b"x\n").await.unwrap();
             theirs
         });
         match frames.next().await.unwrap() {
             Framing::Refused(message) => {
                 assert!(message.contains("before its newline"), "{message}");
-                assert!(message.contains(&ipc::MAX_REQUEST_FRAME.to_string()), "{message}");
+                assert!(
+                    message.contains(&ipc::MAX_REQUEST_FRAME.to_string()),
+                    "{message}"
+                );
             }
             Framing::Frame(line) => panic!(
                 "a {}-byte frame was accepted; the limit is {}",
@@ -412,7 +433,10 @@ mod tests {
 
         let (theirs, mut frames) = pair().await;
         let silent = tokio::time::timeout(ipc::FRAME_DEADLINE * 4, frames.next()).await;
-        assert!(silent.is_err(), "a connection that has said nothing was cut");
+        assert!(
+            silent.is_err(),
+            "a connection that has said nothing was cut"
+        );
         drop(theirs);
     }
 
@@ -426,7 +450,10 @@ mod tests {
         let mut writer = Writer { inner: write };
         // Fill the socket buffer with a reply nobody is reading. The size is
         // beside the point; what is under test is that it ends.
-        let fat = Response::Log { text: "x".repeat(4 << 20), truncated: false };
+        let fat = Response::Log {
+            text: "x".repeat(4 << 20),
+            truncated: false,
+        };
         let sent: Result<()> = tokio::time::timeout(ipc::WRITE_DEADLINE * 4, async {
             loop {
                 writer.send(&fat).await?;
@@ -434,7 +461,10 @@ mod tests {
         })
         .await
         .expect("the write gave up on its own rather than being timed out here");
-        let message = format!("{:#}", sent.expect_err("a peer that reads nothing must fail"));
+        let message = format!(
+            "{:#}",
+            sent.expect_err("a peer that reads nothing must fail")
+        );
         assert!(message.contains("stopped reading"), "{message}");
         drop(theirs);
     }
@@ -446,7 +476,10 @@ mod tests {
     async fn the_connection_cap_refuses_in_words_and_gives_slots_back() {
         let slots = Arc::new(Semaphore::new(1));
         let (client, server) = UnixStream::pair().unwrap();
-        let held = admit(server, Arc::clone(&slots)).await.unwrap().expect("the first is served");
+        let held = admit(server, Arc::clone(&slots))
+            .await
+            .unwrap()
+            .expect("the first is served");
 
         let (mut turned_away, server) = UnixStream::pair().unwrap();
         let refused = admit(server, Arc::clone(&slots));
@@ -457,8 +490,13 @@ mod tests {
         assert!(refused.is_none(), "a connection past the cap was served");
 
         let mut said = String::new();
-        tokio::io::AsyncReadExt::read_to_string(&mut turned_away, &mut said).await.unwrap();
-        assert!(said.contains("limit"), "the refusal says what happened: {said}");
+        tokio::io::AsyncReadExt::read_to_string(&mut turned_away, &mut said)
+            .await
+            .unwrap();
+        assert!(
+            said.contains("limit"),
+            "the refusal says what happened: {said}"
+        );
 
         drop(held);
         drop(client);

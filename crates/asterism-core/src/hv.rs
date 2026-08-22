@@ -75,13 +75,27 @@ impl std::fmt::Display for DiskFormat {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DiskSpec {
-    File { path: PathBuf, format: DiskFormat, readonly: bool },
-    Nbd { url: String, readonly: bool },
+    File {
+        path: PathBuf,
+        format: DiskFormat,
+        readonly: bool,
+    },
+    Nbd {
+        url: String,
+        readonly: bool,
+    },
     /// An NBD export reached over a local unix socket, under a named export.
     /// The export name carries the volume's lease epoch, so a socket that
     /// outlives its lease serves nothing.
-    NbdUnix { socket: PathBuf, export: String, readonly: bool },
-    Block { path: PathBuf, readonly: bool },
+    NbdUnix {
+        socket: PathBuf,
+        export: String,
+        readonly: bool,
+    },
+    Block {
+        path: PathBuf,
+        readonly: bool,
+    },
 }
 
 /// What a base image *is*, which decides how a machine gets into it.
@@ -587,7 +601,9 @@ mod tests {
         assert_eq!(fwd.ssh_target(), ("127.0.0.1".to_owned(), 22022));
         assert_eq!(fwd.to_string(), "127.0.0.1:22022");
 
-        let direct = GuestEndpoint::GuestAddr { addr: "192.168.64.7".parse().unwrap() };
+        let direct = GuestEndpoint::GuestAddr {
+            addr: "192.168.64.7".parse().unwrap(),
+        };
         assert_eq!(direct.ssh_target(), ("192.168.64.7".to_owned(), 22));
         assert_eq!(direct.to_string(), "192.168.64.7:22");
     }
@@ -597,8 +613,14 @@ mod tests {
         let h = Handle {
             backend: "qemu".into(),
             pid: Some(4242),
-            proc: Some(ProcId { pid: 4242, started_us: 1_700_000_000_000_000, exec: None }),
-            ctl: ControlChannel::Qmp { path: "/tmp/qmp.sock".into() },
+            proc: Some(ProcId {
+                pid: 4242,
+                started_us: 1_700_000_000_000_000,
+                exec: None,
+            }),
+            ctl: ControlChannel::Qmp {
+                path: "/tmp/qmp.sock".into(),
+            },
             endpoint: GuestEndpoint::HostForward { ssh_port: 22022 },
             started_at: 1_700_000_000,
         };
@@ -686,7 +708,11 @@ mod tests {
             "dev",
             "laptop",
             "debian:13",
-            crate::instance::Shape { cpus: 2, mem_mib: 2048, disk_gib: 20 },
+            crate::instance::Shape {
+                cpus: 2,
+                mem_mib: 2048,
+                disk_gib: 20,
+            },
             Machine {
                 backend: "bare".into(),
                 machine_type: "t".into(),
@@ -700,7 +726,10 @@ mod tests {
     #[test]
     fn a_remote_root_disk_has_no_local_path() {
         let prep = Prepared {
-            root: DiskSpec::Nbd { url: "nbd://desktop/dev".into(), readonly: false },
+            root: DiskSpec::Nbd {
+                url: "nbd://desktop/dev".into(),
+                readonly: false,
+            },
             firmware: None,
             kernel: None,
         };

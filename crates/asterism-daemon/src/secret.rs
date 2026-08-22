@@ -124,11 +124,8 @@ struct Catalog {
 
 impl Catalog {
     fn load(path: &Path) -> Result<Self> {
-        let loaded = durable::load_json_versioned::<CatalogFile>(
-            path,
-            "secret metadata",
-            CATALOG_VERSION,
-        )?;
+        let loaded =
+            durable::load_json_versioned::<CatalogFile>(path, "secret metadata", CATALOG_VERSION)?;
         let file = match loaded {
             Some(Loaded { value, repaired }) => {
                 if let Some(why) = repaired {
@@ -141,7 +138,10 @@ impl Catalog {
                 }
                 value
             }
-            None => CatalogFile { version: CATALOG_VERSION, secrets: Vec::new() },
+            None => CatalogFile {
+                version: CATALOG_VERSION,
+                secrets: Vec::new(),
+            },
         };
         if file.version != CATALOG_VERSION {
             bail!(
@@ -1253,7 +1253,12 @@ mod tests {
         let path = dir.path().join("secrets.json");
         let lineage = ValueRevision::mint();
         let plane = local_plane(&path, "laptop", MemoryStore::default());
-        plane.put(secret(1, vec![source("laptop", 1, &lineage)]), &value(b"v1")).unwrap();
+        plane
+            .put(
+                secret(1, vec![source("laptop", 1, &lineage)]),
+                &value(b"v1"),
+            )
+            .unwrap();
         // A second secret, so there is a second commit and therefore a
         // last-known-good copy holding only the first.
         let other = Secret {
@@ -1281,7 +1286,12 @@ mod tests {
         let path = dir.path().join("secrets.json");
         let lineage = ValueRevision::mint();
         let plane = local_plane(&path, "laptop", MemoryStore::default());
-        plane.put(secret(1, vec![source("laptop", 1, &lineage)]), &value(b"v1")).unwrap();
+        plane
+            .put(
+                secret(1, vec![source("laptop", 1, &lineage)]),
+                &value(b"v1"),
+            )
+            .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1307,11 +1317,23 @@ mod tests {
 
         let lineage = ValueRevision::mint();
         let plane = local_plane(&path, "laptop", MemoryStore::default());
-        plane.put(secret(1, vec![source("laptop", 1, &lineage)]), &value(b"v1")).unwrap();
+        plane
+            .put(
+                secret(1, vec![source("laptop", 1, &lineage)]),
+                &value(b"v1"),
+            )
+            .unwrap();
 
-        let mode = std::fs::symlink_metadata(&path).unwrap().permissions().mode() & 0o777;
+        let mode = std::fs::symlink_metadata(&path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o600, "the planted mode was adopted");
-        assert!(!tmp.exists(), "and the planted file is gone, not written into");
+        assert!(
+            !tmp.exists(),
+            "and the planted file is gone, not written into"
+        );
     }
 
     /// The same path with a symlink in the way. Following it would put the
@@ -1328,9 +1350,18 @@ mod tests {
 
         let lineage = ValueRevision::mint();
         let plane = local_plane(&path, "laptop", MemoryStore::default());
-        plane.put(secret(1, vec![source("laptop", 1, &lineage)]), &value(b"v1")).unwrap();
+        plane
+            .put(
+                secret(1, vec![source("laptop", 1, &lineage)]),
+                &value(b"v1"),
+            )
+            .unwrap();
 
-        assert_eq!(std::fs::read(&victim).unwrap(), b"victim", "the catalog went to the victim");
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"victim",
+            "the catalog went to the victim"
+        );
         let catalog = Catalog::load(&path).unwrap();
         assert_eq!(catalog.secrets.len(), 1);
     }

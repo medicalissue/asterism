@@ -224,7 +224,10 @@ pub fn migrate_json<T: Serialize>(path: &Path, what: &str, value: &T) -> Result<
         let held = std::fs::read(&bak).ok();
         if held.as_deref() != Some(previous.as_slice()) {
             write_forced(&bak, &previous, None).with_context(|| {
-                format!("restoring the pre-migration copy of {what} at {}", bak.display())
+                format!(
+                    "restoring the pre-migration copy of {what} at {}",
+                    bak.display()
+                )
             })?;
             let dir = path.parent().unwrap_or_else(|| Path::new("."));
             sync_dir(dir).with_context(|| format!("flushing {}", dir.display()))?;
@@ -267,8 +270,7 @@ fn commit_inner(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<()> {
     //    behind is exactly what a `kill -9` here would leave, and
     //    `sweep_temporaries` is what removes both.
     faults::check(faults::Point::Rename, path)?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("committing {}", path.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("committing {}", path.display()))?;
 
     // 4. Make the rename itself survive power loss. Until this returns, the
     //    directory entry is a promise the drive has not made.
@@ -387,7 +389,10 @@ fn keep_backup(live: &Path, mode: Option<u32>) -> io::Result<()> {
         // for one commit — and the caller says so out loud.
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("{} is a symlink, not this device's state file", live.display()),
+            format!(
+                "{} is a symlink, not this device's state file",
+                live.display()
+            ),
         ));
     }
     faults::check_io(faults::Point::Backup, live)?;
@@ -624,10 +629,11 @@ pub fn load_json_versioned<T: DeserializeOwned>(
     let bak = backup_path(path);
     match read_faultily(path) {
         Ok(bytes) => match interpret(&bytes, current) {
-            Ok(value) => Ok(Some(Loaded { value, repaired: None })),
-            Err(Trouble::FromTheFuture(found)) => {
-                Err(from_the_future(what, path, found, current))
-            }
+            Ok(value) => Ok(Some(Loaded {
+                value,
+                repaired: None,
+            })),
+            Err(Trouble::FromTheFuture(found)) => Err(from_the_future(what, path, found, current)),
             Err(Trouble::Unreadable(parse)) => match from_backup(&bak, current) {
                 Some(value) => Ok(Some(Loaded {
                     value,
@@ -689,7 +695,10 @@ fn interpret<T: DeserializeOwned>(bytes: &[u8], current: u32) -> Result<T, Troub
     struct Probe {
         version: Option<u32>,
     }
-    if let Ok(Probe { version: Some(found) }) = serde_json::from_slice::<Probe>(bytes) {
+    if let Ok(Probe {
+        version: Some(found),
+    }) = serde_json::from_slice::<Probe>(bytes)
+    {
         if found > current {
             return Err(Trouble::FromTheFuture(found));
         }
@@ -754,7 +763,9 @@ pub fn from_the_future(what: &str, path: &Path, found: u32, current: u32) -> any
 /// is worth a line in the log even though nothing came of it.
 pub fn sweep_temporaries(dir: &Path) -> Vec<PathBuf> {
     let mut swept = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else { return swept };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return swept;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_file() {
@@ -873,7 +884,14 @@ pub mod faults {
         path_contains: impl Into<String>,
         errno: i32,
     ) -> Armed {
-        push(tag, point, path_contains.into(), io::ErrorKind::Other, Some(errno), None)
+        push(
+            tag,
+            point,
+            path_contains.into(),
+            io::ErrorKind::Other,
+            Some(errno),
+            None,
+        )
     }
 
     /// [`arm`], firing only once — the shape of a transient failure, and how
@@ -897,7 +915,14 @@ pub mod faults {
     ) -> Armed {
         let mut table = table().lock().unwrap_or_else(|e| e.into_inner());
         table.retain(|f| f.tag != tag);
-        table.push(Fault { tag, point, path_contains, kind, errno, remaining });
+        table.push(Fault {
+            tag,
+            point,
+            path_contains,
+            kind,
+            errno,
+            remaining,
+        });
         ANY.store(true, Ordering::Relaxed);
         Armed { tag }
     }
@@ -909,8 +934,9 @@ pub mod faults {
         }
         let display = path.to_string_lossy().into_owned();
         let mut table = table().lock().unwrap_or_else(|e| e.into_inner());
-        let Some(fault) =
-            table.iter_mut().find(|f| f.point == point && display.contains(&f.path_contains))
+        let Some(fault) = table
+            .iter_mut()
+            .find(|f| f.point == point && display.contains(&f.path_contains))
         else {
             return Ok(());
         };
@@ -927,9 +953,8 @@ pub mod faults {
     }
 
     pub(super) fn check(point: Point, path: &Path) -> anyhow::Result<()> {
-        check_io(point, path).map_err(|e| {
-            anyhow::anyhow!("{e}").context(format!("at {}", path.display()))
-        })
+        check_io(point, path)
+            .map_err(|e| anyhow::anyhow!("{e}").context(format!("at {}", path.display())))
     }
 }
 
@@ -956,7 +981,10 @@ mod tests {
         let loaded: Loaded<Doc> = load_json(&path, "a document").unwrap().unwrap();
         assert_eq!(loaded.value, Doc { n: 1 });
         assert!(loaded.repaired.is_none());
-        assert!(!tmp_path(&path).exists(), "the staging file is consumed by the rename");
+        assert!(
+            !tmp_path(&path).exists(),
+            "the staging file is consumed by the rename"
+        );
     }
 
     #[test]
@@ -964,7 +992,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("doc.json");
         let loaded: Option<Loaded<Doc>> = load_json(&missing, "a document").unwrap();
-        assert!(loaded.is_none(), "a first run reads no document and no error");
+        assert!(
+            loaded.is_none(),
+            "a first run reads no document and no error"
+        );
     }
 
     #[test]
@@ -972,7 +1003,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("doc.json");
         commit_json(&path, &Doc { n: 1 }).unwrap();
-        assert!(!backup_path(&path).exists(), "a first commit has nothing to keep");
+        assert!(
+            !backup_path(&path).exists(),
+            "a first commit has nothing to keep"
+        );
         commit_json(&path, &Doc { n: 2 }).unwrap();
         let bak: Doc = serde_json::from_str(&read(&backup_path(&path))).unwrap();
         assert_eq!(bak, Doc { n: 1 });
@@ -989,7 +1023,11 @@ mod tests {
         commit_json(&path, &Doc { n: 2 }).unwrap();
         commit_json(&path, &Doc { n: 3 }).unwrap();
         let bak: Doc = serde_json::from_str(&read(&backup_path(&path))).unwrap();
-        assert_eq!(bak, Doc { n: 2 }, "the backup is the value the last commit replaced");
+        assert_eq!(
+            bak,
+            Doc { n: 2 },
+            "the backup is the value the last commit replaced"
+        );
     }
 
     /// ENOSPC while the new value is being staged. The old value is still
@@ -1006,7 +1044,11 @@ mod tests {
         drop(armed);
 
         let loaded: Loaded<Doc> = load_json(&path, "a document").unwrap().unwrap();
-        assert_eq!(loaded.value, Doc { n: 1 }, "the value that was committed is still there");
+        assert_eq!(
+            loaded.value,
+            Doc { n: 1 },
+            "the value that was committed is still there"
+        );
         assert!(loaded.repaired.is_none(), "and it needed no repair");
     }
 
@@ -1018,12 +1060,19 @@ mod tests {
         let path = dir.path().join("crash-rename.json");
         commit_json(&path, &Doc { n: 1 }).unwrap();
 
-        let armed =
-            faults::arm("crash-rename", Point::Rename, "crash-rename.json", io::ErrorKind::Other);
+        let armed = faults::arm(
+            "crash-rename",
+            Point::Rename,
+            "crash-rename.json",
+            io::ErrorKind::Other,
+        );
         assert!(commit_json(&path, &Doc { n: 2 }).is_err());
         drop(armed);
 
-        assert!(tmp_path(&path).exists(), "the interrupted commit left its staging file");
+        assert!(
+            tmp_path(&path).exists(),
+            "the interrupted commit left its staging file"
+        );
         let swept = sweep_temporaries(dir.path());
         assert_eq!(swept, vec![tmp_path(&path)]);
         assert!(!tmp_path(&path).exists());
@@ -1052,7 +1101,11 @@ mod tests {
         drop(armed);
 
         let loaded: Loaded<Doc> = load_json(&path, "a document").unwrap().unwrap();
-        assert_eq!(loaded.value, Doc { n: 2 }, "the rename had already happened");
+        assert_eq!(
+            loaded.value,
+            Doc { n: 2 },
+            "the rename had already happened"
+        );
     }
 
     /// A commit whose backup step fails still commits: the safety net is
@@ -1063,8 +1116,12 @@ mod tests {
         let path = dir.path().join("nobak.json");
         commit_json(&path, &Doc { n: 1 }).unwrap();
 
-        let armed =
-            faults::arm("nobak", Point::Backup, "nobak.json", io::ErrorKind::PermissionDenied);
+        let armed = faults::arm(
+            "nobak",
+            Point::Backup,
+            "nobak.json",
+            io::ErrorKind::PermissionDenied,
+        );
         commit_json(&path, &Doc { n: 2 }).unwrap();
         drop(armed);
 
@@ -1186,8 +1243,12 @@ mod tests {
         let path = dir.path().join("torn.json");
         std::fs::write(&path, br#"{"n":1,"shape":"old"}"#).unwrap();
 
-        let _armed =
-            faults::arm("torn-migration", Point::Rename, "torn.json", io::ErrorKind::Interrupted);
+        let _armed = faults::arm(
+            "torn-migration",
+            Point::Rename,
+            "torn.json",
+            io::ErrorKind::Interrupted,
+        );
         assert!(migrate_json(&path, "a document", &Doc { n: 2 }).is_err());
         drop(_armed);
 
@@ -1233,7 +1294,10 @@ mod tests {
         assert!(text.contains("will not guess"), "{text}");
         assert!(text.contains("To repair"), "{text}");
         assert!(text.contains(&path.display().to_string()), "{text}");
-        assert!(text.contains(&backup_path(&path).display().to_string()), "{text}");
+        assert!(
+            text.contains(&backup_path(&path).display().to_string()),
+            "{text}"
+        );
     }
 
     /// EIO reading the live file is a machine with a different problem.
@@ -1277,7 +1341,10 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "and it was created that way, not chmod'd after");
+            assert_eq!(
+                mode, 0o600,
+                "and it was created that way, not chmod'd after"
+            );
         }
     }
 
@@ -1291,7 +1358,11 @@ mod tests {
     fn mode_of(path: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt;
         // Not `metadata`: the question is what is at this path.
-        std::fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
     }
 
     const SECRET: &[u8] = b"{\"token\":\"NEVER-READABLE-BY-ANYONE-ELSE\"}";
@@ -1316,7 +1387,10 @@ mod tests {
 
         assert_eq!(mode_of(&path), 0o600, "the committed secret is private");
         assert_eq!(std::fs::read(&path).unwrap(), SECRET);
-        assert!(!tmp.exists(), "and the planted file is gone, not written into");
+        assert!(
+            !tmp.exists(),
+            "and the planted file is gone, not written into"
+        );
     }
 
     /// The same trap on the *public* commit path. Nothing secret is at stake
@@ -1379,9 +1453,16 @@ mod tests {
 
         commit_private(&path, SECRET).unwrap();
 
-        assert_eq!(std::fs::read(&victim).unwrap(), b"victim", "the victim was overwritten");
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"victim",
+            "the victim was overwritten"
+        );
         let meta = std::fs::symlink_metadata(&path).unwrap();
-        assert!(meta.file_type().is_file(), "the link was replaced by a real file");
+        assert!(
+            meta.file_type().is_file(),
+            "the link was replaced by a real file"
+        );
         assert_eq!(std::fs::read(&path).unwrap(), SECRET);
         assert_eq!(mode_of(&path), 0o600);
         // And nothing followed the link on the way past: hard-linking the
@@ -1389,7 +1470,11 @@ mod tests {
         // this device's last-known-good state.
         let bak = backup_path(&path);
         if bak.exists() {
-            assert_ne!(std::fs::read(&bak).unwrap(), b"victim", "the backup is the victim");
+            assert_ne!(
+                std::fs::read(&bak).unwrap(),
+                b"victim",
+                "the backup is the victim"
+            );
         }
     }
 
@@ -1408,11 +1493,22 @@ mod tests {
         std::os::unix::fs::symlink(&victim, backup_path(&path)).unwrap();
         commit_private(&path, SECRET).unwrap();
 
-        assert_eq!(std::fs::read(&victim).unwrap(), b"victim", "the victim was overwritten");
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"victim",
+            "the victim was overwritten"
+        );
         let bak = backup_path(&path);
-        assert!(std::fs::symlink_metadata(&bak).unwrap().file_type().is_file());
+        assert!(std::fs::symlink_metadata(&bak)
+            .unwrap()
+            .file_type()
+            .is_file());
         assert_eq!(std::fs::read(&bak).unwrap(), b"first");
-        assert_eq!(mode_of(&bak), 0o600, "a private file's backup is private too");
+        assert_eq!(
+            mode_of(&bak),
+            0o600,
+            "a private file's backup is private too"
+        );
     }
 
     /// A directory at the staging path cannot be cleared, and must be a
@@ -1438,11 +1534,18 @@ mod tests {
         let path = dir.path().join("state.json");
         commit(&path, b"first").unwrap();
 
-        let armed =
-            faults::arm("leftover", Point::Rename, "state.json", io::ErrorKind::Other);
+        let armed = faults::arm(
+            "leftover",
+            Point::Rename,
+            "state.json",
+            io::ErrorKind::Other,
+        );
         assert!(commit(&path, b"second").is_err());
         drop(armed);
-        assert!(tmp_path(&path).exists(), "the interrupted commit left its staging file");
+        assert!(
+            tmp_path(&path).exists(),
+            "the interrupted commit left its staging file"
+        );
 
         // No sweep in between: the commit clears it itself.
         commit(&path, b"third").unwrap();
@@ -1488,7 +1591,10 @@ mod tests {
         let live = dir.path().join("dev");
         publish_dir(&staging, &live).unwrap();
         assert!(!staging.exists());
-        assert_eq!(std::fs::read(live.join("nested/seed.iso")).unwrap(), b"seed");
+        assert_eq!(
+            std::fs::read(live.join("nested/seed.iso")).unwrap(),
+            b"seed"
+        );
     }
 
     /// A rename that fails while adopting a staged tree leaves the tree
@@ -1529,7 +1635,10 @@ mod tests {
         let text = format!("{err:#}");
         assert!(text.contains("version 9"), "{text}");
         assert!(text.contains("upgrade Asterism"), "{text}");
-        assert!(backup_path(&path).exists(), "and the backup is left where it was");
+        assert!(
+            backup_path(&path).exists(),
+            "and the backup is left where it was"
+        );
     }
 
     /// A backup from the future is no better than a live file from the
@@ -1553,7 +1662,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("doc.json");
         std::fs::write(&path, br#"{"n":4}"#).unwrap();
-        let loaded: Loaded<Doc> = load_json_versioned(&path, "a document", 1).unwrap().unwrap();
+        let loaded: Loaded<Doc> = load_json_versioned(&path, "a document", 1)
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.value, Doc { n: 4 });
     }
 

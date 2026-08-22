@@ -30,7 +30,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ASTERISM_BUILD_ID");
     println!("cargo:rerun-if-changed=build.rs");
 
-    let source = explicit().or_else(git).unwrap_or_else(|| "unknown".to_owned());
+    let source = explicit()
+        .or_else(git)
+        .unwrap_or_else(|| "unknown".to_owned());
     let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_owned());
     println!("cargo:rustc-env=ASTERISM_BUILD_ID={version}+{source}");
 }
@@ -68,7 +70,11 @@ fn git() -> Option<String> {
         Some(out) => !out.is_empty(),
         None => true,
     };
-    Some(if dirty { format!("{commit}.dirty") } else { commit })
+    Some(if dirty {
+        format!("{commit}.dirty")
+    } else {
+        commit
+    })
 }
 
 fn run(args: &[&str]) -> Option<String> {

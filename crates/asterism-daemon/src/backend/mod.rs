@@ -497,7 +497,11 @@ pub fn adopt_identities(reg: &mut asterism_core::registry::Shard) -> bool {
         .list()
         .into_iter()
         .filter(|i| i.status == Status::Running)
-        .filter(|i| i.handle.as_ref().is_some_and(|h| h.proc.is_none() && h.pid.is_some()))
+        .filter(|i| {
+            i.handle
+                .as_ref()
+                .is_some_and(|h| h.proc.is_none() && h.pid.is_some())
+        })
         .collect();
 
     let mut changed = false;
@@ -509,7 +513,14 @@ pub fn adopt_identities(reg: &mut asterism_core::registry::Shard) -> bool {
         };
         let names = instance_evidence(&inst, handle);
         let names: Vec<&Path> = names.iter().map(std::path::PathBuf::as_path).collect();
-        match ProcId::adopt(pid, handle.started_at, &Evidence { exec: execs, names: &names }) {
+        match ProcId::adopt(
+            pid,
+            handle.started_at,
+            &Evidence {
+                exec: execs,
+                names: &names,
+            },
+        ) {
             Ok(proc) => {
                 eprintln!(
                     "astd: {} was recorded before process identities existed — adopting {proc}",
@@ -638,15 +649,23 @@ mod tests {
         /// An instance recorded running by a daemon that predates process
         /// identities: a bare pid on the handle and nothing behind it.
         fn pre_identity(reg: &mut Shard, name: &str, backend: &str, pid: u32) {
-            reg.create(name, "laptop", "debian:13", Shape::default(), machine(backend))
-                .unwrap();
+            reg.create(
+                name,
+                "laptop",
+                "debian:13",
+                Shape::default(),
+                machine(backend),
+            )
+            .unwrap();
             reg.set_running(
                 name,
                 Handle {
                     backend: backend.into(),
                     pid: Some(pid),
                     proc: None,
-                    ctl: ControlChannel::Qmp { path: "/tmp/x.sock".into() },
+                    ctl: ControlChannel::Qmp {
+                        path: "/tmp/x.sock".into(),
+                    },
                     endpoint: GuestEndpoint::HostForward { ssh_port: 22 },
                     started_at: now_unix(),
                 },
@@ -664,15 +683,21 @@ mod tests {
             let ctl = paths::qmp_socket_path("live");
             // `sleep` stands in for the helper, holding the path a real one
             // would have been given on its command line.
-            let mut sleeper =
-                std::process::Command::new("sleep").arg("30").arg(&ctl).spawn().unwrap();
+            let mut sleeper = std::process::Command::new("sleep")
+                .arg("30")
+                .arg(&ctl)
+                .spawn()
+                .unwrap();
             pre_identity(&mut reg, "live", vz::ID, sleeper.id());
 
             let handle = reg.get("live").unwrap().handle.clone().unwrap();
             let proc = ProcId::adopt(
                 sleeper.id(),
                 handle.started_at,
-                &Evidence { exec: &["sleep"], names: &[&ctl] },
+                &Evidence {
+                    exec: &["sleep"],
+                    names: &[&ctl],
+                },
             )
             .unwrap();
             reg.adopt_handle_identity("live", proc).unwrap();
@@ -680,7 +705,11 @@ mod tests {
             let adopted = reg.get("live").unwrap().handle.as_ref().unwrap();
             assert!(adopted.owned().is_some(), "the guest was adopted");
             assert!(adopted.owned().unwrap().alive());
-            assert_eq!(adopted.pid, Some(sleeper.id()), "the pid is left where it was");
+            assert_eq!(
+                adopted.pid,
+                Some(sleeper.id()),
+                "the pid is left where it was"
+            );
 
             let _ = sleeper.kill();
             let _ = sleeper.wait();
@@ -699,8 +728,11 @@ mod tests {
             let (_dir, mut reg) = shard();
             // Somebody else's instance, and a process holding its socket.
             let theirs = paths::qmp_socket_path("theirs");
-            let mut foreign =
-                std::process::Command::new("sleep").arg("30").arg(&theirs).spawn().unwrap();
+            let mut foreign = std::process::Command::new("sleep")
+                .arg("30")
+                .arg(&theirs)
+                .spawn()
+                .unwrap();
 
             pre_identity(&mut reg, "ours", qemu::ID, foreign.id());
             // Backdate the handle so the foreign process started 30s after
@@ -724,7 +756,10 @@ mod tests {
             assert!(!adopt_identities(&mut reg));
             let handle = reg.get("ours").unwrap().handle.clone().unwrap();
             assert_eq!(handle.owned(), None);
-            assert!(owned(&handle).is_none(), "and so there is nothing to signal");
+            assert!(
+                owned(&handle).is_none(),
+                "and so there is nothing to signal"
+            );
             assert!(
                 ProcId::capture(foreign.id()).unwrap().alive(),
                 "the foreign process is untouched"
@@ -752,7 +787,10 @@ mod tests {
                 endpoint: GuestEndpoint::HostForward { ssh_port: 22 },
                 started_at: now_unix(),
             };
-            assert!(observed_running(&handle), "something is serving this instance");
+            assert!(
+                observed_running(&handle),
+                "something is serving this instance"
+            );
             assert!(owned(&handle).is_none(), "and nothing may be sent to it");
 
             // The listener going is the guest going.
@@ -798,7 +836,10 @@ mod tests {
             pre_identity(&mut reg, "gone", qemu::ID, pid);
 
             assert!(!adopt_identities(&mut reg));
-            assert_eq!(reg.get("gone").unwrap().handle.as_ref().unwrap().owned(), None);
+            assert_eq!(
+                reg.get("gone").unwrap().handle.as_ref().unwrap().owned(),
+                None
+            );
         }
 
         /// Idempotent, and only ever additive: a handle that already owns a
@@ -807,13 +848,19 @@ mod tests {
         #[test]
         fn a_handle_that_already_owns_a_process_is_left_exactly_as_it_was() {
             let (_dir, mut reg) = shard();
-            let mut sleeper = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+            let mut sleeper = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
             let real = ProcId::capture(sleeper.id()).unwrap();
             pre_identity(&mut reg, "known", qemu::ID, sleeper.id());
             reg.adopt_handle_identity("known", real.clone()).unwrap();
 
             assert!(!adopt_identities(&mut reg), "nothing left to adopt");
-            let other = ProcId { started_us: real.started_us + 1, ..real.clone() };
+            let other = ProcId {
+                started_us: real.started_us + 1,
+                ..real.clone()
+            };
             reg.adopt_handle_identity("known", other).unwrap();
             assert_eq!(
                 reg.get("known").unwrap().handle.as_ref().unwrap().owned(),
@@ -830,7 +877,10 @@ mod tests {
         #[test]
         fn only_running_instances_are_adopted() {
             let (_dir, mut reg) = shard();
-            let mut sleeper = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+            let mut sleeper = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
             pre_identity(&mut reg, "down", qemu::ID, sleeper.id());
             reg.set_stopped("down").unwrap();
 
@@ -858,24 +908,39 @@ mod tests {
         #[test]
         fn each_backend_names_paths_only_its_own_guest_would_carry() {
             let dir = paths::instance_dir("dev");
-            for (backend, expected) in
-                [(qemu::ID, dir.join("qemu.pid")), (vz::ID, dir.join("vz.json"))]
-            {
+            for (backend, expected) in [
+                (qemu::ID, dir.join("qemu.pid")),
+                (vz::ID, dir.join("vz.json")),
+            ] {
                 let h = Handle {
                     backend: backend.into(),
                     pid: Some(1),
                     proc: None,
-                    ctl: ControlChannel::Qmp { path: paths::qmp_socket_path("dev") },
+                    ctl: ControlChannel::Qmp {
+                        path: paths::qmp_socket_path("dev"),
+                    },
                     endpoint: GuestEndpoint::HostForward { ssh_port: 22 },
                     started_at: 0,
                 };
-                let inst = Instance::new("dev", "laptop", "debian:13", Shape::default(), machine(backend));
+                let inst = Instance::new(
+                    "dev",
+                    "laptop",
+                    "debian:13",
+                    Shape::default(),
+                    machine(backend),
+                );
                 let names = instance_evidence(&inst, &h);
-                assert!(names.contains(&paths::qmp_socket_path("dev")), "{backend}: {names:?}");
+                assert!(
+                    names.contains(&paths::qmp_socket_path("dev")),
+                    "{backend}: {names:?}"
+                );
                 assert!(names.contains(&expected), "{backend}: {names:?}");
                 for name in &names {
                     assert!(name.starts_with(&dir), "{name:?} is not this instance's");
-                    assert!(name.extension().is_some(), "{name:?} is a directory, not a file");
+                    assert!(
+                        name.extension().is_some(),
+                        "{name:?} is a directory, not a file"
+                    );
                 }
             }
         }

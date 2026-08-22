@@ -108,9 +108,11 @@ fn backoff(attempts: u32) -> Duration {
 pub fn note_died(name: &str) {
     let now = Instant::now();
     let mut watches = watches();
-    let watch = watches
-        .entry(name.to_owned())
-        .or_insert_with(|| Watch { attempts: 0, due: None, seen_alive: now });
+    let watch = watches.entry(name.to_owned()).or_insert_with(|| Watch {
+        attempts: 0,
+        due: None,
+        seen_alive: now,
+    });
     if watch.due.is_none() {
         watch.due = Some(now + backoff(watch.attempts));
     }
@@ -146,9 +148,11 @@ fn owed() -> usize {
 fn bump(name: &str) -> u32 {
     let now = Instant::now();
     let mut watches = watches();
-    let watch = watches
-        .entry(name.to_owned())
-        .or_insert_with(|| Watch { attempts: 0, due: None, seen_alive: now });
+    let watch = watches.entry(name.to_owned()).or_insert_with(|| Watch {
+        attempts: 0,
+        due: None,
+        seen_alive: now,
+    });
     watch.attempts += 1;
     watch.seen_alive = now;
     watch.attempts
@@ -157,7 +161,9 @@ fn bump(name: &str) -> u32 {
 /// A guest that has been up longer than [`STABLE`] gets its budget back.
 fn note_alive(name: &str) {
     let mut watches = watches();
-    let Some(watch) = watches.get(name) else { return };
+    let Some(watch) = watches.get(name) else {
+        return;
+    };
     if watch.due.is_none() && watch.seen_alive.elapsed() >= STABLE {
         watches.remove(name);
     }
@@ -176,8 +182,11 @@ fn note_alive(name: &str) {
 /// up because one guest will not boot is worse than the guest being down.
 pub async fn resurrect(registry: &Arc<Mutex<Shard>>) {
     let mut reg = registry.lock().await;
-    let recorded: Vec<Instance> =
-        reg.list().into_iter().filter(|i| i.status == Status::Running).collect();
+    let recorded: Vec<Instance> = reg
+        .list()
+        .into_iter()
+        .filter(|i| i.status == Status::Running)
+        .collect();
     if recorded.is_empty() {
         return;
     }
@@ -211,7 +220,10 @@ pub async fn resurrect(registry: &Arc<Mutex<Shard>>) {
         match boot_again(&mut reg, &inst) {
             Ok(booted) => eprintln!(
                 "astd: {name} is back{}",
-                booted.endpoint().map(|e| format!(" on {e}")).unwrap_or_default()
+                booted
+                    .endpoint()
+                    .map(|e| format!(" on {e}"))
+                    .unwrap_or_default()
             ),
             Err(e) => {
                 eprintln!("astd: {name} did not come back: {e:#} — the supervisor will retry");
@@ -321,7 +333,10 @@ fn restart(reg: &mut Shard, name: &str) -> bool {
         Ok(booted) => {
             eprintln!(
                 "astd: {name} is back{}",
-                booted.endpoint().map(|e| format!(" on {e}")).unwrap_or_default()
+                booted
+                    .endpoint()
+                    .map(|e| format!(" on {e}"))
+                    .unwrap_or_default()
             );
             true
         }
@@ -352,8 +367,15 @@ fn give_up(reg: &mut Shard, name: &str, attempts: u32) {
 
 fn append_to_console(name: &str, message: &str) -> anyhow::Result<()> {
     let path = paths::instance_dir(name).join("console.log");
-    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
-    writeln!(file, "\n[asterism t={}] {message}", asterism_core::instance::now_unix())?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    writeln!(
+        file,
+        "\n[asterism t={}] {message}",
+        asterism_core::instance::now_unix()
+    )?;
     Ok(())
 }
 
@@ -459,7 +481,10 @@ mod tests {
         forget(&name);
         note_died(&name);
         let now = Instant::now();
-        assert!(take_due(now).is_empty(), "the first restart waits out the backoff");
+        assert!(
+            take_due(now).is_empty(),
+            "the first restart waits out the backoff"
+        );
         assert_eq!(owed(), 1, "but it is owed, so the device stays awake");
         assert!(take_due(now + Duration::from_secs(6)).contains(&name));
         // Taken off the queue: a second sweep does not restart it twice.
@@ -511,7 +536,9 @@ mod tests {
             backend: "vz".into(),
             pid: None,
             proc: None,
-            ctl: asterism_core::hv::ControlChannel::Rpc { path: ctl.to_owned() },
+            ctl: asterism_core::hv::ControlChannel::Rpc {
+                path: ctl.to_owned(),
+            },
             endpoint: asterism_core::hv::GuestEndpoint::GuestAddr {
                 addr: "192.168.64.3".parse().unwrap(),
             },
@@ -532,7 +559,10 @@ mod tests {
         // like to anyone trying to use it.
         std::fs::write(&sock, b"").unwrap();
         clear_stale_control(&stopped_instance_with_ctl(&sock));
-        assert!(!sock.exists(), "a socket with nothing behind it is crash litter");
+        assert!(
+            !sock.exists(),
+            "a socket with nothing behind it is crash litter"
+        );
     }
 
     /// The case that makes the check worth making. A helper spends the
@@ -548,7 +578,10 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
 
         clear_stale_control(&stopped_instance_with_ctl(&sock));
-        assert!(sock.exists(), "a live listener's socket is not ours to remove");
+        assert!(
+            sock.exists(),
+            "a live listener's socket is not ours to remove"
+        );
         drop(listener);
     }
 
@@ -571,6 +604,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(inst.policy.restart, Restart::Always);
-        assert_eq!(inst.policy.max_attempts, asterism_core::instance::MAX_ATTEMPTS);
+        assert_eq!(
+            inst.policy.max_attempts,
+            asterism_core::instance::MAX_ATTEMPTS
+        );
     }
 }

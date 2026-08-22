@@ -228,7 +228,14 @@ fn build(
     let _ = std::fs::remove_file(seed);
     if cfg!(target_os = "macos") {
         run(Command::new("hdiutil")
-            .args(["makehybrid", "-iso", "-joliet", "-default-volume-name", "cidata", "-o"])
+            .args([
+                "makehybrid",
+                "-iso",
+                "-joliet",
+                "-default-volume-name",
+                "cidata",
+                "-o",
+            ])
             .arg(seed)
             .arg(&stage))?;
     } else {
@@ -767,7 +774,11 @@ mod tests {
     use crate::instance::local_host;
 
     fn share(host_path: &str, guest_path: &str) -> Share {
-        Share::new(&Volume::dir(host_path, &local_host(), Some(guest_path.into())))
+        Share::new(&Volume::dir(
+            host_path,
+            &local_host(),
+            Some(guest_path.into()),
+        ))
     }
 
     /// The shape a backend's `Hypervisor::guest_config` has: keys of its
@@ -789,7 +800,10 @@ mod tests {
         assert_eq!(systemd_path_escape("/mnt/my-vol"), "mnt-my\\x2dvol");
         assert_eq!(systemd_path_escape("/mnt/my vol"), "mnt-my\\x20vol");
         assert_eq!(systemd_path_escape("/.cache"), "\\x2ecache");
-        assert_eq!(share("/tank/media", "/mnt/ast/media").unit(), "mnt-ast-media.mount");
+        assert_eq!(
+            share("/tank/media", "/mnt/ast/media").unit(),
+            "mnt-ast-media.mount"
+        );
     }
 
     /// A guest with no volumes still gets the two things every guest needs:
@@ -868,7 +882,10 @@ mod tests {
         // backend's `bootcmd` joins ours rather than replacing it — which
         // is the case that used to be refused, and the one vz brings.
         let keys: Vec<String> = blocks(&merged).into_iter().map(|b| b.key).collect();
-        assert_eq!(keys, vec!["bootcmd", "write_files", "runcmd", "final_message"]);
+        assert_eq!(
+            keys,
+            vec!["bootcmd", "write_files", "runcmd", "final_message"]
+        );
         // Both sides' work is under the one `runcmd`.
         assert!(merged.contains("systemctl enable asterism-hostkeys.service"));
         assert!(merged.contains("systemctl enable --now \"$unit\""));
@@ -882,7 +899,10 @@ mod tests {
         // whose items sit at two different depths is not a sequence.
         assert_eq!(merge(&ours, "").unwrap(), ours);
         let alone = merge("", vz).unwrap();
-        assert!(alone.contains("\n  - [ sh, -c, \"echo hi > /dev/hvc0\" ]\n"), "{alone}");
+        assert!(
+            alone.contains("\n  - [ sh, -c, \"echo hi > /dev/hvc0\" ]\n"),
+            "{alone}"
+        );
         for line in merged.lines() {
             assert!(
                 !line.starts_with(" -"),
@@ -891,17 +911,26 @@ mod tests {
         }
         // The shell inside a block scalar is shifted with everything around
         // it, so its own indentation survives.
-        assert!(merged.contains("\n  - |\n    systemctl enable --now serial-getty"), "{merged}");
+        assert!(
+            merged.contains("\n  - |\n    systemctl enable --now serial-getty"),
+            "{merged}"
+        );
 
         // A key that carries one value rather than a list cannot be merged,
         // and saying so beats picking a winner.
         let mine = "final_message: \"ours\"\n";
-        assert_eq!(merge(mine, "final_message: \"theirs\"\n").unwrap_err().to_string(),
+        assert_eq!(
+            merge(mine, "final_message: \"theirs\"\n")
+                .unwrap_err()
+                .to_string(),
             "the guest configuration and this backend's would both set \
              `final_message`, and it takes one value rather than a list — one of \
-             them has to give it up");
+             them has to give it up"
+        );
         // One of them alone is fine, wherever it comes from.
-        assert!(merge(&ours, mine).unwrap().contains("final_message: \"ours\""));
+        assert!(merge(&ours, mine)
+            .unwrap()
+            .contains("final_message: \"ours\""));
     }
 
     /// The whole user-data as a guest receives it, with a backend's half
@@ -934,12 +963,23 @@ mod tests {
 
         let mut seen: Vec<String> = Vec::new();
         for block in blocks(&user_data) {
-            assert!(!seen.contains(&block.key), "{:?} appears twice:\n{user_data}", block.key);
+            assert!(
+                !seen.contains(&block.key),
+                "{:?} appears twice:\n{user_data}",
+                block.key
+            );
             seen.push(block.key);
         }
         assert_eq!(
             seen,
-            vec!["hostname", "users", "bootcmd", "write_files", "runcmd", "final_message"]
+            vec![
+                "hostname",
+                "users",
+                "bootcmd",
+                "write_files",
+                "runcmd",
+                "final_message"
+            ]
         );
     }
 
@@ -998,7 +1038,10 @@ mod tests {
 
         // 1. A heredoc's terminator has to be at column zero, and nothing in
         //    a block scalar is. So there is no heredoc.
-        assert!(!script.contains("<<"), "a heredoc cannot terminate in here:\n{script}");
+        assert!(
+            !script.contains("<<"),
+            "a heredoc cannot terminate in here:\n{script}"
+        );
         assert!(script.contains("printf '%s\\n'"), "{script}");
         // 2. `sed -i` takes a mandatory suffix on BSD and none on GNU. The
         //    guest is Linux, but the spelling that works on both is neither,
@@ -1032,7 +1075,10 @@ mod tests {
 
         // The port is in it: a proxy that came back somewhere else is a guest
         // that has to be told where.
-        let moved = Egress { proxy: "http://10.0.2.2:39000".into(), ..egress() };
+        let moved = Egress {
+            proxy: "http://10.0.2.2:39000".into(),
+            ..egress()
+        };
         assert_ne!(bound, fingerprint("dev", &[], "", &moved));
 
         // So is the handle: revoking a binding and making a new one must not
@@ -1055,7 +1101,12 @@ mod tests {
         assert_ne!(one, elsewhere);
         assert_ne!(
             one,
-            fingerprint("other", &[share("/tank/media", "/mnt/ast/media")], "", &bare)
+            fingerprint(
+                "other",
+                &[share("/tank/media", "/mnt/ast/media")],
+                "",
+                &bare
+            )
         );
 
         // Backend cloud-config is part of what the seed says, so it moves
@@ -1069,23 +1120,22 @@ mod tests {
 
     #[test]
     fn only_volumes_on_this_device_reach_the_hypervisor() {
-        let mut inst = crate::registry::Shard::load(
-            &std::env::temp_dir().join("nonexistent-registry.json"),
-        )
-        .unwrap()
-        .create(
-            "dev",
-            &local_host(),
-            "debian:13",
-            Default::default(),
-            crate::hv::Machine {
-                backend: "qemu".into(),
-                machine_type: "virt".into(),
-                cpu: "host".into(),
-                hv_version: "test".into(),
-            },
-        )
-        .unwrap();
+        let mut inst =
+            crate::registry::Shard::load(&std::env::temp_dir().join("nonexistent-registry.json"))
+                .unwrap()
+                .create(
+                    "dev",
+                    &local_host(),
+                    "debian:13",
+                    Default::default(),
+                    crate::hv::Machine {
+                        backend: "qemu".into(),
+                        machine_type: "virt".into(),
+                        cpu: "host".into(),
+                        hv_version: "test".into(),
+                    },
+                )
+                .unwrap();
         inst.volumes = vec![
             Volume::dir("/tank/here", &local_host(), None),
             Volume::dir("/tank/there", "some-other-box", None),

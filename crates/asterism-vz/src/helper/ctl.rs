@@ -80,7 +80,9 @@ fn converse(stream: UnixStream, jobs: Sender<Job>) -> Result<()> {
         }
         let reply = match serde_json::from_str::<Command>(&line) {
             Ok(command) => ask(&jobs, command),
-            Err(e) => Reply::Error { message: format!("bad command: {e}") },
+            Err(e) => Reply::Error {
+                message: format!("bad command: {e}"),
+            },
         };
         let mut out = serde_json::to_vec(&reply)?;
         out.push(b'\n');
@@ -95,7 +97,9 @@ fn ask(jobs: &Sender<Job>, command: Command) -> Reply {
     let (tx, rx): (Sender<Reply>, Receiver<Reply>) = std::sync::mpsc::channel();
     if jobs.send(Job { command, reply: tx }).is_err() {
         // The run loop is gone, which means so is the guest.
-        return Reply::Error { message: "the vz helper is shutting down".into() };
+        return Reply::Error {
+            message: "the vz helper is shutting down".into(),
+        };
     }
     match rx.recv_timeout(REPLY_TIMEOUT) {
         Ok(reply) => reply,

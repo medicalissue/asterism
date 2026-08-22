@@ -185,8 +185,8 @@ impl Digest {
     /// Hash a whole file without reading it into memory. A megabyte at a
     /// time: a base image does not fit in ram and a layer blob need not.
     pub fn of_file(algo: Algo, path: &Path) -> Result<Digest> {
-        let mut file = std::fs::File::open(path)
-            .with_context(|| format!("hashing {}", path.display()))?;
+        let mut file =
+            std::fs::File::open(path).with_context(|| format!("hashing {}", path.display()))?;
         let mut hasher = Hasher::new(algo);
         let mut buf = vec![0u8; 1 << 20];
         loop {
@@ -434,7 +434,11 @@ pub struct Source<'a> {
 
 impl<'a> Source<'a> {
     pub fn new(kind: &'a str, origin: &'a str) -> Source<'a> {
-        Source { kind, origin, derived_from: Vec::new() }
+        Source {
+            kind,
+            origin,
+            derived_from: Vec::new(),
+        }
     }
 
     pub fn derived_from(mut self, parents: impl IntoIterator<Item = String>) -> Source<'a> {
@@ -490,8 +494,8 @@ pub fn adopt_recorded(
     expected: Option<&Digest>,
     source: Source<'_>,
 ) -> Result<Provenance> {
-    let meta = std::fs::metadata(staged)
-        .with_context(|| format!("adopting {}", staged.display()))?;
+    let meta =
+        std::fs::metadata(staged).with_context(|| format!("adopting {}", staged.display()))?;
     let algo = expected.map(|d| d.algo).unwrap_or(OWN_ALGO);
     let content = Digest::of_file(algo, staged)?;
 
@@ -557,8 +561,8 @@ fn write_record(artifact: &Path, record: &Provenance) -> Result<()> {
 /// its adoption. The record then lives in the store, not next to the user's
 /// file, which is why this takes the record's path separately.
 pub fn record(artifact: &Path, at: &Path, source: Source<'_>) -> Result<Provenance> {
-    let meta = std::fs::metadata(artifact)
-        .with_context(|| format!("reading {}", artifact.display()))?;
+    let meta =
+        std::fs::metadata(artifact).with_context(|| format!("reading {}", artifact.display()))?;
     let record = Provenance {
         content: Digest::of_file(OWN_ALGO, artifact)?,
         size: meta.len(),
@@ -605,11 +609,7 @@ impl Depth {
 ///
 /// The record's path is separate from the artifact's because a local file
 /// the user owns is verified against a record kept in the store.
-pub fn verified_provenance(
-    artifact: &Path,
-    record_at: &Path,
-    depth: Depth,
-) -> Result<Provenance> {
+pub fn verified_provenance(artifact: &Path, record_at: &Path, depth: Depth) -> Result<Provenance> {
     // Absence first, and separately: "there is nothing here" and "what is
     // here cannot be accounted for" are different problems with different
     // fixes, and folding the first into the second would tell somebody who
@@ -619,9 +619,7 @@ pub fn verified_provenance(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             bail!("{} is not on this device", artifact.display())
         }
-        Err(e) => {
-            return Err(e).with_context(|| format!("verifying {}", artifact.display()))
-        }
+        Err(e) => return Err(e).with_context(|| format!("verifying {}", artifact.display())),
     };
     let Some(record) = provenance(record_at) else {
         bail!(
@@ -648,21 +646,24 @@ pub fn verified_provenance(
     if depth == Depth::Quick && mtime_of(&meta) == record.mtime {
         return Ok(record);
     }
-    record.content.verify_file(artifact, "it").with_context(|| {
-        // A file the user owns was never "pulled from" anywhere, and telling
-        // them their own path is where their own path came from is noise.
-        match record.kind.as_str() {
-            "local-image" => format!(
-                "{} is not the file Asterism recorded when the instance was created",
-                artifact.display()
-            ),
-            _ => format!(
-                "{} has changed since it was pulled from {}",
-                artifact.display(),
-                record.source
-            ),
-        }
-    })?;
+    record
+        .content
+        .verify_file(artifact, "it")
+        .with_context(|| {
+            // A file the user owns was never "pulled from" anywhere, and telling
+            // them their own path is where their own path came from is noise.
+            match record.kind.as_str() {
+                "local-image" => format!(
+                    "{} is not the file Asterism recorded when the instance was created",
+                    artifact.display()
+                ),
+                _ => format!(
+                    "{} has changed since it was pulled from {}",
+                    artifact.display(),
+                    record.source
+                ),
+            }
+        })?;
     Ok(record)
 }
 
@@ -733,30 +734,52 @@ mod tests {
         let record_at = dir.path().join("store").join("keyed-on-the-path");
         write(&staged, b"bytes");
 
-        adopt_recorded(&staged, &dest, &record_at, None, Source::new("local-image", "x"))
-            .unwrap();
+        adopt_recorded(
+            &staged,
+            &dest,
+            &record_at,
+            None,
+            Source::new("local-image", "x"),
+        )
+        .unwrap();
 
         assert!(dest.exists());
-        assert!(provenance_path(&record_at).exists(), "the record went where it was told");
-        assert!(!provenance_path(&dest).exists(), "and not beside the artifact");
+        assert!(
+            provenance_path(&record_at).exists(),
+            "the record went where it was told"
+        );
+        assert!(
+            !provenance_path(&dest).exists(),
+            "and not beside the artifact"
+        );
         check_recorded(&dest, &record_at, Depth::Full).unwrap();
-        assert!(check(&dest, Depth::Full).is_err(), "there is nothing beside it to check");
+        assert!(
+            check(&dest, Depth::Full).is_err(),
+            "there is nothing beside it to check"
+        );
     }
 
     /// A digest we cannot compute is refused when it is read, not when it is
     /// checked: the whole point is that such a source never reaches a write.
     #[test]
     fn unsupported_algorithms_are_refused_up_front() {
-        let err = Digest::parse("md5:d41d8cd98f00b204e9800998ecf8427e").unwrap_err().to_string();
+        let err = Digest::parse("md5:d41d8cd98f00b204e9800998ecf8427e")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("unsupported digest algorithm"), "{err}");
         assert!(err.contains("refuses to adopt"), "{err}");
 
         assert!(Digest::parse("sha256:not-hex").is_err());
-        assert!(Digest::parse("sha256:abc").is_err(), "a short digest is not a digest");
+        assert!(
+            Digest::parse("sha256:abc").is_err(),
+            "a short digest is not a digest"
+        );
         assert!(Digest::parse("deadbeef").is_err(), "no algorithm at all");
         // Registries write digests lowercase; accept either and normalise.
         assert_eq!(
-            Digest::parse(&format!("sha256:{}", "AB".repeat(32))).unwrap().hex(),
+            Digest::parse(&format!("sha256:{}", "AB".repeat(32)))
+                .unwrap()
+                .hex(),
             "ab".repeat(32)
         );
     }
@@ -769,8 +792,13 @@ mod tests {
         write(&staged, b"the real bytes");
         let want = Digest::of_bytes(Algo::Sha256, b"the real bytes");
 
-        let record = adopt(&staged, &dest, Some(&want), Source::new("base-image", "https://x"))
-            .unwrap();
+        let record = adopt(
+            &staged,
+            &dest,
+            Some(&want),
+            Source::new("base-image", "https://x"),
+        )
+        .unwrap();
         assert_eq!(record.content, want);
         assert_eq!(record.size, 14);
         assert!(dest.exists());
@@ -790,12 +818,20 @@ mod tests {
         write(&staged, b"substituted bytes");
         let want = Digest::of_bytes(Algo::Sha256, b"the real bytes");
 
-        let err = adopt(&staged, &dest, Some(&want), Source::new("base-image", "https://x"))
-            .unwrap_err()
-            .to_string();
+        let err = adopt(
+            &staged,
+            &dest,
+            Some(&want),
+            Source::new("base-image", "https://x"),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("does not match its published digest"), "{err}");
         assert!(err.contains("nothing in the store was changed"), "{err}");
-        assert!(!dest.exists(), "the poisoned bytes must not have the durable name");
+        assert!(
+            !dest.exists(),
+            "the poisoned bytes must not have the durable name"
+        );
         assert!(!provenance_path(&dest).exists());
         assert!(!staged.exists(), "and must not be left to be resumed");
     }
@@ -825,7 +861,10 @@ mod tests {
         write(&orphan, b"where did you come from");
         let err = check(&orphan, Depth::Quick).unwrap_err().to_string();
         assert!(err.contains("no provenance record"), "{err}");
-        assert!(err.contains("ast pull"), "the error has to say what to do: {err}");
+        assert!(
+            err.contains("ast pull"),
+            "the error has to say what to do: {err}"
+        );
     }
 
     /// A cache somebody wrote into after adoption. Size and mtime both move
@@ -836,7 +875,13 @@ mod tests {
         let staged = dir.path().join("k.part");
         let dest = dir.path().join("kernel");
         write(&staged, b"a kernel, honestly");
-        adopt(&staged, &dest, None, Source::new("kernel", "https://mirror")).unwrap();
+        adopt(
+            &staged,
+            &dest,
+            None,
+            Source::new("kernel", "https://mirror"),
+        )
+        .unwrap();
         check(&dest, Depth::Quick).unwrap();
 
         write(&dest, b"not a kernel at all");
@@ -858,7 +903,10 @@ mod tests {
         write(&dest, b"bbbbbbbbbbbbbbbb");
         // Put the mtime back the way an adversary with write access would.
         set_mtime(&dest, record.mtime);
-        assert!(check(&dest, Depth::Quick).is_ok(), "a stat cannot see this, by design");
+        assert!(
+            check(&dest, Depth::Quick).is_ok(),
+            "a stat cannot see this, by design"
+        );
         let err = check(&dest, Depth::Full).unwrap_err().to_string();
         assert!(err.contains("has changed since it was pulled"), "{err}");
 
@@ -983,7 +1031,10 @@ mod tests {
             provenance_path(&dest).exists(),
             "and its record is allowed to be there first — that is the whole ordering"
         );
-        assert!(check(&dest, Depth::Quick).is_err(), "a record is not an image");
+        assert!(
+            check(&dest, Depth::Quick).is_err(),
+            "a record is not an image"
+        );
 
         // The orphan record does not bless a later, different artifact: the
         // retry overwrites it with one describing what is actually there.
@@ -1009,7 +1060,12 @@ mod tests {
         write(&staged, b"a kernel");
 
         {
-            let _armed = arm("verify-fault-syncdir", Point::SyncDir, scope, std::io::ErrorKind::Other);
+            let _armed = arm(
+                "verify-fault-syncdir",
+                Point::SyncDir,
+                scope,
+                std::io::ErrorKind::Other,
+            );
             assert!(adopt(&staged, &dest, None, Source::new("kernel", "u")).is_err());
         }
         // Whatever landed, it is accountable: either nothing is there, or
@@ -1063,7 +1119,11 @@ mod tests {
         let record = adopt(&staged, &dest, None, Source::new("base-image", "u")).unwrap();
         let meta = std::fs::metadata(&dest).unwrap();
         assert_eq!(record.size, meta.len());
-        assert_eq!(record.mtime, mtime_of(&meta), "a rename does not move mtime");
+        assert_eq!(
+            record.mtime,
+            mtime_of(&meta),
+            "a rename does not move mtime"
+        );
         assert_eq!(provenance(&dest).unwrap(), record);
         // Which is what makes the cheap check cheap: it must not re-hash.
         check(&dest, Depth::Quick).unwrap();
@@ -1157,7 +1217,11 @@ mod tests {
         assert_eq!(read.kind, "base-image");
         assert_eq!(read.source, "debian:13");
         assert_eq!(read.derived_from, parents);
-        assert_eq!(read.content.algo(), OWN_ALGO, "our own bytes get our own hash");
+        assert_eq!(
+            read.content.algo(),
+            OWN_ALGO,
+            "our own bytes get our own hash"
+        );
     }
 
     /// A local file is the user's and is never rewritten, so its identity is
@@ -1169,17 +1233,29 @@ mod tests {
         write(&theirs, b"QFI\xfb the user's own image");
         let ours = dir.path().join("store").join("local-mine");
 
-        record(&theirs, &ours, Source::new("local-image", &theirs.display().to_string()))
-            .unwrap();
+        record(
+            &theirs,
+            &ours,
+            Source::new("local-image", &theirs.display().to_string()),
+        )
+        .unwrap();
         assert!(theirs.exists(), "their file is left exactly where it was");
-        assert!(!provenance_path(&theirs).exists(), "and nothing is written beside it");
+        assert!(
+            !provenance_path(&theirs).exists(),
+            "and nothing is written beside it"
+        );
         check_recorded(&theirs, &ours, Depth::Full).unwrap();
 
         // The file changing under us between create and boot is the case
         // this exists for.
         write(&theirs, b"QFI\xfb something else entirely");
-        let err = check_recorded(&theirs, &ours, Depth::Quick).unwrap_err().to_string();
-        assert!(err.contains("truncated or replaced") || err.contains("has changed"), "{err}");
+        let err = check_recorded(&theirs, &ours, Depth::Quick)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("truncated or replaced") || err.contains("has changed"),
+            "{err}"
+        );
     }
 
     /// A record with a newline in the source cannot be allowed to forge a
@@ -1203,7 +1279,10 @@ mod tests {
         // An unknown field is skipped, not fatal.
         std::fs::write(
             provenance_path(&path),
-            format!("asterism-provenance 1\ncontent {}\nsize 1\nfuture-field yes\n", read.content),
+            format!(
+                "asterism-provenance 1\ncontent {}\nsize 1\nfuture-field yes\n",
+                read.content
+            ),
         )
         .unwrap();
         assert!(provenance(&path).is_some());

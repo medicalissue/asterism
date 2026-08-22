@@ -219,8 +219,7 @@ fn audit_dir(path: &Path, md: &std::fs::Metadata, ours: u32) -> Result<Privacy> 
                  ASTERISM_HOME at a directory of your own."
             );
         }
-        let target = std::fs::metadata(path)
-            .with_context(|| format!("following {what}"))?;
+        let target = std::fs::metadata(path).with_context(|| format!("following {what}"))?;
         return audit_dir_target(path, &target, ours);
     }
     audit_dir_target(path, md, ours)
@@ -359,8 +358,8 @@ impl Door {
             private_dir(parent)?;
         }
         clear_stale(sock)?;
-        let listener = UnixListener::bind(sock)
-            .with_context(|| format!("binding {}", sock.display()))?;
+        let listener =
+            UnixListener::bind(sock).with_context(|| format!("binding {}", sock.display()))?;
         // `0600` after the bind rather than a umask around it: umask is
         // process-wide and this daemon has a runtime under it, so narrowing
         // it here would narrow it for whatever else happened to be creating a
@@ -368,7 +367,11 @@ impl Door {
         // directory, where there is no path another user can traverse.
         std::fs::set_permissions(sock, std::fs::Permissions::from_mode(0o600))
             .with_context(|| format!("making {} private", sock.display()))?;
-        Ok(Door { listener, sock: sock.to_path_buf(), _lock: lock })
+        Ok(Door {
+            listener,
+            sock: sock.to_path_buf(),
+            _lock: lock,
+        })
     }
 
     pub fn listener(&self) -> &UnixListener {
@@ -549,7 +552,11 @@ mod platform {
 
     /// `SO_PEERCRED`: the Linux spelling of the same question.
     pub(super) fn peer_uid(fd: RawFd) -> io::Result<u32> {
-        let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+        let mut cred = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
         let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
         // Safe: a connected socket fd owned by the caller, and a buffer whose
         // size is what `len` says it is.
@@ -599,7 +606,11 @@ mod tests {
     use std::os::unix::net::UnixStream;
 
     fn mode_of(path: &Path) -> u32 {
-        std::fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777
     }
 
     /// A uid that is not this process's, for the refusals that would
@@ -627,7 +638,11 @@ mod tests {
         let deep = tmp.path().join("home").join("guest-keys");
         private_dir(&deep).unwrap();
         assert_eq!(mode_of(&deep), 0o700);
-        assert_eq!(mode_of(&tmp.path().join("home")), 0o700, "the parent was left open");
+        assert_eq!(
+            mode_of(&tmp.path().join("home")),
+            0o700,
+            "the parent was left open"
+        );
     }
 
     /// Every `$ASTERISM_HOME` that predates this module is a shared
@@ -641,7 +656,10 @@ mod tests {
         std::fs::create_dir(&home).unwrap();
         std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        assert_eq!(private_dir(&home).unwrap(), Privacy::Tightened { was: 0o755 });
+        assert_eq!(
+            private_dir(&home).unwrap(),
+            Privacy::Tightened { was: 0o755 }
+        );
         assert_eq!(mode_of(&home), 0o700);
         // And it stays fixed, silently, on every start after that.
         assert_eq!(private_dir(&home).unwrap(), Privacy::Already);
@@ -659,7 +677,10 @@ mod tests {
 
         let refusal = format!("{:#}", audit_dir(&home, &md, somebody_else()).unwrap_err());
         assert!(refusal.contains("belongs to uid"), "{refusal}");
-        assert!(refusal.contains("ASTERISM_HOME"), "the refusal says what to do: {refusal}");
+        assert!(
+            refusal.contains("ASTERISM_HOME"),
+            "the refusal says what to do: {refusal}"
+        );
     }
 
     /// A symlink somebody else made where the state directory should be
@@ -690,15 +711,25 @@ mod tests {
         let home = tmp.path().join("home");
         std::os::unix::fs::symlink(&elsewhere, &home).unwrap();
 
-        assert_eq!(private_dir(&home).unwrap(), Privacy::Tightened { was: 0o755 });
-        assert_eq!(mode_of(&elsewhere), 0o700, "the directory behind the link is still open");
+        assert_eq!(
+            private_dir(&home).unwrap(),
+            Privacy::Tightened { was: 0o755 }
+        );
+        assert_eq!(
+            mode_of(&elsewhere),
+            0o700,
+            "the directory behind the link is still open"
+        );
     }
 
     /// The first run, and the state a stale-socket recovery leaves behind.
     #[test]
     fn nothing_at_the_socket_path_is_absent_rather_than_an_error() {
         let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(audit_socket(&tmp.path().join("astd.sock")).unwrap(), SocketState::Absent);
+        assert_eq!(
+            audit_socket(&tmp.path().join("astd.sock")).unwrap(),
+            SocketState::Absent
+        );
         assert_eq!(
             audit_socket(&tmp.path().join("no-such-home").join("astd.sock")).unwrap(),
             SocketState::Absent,
@@ -715,7 +746,11 @@ mod tests {
         let sock = home.join("astd.sock");
         let door = Door::open(&home, &sock).unwrap();
 
-        assert_eq!(mode_of(&sock), 0o600, "the socket is readable by other users");
+        assert_eq!(
+            mode_of(&sock),
+            0o600,
+            "the socket is readable by other users"
+        );
         assert_eq!(mode_of(&home), 0o700, "the directory it is in is listable");
         assert_eq!(audit_socket(&sock).unwrap(), SocketState::Ready);
         UnixStream::connect(&sock).expect("it is a socket that accepts");
@@ -756,8 +791,14 @@ mod tests {
 
         let dead = Door::open(&home, &sock).unwrap();
         drop(dead);
-        assert!(sock.exists(), "this test is about the file a crash leaves behind");
-        assert!(UnixStream::connect(&sock).is_err(), "and about nobody being behind it");
+        assert!(
+            sock.exists(),
+            "this test is about the file a crash leaves behind"
+        );
+        assert!(
+            UnixStream::connect(&sock).is_err(),
+            "and about nobody being behind it"
+        );
 
         let door = Door::open(&home, &sock).unwrap();
         UnixStream::connect(&sock).expect("the replacement is accepting");
@@ -830,7 +871,11 @@ mod tests {
         std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         assert_eq!(audit_socket(&sock).unwrap(), SocketState::Ready);
-        assert_eq!(mode_of(&home), 0o700, "a world-writable home was left as it was");
+        assert_eq!(
+            mode_of(&home),
+            0o700,
+            "a world-writable home was left as it was"
+        );
     }
 
     /// A lock is released by the kernel when its holder dies, however it
@@ -845,9 +890,15 @@ mod tests {
         let lock = home.join("astd.lock");
 
         let held = lock_file(&lock, Wait::No).unwrap().expect("nobody had it");
-        assert!(lock_file(&lock, Wait::No).unwrap().is_none(), "it was handed out twice");
+        assert!(
+            lock_file(&lock, Wait::No).unwrap().is_none(),
+            "it was handed out twice"
+        );
         drop(held);
-        assert!(lock_file(&lock, Wait::No).unwrap().is_some(), "it was never given back");
+        assert!(
+            lock_file(&lock, Wait::No).unwrap().is_some(),
+            "it was never given back"
+        );
     }
 
     /// One protocol, one ceiling. A request a daemon may send another over
@@ -857,7 +908,12 @@ mod tests {
     #[test]
     fn the_local_frame_limit_is_the_mesh_frame_limit() {
         assert_eq!(MAX_REQUEST_FRAME, crate::protocol::MESH_FRAME_LIMIT);
-        const { assert!(MAX_RESPONSE_FRAME > MAX_REQUEST_FRAME, "a console tail has to fit") };
+        const {
+            assert!(
+                MAX_RESPONSE_FRAME > MAX_REQUEST_FRAME,
+                "a console tail has to fit"
+            )
+        };
     }
 
     /// The peer check answers with the truth about a connection this process

@@ -206,12 +206,7 @@ impl Store {
     /// that is what fences the *previous* connection of that same instance,
     /// which is the case that actually happens (a guest that was killed
     /// leaves a QEMU that may not have noticed yet).
-    pub fn lease(
-        &mut self,
-        name: &str,
-        holder: &str,
-        holder_device: &str,
-    ) -> Result<BlockVolume> {
+    pub fn lease(&mut self, name: &str, holder: &str, holder_device: &str) -> Result<BlockVolume> {
         let vol = self.volumes.get_mut(name).with_context(|| no_such(name))?;
         if let Some(current) = &vol.lease {
             if current.holder != holder {
@@ -360,7 +355,10 @@ pub fn check_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 40 {
         bail!("a volume name must be 1-40 characters (got {name:?})");
     }
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         bail!("a volume name may hold letters, digits, - and _ (got {name:?})");
     }
     if name.starts_with('-') {
@@ -408,8 +406,12 @@ pub fn parse_size(value: &str) -> Result<u64> {
 
 /// A size as a human reads it.
 pub fn format_size(bytes: u64) -> String {
-    const UNITS: [(&str, u64); 4] =
-        [("T", 1 << 40), ("G", 1 << 30), ("M", 1 << 20), ("K", 1 << 10)];
+    const UNITS: [(&str, u64); 4] = [
+        ("T", 1 << 40),
+        ("G", 1 << 30),
+        ("M", 1 << 20),
+        ("K", 1 << 10),
+    ];
     for (suffix, scale) in UNITS {
         if bytes >= scale {
             let whole = bytes as f64 / scale as f64;
@@ -428,8 +430,7 @@ mod tests {
 
     fn store() -> Store {
         Store {
-            path: std::env::temp_dir()
-                .join(format!("ast-vol-test-{}.json", std::process::id())),
+            path: std::env::temp_dir().join(format!("ast-vol-test-{}.json", std::process::id())),
             ..Default::default()
         }
     }
@@ -449,8 +450,15 @@ mod tests {
 
     #[test]
     fn a_device_qualified_reference_is_told_from_a_path() {
-        assert_eq!(parse_ref("desktop:tank"), Some(("desktop".into(), "tank".into())));
-        assert_eq!(parse_ref("/tank/media"), None, "an absolute path is a directory");
+        assert_eq!(
+            parse_ref("desktop:tank"),
+            Some(("desktop".into(), "tank".into()))
+        );
+        assert_eq!(
+            parse_ref("/tank/media"),
+            None,
+            "an absolute path is a directory"
+        );
         assert_eq!(parse_ref("./here"), None);
         assert_eq!(parse_ref("~/here"), None);
         assert_eq!(parse_ref("tank"), None, "no device, no reference");
@@ -485,11 +493,17 @@ mod tests {
         assert!(s.release("tank", "other").is_err());
         let released = s.release("tank", "dev").unwrap().unwrap();
         assert_eq!(released.epoch, 2);
-        assert!(s.release("tank", "dev").unwrap().is_none(), "releasing twice is fine");
+        assert!(
+            s.release("tank", "dev").unwrap().is_none(),
+            "releasing twice is fine"
+        );
 
         // ...and the counter did not come back down with it.
         let elsewhere = s.lease("tank", "other", "desktop").unwrap();
-        assert_eq!(elsewhere.epoch, 3, "a released volume does not rewind the epoch");
+        assert_eq!(
+            elsewhere.epoch, 3,
+            "a released volume does not rewind the epoch"
+        );
         assert_eq!(elsewhere.export_name(elsewhere.epoch), "tank-e3");
     }
 
@@ -506,7 +520,10 @@ mod tests {
 
         let back = s.reconnect("tank", "dev", epoch).unwrap();
         assert_eq!(back.epoch, epoch, "a reconnect is not a renewal");
-        assert_eq!(back.lease.as_ref().unwrap().export, granted.lease.unwrap().export);
+        assert_eq!(
+            back.lease.as_ref().unwrap().export,
+            granted.lease.unwrap().export
+        );
         // Twice, and it is still the same door: nothing about it is a grant.
         assert_eq!(s.reconnect("tank", "dev", epoch).unwrap().epoch, epoch);
         assert_eq!(s.get("tank").unwrap().epoch, epoch);
@@ -518,7 +535,10 @@ mod tests {
         // The holder's own stale epoch is refused too — that is a consumer
         // that was fenced while it was away, and it must not be handed the
         // current door just because the name on the lease still matches.
-        let err = s.reconnect("tank", "dev", epoch - 1).unwrap_err().to_string();
+        let err = s
+            .reconnect("tank", "dev", epoch - 1)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("fenced out"), "{err}");
         assert!(err.contains(&format!("current is {epoch}")), "{err}");
 
@@ -567,8 +587,15 @@ mod tests {
         let mut s = Store::load(&path).unwrap();
         s.create("tank", 5 << 30).unwrap();
         s.lease("tank", "dev", "laptop").unwrap();
-        s.set_export_proc("tank", Some(ProcId { pid: 4242, started_us: 7, exec: None }))
-            .unwrap();
+        s.set_export_proc(
+            "tank",
+            Some(ProcId {
+                pid: 4242,
+                started_us: 7,
+                exec: None,
+            }),
+        )
+        .unwrap();
         s.save().unwrap();
 
         let back = Store::load(&path).unwrap();
@@ -611,7 +638,10 @@ mod tests {
 
         let back = Store::load(&path).unwrap();
         let vol = back.get("tank").unwrap();
-        assert_eq!(vol.epoch, 1, "the epoch that was committed is the epoch that holds");
+        assert_eq!(
+            vol.epoch, 1,
+            "the epoch that was committed is the epoch that holds"
+        );
         assert_eq!(vol.lease.as_ref().unwrap().export, "tank-e1");
     }
 
@@ -633,7 +663,9 @@ mod tests {
         std::fs::write(&path, &whole[..whole.len() / 2]).unwrap();
 
         let back = Store::load(&path).unwrap();
-        let vol = back.get("tank").expect("the volume is not forgotten because a page went");
+        let vol = back
+            .get("tank")
+            .expect("the volume is not forgotten because a page went");
         assert_eq!(vol.size_bytes, 5 << 30);
     }
 }

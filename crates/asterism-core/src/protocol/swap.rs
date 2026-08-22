@@ -72,7 +72,11 @@ impl BaseImage {
 
     /// What a peer fetch of it would really cost.
     pub fn cost(&self) -> u64 {
-        if self.allocated == 0 { self.len } else { self.allocated }
+        if self.allocated == 0 {
+            self.len
+        } else {
+            self.allocated
+        }
     }
 }
 
@@ -156,8 +160,18 @@ mod tests {
             arch: "aarch64".into(),
             base: BaseImage::absent("debian:13".to_owned()),
             files: vec![
-                MoveFile { path: "disk.raw".into(), len: 20 << 30, allocated: 1 << 30, mode: 0o600 },
-                MoveFile { path: "seed.iso".into(), len: 366 << 10, allocated: 366 << 10, mode: 0o644 },
+                MoveFile {
+                    path: "disk.raw".into(),
+                    len: 20 << 30,
+                    allocated: 1 << 30,
+                    mode: 0o600,
+                },
+                MoveFile {
+                    path: "seed.iso".into(),
+                    len: 366 << 10,
+                    allocated: 366 << 10,
+                    mode: 0o644,
+                },
             ],
             local_volumes: vec!["/mnt/ast/tank".into()],
         });
@@ -170,16 +184,42 @@ mod tests {
         );
 
         for req in [
-            Request::SetCpu { name: "dev".into(), device: "desktop".into(), down: false },
+            Request::SetCpu {
+                name: "dev".into(),
+                device: "desktop".into(),
+                down: false,
+            },
             Request::MoveOffer { name: "dev".into() },
-            Request::MoveProbe { manifest: manifest.clone() },
-            Request::MovePrepare { name: "dev".into(), to_device: "desktop".into(), epoch: 1 },
-            Request::MoveCommitTarget { manifest: manifest.clone(), epoch: 1 },
-            Request::MoveCommitSource { name: "dev".into(), epoch: 1 },
-            Request::MoveAbortSource { name: "dev".into(), epoch: 1 },
-            Request::MoveAbortTarget { name: "dev".into(), epoch: 1 },
+            Request::MoveProbe {
+                manifest: manifest.clone(),
+            },
+            Request::MovePrepare {
+                name: "dev".into(),
+                to_device: "desktop".into(),
+                epoch: 1,
+            },
+            Request::MoveCommitTarget {
+                manifest: manifest.clone(),
+                epoch: 1,
+            },
+            Request::MoveCommitSource {
+                name: "dev".into(),
+                epoch: 1,
+            },
+            Request::MoveAbortSource {
+                name: "dev".into(),
+                epoch: 1,
+            },
+            Request::MoveAbortTarget {
+                name: "dev".into(),
+                epoch: 1,
+            },
         ] {
-            assert_eq!(req.subject(), None, "{req:?} names a device, not an instance");
+            assert_eq!(
+                req.subject(),
+                None,
+                "{req:?} names a device, not an instance"
+            );
             assert!(!req.survives_a_move(), "{req:?} is not a read");
         }
 
@@ -190,10 +230,26 @@ mod tests {
 
         // A fenced instance answers what reads and nothing that writes.
         assert!(Request::Status { name: "dev".into() }.survives_a_move());
-        assert!(Request::Logs { name: "dev".into(), lines: 10 }.survives_a_move());
-        assert!(!Request::Up { name: "dev".into(), restart: None }.survives_a_move());
+        assert!(Request::Logs {
+            name: "dev".into(),
+            lines: 10
+        }
+        .survives_a_move());
+        assert!(!Request::Up {
+            name: "dev".into(),
+            restart: None
+        }
+        .survives_a_move());
         assert!(!Request::Remove { name: "dev".into() }.survives_a_move());
-        assert!(!Request::Snapshot { name: "dev".into(), tag: "t".into() }.survives_a_move());
-        assert!(!Request::Rename { name: "dev".into(), new_name: "e".into() }.survives_a_move());
+        assert!(!Request::Snapshot {
+            name: "dev".into(),
+            tag: "t".into()
+        }
+        .survives_a_move());
+        assert!(!Request::Rename {
+            name: "dev".into(),
+            new_name: "e".into()
+        }
+        .survives_a_move());
     }
 }

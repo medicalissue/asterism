@@ -153,7 +153,9 @@ pub fn list(instance_dir: &Path) -> Result<Vec<Snapshot>> {
     let mut rows: Vec<(u64, String, u64)> = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(tag) = name.strip_suffix(SUFFIX) else { continue };
+        let Some(tag) = name.strip_suffix(SUFFIX) else {
+            continue;
+        };
         if validate_tag(tag).is_err() {
             continue;
         }
@@ -164,7 +166,11 @@ pub fn list(instance_dir: &Path) -> Result<Vec<Snapshot>> {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        rows.push((taken, tag.to_owned(), cow::usage(&entry.path()).unwrap_or(0)));
+        rows.push((
+            taken,
+            tag.to_owned(),
+            cow::usage(&entry.path()).unwrap_or(0),
+        ));
     }
     rows.sort();
     Ok(rows
@@ -378,7 +384,10 @@ mod tests {
         let (dir, disk) = instance_with_disk(b"pristine");
         let id = take(dir.path(), &disk, "clean").unwrap();
         assert_eq!(id.0, "clean");
-        assert_eq!(path(dir.path(), "clean").unwrap(), dir.path().join("snapshots/clean.raw"));
+        assert_eq!(
+            path(dir.path(), "clean").unwrap(),
+            dir.path().join("snapshots/clean.raw")
+        );
         assert!(dir.path().join("snapshots/clean.raw").exists());
 
         // Snapshots live under the instance, so removing it removes them.
@@ -413,7 +422,9 @@ mod tests {
         restore(dir.path(), &disk, "clean").unwrap();
         assert_eq!(std::fs::read(&disk).unwrap(), b"pristine");
 
-        let err = restore(dir.path(), &disk, "never-taken").unwrap_err().to_string();
+        let err = restore(dir.path(), &disk, "never-taken")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("no snapshot"), "{err}");
         // A failed restore leaves the disk untouched.
         assert_eq!(std::fs::read(&disk).unwrap(), b"pristine");
@@ -433,8 +444,11 @@ mod tests {
 
         // The listing is a directory listing, so it is truthful by
         // construction: what is gone is gone from it.
-        let listed: Vec<String> =
-            list(dir.path()).unwrap().into_iter().map(|s| s.tag).collect();
+        let listed: Vec<String> = list(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|s| s.tag)
+            .collect();
         assert_eq!(listed, vec!["keep".to_owned()]);
 
         // Deleting the same one twice says what is true rather than
@@ -475,13 +489,31 @@ mod tests {
         assert!(restore(dir.path(), &disk, "clean").is_err());
         drop(armed);
 
-        assert_eq!(std::fs::read(&disk).unwrap(), b"diverged", "the disk was never replaced");
-        assert_eq!(restoring(dir.path()).as_deref(), Some("clean"), "and it is still pinned");
+        assert_eq!(
+            std::fs::read(&disk).unwrap(),
+            b"diverged",
+            "the disk was never replaced"
+        );
+        assert_eq!(
+            restoring(dir.path()).as_deref(),
+            Some("clean"),
+            "and it is still pinned"
+        );
 
         let said = converge(dir.path()).expect("there was something to settle");
-        assert!(said.contains("interrupted before it replaced the disk"), "{said}");
-        assert_eq!(restoring(dir.path()), None, "the snapshot is unpinned again");
-        assert!(!disk.with_extension("restoring").exists(), "the half-made copy is gone");
+        assert!(
+            said.contains("interrupted before it replaced the disk"),
+            "{said}"
+        );
+        assert_eq!(
+            restoring(dir.path()),
+            None,
+            "the snapshot is unpinned again"
+        );
+        assert!(
+            !disk.with_extension("restoring").exists(),
+            "the half-made copy is gone"
+        );
         assert_eq!(std::fs::read(&disk).unwrap(), b"diverged");
 
         // And the restore can simply be run again.
@@ -574,7 +606,9 @@ mod tests {
     /// Pure Rust: shelling out to `date`/`touch` differs between BSD and
     /// GNU (`date -r` means epoch on one and reference-file on the other).
     fn backdate(instance_dir: &Path, tag: &str, unix_secs: u64) -> bool {
-        let Ok(p) = path(instance_dir, tag) else { return false };
+        let Ok(p) = path(instance_dir, tag) else {
+            return false;
+        };
         let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(unix_secs);
         std::fs::File::options()
             .write(true)
@@ -636,7 +670,10 @@ ID      TAG               VM_SIZE                DATE      VM_CLOCK     ICOUNT
         assert!(validate_tag("two words").is_err());
         assert!(validate_tag("-c").is_err(), "must not pass for a flag");
         assert!(validate_tag("what?").is_err());
-        assert!(validate_tag("../escape").is_err(), "must not leave the directory");
+        assert!(
+            validate_tag("../escape").is_err(),
+            "must not leave the directory"
+        );
     }
 
     #[test]

@@ -68,13 +68,22 @@ fn an_unpinned_url_is_refused_before_anything_is_downloaded_or_written() {
     for reference in UNPINNED {
         let text = match image::resolve(reference) {
             Err(e) => format!("{e:#}"),
-            Ok(r) => panic!("{reference} resolved to {} instead of being refused", r.name),
+            Ok(r) => panic!(
+                "{reference} resolved to {} instead of being refused",
+                r.name
+            ),
         };
 
         // Refused, and the refusal is one somebody can act on: it says what
         // is missing, that nothing happened, and exactly what to type.
-        assert!(text.contains("nothing publishes a digest"), "{reference}: {text}");
-        assert!(text.contains("nothing was downloaded"), "{reference}: {text}");
+        assert!(
+            text.contains("nothing publishes a digest"),
+            "{reference}: {text}"
+        );
+        assert!(
+            text.contains("nothing was downloaded"),
+            "{reference}: {text}"
+        );
         assert!(text.contains("#sha256:<hex>"), "{reference}: {text}");
         assert!(text.contains("sha512"), "{reference}: {text}");
         assert!(text.contains("blake3"), "{reference}: {text}");
@@ -101,7 +110,10 @@ fn only_the_digest_algorithms_asterism_can_compute_are_accepted() {
             Err(e) => format!("{e:#}"),
             Ok(r) => panic!("{algo} was accepted, resolving to {}", r.name),
         };
-        assert!(text.contains("unsupported digest algorithm"), "{algo}: {text}");
+        assert!(
+            text.contains("unsupported digest algorithm"),
+            "{algo}: {text}"
+        );
         assert!(text.contains("nothing was pulled"), "{algo}: {text}");
         assert_store_untouched(algo);
     }
@@ -121,7 +133,10 @@ fn only_the_digest_algorithms_asterism_can_compute_are_accepted() {
             Err(e) => format!("{e:#}"),
             Ok(r) => panic!("{bad} was accepted, resolving to {}", r.name),
         };
-        assert!(text.contains("pins a digest Asterism will not accept"), "{bad}: {text}");
+        assert!(
+            text.contains("pins a digest Asterism will not accept"),
+            "{bad}: {text}"
+        );
         assert_store_untouched(bad);
     }
 }
@@ -144,10 +159,16 @@ fn a_supported_pin_resolves_and_then_governs_the_adoption() {
 
         assert_eq!(resolved.url.as_deref(), Some(url), "{algo}");
         assert_eq!(resolved.name, url, "the pin is not part of the name");
-        let expected = resolved.expected.as_ref().expect("a pinned url carries its digest");
+        let expected = resolved
+            .expected
+            .as_ref()
+            .expect("a pinned url carries its digest");
         assert_eq!(expected, &digest, "{algo}");
         assert_eq!(expected.algo(), algo);
-        assert!(resolved.staging.is_some(), "a url is downloaded, not used in place");
+        assert!(
+            resolved.staging.is_some(),
+            "a url is downloaded, not used in place"
+        );
         assert_store_untouched(algo.name());
 
         // What `ast pull` does with it once curl has written the `.part`.
@@ -167,12 +188,23 @@ fn a_supported_pin_resolves_and_then_governs_the_adoption() {
         std::fs::write(&poisoned, b"a backdoored image of the same shape").unwrap();
         let text = format!(
             "{:#}",
-            verify::adopt(&poisoned, &elsewhere, Some(expected), Source::new("download", url))
-                .unwrap_err()
+            verify::adopt(
+                &poisoned,
+                &elsewhere,
+                Some(expected),
+                Source::new("download", url)
+            )
+            .unwrap_err()
         );
-        assert!(text.contains("does not match its published digest"), "{algo}: {text}");
+        assert!(
+            text.contains("does not match its published digest"),
+            "{algo}: {text}"
+        );
         assert!(!elsewhere.exists(), "{algo}");
-        assert!(!poisoned.exists(), "{algo}: left where a retry would resume it");
+        assert!(
+            !poisoned.exists(),
+            "{algo}: left where a retry would resume it"
+        );
         assert_store_untouched(algo.name());
     }
 }

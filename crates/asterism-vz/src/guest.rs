@@ -366,7 +366,12 @@ impl<R: BufRead, W: Write> Session<R, W> {
 
     /// [`Session::open`] with the host nonce supplied, so a test can pin
     /// both halves of a handshake and check the exact bytes.
-    pub fn open_with_nonce(mut reader: R, mut writer: W, key: &Key, host_nonce: &str) -> Result<Self> {
+    pub fn open_with_nonce(
+        mut reader: R,
+        mut writer: W,
+        key: &Key,
+        host_nonce: &str,
+    ) -> Result<Self> {
         let hello: Hello = read_line(&mut reader).context("reading the guest agent's hello")?;
         if hello.agent != "asterism" {
             bail!(
@@ -482,7 +487,11 @@ impl<R: BufRead, W: Write> Session<R, W> {
         self.next_id += 1;
         write_line(
             &mut self.writer,
-            &Request { id, op: op.to_owned(), wait_ms },
+            &Request {
+                id,
+                op: op.to_owned(),
+                wait_ms,
+            },
         )?;
         let answer: Answer = read_line(&mut self.reader)
             .with_context(|| format!("reading the guest agent's answer to {op:?}"))?;
@@ -513,8 +522,8 @@ pub fn pick_version(theirs: &[u32]) -> Option<u32> {
 
 fn read_line<T: serde::de::DeserializeOwned>(reader: &mut impl BufRead) -> Result<T> {
     let line = read_frame(reader)?;
-    let line = std::str::from_utf8(&line)
-        .context("the guest agent sent a frame that was not utf-8")?;
+    let line =
+        std::str::from_utf8(&line).context("the guest agent sent a frame that was not utf-8")?;
     serde_json::from_str(line.trim())
         .with_context(|| format!("the guest agent sent {:?}", truncate(line.trim())))
 }
@@ -542,9 +551,7 @@ fn read_frame(reader: &mut impl BufRead) -> Result<Vec<u8>> {
         let newline = chunk.iter().position(|byte| *byte == b'\n');
         let would_be = frame.len() + newline.unwrap_or(chunk.len());
         if would_be > MAX_FRAME_BYTES {
-            bail!(
-                "the guest agent sent more than {MAX_FRAME_BYTES} bytes before ending a frame"
-            );
+            bail!("the guest agent sent more than {MAX_FRAME_BYTES} bytes before ending a frame");
         }
         if let Some(at) = newline {
             frame.extend_from_slice(&chunk[..at]);
@@ -1106,9 +1113,11 @@ exit 0
          exit 0\n\
          fi\n"
     ));
-    script.push_str("umask 077
+    script.push_str(
+        "umask 077
 mkdir -p /etc/asterism
-");
+",
+    );
     script.push_str(&format!(
         "printf '%s\\n' '{}' > {GUEST_KEY_PATH}\nchmod 0600 {GUEST_KEY_PATH}\n",
         key.hex()
@@ -1238,7 +1247,10 @@ mod tests {
         assert_eq!(first.hex(), Key::ensure(&path).unwrap().hex());
         assert_eq!(first.hex(), Key::read(&path).unwrap().unwrap().hex());
         assert_eq!(first.hex().len(), 64);
-        assert_ne!(first.hex(), Key::ensure(&dir.path().join("b.key")).unwrap().hex());
+        assert_ne!(
+            first.hex(),
+            Key::ensure(&dir.path().join("b.key")).unwrap().hex()
+        );
     }
 
     #[test]
@@ -1254,7 +1266,12 @@ mod tests {
     #[test]
     fn a_request_carries_only_what_it_needs() {
         assert_eq!(
-            serde_json::to_string(&Request { id: 7, op: "status".into(), wait_ms: None }).unwrap(),
+            serde_json::to_string(&Request {
+                id: 7,
+                op: "status".into(),
+                wait_ms: None
+            })
+            .unwrap(),
             r#"{"id":7,"op":"status"}"#
         );
         assert_eq!(
@@ -1292,17 +1309,13 @@ mod tests {
             bytes.push(b'\n');
             bytes
         };
-        let mut exact = BufReader::with_capacity(
-            1024,
-            std::io::Cursor::new(frame(MAX_FRAME_BYTES)),
-        );
+        let mut exact =
+            BufReader::with_capacity(1024, std::io::Cursor::new(frame(MAX_FRAME_BYTES)));
         let value: serde_json::Value = read_line(&mut exact).expect("exactly the cap is valid");
         assert_eq!(value, serde_json::json!({}));
 
-        let mut over = BufReader::with_capacity(
-            1024,
-            std::io::Cursor::new(frame(MAX_FRAME_BYTES + 1)),
-        );
+        let mut over =
+            BufReader::with_capacity(1024, std::io::Cursor::new(frame(MAX_FRAME_BYTES + 1)));
         let err = read_line::<serde_json::Value>(&mut over).unwrap_err();
         let err = format!("{err:#}");
         assert!(err.contains(&MAX_FRAME_BYTES.to_string()), "{err}");
@@ -1344,14 +1357,22 @@ mod tests {
         };
         assert_eq!(status.endpoint(), Some(addr("192.168.64.7")));
         assert_eq!(
-            Status { addrs: vec![addr("8.8.8.8")], ..status.clone() }.endpoint(),
+            Status {
+                addrs: vec![addr("8.8.8.8")],
+                ..status.clone()
+            }
+            .endpoint(),
             None,
             "a guest with nothing but a public address has no endpoint here"
         );
         // The address arrives a second or two before sshd does. Handing it
         // back then would make `ast up && ast ssh` a race.
         assert_eq!(
-            Status { ssh: false, ..status.clone() }.endpoint(),
+            Status {
+                ssh: false,
+                ..status.clone()
+            }
+            .endpoint(),
             None,
             "an address nobody can ssh to yet is not an endpoint"
         );
@@ -1485,13 +1506,18 @@ mod tests {
         // so what is proved is the *waiting* — it neither returns at once
         // nor sits there forever.
         let asked = std::time::Instant::now();
-        let waited = session.ready_within(Duration::from_millis(300)).expect("status");
+        let waited = session
+            .ready_within(Duration::from_millis(300))
+            .expect("status");
         assert!(
             asked.elapsed() >= Duration::from_millis(250) || waited.endpoint().is_some(),
             "the guest answered a wait in {:?} without being reachable",
             asked.elapsed()
         );
-        assert!(asked.elapsed() < Duration::from_secs(5), "and it did come back");
+        assert!(
+            asked.elapsed() < Duration::from_secs(5),
+            "and it did come back"
+        );
 
         // Deliberately no `sync` here: the agent's sync *is* `sync(2)`, and
         // on the machine running this test that flushes the developer's own
@@ -1650,7 +1676,10 @@ mod tests {
         let welcome = r#"{"ok":true,"proof":"deadbeef","facts":{"hostname":"liar"}}"#;
         let script = format!("{hello}\n{welcome}\n");
         let err = one_shot(&script, "bbbb");
-        assert!(err.contains("did not prove it holds this instance's key"), "{err}");
+        assert!(
+            err.contains("did not prove it holds this instance's key"),
+            "{err}"
+        );
 
         // Something else entirely on the port is refused before any of that.
         let err = one_shot(r#"{"agent":"sshd","versions":[1],"nonce":"a"}"#, "bbbb");
@@ -1675,7 +1704,11 @@ mod tests {
         let _hello: Hello = read_line(&mut out).unwrap();
         write_line(
             &mut inp,
-            &Accept { version: 99, nonce: "bbbb".into(), proof: "whatever".into() },
+            &Accept {
+                version: 99,
+                nonce: "bbbb".into(),
+                proof: "whatever".into(),
+            },
         )
         .unwrap();
         let refusal: Welcome = read_line(&mut out).unwrap();
@@ -1742,8 +1775,14 @@ mod tests {
         assert!(unit.contains("Restart=always"), "{unit}");
         // The path in the unit is the one the rewrite above moved, so what
         // is checked here is that the unit runs the agent it just wrote.
-        assert!(unit.contains(&format!("ExecStart={root}/sbin/asterism-guest")), "{unit}");
-        assert!(AGENT_UNIT.contains(GUEST_AGENT_PATH), "and the real one is absolute");
+        assert!(
+            unit.contains(&format!("ExecStart={root}/sbin/asterism-guest")),
+            "{unit}"
+        );
+        assert!(
+            AGENT_UNIT.contains(GUEST_AGENT_PATH),
+            "and the real one is absolute"
+        );
     }
 
     /// cloud-init concatenates every `bootcmd` entry into one `/bin/sh`

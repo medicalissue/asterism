@@ -163,7 +163,10 @@ impl Agent {
     }
 
     /// Hand one job to the session thread.
-    fn ask<T>(&self, job: impl FnOnce(Sender<Result<T, String>>) -> Job) -> Result<Pending<T>, String> {
+    fn ask<T>(
+        &self,
+        job: impl FnOnce(Sender<Result<T, String>>) -> Job,
+    ) -> Result<Pending<T>, String> {
         let jobs = self
             .jobs
             .as_ref()
@@ -198,9 +201,9 @@ impl<T> Pending<T> {
         match self.0.try_recv() {
             Ok(answer) => Some(answer),
             Err(std::sync::mpsc::TryRecvError::Empty) => None,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                Some(Err("the guest agent session ended before it answered".to_owned()))
-            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(
+                "the guest agent session ended before it answered".to_owned(),
+            )),
         }
     }
 }
@@ -321,7 +324,12 @@ fn session(
         drop(state);
         // Once the guest is reachable there is nothing to wait for, and
         // asking again is health rather than discovery.
-        next_status = Instant::now() + if addr.is_some() { SETTLED } else { Duration::ZERO };
+        next_status = Instant::now()
+            + if addr.is_some() {
+                SETTLED
+            } else {
+                Duration::ZERO
+            };
     }
 }
 

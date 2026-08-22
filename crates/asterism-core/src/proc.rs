@@ -282,7 +282,9 @@ impl ProcId {
             Look::Found(probe) => probe,
             Look::NoSuchProcess => return Err(format!("no process {pid}")),
             Look::Unreadable(why) => {
-                return Err(format!("this host will not say what process {pid} is: {why}"))
+                return Err(format!(
+                    "this host will not say what process {pid} is: {why}"
+                ))
             }
         };
         if probe.zombie {
@@ -321,7 +323,9 @@ impl ProcId {
             return Err(format!(
                 "pid {pid} is a {} that was not started for this instance — its command \
                  line names none of {}",
-                exec.file_name().and_then(|n| n.to_str()).unwrap_or("process"),
+                exec.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("process"),
                 evidence.describe()
             ));
         }
@@ -610,7 +614,11 @@ fn look(pid: u32) -> Look {
         // be known: an exit status waiting to be collected is not a running
         // guest.
         if why.raw_os_error() == Some(libc::ESRCH) {
-            return Look::Found(Probe { started_us: 0, zombie: true, exec: None });
+            return Look::Found(Probe {
+                started_us: 0,
+                zombie: true,
+                exec: None,
+            });
         }
         // Anything else (EPERM, for a process belonging to another user) is
         // a live process this host will not describe. Its own answer, and
@@ -670,7 +678,9 @@ fn look(pid: u32) -> Look {
     // The second field is the executable name in parentheses and may contain
     // both spaces and parentheses, so everything is counted from the last
     // `)` rather than by splitting the whole line.
-    let Some(close) = stat.rfind(')') else { return unreadable() };
+    let Some(close) = stat.rfind(')') else {
+        return unreadable();
+    };
     let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
     // `fields[0]` is field 3 (state), so field N is `fields[N - 3]`.
     let (Some(state), Some(ticks)) = (fields.first(), fields.get(19)) else {
@@ -736,7 +746,11 @@ mod tests {
     #[test]
     fn a_pid_that_was_never_there_is_gone() {
         // Pid 0 is the kernel's, and nothing Asterism spawns can be it.
-        let nobody = ProcId { pid: 0, started_us: 1, exec: None };
+        let nobody = ProcId {
+            pid: 0,
+            started_us: 1,
+            exec: None,
+        };
         assert_eq!(nobody.check(), Ownership::Gone);
         assert!(!nobody.alive());
         assert!(!nobody.signal(Signal::Kill).unwrap(), "nothing to signal");
@@ -751,7 +765,10 @@ mod tests {
 
         // Same pid, a start instant it never had: what a stale handle looks
         // like once the number has been handed out again.
-        let stale = ProcId { started_us: real.started_us - 1, ..real.clone() };
+        let stale = ProcId {
+            started_us: real.started_us - 1,
+            ..real.clone()
+        };
         assert!(matches!(stale.check(), Ownership::Foreign(_)));
         assert!(!stale.alive());
 
@@ -770,7 +787,10 @@ mod tests {
     #[test]
     fn a_replaced_executable_is_foreign() {
         let me = ProcId::capture(std::process::id()).unwrap();
-        let swapped = ProcId { exec: Some(PathBuf::from("/bin/somebody-else")), ..me };
+        let swapped = ProcId {
+            exec: Some(PathBuf::from("/bin/somebody-else")),
+            ..me
+        };
         assert!(matches!(swapped.check(), Ownership::Foreign(_)));
         assert!(swapped.signal(Signal::Term).is_err());
     }
@@ -801,10 +821,17 @@ mod tests {
         while id.check() != Ownership::Gone && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert_eq!(id.check(), Ownership::Gone, "an unreaped exit is not a running guest");
+        assert_eq!(
+            id.check(),
+            Ownership::Gone,
+            "an unreaped exit is not a running guest"
+        );
         // `kill -0`, the old test, would have said this was alive.
         let answers_kill_zero = unsafe { libc::kill(id.pid as libc::pid_t, 0) } == 0;
-        assert!(answers_kill_zero, "and this is exactly what used to be believed");
+        assert!(
+            answers_kill_zero,
+            "and this is exactly what used to be believed"
+        );
         let _ = child.wait();
     }
 
@@ -821,12 +848,20 @@ mod tests {
     // so each verdict can be asserted on directly.
 
     fn found(started_us: u64) -> Look {
-        Look::Found(Probe { started_us, zombie: false, exec: None })
+        Look::Found(Probe {
+            started_us,
+            zombie: false,
+            exec: None,
+        })
     }
 
     #[test]
     fn a_process_the_kernel_will_not_describe_is_neither_dead_nor_ours() {
-        let id = ProcId { pid: 4242, started_us: 7, exec: None };
+        let id = ProcId {
+            pid: 4242,
+            started_us: 7,
+            exec: None,
+        };
         let unknown = id.against(Look::Unreadable("no answer".into()));
 
         assert!(matches!(unknown, Ownership::Unknown(_)));
@@ -840,7 +875,11 @@ mod tests {
 
     #[test]
     fn every_other_answer_is_settled_one_way_or_the_other() {
-        let id = ProcId { pid: 4242, started_us: 7, exec: None };
+        let id = ProcId {
+            pid: 4242,
+            started_us: 7,
+            exec: None,
+        };
 
         assert_eq!(id.against(found(7)), Ownership::Ours);
         assert!(id.against(found(7)).is_ours());
@@ -867,7 +906,11 @@ mod tests {
     /// there is nothing to compare — and one that does is held to it.
     #[test]
     fn the_executable_is_compared_only_when_both_sides_name_one() {
-        let bare = ProcId { pid: 1, started_us: 7, exec: None };
+        let bare = ProcId {
+            pid: 1,
+            started_us: 7,
+            exec: None,
+        };
         let running = Look::Found(Probe {
             started_us: 7,
             zombie: false,
@@ -875,7 +918,10 @@ mod tests {
         });
         assert_eq!(bare.against(running), Ownership::Ours);
 
-        let named = ProcId { exec: Some(PathBuf::from("/bin/qemu")), ..bare };
+        let named = ProcId {
+            exec: Some(PathBuf::from("/bin/qemu")),
+            ..bare
+        };
         assert!(matches!(
             named.against(Look::Found(Probe {
                 started_us: 7,
@@ -896,7 +942,10 @@ mod tests {
         assert!(ProcId::adopt(
             0,
             crate::instance::now_unix(),
-            &Evidence { exec: &["anything"], names: &[&ctl] }
+            &Evidence {
+                exec: &["anything"],
+                names: &[&ctl]
+            }
         )
         .is_err());
     }
@@ -923,8 +972,7 @@ mod tests {
         let mut child = holder(&ctl);
         let now = crate::instance::now_unix();
 
-        let adopted =
-            ProcId::adopt(child.id(), now, &evidence(&["sleep"], &[&ctl])).unwrap();
+        let adopted = ProcId::adopt(child.id(), now, &evidence(&["sleep"], &[&ctl])).unwrap();
         assert_eq!(adopted.pid, child.id());
         assert!(adopted.alive());
 
@@ -974,7 +1022,10 @@ mod tests {
         // Even a hand-built identity naming that pid does not help if it is
         // not the process that was recorded: the number is the only thing it
         // shares, and that is not what `signal` checks.
-        let forged = ProcId { started_us: real.started_us - 1, ..real.clone() };
+        let forged = ProcId {
+            started_us: real.started_us - 1,
+            ..real.clone()
+        };
         assert!(forged.signal(Signal::Kill).is_err());
         assert!(real.alive(), "still untouched");
 
@@ -1058,8 +1109,7 @@ mod tests {
         let ctl = PathBuf::from("/tmp/asterism-adopt-test/instances/dev/qmp.sock");
         let mut child = holder(&ctl);
         let long_ago = crate::instance::now_unix() - 3600;
-        let why =
-            ProcId::adopt(child.id(), long_ago, &evidence(&["sleep"], &[&ctl])).unwrap_err();
+        let why = ProcId::adopt(child.id(), long_ago, &evidence(&["sleep"], &[&ctl])).unwrap_err();
         assert!(why.contains("different process"), "{why}");
         let _ = child.kill();
         let _ = child.wait();
@@ -1068,9 +1118,12 @@ mod tests {
     #[test]
     fn adoption_refuses_a_pid_with_nothing_behind_it() {
         let ctl = PathBuf::from("/tmp/asterism-adopt-test/instances/dev/qmp.sock");
-        assert!(
-            ProcId::adopt(0, crate::instance::now_unix(), &evidence(&["sleep"], &[&ctl])).is_err()
-        );
+        assert!(ProcId::adopt(
+            0,
+            crate::instance::now_unix(),
+            &evidence(&["sleep"], &[&ctl])
+        )
+        .is_err());
     }
 
     /// The command line is read from the kernel, and only the arguments are
@@ -1097,9 +1150,18 @@ mod tests {
 
     #[test]
     fn a_trailing_star_matches_a_family_of_binaries() {
-        assert!(matches_any(Path::new("/opt/homebrew/bin/qemu-system-aarch64"), &["qemu-system-*"]));
-        assert!(matches_any(Path::new("/usr/local/bin/qemu-system-x86_64"), &["qemu-system-*"]));
-        assert!(!matches_any(Path::new("/usr/bin/qemu-img"), &["qemu-system-*"]));
+        assert!(matches_any(
+            Path::new("/opt/homebrew/bin/qemu-system-aarch64"),
+            &["qemu-system-*"]
+        ));
+        assert!(matches_any(
+            Path::new("/usr/local/bin/qemu-system-x86_64"),
+            &["qemu-system-*"]
+        ));
+        assert!(!matches_any(
+            Path::new("/usr/bin/qemu-img"),
+            &["qemu-system-*"]
+        ));
         assert!(matches_any(Path::new("/x/astd-vz"), &["astd-vz"]));
         assert!(!matches_any(Path::new("/x/astd-vz-old"), &["astd-vz"]));
     }

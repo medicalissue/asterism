@@ -269,7 +269,12 @@ impl DeviceIdentity {
 fn sync_dir(dir: &Path) -> Result<(), IdentityError> {
     match std::fs::File::open(dir).and_then(|handle| handle.sync_all()) {
         Ok(()) => Ok(()),
-        Err(e) if matches!(e.kind(), io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported) => {
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+            ) =>
+        {
             Ok(())
         }
         Err(e) => Err(e.into()),

@@ -127,7 +127,10 @@ const WAKE_POLL: Duration = Duration::from_secs(2);
 const WAKE_WAIT_ENV: &str = "ASTERISM_WAKE_WAIT";
 
 fn wake_wait() -> Duration {
-    match std::env::var(WAKE_WAIT_ENV).ok().and_then(|s| s.parse().ok()) {
+    match std::env::var(WAKE_WAIT_ENV)
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
         Some(secs) => Duration::from_secs(secs),
         None => WAKE_WAIT,
     }
@@ -315,7 +318,9 @@ enum MoveFrame {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum MeshReply {
-    Rpc { response: Response },
+    Rpc {
+        response: Response,
+    },
     /// A round trip, and what this device speaks.
     ///
     /// The range travels on the pong because a probe is the one frame every
@@ -336,7 +341,9 @@ enum MeshReply {
     /// session, or a volume's NBD connection.
     SpliceReady,
     /// The private half of this device's guest key, in OpenSSH format.
-    GuestKey { key: String },
+    GuestKey {
+        key: String,
+    },
     /// There is no version of this wire both devices speak, or the frame that
     /// arrived is newer than the version they settled on.
     ///
@@ -608,15 +615,20 @@ impl Mesh {
             }
             Some(peer) => {
                 io.send(&Response::Wake {
-                    text: format!("{peer} is awake on {name}'s network ({lan_id}) — asking it to broadcast"),
+                    text: format!(
+                        "{peer} is awake on {name}'s network ({lan_id}) — asking it to broadcast"
+                    ),
                     done: false,
                 })
                 .await?;
                 match self
-                    .proxy(peer, Request::WakeBroadcast {
-                        mac: mac.to_owned(),
-                        lan_id: Some(lan_id.to_owned()),
-                    })
+                    .proxy(
+                        peer,
+                        Request::WakeBroadcast {
+                            mac: mac.to_owned(),
+                            lan_id: Some(lan_id.to_owned()),
+                        },
+                    )
                     .await?
                 {
                     Response::Wake { text, .. } => vec![text],
@@ -642,7 +654,11 @@ impl Mesh {
     /// lie about a working system: the packet was never sendable, because
     /// nothing awake is standing on that network, and the fix is a device
     /// that stays on — which is the argument for a beacon.
-    async fn wake_sender(self: &Arc<Self>, name: &str, target: &WakeFacts) -> Result<Option<String>> {
+    async fn wake_sender(
+        self: &Arc<Self>,
+        name: &str,
+        target: &WakeFacts,
+    ) -> Result<Option<String>> {
         if crate::wake::facts().shares_lan_with(target) {
             return Ok(None);
         }
@@ -696,7 +712,10 @@ impl Mesh {
                 .await;
         }
         io.send(&Response::Wake {
-            text: format!("waiting up to {}s for {name} to check in ...", wait.as_secs()),
+            text: format!(
+                "waiting up to {}s for {name} to check in ...",
+                wait.as_secs()
+            ),
             done: false,
         })
         .await?;
@@ -819,23 +838,32 @@ impl Mesh {
         let mut cache = ShardCache::load();
         let mut rows: Vec<OrbitRow> = mine
             .into_iter()
-            .map(|instance| OrbitRow { instance, live: true })
+            .map(|instance| OrbitRow {
+                instance,
+                live: true,
+            })
             .collect();
         while let Some(Ok((device, answer))) = asking.join_next().await {
             match answer {
                 Ok(instances) => {
                     cache.remember(&device, &instances);
-                    rows.extend(
-                        instances.into_iter().map(|instance| OrbitRow { instance, live: true }),
-                    );
+                    rows.extend(instances.into_iter().map(|instance| OrbitRow {
+                        instance,
+                        live: true,
+                    }));
                 }
                 // Out of touch, not gone.
-                Err(_) => rows.extend(
-                    cache
-                        .last_seen(&device)
-                        .into_iter()
-                        .map(|instance| OrbitRow { instance, live: false }),
-                ),
+                Err(_) => {
+                    rows.extend(
+                        cache
+                            .last_seen(&device)
+                            .into_iter()
+                            .map(|instance| OrbitRow {
+                                instance,
+                                live: false,
+                            }),
+                    )
+                }
             }
         }
         let _ = cache.save();
@@ -850,9 +878,7 @@ impl Mesh {
                 eprintln!(
                     "astd: {:?} has a stale copy on {} at move epoch {} — an interrupted \
                      move left it, and the higher epoch is the live one",
-                    rows[i].instance.name,
-                    rows[i].instance.cpu_device,
-                    rows[i].instance.move_epoch
+                    rows[i].instance.name, rows[i].instance.cpu_device, rows[i].instance.move_epoch
                 );
             }
             rows = rows
@@ -881,12 +907,22 @@ impl Mesh {
     /// and deliberately so: see `Shard::mark_conflicted` for what an
     /// unreachable device's objection costs and when it is collected.
     pub async fn claim(self: &Arc<Self>, name: &str) -> Result<Option<Instance>> {
-        Ok(self.find(name).await.into_iter().next().map(|(_, inst)| inst))
+        Ok(self
+            .find(name)
+            .await
+            .into_iter()
+            .next()
+            .map(|(_, inst)| inst))
     }
 
     /// Which device holds the row for `name`, if any reachable one does.
     pub async fn locate(self: &Arc<Self>, name: &str) -> Result<Option<String>> {
-        Ok(self.find(name).await.into_iter().next().map(|(device, _)| device))
+        Ok(self
+            .find(name)
+            .await
+            .into_iter()
+            .next()
+            .map(|(device, _)| device))
     }
 
     /// Every reachable device whose shard holds `name`. More than one is a
@@ -982,16 +1018,21 @@ impl Mesh {
     /// the local port, the key file that opens the guest, and the lease on the
     /// listener.
     #[allow(clippy::type_complexity)]
-    pub async fn ssh_splice(
-        self: &Arc<Self>,
-        name: &str,
-    ) -> Result<Option<(u16, String, Splice)>> {
+    pub async fn ssh_splice(self: &Arc<Self>, name: &str) -> Result<Option<(u16, String, Splice)>> {
         let Some(device) = self.locate(name).await? else {
             return Ok(None);
         };
         // Ask before binding anything, so "it is not running" is an error
         // about the instance rather than a connection that refuses later.
-        let instance = match self.proxy(&device, Request::Status { name: name.to_owned() }).await? {
+        let instance = match self
+            .proxy(
+                &device,
+                Request::Status {
+                    name: name.to_owned(),
+                },
+            )
+            .await?
+        {
             Response::Instance { instance } => {
                 if instance.endpoint().is_none() {
                     bail!("instance {name:?} is not running — `ast up {name}` first");
@@ -1026,7 +1067,9 @@ impl Mesh {
             // session with it: the listener's lifetime is the command's.
             let mut sessions = tokio::task::JoinSet::new();
             loop {
-                let Ok((tcp, _)) = listener.accept().await else { return };
+                let Ok((tcp, _)) = listener.accept().await else {
+                    return;
+                };
                 let (mesh, device, name) = (mesh.clone(), device.clone(), name.clone());
                 sessions.spawn(async move {
                     if let Err(e) = splice_to_guest(&mesh, &device, &name, tcp).await {
@@ -1056,9 +1099,10 @@ impl Mesh {
         local: tokio::net::UnixStream,
     ) -> Result<()> {
         let peer = self.device(device).await?;
-        let connection = self.live_connection(&peer).await.with_context(|| {
-            format!("{}: {device}", crate::volume::UNREACHABLE)
-        })?;
+        let connection = self
+            .live_connection(&peer)
+            .await
+            .with_context(|| format!("{}: {device}", crate::volume::UNREACHABLE))?;
         let mut stream = connection.open_stream().await?;
         open_stream_with(
             &mut stream.send,
@@ -1071,7 +1115,9 @@ impl Mesh {
         .await?;
         match read_frame::<MeshReply>(&mut stream.recv).await? {
             MeshReply::SpliceReady => {}
-            MeshReply::Rpc { response: Response::Error { message } } => bail!(message),
+            MeshReply::Rpc {
+                response: Response::Error { message },
+            } => bail!(message),
             MeshReply::Incompatible { message, .. } => bail!(message),
             other => bail!("device {device:?} would not serve volume {volume:?}: {other:?}"),
         }
@@ -1196,7 +1242,9 @@ impl Mesh {
         if let Some(name) = name {
             self.rename_self(&name).await?;
         }
-        let ttl = ttl_secs.map(Duration::from_secs).unwrap_or(DEFAULT_TICKET_TTL);
+        let ttl = ttl_secs
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_TICKET_TTL);
         let addr = self.endpoint.direct_addr().await?;
         let mut issued = IssuedTicket::new(PairingTicket::issue(addr.clone(), ttl));
 
@@ -1332,8 +1380,14 @@ impl Mesh {
         };
 
         let ack = match &outcome {
-            Ok(()) => Ack { ok: true, error: None },
-            Err(e) => Ack { ok: false, error: Some(e.to_string()) },
+            Ok(()) => Ack {
+                ok: true,
+                error: None,
+            },
+            Err(e) => Ack {
+                ok: false,
+                error: Some(e.to_string()),
+            },
         };
         write_frame(&mut stream.send, &ack).await?;
         let _ = stream.send.finish();
@@ -1478,7 +1532,10 @@ impl Mesh {
         tokio::time::timeout(PROBE_TIMEOUT, ask(&connection, &MeshRequest::Ping))
             .await
             .map_err(|_| {
-                anyhow!("device {:?} answered the dial but not the mesh", device.name)
+                anyhow!(
+                    "device {:?} answered the dial but not the mesh",
+                    device.name
+                )
             })?
             // A device that refuses us closes the connection here, and its
             // reason ("not in this orbit") is the useful half of the message.
@@ -1536,9 +1593,7 @@ impl Mesh {
                 // Both messages matter: the first says the address on file did
                 // not answer, the second says nobody knows a better one. Only
                 // together do they mean "offline".
-                anyhow!(
-                    "{stored:#}; and discovery had no fresher address for it either: {found:#}"
-                )
+                anyhow!("{stored:#}; and discovery had no fresher address for it either: {found:#}")
             }),
         }
     }
@@ -1583,7 +1638,11 @@ impl Mesh {
         let Ok(key) = device.device_id.parse::<PublicKey>() else {
             return;
         };
-        let Some(addr) = self.endpoint.peer_addr(DeviceId::from_public_key(key)).await else {
+        let Some(addr) = self
+            .endpoint
+            .peer_addr(DeviceId::from_public_key(key))
+            .await
+        else {
             return;
         };
         let (addrs, relays) = addr_strings(&addr);
@@ -1595,7 +1654,10 @@ impl Mesh {
             asterism_core::instance::now_unix(),
         ) {
             if let Err(e) = orbit.save() {
-                eprintln!("astd: could not record where {:?} answered from: {e:#}", device.name);
+                eprintln!(
+                    "astd: could not record where {:?} answered from: {e:#}",
+                    device.name
+                );
             }
         }
     }
@@ -1743,10 +1805,18 @@ async fn splice_to_guest(
     let peer = mesh.device(device).await?;
     let connection = mesh.live_connection(&peer).await?;
     let mut stream = connection.open_stream().await?;
-    open_stream_with(&mut stream.send, &MeshRequest::SshSplice { name: name.to_owned() }).await?;
+    open_stream_with(
+        &mut stream.send,
+        &MeshRequest::SshSplice {
+            name: name.to_owned(),
+        },
+    )
+    .await?;
     match read_frame::<MeshReply>(&mut stream.recv).await? {
         MeshReply::SpliceReady => {}
-        MeshReply::Rpc { response: Response::Error { message } } => bail!(message),
+        MeshReply::Rpc {
+            response: Response::Error { message },
+        } => bail!(message),
         MeshReply::Incompatible { message, .. } => bail!(message),
         other => bail!("device {device:?} would not splice: {other:?}"),
     }
@@ -1814,7 +1884,14 @@ async fn serve_splice(
 ) -> Result<()> {
     // Resolved through the ordinary request path, so a conflicted or missing
     // instance refuses here in exactly the words it refuses everywhere else.
-    let target = match crate::handle(Request::Status { name: name.to_owned() }, node).await {
+    let target = match crate::handle(
+        Request::Status {
+            name: name.to_owned(),
+        },
+        node,
+    )
+    .await
+    {
         Response::Instance { instance } => instance
             .endpoint()
             .map(|e| e.ssh_target())
@@ -1827,7 +1904,9 @@ async fn serve_splice(
         Ok(target) => target,
         Err(e) => {
             let refusal = MeshReply::Rpc {
-                response: Response::Error { message: format!("{e:#}") },
+                response: Response::Error {
+                    message: format!("{e:#}"),
+                },
             };
             write_frame(&mut stream.send, &refusal).await?;
             let _ = stream.send.finish();
@@ -1857,7 +1936,9 @@ async fn serve_volume_splice(
         Ok(export) => export,
         Err(e) => {
             let refusal = MeshReply::Rpc {
-                response: Response::Error { message: format!("{e:#}") },
+                response: Response::Error {
+                    message: format!("{e:#}"),
+                },
             };
             write_frame(&mut stream.send, &refusal).await?;
             let _ = stream.send.finish();
@@ -1894,9 +1975,7 @@ impl Reporter<'_, '_> {
     async fn progress(&mut self, text: String, bytes: u64) -> Result<()> {
         match self {
             Reporter::Client(io) => io.send(&swap::line(text)).await,
-            Reporter::Stream(send) => {
-                write_frame(send, &MoveFrame::Progress { text, bytes }).await
-            }
+            Reporter::Stream(send) => write_frame(send, &MoveFrame::Progress { text, bytes }).await,
         }
     }
 }
@@ -1920,8 +1999,7 @@ async fn import(
     // An earlier attempt at this same epoch is not something to resume: the
     // manifest may have moved on and a half-file is worse than no file.
     let _ = std::fs::remove_dir_all(&staging);
-    std::fs::create_dir_all(&staging)
-        .with_context(|| format!("making {}", staging.display()))?;
+    std::fs::create_dir_all(&staging).with_context(|| format!("making {}", staging.display()))?;
 
     if swap::base_wanted(&manifest.base)? {
         fetch_base(mesh, from_device, manifest, report).await?;
@@ -1932,7 +2010,10 @@ async fn import(
     let mut stream = connection.open_stream().await?;
     open_stream_with(
         &mut stream.send,
-        &MeshRequest::MoveExport { name: name.clone(), epoch },
+        &MeshRequest::MoveExport {
+            name: name.clone(),
+            epoch,
+        },
     )
     .await?;
     let _ = stream.send.finish();
@@ -2003,7 +2084,9 @@ async fn fetch_base(
     let mut stream = connection.open_stream().await?;
     open_stream_with(
         &mut stream.send,
-        &MeshRequest::MoveBase { reference: base.reference.clone() },
+        &MeshRequest::MoveBase {
+            reference: base.reference.clone(),
+        },
     )
     .await?;
     let _ = stream.send.finish();
@@ -2016,8 +2099,15 @@ async fn fetch_base(
     let mut receipt = swap::Receipt::default();
     // The wire name is ignored: a base image lands where *this* device's
     // image store says it goes, never where the sender says.
-    receive_into_as(&mut stream.recv, &dir, &leaf, base.cost(), &mut receipt, report)
-        .await?;
+    receive_into_as(
+        &mut stream.recv,
+        &dir,
+        &leaf,
+        base.cost(),
+        &mut receipt,
+        report,
+    )
+    .await?;
 
     // Adopted, not merely published. [`verify::adopt_recorded`] hashes the
     // staged file once against the manifest's digest, discards it and leaves
@@ -2035,10 +2125,18 @@ async fn fetch_base(
         // record says the bytes were derived from.
         .derived_from(base.derived_from.clone());
     verify::adopt_recorded(&staging, &path, &record_at, Some(&expected), source).with_context(
-        || format!("adopting the base image {} fetched from {from_device}", base.reference),
+        || {
+            format!(
+                "adopting the base image {} fetched from {from_device}",
+                base.reference
+            )
+        },
     )?;
     report
-        .progress(format!("base image {} verified and stored", base.reference), 0)
+        .progress(
+            format!("base image {} verified and stored", base.reference),
+            0,
+        )
         .await
 }
 
@@ -2181,8 +2279,7 @@ async fn send_file(send: &mut SendStream, path: &Path, wire_name: &str) -> Resul
     use std::io::{Read, Seek, SeekFrom};
     use std::os::unix::fs::PermissionsExt;
 
-    let meta = std::fs::metadata(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let meta = std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
     let extents = cow::extents(path)?;
     write_frame(
         send,
@@ -2203,13 +2300,27 @@ async fn send_file(send: &mut SendStream, path: &Path, wire_name: &str) -> Resul
             let n = ((extent.end() - offset) as usize).min(MOVE_CHUNK);
             file.seek(SeekFrom::Start(offset))?;
             file.read_exact(&mut buf[..n])?;
-            write_frame(send, &MoveFrame::Data { offset, len: n as u64 }).await?;
+            write_frame(
+                send,
+                &MoveFrame::Data {
+                    offset,
+                    len: n as u64,
+                },
+            )
+            .await?;
             send.write_all(&buf[..n]).await?;
             offset += n as u64;
             written += n as u64;
         }
     }
-    write_frame(send, &MoveFrame::Done { path: wire_name.to_owned(), written }).await?;
+    write_frame(
+        send,
+        &MoveFrame::Done {
+            path: wire_name.to_owned(),
+            written,
+        },
+    )
+    .await?;
     Ok(written)
 }
 
@@ -2260,7 +2371,10 @@ async fn serve_move_export(
     }
     write_frame(
         &mut stream.send,
-        &MoveFrame::End { files: manifest.files.len() as u64, bytes },
+        &MoveFrame::End {
+            files: manifest.files.len() as u64,
+            bytes,
+        },
     )
     .await?;
     let _ = stream.send.finish();
@@ -2269,10 +2383,7 @@ async fn serve_move_export(
 }
 
 /// The peer fetch: hand a base image to another device in this orbit.
-async fn serve_move_base(
-    mut stream: asterism_mesh::MeshStream,
-    reference: &str,
-) -> Result<()> {
+async fn serve_move_base(mut stream: asterism_mesh::MeshStream, reference: &str) -> Result<()> {
     let base = match crate::backend::image_ref(reference) {
         Ok(base) if base.path.exists() => base,
         Ok(base) => {
@@ -2335,7 +2446,13 @@ async fn serve_move_import(
 
 /// End a data stream with a sentence rather than a truncation.
 async fn fail(send: &mut SendStream, e: anyhow::Error) -> Result<()> {
-    write_frame(send, &MoveFrame::Failed { message: format!("{e:#}") }).await?;
+    write_frame(
+        send,
+        &MoveFrame::Failed {
+            message: format!("{e:#}"),
+        },
+    )
+    .await?;
     let _ = send.finish();
     let _ = tokio::time::timeout(FLUSH_TIMEOUT, send.stopped()).await;
     Ok(())
@@ -2477,8 +2594,13 @@ async fn serve_stream(mut stream: asterism_mesh::MeshStream, node: Node) -> Resu
             if !arriving.request.answered_in_bulk() {
                 write_frame(&mut stream.send, &*refusal).await?;
             } else if let MeshReply::Incompatible { message, .. } = &*refusal {
-                write_frame(&mut stream.send, &MoveFrame::Failed { message: message.clone() })
-                    .await?;
+                write_frame(
+                    &mut stream.send,
+                    &MoveFrame::Failed {
+                        message: message.clone(),
+                    },
+                )
+                .await?;
             }
             let _ = stream.send.finish();
             return Ok(());
@@ -2488,27 +2610,35 @@ async fn serve_stream(mut stream: asterism_mesh::MeshStream, node: Node) -> Resu
     let reply = match arriving.request {
         MeshRequest::Ping => {
             let ours = compat::ours();
-            MeshReply::Pong { protocol: ours.max, min_protocol: ours.min, speaking: spoken }
+            MeshReply::Pong {
+                protocol: ours.max,
+                min_protocol: ours.min,
+                speaking: spoken,
+            }
         }
         MeshRequest::SshSplice { name } => return serve_splice(stream, &node, &name).await,
-        MeshRequest::VolumeSplice { volume, holder, epoch } => {
-            return serve_volume_splice(stream, &volume, &holder, epoch).await
-        }
+        MeshRequest::VolumeSplice {
+            volume,
+            holder,
+            epoch,
+        } => return serve_volume_splice(stream, &volume, &holder, epoch).await,
         // Bulk, not request/reply: each of these stops being a framed RPC
         // after this line and becomes a stream of `MoveFrame`s.
         MeshRequest::MoveExport { name, epoch } => {
             return serve_move_export(stream, &node, &name, epoch).await
         }
-        MeshRequest::MoveBase { reference } => {
-            return serve_move_base(stream, &reference).await
-        }
-        MeshRequest::MoveImport { manifest, epoch, from_device } => {
-            return serve_move_import(stream, &manifest, epoch, &from_device).await
-        }
+        MeshRequest::MoveBase { reference } => return serve_move_base(stream, &reference).await,
+        MeshRequest::MoveImport {
+            manifest,
+            epoch,
+            from_device,
+        } => return serve_move_import(stream, &manifest, epoch, &from_device).await,
         MeshRequest::GuestKey => match guest_key() {
             Ok(key) => MeshReply::GuestKey { key },
             Err(e) => MeshReply::Rpc {
-                response: Response::Error { message: format!("{e:#}") },
+                response: Response::Error {
+                    message: format!("{e:#}"),
+                },
             },
         },
         MeshRequest::Rpc { request } => MeshReply::Rpc {
@@ -2528,11 +2658,18 @@ async fn serve_stream(mut stream: asterism_mesh::MeshStream, node: Node) -> Resu
                 // clears.
                 Request::WakeBroadcast { mac, lan_id } => {
                     match crate::wake::broadcast(&mac, lan_id.as_deref()) {
-                        Ok(sent) => Response::Wake { text: sent.join(", "), done: true },
-                        Err(e) => Response::Error { message: format!("{e:#}") },
+                        Ok(sent) => Response::Wake {
+                            text: sent.join(", "),
+                            done: true,
+                        },
+                        Err(e) => Response::Error {
+                            message: format!("{e:#}"),
+                        },
                     }
                 }
-                Request::DeviceFacts => Response::WakeFacts { facts: crate::wake::facts() },
+                Request::DeviceFacts => Response::WakeFacts {
+                    facts: crate::wake::facts(),
+                },
                 Request::DeviceCheck => Response::WakeCheck {
                     device: node.device_name().await,
                     rows: crate::wake::check(),
@@ -2561,7 +2698,12 @@ fn answerable_at(reply: MeshReply, spoken: u32) -> MeshReply {
     if needs <= spoken {
         return reply;
     }
-    incompatible(compat::frame_too_new("that reply", needs, spoken, "that device"))
+    incompatible(compat::frame_too_new(
+        "that reply",
+        needs,
+        spoken,
+        "that device",
+    ))
 }
 
 /// Asks one question on a new stream and reads the answer.
@@ -2582,7 +2724,15 @@ async fn ask(connection: &MeshConnection, request: &MeshRequest) -> Result<MeshR
 /// when the answer is that a peer was told nothing.
 async fn open_stream_with(send: &mut SendStream, request: &MeshRequest) -> Result<()> {
     let ours = compat::ours();
-    write_frame(send, &Opening { protocol: ours.max, min_protocol: ours.min, request }).await
+    write_frame(
+        send,
+        &Opening {
+            protocol: ours.max,
+            min_protocol: ours.min,
+            request,
+        },
+    )
+    .await
 }
 
 /// The version to speak on a stream whose opening frame just arrived, or the
@@ -2599,10 +2749,18 @@ fn settle(arriving: &Arriving) -> Result<u32, Box<MeshReply>> {
     let spoken = match compat::select(theirs) {
         compat::Selection::Common(v) => v,
         compat::Selection::TooOld { theirs, ours } => {
-            return Err(Box::new(incompatible(compat::too_old("that device", theirs, ours))))
+            return Err(Box::new(incompatible(compat::too_old(
+                "that device",
+                theirs,
+                ours,
+            ))))
         }
         compat::Selection::TooNew { theirs, ours } => {
-            return Err(Box::new(incompatible(compat::too_new("that device", theirs, ours))))
+            return Err(Box::new(incompatible(compat::too_new(
+                "that device",
+                theirs,
+                ours,
+            ))))
         }
     };
     // A frame from after the version both ends have. Refused by name, because
@@ -2612,7 +2770,10 @@ fn settle(arriving: &Arriving) -> Result<u32, Box<MeshReply>> {
             arriving.request.name(),
             arriving.request.since(),
             spoken,
-            &format!("this device (Asterism {VERSION}, speaking {})", ours.describe()),
+            &format!(
+                "this device (Asterism {VERSION}, speaking {})",
+                ours.describe()
+            ),
         ))));
     }
     Ok(spoken)
@@ -2703,15 +2864,21 @@ fn endpoint_addr(device: &Device) -> Result<EndpointAddr> {
         .map_err(|e| anyhow!("device {:?} has an unreadable device id: {e}", device.name))?;
     let mut addr = EndpointAddr::new(key);
     for hint in &device.addrs {
-        let socket = hint
-            .parse()
-            .map_err(|e| anyhow!("device {:?} has an unreadable address {hint:?}: {e}", device.name))?;
+        let socket = hint.parse().map_err(|e| {
+            anyhow!(
+                "device {:?} has an unreadable address {hint:?}: {e}",
+                device.name
+            )
+        })?;
         addr = addr.with_ip_addr(socket);
     }
     for relay in &device.relays {
-        let url = relay
-            .parse()
-            .map_err(|e| anyhow!("device {:?} has an unreadable relay {relay:?}: {e}", device.name))?;
+        let url = relay.parse().map_err(|e| {
+            anyhow!(
+                "device {:?} has an unreadable relay {relay:?}: {e}",
+                device.name
+            )
+        })?;
         addr = addr.with_relay_url(url);
     }
     Ok(addr)
@@ -2837,7 +3004,10 @@ mod tests {
 
         let mut old = device(&["127.0.0.1:4242"], &[]);
         old.addrs_seen_at = now - (2 * 24 * 60 * 60);
-        assert!(hint_is_stale(&old), "a two-day-old hint is worth a lookup first");
+        assert!(
+            hint_is_stale(&old),
+            "a two-day-old hint is worth a lookup first"
+        );
 
         // A store written before the timestamp existed says nothing about its
         // own age, and "unknown" must not read as "ancient": that record is
@@ -2860,7 +3030,10 @@ mod tests {
     async fn raw_ask(connection: &MeshConnection, frame: &str) -> Result<MeshReply> {
         let mut stream = connection.open_stream().await?;
         let bytes = frame.as_bytes();
-        stream.send.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
+        stream
+            .send
+            .write_all(&(bytes.len() as u32).to_be_bytes())
+            .await?;
         stream.send.write_all(bytes).await?;
         let _ = stream.send.finish();
         read_frame(&mut stream.recv).await
@@ -2880,7 +3053,11 @@ mod tests {
 
         // The bytes a protocol-1 daemon writes to open a ping stream.
         match raw_ask(&connection, r#"{"kind":"ping"}"#).await.unwrap() {
-            MeshReply::Pong { protocol, min_protocol, speaking } => {
+            MeshReply::Pong {
+                protocol,
+                min_protocol,
+                speaking,
+            } => {
                 let ours = compat::ours();
                 assert_eq!(protocol, ours.max, "we still say what we speak");
                 assert_eq!(min_protocol, ours.min);
@@ -2895,8 +3072,13 @@ mod tests {
 
         // And a forwarded request from that same vintage is answered with the
         // answer, which is the whole claim: the two vintages interoperate.
-        match raw_ask(&connection, r#"{"kind":"rpc","request":{"cmd":"list"}}"#).await.unwrap() {
-            MeshReply::Rpc { response: Response::Instances { instances } } => {
+        match raw_ask(&connection, r#"{"kind":"rpc","request":{"cmd":"list"}}"#)
+            .await
+            .unwrap()
+        {
+            MeshReply::Rpc {
+                response: Response::Instances { instances },
+            } => {
                 assert!(instances.is_empty());
             }
             other => panic!("an old peer's list was answered with {other:?}"),
@@ -2915,12 +3097,17 @@ mod tests {
         let (client, connection, _dir) = wired().await;
 
         let ahead = compat::PROTOCOL_VERSION + 9;
-        let frame = format!(
-            r#"{{"protocol":{ahead},"min_protocol":{ahead},"kind":"ping"}}"#
-        );
+        let frame = format!(r#"{{"protocol":{ahead},"min_protocol":{ahead},"kind":"ping"}}"#);
         match raw_ask(&connection, &frame).await.unwrap() {
-            MeshReply::Incompatible { message, protocol, min_protocol } => {
-                assert!(message.contains("left alone rather than replaced"), "{message}");
+            MeshReply::Incompatible {
+                message,
+                protocol,
+                min_protocol,
+            } => {
+                assert!(
+                    message.contains("left alone rather than replaced"),
+                    "{message}"
+                );
                 let ours = compat::ours();
                 assert_eq!(
                     compat::Speaks::claimed(protocol, min_protocol),
@@ -2949,13 +3136,20 @@ mod tests {
         );
         let mut stream = connection.open_stream().await.unwrap();
         let bytes = frame.as_bytes();
-        stream.send.write_all(&(bytes.len() as u32).to_be_bytes()).await.unwrap();
+        stream
+            .send
+            .write_all(&(bytes.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
         stream.send.write_all(bytes).await.unwrap();
         let _ = stream.send.finish();
 
         match read_frame::<MoveFrame>(&mut stream.recv).await.unwrap() {
             MoveFrame::Failed { message } => {
-                assert!(message.contains("left alone rather than replaced"), "{message}");
+                assert!(
+                    message.contains("left alone rather than replaced"),
+                    "{message}"
+                );
             }
             other => panic!("a bulk stream was refused with {other:?}"),
         }
@@ -2968,7 +3162,9 @@ mod tests {
     /// out of one of our frames is the frame it has always read.
     #[test]
     fn the_range_rides_along_without_changing_the_frame_underneath() {
-        let request = MeshRequest::Rpc { request: Request::List };
+        let request = MeshRequest::Rpc {
+            request: Request::List,
+        };
         let opening = serde_json::to_string(&Opening {
             protocol: 2,
             min_protocol: 1,
@@ -2982,12 +3178,20 @@ mod tests {
         // Which a build that has never heard of the two keys still reads as
         // the `rpc` frame it always was.
         let bare: MeshRequest = serde_json::from_str(&opening).unwrap();
-        assert!(matches!(bare, MeshRequest::Rpc { request: Request::List }));
+        assert!(matches!(
+            bare,
+            MeshRequest::Rpc {
+                request: Request::List
+            }
+        ));
     }
 
     #[test]
     fn an_rpc_frame_carries_the_request_enum_unchanged() {
-        let frame = serde_json::to_string(&MeshRequest::Rpc { request: Request::List }).unwrap();
+        let frame = serde_json::to_string(&MeshRequest::Rpc {
+            request: Request::List,
+        })
+        .unwrap();
         assert_eq!(frame, r#"{"kind":"rpc","request":{"cmd":"list"}}"#);
     }
 
@@ -3026,11 +3230,18 @@ mod tests {
 
         // The point of the whole design: the far daemon answers the frame the
         // near one would have answered, so `ls` needed no remote counterpart.
-        let reply = ask(&connection, &MeshRequest::Rpc { request: Request::List })
-            .await
-            .unwrap();
+        let reply = ask(
+            &connection,
+            &MeshRequest::Rpc {
+                request: Request::List,
+            },
+        )
+        .await
+        .unwrap();
         match reply {
-            MeshReply::Rpc { response: Response::Instances { instances } } => {
+            MeshReply::Rpc {
+                response: Response::Instances { instances },
+            } => {
                 assert!(instances.is_empty(), "a fresh registry has no instances");
             }
             other => panic!("expected an instance list, got {other:?}"),
@@ -3039,10 +3250,17 @@ mod tests {
         // And the probe every device sends to every other one carries the
         // vintage back with it, settled against the range we opened with.
         match ask(&connection, &MeshRequest::Ping).await.unwrap() {
-            MeshReply::Pong { protocol, min_protocol, speaking } => {
+            MeshReply::Pong {
+                protocol,
+                min_protocol,
+                speaking,
+            } => {
                 let ours = compat::ours();
                 assert_eq!(compat::Speaks::claimed(protocol, min_protocol), ours);
-                assert_eq!(speaking, ours.max, "two builds of one vintage speak its wire");
+                assert_eq!(
+                    speaking, ours.max,
+                    "two builds of one vintage speak its wire"
+                );
             }
             other => panic!("expected a pong, got {other:?}"),
         }
@@ -3075,14 +3293,20 @@ mod tests {
         let losers = collisions(&rows);
         assert_eq!(losers.len(), 1, "one collision, one loser");
         assert_eq!(losers[0].0, 1, "the later creation loses");
-        assert_eq!(losers[0].1, "desktop", "and is told where the winner's cpu is");
+        assert_eq!(
+            losers[0].1, "desktop",
+            "and is told where the winner's cpu is"
+        );
     }
 
     /// Both devices compute this independently and must agree, or each would
     /// decide the other's instance was the broken one.
     #[test]
     fn two_instances_created_in_the_same_second_still_have_one_loser() {
-        let mut rows = vec![row("dev", "desktop", 100, true), row("dev", "laptop", 100, true)];
+        let mut rows = vec![
+            row("dev", "desktop", 100, true),
+            row("dev", "laptop", 100, true),
+        ];
         rows[0].instance.id = "aaaa".into();
         rows[1].instance.id = "bbbb".into();
 
@@ -3102,12 +3326,19 @@ mod tests {
     /// epoch the commit bumped says which sighting is current.
     #[test]
     fn the_higher_move_epoch_settles_two_rows_for_one_instance() {
-        let mut rows = vec![row("dev", "laptop", 100, true), row("dev", "desktop", 100, true)];
+        let mut rows = vec![
+            row("dev", "laptop", 100, true),
+            row("dev", "desktop", 100, true),
+        ];
         rows[0].instance.id = "same".into();
         rows[1].instance.id = "same".into();
         rows[1].instance.move_epoch = 1;
 
-        assert_eq!(superseded(&rows), vec![0], "the stale copy is the older epoch");
+        assert_eq!(
+            superseded(&rows),
+            vec![0],
+            "the stale copy is the older epoch"
+        );
         // And whichever order the shards answered in.
         rows.swap(0, 1);
         assert_eq!(superseded(&rows), vec![1]);
@@ -3118,9 +3349,16 @@ mod tests {
         assert!(superseded(&rows).is_empty());
 
         // Nor is a plain collision: two different instances, two ids.
-        let separate = vec![row("dev", "laptop", 100, true), row("dev", "desktop", 200, true)];
+        let separate = vec![
+            row("dev", "laptop", 100, true),
+            row("dev", "desktop", 200, true),
+        ];
         assert!(superseded(&separate).is_empty());
-        assert_eq!(collisions(&separate).len(), 1, "that one is the rename case");
+        assert_eq!(
+            collisions(&separate).len(),
+            1,
+            "that one is the rename case"
+        );
     }
 
     #[test]
@@ -3133,7 +3371,10 @@ mod tests {
 
         // Nor is one row that turned up in two answers.
         let dup = vec![rows[0].clone(), rows[0].clone()];
-        assert!(collisions(&dup).is_empty(), "the same instance is not its own rival");
+        assert!(
+            collisions(&dup).is_empty(),
+            "the same instance is not its own rival"
+        );
     }
 
     /// A device that is out of touch keeps its instances in the listing. The
@@ -3168,13 +3409,20 @@ mod tests {
         let (client, connection, _dir) = wired().await;
 
         let mut stream = connection.open_stream().await.unwrap();
-        write_frame(&mut stream.send, &MeshRequest::SshSplice { name: "ghost".into() })
-            .await
-            .unwrap();
+        write_frame(
+            &mut stream.send,
+            &MeshRequest::SshSplice {
+                name: "ghost".into(),
+            },
+        )
+        .await
+        .unwrap();
         let reply: MeshReply = read_frame(&mut stream.recv).await.unwrap();
 
         match reply {
-            MeshReply::Rpc { response: Response::Error { message } } => {
+            MeshReply::Rpc {
+                response: Response::Error { message },
+            } => {
                 assert!(message.contains("ghost"), "{message}");
                 assert!(message.contains("in this orbit"), "{message}");
             }
@@ -3202,7 +3450,9 @@ mod tests {
         .unwrap();
 
         match reply {
-            MeshReply::Rpc { response: Response::Error { message } } => {
+            MeshReply::Rpc {
+                response: Response::Error { message },
+            } => {
                 assert!(message.contains("somewhere-else"), "{message}");
             }
             other => panic!("relaying must be refused, got {other:?}"),

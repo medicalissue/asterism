@@ -90,7 +90,10 @@ pub enum Event {
 impl Event {
     fn parse(name: &str, data: Option<&Value>) -> Event {
         let field = |k: &str| {
-            data.and_then(|d| d.get(k)).and_then(Value::as_str).unwrap_or_default().to_owned()
+            data.and_then(|d| d.get(k))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
         };
         match name {
             "SHUTDOWN" => Event::Shutdown {
@@ -101,7 +104,10 @@ impl Event {
             },
             "RESET" => Event::Reset,
             "STOP" => Event::Stopped,
-            "JOB_STATUS_CHANGE" => Event::Job { id: field("id"), status: field("status") },
+            "JOB_STATUS_CHANGE" => Event::Job {
+                id: field("id"),
+                status: field("status"),
+            },
             other => Event::Other(other.to_owned()),
         }
     }
@@ -244,7 +250,11 @@ impl Conn {
         let mut greeting = String::new();
         reader.read_line(&mut greeting)?;
         if !greeting.contains("\"QMP\"") {
-            bail!("{} answered, but not with a QMP greeting: {}", sock.display(), greeting.trim());
+            bail!(
+                "{} answered, but not with a QMP greeting: {}",
+                sock.display(),
+                greeting.trim()
+            );
         }
 
         // Capabilities negotiation happens before the reader thread
@@ -261,9 +271,14 @@ impl Conn {
         loop {
             let mut line = String::new();
             if reader.read_line(&mut line)? == 0 {
-                bail!("{} closed before it accepted qmp_capabilities", sock.display());
+                bail!(
+                    "{} closed before it accepted qmp_capabilities",
+                    sock.display()
+                );
             }
-            let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
+            let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
             if let Some(error) = msg.get("error") {
                 bail!("{} refused qmp_capabilities: {error}", sock.display());
             }
@@ -286,7 +301,9 @@ impl Conn {
 fn read_loop(conn: Arc<Conn>, reader: BufReader<UnixStream>) {
     for line in reader.lines() {
         let Ok(line) = line else { break };
-        let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
 
         if let Some(id) = msg.get("id").and_then(Value::as_u64) {
             let waiter = lock(&conn.pending).remove(&id);
@@ -302,14 +319,20 @@ fn read_loop(conn: Arc<Conn>, reader: BufReader<UnixStream>) {
     conn.die("the guest's control channel closed");
     // Only evict this connection: a reconnect may already have replaced it.
     let mut table = table();
-    if table.get(&conn.sock).is_some_and(|live| Arc::ptr_eq(live, &conn)) {
+    if table
+        .get(&conn.sock)
+        .is_some_and(|live| Arc::ptr_eq(live, &conn))
+    {
         table.remove(&conn.sock);
     }
 }
 
 fn reply_of(msg: &Value) -> Reply {
     if let Some(error) = msg.get("error") {
-        let desc = error.get("desc").and_then(Value::as_str).unwrap_or_default();
+        let desc = error
+            .get("desc")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         return Err(match desc.is_empty() {
             true => error.to_string(),
             false => desc.to_owned(),
@@ -409,7 +432,10 @@ mod tests {
     fn a_command_gets_its_own_reply() {
         let (sock, _dir) = fake_monitor(echo);
         let conn = on(&sock).unwrap();
-        assert_eq!(conn.execute("system_powerdown", Value::Null).unwrap(), json!({}));
+        assert_eq!(
+            conn.execute("system_powerdown", Value::Null).unwrap(),
+            json!({})
+        );
         forget(&sock);
     }
 
@@ -422,11 +448,20 @@ mod tests {
         });
         let conn = on(&sock).unwrap();
 
-        let sent = conn.execute("human-monitor-command", json!({ "command-line": "info status" }));
-        assert_eq!(sent.unwrap()["arguments"], json!({ "command-line": "info status" }));
+        let sent = conn.execute(
+            "human-monitor-command",
+            json!({ "command-line": "info status" }),
+        );
+        assert_eq!(
+            sent.unwrap()["arguments"],
+            json!({ "command-line": "info status" })
+        );
 
         let bare = conn.execute("query-status", Value::Null).unwrap();
-        assert!(bare.get("arguments").is_none(), "a null argument sends no arguments field");
+        assert!(
+            bare.get("arguments").is_none(),
+            "a null argument sends no arguments field"
+        );
         forget(&sock);
     }
 
@@ -441,8 +476,7 @@ mod tests {
                 held.lock().unwrap().push(msg["id"].clone());
                 return Vec::new();
             }
-            let mut out =
-                vec![json!({ "return": { "who": "fast" }, "id": msg["id"] }).to_string()];
+            let mut out = vec![json!({ "return": { "who": "fast" }, "id": msg["id"] }).to_string()];
             for id in held.lock().unwrap().drain(..) {
                 out.push(json!({ "return": { "who": "slow" }, "id": id }).to_string());
             }
@@ -459,7 +493,11 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         let fast = conn.execute("fast", Value::Null).unwrap();
 
-        assert_eq!(fast["who"], json!("fast"), "the fast command got its own reply");
+        assert_eq!(
+            fast["who"],
+            json!("fast"),
+            "the fast command got its own reply"
+        );
         assert_eq!(slow.join().unwrap().unwrap()["who"], json!("slow"));
         forget(&sock);
     }
@@ -474,9 +512,15 @@ mod tests {
             .to_string()]
         });
         let conn = on(&sock).unwrap();
-        let err = conn.execute("hostfwd_add", Value::Null).unwrap_err().to_string();
+        let err = conn
+            .execute("hostfwd_add", Value::Null)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("Invalid parameter 'nope'"), "{err}");
-        assert!(err.contains("hostfwd_add"), "the error names the command: {err}");
+        assert!(
+            err.contains("hostfwd_add"),
+            "the error names the command: {err}"
+        );
         forget(&sock);
     }
 
@@ -491,7 +535,10 @@ mod tests {
             ]
         });
         let conn = on(&sock).unwrap();
-        assert_eq!(conn.execute("query-status", Value::Null).unwrap()["who"], json!("the reply"));
+        assert_eq!(
+            conn.execute("query-status", Value::Null).unwrap()["who"],
+            json!("the reply")
+        );
         forget(&sock);
     }
 
@@ -520,9 +567,15 @@ mod tests {
 
         let conn = on(&sock).unwrap();
         let started = std::time::Instant::now();
-        let err = conn.execute("system_powerdown", Value::Null).unwrap_err().to_string();
+        let err = conn
+            .execute("system_powerdown", Value::Null)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("closed"), "{err}");
-        assert!(started.elapsed() < REPLY, "it heard the hangup instead of waiting out the reply timeout");
+        assert!(
+            started.elapsed() < REPLY,
+            "it heard the hangup instead of waiting out the reply timeout"
+        );
         assert!(!conn.is_alive(), "the connection knows it is gone");
         forget(&sock);
     }
@@ -553,7 +606,10 @@ mod tests {
         let (sock, _dir) = fake_monitor(echo);
         let first = on(&sock).unwrap();
         let second = on(&sock).unwrap();
-        assert!(Arc::ptr_eq(&first, &second), "the second caller reuses the live connection");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the second caller reuses the live connection"
+        );
         forget(&sock);
         assert!(!first.is_alive(), "forgetting it closes it");
     }
@@ -566,13 +622,25 @@ mod tests {
         );
         // QEMU has emitted SHUTDOWN without a `guest` field; the safe read
         // is that this daemon asked for it, not that the guest did.
-        assert_eq!(Event::parse("SHUTDOWN", None), Event::Shutdown { guest: false });
+        assert_eq!(
+            Event::parse("SHUTDOWN", None),
+            Event::Shutdown { guest: false }
+        );
         assert_eq!(Event::parse("RESET", None), Event::Reset);
         assert_eq!(
-            Event::parse("JOB_STATUS_CHANGE", Some(&json!({ "id": "s0", "status": "concluded" }))),
-            Event::Job { id: "s0".into(), status: "concluded".into() }
+            Event::parse(
+                "JOB_STATUS_CHANGE",
+                Some(&json!({ "id": "s0", "status": "concluded" }))
+            ),
+            Event::Job {
+                id: "s0".into(),
+                status: "concluded".into()
+            }
         );
-        assert_eq!(Event::parse("RTC_CHANGE", None), Event::Other("RTC_CHANGE".into()));
+        assert_eq!(
+            Event::parse("RTC_CHANGE", None),
+            Event::Other("RTC_CHANGE".into())
+        );
         assert_eq!(Event::Reset.to_string(), "the guest rebooted");
     }
 }

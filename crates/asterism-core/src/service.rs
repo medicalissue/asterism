@@ -122,7 +122,14 @@ pub struct State {
 
 impl State {
     fn missing(unit: PathBuf) -> State {
-        State { unit, installed: false, loaded: false, pid: None, program: None, notes: Vec::new() }
+        State {
+            unit,
+            installed: false,
+            loaded: false,
+            pid: None,
+            program: None,
+            notes: Vec::new(),
+        }
     }
 
     /// One line for `ast service status`.
@@ -221,7 +228,10 @@ mod imp {
 
         fn install(&self, spec: &Spec) -> Result<Report> {
             let unit = self.unit_path();
-            let mut report = Report { unit: unit.clone(), ..Report::default() };
+            let mut report = Report {
+                unit: unit.clone(),
+                ..Report::default()
+            };
 
             if let Some(dir) = unit.parent() {
                 std::fs::create_dir_all(dir)
@@ -270,7 +280,10 @@ mod imp {
 
         fn uninstall(&self) -> Result<Report> {
             let unit = self.unit_path();
-            let mut report = Report { unit: unit.clone(), ..Report::default() };
+            let mut report = Report {
+                unit: unit.clone(),
+                ..Report::default()
+            };
             let target = self.target()?;
             let (ok, out) = run(std::process::Command::new("launchctl")
                 .arg("bootout")
@@ -346,11 +359,15 @@ mod imp {
     }
 
     fn escape(s: &str) -> String {
-        s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
     }
 
     fn unescape(s: &str) -> String {
-        s.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+        s.replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&")
     }
 
     /// KeepAlive plus RunAtLoad is the whole persistence promise in two
@@ -493,13 +510,20 @@ mod imp {
         fn unit_path(&self) -> PathBuf {
             let base = std::env::var_os("XDG_CONFIG_HOME")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| home().unwrap_or_else(|_| PathBuf::from(".")).join(".config"));
+                .unwrap_or_else(|| {
+                    home()
+                        .unwrap_or_else(|_| PathBuf::from("."))
+                        .join(".config")
+                });
             base.join("systemd/user").join(UNIT)
         }
 
         fn install(&self, spec: &Spec) -> Result<Report> {
             let unit = self.unit_path();
-            let mut report = Report { unit: unit.clone(), ..Report::default() };
+            let mut report = Report {
+                unit: unit.clone(),
+                ..Report::default()
+            };
             if let Some(dir) = unit.parent() {
                 std::fs::create_dir_all(dir)
                     .with_context(|| format!("creating {}", dir.display()))?;
@@ -515,11 +539,12 @@ mod imp {
                 report.step("systemctl is not on PATH: the unit is written but not enabled");
                 return Ok(report);
             }
-            let (_, _) = run(std::process::Command::new("systemctl")
-                .args(["--user", "daemon-reload"]))?;
+            let (_, _) =
+                run(std::process::Command::new("systemctl").args(["--user", "daemon-reload"]))?;
             report.step("systemctl --user daemon-reload");
-            let (ok, out) = run(std::process::Command::new("systemctl")
-                .args(["--user", "enable", "--now", UNIT]))?;
+            let (ok, out) =
+                run(std::process::Command::new("systemctl")
+                    .args(["--user", "enable", "--now", UNIT]))?;
             if !ok {
                 anyhow::bail!("systemctl could not enable {UNIT}: {}", out.trim());
             }
@@ -533,7 +558,10 @@ mod imp {
 
         fn uninstall(&self) -> Result<Report> {
             let unit = self.unit_path();
-            let mut report = Report { unit: unit.clone(), ..Report::default() };
+            let mut report = Report {
+                unit: unit.clone(),
+                ..Report::default()
+            };
             if systemctl_present() {
                 let (ok, out) = run(std::process::Command::new("systemctl")
                     .args(["--user", "disable", "--now", UNIT]))?;
@@ -554,8 +582,8 @@ mod imp {
             // that directory would find Asterism still in it.
             let _ = std::fs::remove_file(crate::durable::backup_path(&unit));
             if systemctl_present() {
-                let _ = run(std::process::Command::new("systemctl")
-                    .args(["--user", "daemon-reload"]))?;
+                let _ =
+                    run(std::process::Command::new("systemctl").args(["--user", "daemon-reload"]))?;
             }
             Ok(report)
         }
@@ -590,11 +618,18 @@ mod imp {
                 state.notes.push("systemctl is not on PATH".into());
                 return Ok(state);
             }
-            let (_, enabled) = run(std::process::Command::new("systemctl")
-                .args(["--user", "is-enabled", UNIT]))?;
+            let (_, enabled) =
+                run(std::process::Command::new("systemctl").args(["--user", "is-enabled", UNIT]))?;
             state.loaded = enabled.trim() == "enabled";
-            let (_, props) = run(std::process::Command::new("systemctl")
-                .args(["--user", "show", UNIT, "-p", "MainPID", "-p", "ActiveState"]))?;
+            let (_, props) = run(std::process::Command::new("systemctl").args([
+                "--user",
+                "show",
+                UNIT,
+                "-p",
+                "MainPID",
+                "-p",
+                "ActiveState",
+            ]))?;
             for line in props.lines() {
                 if let Some(v) = line.strip_prefix("MainPID=") {
                     state.pid = v.trim().parse().ok().filter(|p| *p != 0);

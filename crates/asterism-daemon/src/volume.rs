@@ -63,11 +63,11 @@ use tokio::sync::Mutex;
 
 use asterism_core::hv::{DiskSpec, Hypervisor};
 use asterism_core::instance::{Instance, Volume};
+use asterism_core::paths;
 use asterism_core::proc::{ProcId, Signal};
 use asterism_core::protocol::{Request, Response};
 use asterism_core::tools::{run, tool};
 use asterism_core::volume::{self, BlockVolume, Store};
-use asterism_core::paths;
 
 use crate::mesh::{Mesh, Splice};
 use crate::Node;
@@ -108,7 +108,9 @@ pub fn init(node: Node, mesh: Option<Arc<Mesh>>) -> Result<()> {
 }
 
 fn plane() -> Result<&'static Plane> {
-    PLANE.get().context("this daemon's volume plane was never started")
+    PLANE
+        .get()
+        .context("this daemon's volume plane was never started")
 }
 
 // ---- the provider's half ---------------------------------------------------
@@ -137,18 +139,24 @@ pub async fn serve(req: Request) -> Response {
         Request::VolumeCreate { name, size_bytes } => create(&name, size_bytes).await,
         Request::VolumeList => list().await,
         Request::VolumeRemove { name } => remove(&name).await,
-        Request::VolumeLease { volume, holder, holder_device } => {
-            grant(&volume, &holder, &holder_device).await
-        }
-        Request::VolumeReconnect { volume, holder, epoch } => {
-            resume(&volume, &holder, epoch).await
-        }
+        Request::VolumeLease {
+            volume,
+            holder,
+            holder_device,
+        } => grant(&volume, &holder, &holder_device).await,
+        Request::VolumeReconnect {
+            volume,
+            holder,
+            epoch,
+        } => resume(&volume, &holder, epoch).await,
         Request::VolumeRelease { volume, holder } => release(&volume, &holder).await,
         other => Err(anyhow!("{other:?} is not a volume request")),
     };
     match result {
         Ok(response) => response,
-        Err(e) => Response::Error { message: format!("{e:#}") },
+        Err(e) => Response::Error {
+            message: format!("{e:#}"),
+        },
     }
 }
 
@@ -180,7 +188,9 @@ async fn create(name: &str, size_bytes: u64) -> Result<Response> {
 async fn list() -> Result<Response> {
     let plane = plane()?;
     let store = plane.store.lock().await;
-    Ok(Response::Volumes { volumes: store.list() })
+    Ok(Response::Volumes {
+        volumes: store.list(),
+    })
 }
 
 async fn remove(name: &str) -> Result<Response> {
@@ -190,8 +200,7 @@ async fn remove(name: &str) -> Result<Response> {
     store.save()?;
     let dir = paths::volume_dir(name);
     if dir.exists() {
-        std::fs::remove_dir_all(&dir)
-            .with_context(|| format!("removing {}", dir.display()))?;
+        std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
     }
     Ok(Response::Volumes { volumes: vec![vol] })
 }
@@ -222,7 +231,9 @@ async fn grant(name: &str, holder: &str, holder_device: &str) -> Result<Response
         volume: vol.name.clone(),
         epoch: lease.epoch,
         export: lease.export,
-        socket: paths::volume_export_socket(name, lease.epoch).display().to_string(),
+        socket: paths::volume_export_socket(name, lease.epoch)
+            .display()
+            .to_string(),
         size_bytes: vol.size_bytes,
     })
 }
@@ -264,7 +275,9 @@ async fn release(name: &str, holder: &str) -> Result<Response> {
     if let Some(lease) = released {
         stop_export(name, lease.epoch, lease.proc.as_ref());
     }
-    Ok(Response::Volumes { volumes: vec![store.get(name)?.clone()] })
+    Ok(Response::Volumes {
+        volumes: vec![store.get(name)?.clone()],
+    })
 }
 
 /// Connect to the export serving `volume` at `epoch`, on behalf of `holder`.
@@ -274,11 +287,7 @@ async fn release(name: &str, holder: &str) -> Result<Response> {
 /// current one, gets a refusal rather than a pipe. Nothing about the reply
 /// tells a stale consumer what the new epoch is; it has to go and ask for a
 /// lease, which is the code path that decides whether it may have one.
-pub async fn open_export(
-    volume: &str,
-    holder: &str,
-    epoch: u64,
-) -> Result<tokio::net::UnixStream> {
+pub async fn open_export(volume: &str, holder: &str, epoch: u64) -> Result<tokio::net::UnixStream> {
     let plane = plane()?;
     let mut store = plane.store.lock().await;
     let vol = store.get(volume)?.clone();
@@ -365,7 +374,11 @@ fn start_export(vol: &BlockVolume, epoch: u64, export: &str) -> Result<ProcId> {
     )?;
     let image = paths::volume_image_path(&vol.name);
     if !image.exists() {
-        bail!("volume {:?} has lost its image at {}", vol.name, image.display());
+        bail!(
+            "volume {:?} has lost its image at {}",
+            vol.name,
+            image.display()
+        );
     }
     let socket = paths::volume_export_socket(&vol.name, epoch);
     let pidfile = paths::volume_export_pid(&vol.name, epoch);
@@ -490,8 +503,12 @@ pub struct Leased {
 /// undone by [`take_down`] — including on its own failure, so a boot that
 /// cannot get one of two volumes does not leave the other half-attached.
 pub fn bring_up(inst: &Instance, hv: &dyn Hypervisor) -> Result<Raised> {
-    let blocks: Vec<Volume> =
-        inst.volumes.iter().filter(|v| v.is_block()).cloned().collect();
+    let blocks: Vec<Volume> = inst
+        .volumes
+        .iter()
+        .filter(|v| v.is_block())
+        .cloned()
+        .collect();
     if blocks.is_empty() {
         return Ok(Raised::default());
     }
@@ -537,7 +554,12 @@ pub async fn take_down(instance: &str) {
 /// Per-volume failures are reported and the rest go up: one unreachable
 /// provider must not cost the guest the disks whose providers are awake.
 pub async fn reattach(inst: &Instance) {
-    let blocks: Vec<Volume> = inst.volumes.iter().filter(|v| v.is_block()).cloned().collect();
+    let blocks: Vec<Volume> = inst
+        .volumes
+        .iter()
+        .filter(|v| v.is_block())
+        .cloned()
+        .collect();
     if blocks.is_empty() {
         return;
     }
@@ -569,7 +591,13 @@ pub async fn reattach(inst: &Instance) {
         }
     }
     if !raised.is_empty() {
-        plane.bridges.lock().await.entry(inst.name.clone()).or_default().extend(raised);
+        plane
+            .bridges
+            .lock()
+            .await
+            .entry(inst.name.clone())
+            .or_default()
+            .extend(raised);
     }
 }
 
@@ -617,11 +645,7 @@ pub async fn release_all(inst: &Instance) {
 ///
 /// This is what `ast attach` calls, and what every boot calls again. The
 /// answer carries the epoch the consumer must present on every splice.
-pub async fn take_lease(
-    volume: &str,
-    device: &str,
-    holder: &str,
-) -> Result<(u64, String, u64)> {
+pub async fn take_lease(volume: &str, device: &str, holder: &str) -> Result<(u64, String, u64)> {
     let plane = plane()?;
     let holder_device = plane.node.device_name().await;
     let response = ask(
@@ -634,9 +658,12 @@ pub async fn take_lease(
     )
     .await?;
     match response {
-        Response::VolumeLease { epoch, export, size_bytes, .. } => {
-            Ok((epoch, export, size_bytes))
-        }
+        Response::VolumeLease {
+            epoch,
+            export,
+            size_bytes,
+            ..
+        } => Ok((epoch, export, size_bytes)),
         Response::Error { message } => bail!(message),
         other => bail!("device {device:?} answered a lease request with {other:?}"),
     }
@@ -668,7 +695,10 @@ async fn confirm_lease(volume: &str, device: &str, holder: &str, epoch: u64) -> 
 pub async fn give_lease_back(volume: &str, device: &str, holder: &str) -> Result<()> {
     match ask(
         device,
-        Request::VolumeRelease { volume: volume.to_owned(), holder: holder.to_owned() },
+        Request::VolumeRelease {
+            volume: volume.to_owned(),
+            holder: holder.to_owned(),
+        },
     )
     .await?
     {
@@ -730,7 +760,11 @@ async fn raise_all(instance: &str, blocks: &[Volume]) -> Result<Raised> {
         let socket = paths::volume_bridge_socket(instance, &vol.host, &vol.path);
         let splice = bridge(instance, vol, epoch, &socket).await?;
         raised.push(splice);
-        out.disks.push(DiskSpec::NbdUnix { socket, export, readonly: false });
+        out.disks.push(DiskSpec::NbdUnix {
+            socket,
+            export,
+            readonly: false,
+        });
         out.leases.push(Leased {
             volume: vol.path.clone(),
             device: vol.host.clone(),
@@ -738,7 +772,11 @@ async fn raise_all(instance: &str, blocks: &[Volume]) -> Result<Raised> {
             size_bytes,
         });
     }
-    plane.bridges.lock().await.insert(instance.to_owned(), raised);
+    plane
+        .bridges
+        .lock()
+        .await
+        .insert(instance.to_owned(), raised);
     Ok(out)
 }
 
@@ -748,12 +786,7 @@ async fn raise_all(instance: &str, blocks: &[Volume]) -> Result<Raised> {
 /// One accept loop per volume, one mesh stream per connection — the same
 /// shape `ast ssh` uses, and for the same reason: past the first frame this
 /// is a pipe, and neither daemon reads what goes through it.
-async fn bridge(
-    instance: &str,
-    vol: &Volume,
-    epoch: u64,
-    socket: &Path,
-) -> Result<Splice> {
+async fn bridge(instance: &str, vol: &Volume, epoch: u64, socket: &Path) -> Result<Splice> {
     if let Some(dir) = socket.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -763,17 +796,17 @@ async fn bridge(
     let listener = tokio::net::UnixListener::bind(socket)
         .with_context(|| format!("binding {} for volume {}", socket.display(), vol.path))?;
 
-    let (device, volume, holder) =
-        (vol.host.clone(), vol.path.clone(), instance.to_owned());
+    let (device, volume, holder) = (vol.host.clone(), vol.path.clone(), instance.to_owned());
     let socket_path = socket.to_owned();
     let task = tokio::spawn(async move {
         // A JoinSet, so dropping the bridge takes every live NBD session with
         // it — which is exactly what a revoked lease has to look like.
         let mut sessions = tokio::task::JoinSet::new();
         loop {
-            let Ok((stream, _)) = listener.accept().await else { return };
-            let (device, volume, holder) =
-                (device.clone(), volume.clone(), holder.clone());
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (device, volume, holder) = (device.clone(), volume.clone(), holder.clone());
             sessions.spawn(async move {
                 if let Err(e) = splice_one(&device, &volume, &holder, epoch, stream).await {
                     eprintln!(
@@ -810,7 +843,8 @@ async fn splice_one(
         .mesh
         .as_ref()
         .context("this daemon has no mesh endpoint, so it cannot reach a remote volume")?;
-    mesh.volume_splice(device, volume, holder, epoch, stream).await
+    mesh.volume_splice(device, volume, holder, epoch, stream)
+        .await
 }
 
 #[cfg(test)]
@@ -877,7 +911,10 @@ mod tests {
     #[test]
     fn a_backend_without_an_nbd_client_refuses_in_words() {
         let err = check_backend(&Fake(false)).unwrap_err().to_string();
-        assert!(err.contains("remote volumes ride the qemu backend today"), "{err}");
+        assert!(
+            err.contains("remote volumes ride the qemu backend today"),
+            "{err}"
+        );
         assert!(err.contains("vz"), "{err}");
         assert!(check_backend(&Fake(true)).is_ok());
     }
@@ -913,7 +950,10 @@ mod tests {
         let socket = dir.path().join("nbd-e1.sock");
         let me = ProcId::capture(std::process::id()).unwrap();
 
-        assert!(!export_alive(None, &socket), "nothing recorded, nothing running");
+        assert!(
+            !export_alive(None, &socket),
+            "nothing recorded, nothing running"
+        );
         std::fs::write(&socket, b"").unwrap();
         // Our own process is certainly alive, and the file is there.
         assert!(export_alive(Some(&me), &socket));
@@ -934,11 +974,20 @@ mod tests {
         let socket = dir.path().join("nbd-e1.sock");
         std::fs::write(&socket, b"").unwrap();
 
-        let mut sleeper = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let mut sleeper = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
         let real = ProcId::capture(sleeper.id()).unwrap();
-        let stale = ProcId { started_us: real.started_us - 1, ..real.clone() };
+        let stale = ProcId {
+            started_us: real.started_us - 1,
+            ..real.clone()
+        };
 
-        assert!(!export_alive(Some(&stale), &socket), "not our export any more");
+        assert!(
+            !export_alive(Some(&stale), &socket),
+            "not our export any more"
+        );
         // Revocation still runs — the unlink of the lease's own socket is
         // the fence, and it does not depend on any process — but the
         // stranger holding the number is left alone.

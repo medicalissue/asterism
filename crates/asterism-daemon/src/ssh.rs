@@ -46,7 +46,9 @@ pub(crate) async fn endpoint(
     if let Some(inst) = local {
         if let Some(conflict) = &inst.conflict {
             return (
-                Response::Error { message: registry::conflicted(&inst, conflict) },
+                Response::Error {
+                    message: registry::conflicted(&inst, conflict),
+                },
                 None,
             );
         }
@@ -56,9 +58,23 @@ pub(crate) async fn endpoint(
         let (host, port) = endpoint.ssh_target();
         let identity = match guest_identity(&inst, node, mesh).await {
             Ok(identity) => identity,
-            Err(e) => return (Response::Error { message: format!("{e:#}") }, None),
+            Err(e) => {
+                return (
+                    Response::Error {
+                        message: format!("{e:#}"),
+                    },
+                    None,
+                )
+            }
         };
-        return (Response::SshEndpoint { host, port, identity }, None);
+        return (
+            Response::SshEndpoint {
+                host,
+                port,
+                identity,
+            },
+            None,
+        );
     }
 
     let Some(mesh) = mesh else {
@@ -71,7 +87,11 @@ pub(crate) async fn endpoint(
     };
     match mesh.ssh_splice(name).await {
         Ok(Some((port, identity, splice))) => (
-            Response::SshEndpoint { host: "127.0.0.1".into(), port, identity },
+            Response::SshEndpoint {
+                host: "127.0.0.1".into(),
+                port,
+                identity,
+            },
             Some(splice),
         ),
         Ok(None) => (
@@ -80,7 +100,12 @@ pub(crate) async fn endpoint(
             },
             None,
         ),
-        Err(e) => (Response::Error { message: format!("{e:#}") }, None),
+        Err(e) => (
+            Response::Error {
+                message: format!("{e:#}"),
+            },
+            None,
+        ),
     }
 }
 
@@ -90,11 +115,7 @@ pub(crate) async fn endpoint(
 /// swap it is the *seeding* device's, because the seed travelled with the
 /// instance and a guest trusts the key that is in its seed — which is a
 /// property of the instance, not of whoever is running it today.
-async fn guest_identity(
-    inst: &Instance,
-    node: &Node,
-    mesh: Option<&Arc<Mesh>>,
-) -> Result<String> {
+async fn guest_identity(inst: &Instance, node: &Node, mesh: Option<&Arc<Mesh>>) -> Result<String> {
     // Reached only for a row this device holds, so an instance with nothing
     // recorded was seeded here — that was the invariant before instances
     // could move. Falling back to *this device* rather than to the recorded
@@ -103,8 +124,7 @@ async fn guest_identity(
     let here = node.device_name().await;
     let seeder = inst.seed_device.as_deref().unwrap_or(&here);
     if seeder == here {
-        asterism_core::seed::ensure_asterism_key()
-            .context("preparing this device's guest key")?;
+        asterism_core::seed::ensure_asterism_key().context("preparing this device's guest key")?;
         return Ok(paths::ssh_key_path().display().to_string());
     }
     let mesh = mesh.ok_or_else(|| {

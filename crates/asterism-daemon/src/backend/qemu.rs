@@ -500,8 +500,7 @@ impl Hypervisor for Qemu {
         ))
     }
 
-
-/// Ask the guest to power down cleanly via QMP (ACPI power button); a
+    /// Ask the guest to power down cleanly via QMP (ACPI power button); a
     /// killed QEMU is a yanked power cord — the overlay needs journal
     /// recovery on the next boot and recent guest writes are lost. Only if
     /// the guest ignores the request do we escalate to SIGTERM/SIGKILL.
@@ -830,7 +829,9 @@ fn powerdown_only(h: &Handle, budget: Duration) -> Result<()> {
          cannot be signalled. Its monitor is {}; it was recorded at pid {}. Check that \
          pid is really the guest and stop it by hand.",
         ctl.display(),
-        h.pid.map(|p| p.to_string()).unwrap_or_else(|| "none".into())
+        h.pid
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "none".into())
     )
 }
 
@@ -1868,7 +1869,11 @@ mod tests {
     #[test]
     fn unoffered_capabilities_refuse_by_name() {
         let hv = Qemu::new();
-        let h = handle(Some(ProcId { pid: 1, started_us: 1, exec: None }));
+        let h = handle(Some(ProcId {
+            pid: 1,
+            started_us: 1,
+            exec: None,
+        }));
         let err = hv.snapshot(&h, "t").unwrap_err().to_string();
         assert!(err.contains("qemu"), "{err}");
         assert!(hv
@@ -1938,9 +1943,15 @@ mod tests {
     #[test]
     fn a_recycled_pid_is_stopped_and_refuses_the_signals() {
         let hv = Qemu::new();
-        let mut sleeper = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let mut sleeper = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
         let real = ProcId::capture(sleeper.id()).unwrap();
-        let stale = ProcId { started_us: real.started_us - 1, ..real.clone() };
+        let stale = ProcId {
+            started_us: real.started_us - 1,
+            ..real.clone()
+        };
         let h = handle(Some(stale));
 
         assert_eq!(hv.state(&h).unwrap(), RunState::Stopped);
@@ -1961,7 +1972,11 @@ mod tests {
     fn a_dead_guest_is_stopped_and_stopping_it_again_succeeds() {
         let hv = Qemu::new();
         let pid = dead_pid();
-        let h = handle(Some(ProcId { pid, started_us: 1, exec: None }));
+        let h = handle(Some(ProcId {
+            pid,
+            started_us: 1,
+            exec: None,
+        }));
         assert_eq!(hv.state(&h).unwrap(), RunState::Stopped);
         assert!(hv.stop(&h, Duration::from_millis(10)).is_ok());
         assert!(hv.kill(&h).is_ok());

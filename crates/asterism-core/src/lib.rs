@@ -29,8 +29,8 @@ pub mod proc;
 pub mod protocol;
 pub mod registry;
 pub mod rewrite;
-pub mod seed;
 pub mod secret;
+pub mod seed;
 pub mod service;
 pub mod snapshot;
 pub mod tools;
@@ -74,7 +74,9 @@ mod build_id_tests {
         let source = &BUILD_ID[VERSION.len() + 1..];
         assert!(!source.is_empty(), "build id {BUILD_ID} names no source");
         assert!(
-            source.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+')),
+            source
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '+')),
             "build id {BUILD_ID} is not one word"
         );
     }

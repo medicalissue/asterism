@@ -39,7 +39,9 @@ pub struct Assertion {
 impl Assertion {
     /// Take an assertion, or say why this device cannot.
     pub fn hold(reason: &str) -> Result<Self> {
-        Ok(Assertion { held: imp::hold(reason)? })
+        Ok(Assertion {
+            held: imp::hold(reason)?,
+        })
     }
 
     /// The mechanism doing the holding, for logs and status output.
@@ -311,7 +313,10 @@ mod tests {
     /// five-second supervisor loop cannot become a log flood.
     #[test]
     fn an_unavailable_mechanism_is_reported_once() {
-        let mut guard = SleepGuard { held: None, refused: true };
+        let mut guard = SleepGuard {
+            held: None,
+            refused: true,
+        };
         assert_eq!(guard.set(1), Change::Same);
         assert!(!guard.is_held());
     }

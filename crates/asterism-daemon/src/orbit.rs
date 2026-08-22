@@ -57,13 +57,17 @@ pub(crate) async fn serve(req: Request, node: &Node, mesh: Option<&Arc<Mesh>>) -
             None => no_mesh(),
         },
         Request::Devices => match mesh {
-            Some(mesh) => Response::Devices { devices: mesh.devices().await },
+            Some(mesh) => Response::Devices {
+                devices: mesh.devices().await,
+            },
             None => no_mesh(),
         },
         // Two questions about this device and nothing else: where it sits on
         // the wire, and what it can honestly promise about being woken.
         // Neither consults the shard or the orbit.
-        Request::DeviceFacts => Response::WakeFacts { facts: wake::facts() },
+        Request::DeviceFacts => Response::WakeFacts {
+            facts: wake::facts(),
+        },
         Request::DeviceCheck => Response::WakeCheck {
             device: node.device_name().await,
             rows: wake::check(),
@@ -74,12 +78,15 @@ pub(crate) async fn serve(req: Request, node: &Node, mesh: Option<&Arc<Mesh>>) -
         // as for every other forwarded request; the lan-id inside it is then
         // checked against this device's own, so a device that has moved
         // declines rather than broadcasting somebody's MAC at strangers.
-        Request::WakeBroadcast { mac, lan_id } => {
-            match wake::broadcast(&mac, lan_id.as_deref()) {
-                Ok(sent) => Response::Wake { text: sent.join(", "), done: true },
-                Err(e) => Response::Error { message: format!("{e:#}") },
-            }
-        }
+        Request::WakeBroadcast { mac, lan_id } => match wake::broadcast(&mac, lan_id.as_deref()) {
+            Ok(sent) => Response::Wake {
+                text: sent.join(", "),
+                done: true,
+            },
+            Err(e) => Response::Error {
+                message: format!("{e:#}"),
+            },
+        },
         // Answered on the connection that asked, in `serve`, because it
         // reports as it goes rather than once at the end.
         Request::DeviceWake { name } => Response::Error {
@@ -92,7 +99,9 @@ pub(crate) async fn serve(req: Request, node: &Node, mesh: Option<&Arc<Mesh>>) -
         Request::DeviceRemove { name } => match mesh {
             Some(mesh) => match mesh.remove_device(&name).await {
                 Ok(_) => Response::Ok,
-                Err(e) => Response::Error { message: format!("{e:#}") },
+                Err(e) => Response::Error {
+                    message: format!("{e:#}"),
+                },
             },
             None => no_mesh(),
         },
@@ -122,7 +131,10 @@ async fn local_rows(node: &Node) -> Response {
         rows: shard
             .list()
             .into_iter()
-            .map(|instance| OrbitRow { instance, live: true })
+            .map(|instance| OrbitRow {
+                instance,
+                live: true,
+            })
             .collect(),
     }
 }
@@ -145,13 +157,17 @@ pub(crate) async fn pair(
 }
 
 pub(crate) fn no_mesh() -> Response {
-    Response::Error { message: NO_MESH.into() }
+    Response::Error {
+        message: NO_MESH.into(),
+    }
 }
 
 pub(crate) fn reply_or_error(result: Result<Response>) -> Response {
     match result {
         Ok(response) => response,
-        Err(e) => Response::Error { message: format!("{e:#}") },
+        Err(e) => Response::Error {
+            message: format!("{e:#}"),
+        },
     }
 }
 
@@ -167,8 +183,12 @@ mod tests {
         for req in [
             Request::Devices,
             Request::ListOrbit,
-            Request::DevicePing { device: "desktop".into() },
-            Request::DeviceRemove { name: "desktop".into() },
+            Request::DevicePing {
+                device: "desktop".into(),
+            },
+            Request::DeviceRemove {
+                name: "desktop".into(),
+            },
             Request::DeviceFacts,
             Request::DeviceCheck,
             Request::PairConfirm { accept: true },
@@ -189,7 +209,10 @@ mod tests {
     fn a_single_shard_is_not_an_orbit_question() {
         assert!(!claims(&Request::List));
         assert!(!claims(&Request::Status { name: "dev".into() }));
-        assert!(!claims(&Request::Up { name: "dev".into(), restart: None }));
+        assert!(!claims(&Request::Up {
+            name: "dev".into(),
+            restart: None
+        }));
     }
 
     /// The two pairing frames borrow the connection, so they are answered in
@@ -197,7 +220,13 @@ mod tests {
     /// here would turn a conversation into a single reply.
     #[test]
     fn the_pairing_frames_are_left_to_the_connection_that_asked() {
-        assert!(!claims(&Request::DeviceInvite { name: None, ttl_secs: None }));
-        assert!(!claims(&Request::DeviceAdd { ticket: "t".into(), name: None }));
+        assert!(!claims(&Request::DeviceInvite {
+            name: None,
+            ttl_secs: None
+        }));
+        assert!(!claims(&Request::DeviceAdd {
+            ticket: "t".into(),
+            name: None
+        }));
     }
 }

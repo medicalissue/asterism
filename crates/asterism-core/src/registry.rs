@@ -36,8 +36,7 @@ use serde::{Deserialize, Serialize};
 use crate::durable::{self, Loaded};
 use crate::hv::{Handle, ImageKind, Machine};
 use crate::instance::{
-    self, now_unix, Conflict, Instance, Moving, Policy, PortForward, Restart, Shape, Status,
-    Volume,
+    self, now_unix, Conflict, Instance, Moving, Policy, PortForward, Restart, Shape, Status, Volume,
 };
 use crate::proc::ProcId;
 use crate::secret::Binding;
@@ -89,10 +88,17 @@ impl<'de> Deserialize<'de> for AnyShard {
         let value = serde_json::Value::deserialize(de)?;
         // An envelope has a numeric `version`. An instance called "version"
         // is not a number, so the two cannot be confused.
-        if value.get("version").is_some_and(serde_json::Value::is_number) {
-            serde_json::from_value(value).map(AnyShard::Current).map_err(D::Error::custom)
+        if value
+            .get("version")
+            .is_some_and(serde_json::Value::is_number)
+        {
+            serde_json::from_value(value)
+                .map(AnyShard::Current)
+                .map_err(D::Error::custom)
         } else {
-            serde_json::from_value(value).map(AnyShard::Legacy).map_err(D::Error::custom)
+            serde_json::from_value(value)
+                .map(AnyShard::Legacy)
+                .map_err(D::Error::custom)
         }
     }
 }
@@ -129,14 +135,11 @@ pub struct OrbitRow {
 impl Shard {
     pub fn load(path: &Path) -> Result<Self> {
         let what = "this device's registry shard";
-        let (raw, repaired) = match durable::load_json_versioned::<AnyShard>(
-            path,
-            what,
-            SHARD_VERSION,
-        )? {
-            Some(Loaded { value, repaired }) => (Some(value), repaired),
-            None => (None, None),
-        };
+        let (raw, repaired) =
+            match durable::load_json_versioned::<AnyShard>(path, what, SHARD_VERSION)? {
+                Some(Loaded { value, repaired }) => (Some(value), repaired),
+                None => (None, None),
+            };
         if let Some(why) = &repaired {
             // Loud, and on the daemon's log rather than swallowed: the rows
             // that were in the failed commit are gone, and the user is owed
@@ -151,7 +154,10 @@ impl Shard {
         for inst in instances.values_mut() {
             inst.migrate_legacy();
         }
-        let mut shard = Self { path: path.to_owned(), instances };
+        let mut shard = Self {
+            path: path.to_owned(),
+            instances,
+        };
         // A shard that was recovered from its backup, or that arrived in the
         // pre-envelope shape, is written back now rather than at the next
         // mutation: a daemon that read it and then died would otherwise do
@@ -202,7 +208,9 @@ impl Shard {
     /// other order — delete, then save — loses a hand-set `never` to a
     /// `kill -9` in between.
     fn adopt_policy_sidecars(&mut self) -> Result<()> {
-        let Some(home) = self.path.parent().map(Path::to_owned) else { return Ok(()) };
+        let Some(home) = self.path.parent().map(Path::to_owned) else {
+            return Ok(());
+        };
         let mut adopted: Vec<PathBuf> = Vec::new();
         for (name, inst) in self.instances.iter_mut() {
             let path = home.join("instances").join(name).join("policy.json");
@@ -212,7 +220,10 @@ impl Shard {
             // A file that will not parse is not a reason to refuse to restart
             // anything: the default is "come back", and losing a hand-edited
             // `never` is the lesser of the two failures.
-            match std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()) {
+            match std::fs::read(&path)
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+            {
                 Some(policy) => {
                     inst.policy = policy;
                     eprintln!(
@@ -232,7 +243,8 @@ impl Shard {
         if adopted.is_empty() {
             return Ok(());
         }
-        self.save().context("saving the registry after folding in policy.json")?;
+        self.save()
+            .context("saving the registry after folding in policy.json")?;
         for path in adopted {
             let _ = std::fs::remove_file(path);
         }
@@ -246,7 +258,10 @@ impl Shard {
 
     /// This shard in the shape it is written in.
     fn file(&self) -> ShardFile {
-        ShardFile { version: SHARD_VERSION, instances: self.instances.clone() }
+        ShardFile {
+            version: SHARD_VERSION,
+            instances: self.instances.clone(),
+        }
     }
 
     /// Define an instance in this shard, sourcing its cpu and ram from
@@ -457,7 +472,11 @@ impl Shard {
         }
 
         let inst = self.get_mut(name)?;
-        if inst.volumes.iter().any(|v| v.path == path && v.host == host) {
+        if inst
+            .volumes
+            .iter()
+            .any(|v| v.path == path && v.host == host)
+        {
             bail!("{host}:{path} is already attached to {name:?}");
         }
         // Two volumes at one guest path would silently shadow each other.
@@ -468,7 +487,8 @@ impl Shard {
                 clash.path
             );
         }
-        inst.volumes.push(Volume::dir(path, host, Some(mount_point)));
+        inst.volumes
+            .push(Volume::dir(path, host, Some(mount_point)));
         Ok(inst.clone())
     }
 
@@ -488,8 +508,10 @@ impl Shard {
         size_bytes: u64,
     ) -> Result<Instance> {
         let inst = self.get_mut(name)?;
-        if let Some(existing) =
-            inst.volumes.iter_mut().find(|v| v.path == volume && v.host == host)
+        if let Some(existing) = inst
+            .volumes
+            .iter_mut()
+            .find(|v| v.path == volume && v.host == host)
         {
             if !existing.is_block() {
                 bail!("{host}:{volume} is already attached to {name:?} as a directory");
@@ -497,7 +519,8 @@ impl Shard {
             existing.epoch = Some(epoch);
             existing.size_bytes = Some(size_bytes);
         } else {
-            inst.volumes.push(Volume::block(volume, host, epoch, size_bytes));
+            inst.volumes
+                .push(Volume::block(volume, host, epoch, size_bytes));
         }
         Ok(inst.clone())
     }
@@ -560,11 +583,12 @@ impl Shard {
         host: &str,
     ) -> Result<(Instance, Volume)> {
         let inst = self.get_mut(name)?;
-        let Some(index) = inst.volumes.iter().position(|v| v.path == volume && v.host == host)
+        let Some(index) = inst
+            .volumes
+            .iter()
+            .position(|v| v.path == volume && v.host == host)
         else {
-            bail!(
-                "{host}:{volume} is not attached to {name:?} — see: ast status {name}"
-            );
+            bail!("{host}:{volume} is not attached to {name:?} — see: ast status {name}");
         };
         let removed = inst.volumes.remove(index);
         Ok((inst.clone(), removed))
@@ -608,7 +632,8 @@ impl Shard {
         if let Some(existing) = self.instances.get(&instance.name) {
             bail!("{}", taken(existing));
         }
-        self.instances.insert(instance.name.clone(), instance.clone());
+        self.instances
+            .insert(instance.name.clone(), instance.clone());
         Ok(instance)
     }
 
@@ -659,8 +684,14 @@ mod tests {
         Handle {
             backend: "qemu".into(),
             pid: Some(pid),
-            proc: Some(ProcId { pid, started_us: 1_700_000_000_000_000, exec: None }),
-            ctl: ControlChannel::Qmp { path: "/tmp/qmp.sock".into() },
+            proc: Some(ProcId {
+                pid,
+                started_us: 1_700_000_000_000_000,
+                exec: None,
+            }),
+            ctl: ControlChannel::Qmp {
+                path: "/tmp/qmp.sock".into(),
+            },
             endpoint: GuestEndpoint::HostForward { ssh_port },
             started_at: 1_700_000_000,
         }
@@ -685,8 +716,12 @@ mod tests {
     fn create_save_load_round_trip() {
         let path = scratch();
         let mut shard = Shard::load(&path).unwrap();
-        shard.create("dev", "laptop", "ubuntu:24.04", Shape::default(), machine()).unwrap();
-        shard.attach_volume("dev", "/tank/media", "desktop", None).unwrap();
+        shard
+            .create("dev", "laptop", "ubuntu:24.04", Shape::default(), machine())
+            .unwrap();
+        shard
+            .attach_volume("dev", "/tank/media", "desktop", None)
+            .unwrap();
         shard.save().unwrap();
 
         let reloaded = Shard::load(&path).unwrap();
@@ -707,7 +742,9 @@ mod tests {
         let home = path.parent().unwrap().to_owned();
         let mut shard = Shard::load(&path).unwrap();
         for name in ["kept-up", "left-down", "corrupt", "silent"] {
-            shard.create(name, "laptop", "ubuntu:24.04", Shape::default(), machine()).unwrap();
+            shard
+                .create(name, "laptop", "ubuntu:24.04", Shape::default(), machine())
+                .unwrap();
         }
         shard.save().unwrap();
 
@@ -715,7 +752,11 @@ mod tests {
         for name in ["kept-up", "left-down", "corrupt"] {
             std::fs::create_dir_all(sidecar(name).parent().unwrap()).unwrap();
         }
-        std::fs::write(sidecar("kept-up"), r#"{"restart":"always","max_attempts":9}"#).unwrap();
+        std::fs::write(
+            sidecar("kept-up"),
+            r#"{"restart":"always","max_attempts":9}"#,
+        )
+        .unwrap();
         // A file naming only the part it cared about is what most of them are.
         std::fs::write(sidecar("left-down"), r#"{"restart":"never"}"#).unwrap();
         std::fs::write(sidecar("corrupt"), "{ this is not json").unwrap();
@@ -723,7 +764,11 @@ mod tests {
         let reloaded = Shard::load(&path).unwrap();
         let policy = |name: &str| reloaded.get(name).unwrap().policy;
         assert_eq!(policy("kept-up").restart, Restart::Always);
-        assert_eq!(policy("kept-up").max_attempts, 9, "the whole file is kept, not half");
+        assert_eq!(
+            policy("kept-up").max_attempts,
+            9,
+            "the whole file is kept, not half"
+        );
         assert_eq!(policy("left-down").restart, Restart::Never);
         assert_eq!(
             policy("left-down").max_attempts,
@@ -736,7 +781,10 @@ mod tests {
         assert_eq!(policy("silent").restart, Restart::Always);
 
         for name in ["kept-up", "left-down", "corrupt"] {
-            assert!(!sidecar(name).exists(), "{name}'s policy.json survived the migration");
+            assert!(
+                !sidecar(name).exists(),
+                "{name}'s policy.json survived the migration"
+            );
         }
 
         // Load wrote the shard back itself, so what the files said is in
@@ -745,29 +793,45 @@ mod tests {
         let json = std::fs::read_to_string(&path).unwrap();
         assert!(json.contains("\"never\""), "{json}");
         let again = Shard::load(&path).unwrap();
-        assert_eq!(again.get("left-down").unwrap().policy.restart, Restart::Never);
+        assert_eq!(
+            again.get("left-down").unwrap().policy.restart,
+            Restart::Never
+        );
         assert_eq!(again.get("kept-up").unwrap().policy.max_attempts, 9);
     }
 
     #[test]
     fn volumes_get_mount_points_and_do_not_collide() {
         let mut shard = Shard::load(&scratch()).unwrap();
-        shard.create("dev", "laptop", "ubuntu:24.04", Shape::default(), machine()).unwrap();
+        shard
+            .create("dev", "laptop", "ubuntu:24.04", Shape::default(), machine())
+            .unwrap();
 
-        let inst = shard.attach_volume("dev", "/tank/media", "desktop", None).unwrap();
-        assert_eq!(inst.volumes[0].mount_point.as_deref(), Some("/mnt/ast/media"));
+        let inst = shard
+            .attach_volume("dev", "/tank/media", "desktop", None)
+            .unwrap();
+        assert_eq!(
+            inst.volumes[0].mount_point.as_deref(),
+            Some("/mnt/ast/media")
+        );
 
         // Same host path twice is a duplicate.
-        assert!(shard.attach_volume("dev", "/tank/media", "desktop", None).is_err());
+        assert!(shard
+            .attach_volume("dev", "/tank/media", "desktop", None)
+            .is_err());
         // Different path, same basename: would shadow, so it is refused.
-        assert!(shard.attach_volume("dev", "/srv/media", "desktop", None).is_err());
+        assert!(shard
+            .attach_volume("dev", "/srv/media", "desktop", None)
+            .is_err());
         // ...unless the caller says where to put it.
         let inst = shard
             .attach_volume("dev", "/srv/media", "desktop", Some("/opt/media"))
             .unwrap();
         assert_eq!(inst.volumes[1].guest_path(), "/opt/media");
         // Relative mount points are nonsense inside the guest.
-        assert!(shard.attach_volume("dev", "/srv/x", "desktop", Some("rel")).is_err());
+        assert!(shard
+            .attach_volume("dev", "/srv/x", "desktop", Some("rel"))
+            .is_err());
     }
 
     /// A block volume is a disk, so it has no mount point to collide on, and
@@ -775,20 +839,28 @@ mod tests {
     #[test]
     fn block_volumes_carry_an_epoch_and_re_attach_in_place() {
         let mut shard = Shard::load(&scratch()).unwrap();
-        shard.create("dev", "laptop", "ubuntu:24.04", Shape::default(), machine()).unwrap();
+        shard
+            .create("dev", "laptop", "ubuntu:24.04", Shape::default(), machine())
+            .unwrap();
 
-        let inst = shard.attach_block("dev", "tank", "desktop", 1, 10 << 30).unwrap();
+        let inst = shard
+            .attach_block("dev", "tank", "desktop", 1, 10 << 30)
+            .unwrap();
         assert_eq!(inst.volumes.len(), 1);
         assert!(inst.volumes[0].is_block());
         assert_eq!(inst.volumes[0].epoch, Some(1));
         assert_eq!(inst.volumes[0].mount_point, None, "the guest decides that");
 
-        let inst = shard.attach_block("dev", "tank", "desktop", 2, 10 << 30).unwrap();
+        let inst = shard
+            .attach_block("dev", "tank", "desktop", 2, 10 << 30)
+            .unwrap();
         assert_eq!(inst.volumes.len(), 1, "a renewal is not a second disk");
         assert_eq!(inst.volumes[0].epoch, Some(2));
 
         // Two volumes of the same name on different devices are two volumes.
-        let inst = shard.attach_block("dev", "tank", "nas", 1, 1 << 30).unwrap();
+        let inst = shard
+            .attach_block("dev", "tank", "nas", 1, 1 << 30)
+            .unwrap();
         assert_eq!(inst.volumes.len(), 2);
 
         // Detaching names what came off, so the caller can release the lease.
@@ -796,12 +868,17 @@ mod tests {
         assert!(removed.is_block());
         assert_eq!(removed.epoch, Some(2));
         assert_eq!(inst.volumes.len(), 1);
-        let err = shard.detach_volume("dev", "tank", "desktop").unwrap_err().to_string();
+        let err = shard
+            .detach_volume("dev", "tank", "desktop")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("is not attached to \"dev\""), "{err}");
 
         // A directory and a block volume are different parts, and one cannot
         // quietly become the other.
-        shard.attach_volume("dev", "/tank/media", "desktop", None).unwrap();
+        shard
+            .attach_volume("dev", "/tank/media", "desktop", None)
+            .unwrap();
         let err = shard
             .attach_block("dev", "/tank/media", "desktop", 1, 1 << 30)
             .unwrap_err()
@@ -840,11 +917,19 @@ mod tests {
         inst.move_epoch = 1;
         inst.seed_device = Some("laptop".into());
         let adopted = target.adopt(inst.clone()).unwrap();
-        assert_eq!(adopted.id, source.get("dev").unwrap().id, "one instance, one id");
+        assert_eq!(
+            adopted.id,
+            source.get("dev").unwrap().id,
+            "one instance, one id"
+        );
         assert_eq!(adopted.created_at, source.get("dev").unwrap().created_at);
         assert_eq!(adopted.cpu_device, "desktop", "only the part moved");
         assert_eq!(adopted.move_epoch, 1);
-        assert_eq!(adopted.seeded_by(), "laptop", "the seed did not move with the cpu");
+        assert_eq!(
+            adopted.seeded_by(),
+            "laptop",
+            "the seed did not move with the cpu"
+        );
 
         // A shard that already holds the name refuses, in the orbit's words.
         let err = target.adopt(inst).unwrap_err().to_string();
@@ -857,15 +942,24 @@ mod tests {
     #[test]
     fn a_name_this_shard_holds_is_refused_in_the_orbits_words() {
         let mut shard = Shard::load(&scratch()).unwrap();
-        shard.create("dev", "laptop", "ubuntu:24.04", Shape::default(), machine()).unwrap();
+        shard
+            .create("dev", "laptop", "ubuntu:24.04", Shape::default(), machine())
+            .unwrap();
 
         let err = shard
             .create("dev", "laptop", "ubuntu:24.04", Shape::default(), machine())
             .unwrap_err()
             .to_string();
-        assert_eq!(err, "instance \"dev\" already exists in this orbit (cpu/ram on laptop)");
-        assert!(shard.create("has space", "laptop", "u", Shape::default(), machine()).is_err());
-        assert!(shard.create("", "laptop", "u", Shape::default(), machine()).is_err());
+        assert_eq!(
+            err,
+            "instance \"dev\" already exists in this orbit (cpu/ram on laptop)"
+        );
+        assert!(shard
+            .create("has space", "laptop", "u", Shape::default(), machine())
+            .is_err());
+        assert!(shard
+            .create("", "laptop", "u", Shape::default(), machine())
+            .is_err());
     }
 
     #[test]
@@ -878,10 +972,15 @@ mod tests {
     #[test]
     fn lifecycle_transitions() {
         let mut shard = Shard::load(&scratch()).unwrap();
-        shard.create("dev", "laptop", "ubuntu:24.04", Shape::default(), machine()).unwrap();
+        shard
+            .create("dev", "laptop", "ubuntu:24.04", Shape::default(), machine())
+            .unwrap();
         let inst = shard.set_running("dev", handle(4242, 22022)).unwrap();
         assert_eq!(inst.status, Status::Running);
-        assert_eq!(inst.endpoint().unwrap().ssh_target(), ("127.0.0.1".to_owned(), 22022));
+        assert_eq!(
+            inst.endpoint().unwrap().ssh_target(),
+            ("127.0.0.1".to_owned(), 22022)
+        );
         assert_eq!(inst.pid(), Some(4242));
         assert!(shard.remove("dev").is_err());
         let inst = shard.set_stopped("dev").unwrap();
@@ -897,7 +996,9 @@ mod tests {
     #[test]
     fn renaming_moves_the_row_and_clears_the_conflict() {
         let mut shard = Shard::load(&scratch()).unwrap();
-        shard.create("dev", "laptop", "ubuntu:24.04", Shape::default(), machine()).unwrap();
+        shard
+            .create("dev", "laptop", "ubuntu:24.04", Shape::default(), machine())
+            .unwrap();
         let marked = shard.mark_conflicted("dev", "desktop").unwrap();
         assert_eq!(marked.conflict.unwrap().other_cpu_device, "desktop");
 
@@ -911,8 +1012,18 @@ mod tests {
     #[test]
     fn a_rename_cannot_collide_or_run_over_a_live_guest() {
         let mut shard = Shard::load(&scratch()).unwrap();
-        shard.create("dev", "laptop", "ubuntu:24.04", Shape::default(), machine()).unwrap();
-        shard.create("other", "laptop", "ubuntu:24.04", Shape::default(), machine()).unwrap();
+        shard
+            .create("dev", "laptop", "ubuntu:24.04", Shape::default(), machine())
+            .unwrap();
+        shard
+            .create(
+                "other",
+                "laptop",
+                "ubuntu:24.04",
+                Shape::default(),
+                machine(),
+            )
+            .unwrap();
 
         let err = shard.rename("dev", "other").unwrap_err().to_string();
         assert!(err.contains("already exists in this orbit"), "{err}");
@@ -932,10 +1043,15 @@ mod tests {
     #[test]
     fn the_conflict_message_says_what_to_do() {
         let mut shard = Shard::load(&scratch()).unwrap();
-        shard.create("dev", "laptop", "ubuntu:24.04", Shape::default(), machine()).unwrap();
+        shard
+            .create("dev", "laptop", "ubuntu:24.04", Shape::default(), machine())
+            .unwrap();
         let inst = shard.mark_conflicted("dev", "desktop").unwrap();
         let text = conflicted(&inst, inst.conflict.as_ref().unwrap());
-        assert!(text.contains("shares its name with another instance in this orbit"), "{text}");
+        assert!(
+            text.contains("shares its name with another instance in this orbit"),
+            "{text}"
+        );
         assert!(text.contains("cpu/ram on desktop"), "{text}");
         assert!(text.contains("ast rename dev <new-name>"), "{text}");
     }
@@ -964,12 +1080,20 @@ mod tests {
         // The device that was called this instance's anchor is the device
         // supplying its cpu and ram; only the framing changed.
         assert_eq!(inst.cpu_device, "laptop");
-        let h = inst.handle.as_ref().expect("the running guest survived the upgrade");
+        let h = inst
+            .handle
+            .as_ref()
+            .expect("the running guest survived the upgrade");
         assert_eq!(h.backend, "qemu", "old entries were all QEMU");
         assert_eq!(h.pid, Some(4242));
         assert_eq!(h.endpoint, GuestEndpoint::HostForward { ssh_port: 22022 });
         // The control path is the one the old backend derived from the name.
-        assert_eq!(h.ctl, ControlChannel::Qmp { path: crate::paths::qmp_socket_path("dev") });
+        assert_eq!(
+            h.ctl,
+            ControlChannel::Qmp {
+                path: crate::paths::qmp_socket_path("dev")
+            }
+        );
         assert_eq!(inst.machine.backend, "qemu");
 
         // Saving rewrites it in the new shape, and the legacy keys go away.
@@ -982,14 +1106,26 @@ mod tests {
         let saved = &raw["instances"]["dev"];
         assert!(saved.get("handle").is_some());
         assert_eq!(saved["cpu_device"], "laptop");
-        assert!(saved.get("anchor").is_none(), "the old key is not written back: {saved}");
-        assert!(saved.get("pid").is_none(), "legacy pid is not written back: {saved}");
-        assert!(saved.get("ssh_port").is_none(), "legacy port is not written back: {saved}");
+        assert!(
+            saved.get("anchor").is_none(),
+            "the old key is not written back: {saved}"
+        );
+        assert!(
+            saved.get("pid").is_none(),
+            "legacy pid is not written back: {saved}"
+        );
+        assert!(
+            saved.get("ssh_port").is_none(),
+            "legacy port is not written back: {saved}"
+        );
         assert_eq!(saved["handle"]["endpoint"]["ssh_port"], 22022);
 
         // ...and the migrated file loads to the same thing.
         let again = Shard::load(&path).unwrap();
-        assert_eq!(again.get("dev").unwrap().handle, shard.get("dev").unwrap().handle);
+        assert_eq!(
+            again.get("dev").unwrap().handle,
+            shard.get("dev").unwrap().handle
+        );
     }
 
     // ---- crash recovery ----------------------------------------------------
@@ -1000,7 +1136,9 @@ mod tests {
     fn shard_with(path: &Path, names: &[&str]) -> Shard {
         let mut shard = Shard::load(path).unwrap();
         for name in names {
-            shard.create(name, "laptop", "debian:13", Shape::default(), machine()).unwrap();
+            shard
+                .create(name, "laptop", "debian:13", Shape::default(), machine())
+                .unwrap();
         }
         shard.save().unwrap();
         shard
@@ -1012,7 +1150,9 @@ mod tests {
     fn a_shard_killed_mid_save_converges_on_the_last_committed_rows() {
         let path = scratch();
         let mut shard = shard_with(&path, &["one"]);
-        shard.create("two", "laptop", "debian:13", Shape::default(), machine()).unwrap();
+        shard
+            .create("two", "laptop", "debian:13", Shape::default(), machine())
+            .unwrap();
 
         let armed = durable::faults::arm(
             "shard-kill",
@@ -1028,7 +1168,10 @@ mod tests {
 
         let reloaded = Shard::load(&path).unwrap();
         assert!(reloaded.holds("one"));
-        assert!(!reloaded.holds("two"), "a row from a commit that never landed is not a row");
+        assert!(
+            !reloaded.holds("two"),
+            "a row from a commit that never landed is not a row"
+        );
     }
 
     /// ENOSPC: the save fails and says so, and the registry that was on disk
@@ -1038,7 +1181,9 @@ mod tests {
     fn a_full_disk_does_not_cost_the_registry() {
         let path = scratch();
         let mut shard = shard_with(&path, &["one"]);
-        shard.create("two", "laptop", "debian:13", Shape::default(), machine()).unwrap();
+        shard
+            .create("two", "laptop", "debian:13", Shape::default(), machine())
+            .unwrap();
 
         let armed = durable::faults::arm_errno(
             "shard-enospc",
@@ -1063,14 +1208,19 @@ mod tests {
     fn a_truncated_shard_is_repaired_and_written_back() {
         let path = scratch();
         let mut shard = shard_with(&path, &["one"]);
-        shard.create("two", "laptop", "debian:13", Shape::default(), machine()).unwrap();
+        shard
+            .create("two", "laptop", "debian:13", Shape::default(), machine())
+            .unwrap();
         shard.save().unwrap();
 
         let whole = std::fs::read_to_string(&path).unwrap();
         std::fs::write(&path, &whole[..whole.len() / 3]).unwrap();
 
         let reloaded = Shard::load(&path).unwrap();
-        assert!(reloaded.holds("one"), "the commit before the damage is what survives");
+        assert!(
+            reloaded.holds("one"),
+            "the commit before the damage is what survives"
+        );
         // Written back on load, in the current shape, with no hand-editing.
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -1085,13 +1235,17 @@ mod tests {
     fn a_shard_with_no_readable_copy_is_refused_with_a_repair_path() {
         let path = scratch();
         let mut shard = shard_with(&path, &["one"]);
-        shard.create("two", "laptop", "debian:13", Shape::default(), machine()).unwrap();
+        shard
+            .create("two", "laptop", "debian:13", Shape::default(), machine())
+            .unwrap();
         shard.save().unwrap();
 
         std::fs::write(&path, b"{\"instances\": ").unwrap();
         std::fs::write(durable::backup_path(&path), b"neither is this").unwrap();
 
-        let err = Shard::load(&path).err().expect("an unreadable pair is refused");
+        let err = Shard::load(&path)
+            .err()
+            .expect("an unreadable pair is refused");
         let text = format!("{err:#}");
         assert!(text.contains("will not guess"), "{text}");
         assert!(text.contains("To repair"), "{text}");
@@ -1110,12 +1264,19 @@ mod tests {
         for name in ["kept-up", "left-down"] {
             std::fs::create_dir_all(sidecar(name).parent().unwrap()).unwrap();
         }
-        std::fs::write(sidecar("kept-up"), r#"{"restart":"always","max_attempts":9}"#).unwrap();
+        std::fs::write(
+            sidecar("kept-up"),
+            r#"{"restart":"always","max_attempts":9}"#,
+        )
+        .unwrap();
         std::fs::write(sidecar("left-down"), r#"{"restart":"never"}"#).unwrap();
 
         // First load folds them in and deletes the files.
         let once = Shard::load(&path).unwrap();
-        assert_eq!(once.get("left-down").unwrap().policy.restart, Restart::Never);
+        assert_eq!(
+            once.get("left-down").unwrap().policy.restart,
+            Restart::Never
+        );
 
         // Now put one back, which is exactly what a crash between the commit
         // and the unlink leaves: the shard already says it, and the file is
@@ -1124,9 +1285,15 @@ mod tests {
         std::fs::write(sidecar("left-down"), r#"{"restart":"never"}"#).unwrap();
 
         let twice = Shard::load(&path).unwrap();
-        assert_eq!(twice.get("left-down").unwrap().policy.restart, Restart::Never);
+        assert_eq!(
+            twice.get("left-down").unwrap().policy.restart,
+            Restart::Never
+        );
         assert_eq!(twice.get("kept-up").unwrap().policy.max_attempts, 9);
-        assert!(!sidecar("left-down").exists(), "and the second pass finished the job");
+        assert!(
+            !sidecar("left-down").exists(),
+            "and the second pass finished the job"
+        );
     }
 
     /// The other half of that ordering: a migration whose commit fails keeps
@@ -1152,9 +1319,15 @@ mod tests {
         let _ = Shard::load(&path).unwrap();
         drop(armed);
 
-        assert!(sidecar.exists(), "the sidecar is the only copy of what it says");
+        assert!(
+            sidecar.exists(),
+            "the sidecar is the only copy of what it says"
+        );
         let retried = Shard::load(&path).unwrap();
-        assert_eq!(retried.get("left-down").unwrap().policy.restart, Restart::Never);
+        assert_eq!(
+            retried.get("left-down").unwrap().policy.restart,
+            Restart::Never
+        );
         assert!(!sidecar.exists());
     }
 

@@ -610,7 +610,10 @@ mod tests {
         // answers a `Reply::Error` rather than failing to parse the line,
         // which is what makes asking one safe.
         assert_eq!(
-            serde_json::to_string(&Command::Sync { timeout_secs: Some(20) }).unwrap(),
+            serde_json::to_string(&Command::Sync {
+                timeout_secs: Some(20)
+            })
+            .unwrap(),
             r#"{"cmd":"sync","timeout_secs":20}"#
         );
         assert_eq!(

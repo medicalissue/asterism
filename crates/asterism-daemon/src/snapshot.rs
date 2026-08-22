@@ -55,7 +55,9 @@ pub(crate) fn serve(req: Request, reg: &Shard) -> Response {
                 .and_then(|inst| tokio::task::block_in_place(|| list(&inst)));
             match listed {
                 Ok(snapshots) => Response::Snapshots { snapshots },
-                Err(e) => Response::Error { message: format!("{e:#}") },
+                Err(e) => Response::Error {
+                    message: format!("{e:#}"),
+                },
             }
         }
         Request::SnapshotRestore { name, tag } => reply(
@@ -81,7 +83,9 @@ pub(crate) fn serve(req: Request, reg: &Shard) -> Response {
 fn reply(result: Result<()>) -> Response {
     match result {
         Ok(()) => Response::Ok,
-        Err(e) => Response::Error { message: format!("{e:#}") },
+        Err(e) => Response::Error {
+            message: format!("{e:#}"),
+        },
     }
 }
 
@@ -124,12 +128,21 @@ fn list(inst: &Instance) -> Result<Vec<asterism_core::snapshot::Snapshot>> {
 fn restore(inst: &Instance, tag: &str) -> Result<()> {
     let hv = backend::for_instance(inst)?;
     if !hv.caps().disk_snapshot {
-        anyhow::bail!("the {} backend cannot roll {:?}'s disk back", hv.id(), inst.name);
+        anyhow::bail!(
+            "the {} backend cannot roll {:?}'s disk back",
+            hv.id(),
+            inst.name
+        );
     }
     let req = backend::disk_req(inst)?;
     let prep = hv.prepare(&req)?;
     hv.disk_restore(&prep, &SnapshotId(tag.to_owned()))
-        .with_context(|| format!("restoring {:?} — see: ast snapshots {}", inst.name, inst.name))
+        .with_context(|| {
+            format!(
+                "restoring {:?} — see: ast snapshots {}",
+                inst.name, inst.name
+            )
+        })
 }
 
 fn remove(inst: &Instance, tag: &str) -> Result<()> {
@@ -140,7 +153,12 @@ fn remove(inst: &Instance, tag: &str) -> Result<()> {
     let req = backend::disk_req(inst)?;
     let prep = hv.prepare(&req)?;
     hv.disk_snapshot_remove(&prep, &SnapshotId(tag.to_owned()))
-        .with_context(|| format!("deleting a snapshot of {:?} — see: ast snapshots {}", inst.name, inst.name))
+        .with_context(|| {
+            format!(
+                "deleting a snapshot of {:?} — see: ast snapshots {}",
+                inst.name, inst.name
+            )
+        })
 }
 
 #[cfg(test)]
@@ -154,10 +172,19 @@ mod tests {
     #[test]
     fn every_frame_this_module_claims_is_one_it_answers() {
         for req in [
-            Request::Snapshot { name: "dev".into(), tag: "t".into() },
+            Request::Snapshot {
+                name: "dev".into(),
+                tag: "t".into(),
+            },
             Request::SnapshotList { name: "dev".into() },
-            Request::SnapshotRestore { name: "dev".into(), tag: "t".into() },
-            Request::SnapshotRemove { name: "dev".into(), tag: "t".into() },
+            Request::SnapshotRestore {
+                name: "dev".into(),
+                tag: "t".into(),
+            },
+            Request::SnapshotRemove {
+                name: "dev".into(),
+                tag: "t".into(),
+            },
         ] {
             assert!(claims(&req), "{req:?}");
         }
@@ -175,7 +202,10 @@ mod tests {
     #[test]
     fn the_shards_own_commands_are_left_alone() {
         assert!(!claims(&Request::List));
-        assert!(!claims(&Request::Up { name: "dev".into(), restart: None }));
+        assert!(!claims(&Request::Up {
+            name: "dev".into(),
+            restart: None
+        }));
         assert!(!claims(&Request::Status { name: "dev".into() }));
         assert!(!claims(&Request::VolumeList));
     }

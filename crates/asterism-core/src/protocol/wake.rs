@@ -66,7 +66,8 @@ mod tests {
     /// without the field a newer daemon would send.
     #[test]
     fn the_wake_frames_are_additive() {
-        let wake: Request = serde_json::from_str(r#"{"cmd":"device_wake","name":"desktop"}"#).unwrap();
+        let wake: Request =
+            serde_json::from_str(r#"{"cmd":"device_wake","name":"desktop"}"#).unwrap();
         assert!(matches!(wake, Request::DeviceWake { name } if name == "desktop"));
 
         // An `astd` that predates lan-id checking sends the MAC and nothing
@@ -83,7 +84,9 @@ mod tests {
         let facts: Response =
             serde_json::from_str(r#"{"result":"wake_facts","facts":{"mac":"de:ad:be:ef:00:01"}}"#)
                 .unwrap();
-        let Response::WakeFacts { facts } = facts else { panic!("should be facts") };
+        let Response::WakeFacts { facts } = facts else {
+            panic!("should be facts")
+        };
         assert_eq!(facts.mac.as_deref(), Some("de:ad:be:ef:00:01"));
         assert_eq!(facts.lan_id, None);
         assert_eq!(facts.wakeable(), None, "half a story cannot wake anything");

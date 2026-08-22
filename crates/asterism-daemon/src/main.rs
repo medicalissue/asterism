@@ -316,7 +316,14 @@ fn private_state(home: &std::path::Path) -> Result<()> {
 /// on is readable from the directory, so this converges rather than guesses —
 /// see [`asterism_core::snapshot::converge`].
 async fn converge_restores(node: &Node) {
-    let names: Vec<String> = node.shard.lock().await.list().into_iter().map(|i| i.name).collect();
+    let names: Vec<String> = node
+        .shard
+        .lock()
+        .await
+        .list()
+        .into_iter()
+        .map(|i| i.name)
+        .collect();
     for name in names {
         let dir = paths::instance_dir(&name);
         if let Some(what) = asterism_core::snapshot::converge(&dir) {
@@ -397,7 +404,11 @@ impl Stop {
 /// go and so need somewhere to send progress; the fourth needs to leave a
 /// listener standing that dies when this socket does.
 async fn serve(conn: Admitted, node: Node, mesh: Option<Arc<Mesh>>) -> Result<()> {
-    let Admitted { mut frames, mut write, .. } = conn;
+    let Admitted {
+        mut frames,
+        mut write,
+        ..
+    } = conn;
 
     // Anything this connection asked us to hold open on its behalf. Today
     // that is the loopback listener behind `ast ssh` on a guest whose cpu is
@@ -440,7 +451,11 @@ async fn serve(conn: Admitted, node: Node, mesh: Option<Arc<Mesh>>) -> Result<()
             // still matters: `ast` classifies it and restarts us rather than
             // showing the user a serde error.
             Err(e) => {
-                write.send(&Response::Error { message: format!("bad request: {e}") }).await?;
+                write
+                    .send(&Response::Error {
+                        message: format!("bad request: {e}"),
+                    })
+                    .await?;
                 continue;
             }
         };
@@ -448,7 +463,11 @@ async fn serve(conn: Admitted, node: Node, mesh: Option<Arc<Mesh>>) -> Result<()
         // The first frame of the conversation settles what the rest of it is
         // spoken in. Both ends run the same rule on the same pair of ranges,
         // so neither has to be told the answer.
-        if let Request::Ping { protocol, min_protocol } = &request {
+        if let Request::Ping {
+            protocol,
+            min_protocol,
+        } = &request
+        {
             let theirs = compat::Speaks::claimed(*protocol, *min_protocol);
             match compat::select(theirs) {
                 compat::Selection::Common(version) => spoken = version,
@@ -484,7 +503,11 @@ async fn serve(conn: Admitted, node: Node, mesh: Option<Arc<Mesh>>) -> Result<()
                 .map(|name| format!("the {name} frame"))
                 .unwrap_or_else(|| "that request".to_owned());
             let refusal = compat::frame_too_new(&what, request.since(), spoken, "this daemon");
-            write.send(&Response::Error { message: format!("{refusal:#}") }).await?;
+            write
+                .send(&Response::Error {
+                    message: format!("{refusal:#}"),
+                })
+                .await?;
             continue;
         }
 
@@ -492,9 +515,15 @@ async fn serve(conn: Admitted, node: Node, mesh: Option<Arc<Mesh>>) -> Result<()
         // code to compare, a verdict to take — so it borrows the connection
         // for as many frames as it needs.
         if let Request::DeviceInvite { .. } | Request::DeviceAdd { .. } = request {
-            let mut io = ClientIo { frames: &mut frames, write: &mut write };
+            let mut io = ClientIo {
+                frames: &mut frames,
+                write: &mut write,
+            };
             if let Err(e) = orbit::pair(request, mesh.as_ref(), &mut io).await {
-                io.send(&Response::Error { message: format!("{e:#}") }).await?;
+                io.send(&Response::Error {
+                    message: format!("{e:#}"),
+                })
+                .await?;
             }
             continue;
         }
@@ -504,13 +533,19 @@ async fn serve(conn: Admitted, node: Node, mesh: Option<Arc<Mesh>>) -> Result<()
         // machine turned up — so it reports as it goes, which needs the
         // connection the same way pairing does.
         if let Request::DeviceWake { name } = &request {
-            let mut io = ClientIo { frames: &mut frames, write: &mut write };
+            let mut io = ClientIo {
+                frames: &mut frames,
+                write: &mut write,
+            };
             let woken = match mesh.as_ref() {
                 Some(mesh) => mesh.wake(name, &mut io).await,
                 None => Err(anyhow::anyhow!("{}", orbit::NO_MESH)),
             };
             if let Err(e) = woken {
-                io.send(&Response::Error { message: format!("{e:#}") }).await?;
+                io.send(&Response::Error {
+                    message: format!("{e:#}"),
+                })
+                .await?;
             }
             continue;
         }
@@ -519,10 +554,16 @@ async fn serve(conn: Admitted, node: Node, mesh: Option<Arc<Mesh>>) -> Result<()
         // fence, a disk crossing a network, two commits — so it reports as it
         // goes, on the connection that asked, exactly as a wake does.
         if let Request::SetCpu { name, device, down } = &request {
-            let mut io = ClientIo { frames: &mut frames, write: &mut write };
+            let mut io = ClientIo {
+                frames: &mut frames,
+                write: &mut write,
+            };
             let moved = swap::run(name, device, *down, &node, mesh.as_ref(), &mut io).await;
             if let Err(e) = moved {
-                io.send(&Response::Error { message: format!("{e:#}") }).await?;
+                io.send(&Response::Error {
+                    message: format!("{e:#}"),
+                })
+                .await?;
             }
             continue;
         }
@@ -556,7 +597,9 @@ fn at_most(response: Response, spoken: u32) -> Response {
         return response;
     }
     let refusal = compat::frame_too_new("that reply", response.since(), spoken, "this client");
-    Response::Error { message: format!("{refusal:#}") }
+    Response::Error {
+        message: format!("{refusal:#}"),
+    }
 }
 
 /// Routes one request that came off the unix socket.
@@ -606,7 +649,9 @@ async fn route(request: Request, node: &Node, mesh: Option<&Arc<Mesh>>) -> Respo
         // Nowhere in the orbit answers to it, so the local shard's "no such
         // instance" is both true and the message the user should see.
         Ok(None) => handle(request, node).await,
-        Err(e) => Response::Error { message: format!("{e:#}") },
+        Err(e) => Response::Error {
+            message: format!("{e:#}"),
+        },
     }
 }
 
@@ -657,7 +702,9 @@ pub(crate) async fn handle(req: Request, node: &Node) -> Response {
     // anything on disk, so it is the one command that still works when the
     // registry is wedged. `ast` merges it with its own view.
     if let Request::Compat = req {
-        return Response::Compat { compat: Box::new(compat::Compat::current()) };
+        return Response::Compat {
+            compat: Box::new(compat::Compat::current()),
+        };
     }
     if secret::is_source_request(&req) {
         return secret::serve_source(req).await;
@@ -722,7 +769,13 @@ mod tests {
 
         let answered = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            handle(Request::Ping { protocol: 0, min_protocol: 0 }, &node),
+            handle(
+                Request::Ping {
+                    protocol: 0,
+                    min_protocol: 0,
+                },
+                &node,
+            ),
         )
         .await
         .expect("the handshake waited on the registry");
@@ -746,7 +799,14 @@ mod tests {
     async fn a_free_registry_is_still_reconciled_by_the_handshake() {
         let tmp = tempfile::tempdir().unwrap();
         let node = node_on(tmp.path());
-        let answered = handle(Request::Ping { protocol: 0, min_protocol: 0 }, &node).await;
+        let answered = handle(
+            Request::Ping {
+                protocol: 0,
+                min_protocol: 0,
+            },
+            &node,
+        )
+        .await;
         assert!(matches!(answered, Response::Pong { .. }));
         assert!(
             node.shard.try_lock().is_ok(),

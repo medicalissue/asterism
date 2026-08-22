@@ -59,19 +59,35 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             };
         }
         Request::Compat => {
-            return Response::Compat { compat: Box::new(compat::Compat::current()) }
+            return Response::Compat {
+                compat: Box::new(compat::Compat::current()),
+            }
         }
-        Request::List => return Response::Instances { instances: reg.list() },
+        Request::List => {
+            return Response::Instances {
+                instances: reg.list(),
+            }
+        }
         Request::Status { name } => {
             return match reg.get(&name) {
-                Ok(instance) => Response::Instance { instance: instance.clone() },
-                Err(e) => Response::Error { message: format!("{e:#}") },
+                Ok(instance) => Response::Instance {
+                    instance: instance.clone(),
+                },
+                Err(e) => Response::Error {
+                    message: format!("{e:#}"),
+                },
             }
         }
         // The backend is chosen once, here, and recorded on the instance. An
         // explicit choice is forced; the default probes VZ first and falls
         // back to QEMU when VZ is unavailable or lacks a required capability.
-        Request::Create { name, image, shape, backend: requested, publish } => {
+        Request::Create {
+            name,
+            image,
+            shape,
+            backend: requested,
+            publish,
+        } => {
             // `_recording` rather than plain `image_ref`: a local file is
             // never adopted into the store, so the moment the user names it
             // is the only chance to write down what it was.
@@ -135,14 +151,24 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
                 // with the rename still in the page cache would leave a row
                 // pointing at a directory that is not there.
                 if let Err(e) = durable::publish_rename(&from, &to) {
-                    eprintln!("astd: renaming {} to {}: {e:#}", from.display(), to.display());
+                    eprintln!(
+                        "astd: renaming {} to {}: {e:#}",
+                        from.display(),
+                        to.display()
+                    );
                 }
             }
         }),
-        Request::MarkConflicted { name, other_cpu_device } => {
-            reg.mark_conflicted(&name, &other_cpu_device)
-        }
-        Request::AttachVolume { name, path, host, mount_point } => {
+        Request::MarkConflicted {
+            name,
+            other_cpu_device,
+        } => reg.mark_conflicted(&name, &other_cpu_device),
+        Request::AttachVolume {
+            name,
+            path,
+            host,
+            mount_point,
+        } => {
             let host = host.unwrap_or_else(local_host);
             // Recording a volume the instance's backend could never show
             // the guest would leave something that looks configured and is
@@ -157,12 +183,16 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
         // for now, from the device that holds the bytes, so that "somebody
         // else has it" is a refusal at attach time rather than a boot that
         // fails later for reasons the user has to go and read about.
-        Request::AttachBlock { name, volume: vol, device } => {
-            attach_block(reg, &name, &vol, &device).await
-        }
-        Request::Detach { name, volume: vol, host } => {
-            detach(reg, &name, &vol, host.as_deref()).await
-        }
+        Request::AttachBlock {
+            name,
+            volume: vol,
+            device,
+        } => attach_block(reg, &name, &vol, &device).await,
+        Request::Detach {
+            name,
+            volume: vol,
+            host,
+        } => detach(reg, &name, &vol, host.as_deref()).await,
         // A secret is taken, not merely recorded: the orbit is asked which
         // devices hold it, and a source that cannot serve its current version
         // is a refusal here rather than a guest that boots holding a handle
@@ -193,9 +223,13 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             return match reg.get(&name).map(|i| i.name.clone()) {
                 Ok(name) => match console_tail(&name, lines) {
                     Ok((text, truncated)) => Response::Log { text, truncated },
-                    Err(e) => Response::Error { message: format!("{e:#}") },
+                    Err(e) => Response::Error {
+                        message: format!("{e:#}"),
+                    },
                 },
-                Err(e) => Response::Error { message: format!("{e:#}") },
+                Err(e) => Response::Error {
+                    message: format!("{e:#}"),
+                },
             }
         }
         _ => return not_a_shard_request(),
@@ -203,11 +237,15 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
     match mutation {
         Ok(instance) => {
             if let Err(e) = reg.save() {
-                return Response::Error { message: format!("saving registry: {e:#}") };
+                return Response::Error {
+                    message: format!("saving registry: {e:#}"),
+                };
             }
             Response::Instance { instance }
         }
-        Err(e) => Response::Error { message: format!("{e:#}") },
+        Err(e) => Response::Error {
+            message: format!("{e:#}"),
+        },
     }
 }
 
@@ -304,7 +342,9 @@ pub(crate) async fn claim_name(
     claim(name, node, mesh)
         .await
         .err()
-        .map(|e| Response::Error { message: format!("{e:#}") })
+        .map(|e| Response::Error {
+            message: format!("{e:#}"),
+        })
 }
 
 /// The name a request claims outright, as opposed to the name it resolves.
@@ -370,7 +410,13 @@ pub(crate) fn up(reg: &mut Shard, name: &str) -> Result<Instance> {
     // matters more to the next daemon that has to reconnect this guest's
     // disks without disturbing the guest (`volume::reattach`).
     for lease in leases {
-        let _ = reg.attach_block(name, &lease.volume, &lease.device, lease.epoch, lease.size_bytes);
+        let _ = reg.attach_block(
+            name,
+            &lease.volume,
+            &lease.device,
+            lease.epoch,
+            lease.size_bytes,
+        );
     }
     if inst.seed_device.is_none() || std::fs::read(&stamp).ok() != before {
         let _ = reg.set_seed_device(name, &inst.cpu_device);
@@ -422,7 +468,9 @@ pub(crate) fn reconcile(reg: &mut Shard) {
 /// "is it alive" means something different for each.
 fn is_running(inst: &Instance) -> bool {
     let Some(h) = &inst.handle else { return false };
-    let Ok(hv) = backend::for_handle(&h.backend) else { return false };
+    let Ok(hv) = backend::for_handle(&h.backend) else {
+        return false;
+    };
     matches!(hv.state(h), Ok(RunState::Running))
 }
 
@@ -434,12 +482,7 @@ fn is_running(inst: &Instance) -> bool {
 /// The lease first, the registry second: a record written against a lease we
 /// were refused would be an instance that looks configured and cannot boot,
 /// which is the failure `check_can_share` exists to prevent for directories.
-async fn attach_block(
-    reg: &mut Shard,
-    name: &str,
-    vol: &str,
-    device: &str,
-) -> Result<Instance> {
+async fn attach_block(reg: &mut Shard, name: &str, vol: &str, device: &str) -> Result<Instance> {
     let inst = reg.get(name)?.clone();
     let hv = backend::for_instance(&inst)?;
     volume::check_backend(&*hv)?;
@@ -502,12 +545,7 @@ fn detach_secret(reg: &mut Shard, name: &str, secret: &str) -> Result<Instance> 
 /// Refused while the guest is running: neither backend offers disk hotplug
 /// (`Caps::disk_hotplug` is false on both), so pulling the bytes out from
 /// under a live guest would be a yanked cable rather than a detach.
-async fn detach(
-    reg: &mut Shard,
-    name: &str,
-    vol: &str,
-    host: Option<&str>,
-) -> Result<Instance> {
+async fn detach(reg: &mut Shard, name: &str, vol: &str, host: Option<&str>) -> Result<Instance> {
     let inst = reg.get(name)?.clone();
     if inst.status == Status::Running {
         anyhow::bail!(
@@ -524,9 +562,7 @@ async fn detach(
         Some(host) => host.to_owned(),
         None => match matches.as_slice() {
             [only] => only.host.clone(),
-            [] => anyhow::bail!(
-                "{name:?} has no volume called {vol:?} — see: ast status {name}"
-            ),
+            [] => anyhow::bail!("{name:?} has no volume called {vol:?} — see: ast status {name}"),
             many => anyhow::bail!(
                 "{name:?} has {vol:?} from {} devices — say which: {}",
                 many.len(),
@@ -623,7 +659,10 @@ fn tail_of(path: &Path, lines: u32) -> Result<(String, bool)> {
     // The first line of a clipped read is half a line. Dropping it is what
     // makes "the rest of this is real" true.
     let text = match clipped {
-        true => text.split_once('\n').map(|(_, rest)| rest.to_owned()).unwrap_or_default(),
+        true => text
+            .split_once('\n')
+            .map(|(_, rest)| rest.to_owned())
+            .unwrap_or_default(),
         false => text,
     };
     if lines == 0 {
@@ -663,10 +702,17 @@ mod tests {
             "answered with {} bytes, cap is {CONSOLE_TAIL_BYTES}",
             text.len()
         );
-        assert!(text.ends_with("this is the last thing it said\n"), "it is not the end");
+        assert!(
+            text.ends_with("this is the last thing it said\n"),
+            "it is not the end"
+        );
         // Starting mid-file lands mid-line; the half-line is dropped rather
         // than presented as something the guest wrote.
-        assert!(text.starts_with(line), "a partial first line was kept: {:?}", &text[..40]);
+        assert!(
+            text.starts_with(line),
+            "a partial first line was kept: {:?}",
+            &text[..40]
+        );
     }
 
     /// The ordinary case still reads the whole file and says nothing was
@@ -677,9 +723,15 @@ mod tests {
         let log = tmp.path().join("console.log");
         std::fs::write(&log, "one\ntwo\nthree\n").unwrap();
 
-        assert_eq!(tail_of(&log, 0).unwrap(), ("one\ntwo\nthree\n".to_owned(), false));
+        assert_eq!(
+            tail_of(&log, 0).unwrap(),
+            ("one\ntwo\nthree\n".to_owned(), false)
+        );
         assert_eq!(tail_of(&log, 2).unwrap(), ("two\nthree".to_owned(), true));
-        assert_eq!(tail_of(&log, 9).unwrap(), ("one\ntwo\nthree".to_owned(), false));
+        assert_eq!(
+            tail_of(&log, 9).unwrap(),
+            ("one\ntwo\nthree".to_owned(), false)
+        );
     }
 
     /// Firmware puts whatever it likes on a serial line, and a stray byte
@@ -692,7 +744,10 @@ mod tests {
         let log = tmp.path().join("console.log");
         std::fs::write(&log, b"before\n\xff\xfe\nafter\n").unwrap();
         let (text, _) = tail_of(&log, 0).unwrap();
-        assert!(text.contains("before") && text.contains("after"), "{text:?}");
+        assert!(
+            text.contains("before") && text.contains("after"),
+            "{text:?}"
+        );
     }
 
     /// Claiming and resolving are different questions, and a rename asks
@@ -702,7 +757,10 @@ mod tests {
     #[test]
     fn a_rename_claims_the_name_it_is_moving_to_and_not_the_one_it_has() {
         assert_eq!(
-            claimed_name(&Request::Rename { name: "dev".into(), new_name: "dev2".into() }),
+            claimed_name(&Request::Rename {
+                name: "dev".into(),
+                new_name: "dev2".into()
+            }),
             Some("dev2")
         );
         assert_eq!(
@@ -717,7 +775,13 @@ mod tests {
         );
         // Everything else resolves a name it did not invent, so it claims
         // nothing and must not be made to wait on every peer in the orbit.
-        assert_eq!(claimed_name(&Request::Up { name: "dev".into(), restart: None }), None);
+        assert_eq!(
+            claimed_name(&Request::Up {
+                name: "dev".into(),
+                restart: None
+            }),
+            None
+        );
         assert_eq!(claimed_name(&Request::Status { name: "dev".into() }), None);
         assert_eq!(claimed_name(&Request::List), None);
     }

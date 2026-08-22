@@ -207,7 +207,14 @@ fn main() -> anyhow::Result<()> {
         vm::pump(Duration::from_millis(100));
 
         if let Some(key) = agent_key.as_ref() {
-            keep_session(&machine, &mut agent, key, &config.instance, t0, &mut reconnect);
+            keep_session(
+                &machine,
+                &mut agent,
+                key,
+                &config.instance,
+                t0,
+                &mut reconnect,
+            );
         }
 
         while let Ok(job) = jobs_rx.try_recv() {
@@ -531,9 +538,9 @@ fn flush(agent: &agent::Agent, budget: std::time::Duration, instance: &str) {
         Ok(seconds) => {
             eprintln!("astd-vz: {instance}: the guest flushed its disks in {seconds:.2}s")
         }
-        Err(why) => eprintln!(
-            "astd-vz: {instance}: no file sync barrier before the forced stop — {why}"
-        ),
+        Err(why) => {
+            eprintln!("astd-vz: {instance}: no file sync barrier before the forced stop — {why}")
+        }
     }
 }
 
@@ -546,10 +553,7 @@ fn sync_guest(agent: &agent::Agent, budget: std::time::Duration) -> Result<f64, 
 
 /// Wait for the guest agent without stopping the guest.
 #[cfg(target_os = "macos")]
-fn await_agent<T>(
-    pending: agent::Pending<T>,
-    budget: std::time::Duration,
-) -> Result<T, String> {
+fn await_agent<T>(pending: agent::Pending<T>, budget: std::time::Duration) -> Result<T, String> {
     let until = std::time::Instant::now() + budget;
     loop {
         if let Some(answer) = pending.taken() {

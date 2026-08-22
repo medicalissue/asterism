@@ -447,8 +447,14 @@ mod tests {
         // generated device key, and three of those hex digits land on
         // "171" about once in seventy runs, which is how this assertion
         // used to fail for a reason that had nothing to do with the token.
-        assert!(!rendered.contains("171, 171"), "token leaked into Debug: {rendered}");
-        assert!(rendered.contains("redacted"), "the token field is redacted: {rendered}");
+        assert!(
+            !rendered.contains("171, 171"),
+            "token leaked into Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("redacted"),
+            "the token field is redacted: {rendered}"
+        );
     }
 
     #[test]
