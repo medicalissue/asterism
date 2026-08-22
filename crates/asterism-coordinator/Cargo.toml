@@ -1,0 +1,23 @@
+[package]
+name = "asterism-coordinator"
+description = "Provider-neutral hosted identity and discovery coordination contracts for Asterism."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+asterism-mesh.workspace = true
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+data-encoding = "2"
+# Nonces come from UUID v4 below; do not enable aes-gcm's separate RNG feature.
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+
+[dev-dependencies]
+asterism-core.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util", "time"] }
