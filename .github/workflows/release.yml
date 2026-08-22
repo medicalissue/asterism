@@ -282,12 +282,15 @@ jobs:
         run: |
           set -eu
           version="${{ steps.version.outputs.version }}"
+          node scripts/generate-supply-chain-metadata.mjs --out "dist/${version}" --version "$version"
           # Every artifact, not just the tarball — asterism.rb is checked
           # against this file too when the installer stands up a local tap.
           cli="asterism-${version}-darwin-arm64.tar.gz"
           app="Asterism-${version}-darwin-arm64.app.tar.gz"
           dmg="Asterism-${version}-darwin-arm64.dmg"
-          ( cd "dist/${version}" && shasum -a 256 "$cli" "$app" "$dmg" asterism.rb >SHA256SUMS )
+          sbom="asterism-${version}-sbom.cdx.json"
+          licenses="asterism-${version}-licenses.json"
+          ( cd "dist/${version}" && shasum -a 256 "$cli" "$app" "$dmg" "$sbom" "$licenses" asterism.rb >SHA256SUMS )
           cli_sha="$(shasum -a 256 "dist/${version}/${cli}" | awk '{print $1}')"
           app_sha="$(shasum -a 256 "dist/${version}/${app}" | awk '{print $1}')"
           base="https://github.com/${{ github.repository }}/releases/download/${version}"
@@ -378,6 +381,8 @@ jobs:
           RELEASE.json.sig
           SHA256SUMS
           asterism-${version}-darwin-arm64.tar.gz
+          asterism-${version}-licenses.json
+          asterism-${version}-sbom.cdx.json
           asterism.rb
           NAMES
           )"
@@ -570,4 +575,6 @@ jobs:
             "dist/${version}/SHA256SUMS" \
             "dist/${version}/RELEASE.json" \
             "dist/${version}/RELEASE.json.sig" \
+            "dist/${version}/asterism-${version}-sbom.cdx.json" \
+            "dist/${version}/asterism-${version}-licenses.json" \
             "dist/${version}/asterism.rb"
