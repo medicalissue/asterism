@@ -42,12 +42,59 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::hv::{DiskFormat, ImageKind};
 use crate::oci;
 use crate::paths;
 use crate::tools::{run, tool};
 use crate::verify::{self, Depth, Digest, Pinned, Source};
+
+/// The largest number of progress observations a pull result may carry.
+///
+/// Image pulls are currently request/reply operations, including through a
+/// [`crate::protocol::Request::Proxy`] envelope. Keeping the observations in
+/// the result gives a caller useful phase information without allowing a
+/// registry or a layer list to turn one response into an unbounded document.
+pub const MAX_PULL_PROGRESS: usize = 64;
+
+/// One bounded observation from an image pull.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageProgress {
+    pub phase: String,
+    pub bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+    pub done: bool,
+}
+
+/// One device-local image row exposed to management clients.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageRow {
+    pub reference: String,
+    pub kind: ImageKind,
+    pub pulled: bool,
+    pub verified: bool,
+    pub bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    /// A display-safe source. Credentials are never copied from an input into
+    /// this field.
+    pub source: String,
+}
+
+/// The durable outcome of a device-owned image pull.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImagePullResult {
+    pub reference: String,
+    pub kind: ImageKind,
+    pub bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    pub progress: Vec<ImageProgress>,
+    /// True when this request changed the device's image store.
+    pub changed: bool,
+}
 
 pub struct Resolved {
     /// Canonical name recorded on the instance.
@@ -223,6 +270,7 @@ impl Resolved {
             return false;
         }
         let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_file(self.path.with_extension("raw.part"));
         let _ = std::fs::remove_file(verify::provenance_path(&self.record));
         if let Some(staging) = &self.staging {
             let _ = std::fs::remove_file(staging);
@@ -532,6 +580,11 @@ pub fn resolve(reference: &str) -> Result<Resolved> {
     }
 
     if reference.starts_with("http://") || reference.starts_with("https://") {
+        if url_has_credentials(reference) {
+            bail!(
+                "image URLs cannot carry credentials; use the device's credential store for registry authentication"
+            );
+        }
         // The one source nobody has vouched for. A catalog entry carries the
         // digest its publisher published; a registry blob carries the one its
         // manifest names; a file on this disk is already here. A url somebody
@@ -646,6 +699,254 @@ fn stored(reference: &str, url: Option<String>, expected: Option<Digest>) -> Res
         oci: None,
         expected,
     }
+}
+
+/// Pull an image into this device's store, using the same cloud and OCI
+/// integrity paths for local and remote callers.
+///
+/// The daemon owns this operation on the wire, but keeping the implementation
+/// here makes the CLI, daemon, and focused store tests share adoption,
+/// conversion, registry credentials, and retry behavior. The result carries
+/// phase observations rather than raw downloader output, which keeps a
+/// proxied response bounded.
+pub fn pull(reference: &str) -> Result<ImagePullResult> {
+    let resolved = resolve(reference)?;
+    let mut progress = Vec::new();
+    push_progress(&mut progress, "resolved", 0, None, false);
+
+    if let Some(image) = &resolved.oci {
+        push_progress(&mut progress, "kernel", 0, None, false);
+        ensure_oci_kernel()?;
+        push_progress(&mut progress, "layers", 0, None, false);
+        let pulled = oci::pull(image, false)?;
+        let bytes = std::fs::metadata(&pulled.image)
+            .with_context(|| format!("reading pulled OCI image {}", pulled.image.display()))?
+            .len();
+        push_progress(&mut progress, "stored", bytes, Some(bytes), true);
+        return Ok(ImagePullResult {
+            reference: image.canonical(),
+            kind: ImageKind::OciRootfs,
+            bytes,
+            digest: Some(pulled.digest),
+            progress,
+            changed: pulled.built,
+        });
+    }
+
+    let (Some(url), Some(staging)) = (&resolved.url, &resolved.staging) else {
+        resolved.record_local()?;
+        let bytes = file_len(&resolved.path)?;
+        push_progress(&mut progress, "local", bytes, Some(bytes), true);
+        return Ok(pull_result(&resolved, bytes, progress, false));
+    };
+
+    if resolved.path.exists() {
+        if resolved.verify_bootable().is_ok() {
+            let bytes = file_len(&resolved.path)?;
+            push_progress(&mut progress, "already_present", bytes, Some(bytes), true);
+            return Ok(pull_result(&resolved, bytes, progress, false));
+        }
+        // This is a store-owned path, so a corrupt image is safe to replace.
+        resolved.discard();
+        push_progress(&mut progress, "repair", 0, None, false);
+    }
+
+    if !staging.exists() {
+        let dir = staging
+            .parent()
+            .context("image staging path has no parent directory")?;
+        std::fs::create_dir_all(dir)?;
+        let part = staging.with_extension("qcow2.part");
+        let _ = std::fs::remove_file(&part);
+        download(url, &part)?;
+        push_progress(&mut progress, "downloaded", file_len(&part)?, None, false);
+        verify::adopt(
+            &part,
+            staging,
+            resolved.expected.as_ref(),
+            Source::new("download", url),
+        )?;
+        push_progress(&mut progress, "verified", file_len(staging)?, None, false);
+    }
+
+    if let Err(error) = resolved.materialise() {
+        // A bad staged file must not become a retry trap. The next pull gets
+        // a fresh `.part`, while an unrelated local file remains untouched.
+        resolved.discard();
+        return Err(error);
+    }
+    resolved.verify_bootable()?;
+    let bytes = file_len(&resolved.path)?;
+    push_progress(&mut progress, "stored", bytes, Some(bytes), true);
+    Ok(pull_result(&resolved, bytes, progress, true))
+}
+
+fn ensure_oci_kernel() -> Result<()> {
+    oci::ensure_kernel(|url, dest| download(url, dest)).map(|_| ())
+}
+
+fn download(url: &str, dest: &Path) -> Result<()> {
+    if let Some(dir) = dest.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let status = Command::new("curl")
+        .args(["--location", "--fail", "--progress-bar", "--output"])
+        .arg(dest)
+        .arg(url)
+        .status()
+        .context("running curl")?;
+    if !status.success() {
+        let _ = std::fs::remove_file(dest);
+        bail!("download failed for {url}");
+    }
+    Ok(())
+}
+
+fn file_len(path: &Path) -> Result<u64> {
+    Ok(std::fs::metadata(path)
+        .with_context(|| format!("reading {}", path.display()))?
+        .len())
+}
+
+fn pull_result(
+    resolved: &Resolved,
+    bytes: u64,
+    progress: Vec<ImageProgress>,
+    changed: bool,
+) -> ImagePullResult {
+    ImagePullResult {
+        reference: resolved.name.clone(),
+        kind: resolved.kind(),
+        bytes,
+        digest: verify::provenance(&resolved.path).map(|record| {
+            record
+                .derived_from
+                .first()
+                .cloned()
+                .unwrap_or_else(|| record.content.to_string())
+        }),
+        progress,
+        changed,
+    }
+}
+
+fn push_progress(
+    progress: &mut Vec<ImageProgress>,
+    phase: &str,
+    bytes: u64,
+    total_bytes: Option<u64>,
+    done: bool,
+) {
+    if progress.len() == MAX_PULL_PROGRESS {
+        // Preserve the terminal observation even if a future pull gains more
+        // phases. This keeps the bound a correctness property, not a best
+        // effort allocation hint.
+        progress.pop();
+    }
+    progress.push(ImageProgress {
+        phase: phase.to_owned(),
+        bytes,
+        total_bytes,
+        done,
+    });
+}
+
+/// Return the device-local catalog and its current pulled/verified state.
+pub fn catalog_rows() -> Result<Vec<ImageRow>> {
+    catalog_rows_at(Depth::Quick)
+}
+
+/// The thorough local view used by `ast images --verify`.
+pub fn catalog_rows_full() -> Result<Vec<ImageRow>> {
+    catalog_rows_at(Depth::Full)
+}
+
+fn catalog_rows_at(depth: Depth) -> Result<Vec<ImageRow>> {
+    let mut rows = Vec::with_capacity(CATALOG.len());
+    for entry in CATALOG {
+        rows.push(catalog_row(entry.alias, depth)?);
+    }
+    for reference in oci::built()? {
+        rows.push(catalog_row(&reference, depth)?);
+    }
+    Ok(rows)
+}
+
+fn catalog_row(reference: &str, depth: Depth) -> Result<ImageRow> {
+    let resolved = resolve(reference)?;
+    let path = if resolved.path.exists() {
+        resolved.path.clone()
+    } else {
+        resolved
+            .staging
+            .clone()
+            .unwrap_or_else(|| resolved.path.clone())
+    };
+    let pulled = path.exists();
+    let verified = resolved.path.exists()
+        && verify::check_recorded(&resolved.path, &resolved.record, depth).is_ok()
+        && resolved.pin_satisfied().is_ok();
+    let bytes = if pulled { file_len(&path)? } else { 0 };
+    let digest = if resolved.path.exists() {
+        verify::provenance(&resolved.path).map(|record| {
+            record
+                .derived_from
+                .first()
+                .cloned()
+                .unwrap_or_else(|| record.content.to_string())
+        })
+    } else {
+        resolved.expected.as_ref().map(ToString::to_string)
+    };
+    let source = resolved
+        .url
+        .as_deref()
+        .map(redact_source)
+        .unwrap_or_else(|| resolved.name.clone());
+    Ok(ImageRow {
+        reference: resolved.name,
+        kind: resolved.kind(),
+        pulled,
+        verified,
+        bytes,
+        digest,
+        source,
+    })
+}
+
+/// Remove credentials from a source before it crosses a management boundary.
+pub fn redact_source(source: &str) -> String {
+    let Some(scheme) = source.find("://") else {
+        return source.to_owned();
+    };
+    let authority_start = scheme + 3;
+    let authority_end = source[authority_start..]
+        .find(&['/', '?', '#'][..])
+        .map(|offset| authority_start + offset)
+        .unwrap_or(source.len());
+    let authority = &source[authority_start..authority_end];
+    let public_authority = authority
+        .rsplit_once('@')
+        .map(|(_, public)| public)
+        .unwrap_or(authority);
+    format!(
+        "{}{}{}",
+        &source[..authority_start],
+        public_authority,
+        &source[authority_end..]
+    )
+}
+
+fn url_has_credentials(source: &str) -> bool {
+    let Some(scheme) = source.find("://") else {
+        return false;
+    };
+    let authority_start = scheme + 3;
+    let authority_end = source[authority_start..]
+        .find(&['/', '?', '#'][..])
+        .map(|offset| authority_start + offset)
+        .unwrap_or(source.len());
+    source[authority_start..authority_end].contains('@')
 }
 
 fn slug(s: &str) -> String {
@@ -1401,5 +1702,31 @@ mod tests {
             "the staging copy is not kept"
         );
         assert!(!r.materialise().unwrap(), "and again is a no-op");
+    }
+
+    #[test]
+    fn catalog_sources_redact_url_credentials() {
+        assert_eq!(
+            redact_source("https://user:secret@example.test/path#sha256:abc"),
+            "https://example.test/path#sha256:abc"
+        );
+        assert_eq!(
+            redact_source("docker.io/library/nginx:latest"),
+            "docker.io/library/nginx:latest"
+        );
+    }
+
+    #[test]
+    fn pull_progress_is_bounded_and_keeps_the_latest_observation() {
+        let mut progress = Vec::new();
+        for i in 0..(MAX_PULL_PROGRESS + 8) {
+            push_progress(&mut progress, "phase", i as u64, None, i == MAX_PULL_PROGRESS + 7);
+        }
+        assert_eq!(progress.len(), MAX_PULL_PROGRESS);
+        assert!(progress.last().is_some_and(|item| item.done));
+        assert_eq!(
+            progress.last().unwrap().bytes,
+            (MAX_PULL_PROGRESS + 7) as u64
+        );
     }
 }

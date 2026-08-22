@@ -1,8 +1,8 @@
 //! ast — the Asterism CLI.
 //!
 //! Talks to the local `astd` daemon over its unix socket, starting the
-//! daemon on demand if it is not running. Image pulls run here in the
-//! foreground so the user sees download progress.
+//! daemon on demand if it is not running. Image pulls are device-owned RPCs;
+//! the daemon reports bounded phase progress after the store is durable.
 //!
 //! It talks to *that* daemon and no other, ever. `ast up dev` does not know or
 //! care which device in the orbit is supplying `dev`'s cpu and ram: the
@@ -751,16 +751,10 @@ fn main() -> Result<()> {
             backend,
             profiles,
         } => {
-            // Resolved here as well as in the daemon, because a mistyped
-            // profile should cost the user a message rather than a
-            // gigabyte: `ensure_pulled` below downloads the image.
+            // Profile names are cheap to validate locally. Image bytes are
+            // always pulled by the device that will own the instance.
             asterism_core::profile::resolve(&profiles)?;
-            // An image for another device has to be on that device: pulling it
-            // here would fill this disk and still leave the far one without it.
-            let resolved = match &device {
-                Some(_) => image.clone(),
-                None => ensure_pulled(&image)?,
-            };
+            let resolved = ensure_image_on_device(device.as_deref(), &image)?;
             Request::Create {
                 name,
                 image: resolved,
@@ -940,15 +934,14 @@ fn main() -> Result<()> {
             asterism_core::profile::resolve(&profiles)?;
             Request::SetProfiles { name, profiles }
         }
-        // The image store is per device, so both of these are about this one.
-        Command::Images { verify } => {
-            local_only("images", device.as_deref())?;
-            return print_images(verify);
+        // Image state is per device, so `--device` asks that device rather
+        // than consulting this process's store.
+        Command::Images { verify: true } if device.is_none() => {
+            return print_image_rows(&image::catalog_rows_full()?);
         }
+        Command::Images { verify: _ } => Request::ImageList,
         Command::Pull { image } => {
-            local_only("pull", device.as_deref())?;
-            ensure_pulled(&image)?;
-            return Ok(());
+            Request::ImagePull { reference: image }
         }
         // Which device is running the guest is the daemon's problem, not the
         // user's and not this process's: it answers with a loopback port
@@ -1082,6 +1075,8 @@ fn main() -> Result<()> {
                 .map(|instance| OrbitRow { instance, live: true })
                 .collect::<Vec<_>>(),
         ),
+        Response::Images { images } => print_image_rows(&images),
+        Response::ImagePulled { result } => print_image_pull(&result),
         Response::BackupExported { report } => {
             println!(
                 "exported {} file(s), {} logical bytes to {}",
@@ -2242,256 +2237,95 @@ fn confirmed(yes: bool) -> Result<bool> {
 
 // ---- images ----------------------------------------------------------------
 
-/// Resolve an image reference, download it if it is not cached yet, and
-/// leave the store holding a raw base image either way.
-/// Returns the canonical name to record on the instance.
+/// Make an image available on the device that will own the next operation.
 ///
-/// Cloud images are published as qcow2 and instances are built from raw
-/// (BACKENDS.md §4), so a pull is a download *and* a conversion. Both run
-/// here, in the foreground, where the user can see them: the alternative is
-/// a mysterious pause inside the first `ast up`.
-fn ensure_pulled(reference: &str) -> Result<String> {
-    let resolved = image::resolve(reference)?;
-    if let Some(image) = &resolved.oci {
-        return pull_oci(image);
-    }
-    // Before anything that could delete a file: a local image is the user's,
-    // and the only thing that happens to it here is that its identity is
-    // written down, in the store, so a boot can tell whether the file they
-    // pointed at is still the file they pointed at.
-    let (Some(url), Some(staging)) = (&resolved.url, &resolved.staging) else {
-        resolved.record_local()?;
-        return Ok(resolved.name);
-    };
-
-    if resolved.path.exists() {
-        // Present is not the same as sound. A store that was corrupted since
-        // the last pull should be repaired by the command whose whole job is
-        // to make the image available, not discovered at the next `ast up`.
-        // Safe to delete because everything reaching this line is a file
-        // this store downloaded and can download again.
-        if let Err(e) = resolved.verify_bootable() {
-            eprintln!("{}: {e:#}", resolved.name);
-            eprintln!("re-pulling it");
-            resolved.discard();
-        } else {
-            return Ok(resolved.name);
+/// A remote create first reads the remote catalog and only then asks that same
+/// device to pull. The local catalog is never used as evidence for a remote
+/// host, even when both devices happen to share an image reference.
+fn ensure_image_on_device(device: Option<&str>, reference: &str) -> Result<String> {
+    let canonical = canonical_image_reference(reference);
+    if let Some(device) = device {
+        let rows = match send(&aimed(Request::ImageList, Some(device)))? {
+            Response::Images { images } => images,
+            Response::Error { message } => bail!(message),
+            other => bail!("unexpected image catalog reply from astd: {other:?}"),
+        };
+        if rows
+            .iter()
+            .any(|row| row.reference == canonical && row.pulled && row.verified)
+        {
+            return Ok(canonical);
         }
     }
-
-    if !staging.exists() {
-        if let Some(dir) = staging.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let part = staging.with_extension("qcow2.part");
-        let _ = std::fs::remove_file(&part);
-        eprintln!("pulling {} ({})", resolved.name, url);
-        // Always `Some` by the time a download starts: `image::resolve`
-        // refuses a source with nothing to check it against before any of
-        // this runs.
-        if let Some(want) = &resolved.expected {
-            eprintln!("it must hash to {want}");
-        }
-        let status = std::process::Command::new("curl")
-            .arg("--location")
-            .arg("--fail")
-            .arg("--progress-bar")
-            .arg("--output")
-            .arg(&part)
-            .arg(url)
-            .status()
-            .context("running curl")?;
-        if !status.success() {
-            let _ = std::fs::remove_file(&part);
-            bail!("download failed for {url}");
-        }
-        // Verified here, before the download can be mistaken for a resumable
-        // one: a `.part` left behind by a poisoned mirror would otherwise be
-        // skipped by the `!staging.exists()` above on the next run. Adoption
-        // is also where it is forced down before it takes its final name —
-        // half a cloud image under the name of a whole one is a boot failure
-        // with no clue in it.
-        verify::adopt(
-            &part,
-            staging,
-            resolved.expected.as_ref(),
-            verify::Source::new("download", url),
-        )?;
-    }
-
-    // Converting an image already in the store is how a cache written by an
-    // older Asterism migrates; `ast pull` is just the polite place to do it.
-    eprintln!("converting {} to a raw base image", resolved.name);
-    resolved.materialise()?;
-    eprintln!("pulled {} -> {}", resolved.name, resolved.path.display());
-    Ok(resolved.name)
+    let result = pull_image(device, reference)?;
+    Ok(result.reference)
 }
 
-/// Pull an OCI image and leave a bootable filesystem in the store.
-///
-/// Here rather than in the daemon for the same reason a cloud image download
-/// is: it is minutes of network and disk that the user should be able to
-/// watch, and a daemon doing it silently inside `ast up` is the version of
-/// this that people hate. The guest kernel comes first — the image has none,
-/// and finding that out at the first `ast up` would be worse than a slightly
-/// longer pull.
-fn pull_oci(image: &oci::Reference) -> Result<String> {
-    if oci::ensure_kernel(|url, dest| {
-        eprintln!("fetching the guest kernel ({url})");
-        download(url, dest)
-    })? {
-        eprintln!("guest kernel ready — every OCI instance on this device shares it");
-    }
-
-    eprintln!("pulling {image}");
-    let pulled = oci::pull(image, true)?;
-    match pulled.built {
-        true => eprintln!(
-            "pulled {image} -> {} ({})",
-            pulled.image.display(),
-            pulled.digest
-        ),
-        false => eprintln!(
-            "{image} is already built on this device ({})",
-            pulled.digest
-        ),
-    }
-    // What the machine will actually run, said out loud: it is the one thing
-    // about a container image that decides whether the instance does anything.
-    let argv = pulled.config.argv();
-    if !argv.is_empty() {
-        eprintln!("entrypoint: {}", argv.join(" "));
-    }
-    let ports = pulled.config.tcp_ports();
-    if let Some(first) = ports.first() {
-        let list: Vec<String> = ports.iter().map(|p| p.to_string()).collect();
-        // Suggest a host port the user can actually bind: below 1024 needs
-        // root on macOS and Linux alike.
-        let host = if *first < 1024 { first + 8000 } else { *first };
-        eprintln!(
-            "the image listens on {} — publish it with: \
-             ast create <name> --image {image} -p {host}:{first}",
-            list.join(", "),
-        );
-    }
-    Ok(image.canonical())
-}
-
-/// An image reference short enough for a table column.
-///
-/// Only the part every Docker Hub library image shares is dropped, and only
-/// for display: `docker.io/library/nginx:latest` is what is recorded, what
-/// `ast status` prints, and what `--image` accepts, because it is the name
-/// that means one thing everywhere. `nginx:latest` is what a column has room
-/// for.
-fn short_image(reference: &str) -> String {
-    reference
-        .strip_prefix("docker.io/library/")
-        .unwrap_or(reference)
-        .to_owned()
-}
-
-/// One file off the network, with a progress bar. The same `curl` the cloud
-/// image path uses, for the same reason: it is already on every host and it
-/// reports progress better than anything worth linking in.
-fn download(url: &str, dest: &std::path::Path) -> Result<()> {
-    if let Some(dir) = dest.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let status = std::process::Command::new("curl")
-        .args(["--location", "--fail", "--progress-bar", "--output"])
-        .arg(dest)
-        .arg(url)
-        .status()
-        .context("running curl")?;
-    if !status.success() {
-        let _ = std::fs::remove_file(dest);
-        bail!("download failed for {url}");
-    }
-    Ok(())
-}
-
-fn print_images(full: bool) -> Result<()> {
-    let depth = if full {
-        verify::Depth::Full
-    } else {
-        verify::Depth::Quick
-    };
-    let mut unsound = 0usize;
-    // `PULLED` answers two questions at once, because they are the same
-    // question to the person reading it: is it here, and can it be booted.
-    println!(
-        "{:<14} {:<8} SOURCE ({})",
-        "NAME",
-        "PULLED",
-        image::host_arch()
-    );
-    for entry in image::CATALOG {
-        let r = image::resolve(entry.alias)?;
-        // An image pulled by an older Asterism is still on this device even
-        // though it has not been converted yet, and saying "-" would send
-        // the user off to re-download something they already have.
-        let pulled = match r.is_pulled() {
-            false => "-".to_owned(),
-            true => match verify_row(&r.path, &r.record, depth) {
-                Ok(()) => "yes".to_owned(),
-                Err(e) => {
-                    unsound += 1;
-                    eprintln!("{}: {e:#}", entry.alias);
-                    "BAD".to_owned()
+fn pull_image(device: Option<&str>, reference: &str) -> Result<asterism_core::image::ImagePullResult> {
+    match send(&aimed(
+        Request::ImagePull {
+            reference: reference.to_owned(),
+        },
+        device,
+    ))? {
+        Response::ImagePulled { result } => {
+            for progress in &result.progress {
+                if progress.done {
+                    eprintln!("{} ({} bytes)", progress.phase, progress.bytes);
+                } else {
+                    eprintln!("{}", progress.phase);
                 }
-            },
+            }
+            Ok(*result)
+        }
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected image pull reply from astd: {other:?}"),
+    }
+}
+
+fn canonical_image_reference(reference: &str) -> String {
+    image::DEFAULTS
+        .iter()
+        .find(|(bare, _)| *bare == reference)
+        .map(|(_, full)| (*full).to_owned())
+        .or_else(|| oci::parse(reference).map(|parsed| parsed.canonical()))
+        .unwrap_or_else(|| reference.to_owned())
+}
+
+fn print_image_rows(images: &[asterism_core::image::ImageRow]) -> Result<()> {
+    println!(
+        "{:<30} {:<10} {:<8} {:>12} SOURCE",
+        "REFERENCE", "KIND", "STATE", "BYTES"
+    );
+    for image in images {
+        let state = if !image.pulled {
+            "missing"
+        } else if image.verified {
+            "ready"
+        } else {
+            "bad"
         };
         println!(
-            "{:<14} {:<8} {}",
-            entry.alias,
-            pulled,
-            r.url.as_deref().unwrap_or("-")
+            "{:<30} {:<10} {:<8} {:>12} {}",
+            image.reference, image.kind, state, image.bytes, image.source
         );
     }
-    // Container images are not a catalog — the catalog is Docker Hub — but
-    // the ones this device has built are as real as any row above, and
-    // nothing else would tell the user what is taking up the space.
-    for reference in oci::built()? {
-        let state =
-            match image::resolve(&reference).and_then(|r| verify_row(&r.path, &r.record, depth)) {
-                Ok(()) => "yes".to_owned(),
-                Err(e) => {
-                    unsound += 1;
-                    eprintln!("{reference}: {e:#}");
-                    "BAD".to_owned()
-                }
-            };
-        println!("{:<14} {:<8} {}", short_image(&reference), state, reference);
-    }
-    if unsound > 0 {
-        println!(
-            "\n{unsound} image(s) marked BAD: the bytes on disk are not the ones that were \
-             pulled.\nThey will be refused at boot. `ast pull <name>` replaces one."
-        );
-    }
-    println!("\nalso accepted: an https:// url, a path to a local qcow2 or raw image, or");
-    println!("an OCI/Docker reference — `nginx`, `ghcr.io/owner/app:v1` — booted as a");
-    println!("microVM from the image's own filesystem (ast create web --image nginx -p 8080:80)");
-    println!("a url must pin its bytes: --image https://mirror/x.qcow2#sha256:<hex>");
-    println!("(sha256, sha512 and blake3 are accepted; a path may pin its bytes too)");
     Ok(())
 }
 
-/// One row's verdict: is what is on disk still what was pulled?
-///
-/// An image only half-migrated by an older Asterism — the qcow2 is there and
-/// the raw is not — has nothing to check yet, and saying so is not a
-/// complaint about it.
-fn verify_row(
-    path: &std::path::Path,
-    record: &std::path::Path,
-    depth: verify::Depth,
-) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    verify::check_recorded(path, record, depth)
+fn print_image_pull(result: &asterism_core::image::ImagePullResult) -> Result<()> {
+    println!(
+        "{}  {} image ready ({} bytes{})",
+        result.reference,
+        result.kind,
+        result.bytes,
+        result
+            .digest
+            .as_deref()
+            .map(|digest| format!(", {digest}"))
+            .unwrap_or_default()
+    );
+    Ok(())
 }
 
 // ---- volumes ---------------------------------------------------------------

@@ -59,6 +59,7 @@ mod backend;
 mod device_shell;
 mod egress;
 mod instance;
+mod images;
 mod mesh;
 mod orbit;
 mod persist;
@@ -782,6 +783,9 @@ pub(crate) async fn handle(req: Request, node: &Node) -> Response {
     // a lease and wait forever on its own lock.
     if volume::is_plane_request(&req) {
         return volume::serve(req).await;
+    }
+    if images::is_plane_request(&req) {
+        return images::serve(req).await;
     }
 
     let cpu_device = node.device_name().await;
