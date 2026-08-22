@@ -1073,8 +1073,8 @@ fn main() -> Result<()> {
                 .map(|instance| OrbitRow { instance, live: true })
                 .collect::<Vec<_>>(),
         ),
-        Response::Images { images } => print_image_rows(&images),
-        Response::ImagePulled { result } => print_image_pull(&result),
+        Response::Images { images } => print_image_rows(&images)?,
+        Response::ImagePulled { result } => print_image_pull(&result)?,
         Response::BackupExported { report } => {
             println!(
                 "exported {} file(s), {} logical bytes to {}",
@@ -2291,6 +2291,18 @@ fn canonical_image_reference(reference: &str) -> String {
         .map(|(_, full)| (*full).to_owned())
         .or_else(|| oci::parse(reference).map(|parsed| parsed.canonical()))
         .unwrap_or_else(|| reference.to_owned())
+}
+
+/// Only the part every Docker Hub library image shares is dropped, and only
+/// for display: `docker.io/library/nginx:latest` is what is recorded, what
+/// `ast status` prints, and what `--image` accepts, because it is the name
+/// that means one thing everywhere. `nginx:latest` is what a column has room
+/// for.
+fn short_image(reference: &str) -> String {
+    reference
+        .strip_prefix("docker.io/library/")
+        .unwrap_or(reference)
+        .to_owned()
 }
 
 fn print_image_rows(images: &[asterism_core::image::ImageRow]) -> Result<()> {
