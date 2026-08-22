@@ -229,9 +229,11 @@ pub fn check_can_share(inst: &Instance) -> Result<()> {
     if hv.probe().is_ok() && hv.caps().shared_dir.is_none() {
         bail!(
             "the {} backend on this device cannot share host directories, so a \
-             volume attached to {:?} could never reach the guest — put it on an \
-             instance whose backend can (qemu with 9p support, today)",
+             volume attached to {:?} could never reach the guest — the backend is \
+             fixed at create time, so destroy and recreate it with `ast create {:?} \
+             --backend qemu` (qemu has 9p support)",
             hv.id(),
+            inst.name,
             inst.name
         );
     }
@@ -1318,6 +1320,8 @@ mod tests {
             let err = check_can_share(&inst).unwrap_err().to_string();
             assert!(err.contains("vz"), "{err}");
             assert!(err.contains("9p"), "{err}");
+            assert!(err.contains("destroy and recreate"), "{err}");
+            assert!(err.contains("ast create dev --backend qemu"), "{err}");
         } else {
             assert!(
                 check_can_share(&inst).is_ok(),
