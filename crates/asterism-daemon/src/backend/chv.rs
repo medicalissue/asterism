@@ -207,7 +207,21 @@ impl Chv {
         }
 
         let endpoint = if req.base.kind == ImageKind::Disk {
-            wait_for_guest(&vsock, &req.dir, req.instance, &proc, BOOT_TIMEOUT)?
+            match wait_for_guest(&vsock, &req.dir, req.instance, &proc, BOOT_TIMEOUT) {
+                Ok(endpoint) => endpoint,
+                Err(error) => {
+                    // A failed boot never produces a Handle for the caller to
+                    // stop. Retire the VMM here or a readiness timeout leaves
+                    // an untracked VM, TAP and gigabyte of guest memory alive.
+                    let _ = api_with_timeout(&api, "PUT", "/vmm.shutdown", None, API_TIMEOUT);
+                    if proc.alive() {
+                        let _ = proc.signal(Signal::Kill);
+                        let _ = proc.wait_gone(Duration::from_secs(2));
+                    }
+                    cleanup_fs_helpers(&req.dir);
+                    return Err(error);
+                }
+            }
         } else {
             // OCI instances run their image entrypoint as pid 1 and do not
             // carry cloud-init or sshd.  Their deterministic address is still
