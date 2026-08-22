@@ -1233,8 +1233,8 @@ impl EncryptedFileStore {
         else {
             return Ok(None);
         };
-        let encrypted: EncryptedMetadata = serde_json::from_slice(&bytes)
-            .context("parsing encrypted coordinator metadata")?;
+        let encrypted: EncryptedMetadata =
+            serde_json::from_slice(&bytes).context("parsing encrypted coordinator metadata")?;
         encrypted.validate_bounds()?;
         Ok(Some(encrypted))
     }
@@ -1719,14 +1719,14 @@ mod tests {
         assert!(EnrollmentChallenge::from_token(&challenge).is_ok());
         assert!(EnrollmentChallenge::from_token(&format!("{challenge}A")).is_err());
 
-        assert_eq!(signature.len(), base64url_nopad_encoded_len(Signature::LENGTH));
+        assert_eq!(
+            signature.len(),
+            base64url_nopad_encoded_len(Signature::LENGTH)
+        );
         assert!(EnrollmentProof::from_tokens(&device_id, &challenge, &signature).is_ok());
-        assert!(EnrollmentProof::from_tokens(
-            &device_id,
-            &challenge,
-            &format!("{signature}A")
-        )
-        .is_err());
+        assert!(
+            EnrollmentProof::from_tokens(&device_id, &challenge, &format!("{signature}A")).is_err()
+        );
 
         assert_eq!(generation.len(), base64url_nopad_encoded_len(32));
         assert!(validate_generation(&generation).is_ok());
@@ -2484,11 +2484,7 @@ mod tests {
         let service = PersistentCoordinator::open(&path, keys.clone(), [18; 32]).unwrap();
         drop(service);
 
-        fs::write(
-            &high_watermark,
-            "0".repeat(MAX_HIGH_WATERMARK_BYTES + 1),
-        )
-        .unwrap();
+        fs::write(&high_watermark, "0".repeat(MAX_HIGH_WATERMARK_BYTES + 1)).unwrap();
         let error = PersistentCoordinator::open(&path, keys, [18; 32]).unwrap_err();
         assert!(format!("{error:#}").contains("high-watermark exceeds"));
     }
