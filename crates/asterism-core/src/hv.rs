@@ -665,6 +665,12 @@ pub trait Hypervisor: Send + Sync {
     fn prepare(&self, req: &BootReq) -> Result<Prepared>;
 
     /// Start the guest. Must not return until it is running (or failed).
+    ///
+    /// Once this method is called, an error is conservatively ambiguous to
+    /// orchestration: a backend may have spawned the guest and then failed to
+    /// capture its process identity or endpoint. Callers must retain their
+    /// durable launch fence unless they hold a handle with which guest death
+    /// can be proven.
     fn boot(&self, req: &BootReq, prep: &Prepared) -> Result<Handle>;
 
     /// Graceful shutdown request, then escalate, then hard kill by `deadline`.

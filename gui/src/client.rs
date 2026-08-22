@@ -34,7 +34,7 @@ use asterism_core::paths;
 use asterism_core::protocol::{self, Request, Response};
 use asterism_core::registry::OrbitRow;
 use asterism_core::snapshot::Snapshot;
-use asterism_core::volume::BlockVolume;
+use asterism_core::volume::Catalog as VolumeCatalog;
 
 /// How long to wait for a freshly spawned daemon to start answering.
 const STARTUP_ATTEMPTS: u32 = 20;
@@ -285,13 +285,10 @@ pub fn restore_backup(source: &str, name: Option<&str>) -> Result<RestoreReport>
     }
 }
 
-/// Block volumes whose bytes are supplied by this device.
-///
-/// Volumes are device parts, not orbit-global objects, so this deliberately
-/// asks the local daemon without pretending to assemble a global inventory.
-pub fn volumes() -> Result<Vec<BlockVolume>> {
-    match send(&Request::VolumeList)? {
-        Response::Volumes { volumes } => Ok(volumes),
+/// The orbit-visible storage catalog as observed by this device.
+pub fn volumes() -> Result<VolumeCatalog> {
+    match send(&Request::VolumeCatalog)? {
+        Response::VolumeCatalog { catalog } => Ok(catalog),
         Response::Error { message } => bail!(message),
         other => bail!("unexpected reply from astd: {other:?}"),
     }

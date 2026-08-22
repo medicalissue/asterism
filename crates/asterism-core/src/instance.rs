@@ -65,6 +65,11 @@ pub struct Volume {
     /// `host`, for a [`VolumeKind::Block`].
     pub path: String,
     pub host: String,
+    /// Immutable identity of the device behind `host`. Absent on directory
+    /// shares and records written before storage authority was identity
+    /// bound; new block attachments always populate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<String>,
     /// Absolute path the volume appears at inside the guest. Assigned when
     /// the volume is attached; `None` on records written before mount
     /// points existed, which fall back to [`Volume::guest_path`]'s default,
@@ -80,6 +85,11 @@ pub struct Volume {
     /// refused rather than served (`docs/ROADMAP.md` Phase 3).
     #[serde(default)]
     pub epoch: Option<u64>,
+    /// Attach-saga identity which created this durable block row. It lets
+    /// restart reconciliation distinguish this commit from a later attach of
+    /// the same human-named volume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attach_intent_id: Option<String>,
     /// Size of a block volume as its provider reported it, for `ast status`.
     #[serde(default)]
     pub size_bytes: Option<u64>,
@@ -99,9 +109,11 @@ impl Volume {
         Volume {
             path: path.to_owned(),
             host: host.to_owned(),
+            host_id: None,
             mount_point,
             kind: VolumeKind::Dir,
             epoch: None,
+            attach_intent_id: None,
             size_bytes: None,
             runtime: None,
         }
@@ -109,12 +121,24 @@ impl Volume {
 
     /// A block volume, named on the device that holds its bytes.
     pub fn block(volume: &str, host: &str, epoch: u64, size_bytes: u64) -> Self {
+        Self::block_owned(volume, host, None, epoch, size_bytes)
+    }
+
+    pub fn block_owned(
+        volume: &str,
+        host: &str,
+        host_id: Option<String>,
+        epoch: u64,
+        size_bytes: u64,
+    ) -> Self {
         Volume {
             path: volume.to_owned(),
             host: host.to_owned(),
+            host_id,
             mount_point: None,
             kind: VolumeKind::Block,
             epoch: Some(epoch),
+            attach_intent_id: None,
             size_bytes: Some(size_bytes),
             runtime: None,
         }
@@ -485,6 +509,14 @@ pub struct Instance {
     /// The running guest, while there is one.
     #[serde(default)]
     pub handle: Option<Handle>,
+    /// Durable fence for a guest launch whose handle is not committed yet.
+    ///
+    /// The daemon writes this before renewing storage or asking a hypervisor
+    /// to boot, and clears it atomically with the running handle. A crash in
+    /// that window therefore leaves a row which refuses another launch,
+    /// rather than a stopped-looking row beside a possibly live guest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_intent_id: Option<String>,
     /// Set when this instance's name turned out not to be unique in the
     /// orbit. Every command on it refuses until `ast rename` clears it.
     #[serde(default)]
@@ -581,6 +613,7 @@ impl Instance {
             policy: Policy::default(),
             machine,
             handle: None,
+            boot_intent_id: None,
             conflict: None,
             move_epoch: 0,
             moving: None,
