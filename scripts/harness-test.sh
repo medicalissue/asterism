@@ -158,7 +158,61 @@ ok "a half-written record yields nothing rather than failing the cleanup"
 harness_reap_home "$WORK/never" || fail "reaping a home that does not exist was an error"
 ok "a home that does not exist is nothing to reap"
 
-# ---- 8. the image cache is the harness's own, never the user's ---------------
+# ---- 8. insufficient host space is refused before a suite starts -------------
+
+available="$(harness_free_bytes "$WORK")" \
+  || fail "the harness could not measure free space in its own work directory"
+[ "$available" -gt 0 ] || fail "the harness reported no free space in $WORK"
+harness_require_free_space "$WORK" 1 "the harness test" \
+  || fail "one byte of required space was refused despite $available bytes free"
+if space_error="$(harness_require_free_space "$WORK" "$((available + 1))" "a too-large test" 2>&1)"; then
+  fail "a requirement above the available space was accepted"
+fi
+grep -qF "needs at least" <<<"$space_error" \
+  || fail "the free-space refusal did not name its requirement: $space_error"
+grep -qF "only" <<<"$space_error" \
+  || fail "the free-space refusal did not name what was available: $space_error"
+ok "host disk capacity is measured, and insufficient capacity is refused in words"
+
+# ---- 9. QMP io-error reaches a suite's timeout report -----------------------
+
+QMP_SOCK="$WORK/qmp.sock"
+python3 - "$QMP_SOCK" <<'PY' &
+import json
+import socket
+import sys
+
+path = sys.argv[1]
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+    server.bind(path)
+    server.listen(1)
+    conn, _ = server.accept()
+    with conn:
+        conn.sendall(b'{"QMP":{"version":{"qemu":{"major":9}}}}\n')
+        reader = conn.makefile("r", encoding="utf-8", newline="\n")
+        for _ in range(2):
+            request = json.loads(reader.readline())
+            if request["execute"] == "qmp_capabilities":
+                response = {"return": {}, "id": request["id"]}
+            elif request["execute"] == "query-status":
+                response = {"return": {"status": "io-error"}, "id": request["id"]}
+            else:
+                raise RuntimeError(f"unexpected QMP request: {request}")
+            conn.sendall(json.dumps(response).encode() + b"\n")
+PY
+qmp_server=$!
+for _ in $(seq 1 50); do [ -S "$QMP_SOCK" ] && break; sleep 0.1; done
+[ -S "$QMP_SOCK" ] || fail "the fake QMP server did not create its socket"
+qmp_status="$(harness_qmp_status "$QMP_SOCK")" \
+  || fail "the QMP diagnostic could not query the fake monitor"
+wait "$qmp_server" || fail "the fake QMP server failed"
+grep -qF "QMP query-status: io-error" <<<"$qmp_status" \
+  || fail "the QMP status was not reported: $qmp_status"
+grep -qF "host storage I/O failed" <<<"$qmp_status" \
+  || fail "io-error was not explained as a host storage fact: $qmp_status"
+ok "QMP io-error is reported as a host storage failure"
+
+# ---- 10. the image cache is the harness's own, never the user's --------------
 
 case "$(harness_cache_dir)" in
   *"/.asterism"*) fail "the harness cache is inside the user's ~/.asterism" ;;
@@ -195,7 +249,7 @@ case "$default_one" in
 esac
 ok "direct runs get separate diagnostics directories"
 
-# ---- 9. evidence is copied out before the home it lives in goes --------------
+# ---- 11. evidence is copied out before the home it lives in goes -------------
 
 mkdir -p "$home/instances/one"
 printf 'daemon said this\n' >"$home/astd.log"
@@ -209,7 +263,7 @@ grep -qF "the guest said this" \
   || fail "the guest console log was not preserved"
 ok "a home's logs outlive the home"
 
-# ---- 10. build ids are compared, not assumed --------------------------------
+# ---- 12. build ids are compared, not assumed --------------------------------
 #
 # Two stand-ins for `ast version`, because what is being tested is the
 # comparison and not the binary.
@@ -247,7 +301,7 @@ if harness_build_id "$WORK/bin/mute" >/dev/null 2>&1; then
 fi
 ok "a binary that will not say which build it is, is not accepted as any"
 
-# ---- 11. the exact-artifact VZ gate has no source fallback -----------------
+# ---- 13. the exact-artifact VZ gate has no source fallback -----------------
 
 make_helper() {
   cat >"$WORK/bin/$1" <<EOF

@@ -237,6 +237,102 @@ harness_skip() {
   exit "$HARNESS_SKIP_STATUS"
 }
 
+# ---- host capacity ---------------------------------------------------------
+
+# <path>: print the bytes still available on the filesystem holding path.
+#
+# `df -Pk` is the portable form on both macOS and Linux: it asks for POSIX
+# one-kilobyte blocks, so the calculation does not depend on a locale's block
+# size or on GNU-only `--output`.  E2E suites create sparse guest disks, then
+# write inside them and copy them for snapshots; checking this before a pull
+# makes an almost-full host a short, actionable refusal instead of a guest
+# paused by QEMU after its bootstrap budget has elapsed.
+harness_free_bytes() {
+  local path="$1" available
+  available="$(df -Pk "$path" 2>/dev/null | awk 'NR == 2 { printf "%.0f", $4 * 1024; exit }')"
+  case "$available" in
+    '' | *[!0-9]*)
+      echo "harness: could not determine free space for $path" >&2
+      return 1
+      ;;
+  esac
+  printf '%s\n' "$available"
+}
+
+# <path> <required-bytes> <purpose>: refuse a suite before it starts work the
+# host cannot store.  Both figures are printed in GiB because the disk and
+# snapshot budgets E2E authors reason about are GiB, not filesystem blocks.
+harness_require_free_space() {
+  local path="$1" required="$2" purpose="$3" available
+  case "$required" in
+    '' | *[!0-9]*)
+      echo "harness: free-space requirement must be a byte count, got $required" >&2
+      return 2
+      ;;
+  esac
+  available="$(harness_free_bytes "$path")" || return 1
+  if [ "$available" -lt "$required" ]; then
+    printf 'harness: %s needs at least %s GiB free on %s; only %s GiB is available\n' \
+      "$purpose" "$((required / 1024 / 1024 / 1024))" "$path" \
+      "$((available / 1024 / 1024 / 1024))" >&2
+    return 1
+  fi
+}
+
+# <qmp-socket>: issue QMP `query-status` and print the status in a form a
+# suite can append to its failure.  This intentionally uses Python's standard
+# library rather than `socat` or `nc`: neither is guaranteed on a clean macOS
+# developer host.  It connects only at diagnosis time, when no lifecycle
+# command has an outstanding QMP request.
+harness_qmp_status() {
+  local socket="$1"
+  if [ ! -S "$socket" ]; then
+    echo "QMP diagnostic unavailable: no control socket at $socket" >&2
+    return 1
+  fi
+  python3 - "$socket" <<'PY'
+import json
+import socket
+import sys
+
+path = sys.argv[1]
+
+try:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+        conn.settimeout(3)
+        conn.connect(path)
+        reader = conn.makefile("r", encoding="utf-8", newline="\n")
+
+        def receive(label):
+            while True:
+                line = reader.readline()
+                if not line:
+                    raise RuntimeError(f"QMP closed while waiting for {label}")
+                message = json.loads(line)
+                if message.get("id") == label:
+                    if "error" in message:
+                        raise RuntimeError(f"QMP {label} failed: {message['error']}")
+                    return message.get("return")
+
+        greeting = json.loads(reader.readline())
+        if "QMP" not in greeting:
+            raise RuntimeError(f"unexpected QMP greeting: {greeting}")
+        conn.sendall(b'{"execute":"qmp_capabilities","id":"harness-caps"}\n')
+        receive("harness-caps")
+        conn.sendall(b'{"execute":"query-status","id":"harness-status"}\n')
+        result = receive("harness-status")
+        status = result.get("status") if isinstance(result, dict) else None
+        if not isinstance(status, str):
+            raise RuntimeError(f"query-status had no status: {result}")
+        print(f"QMP query-status: {status}")
+        if status == "io-error":
+            print("QMP reports io-error: the host storage I/O failed (commonly ENOSPC).")
+except Exception as error:
+    print(f"QMP diagnostic unavailable: {error}", file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
 # ---- the binaries under test -----------------------------------------------
 
 # <repo-root>: set AST and ASTD to the pair this run is exercising.
