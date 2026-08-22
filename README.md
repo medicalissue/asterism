@@ -244,9 +244,13 @@ $ ast update apply --yes
 
 ## Roadmap
 
-The next hardware part is a production remote GPU projection that presents
-`/dev/nvidia0` inside a guest; the versioned boundary and current portable
-proof are in [docs/remote-gpu-abi.md](docs/remote-gpu-abi.md).
+The remote GPU part presents `/dev/nvidia0` inside an instance. Its versioned
+CUDA-semantic ABI and runnable reference proof are in
+[docs/remote-gpu-abi.md](docs/remote-gpu-abi.md); production placement,
+identity-bound leases, quotas, revocation and restart fencing are in
+[docs/remote-gpu-production.md](docs/remote-gpu-production.md). The real CUDA
+executor and Linux guest adapter remain explicit hardware gates, not claims
+inferred from the portable reference executor.
 
 ## Build from source
 
