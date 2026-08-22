@@ -1,0 +1,10 @@
+/Users/medicalissue/gt/asterism/polecats/immortan/asterism/target-as-bpt3-v2/debug/deps/base16ct-e15ae4aad773fa2d.d: /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base16ct-1.0.0/src/lib.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base16ct-1.0.0/src/lower.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base16ct-1.0.0/src/mixed.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base16ct-1.0.0/src/upper.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base16ct-1.0.0/src/display.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base16ct-1.0.0/src/error.rs
+
+/Users/medicalissue/gt/asterism/polecats/immortan/asterism/target-as-bpt3-v2/debug/deps/libbase16ct-e15ae4aad773fa2d.rmeta: /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base16ct-1.0.0/src/lib.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base16ct-1.0.0/src/lower.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base16ct-1.0.0/src/mixed.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base16ct-1.0.0/src/upper.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base16ct-1.0.0/src/display.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base16ct-1.0.0/src/error.rs
+
+/Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base16ct-1.0.0/src/lib.rs:
+/Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base16ct-1.0.0/src/lower.rs:
+/Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base16ct-1.0.0/src/mixed.rs:
+/Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base16ct-1.0.0/src/upper.rs:
+/Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base16ct-1.0.0/src/display.rs:
+/Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/base16ct-1.0.0/src/error.rs:

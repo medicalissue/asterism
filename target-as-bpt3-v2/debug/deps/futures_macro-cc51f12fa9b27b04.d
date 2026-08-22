@@ -1,0 +1,9 @@
+/Users/medicalissue/gt/asterism/polecats/immortan/asterism/target-as-bpt3-v2/debug/deps/futures_macro-cc51f12fa9b27b04.d: /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-macro-0.3.34/src/lib.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-macro-0.3.34/src/executor.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-macro-0.3.34/src/join.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-macro-0.3.34/src/select.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-macro-0.3.34/src/stream_select.rs
+
+/Users/medicalissue/gt/asterism/polecats/immortan/asterism/target-as-bpt3-v2/debug/deps/libfutures_macro-cc51f12fa9b27b04.dylib: /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-macro-0.3.34/src/lib.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-macro-0.3.34/src/executor.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-macro-0.3.34/src/join.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-macro-0.3.34/src/select.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-macro-0.3.34/src/stream_select.rs
+
+/Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-macro-0.3.34/src/lib.rs:
+/Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-macro-0.3.34/src/executor.rs:
+/Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-macro-0.3.34/src/join.rs:
+/Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-macro-0.3.34/src/select.rs:
+/Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-macro-0.3.34/src/stream_select.rs:

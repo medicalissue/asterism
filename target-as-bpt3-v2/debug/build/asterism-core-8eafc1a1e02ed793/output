@@ -1,0 +1,3 @@
+cargo:rerun-if-env-changed=ASTERISM_BUILD_ID
+cargo:rerun-if-changed=build.rs
+cargo:rustc-env=ASTERISM_BUILD_ID=0.0.2+835294c0402a

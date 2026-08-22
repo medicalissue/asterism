@@ -1,0 +1,9 @@
+/Users/medicalissue/gt/asterism/polecats/immortan/asterism/target-as-bpt3-v2/debug/deps/iroh_dns-e84a997e2659e19f.d: /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.3/src/lib.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.3/src/attrs.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.3/src/dns.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.3/src/endpoint_info.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.3/src/pkarr.rs
+
+/Users/medicalissue/gt/asterism/polecats/immortan/asterism/target-as-bpt3-v2/debug/deps/libiroh_dns-e84a997e2659e19f.rmeta: /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.3/src/lib.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.3/src/attrs.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.3/src/dns.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.3/src/endpoint_info.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.3/src/pkarr.rs
+
+/Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.3/src/lib.rs:
+/Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.3/src/attrs.rs:
+/Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.3/src/dns.rs:
+/Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.3/src/endpoint_info.rs:
+/Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.3/src/pkarr.rs:

@@ -1,0 +1,10 @@
+/Users/medicalissue/gt/asterism/polecats/immortan/asterism/target-as-bpt3-v2/debug/deps/iroh_base-31438df27837f9fc.d: /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-base-1.0.3/src/lib.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-base-1.0.3/src/endpoint_addr.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-base-1.0.3/src/key.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-base-1.0.3/src/relay_url.rs
+
+/Users/medicalissue/gt/asterism/polecats/immortan/asterism/target-as-bpt3-v2/debug/deps/libiroh_base-31438df27837f9fc.rlib: /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-base-1.0.3/src/lib.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-base-1.0.3/src/endpoint_addr.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-base-1.0.3/src/key.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-base-1.0.3/src/relay_url.rs
+
+/Users/medicalissue/gt/asterism/polecats/immortan/asterism/target-as-bpt3-v2/debug/deps/libiroh_base-31438df27837f9fc.rmeta: /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-base-1.0.3/src/lib.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-base-1.0.3/src/endpoint_addr.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-base-1.0.3/src/key.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-base-1.0.3/src/relay_url.rs
+
+/Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-base-1.0.3/src/lib.rs:
+/Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-base-1.0.3/src/endpoint_addr.rs:
+/Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-base-1.0.3/src/key.rs:
+/Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-base-1.0.3/src/relay_url.rs:

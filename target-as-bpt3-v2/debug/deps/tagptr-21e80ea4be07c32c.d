@@ -1,0 +1,10 @@
+/Users/medicalissue/gt/asterism/polecats/immortan/asterism/target-as-bpt3-v2/debug/deps/tagptr-21e80ea4be07c32c.d: /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tagptr-0.2.0/src/lib.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tagptr-0.2.0/src/macros.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tagptr-0.2.0/src/macros/doc.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tagptr-0.2.0/src/imp/atomic.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tagptr-0.2.0/src/imp/non_null.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tagptr-0.2.0/src/imp/ptr.rs
+
+/Users/medicalissue/gt/asterism/polecats/immortan/asterism/target-as-bpt3-v2/debug/deps/libtagptr-21e80ea4be07c32c.rmeta: /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tagptr-0.2.0/src/lib.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tagptr-0.2.0/src/macros.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tagptr-0.2.0/src/macros/doc.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tagptr-0.2.0/src/imp/atomic.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tagptr-0.2.0/src/imp/non_null.rs /Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tagptr-0.2.0/src/imp/ptr.rs
+
+/Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tagptr-0.2.0/src/lib.rs:
+/Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tagptr-0.2.0/src/macros.rs:
+/Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tagptr-0.2.0/src/macros/doc.rs:
+/Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tagptr-0.2.0/src/imp/atomic.rs:
+/Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tagptr-0.2.0/src/imp/non_null.rs:
+/Users/medicalissue/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/tagptr-0.2.0/src/imp/ptr.rs:
