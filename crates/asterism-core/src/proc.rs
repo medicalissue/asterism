@@ -733,6 +733,37 @@ mod tests {
         Command::new("sleep").arg("30").spawn().unwrap()
     }
 
+    /// Wait for a child to exit while deliberately leaving its exit status in
+    /// the process table.  `waitid` with `WNOWAIT` gives this test its needed
+    /// ordering edge without consuming the very zombie it is about to
+    /// inspect.
+    fn wait_for_exit_without_reaping(child: &Child) {
+        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+        loop {
+            // SAFETY: `info` is valid writable storage, and `child.id()` is
+            // the id of our direct child. `WNOWAIT` promises not to reap it.
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    child.id() as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if rc == 0 {
+                return;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            panic!(
+                "waiting for child {} to exit without reaping it: {error}",
+                child.id()
+            );
+        }
+    }
+
     #[test]
     fn our_own_process_is_ours() {
         let me = ProcId::capture(std::process::id()).unwrap();
@@ -814,13 +845,11 @@ mod tests {
     /// state says what it is.
     #[test]
     fn a_zombie_is_gone_not_running() {
-        let mut child = Command::new("true").spawn().unwrap();
+        let mut child = sleeper();
         let id = ProcId::capture(child.id()).unwrap();
+        assert!(id.signal(Signal::Kill).unwrap(), "delivered");
+        wait_for_exit_without_reaping(&child);
         // Deliberately not waited for: the pid is now an exit status.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while id.check() != Ownership::Gone && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
         assert_eq!(
             id.check(),
             Ownership::Gone,

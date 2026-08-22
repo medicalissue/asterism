@@ -86,7 +86,7 @@ cleanup() {
   # Then what they left running: both outlive astd by design.
   for home in "$RUN"/h-*; do
     [ -d "$home" ] || continue
-    for f in "$home"/instances/*/qemu.pid; do
+    for f in "$home"/instances/*/qemu.pid "$home"/instances/*/vz.pid; do
       [ -f "$f" ] || continue
       kill_pid "$(cat "$f" 2>/dev/null || true)"
     done
