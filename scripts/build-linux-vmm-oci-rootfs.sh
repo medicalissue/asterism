@@ -104,7 +104,7 @@ sudo mke2fs -q -F -t ext4 -b 4096 -E root_owner=0:0 -L asterism \
   -d "$root" "$tmp/oci.raw" 768M
 sudo chown "$(id -u):$(id -g)" "$tmp/oci.raw"
 mv "$tmp/oci.raw" "$BENCH/oci.raw"
-config_digest=$(nerdctl image inspect docker.io/library/python:3.12-alpine --format '{{.Id}}')
+config_digest=$(nerdctl image inspect "$IMAGE" --format '{{.Id}}')
 cat > "$BENCH/oci.manifest" <<EOF
 image=$IMAGE platform=$PLATFORM platform_manifest=$ARM64_MANIFEST config=$config_digest kernel_modules=$kernel_release
 EOF
