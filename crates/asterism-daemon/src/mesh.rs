@@ -670,30 +670,37 @@ impl Mesh {
     /// the accept loop reads the same store this writes, and every connection
     /// already authenticated as that key is closed before this call returns.
     pub async fn remove_device(&self, name: &str) -> Result<Device> {
-        let removed = {
+        let (device, removal, membership_gone) = {
             let mut orbit = self.orbit.lock().await;
-            let removed = orbit.remove(name)?;
-            orbit.save()?;
-            removed
+            let device = orbit.get(name).cloned().ok_or_else(|| {
+                anyhow!("no device named {name:?} in this orbit — see: ast devices")
+            })?;
+            let removal = crate::volume::remove_device(&mut orbit, name)
+                .await
+                .with_context(|| format!("removing device {name:?} and revoking its leases"));
+            let membership_gone = !orbit.trusts(&device.device_id);
+            (device, removal, membership_gone)
         };
 
-        if let Some(connection) = self.conns.lock().await.remove(&removed.device_id) {
+        // An error after the orbit rename can still leave the new membership
+        // visible (the failed step was its directory flush). Close live
+        // authority whenever the in-memory store says the key is gone, even
+        // if the caller must retry to obtain a durability guarantee.
+        if membership_gone {
+            self.close_device_connections(&device).await;
+        }
+        removal
+    }
+
+    async fn close_device_connections(&self, device: &Device) {
+        if let Some(connection) = self.conns.lock().await.remove(&device.device_id) {
             connection.close(b"device revoked");
         }
-        if let Some(connections) = self.active.lock().await.remove(&removed.device_id) {
+        if let Some(connections) = self.active.lock().await.remove(&device.device_id) {
             for connection in connections {
                 connection.close(b"device revoked");
             }
         }
-
-        // A lease is durable authorization as well as bookkeeping.  Clear all
-        // leases whose writer lived on this device and stop their exports, so
-        // re-pairing a different key under the same human name cannot inherit
-        // one and an already-open NBD pipe has no process behind it.
-        crate::volume::revoke_device(&removed.name)
-            .await
-            .with_context(|| format!("revoking volume leases held by {:?}", removed.name))?;
-        Ok(removed)
     }
 
     async fn trusts(&self, device_id: &str) -> bool {
@@ -2208,8 +2215,17 @@ async fn serve_volume_splice(
     holder: &str,
     epoch: u64,
     requester_device: &str,
+    requester_device_id: &str,
 ) -> Result<()> {
-    let export = match crate::volume::open_export(volume, holder, epoch, requester_device).await {
+    let export = match crate::volume::open_export(
+        volume,
+        holder,
+        epoch,
+        requester_device,
+        requester_device_id,
+    )
+    .await
+    {
         Ok(export) => export,
         Err(e) => {
             let refusal = MeshReply::Rpc {
@@ -2853,12 +2869,17 @@ async fn serve_trusted_peer(mesh: Arc<Mesh>, connection: MeshConnection, node: N
         return;
     };
 
-    serve_peer(connection, node, peer_name).await;
+    serve_peer(connection, node, peer_name, peer_id.clone()).await;
     mesh.untrack(&peer_id, stable).await;
 }
 
 /// Serves streams from one trusted peer until it goes away.
-async fn serve_peer(connection: MeshConnection, node: Node, requester_device: String) {
+async fn serve_peer(
+    connection: MeshConnection,
+    node: Node,
+    requester_device: String,
+    requester_device_id: String,
+) {
     let peer = connection.remote_device_id().short();
     let slots = Arc::new(Semaphore::new(MAX_PEER_STREAMS));
     loop {
@@ -2873,9 +2894,11 @@ async fn serve_peer(connection: MeshConnection, node: Node, requester_device: St
         let node = node.clone();
         let peer = peer.clone();
         let requester_device = requester_device.clone();
+        let requester_device_id = requester_device_id.clone();
         tokio::spawn(async move {
             let _slot = slot;
-            if let Err(e) = serve_stream(stream, node, requester_device).await {
+            if let Err(e) = serve_stream(stream, node, requester_device, requester_device_id).await
+            {
                 eprintln!("astd: mesh stream from {peer} failed: {e:#}");
             }
         });
@@ -2888,6 +2911,7 @@ async fn serve_stream(
     mut stream: asterism_mesh::MeshStream,
     node: Node,
     requester_device: String,
+    requester_device_id: String,
 ) -> Result<()> {
     let arriving = read_frame::<Arriving>(&mut stream.recv).await?;
 
@@ -2929,7 +2953,17 @@ async fn serve_stream(
             volume,
             holder,
             epoch,
-        } => return serve_volume_splice(stream, &volume, &holder, epoch, &requester_device).await,
+        } => {
+            return serve_volume_splice(
+                stream,
+                &volume,
+                &holder,
+                epoch,
+                &requester_device,
+                &requester_device_id,
+            )
+            .await
+        }
         // Bulk, not request/reply: each of these stops being a framed RPC
         // after this line and becomes a stream of `MoveFrame`s.
         MeshRequest::MoveExport { name, epoch } => {
@@ -2983,7 +3017,12 @@ async fn serve_stream(
                     rows: crate::wake::check(),
                 },
                 request if crate::volume::is_plane_request(&request) => {
-                    crate::volume::serve_authenticated(request, &requester_device).await
+                    crate::volume::serve_authenticated(
+                        request,
+                        &requester_device,
+                        &requester_device_id,
+                    )
+                    .await
                 }
                 request => crate::handle(request, &node).await,
             },
@@ -3608,7 +3647,7 @@ mod tests {
 
         tokio::spawn(async move {
             let conn = server.accept().await.unwrap().unwrap();
-            serve_peer(conn, node, "test-peer".into()).await;
+            serve_peer(conn, node, "test-peer".into(), "test-peer-id".into()).await;
         });
 
         let connection = client.connect(addr).await.unwrap();

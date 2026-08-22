@@ -63,6 +63,7 @@ use tokio::sync::Mutex;
 
 use asterism_core::hv::{DiskSpec, Hypervisor};
 use asterism_core::instance::{Instance, Volume};
+use asterism_core::orbit::{Device, Orbit};
 use asterism_core::paths;
 use asterism_core::proc::{ProcId, Signal};
 use asterism_core::protocol::{Request, Response};
@@ -135,7 +136,7 @@ pub fn is_plane_request(req: &Request) -> bool {
 
 /// Answer one volume request against this device's own volumes.
 pub async fn serve(req: Request) -> Response {
-    serve_for(req, None).await
+    reply(serve_for(req, None).await)
 }
 
 /// Answer a volume request which arrived from an authenticated mesh peer.
@@ -143,12 +144,41 @@ pub async fn serve(req: Request) -> Response {
 /// Volume administration is orbit-wide, but a writer lease is narrower: its
 /// device field says which authenticated peer may renew, release, or open the
 /// export.  The peer does not get to supply that identity for itself.
-pub async fn serve_authenticated(req: Request, requester_device: &str) -> Response {
-    serve_for(req, Some(requester_device)).await
+pub async fn serve_authenticated(
+    req: Request,
+    requester_device: &str,
+    requester_device_id: &str,
+) -> Response {
+    // Refuse an attempted name substitution before consulting the plane. It
+    // is both the clearest error and keeps this check independent of volume
+    // availability.
+    if let Request::VolumeLease { holder_device, .. } = &req {
+        if holder_device != requester_device {
+            return reply(Err(anyhow!(
+                "authenticated device {requester_device:?} cannot request a volume lease for \
+                 device {holder_device:?}"
+            )));
+        }
+    }
+
+    let result = async {
+        let plane = plane()?;
+        // Removal takes this same lock before the volume lock. Holding it
+        // through the operation makes the ordering total: a request which
+        // got here first is included in revocation, while one which got here
+        // second observes the missing exact key and cannot grant or resume.
+        let membership = plane.node.orbit.lock().await;
+        authorize_peer(&membership, requester_device, requester_device_id)?;
+        let response = serve_for(req, Some(requester_device)).await;
+        drop(membership);
+        response
+    }
+    .await;
+    reply(result)
 }
 
-async fn serve_for(req: Request, requester_device: Option<&str>) -> Response {
-    let result = match req {
+async fn serve_for(req: Request, requester_device: Option<&str>) -> Result<Response> {
+    match req {
         Request::VolumeCreate { name, size_bytes } => create(&name, size_bytes).await,
         Request::VolumeList => list().await,
         Request::VolumeRemove { name } => remove(&name).await,
@@ -157,18 +187,12 @@ async fn serve_for(req: Request, requester_device: Option<&str>) -> Response {
             holder,
             holder_device,
         } => {
-            let holder_device = match requester_device {
-                Some(authenticated) if authenticated != holder_device => Err(anyhow!(
-                    "authenticated device {authenticated:?} cannot request a volume lease for \
-                     device {holder_device:?}"
-                )),
-                Some(authenticated) => Ok(authenticated),
-                None => Ok(holder_device.as_str()),
-            };
-            match holder_device {
-                Ok(holder_device) => grant(&volume, &holder, holder_device).await,
-                Err(e) => Err(e),
-            }
+            grant(
+                &volume,
+                &holder,
+                requester_device.unwrap_or(holder_device.as_str()),
+            )
+            .await
         }
         Request::VolumeReconnect {
             volume,
@@ -179,12 +203,29 @@ async fn serve_for(req: Request, requester_device: Option<&str>) -> Response {
             release(&volume, &holder, requester_device).await
         }
         other => Err(anyhow!("{other:?} is not a volume request")),
-    };
+    }
+}
+
+fn reply(result: Result<Response>) -> Response {
     match result {
         Ok(response) => response,
         Err(e) => Response::Error {
             message: format!("{e:#}"),
         },
+    }
+}
+
+fn authorize_peer(orbit: &Orbit, requester_device: &str, requester_device_id: &str) -> Result<()> {
+    match orbit.by_id(requester_device_id) {
+        Some(device) if device.name == requester_device => Ok(()),
+        Some(device) => bail!(
+            "authenticated key {requester_device_id} now belongs to device {:?}, not \
+             {requester_device:?}",
+            device.name
+        ),
+        None => {
+            bail!("device {requester_device:?} ({requester_device_id}) is no longer in this orbit")
+        }
     }
 }
 
@@ -338,29 +379,53 @@ fn authorize_lease_device(
     Ok(())
 }
 
-/// Revoke every local volume lease whose writer was on a removed device.
+/// Durably revoke a device's local leases before durably removing its orbit
+/// membership.
 ///
-/// The store is committed before an export is stopped: after a crash, a
-/// stopped export may safely be stopped again, while a live export backed by
-/// a lease that came back from disk would reopen a revoked writer's door.
-pub async fn revoke_device(device: &str) -> Result<usize> {
-    let Some(plane) = PLANE.get() else {
-        // Startup has not installed the plane yet, so there cannot be a mesh
-        // request holding one of its leases or exports.
-        return Ok(0);
-    };
-    let mut store = plane.store.lock().await;
-    let revoked = store.revoke_device(device);
-    if revoked.is_empty() {
-        return Ok(0);
+/// This order is the transaction: every crash boundary is either (member,
+/// leased), (member, revoked), or (removed, revoked). There is deliberately no
+/// path to (removed, leased), because a new key can later pair under the same
+/// human name. The caller already holds the orbit lock, and authenticated
+/// volume operations take that same lock before the store lock, so an
+/// in-flight grant is either committed before this revocation or refused
+/// after removal.
+pub async fn remove_device(orbit: &mut Orbit, name: &str) -> Result<Device> {
+    match PLANE.get() {
+        Some(plane) => {
+            let mut store = plane.store.lock().await;
+            remove_device_from_store(orbit, &mut store, name, stop_revoked_exports)
+        }
+        None => {
+            // If volume-plane startup failed, the on-disk leases still exist
+            // and are more important, not less. Load them directly and fail
+            // closed if they cannot be read or committed.
+            let volume_path = orbit.path().with_file_name("volumes.json");
+            let mut store =
+                Store::load(&volume_path).context("loading volumes before removing a device")?;
+            remove_device_from_store(orbit, &mut store, name, stop_revoked_exports)
+        }
     }
-    store.save()?;
-    drop(store);
+}
 
-    for (volume, lease) in &revoked {
+fn remove_device_from_store(
+    orbit: &mut Orbit,
+    store: &mut Store,
+    name: &str,
+    after_revocation: impl FnOnce(&[(String, volume::Lease)]),
+) -> Result<Device> {
+    let device = orbit
+        .get(name)
+        .cloned()
+        .ok_or_else(|| anyhow!("no device named {name:?} in this orbit — see: ast devices"))?;
+    let revoked = store.revoke_device_durable(&device.name)?;
+    after_revocation(&revoked);
+    orbit.remove_durable(name)
+}
+
+fn stop_revoked_exports(revoked: &[(String, volume::Lease)]) {
+    for (volume, lease) in revoked {
         stop_export(volume, lease.epoch, lease.proc.as_ref());
     }
-    Ok(revoked.len())
 }
 
 /// Connect to the export serving `volume` at `epoch`, on behalf of `holder`.
@@ -375,8 +440,33 @@ pub async fn open_export(
     holder: &str,
     epoch: u64,
     requester_device: &str,
+    requester_device_id: &str,
+) -> Result<tokio::net::UnixStream> {
+    open_export_for(
+        volume,
+        holder,
+        epoch,
+        requester_device,
+        Some(requester_device_id),
+    )
+    .await
+}
+
+async fn open_export_for(
+    volume: &str,
+    holder: &str,
+    epoch: u64,
+    requester_device: &str,
+    requester_device_id: Option<&str>,
 ) -> Result<tokio::net::UnixStream> {
     let plane = plane()?;
+    let membership = if let Some(requester_device_id) = requester_device_id {
+        let membership = plane.node.orbit.lock().await;
+        authorize_peer(&membership, requester_device, requester_device_id)?;
+        Some(membership)
+    } else {
+        None
+    };
     let mut store = plane.store.lock().await;
     let vol = store.get(volume)?.clone();
     let Some(lease) = vol.lease.clone() else {
@@ -408,9 +498,11 @@ pub async fn open_export(
     }
     drop(store);
 
-    tokio::net::UnixStream::connect(&socket)
+    let connected = tokio::net::UnixStream::connect(&socket)
         .await
-        .with_context(|| format!("connecting to the export for volume {volume:?}"))
+        .with_context(|| format!("connecting to the export for volume {volume:?}"));
+    drop(membership);
+    connected
 }
 
 /// Give every pre-identity lease on this device an identity, once.
@@ -931,7 +1023,7 @@ async fn splice_one(
         // connect the guest's socket to the export socket directly. Same
         // lease, same epoch check, one less hop — `fast and light` is a rule,
         // not a preference (docs/MODEL.md).
-        let mut export = open_export(volume, holder, epoch, &local_device).await?;
+        let mut export = open_export_for(volume, holder, epoch, &local_device, None).await?;
         tokio::io::copy_bidirectional(&mut stream, &mut export).await?;
         return Ok(());
     }
@@ -1047,6 +1139,7 @@ mod tests {
                 holder_device: "victim".into(),
             },
             "attacker",
+            "attacker-key",
         )
         .await;
         match response {
@@ -1082,6 +1175,161 @@ mod tests {
             error.contains("authenticated device \"desktop\""),
             "{error}"
         );
+    }
+
+    /// Exercise both durable boundaries of the cross-store transition. A
+    /// failed volume commit leaves membership and its lease intact; a failed
+    /// orbit commit can leave membership intact only after the lease is gone.
+    /// Retrying converges, and a different key paired under the old display
+    /// name cannot resume the old epoch.
+    #[test]
+    fn removal_faults_fail_closed_and_same_name_repair_cannot_resume() {
+        use asterism_core::durable;
+
+        let dir = tempfile::tempdir().unwrap();
+        let orbit_path = dir.path().join("orbit.json");
+        let volume_path = dir.path().join("volumes.json");
+        let mut orbit = Orbit::load(&orbit_path).unwrap();
+        orbit.set_self_name("provider").unwrap();
+        orbit
+            .add(asterism_core::orbit::device_now(
+                "laptop",
+                "old-key",
+                Vec::new(),
+                Vec::new(),
+            ))
+            .unwrap();
+        orbit.save().unwrap();
+        let mut store = Store::load(&volume_path).unwrap();
+        store.create("tank", 1 << 30).unwrap();
+        let old_epoch = store
+            .lease("tank", "dev", "laptop")
+            .unwrap()
+            .lease
+            .unwrap()
+            .epoch;
+        store.save().unwrap();
+
+        let volume_fault = durable::faults::arm(
+            "remove-volume-boundary",
+            durable::faults::Point::Rename,
+            volume_path.display().to_string(),
+            std::io::ErrorKind::Other,
+        );
+        assert!(remove_device_from_store(&mut orbit, &mut store, "laptop", |_| {}).is_err());
+        assert!(orbit.trusts("old-key"));
+        assert!(Store::load(&volume_path)
+            .unwrap()
+            .get("tank")
+            .unwrap()
+            .lease
+            .is_some());
+        drop(volume_fault);
+
+        let orbit_fault = durable::faults::arm(
+            "remove-orbit-boundary",
+            durable::faults::Point::Rename,
+            orbit_path.display().to_string(),
+            std::io::ErrorKind::Other,
+        );
+        assert!(remove_device_from_store(&mut orbit, &mut store, "laptop", |_| {}).is_err());
+        assert!(
+            Orbit::load(&orbit_path).unwrap().trusts("old-key"),
+            "a failed membership publish rolls membership back"
+        );
+        assert!(
+            Store::load(&volume_path)
+                .unwrap()
+                .get("tank")
+                .unwrap()
+                .lease
+                .is_none(),
+            "the only intermediate durable state is fail-closed"
+        );
+        drop(orbit_fault);
+
+        remove_device_from_store(&mut orbit, &mut store, "laptop", |_| {}).unwrap();
+        orbit
+            .add(asterism_core::orbit::device_now(
+                "laptop",
+                "new-key",
+                Vec::new(),
+                Vec::new(),
+            ))
+            .unwrap();
+        orbit.save().unwrap();
+
+        let refusal = authorize_peer(&orbit, "laptop", "old-key")
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("no longer in this orbit"), "{refusal}");
+        authorize_peer(&orbit, "laptop", "new-key").unwrap();
+        assert!(
+            store.reconnect("tank", "dev", old_epoch).is_err(),
+            "the old writer's epoch has no lease to resume"
+        );
+        let next = store.lease("tank", "dev", "laptop").unwrap();
+        assert_eq!(next.epoch, old_epoch + 1);
+    }
+
+    /// The exact-key membership guard and the volume-store lock are held in
+    /// one order on both sides. A grant already inside the guard finishes
+    /// first and is then revoked; removal can never slip between its check and
+    /// save and leave the newly granted lease behind.
+    #[tokio::test]
+    async fn an_in_flight_grant_is_included_before_membership_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let orbit_path = dir.path().join("orbit.json");
+        let volume_path = dir.path().join("volumes.json");
+        let mut initial_orbit = Orbit::load(&orbit_path).unwrap();
+        initial_orbit.set_self_name("provider").unwrap();
+        initial_orbit
+            .add(asterism_core::orbit::device_now(
+                "laptop",
+                "old-key",
+                Vec::new(),
+                Vec::new(),
+            ))
+            .unwrap();
+        initial_orbit.save().unwrap();
+        let mut initial_store = Store::load(&volume_path).unwrap();
+        initial_store.create("tank", 1 << 30).unwrap();
+        initial_store.save().unwrap();
+
+        let orbit = Arc::new(Mutex::new(initial_orbit));
+        let store = Arc::new(Mutex::new(initial_store));
+        let (inside_tx, inside_rx) = tokio::sync::oneshot::channel();
+        let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
+
+        let granting_orbit = Arc::clone(&orbit);
+        let granting_store = Arc::clone(&store);
+        let grant = tokio::spawn(async move {
+            let membership = granting_orbit.lock().await;
+            authorize_peer(&membership, "laptop", "old-key").unwrap();
+            inside_tx.send(()).unwrap();
+            continue_rx.await.unwrap();
+            let mut volumes = granting_store.lock().await;
+            volumes.lease("tank", "dev", "laptop").unwrap();
+            volumes.save().unwrap();
+            drop(volumes);
+            drop(membership);
+        });
+        inside_rx.await.unwrap();
+
+        let removing_orbit = Arc::clone(&orbit);
+        let removing_store = Arc::clone(&store);
+        let removal = tokio::spawn(async move {
+            let mut membership = removing_orbit.lock().await;
+            let mut volumes = removing_store.lock().await;
+            remove_device_from_store(&mut membership, &mut volumes, "laptop", |_| {}).unwrap();
+        });
+        tokio::task::yield_now().await;
+        continue_tx.send(()).unwrap();
+        grant.await.unwrap();
+        removal.await.unwrap();
+
+        assert!(!orbit.lock().await.trusts("old-key"));
+        assert!(store.lock().await.get("tank").unwrap().lease.is_none());
     }
 
     /// A dead export leaves its socket file behind, so liveness is never the

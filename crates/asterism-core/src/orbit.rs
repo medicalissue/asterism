@@ -344,6 +344,15 @@ impl Orbit {
         &self.self_name
     }
 
+    /// The durable document backing this orbit.
+    ///
+    /// Other stores which participate in a cross-store transition use its
+    /// directory so tests and alternate homes keep the whole transaction in
+    /// one state root.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Renames this device.
     ///
     /// Refused if a peer already answers to that name — two devices called
@@ -434,6 +443,43 @@ impl Orbit {
             bail!("no device named {name:?} in this orbit — see: ast devices");
         };
         Ok(self.devices.remove(i))
+    }
+
+    /// Removes a peer and does not return success until that removal is
+    /// durable.
+    ///
+    /// A commit can report an error on either side of its publishing rename.
+    /// Reloading after an error tells the live daemon which side became
+    /// visible. If the rename landed but its directory flush failed, writing
+    /// that already-removed state once more gives the retry a fresh durability
+    /// boundary. If it did not land, the in-memory store is restored to the
+    /// still-committed membership so a later call can retry the removal.
+    pub fn remove_durable(&mut self, name: &str) -> Result<Device> {
+        let removed = self.remove(name)?;
+        if let Err(first) = self.save() {
+            *self = Self::load(&self.path).with_context(|| {
+                format!(
+                    "reloading the orbit store after removing {:?} could not be committed: \
+                     {first:#}",
+                    removed.name
+                )
+            })?;
+            if self.by_id(&removed.device_id).is_some() {
+                return Err(first)
+                    .with_context(|| format!("removing device {:?} from the orbit", removed.name));
+            }
+        }
+
+        // The backup is a recovery input, not inert history. The first commit
+        // leaves the old membership there; committing the removed state again
+        // makes both live and last-known-good copies refuse this key.
+        self.save().with_context(|| {
+            format!(
+                "confirming device {:?} is removed from both the live and recovery orbit stores",
+                removed.name
+            )
+        })?;
+        Ok(removed)
     }
 
     /// Records what a peer just said about its own place on the wire.
@@ -859,6 +905,63 @@ mod tests {
         assert!(
             !reloaded.trusts("bb"),
             "a pairing that did not commit is not a pairing"
+        );
+    }
+
+    #[test]
+    fn failed_durable_removal_restores_membership_and_can_be_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orbit.json");
+        let mut o = orbit(dir.path());
+        o.add(peer("laptop", "old-key")).unwrap();
+        o.save().unwrap();
+
+        let armed = durable::faults::arm(
+            "remove-rollback",
+            durable::faults::Point::Rename,
+            path.display().to_string(),
+            std::io::ErrorKind::Other,
+        );
+        assert!(o.remove_durable("laptop").is_err());
+        assert!(o.trusts("old-key"), "memory follows the durable store");
+        assert!(Orbit::load(&path).unwrap().trusts("old-key"));
+        drop(armed);
+
+        assert_eq!(o.remove_durable("laptop").unwrap().device_id, "old-key");
+        assert!(!Orbit::load(&path).unwrap().trusts("old-key"));
+    }
+
+    #[test]
+    fn ambiguous_removal_commit_is_confirmed_at_a_fresh_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orbit.json");
+        let mut o = orbit(dir.path());
+        o.add(peer("laptop", "old-key")).unwrap();
+        o.save().unwrap();
+
+        let _armed = durable::faults::arm_once(
+            "remove-sync",
+            durable::faults::Point::SyncDir,
+            dir.path().display().to_string(),
+            std::io::ErrorKind::Other,
+        );
+        assert_eq!(o.remove_durable("laptop").unwrap().device_id, "old-key");
+        assert!(!Orbit::load(&path).unwrap().trusts("old-key"));
+    }
+
+    #[test]
+    fn recovery_copy_cannot_restore_a_removed_device_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orbit.json");
+        let mut o = orbit(dir.path());
+        o.add(peer("laptop", "old-key")).unwrap();
+        o.save().unwrap();
+        o.remove_durable("laptop").unwrap();
+
+        std::fs::write(&path, b"{").unwrap();
+        assert!(
+            !Orbit::load(&path).unwrap().trusts("old-key"),
+            "last-known-good membership must be revoked too"
         );
     }
 

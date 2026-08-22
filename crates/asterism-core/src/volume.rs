@@ -341,6 +341,46 @@ impl Store {
         }
         revoked
     }
+
+    /// Revokes a device's leases and confirms the result at a durable commit
+    /// boundary before returning it to a membership-removal transaction.
+    ///
+    /// The save is intentional even when no matching lease remains. That can
+    /// be the retry of a commit whose rename became visible but whose
+    /// directory flush failed; skipping the write would let the caller commit
+    /// orbit removal without ever confirming the lease state was durable.
+    pub fn revoke_device_durable(&mut self, device: &str) -> Result<Vec<(String, Lease)>> {
+        let revoked = self.revoke_device(device);
+        if let Err(first) = self.save() {
+            *self = Self::load(&self.path).with_context(|| {
+                format!(
+                    "reloading the volume store after leases for {device:?} could not be \
+                     revoked: {first:#}"
+                )
+            })?;
+            let revocation_is_visible = self.volumes.values().all(|volume| {
+                volume
+                    .lease
+                    .as_ref()
+                    .is_none_or(|lease| lease.holder_device != device)
+            });
+            if !revocation_is_visible {
+                return Err(first)
+                    .with_context(|| format!("revoking volume leases held by device {device:?}"));
+            }
+        }
+
+        // Recovery from an unreadable live document uses `.bak`. The first
+        // commit necessarily leaves the old lease in that backup, so publish
+        // the revoked value once more before membership is allowed to vanish.
+        self.save().with_context(|| {
+            format!(
+                "confirming leases for {device:?} are revoked in both the live and recovery \
+                 volume stores"
+            )
+        })?;
+        Ok(revoked)
+    }
 }
 
 /// What this device says when it is asked about a volume it does not have.
@@ -620,6 +660,100 @@ mod tests {
 
         let next = s.lease("tank", "new", "desktop").unwrap();
         assert_eq!(next.epoch, 2, "the next writer gets a new door");
+    }
+
+    /// A save error before publish must restore the in-memory lease as well
+    /// as leaving it on disk. Otherwise the retry sees "nothing to revoke",
+    /// skips the commit, and permits orbit removal over the still-durable
+    /// writer.
+    #[test]
+    fn failed_durable_revocation_reloads_the_lease_and_retries_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("revoke-rollback-volumes.json");
+        let mut s = Store::load(&path).unwrap();
+        s.create("tank", 1 << 30).unwrap();
+        s.lease("tank", "dev", "laptop").unwrap();
+        s.save().unwrap();
+
+        let armed = durable::faults::arm(
+            "revoke-rollback",
+            durable::faults::Point::Rename,
+            path.display().to_string(),
+            std::io::ErrorKind::Other,
+        );
+        assert!(s.revoke_device_durable("laptop").is_err());
+        assert_eq!(
+            s.get("tank")
+                .unwrap()
+                .lease
+                .as_ref()
+                .map(|lease| lease.holder_device.as_str()),
+            Some("laptop"),
+            "memory follows the value which remained committed"
+        );
+        assert!(
+            Store::load(&path)
+                .unwrap()
+                .get("tank")
+                .unwrap()
+                .lease
+                .is_some(),
+            "the failed publish left the durable writer intact"
+        );
+        drop(armed);
+
+        assert_eq!(s.revoke_device_durable("laptop").unwrap().len(), 1);
+        assert!(Store::load(&path)
+            .unwrap()
+            .get("tank")
+            .unwrap()
+            .lease
+            .is_none());
+    }
+
+    /// A directory-flush error happens after rename. The method reads that
+    /// state back and recommits it, so it never lets the caller remove orbit
+    /// membership on the strength of an unconfirmed rename.
+    #[test]
+    fn ambiguous_revocation_commit_is_confirmed_at_a_fresh_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("revoke-sync-volumes.json");
+        let mut s = Store::load(&path).unwrap();
+        s.create("tank", 1 << 30).unwrap();
+        s.lease("tank", "dev", "laptop").unwrap();
+        s.save().unwrap();
+
+        let _armed = durable::faults::arm_once(
+            "revoke-sync",
+            durable::faults::Point::SyncDir,
+            dir.path().display().to_string(),
+            std::io::ErrorKind::Other,
+        );
+        assert_eq!(s.revoke_device_durable("laptop").unwrap().len(), 1);
+        assert!(Store::load(&path)
+            .unwrap()
+            .get("tank")
+            .unwrap()
+            .lease
+            .is_none());
+    }
+
+    #[test]
+    fn recovery_copy_cannot_resurrect_a_revoked_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("revoke-recovery-volumes.json");
+        let mut s = Store::load(&path).unwrap();
+        s.create("tank", 1 << 30).unwrap();
+        s.lease("tank", "dev", "laptop").unwrap();
+        s.save().unwrap();
+        s.revoke_device_durable("laptop").unwrap();
+
+        std::fs::write(&path, b"{").unwrap();
+        let recovered = Store::load(&path).unwrap();
+        assert!(
+            recovered.get("tank").unwrap().lease.is_none(),
+            "last-known-good state must be revoked too"
+        );
     }
 
     #[test]
