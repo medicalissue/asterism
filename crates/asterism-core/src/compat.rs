@@ -59,7 +59,7 @@
 //! ### The window
 //!
 //! A build serves its own version and the [`SUPPORTED_BACK`] before it:
-//! currently N-5 through N. That is a floor on how far back it will *serve*, not a
+//! currently N-6 through N. That is a floor on how far back it will *serve*, not a
 //! ceiling on how far forward it will speak — the ceiling is the other side's
 //! range, which is why a newer peer is usable.
 //!
@@ -124,7 +124,7 @@ pub const FIRST_PROTOCOL: u32 = 1;
 
 /// How many versions back this build still serves. Keep the unnumbered first
 /// wire usable while newer device-shell capabilities negotiate independently.
-pub const SUPPORTED_BACK: u32 = 5;
+pub const SUPPORTED_BACK: u32 = 6;
 
 /// Format version of the home stamp document itself.
 pub const STAMP_VERSION: u32 = 1;
