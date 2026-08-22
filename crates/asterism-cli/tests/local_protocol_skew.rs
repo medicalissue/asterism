@@ -118,3 +118,63 @@ fn local_images_and_pull_use_core_fallback_for_protocols_one_through_five() {
         }
     }
 }
+
+#[test]
+fn proxied_image_request_uses_its_inner_protocol_floor() {
+    for protocol in [5, 6] {
+        let home = tempfile::tempdir().unwrap();
+        let socket = home.path().join("astd.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let ping = read_frame(&mut reader);
+            assert_eq!(ping["cmd"], "ping");
+            write_pong(&mut stream, protocol);
+
+            if protocol == 5 {
+                // The refusal is local: after the handshake, no incompatible
+                // envelope is put on the wire for the daemon to misparse.
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut unexpected = String::new();
+                let read = reader.read_line(&mut unexpected).unwrap();
+                assert_eq!(
+                    read, 0,
+                    "protocol 5 received a proxied protocol-6 image frame"
+                );
+            } else {
+                let proxied = read_frame(&mut reader);
+                assert_eq!(proxied["cmd"], "proxy");
+                assert_eq!(proxied["device"], "nas");
+                assert_eq!(proxied["inner"]["cmd"], "image_list");
+                writeln!(stream, r#"{{"result":"images","images":[]}}"#).unwrap();
+            }
+        });
+
+        let output = Command::new(env!("CARGO_BIN_EXE_ast"))
+            .env("ASTERISM_HOME", home.path())
+            .args(["--device", "nas", "images"])
+            .output()
+            .unwrap();
+        if protocol == 5 {
+            assert!(
+                !output.status.success(),
+                "protocol 5 should refuse proxy(image_list)"
+            );
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert!(error.contains("image_list"), "{error}");
+            assert!(error.contains("protocol 6"), "{error}");
+        } else {
+            assert!(
+                output.status.success(),
+                "protocol 6 failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        server.join().unwrap();
+    }
+}
