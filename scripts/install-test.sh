@@ -64,6 +64,18 @@ echo "astd-vz ${version#v}"
 EOF
 		chmod +x "${stage}/astd-vz"
 		members=(ast astd astd-vz)
+	elif [ "$helper" = linux ]; then
+		for bin in cloud-hypervisor virtiofsd; do
+			printf '#!/bin/sh\necho "%s test"\n' "$bin" >"${stage}/${bin}"
+			chmod +x "${stage}/${bin}"
+		done
+		mkdir -p "${stage}/share/asterism/licenses"
+		cp "${ROOT}/packaging/linux-components.env" "${stage}/share/asterism/"
+		for license in cloud-hypervisor-Apache-2.0 cloud-hypervisor-BSD-3-Clause \
+			virtiofsd-Apache-2.0 virtiofsd-BSD-3-Clause; do
+			printf 'test license\n' >"${stage}/share/asterism/licenses/${license}.txt"
+		done
+		members=(ast astd cloud-hypervisor virtiofsd share)
 	fi
 	tar -czf "${dir}/asterism-${version}-${target}.tar.gz" -C "$stage" "${members[@]}"
 	# A release also publishes the rendered Homebrew formula, and it is
@@ -145,6 +157,16 @@ printf '%s\n' "\$*" >>"${WORK}/cargo-args"
 exit 0
 EOF
 chmod +x "${SHIMS}/cargo"
+
+cat >"${SHIMS}/setcap" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+cat >"${SHIMS}/sudo" <<'EOF'
+#!/bin/sh
+exec "$@"
+EOF
+chmod +x "${SHIMS}/setcap" "${SHIMS}/sudo"
 
 # codesign, for the vz helper. Enough of one to answer the three questions
 # asked of it: sign this, does it carry the entitlement, does the signature
@@ -331,6 +353,7 @@ mkdir -p "${WORK}/home"
 # and everything after it carries one.
 make_release v0.0.9 darwin-arm64 novz
 make_release v0.1.0
+make_release v0.1.1 linux-x86_64 linux
 printf '{"tag_name": "v0.1.0", "name": "v0.1.0"}\n' >"${WORK}/latest.json"
 
 # ---- 1. the script itself --------------------------------------------------
@@ -538,7 +561,7 @@ ok "unreachable release assets refuse without touching the prefix"
 
 # ---- 8. unsupported architectures ------------------------------------------
 
-for host in "Darwin x86_64" "Linux arm64" "Linux x86_64" "FreeBSD amd64"; do
+for host in "Darwin x86_64" "Linux riscv64" "FreeBSD amd64"; do
 	# shellcheck disable=SC2086
 	set -- $host
 	fresh_prefix "arch-$1-$2"
@@ -550,6 +573,21 @@ for host in "Darwin x86_64" "Linux arm64" "Linux x86_64" "FreeBSD amd64"; do
 done
 set_host Darwin arm64
 ok "every host without a binary release is refused by name, pointing at source"
+
+fresh_prefix linux-release
+set_host Linux x86_64
+run_install ok ASTERISM_VERSION=v0.1.1
+says "release v0.1.1 for linux-x86_64"
+says "installed ${PREFIX}/bin/cloud-hypervisor"
+says "installed ${PREFIX}/bin/virtiofsd"
+says "Linux instances default to bundled Cloud Hypervisor v53.0 over KVM."
+[ -x "${PREFIX}/bin/cloud-hypervisor" ] || fail "Cloud Hypervisor was not installed"
+[ -f "${PREFIX}/share/asterism/linux-components.env" ] || fail "component lock was not installed"
+run_install ok -- --uninstall
+[ ! -e "${PREFIX}/bin/cloud-hypervisor" ] || fail "uninstall left Cloud Hypervisor behind"
+[ ! -e "${PREFIX}/share/asterism/linux-components.env" ] || fail "uninstall left component metadata behind"
+set_host Darwin arm64
+ok "a Linux release installs and removes its pinned native runtime without a Rust toolchain"
 
 # ---- 9. the source escape hatch --------------------------------------------
 

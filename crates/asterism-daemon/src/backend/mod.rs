@@ -21,6 +21,7 @@ use asterism_core::instance::{Instance, PortForward};
 use asterism_core::proc::{Evidence, Ownership, ProcId};
 use asterism_core::{image, paths, profile, seed};
 
+pub mod chv;
 pub mod qemu;
 pub mod qmp;
 pub mod vz;
@@ -36,7 +37,13 @@ mod conformance;
 fn backends() -> &'static [Arc<dyn Hypervisor>] {
     static BACKENDS: OnceLock<Vec<Arc<dyn Hypervisor>>> = OnceLock::new();
     BACKENDS
-        .get_or_init(|| vec![Arc::new(qemu::Qemu::new()), Arc::new(vz::Vz::new())])
+        .get_or_init(|| {
+            vec![
+                Arc::new(chv::Chv::new()),
+                Arc::new(qemu::Qemu::new()),
+                Arc::new(vz::Vz::new()),
+            ]
+        })
         .as_slice()
 }
 
@@ -151,11 +158,16 @@ fn select_with(
         });
     }
 
-    // VZ is the lightest path on a capable host. Capability mismatches are
-    // ordinary reasons to try QEMU: OCI direct boot, loopback publishing and
-    // qcow2 base images all need facilities VZ does not currently expose.
+    // Native backends lead on their own hosts. Cloud Hypervisor is Linux's
+    // product path; VZ is macOS's. QEMU remains the compatibility floor and
+    // is never tried before a native backend on a host that can run one.
     let mut refusals = Vec::new();
-    for id in [vz::ID, qemu::ID] {
+    let order = if cfg!(target_os = "linux") {
+        [chv::ID, qemu::ID, vz::ID]
+    } else {
+        [vz::ID, qemu::ID, chv::ID]
+    };
+    for id in order {
         match resolve(id).and_then(|hv| runnable(hv, requirements)) {
             Ok(selection) => return Ok(selection),
             Err(error) => refusals.push(format!("{id}: {error:#}")),
@@ -444,12 +456,17 @@ const QEMU_EXECS: &[&str] = &["qemu-system-*"];
 /// (and its helper moved) while the guest kept running.
 const VZ_EXECS: &[&str] = &[asterism_vz::HELPER_BIN];
 
+/// Pinned Cloud Hypervisor helper. A family allows an in-place release
+/// upgrade while a v53 guest from the previous daemon remains adopted.
+const CHV_EXECS: &[&str] = &["cloud-hypervisor"];
+
 /// Which executables a handle for this backend may be holding, or `None` for
 /// a backend with no process of its own.
 fn execs_for(backend: &str) -> Option<&'static [&'static str]> {
     match backend {
         qemu::ID => Some(QEMU_EXECS),
         vz::ID => Some(VZ_EXECS),
+        chv::ID => Some(CHV_EXECS),
         _ => None,
     }
 }
@@ -477,6 +494,7 @@ fn instance_evidence(inst: &Instance, h: &Handle) -> Vec<std::path::PathBuf> {
     match h.backend.as_str() {
         qemu::ID => names.push(dir.join("qemu.pid")),
         vz::ID => names.push(dir.join("vz.json")),
+        chv::ID => names.push(dir.join("chv.pid")),
         _ => {}
     }
     names
@@ -930,8 +948,9 @@ mod tests {
         fn each_backend_names_the_programs_it_spawns() {
             assert_eq!(execs_for(qemu::ID), Some(QEMU_EXECS));
             assert_eq!(execs_for(vz::ID), Some(VZ_EXECS));
-            assert_eq!(execs_for("chv"), None);
+            assert_eq!(execs_for(chv::ID), Some(CHV_EXECS));
             assert_eq!(VZ_EXECS, &["astd-vz"]);
+            assert_eq!(CHV_EXECS, &["cloud-hypervisor"]);
         }
 
         /// And what each backend offers as proof. Every path is inside the
@@ -943,6 +962,7 @@ mod tests {
             for (backend, expected) in [
                 (qemu::ID, dir.join("qemu.pid")),
                 (vz::ID, dir.join("vz.json")),
+                (chv::ID, dir.join("chv.pid")),
             ] {
                 let h = Handle {
                     backend: backend.into(),

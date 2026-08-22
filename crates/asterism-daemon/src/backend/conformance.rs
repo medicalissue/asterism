@@ -19,10 +19,11 @@ use asterism_core::hv::{
 use asterism_core::instance::{Instance, Shape};
 use asterism_core::power::{Change, SleepGuard};
 
-use super::{backends, by_id, qemu, vz};
+use super::{backends, by_id, chv, qemu, vz};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ControlKind {
+    HttpApi,
     Qmp,
     Rpc,
 }
@@ -30,6 +31,7 @@ enum ControlKind {
 impl ControlKind {
     fn channel(self, path: PathBuf) -> ControlChannel {
         match self {
+            ControlKind::HttpApi => ControlChannel::HttpApi { path },
             ControlKind::Qmp => ControlChannel::Qmp { path },
             ControlKind::Rpc => ControlChannel::Rpc { path },
         }
@@ -37,6 +39,7 @@ impl ControlKind {
 
     fn wire_name(self) -> &'static str {
         match self {
+            ControlKind::HttpApi => "http_api",
             ControlKind::Qmp => "qmp",
             ControlKind::Rpc => "rpc",
         }
@@ -49,6 +52,7 @@ impl ControlKind {
 /// panic and cannot merge until its handles join the contract.
 fn control_kind(id: &str) -> ControlKind {
     match id {
+        chv::ID => ControlKind::HttpApi,
         qemu::ID => ControlKind::Qmp,
         vz::ID => ControlKind::Rpc,
         other => panic!("registered backend {other:?} has no conformance profile"),
@@ -138,7 +142,7 @@ impl Fixture {
             ctl: kind.channel(self.control.clone()),
             endpoint: match kind {
                 ControlKind::Qmp => GuestEndpoint::HostForward { ssh_port: 22022 },
-                ControlKind::Rpc => GuestEndpoint::GuestAddr {
+                ControlKind::HttpApi | ControlKind::Rpc => GuestEndpoint::GuestAddr {
                     addr: "192.0.2.1".parse().unwrap(),
                 },
             },
