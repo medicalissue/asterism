@@ -184,6 +184,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "asterism-coordinator"
+version = "0.0.2"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "asterism-core",
+ "asterism-mesh",
+ "blake3",
+ "bytes",
+ "data-encoding",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "asterism-core"
 version = "0.0.2"
 dependencies = [
@@ -2765,6 +2791,9 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -3058,6 +3087,18 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "serde_urlencoded"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3491c14715ca2294c4d6a88f15e84739788c1d030eed8c110436aafdaa2f3fd"
+dependencies = [
+ "form_urlencoded",
+ "itoa",
+ "ryu",
+ "serde",
 ]
 
 [[package]]
