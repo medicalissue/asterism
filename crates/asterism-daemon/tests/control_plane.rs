@@ -12,7 +12,7 @@
 //! control plane, and a daemon that publishes itself to a discovery service
 //! in a test is a daemon doing something a test did not ask for.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -45,12 +45,14 @@ impl Daemon {
     /// Start one on a home somebody else prepared — the tests about what a
     /// previous daemon left behind.
     fn on(dir: tempfile::TempDir, home: PathBuf) -> Daemon {
+        let spawned = spawn_logged(&home, &[]);
         let daemon = Daemon {
-            child: spawn(&home, &[]),
+            child: spawned.child,
             home,
             _dir: dir,
         };
-        daemon.await_socket();
+        let mut daemon = daemon;
+        daemon.await_ready();
         daemon
     }
 
@@ -63,18 +65,20 @@ impl Daemon {
     fn speaking(min: u32, max: u32) -> Daemon {
         let dir = tempfile::tempdir().expect("a temp dir");
         let home = dir.path().join("home");
+        let spawned = spawn_logged(
+            &home,
+            &[
+                ("ASTERISM_MIN_PROTOCOL_VERSION", &min.to_string()),
+                ("ASTERISM_PROTOCOL_VERSION", &max.to_string()),
+            ],
+        );
         let daemon = Daemon {
-            child: spawn(
-                &home,
-                &[
-                    ("ASTERISM_MIN_PROTOCOL_VERSION", &min.to_string()),
-                    ("ASTERISM_PROTOCOL_VERSION", &max.to_string()),
-                ],
-            ),
+            child: spawned.child,
             home,
             _dir: dir,
         };
-        daemon.await_socket();
+        let mut daemon = daemon;
+        daemon.await_ready();
         daemon
     }
 
@@ -82,15 +86,77 @@ impl Daemon {
         self.home.join("astd.sock")
     }
 
-    fn await_socket(&self) {
+    fn stderr(&mut self) -> String {
+        let Some(mut stderr) = self.child.stderr.take() else {
+            return "<stderr was already consumed>".into();
+        };
+        let mut said = String::new();
+        match stderr.read_to_string(&mut said) {
+            Ok(_) => said,
+            Err(e) => format!("<could not read astd stderr: {e}>"),
+        }
+    }
+
+    fn fail_startup(&mut self, reason: &str, last_probe: &str) -> ! {
+        let status = match self.child.try_wait() {
+            Ok(Some(status)) => status,
+            Ok(None) => {
+                let _ = self.child.kill();
+                self.child
+                    .wait()
+                    .unwrap_or_else(|e| panic!("{reason}; could not reap astd: {e}"))
+            }
+            Err(e) => panic!("{reason}; could not inspect astd: {e}"),
+        };
+        panic!(
+            "{reason} on {}\nlast readiness probe: {last_probe}\nchild exit: {status}\nchild stderr:\n{}",
+            self.sock().display(),
+            self.stderr()
+        );
+    }
+
+    fn await_ready(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(30);
+        let mut last_probe = String::from("socket is absent");
         while Instant::now() < deadline {
-            if UnixStream::connect(self.sock()).is_ok() {
-                return;
+            match self.child.try_wait() {
+                Ok(Some(status)) => self.fail_startup(
+                    &format!("astd exited before readiness with {status}"),
+                    &last_probe,
+                ),
+                Ok(None) => {}
+                Err(e) => self.fail_startup(
+                    &format!("could not inspect astd while waiting for readiness: {e}"),
+                    &last_probe,
+                ),
+            }
+
+            match std::fs::symlink_metadata(self.sock()) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    last_probe = "socket is absent".into();
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+                Err(e) => {
+                    last_probe = format!("socket metadata failed: {e}");
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+            }
+
+            match ipc::audit_socket(&self.sock()) {
+                Ok(ipc::SocketState::Ready) => match readiness_probe(&self.sock()) {
+                    Ok(reply) if serde_json::from_str::<Response>(&reply).is_ok() => return,
+                    Ok(reply) => last_probe = format!("unexpected ping reply: {reply:?}"),
+                    Err(e) => last_probe = format!("socket probe failed: {e}"),
+                },
+                Ok(ipc::SocketState::Absent) => last_probe = "socket is absent".into(),
+                Err(e) => last_probe = format!("socket audit failed: {e:#}"),
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        panic!("astd did not come up on {}", self.sock().display());
+        self.fail_startup("astd did not become ready within 30s", &last_probe);
     }
 
     /// One request, one reply, on a connection of its own — which is how
@@ -158,6 +224,13 @@ impl Daemon {
         }
         panic!("astd did not exit");
     }
+
+    /// Stop this daemon while keeping its home alive for a restart test.
+    fn stop_preserving_home(&mut self) -> tempfile::TempDir {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        std::mem::replace(&mut self._dir, tempfile::tempdir().unwrap())
+    }
 }
 
 impl Drop for Daemon {
@@ -167,7 +240,24 @@ impl Drop for Daemon {
     }
 }
 
-fn spawn(home: &Path, extra: &[(&str, &str)]) -> Child {
+struct LoggedChild {
+    child: Child,
+}
+
+impl LoggedChild {
+    fn stderr(&mut self) -> String {
+        let Some(mut stderr) = self.child.stderr.take() else {
+            return "<stderr was already consumed>".into();
+        };
+        let mut said = String::new();
+        match stderr.read_to_string(&mut said) {
+            Ok(_) => said,
+            Err(e) => format!("<could not read astd stderr: {e}>"),
+        }
+    }
+}
+
+fn spawn_logged(home: &Path, extra: &[(&str, &str)]) -> LoggedChild {
     let mut command = Command::new(env!("CARGO_BIN_EXE_astd"));
     command
         .env("ASTERISM_HOME", home)
@@ -175,12 +265,108 @@ fn spawn(home: &Path, extra: &[(&str, &str)]) -> Child {
     for (key, value) in extra {
         command.env(key, value);
     }
-    command
+    let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("starting astd")
+        .expect("starting astd");
+    LoggedChild { child }
+}
+
+fn readiness_probe(sock: &Path) -> io::Result<String> {
+    let mut stream = UnixStream::connect(sock)?;
+    stream.set_read_timeout(Some(Duration::from_millis(250)))?;
+    stream.write_all(b"{\"cmd\":\"ping\"}\n")?;
+    let mut reply = String::new();
+    BufReader::new(stream).read_line(&mut reply)?;
+    Ok(reply)
+}
+
+struct StormRacer {
+    child: LoggedChild,
+    last_probe: String,
+}
+
+struct StormRacers {
+    racers: Vec<StormRacer>,
+    reaped: bool,
+}
+
+struct StormReport {
+    index: usize,
+    pid: u32,
+    status: String,
+    success: bool,
+    socket: String,
+    last_probe: String,
+    stderr: String,
+}
+
+impl StormRacers {
+    fn reap(&mut self, sock: &Path) -> Vec<StormReport> {
+        let reports = self
+            .racers
+            .iter_mut()
+            .enumerate()
+            .map(|(index, racer)| {
+                let pid = racer.child.child.id();
+                let _ = racer.child.child.kill();
+                let status = racer
+                    .child
+                    .child
+                    .wait()
+                    .unwrap_or_else(|e| panic!("reaping storm racer {index} ({pid}): {e}"));
+                let stderr = racer.child.stderr();
+                let socket = match std::fs::symlink_metadata(sock) {
+                    Ok(metadata) => format!("present ({metadata:?})"),
+                    Err(error) => format!("unavailable: {error}"),
+                };
+                StormReport {
+                    index,
+                    pid,
+                    status: status.to_string(),
+                    success: status.success(),
+                    socket,
+                    last_probe: racer.last_probe.clone(),
+                    stderr,
+                }
+            })
+            .collect();
+        self.reaped = true;
+        reports
+    }
+}
+
+impl Drop for StormRacers {
+    fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        for racer in &mut self.racers {
+            let _ = racer.child.child.kill();
+            let _ = racer.child.child.wait();
+        }
+    }
+}
+
+fn storm_evidence(reports: &[StormReport]) -> String {
+    reports
+        .iter()
+        .map(|report| {
+            format!(
+                "racer {} pid {} exit {} success={} socket={} last socket probe: {}\nstderr:\n{}",
+                report.index,
+                report.pid,
+                report.status,
+                report.success,
+                report.socket,
+                report.last_probe,
+                report.stderr
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn read_line(stream: &mut UnixStream) -> String {
@@ -440,80 +626,134 @@ fn a_home_an_older_daemon_left_open_is_tightened_and_reported() {
     let home = dir.path().join("home");
     std::fs::create_dir(&home).unwrap();
     std::fs::set_permissions(&home, PermissionsExt::from_mode(0o755)).unwrap();
+    assert_eq!(mode_of(&home), 0o755, "the fixture home was not opened");
 
     let mut astd = Daemon::on(dir, home.clone());
     assert_eq!(mode_of(&home), 0o700);
 
     astd.signal("-TERM");
     astd.wait_until_gone();
-    let mut said = String::new();
-    astd.child
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut said)
-        .unwrap();
+    let said = astd.stderr();
     assert!(
         said.contains("0755"),
         "the daemon did not say what it found: {said}"
     );
 }
 
-/// The second-daemon race. Six start at once on one home with nothing there
-/// yet; five have to lose, and — the half that matters — losing must not
-/// disturb the one that won. Probe-then-unlink got both of those wrong: the
-/// window between a probe and a bind is wide enough for every one of them to
-/// unlink the socket the last one just bound.
+/// The second-daemon race. One audited daemon prepares the home, then six
+/// start at once; five have to lose, and — the half that matters — losing must
+/// not disturb the one that won. Preparing first isolates the election from
+/// first-boot home creation, so this test can make the lock's one-winner
+/// promise without six stamp writers racing over an empty directory.
 #[test]
 fn only_one_of_a_storm_of_daemons_takes_the_home() {
-    let dir = tempfile::tempdir().unwrap();
-    let home = dir.path().join("home");
-    let mut racers: Vec<Child> = (0..6).map(|_| spawn(&home, &[])).collect();
+    let mut seed = Daemon::start();
+    let home = seed.home.clone();
+    let _dir = seed.stop_preserving_home();
+    drop(seed);
+    let mut racers = StormRacers {
+        racers: (0..6)
+            .map(|_| StormRacer {
+                child: spawn_logged(&home, &[]),
+                last_probe: "not probed".into(),
+            })
+            .collect(),
+        reaped: false,
+    };
 
     let deadline = Instant::now() + Duration::from_secs(30);
-    let mut lost = 0;
-    while Instant::now() < deadline && lost < 5 {
-        lost = 0;
-        for racer in racers.iter_mut() {
-            if matches!(racer.try_wait(), Ok(Some(_))) {
-                lost += 1;
+    let mut finished = vec![false; racers.racers.len()];
+    let mut ready_winners = Vec::new();
+    while Instant::now() < deadline && ready_winners.is_empty() {
+        let pidfile = std::fs::read_to_string(home.join("astd.pid"))
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u32>().ok());
+        for (index, racer) in racers.racers.iter_mut().enumerate() {
+            if finished[index] {
+                continue;
+            }
+            match racer.child.child.try_wait() {
+                Ok(Some(status)) => {
+                    finished[index] = true;
+                    racer.last_probe = format!("child exited before ping readiness: {status}");
+                }
+                Ok(None) => match readiness_probe(&home.join("astd.sock")) {
+                    Ok(reply) => {
+                        let parseable = serde_json::from_str::<Response>(&reply).is_ok();
+                        racer.last_probe = format!(
+                            "pidfile={pidfile:?}, parseable_ping={parseable}, reply={reply:?}"
+                        );
+                        if parseable && pidfile == Some(racer.child.child.id()) {
+                            ready_winners.push(index);
+                        }
+                    }
+                    Err(error) => {
+                        racer.last_probe = format!("pidfile={pidfile:?}, ping failed: {error}");
+                    }
+                },
+                Err(error) => {
+                    racer.last_probe = format!("pidfile={pidfile:?}, child wait failed: {error}");
+                }
             }
         }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
-    let mut failures = 0;
-    let mut alive = 0;
-    for racer in racers.iter_mut() {
-        match racer.try_wait() {
-            Ok(Some(status)) => {
-                assert!(
-                    !status.success(),
-                    "a daemon that lost the home exited as if it won"
-                );
-                failures += 1;
-            }
-            _ => alive += 1,
+        if ready_winners.is_empty() {
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
-    assert_eq!(alive, 1, "{alive} daemons hold one home");
-    assert_eq!(failures, 5);
 
-    let sock = home.join("astd.sock");
-    let mut stream = UnixStream::connect(&sock).expect("the winner is still listening");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .unwrap();
-    stream.write_all(b"{\"cmd\":\"ping\"}\n").unwrap();
-    assert!(
-        read_line(&mut stream).contains("pong"),
-        "the losers took the winner's socket"
+    let winner = ready_winners.first().copied();
+    if let Some(winner) = winner {
+        let settle_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < settle_deadline {
+            let mut all_losers_exited = true;
+            for (index, racer) in racers.racers.iter_mut().enumerate() {
+                if index == winner || finished[index] {
+                    continue;
+                }
+                match racer.child.child.try_wait() {
+                    Ok(Some(status)) => {
+                        finished[index] = true;
+                        racer.last_probe = format!("child exited after losing readiness: {status}");
+                    }
+                    Ok(None) => all_losers_exited = false,
+                    Err(error) => {
+                        all_losers_exited = false;
+                        racer.last_probe = format!("child wait failed while settling: {error}");
+                    }
+                }
+            }
+            if all_losers_exited {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    let reports = racers.reap(&home.join("astd.sock"));
+    let evidence = storm_evidence(&reports);
+    assert_eq!(
+        ready_winners.len(),
+        1,
+        "expected exactly one parseable-ping-ready winner; evidence:\n{evidence}"
     );
-
-    for mut racer in racers {
-        let _ = racer.kill();
-        let _ = racer.wait();
-    }
+    assert_eq!(
+        finished
+            .iter()
+            .enumerate()
+            .filter(|(index, done)| **done || Some(*index) == winner)
+            .count(),
+        6,
+        "not every racer reached an owned cleanup decision; evidence:\n{evidence}"
+    );
+    assert_eq!(
+        reports.len(),
+        6,
+        "every racer must have exit and stderr evidence:\n{evidence}"
+    );
+    assert!(
+        reports.iter().all(|report| !report.success),
+        "a storm racer exited successfully; evidence:\n{evidence}"
+    );
 }
 
 /// A daemon told to stop takes its socket and its pid file with it, and the
@@ -940,7 +1180,7 @@ fn a_home_a_newer_build_wrote_is_refused_before_the_daemon_touches_it() {
 fn a_home_this_build_owns_is_stamped_once_and_then_left_alone() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let home = dir.path().join("home");
-    let astd = Daemon::on(dir, home);
+    let mut astd = Daemon::on(dir, home);
     astd.assert_serving();
 
     let stamp = std::fs::read_to_string(astd.home.join("home.json"))
@@ -952,23 +1192,21 @@ fn a_home_this_build_owns_is_stamped_once_and_then_left_alone() {
     // A second daemon on the same home rewrites nothing: a stamp that churned
     // on every start would be a write on every boot, for no news.
     let home = astd.home.clone();
-    drop(astd);
-    let mut second = Command::new(env!("CARGO_BIN_EXE_astd"))
-        .env("ASTERISM_HOME", &home)
-        .env("ASTERISM_MESH", "local")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("starting astd");
-    await_socket(&home.join("astd.sock"));
+    let preserved_dir = astd.stop_preserving_home();
+    let spawned = spawn_logged(&home, &[]);
+    let mut second = Daemon {
+        child: spawned.child,
+        home: home.clone(),
+        _dir: tempfile::tempdir().unwrap(),
+    };
+    second.await_ready();
     assert_eq!(
         std::fs::read_to_string(home.join("home.json")).unwrap(),
         stamp,
         "the stamp was rewritten for no news"
     );
-    let _ = second.kill();
-    let _ = second.wait();
+    drop(second);
+    drop(preserved_dir);
 }
 
 /// Wait for a child to exit, or give up.
@@ -984,15 +1222,4 @@ fn wait_for_exit(child: &mut Child, patience: Duration) -> Option<std::process::
     let _ = child.kill();
     let _ = child.wait();
     None
-}
-
-fn await_socket(sock: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
-        if UnixStream::connect(sock).is_ok() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!("astd did not come up on {}", sock.display());
 }
