@@ -10,9 +10,11 @@ Two things ship from this repository and they ship separately:
 They are deliberately not one artifact. The CLI is a pair of binaries that
 belong on `PATH` and get upgraded from a shell; the app is a bundle macOS
 wants to notarize and quarantine. Bundling the CLI inside the app would put
-the daemon somewhere `brew upgrade` could not reach, and shipping the app
-through a tarball would strip the signature people are relying on. The
-installer never touches the DMG and the DMG never writes to `~/.local/bin`.
+the daemon somewhere `brew upgrade` could not reach. The app tarball is
+reserved for the authenticated updater; the DMG supplies the notarized,
+stapled container and familiar Applications shortcut expected for a manual
+install. The installer never touches the DMG and the DMG never writes to
+`~/.local/bin`.
 
 After installation they do, however, upgrade as one compatible unit. Both the
 desktop app's Updates controls and `ast update` invoke the same updater and the
@@ -84,17 +86,26 @@ $ sh install.sh --uninstall
 ```
 v0.1.0/
   asterism-v0.1.0-darwin-arm64.tar.gz   # ast, astd, astd-vz, asterism-update — flat
-  Asterism-v0.1.0-darwin-arm64.tar.gz   # signed app; notarized with Developer ID credentials
+  Asterism-v0.1.0-darwin-arm64.app.tar.gz # signed app payload used by the updater
+  Asterism-v0.1.0-darwin-arm64.dmg      # signed manual installer; drag to Applications
   RELEASE.json                          # exact build, URLs, digests, minimum updater
   RELEASE.json.sig                      # mandatory detached update signature
   asterism.rb                           # the Homebrew formula for this tag
-  SHA256SUMS                            # shasum -a 256 of both of the above
+  SHA256SUMS                            # hashes CLI/app payloads, DMG, and formula
   SHA256SUMS.sig                        # when a signing key exists
 ```
 
-The tarball is flat on purpose: the installer unpacks it and expects `ast` and
+The CLI tarball is flat on purpose: the installer unpacks it and expects `ast` and
 `astd` at the top, and refuses a tarball missing either rather than installing
 half a release.
+
+The app tarball remains the signed update channel's payload; it is not the
+manual installer. For a first desktop install, open the DMG and drag
+`Asterism.app` to its Applications shortcut. Both app artifacts are made from
+the same signed bundle. With Developer ID and notary credentials the workflow
+notarizes and staples both the app and its DMG container; a credential-free dry
+run uses an ad-hoc signature and still mounts the DMG and runs the bundled app's
+version and immutable build-id checks.
 
 ### The vz helper
 

@@ -233,10 +233,37 @@ jobs:
               --key "${RUNNER_TEMP}/app-notary.p8" --key-id "$NOTARY_KEY_ID" \
               --issuer "$NOTARY_ISSUER_ID" --wait
             xcrun stapler staple "$app"
+            xcrun stapler validate "$app"
             rm -f "${RUNNER_TEMP}/app-notary.p8" "${RUNNER_TEMP}/Asterism.app.zip"
           fi
+          # Preserve the app tarball as the updater payload. The DMG below is
+          # a second, manual-install presentation of this exact signed app;
+          # the app is not rebuilt or signed again between the two.
           COPYFILE_DISABLE=1 tar -czf "${dist}/Asterism-${version}-darwin-arm64.app.tar.gz" \
             -C "${RUNNER_TEMP}" Asterism.app
+
+          dmg_root="${RUNNER_TEMP}/dmg-root"
+          dmg="${dist}/Asterism-${version}-darwin-arm64.dmg"
+          rm -rf "$dmg_root"
+          mkdir -p "$dmg_root"
+          cp -R "$app" "$dmg_root/Asterism.app"
+          ln -s /Applications "$dmg_root/Applications"
+          hdiutil create -quiet -volname Asterism -srcfolder "$dmg_root" \
+            -format UDZO -ov "$dmg"
+          rm -rf "$dmg_root"
+
+          # The app ticket was stapled before the image was assembled. A DMG
+          # is a separate notarizable container and needs its own submitted
+          # and stapled ticket for Gatekeeper to validate it offline.
+          if [ "$identity" != "-" ]; then
+            printf '%s' "$NOTARY_KEY_P8" | base64 --decode >"${RUNNER_TEMP}/dmg-notary.p8"
+            xcrun notarytool submit "$dmg" \
+              --key "${RUNNER_TEMP}/dmg-notary.p8" --key-id "$NOTARY_KEY_ID" \
+              --issuer "$NOTARY_ISSUER_ID" --wait
+            xcrun stapler staple "$dmg"
+            xcrun stapler validate "$dmg"
+            rm -f "${RUNNER_TEMP}/dmg-notary.p8"
+          fi
 
       - name: Render the tap formula for this tag
         run: |
@@ -259,7 +286,8 @@ jobs:
           # against this file too when the installer stands up a local tap.
           cli="asterism-${version}-darwin-arm64.tar.gz"
           app="Asterism-${version}-darwin-arm64.app.tar.gz"
-          ( cd "dist/${version}" && shasum -a 256 "$cli" "$app" asterism.rb >SHA256SUMS )
+          dmg="Asterism-${version}-darwin-arm64.dmg"
+          ( cd "dist/${version}" && shasum -a 256 "$cli" "$app" "$dmg" asterism.rb >SHA256SUMS )
           cli_sha="$(shasum -a 256 "dist/${version}/${cli}" | awk '{print $1}')"
           app_sha="$(shasum -a 256 "dist/${version}/${app}" | awk '{print $1}')"
           base="https://github.com/${{ github.repository }}/releases/download/${version}"
@@ -334,6 +362,42 @@ jobs:
           got="$("$app/Contents/MacOS/asterism-gui" --version | sed -n 's/^build  *//p')"
           want="${version#v}+${{ github.sha }}"
           [ "$got" = "$want" ] || { echo "app build ${got}, expected ${want}" >&2; exit 1; }
+
+      - name: The manual installer is the exact mounted release DMG
+        run: |
+          set -eu
+          version="${{ needs.build.outputs.version }}"
+          dmg="dist/${version}/Asterism-${version}-darwin-arm64.dmg"
+          expected="$(cat <<NAMES
+          Asterism-${version}-darwin-arm64.app.tar.gz
+          Asterism-${version}-darwin-arm64.dmg
+          RELEASE.json
+          RELEASE.json.sig
+          SHA256SUMS
+          asterism-${version}-darwin-arm64.tar.gz
+          asterism.rb
+          NAMES
+          )"
+          actual="$(find "dist/${version}" -maxdepth 1 -type f -exec basename {} \; | LC_ALL=C sort)"
+          [ "$actual" = "$expected" ] || {
+            echo "release artifact names differ" >&2
+            diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual")
+            exit 1
+          }
+          ( cd "dist/${version}" && shasum -a 256 -c SHA256SUMS )
+          hdiutil verify -quiet "$dmg"
+          mount="${RUNNER_TEMP}/asterism-dmg"
+          mkdir -p "$mount"
+          hdiutil attach -quiet -readonly -nobrowse -mountpoint "$mount" "$dmg"
+          trap 'hdiutil detach -quiet "$mount"' EXIT
+          app="$mount/Asterism.app"
+          [ -L "$mount/Applications" ]
+          [ "$(readlink "$mount/Applications")" = /Applications ]
+          codesign --verify --deep --strict "$app"
+          output="$("$app/Contents/MacOS/asterism-gui" --version)"
+          printf '%s\n' "$output"
+          printf '%s\n' "$output" | grep -qFx "version   ${version#v}"
+          printf '%s\n' "$output" | grep -qFx "build     ${version#v}+${{ github.sha }}"
 
       # Is what was just packed the thing that was built, and is it one build?
       # The digest checks below prove the bytes came through intact; this
@@ -481,6 +545,7 @@ jobs:
             echo "quarantined helper is refused before it can start a guest."
             echo
             echo "The desktop app is a separate download."
+            echo "Open \`Asterism-${version}-darwin-arm64.dmg\` and drag Asterism to Applications."
             echo
             echo "## Checksums"
             echo
@@ -497,6 +562,7 @@ jobs:
             --notes-file "$notes" \
             "dist/${version}/asterism-${version}-darwin-arm64.tar.gz" \
             "dist/${version}/Asterism-${version}-darwin-arm64.app.tar.gz" \
+            "dist/${version}/Asterism-${version}-darwin-arm64.dmg" \
             "dist/${version}/SHA256SUMS" \
             "dist/${version}/RELEASE.json" \
             "dist/${version}/RELEASE.json.sig" \

@@ -208,6 +208,11 @@ manifest and matching app, CLI, daemon, and helper before activation, and
 rolls the unit back if activation fails. Homebrew installations remain owned
 by Homebrew.
 
+For a first desktop install on Apple silicon, download
+`Asterism-<version>-darwin-arm64.dmg` from the matching GitHub release, open it,
+and drag Asterism to Applications. The `.app.tar.gz` beside it is the updater
+payload, not the manual installer.
+
 ```console
 $ ast update status
 $ ast update channel stable       # stable, beta, or nightly
