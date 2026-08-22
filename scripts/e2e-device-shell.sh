@@ -69,7 +69,11 @@ refute() {
 
 assert_no_tcp_listener() {
   local pid listeners
-  command -v lsof >/dev/null 2>&1 || return 0
+  # This is a security assertion, not an optional diagnostic.  Passing the
+  # E2E without inspecting the target process would leave the no-TCP-listener
+  # guarantee unproved on machines where lsof is absent.
+  command -v lsof >/dev/null 2>&1 || \
+    fail "lsof is required to prove the target has no TCP listener"
   pid="$(cat "$B/astd.pid")"
   listeners="$(lsof -nP -a -p "$pid" -iTCP -sTCP:LISTEN 2>/dev/null | tail -n +2 || true)"
   [ -z "$listeners" ] || fail "target opened TCP listeners: $listeners"
