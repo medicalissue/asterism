@@ -43,6 +43,8 @@
 //! asks the guest to power down and then pulls the cord, which is the death
 //! `astd`'s supervisor already knows how to act on.
 
+use anyhow::Context;
+
 #[cfg(target_os = "macos")]
 mod agent;
 #[cfg(target_os = "macos")]
@@ -51,6 +53,48 @@ mod ctl;
 mod net;
 #[cfg(target_os = "macos")]
 mod vm;
+
+/// The helper's daemon-independent cleanup handle.
+///
+/// astd deliberately does not parent the helper for its whole lifetime: the
+/// guest must survive an astd restart or upgrade. That also means a test
+/// harness cannot rely on the daemon's last registry flush to find a helper
+/// after stopping its daemon. This pidfile lives beside the helper's vz.json,
+/// exactly like QEMU's qemu.pid, and is removed by the helper on every
+/// ordinary exit. A forced stop leaves it for the owner of that home to
+/// consume and remove.
+struct PidFile {
+    path: std::path::PathBuf,
+    pid: u32,
+}
+
+impl PidFile {
+    fn create(config_path: &std::path::Path) -> anyhow::Result<Self> {
+        let dir = config_path.parent().ok_or_else(|| {
+            anyhow::anyhow!("the vz config path {} has no parent", config_path.display())
+        })?;
+        let path = dir.join("vz.pid");
+        let pid = std::process::id();
+        std::fs::write(&path, format!("{pid}\n"))
+            .with_context(|| format!("writing {}", path.display()))?;
+        Ok(Self { path, pid })
+    }
+}
+
+impl Drop for PidFile {
+    fn drop(&mut self) {
+        // Never remove a file a newer helper has replaced. This is normally
+        // impossible because astd hands helpers over one at a time, but the
+        // guard keeps cleanup local even if that invariant is broken.
+        let ours = self.pid.to_string();
+        if std::fs::read_to_string(&self.path)
+            .ok()
+            .is_some_and(|recorded| recorded.trim() == ours)
+        {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
@@ -81,6 +125,10 @@ fn main() -> anyhow::Result<()> {
 
     let config_path = parse_args()?;
     let config = Config::read(&config_path)?;
+    // Keep this guard alive for the helper's entire lifetime. It gives suite
+    // cleanup an ownership record that does not depend on astd getting
+    // another chance to persist state.json after the helper has started.
+    let _pidfile = PidFile::create(&config_path)?;
 
     // Leave the daemon's process group. A signal aimed at astd — or at the
     // whole group by a shell, a test script or launchd — must not reach a
@@ -707,6 +755,40 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod pidfile_tests {
+    use super::PidFile;
+
+    #[test]
+    fn helper_pidfile_is_removed_when_its_owner_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("vz.json");
+        let path = dir.path().join("vz.pid");
+
+        let file = PidFile::create(&config).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{}\n", std::process::id())
+        );
+        drop(file);
+
+        assert!(!path.exists(), "a departed helper left its pidfile behind");
+    }
+
+    #[test]
+    fn an_old_helper_never_removes_a_new_helpers_pidfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("vz.json");
+        let path = dir.path().join("vz.pid");
+
+        let file = PidFile::create(&config).unwrap();
+        std::fs::write(&path, "999999\n").unwrap();
+        drop(file);
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "999999\n");
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]

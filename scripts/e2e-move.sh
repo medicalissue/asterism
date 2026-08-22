@@ -57,7 +57,7 @@ POST="post-$$"
 #
 # Everything started here writes down its own pid inside its own
 # ASTERISM_HOME: astd in $home/astd.pid, each guest's qemu in
-# $home/instances/<name>/qemu.pid, each storage daemon in
+# $home/instances/<name>/qemu.pid or VZ helper in vz.pid, each storage daemon in
 # $home/volumes/<name>/nbd-e<epoch>.pid. Those files are what cleanup acts
 # on, so it can only ever reach a process this run started.
 #
@@ -108,12 +108,10 @@ cleanup() {
   done
   # Then what they left running. Both outlive astd by design.
   for home in "$A" "$B" "$C"; do
-    for f in "$home"/instances/*/qemu.pid; do kill_pidfile "$f"; done
+    for f in "$home"/instances/*/qemu.pid "$home"/instances/*/vz.pid; do kill_pidfile "$f"; done
     for f in "$home"/volumes/*/nbd-e*.pid; do kill_pidfile "$f"; done
-    # A backend that keeps its guest's pid on the handle rather than in a
-    # pidfile of its own — the vz helper on macOS — is written down in the
-    # registry instead. Every pid in that file was put there by a daemon
-    # this run started, so it is the same exact-pid rule by another route.
+    # Covers older backends whose only record was state.json. New VZ helpers
+    # were stopped above through their daemon-independent vz.pid.
     for pid in $(grep -o '"pid":[0-9]*' "$home/state.json" 2>/dev/null | cut -d: -f2 || true); do
       kill_pid "$pid"
     done

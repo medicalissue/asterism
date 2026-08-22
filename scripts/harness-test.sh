@@ -158,6 +158,23 @@ ok "a half-written record yields nothing rather than failing the cleanup"
 harness_reap_home "$WORK/never" || fail "reaping a home that does not exist was an error"
 ok "a home that does not exist is nothing to reap"
 
+helper_home="$WORK/helper-home"
+mkdir -p "$helper_home/instances/vz-owned"
+helper="$(spawn)"
+STRAY="$(spawn)"
+# This is the post-astd record from the reported failure: it contains no
+# helper pid, even though the helper that belongs to this home is still live.
+printf '{"instances":[]}\n' >"$helper_home/state.json"
+printf '%s\n' "$helper" >"$helper_home/instances/vz-owned/vz.pid"
+harness_reap_home "$helper_home"
+alive "$helper" && fail "a VZ helper named by its pidfile survived the reaper"
+alive "$STRAY" || fail "the VZ pidfile reaper killed a process it did not own"
+[ ! -e "$helper_home/instances/vz-owned/vz.pid" ] \
+  || fail "the consumed VZ pidfile was left behind"
+kill -KILL "$STRAY" 2>/dev/null || true
+STRAY=""
+ok "a VZ pidfile reaps its helper after a stale daemon record, and no bystander"
+
 # ---- 8. the image cache is the harness's own, never the user's ---------------
 
 case "$(harness_cache_dir)" in

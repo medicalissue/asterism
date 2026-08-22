@@ -12,6 +12,7 @@
 //!   snapshots/      — clones of that disk, one file per snapshot
 //!   efi-vars.bin    — EFI variable store, created by the helper on first boot
 //!   vz.json         — the config the running helper was started from
+//!   vz.pid          — the running helper's pid, for daemon-independent cleanup
 //!   vz.sock         — the helper's control socket, recorded on the Handle
 //!   vz-helper.log   — the helper's own stderr, for when a boot goes wrong
 //!

@@ -1424,6 +1424,7 @@ mod tests {
         for junk in [
             "console.log",
             "qemu.pid",
+            "vz.pid",
             "qmp.sock",
             "disk.raw.part",
             "egress-ca.key.bak",
