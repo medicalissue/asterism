@@ -282,7 +282,7 @@ echo "ok: A's root disk claims $VIRTUAL bytes"
 # the refusal happens before either source fencing or target staging. The
 # first two bytes are saved and restored so the happy-path move below still
 # uses the image this test pulled.
-BASE_A="$(ls "$A/images/"*.raw 2>/dev/null | head -1)"
+BASE_A="$(find "$A/images" -maxdepth 1 -type f -name '*.raw' -print | head -1)"
 [ -n "$BASE_A" ] || fail "A has no adopted raw base image to mutate"
 BASE_PREFIX="$RUN/base-prefix"
 MUTATED_PREFIX="$RUN/mutated-prefix"
@@ -326,7 +326,7 @@ echo "ok: B pulled the base image from A over the mesh and verified it"
 # provenance record, and the peer fetch is the one adoption path that used to
 # write none — leaving an image that passed its digest on arrival and refused
 # to boot a second later.
-BASE_B="$(ls "$B/images/"*.raw 2>/dev/null | head -1)"
+BASE_B="$(find "$B/images" -maxdepth 1 -type f -name '*.raw' -print | head -1)"
 [ -n "$BASE_B" ] || fail "B has no base image after the fetch:"$'\n'"$(ls -la "$B/images" 2>&1)"
 [ -f "$BASE_B.provenance" ] \
   || fail "the fetched base has no provenance record, so it cannot be booted from"
