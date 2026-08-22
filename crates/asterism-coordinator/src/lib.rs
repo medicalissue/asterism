@@ -1632,7 +1632,7 @@ fn enrollment_generation_binding(generation: &str) -> [u8; 32] {
 }
 
 const fn base64url_nopad_encoded_len(decoded_bytes: usize) -> usize {
-    (decoded_bytes * 8 + 5) / 6
+    (decoded_bytes * 8).div_ceil(6)
 }
 
 fn validate_session_bearer(bearer: &str) -> Result<()> {
