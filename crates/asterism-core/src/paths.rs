@@ -110,6 +110,28 @@ pub fn volumes_path() -> PathBuf {
     home_dir().join("volumes.json")
 }
 
+/// Consumer-side journal for block-volume attaches which have not yet
+/// crossed their acknowledgement boundary.
+///
+/// This is deliberately separate from [`state_path`]. An attach writes its
+/// intent before asking a provider for a lease, then clears it only after the
+/// instance row is durable. If the registry commit has an ambiguous result,
+/// the journal must remain independently readable so startup can decide
+/// whether to finish the row or compensate the provider.
+pub fn volume_attach_intents_path() -> PathBuf {
+    home_dir().join("volume-attach-intents.json")
+}
+
+/// Consumer-side journal for block-volume releases which have not yet
+/// crossed their acknowledgement boundary.
+///
+/// Kept apart from both the instance shard and attach intents so a provider
+/// acknowledgement can be replayed after a crash without resurrecting the
+/// row from either file's last-known-good copy.
+pub fn volume_release_intents_path() -> PathBuf {
+    home_dir().join("volume-release-intents.json")
+}
+
 pub fn volume_dir(name: &str) -> PathBuf {
     home_dir().join("volumes").join(name)
 }

@@ -26,12 +26,13 @@
 //!
 //! `reconcile` in `main.rs` flips a running-with-a-dead-process instance to
 //! stopped, which is the truth *right now* and stays that way: `ast ls`
-//! must never claim a guest is up when it is not. What changes here is
-//! what happens next. Before flipping anything, reconcile calls
-//! [`note_died`], which hands the instance to this module — so the status
-//! tells the truth and the supervisor still brings the guest back. At
-//! startup [`resurrect`] runs first, holding the registry lock, so nothing
-//! can be reconciled out from under it.
+//! must never claim a guest is up when it is not. An unresolved durable boot
+//! intent is the exception: its missing handle is precisely the ambiguity it
+//! fences, so reconcile and this supervisor preserve it as running and never
+//! launch or schedule a second guest. For an ordinary dead handle, reconcile
+//! calls [`note_died`] before the flip, handing the instance to this module so
+//! the supervisor still brings it back. At startup [`resurrect`] runs first,
+//! holding the registry lock, so nothing can be reconciled out from under it.
 //!
 //! ### Why a process-wide watch table
 //!
@@ -193,6 +194,15 @@ pub async fn resurrect(registry: &Arc<Mutex<Shard>>) {
 
     for inst in recorded {
         let name = inst.name.as_str();
+        if let Some(intent) = &inst.boot_intent_id {
+            eprintln!(
+                "astd: {name} has unresolved boot intent {intent} — preserving its launch fence"
+            );
+            // A watch may survive from an earlier ordinary guest death. It
+            // must not turn this ambiguous launch into another boot.
+            forget(name);
+            continue;
+        }
         // astd can be restarted without the host going down: the guests
         // are their own processes and outlive us. Those are already home —
         // except for the parts of them this process was holding. A block
@@ -258,6 +268,12 @@ async fn tick(registry: &Arc<Mutex<Shard>>, guard: &mut SleepGuard) {
         if inst.status != Status::Running {
             continue;
         }
+        if inst.boot_intent_id.is_some() {
+            // No handle is expected in the crash window this marker covers.
+            // Treating that as a death would enqueue a second guest.
+            forget(&inst.name);
+            continue;
+        }
         if alive(&inst) {
             note_alive(&inst.name);
         } else {
@@ -291,7 +307,7 @@ async fn tick(registry: &Arc<Mutex<Shard>>, guard: &mut SleepGuard) {
 fn live_count(reg: &Shard) -> usize {
     reg.list()
         .iter()
-        .filter(|i| i.status == Status::Running && alive(i))
+        .filter(|i| i.status == Status::Running && (i.boot_intent_id.is_some() || alive(i)))
         .count()
 }
 
@@ -303,6 +319,12 @@ fn restart(reg: &mut Shard, name: &str) -> bool {
         forget(name);
         return false;
     };
+    if inst.boot_intent_id.is_some() {
+        // A backend may be alive even though its handle was never committed.
+        // Only explicit compensation with proven death may clear this row.
+        forget(name);
+        return false;
+    }
     // It may have been started by hand while the backoff was running.
     if inst.status == Status::Running && alive(&inst) {
         return false;
@@ -352,6 +374,15 @@ fn restart(reg: &mut Shard, name: &str) -> bool {
 /// Stop trying, and leave the reason where the user will look: the
 /// instance's console log (what `ast logs` prints) and the daemon log.
 fn give_up(reg: &mut Shard, name: &str, attempts: u32) {
+    if reg
+        .get(name)
+        .is_ok_and(|instance| instance.boot_intent_id.is_some())
+    {
+        // Defensive backstop: restart normally catches this before spending
+        // an attempt, but no budget path may publish a pending boot stopped.
+        forget(name);
+        return;
+    }
     let why = format!(
         "asterism: gave up restarting {name} after {attempts} attempts — the guest \
          died each time. Nothing will restart it now; the console above is where \
@@ -382,6 +413,12 @@ fn append_to_console(name: &str, message: &str) -> anyhow::Result<()> {
 /// Boot an instance whose recorded guest is gone, through the same path
 /// `ast up` uses — a resurrected instance is not a special kind of boot.
 fn boot_again(reg: &mut Shard, inst: &Instance) -> anyhow::Result<Instance> {
+    if let Some(intent) = &inst.boot_intent_id {
+        anyhow::bail!(
+            "instance {:?} has unresolved boot intent {intent}; refusing a second guest",
+            inst.name
+        );
+    }
     // `up` refuses an instance that is recorded running, and this one is
     // recorded running with a dead process. Clearing the handle first is
     // what makes the two agree.
@@ -389,7 +426,7 @@ fn boot_again(reg: &mut Shard, inst: &Instance) -> anyhow::Result<Instance> {
         let _ = reg.set_stopped(&inst.name);
     }
     clear_stale_control(inst);
-    crate::instance::up(reg, &inst.name)
+    crate::instance::up(reg, &inst.name, None)
 }
 
 /// A killed guest leaves its control socket behind; the next boot binds
@@ -608,5 +645,44 @@ mod tests {
             inst.policy.max_attempts,
             asterism_core::instance::MAX_ATTEMPTS
         );
+    }
+
+    /// A missing handle is not evidence of death while the durable launch
+    /// marker says a backend may have started the guest. Even a stale watch
+    /// from an earlier ordinary death must be discarded instead of spending
+    /// a restart attempt or clearing the marker.
+    #[test]
+    fn a_pending_boot_stays_awake_and_is_never_restarted() {
+        let _table = own_the_table();
+        let dir = tempfile::tempdir().unwrap();
+        let mut reg = Shard::load(&dir.path().join("state.json")).unwrap();
+        let name = scratch("pending-boot");
+        reg.create(
+            &name,
+            "laptop",
+            "debian:13",
+            asterism_core::instance::Shape::default(),
+            asterism_core::hv::Machine {
+                backend: "qemu".into(),
+                machine_type: "virt".into(),
+                cpu: "host".into(),
+                hv_version: "test".into(),
+            },
+        )
+        .unwrap();
+        let (_, intent) = reg.begin_boot(&name).unwrap();
+        note_died(&name);
+
+        assert_eq!(live_count(&reg), 1, "the device may not sleep");
+        assert!(!restart(&mut reg, &name), "restart mutated the registry");
+        assert_eq!(owed(), 0, "the stale restart watch survived");
+
+        let pending = reg.get(&name).unwrap().clone();
+        let error = boot_again(&mut reg, &pending).unwrap_err().to_string();
+        assert!(error.contains("refusing a second guest"), "{error}");
+        let preserved = reg.get(&name).unwrap();
+        assert_eq!(preserved.status, Status::Running);
+        assert_eq!(preserved.boot_intent_id.as_deref(), Some(intent.as_str()));
+        forget(&name);
     }
 }
