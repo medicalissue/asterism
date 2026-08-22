@@ -108,7 +108,8 @@ use crate::VERSION;
 /// * **3** — portable backup export/import frames and their reports.
 /// * **4** — the opt-in, framed device-shell policy and session wire.
 /// * **5** — mesh-safe, read-only device-shell policy status.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// * **6** — fenced live-migration preparation and backend-stream splicing.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// The wire as it was before it carried a version.
 ///
@@ -121,7 +122,7 @@ pub const FIRST_PROTOCOL: u32 = 1;
 
 /// How many versions back this build still serves. Keep the unnumbered first
 /// wire usable while newer device-shell capabilities negotiate independently.
-pub const SUPPORTED_BACK: u32 = 4;
+pub const SUPPORTED_BACK: u32 = 5;
 
 /// Format version of the home stamp document itself.
 pub const STAMP_VERSION: u32 = 1;

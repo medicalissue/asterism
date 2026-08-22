@@ -66,13 +66,14 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use asterism_core::cow;
 use asterism_core::durable;
+use asterism_core::hv::{ControlChannel, Handle, MigrationSource, Ready};
 use asterism_core::instance::{now_unix, Instance, Moving, Status, VolumeKind};
 use asterism_core::paths;
 use asterism_core::protocol::{BaseImage, MoveFile, MoveManifest, Request, Response};
@@ -89,6 +90,8 @@ use crate::Node;
 /// — which is exactly why the staging directory is safe to leave lying
 /// around: nothing can resolve to it.
 pub const STAGING: &str = ".moving-";
+const LIVE_SOCKET: &str = ".live-migration.sock";
+const LIVE_HANDLE: &str = ".live-migration-handle.json";
 
 /// How long a device remembers that an instance left it.
 ///
@@ -147,6 +150,18 @@ pub fn staging_dir(name: &str, epoch: u64) -> PathBuf {
     paths::instance_dir(&format!("{name}{STAGING}{epoch}"))
 }
 
+pub(crate) fn live_socket(name: &str, epoch: u64) -> PathBuf {
+    staging_dir(name, epoch).join(LIVE_SOCKET)
+}
+
+fn live_sessions() -> MutexGuard<'static, BTreeMap<(String, u64), Handle>> {
+    static SESSIONS: OnceLock<Mutex<BTreeMap<(String, u64), Handle>>> = OnceLock::new();
+    SESSIONS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// Delete every staging directory on this device.
 ///
 /// Run at daemon start — before the socket is bound, before the mesh comes
@@ -164,6 +179,12 @@ pub fn sweep_staging() {
         let Some(name) = name.to_str() else { continue };
         if !name.contains(STAGING) {
             continue;
+        }
+        let handle_path = entry.path().join(LIVE_HANDLE);
+        if let Ok(bytes) = std::fs::read(&handle_path) {
+            if let Ok(handle) = serde_json::from_slice::<Handle>(&bytes) {
+                let _ = backend::for_handle(&handle.backend).and_then(|hv| hv.kill(&handle));
+            }
         }
         match std::fs::remove_dir_all(entry.path()) {
             Ok(()) => eprintln!(
@@ -390,6 +411,7 @@ pub(crate) fn is_step(req: &Request) -> bool {
         Request::MoveOffer { .. }
             | Request::MoveProbe { .. }
             | Request::MovePrepare { .. }
+            | Request::MoveLivePrepareTarget { .. }
             | Request::MoveCommitTarget { .. }
             | Request::MoveCommitSource { .. }
             | Request::MoveAbortSource { .. }
@@ -414,7 +436,11 @@ pub(crate) fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Response
             name,
             to_device,
             epoch,
-        } => tokio::task::block_in_place(|| prepare(reg, &name, &to_device, epoch)),
+            live,
+        } => tokio::task::block_in_place(|| prepare(reg, &name, &to_device, epoch, live)),
+        Request::MoveLivePrepareTarget { manifest, epoch } => {
+            tokio::task::block_in_place(|| live_prepare_target(&manifest, epoch, cpu_device))
+        }
         Request::MoveCommitTarget { manifest, epoch } => {
             tokio::task::block_in_place(|| commit_target(reg, &manifest, epoch, cpu_device))
         }
@@ -459,11 +485,11 @@ pub fn offer(reg: &Shard, name: &str) -> Response {
 /// A fence already in place is superseded rather than refused: the epoch only
 /// ever goes up, so a move that was interrupted with nobody left to abort it
 /// does not strand the instance for good.
-pub fn prepare(reg: &mut Shard, name: &str, to_device: &str, epoch: u64) -> Response {
+pub fn prepare(reg: &mut Shard, name: &str, to_device: &str, epoch: u64, live: bool) -> Response {
     let inst = match reg
         .get(name)
         .cloned()
-        .and_then(|inst| movable(&inst).map(|()| inst))
+        .and_then(|inst| movable(&inst, live).map(|()| inst))
     {
         Ok(inst) => inst,
         Err(e) => return error(e),
@@ -523,6 +549,15 @@ pub fn commit_source(reg: &mut Shard, name: &str, epoch: u64) -> Response {
         ));
     }
 
+    if let Some(handle) = &inst.handle {
+        if let Err(e) = backend::for_handle(&handle.backend).and_then(|hv| {
+            hv.migration_commit(handle)?;
+            hv.kill(handle)
+        }) {
+            return error(e.context("the migrated source guest could not be fenced off"));
+        }
+        crate::mesh::finish_live_pump(name, epoch);
+    }
     if let Err(e) = reg.remove(name).and_then(|_| reg.save()) {
         return error(e);
     }
@@ -546,6 +581,16 @@ pub fn abort_source(reg: &mut Shard, name: &str, epoch: u64) -> Response {
                      that move's fence alone"
                 ));
             }
+            if let Some(handle) = &inst.handle {
+                if let Err(e) =
+                    backend::for_handle(&handle.backend).and_then(|hv| hv.migration_abort(handle))
+                {
+                    return error(
+                        e.context("the source backend could not resume after migration abort"),
+                    );
+                }
+                crate::mesh::finish_live_pump(name, epoch);
+            }
             match reg.set_moving(name, None).and_then(|_| reg.save()) {
                 Ok(()) => Response::Ok,
                 Err(e) => error(e),
@@ -564,9 +609,9 @@ fn unconflicted(inst: &Instance) -> Result<()> {
 }
 
 /// Whether this instance can be moved at all, in the words the refusal needs.
-fn movable(inst: &Instance) -> Result<()> {
+fn movable(inst: &Instance, live: bool) -> Result<()> {
     unconflicted(inst)?;
-    if inst.status == Status::Running {
+    if inst.status == Status::Running && !live {
         bail!(
             "instance {:?} is running — an offline move needs it stopped: \
              `ast down {}`, or pass --down",
@@ -654,6 +699,9 @@ fn probe_refusal(
     };
     match hv.probe() {
         Ok(ready) => {
+            if let Some(refusal) = live_refusal(inst, hv.caps().live_migration, &ready, device) {
+                return Some(refusal);
+            }
             if ready.version != machine.hv_version {
                 notes.push(format!(
                     "{device} runs {} {} and {:?} was defined against {} — an \
@@ -703,6 +751,91 @@ fn probe_refusal(
         ));
     }
     None
+}
+
+fn major(version: &str) -> &str {
+    version.split('.').next().unwrap_or(version)
+}
+
+fn live_refusal(
+    inst: &Instance,
+    live_capability: bool,
+    ready: &Ready,
+    device: &str,
+) -> Option<String> {
+    if inst.status != Status::Running {
+        return None;
+    }
+    let machine = &inst.machine;
+    if !live_capability {
+        return Some(format!(
+            "device {device}'s {} backend cannot receive a running guest — use --down \
+             for the offline move",
+            machine.backend
+        ));
+    }
+    if major(&ready.version) != major(&machine.hv_version)
+        || ready.machine_type != machine.machine_type
+        || ready.cpu != machine.cpu
+    {
+        return Some(format!(
+            "device {device}'s live-migration machine is incompatible: source is \
+             {machine}, target is {} {} ({}, cpu {}). Use --down for the portable \
+             offline move",
+            machine.backend, ready.version, ready.machine_type, ready.cpu
+        ));
+    }
+    if !inst.volumes.is_empty() {
+        return Some(format!(
+            "instance {:?} has attached volumes whose live lease handoff is not supported \
+             — use --down",
+            inst.name
+        ));
+    }
+    None
+}
+
+/// Start the target backend in incoming mode against the unlisted staged
+/// directory. The returned handle stays process-local until the epoch commit
+/// publishes both the directory and registry row.
+fn live_prepare_target(manifest: &MoveManifest, epoch: u64, device: &str) -> Response {
+    if manifest.instance.status != Status::Running {
+        return error(anyhow!(
+            "live target preparation requires a running source guest"
+        ));
+    }
+    if let Some(refusal) = probe_refusal(manifest, device, false, &mut Vec::new()) {
+        return error(anyhow!(refusal));
+    }
+    let staging = staging_dir(&manifest.instance.name, epoch);
+    if let Err(e) = verify(&staging, manifest, epoch) {
+        return error(e.context("the live pre-copy is incomplete"));
+    }
+    let socket = live_socket(&manifest.instance.name, epoch);
+    let _ = std::fs::remove_file(&socket);
+    let started = (|| -> Result<Handle> {
+        let hv = backend::for_instance(&manifest.instance)?;
+        let req = backend::migration_req(&manifest.instance, staging.clone())?;
+        hv.migrate_in(
+            &req,
+            MigrationSource {
+                url: format!("unix:{}", socket.display()),
+            },
+        )
+    })();
+    match started {
+        Ok(handle) => {
+            if let Err(e) = durable::commit_json(&staging.join(LIVE_HANDLE), &handle) {
+                let _ = backend::for_handle(&handle.backend).and_then(|hv| hv.kill(&handle));
+                return error(
+                    e.context("recording the incoming guest so restart cleanup can fence it"),
+                );
+            }
+            live_sessions().insert((manifest.instance.name.clone(), epoch), handle);
+            Response::MoveLiveReady
+        }
+        Err(e) => error(e.context("starting the incoming live-migration guest")),
+    }
 }
 
 /// Does the base image have to be fetched from the source?
@@ -811,20 +944,29 @@ pub fn commit_target(
         ));
     }
     let _ = std::fs::remove_file(Receipt::path(&live));
+    let _ = std::fs::remove_file(live.join(LIVE_HANDLE));
+    let _ = std::fs::remove_file(live.join(LIVE_SOCKET));
 
+    let live_handle = live_sessions().remove(&(name.clone(), epoch));
     let mut adopted = manifest.instance.clone();
     adopted.cpu_device = device.to_owned();
     // A guest that was running was shut down before any of this; anything
     // else keeps the state it had, so an instance that had never been booted
     // does not arrive claiming to have been.
-    if adopted.status == Status::Running {
+    if adopted.status == Status::Running && live_handle.is_none() {
         adopted.status = Status::Stopped;
     }
-    adopted.handle = None;
+    adopted.handle = live_handle.map(|mut handle| {
+        if let ControlChannel::Qmp { path } = &mut handle.ctl {
+            *path = paths::qmp_socket_path(&name);
+        }
+        handle
+    });
     adopted.moving = None;
     adopted.conflict = None;
     adopted.move_epoch = epoch;
     adopted.stranded = manifest.local_volumes.clone();
+    let rollback_handle = adopted.handle.clone();
     match reg
         .adopt(adopted)
         .and_then(|inst| reg.save().map(|()| inst))
@@ -833,7 +975,16 @@ pub fn commit_target(
             instance,
             guest_health: None,
         },
-        Err(e) => error(e),
+        Err(e) => {
+            let _ = reg.remove(&name);
+            if let Some(handle) = rollback_handle {
+                let _ = backend::for_handle(&handle.backend).and_then(|hv| hv.kill(&handle));
+            }
+            let _ = std::fs::remove_dir_all(&live);
+            error(e.context(
+                "the target authority row could not be made durable; its staged guest was killed",
+            ))
+        }
     }
 }
 
@@ -888,6 +1039,9 @@ fn verify(staging: &Path, manifest: &MoveManifest, epoch: u64) -> Result<()> {
 
 /// Delete a staging directory. What an abort owes the target.
 pub fn abort_target(name: &str, epoch: u64) -> Response {
+    if let Some(handle) = live_sessions().remove(&(name.to_owned(), epoch)) {
+        let _ = backend::for_handle(&handle.backend).and_then(|hv| hv.kill(&handle));
+    }
     let staging = staging_dir(name, epoch);
     match std::fs::remove_dir_all(&staging) {
         Ok(()) | Err(_) => Response::Ok,
@@ -995,14 +1149,8 @@ pub async fn run(
     }
 
     let mut manifest = offer_of(name, &source, node, mesh).await?;
-    if manifest.instance.status == Status::Running {
-        if !down {
-            bail!(
-                "instance {name:?} is running on {source}. Moving cpu/ram is an offline \
-                 operation on every backend Asterism has — pass --down to shut the guest \
-                 down first"
-            );
-        }
+    let live = manifest.instance.status == Status::Running && !down;
+    if manifest.instance.status == Status::Running && down {
         io.send(&line(format!("shutting {name} down on {source} first")))
             .await?;
         expect_ok(
@@ -1051,8 +1199,9 @@ pub async fn run(
     // checked; a reader who wants to know whether the sparse walk earned its
     // keep should not have to work it out from "1.23 GiB".
     io.send(&line(format!(
-        "moving {name} from {source} to {device}: {} of {} across {} file(s) \
+        "{} {name} from {source} to {device}: {} of {} across {} file(s) \
          [allocated={} virtual={}]",
+        if live { "pre-copying" } else { "moving" },
         cow::human(manifest.allocated()),
         cow::human(manifest.virtual_size()),
         manifest.files.len(),
@@ -1078,6 +1227,7 @@ pub async fn run(
             name: name.to_owned(),
             to_device: device.to_owned(),
             epoch,
+            live,
         },
         node,
         mesh,
@@ -1093,7 +1243,8 @@ pub async fn run(
     )))
     .await?;
 
-    let outcome = transfer_and_commit(&manifest, &source, device, epoch, node, mesh, io).await;
+    let outcome =
+        transfer_and_commit_target(&manifest, &source, device, epoch, live, node, mesh, io).await;
     if let Err(e) = outcome {
         // Nothing the target staged is bootable and nothing has been written
         // to its shard, so this is a tidy-up rather than a rollback.
@@ -1124,10 +1275,38 @@ pub async fn run(
         return Err(e);
     }
 
+    // The target commit is the point of no return. From here an error must
+    // never run either abort: the target row is authoritative at the higher
+    // epoch, and clearing the source fence would create two runnable copies.
+    expect_ok(
+        ask(
+            &source,
+            Request::MoveCommitSource {
+                name: name.to_owned(),
+                epoch,
+            },
+            node,
+            mesh,
+        )
+        .await?,
+    )
+    .with_context(|| {
+        format!(
+            "{device} has {name:?} at epoch {epoch} and {source} would not let go of \
+             its copy — the higher epoch is authoritative; the source remains fenced"
+        )
+    })?;
+    io.send(&line(format!("{source} has dropped its copy")))
+        .await?;
+
     io.send(&Response::Move {
         text: format!(
-            "{name}: cpu/ram now sourced from {device} (move epoch {epoch}) — \
-             `ast up {name}` boots it there"
+            "{name}: cpu/ram now sourced from {device} (move epoch {epoch}){}",
+            if live {
+                " — the running guest and its control channel continued there"
+            } else {
+                " — `ast up` boots it there"
+            }
         ),
         done: true,
     })
@@ -1136,11 +1315,12 @@ pub async fn run(
 
 /// Phases two and three: the bytes, then the two commits in order.
 #[allow(clippy::too_many_arguments)]
-async fn transfer_and_commit(
+async fn transfer_and_commit_target(
     manifest: &MoveManifest,
     source: &str,
     device: &str,
     epoch: u64,
+    live: bool,
     node: &Node,
     mesh: &Arc<Mesh>,
     io: &mut ClientIo<'_>,
@@ -1149,6 +1329,35 @@ async fn transfer_and_commit(
 
     mesh.move_import(device, source, manifest, epoch, io)
         .await?;
+
+    if live {
+        match ask(
+            device,
+            Request::MoveLivePrepareTarget {
+                manifest: Box::new(manifest.clone()),
+                epoch,
+            },
+            node,
+            mesh,
+        )
+        .await?
+        {
+            Response::MoveLiveReady => {}
+            Response::Error { message } => bail!(message),
+            other => bail!("device {device:?} prepared live migration with {other:?}"),
+        }
+        io.send(&line(format!(
+            "{device}'s compatible backend is waiting on the staged pre-copy"
+        )))
+        .await?;
+        mesh.live_migrate(source, device, &name, epoch, node)
+            .await
+            .context("the backend migration stream failed before authority transferred")?;
+        io.send(&line(
+            "dirty disk, memory and device state converged; source execution is fenced".into(),
+        ))
+        .await?;
+    }
 
     // The target checks what arrived against the manifest and only then does
     // a second copy of this instance exist anywhere.
@@ -1170,29 +1379,6 @@ async fn transfer_and_commit(
     )))
     .await?;
 
-    // Past this point the move has happened. A source that will not answer
-    // now leaves a stale copy rather than losing one, and the epoch on the
-    // target's row is what settles which is which.
-    expect_ok(
-        ask(
-            source,
-            Request::MoveCommitSource {
-                name: name.clone(),
-                epoch,
-            },
-            node,
-            mesh,
-        )
-        .await?,
-    )
-    .with_context(|| {
-        format!(
-            "{device} has {name:?} at epoch {epoch} and {source} would not let go of \
-             its copy — the higher epoch is the live one, and {source}'s copy is stale"
-        )
-    })?;
-    io.send(&line(format!("{source} has dropped its copy")))
-        .await?;
     Ok(())
 }
 
@@ -1281,6 +1467,77 @@ mod tests {
             cpu: "host".into(),
             hv_version: "test".into(),
         }
+    }
+
+    fn running_instance() -> Instance {
+        let mut instance = Instance::new(
+            "dev",
+            "laptop",
+            "debian:13",
+            Default::default(),
+            asterism_core::hv::Machine {
+                backend: "qemu".into(),
+                machine_type: "virt-9.0".into(),
+                cpu: "host".into(),
+                hv_version: "9.2.1".into(),
+            },
+        );
+        instance.status = Status::Running;
+        instance
+    }
+
+    fn ready(version: &str, machine_type: &str, cpu: &str) -> Ready {
+        Ready {
+            version: version.into(),
+            accel: "kvm".into(),
+            machine_type: machine_type.into(),
+            cpu: cpu.into(),
+        }
+    }
+
+    #[test]
+    fn live_migration_negotiates_capability_and_machine_compatibility() {
+        let instance = running_instance();
+        assert!(live_refusal(
+            &instance,
+            true,
+            &ready("9.7.0", "virt-9.0", "host"),
+            "desktop"
+        )
+        .is_none());
+
+        for (candidate, needle) in [
+            (ready("10.0.0", "virt-9.0", "host"), "incompatible"),
+            (ready("9.2.1", "virt-10.0", "host"), "incompatible"),
+            (ready("9.2.1", "virt-9.0", "max"), "incompatible"),
+        ] {
+            let refusal = live_refusal(&instance, true, &candidate, "desktop").unwrap();
+            assert!(refusal.contains(needle), "{refusal}");
+            assert!(refusal.contains("--down"), "{refusal}");
+        }
+
+        let refusal = live_refusal(
+            &instance,
+            false,
+            &ready("9.2.1", "virt-9.0", "host"),
+            "desktop",
+        )
+        .unwrap();
+        assert!(
+            refusal.contains("cannot receive a running guest"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn a_live_fence_admits_the_running_source_but_the_offline_fence_does_not() {
+        let instance = running_instance();
+        assert!(movable(&instance, true).is_ok());
+        let refusal = movable(&instance, false).unwrap_err().to_string();
+        assert!(
+            refusal.contains("offline move needs it stopped"),
+            "{refusal}"
+        );
     }
 
     #[test]
@@ -1393,6 +1650,7 @@ mod tests {
                 name: "dev".into(),
                 to_device: "desktop".into(),
                 epoch: 1,
+                live: false,
             },
             Request::MoveCommitSource {
                 name: "dev".into(),
@@ -1432,6 +1690,8 @@ mod tests {
             "disk.raw.part",
             "egress-ca.key.bak",
             ".move-receipt.json",
+            LIVE_SOCKET,
+            LIVE_HANDLE,
         ] {
             assert!(
                 is_plumbing(junk),

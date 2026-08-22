@@ -78,6 +78,15 @@ pub fn qmp_socket_path(name: &str) -> PathBuf {
     short_socket(instance_dir(name).join("qmp.sock"))
 }
 
+/// QMP socket inside an explicitly selected instance directory.
+///
+/// Live migration starts the incoming guest in an unlisted staging
+/// directory; the ordinary name-derived directory does not exist until the
+/// authority commit renames staging into place.
+pub fn qmp_socket_in(dir: &std::path::Path) -> PathBuf {
+    short_socket(dir.join("qmp.sock"))
+}
+
 /// Control socket of the `astd-vz` helper holding one instance's guest.
 ///
 /// The same shape as the QMP path and for the same reason: it is a socket,

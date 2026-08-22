@@ -738,6 +738,18 @@ pub trait Hypervisor: Send + Sync {
     fn migrate_in(&self, _req: &BootReq, _from: MigrationSource) -> Result<Handle> {
         unsupported(self.id(), "receive a migrating guest")
     }
+
+    /// Release a source paused at the backend's switchover boundary after
+    /// the target authority record is durable.
+    fn migration_commit(&self, _h: &Handle) -> Result<()> {
+        unsupported(self.id(), "commit a live migration")
+    }
+
+    /// Cancel a source paused at switchover and resume it after the target
+    /// staging guest has been discarded.
+    fn migration_abort(&self, _h: &Handle) -> Result<()> {
+        unsupported(self.id(), "abort a live migration")
+    }
 }
 
 #[cfg(test)]

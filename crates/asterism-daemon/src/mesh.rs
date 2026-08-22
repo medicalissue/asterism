@@ -36,9 +36,9 @@
 //! carries — which is what makes a proxied command the same code path as a
 //! local one rather than a parallel implementation of it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -241,6 +241,16 @@ enum MeshRequest {
         epoch: u64,
         from_device: String,
     },
+    /// Ask the source backend to emit its live migration stream and tunnel
+    /// it directly to `to_device`.
+    MoveLiveSource {
+        name: String,
+        epoch: u64,
+        to_device: String,
+    },
+    /// Turn this authenticated stream into the target backend's incoming
+    /// migration socket.
+    MoveLiveSplice { name: String, epoch: u64 },
 }
 
 impl MeshRequest {
@@ -254,6 +264,7 @@ impl MeshRequest {
         match self {
             MeshRequest::Rpc { request } => request.since(),
             MeshRequest::DeviceShell { .. } => 4,
+            MeshRequest::MoveLiveSource { .. } | MeshRequest::MoveLiveSplice { .. } => 6,
             _ => compat::FIRST_PROTOCOL,
         }
     }
@@ -271,6 +282,7 @@ impl MeshRequest {
             MeshRequest::MoveExport { .. }
                 | MeshRequest::MoveBase { .. }
                 | MeshRequest::MoveImport { .. }
+                | MeshRequest::MoveLiveSource { .. }
         )
     }
 
@@ -286,6 +298,8 @@ impl MeshRequest {
             MeshRequest::MoveExport { .. } => "an instance export",
             MeshRequest::MoveBase { .. } => "a base image",
             MeshRequest::MoveImport { .. } => "an instance import",
+            MeshRequest::MoveLiveSource { .. } => "a live migration source",
+            MeshRequest::MoveLiveSplice { .. } => "a live migration stream",
         }
     }
 }
@@ -1538,6 +1552,40 @@ impl Mesh {
         }
     }
 
+    /// Carry a backend's opaque migration stream source-to-target. The mesh
+    /// authenticates both devices; neither daemon interprets RAM, dirty-disk
+    /// pages or device state.
+    pub async fn live_migrate(
+        self: &Arc<Self>,
+        source: &str,
+        target: &str,
+        name: &str,
+        epoch: u64,
+        node: &Node,
+    ) -> Result<()> {
+        if source == self.self_name().await {
+            return run_live_source(node, target, name, epoch).await;
+        }
+        let peer = self.device(source).await?;
+        let connection = self.live_connection(&peer).await?;
+        let mut stream = connection.open_stream().await?;
+        open_stream_with(
+            &mut stream.send,
+            &MeshRequest::MoveLiveSource {
+                name: name.to_owned(),
+                epoch,
+                to_device: target.to_owned(),
+            },
+        )
+        .await?;
+        let _ = stream.send.finish();
+        match read_frame::<MoveFrame>(&mut stream.recv).await? {
+            MoveFrame::End { .. } => Ok(()),
+            MoveFrame::Failed { message } => bail!(message),
+            other => bail!("device {source:?} ended live migration with {other:?}"),
+        }
+    }
+
     /// Another device's guest key, cached on this one.
     ///
     /// Refreshed on every use rather than trusted once: a device that has
@@ -2483,6 +2531,122 @@ async fn serve_splice(
     pump(tcp, stream).await.map(|_| ())
 }
 
+async fn run_live_source(node: &Node, target: &str, name: &str, epoch: u64) -> Result<()> {
+    use asterism_core::hv::MigrationTarget;
+
+    let inst = node.shard.lock().await.get(name)?.clone();
+    let moving = inst
+        .moving
+        .as_ref()
+        .filter(|moving| moving.epoch == epoch && moving.to_device == target)
+        .with_context(|| format!("instance {name:?} is not fenced for this live migration"))?;
+    let _ = moving;
+    let handle = inst
+        .handle
+        .clone()
+        .context("a live migration source has no running backend handle")?;
+    let hv = crate::backend::for_handle(&handle.backend)?;
+    if !hv.caps().live_migration {
+        bail!("the {} backend cannot migrate a running guest", hv.id());
+    }
+
+    let socket = paths::home_dir().join(format!(".live-out-{name}-{epoch}.sock"));
+    let _ = std::fs::remove_file(&socket);
+    let listener = tokio::net::UnixListener::bind(&socket)?;
+    struct Remove(std::path::PathBuf);
+    impl Drop for Remove {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _remove = Remove(socket.clone());
+    let uri = format!("unix:{}", socket.display());
+    let migrating =
+        tokio::task::spawn_blocking(move || hv.migrate_out(&handle, MigrationTarget { url: uri }));
+    let (local, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+        .await
+        .context("the source backend did not open its migration stream")??;
+
+    let mesh = crate::swap::mesh()?;
+    let peer = mesh.device(target).await?;
+    let connection = mesh.live_connection(&peer).await?;
+    let mut stream = connection.open_stream().await?;
+    open_stream_with(
+        &mut stream.send,
+        &MeshRequest::MoveLiveSplice {
+            name: name.to_owned(),
+            epoch,
+        },
+    )
+    .await?;
+    match read_frame::<MeshReply>(&mut stream.recv).await? {
+        MeshReply::SpliceReady => {}
+        MeshReply::Rpc {
+            response: Response::Error { message },
+        } => bail!(message),
+        other => bail!("device {target:?} would not receive the migration: {other:?}"),
+    }
+    let pumping = tokio::spawn(pump(local, stream));
+    migrating
+        .await
+        .context("joining the source backend migration")??;
+    live_pumps()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((name.to_owned(), epoch), pumping);
+    Ok(())
+}
+
+type LivePump = tokio::task::JoinHandle<Result<TransferStats>>;
+
+fn live_pumps() -> &'static std::sync::Mutex<BTreeMap<(String, u64), LivePump>> {
+    static PUMPS: OnceLock<std::sync::Mutex<BTreeMap<(String, u64), LivePump>>> = OnceLock::new();
+    PUMPS.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+/// Drop the opaque stream task after the backend has committed or cancelled.
+/// At commit it is normally already at EOF; aborting a finished task is a
+/// no-op, while aborting a stuck peer prevents a failed migration leaking a
+/// connection indefinitely.
+pub(crate) fn finish_live_pump(name: &str, epoch: u64) {
+    if let Some(task) = live_pumps()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(name.to_owned(), epoch))
+    {
+        task.abort();
+    }
+}
+
+async fn serve_live_splice(
+    mut stream: asterism_mesh::MeshStream,
+    name: &str,
+    epoch: u64,
+) -> Result<()> {
+    let socket = crate::swap::live_socket(name, epoch);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let local = loop {
+        match tokio::net::UnixStream::connect(&socket).await {
+            Ok(local) => break local,
+            Err(e) if tokio::time::Instant::now() >= deadline => {
+                let refusal = MeshReply::Rpc {
+                    response: Response::Error {
+                        message: format!(
+                            "the incoming backend for {name:?} did not bind {}: {e}",
+                            socket.display()
+                        ),
+                    },
+                };
+                write_frame(&mut stream.send, &refusal).await?;
+                return Ok(());
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    };
+    write_frame(&mut stream.send, &MeshReply::SpliceReady).await?;
+    pump(local, stream).await.map(|_| ())
+}
+
 /// The provider's end of a volume splice: check the lease, then become a pipe.
 ///
 /// A refusal goes back as an ordinary error frame, which is what makes a
@@ -3294,6 +3458,25 @@ async fn serve_stream(
             epoch,
             from_device,
         } => return serve_move_import(stream, &manifest, epoch, &from_device).await,
+        MeshRequest::MoveLiveSource {
+            name,
+            epoch,
+            to_device,
+        } => {
+            let result = run_live_source(&node, &to_device, &name, epoch).await;
+            let frame = match result {
+                Ok(()) => MoveFrame::End { files: 0, bytes: 0 },
+                Err(error) => MoveFrame::Failed {
+                    message: format!("{error:#}"),
+                },
+            };
+            write_frame(&mut stream.send, &frame).await?;
+            let _ = stream.send.finish();
+            return Ok(());
+        }
+        MeshRequest::MoveLiveSplice { name, epoch } => {
+            return serve_live_splice(stream, &name, epoch).await
+        }
         MeshRequest::GuestKey => match guest_key() {
             Ok(key) => MeshReply::GuestKey { key },
             Err(e) => MeshReply::Rpc {

@@ -519,8 +519,9 @@ pub enum Request {
 
     // ---- swapping the cpu part ----------------------------------------------
     //
-    // `ast set <instance> cpu <device>` — an offline migration, and in the
-    // model's own words a change to one line of an instance's parts table.
+    // `ast set <instance> cpu <device>` — a live migration when compatible,
+    // with an explicit offline fallback, and in the model's own words a
+    // change to one line of an instance's parts table.
     // The daemon in front of the user drives it; the frames below are the
     // steps it drives, each aimed at one named device and therefore each
     // reporting no subject (see [`Request::subject`]).
@@ -532,10 +533,9 @@ pub enum Request {
         name: String,
         /// The device that will supply cpu and ram from here on.
         device: String,
-        /// Shut the guest down first, rather than refusing to move a
-        /// running instance. Offline migration is the only kind that works
-        /// on every backend we have, so this is a real choice and not a
-        /// convenience.
+        /// Force the portable offline path by shutting the guest down first.
+        /// Without this, a running guest negotiates live migration and a
+        /// stopped guest uses the same offline path as before.
         #[serde(default)]
         down: bool,
     },
@@ -562,6 +562,17 @@ pub enum Request {
     MovePrepare {
         name: String,
         to_device: String,
+        epoch: u64,
+        /// Keep the source guest running behind the move fence while its
+        /// disk is pre-copied. The backend migration stream performs the
+        /// final dirty-disk, RAM and device-state convergence.
+        #[serde(default)]
+        live: bool,
+    },
+    /// Start the compatible target backend against the staged disk, paused
+    /// at its incoming-migration boundary.
+    MoveLivePrepareTarget {
+        manifest: Box<MoveManifest>,
         epoch: u64,
     },
     /// The bytes are all here and verified: adopt them. The staging
@@ -703,6 +714,7 @@ impl Request {
             | Request::MoveOffer { .. }
             | Request::MoveProbe { .. }
             | Request::MovePrepare { .. }
+            | Request::MoveLivePrepareTarget { .. }
             | Request::MoveCommitTarget { .. }
             | Request::MoveCommitSource { .. }
             | Request::MoveAbortSource { .. }
@@ -740,6 +752,7 @@ impl Request {
             | Request::DeviceShellResize { .. }
             | Request::DeviceShellSignal { .. }
             | Request::DeviceShellClose => 4,
+            Request::MovePrepare { live: true, .. } | Request::MoveLivePrepareTarget { .. } => 6,
             _ => crate::compat::FIRST_PROTOCOL,
         }
     }
@@ -764,6 +777,9 @@ impl Request {
             | Request::DeviceShellResize { .. }
             | Request::DeviceShellSignal { .. }
             | Request::DeviceShellClose => Some("device shell"),
+            Request::MovePrepare { live: true, .. } | Request::MoveLivePrepareTarget { .. } => {
+                Some("live migration")
+            }
             _ => None,
         }
     }
@@ -1043,6 +1059,9 @@ pub enum Response {
         /// Whether the base image has to be fetched from the source first.
         needs_base: bool,
     },
+    /// The target backend is paused at its incoming migration boundary and
+    /// its staged copy is still unlisted and unbootable by Asterism.
+    MoveLiveReady,
 
     Error {
         message: String,
@@ -1111,6 +1130,7 @@ impl Response {
             | Response::DeviceShellRefused { .. }
             | Response::DeviceShellOutput { .. }
             | Response::DeviceShellExit { .. } => 4,
+            Response::MoveLiveReady => 6,
             _ => crate::compat::FIRST_PROTOCOL,
         }
     }
@@ -1150,6 +1170,31 @@ pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
             "device-shell",
             Request::DeviceShellPolicy {
                 action: ShellPolicyAction::Status,
+            }
+            .since(),
+        ),
+        (
+            "live-migration",
+            Request::MoveLivePrepareTarget {
+                manifest: Box::new(MoveManifest {
+                    instance: Instance::new(
+                        "compat",
+                        "source",
+                        "debian:13",
+                        Shape::default(),
+                        crate::hv::Machine {
+                            backend: "qemu".into(),
+                            machine_type: "virt".into(),
+                            cpu: "host".into(),
+                            hv_version: "test".into(),
+                        },
+                    ),
+                    arch: std::env::consts::ARCH.into(),
+                    base: BaseImage::absent("debian:13".into()),
+                    files: Vec::new(),
+                    local_volumes: Vec::new(),
+                }),
+                epoch: 1,
             }
             .since(),
         ),

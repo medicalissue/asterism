@@ -503,6 +503,7 @@ fn a_move_refuses_a_mutated_adopted_base_before_fencing_the_source() {
         name: "dev".into(),
         to_device: "desktop".into(),
         epoch: 1,
+        live: false,
     });
     let Response::Error { message } = reply else {
         panic!("a mutated source was offered to the move: {reply:?}");

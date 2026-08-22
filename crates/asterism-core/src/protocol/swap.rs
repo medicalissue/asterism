@@ -197,6 +197,7 @@ mod tests {
                 name: "dev".into(),
                 to_device: "desktop".into(),
                 epoch: 1,
+                live: false,
             },
             Request::MoveCommitTarget {
                 manifest: manifest.clone(),
@@ -251,5 +252,27 @@ mod tests {
             new_name: "e".into()
         }
         .survives_a_move());
+    }
+
+    #[test]
+    fn live_preparation_is_versioned_without_changing_offline_move_frames() {
+        let old: Request = serde_json::from_str(
+            r#"{"cmd":"move_prepare","name":"dev","to_device":"desktop","epoch":1}"#,
+        )
+        .unwrap();
+        assert_eq!(old.since(), crate::compat::FIRST_PROTOCOL);
+        let Request::MovePrepare { live, .. } = old else {
+            panic!("the old frame changed shape")
+        };
+        assert!(!live, "an old peer always asked for the offline fence");
+
+        let live = Request::MovePrepare {
+            name: "dev".into(),
+            to_device: "desktop".into(),
+            epoch: 1,
+            live: true,
+        };
+        assert_eq!(live.since(), 6);
+        assert_eq!(live.versioned_name(), Some("live migration"));
     }
 }

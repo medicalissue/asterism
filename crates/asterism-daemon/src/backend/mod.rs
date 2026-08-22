@@ -313,11 +313,14 @@ fn materialised_image_ref(reference: &str) -> Result<ImageRef> {
 /// never read the seed — so the snapshot commands do not pay for an ISO
 /// build they would throw away.
 pub fn disk_req(inst: &Instance) -> Result<BootReq<'_>> {
+    disk_req_in(inst, paths::instance_dir(&inst.name))
+}
+
+fn disk_req_in(inst: &Instance, dir: std::path::PathBuf) -> Result<BootReq<'_>> {
     let reference = inst
         .image
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("instance has no image — recreate it with --image"))?;
-    let dir = paths::instance_dir(&inst.name);
     Ok(BootReq {
         instance: inst,
         base: materialised_image_ref(reference)?,
@@ -329,6 +332,33 @@ pub fn disk_req(inst: &Instance) -> Result<BootReq<'_>> {
         extra_disks: Vec::new(),
         dir,
     })
+}
+
+/// Build the backend-neutral request for an incoming live migration.
+///
+/// The guest's seed and root disk have already been pre-copied into `dir`.
+/// Rebuilding either would change the machine while its source copy is still
+/// running, so this path resolves the immutable base and points the backend
+/// at staged bytes without running first-boot mutation again.
+pub fn migration_req<'a>(inst: &'a Instance, dir: std::path::PathBuf) -> Result<BootReq<'a>> {
+    if !inst.volumes.is_empty() {
+        bail!(
+            "live migration of {:?} is unavailable while volumes are attached — use \
+             --down so their leases and directory parts move through the offline path",
+            inst.name
+        );
+    }
+    if inst.image_kind == ImageKind::OciRootfs {
+        bail!(
+            "live migration of OCI-rootfs instance {:?} is unavailable — use --down",
+            inst.name
+        );
+    }
+    let req = disk_req_in(inst, dir)?;
+    if !req.seed.exists() {
+        bail!("the staged guest seed is missing at {}", req.seed.display());
+    }
+    Ok(req)
 }
 
 /// Assemble a full boot request: resolve the image, work out the shares,
