@@ -561,7 +561,10 @@ pub(crate) async fn handle(req: Request, node: &Node) -> Response {
         if let Ok(mut reg) = node.shard.try_lock() {
             instance::reconcile(&mut reg);
         }
-        return Response::Pong { version: VERSION.to_owned() };
+        return Response::Pong {
+            version: VERSION.to_owned(),
+            build_id: Some(asterism_core::BUILD_ID.to_owned()),
+        };
     }
     if secret::is_source_request(&req) {
         return secret::serve_source(req).await;
@@ -630,7 +633,13 @@ mod tests {
         )
         .await
         .expect("the handshake waited on the registry");
-        assert!(matches!(answered, Response::Pong { version } if version == VERSION));
+        assert!(matches!(
+            answered,
+            Response::Pong {
+                version,
+                build_id: Some(build_id),
+            } if version == VERSION && build_id == asterism_core::BUILD_ID
+        ));
 
         drop(stalled);
     }
