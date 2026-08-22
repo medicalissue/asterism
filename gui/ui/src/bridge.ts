@@ -153,6 +153,35 @@ export function loadConsoleTail(name: string, lines = 120): Promise<ConsoleTail>
   return invoke<ConsoleTail>('console_tail', {name, lines});
 }
 
+export interface BackupReport {
+  destination: string;
+  files: number;
+  logical_bytes: number;
+  data_chunks: number;
+  reused_chunks: number;
+}
+
+export interface RestoreReport {
+  instance: string;
+  id: string;
+  files: number;
+  logical_bytes: number;
+  rebind: {
+    volumes: Array<{kind: string; path: string; source_device: string}>;
+    secrets: Array<{secret: string; authority: string; source_device: string}>;
+  };
+}
+
+export function backupInstance(name: string): Promise<BackupReport> {
+  if (browserPreview) return Promise.resolve({destination: `~/.asterism/backups/${name}`, files: 2, logical_bytes: 1024, data_chunks: 1, reused_chunks: 0});
+  return invoke<BackupReport>('backup_instance', {name});
+}
+
+export function restoreInstance(source: string, name?: string): Promise<RestoreReport> {
+  if (browserPreview) return Promise.resolve({instance: name || 'restored', id: 'preview-id', files: 2, logical_bytes: 1024, rebind: {volumes: [], secrets: []}});
+  return invoke<RestoreReport>('restore_instance', {source, name: name || null});
+}
+
 // ---- the main window: Devices ----------------------------------------------
 
 export interface DeviceRow {

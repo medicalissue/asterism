@@ -25,12 +25,12 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use asterism_core::compat;
 use asterism_core::durable;
 use asterism_core::hv::{ImageKind, RunState, STOP_DEADLINE};
 use asterism_core::instance::{local_host, Instance, Policy, Status};
 use asterism_core::protocol::{Request, Response};
 use asterism_core::registry::{self, Shard};
+use asterism_core::{backup, compat};
 use asterism_core::{paths, VERSION};
 
 use crate::mesh::Mesh;
@@ -217,6 +217,28 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             .await
         }
         Request::DetachSecret { name, secret } => detach_secret(reg, &name, &secret),
+        Request::BackupExport { name, destination } => {
+            let exported = reg.get(&name).cloned().and_then(|inst| {
+                let provenance = backup::image_provenance(&inst)?;
+                backup::export(
+                    &inst,
+                    &paths::instance_dir(&name),
+                    Path::new(&destination),
+                    provenance,
+                )
+            });
+            return match exported {
+                Ok(report) => Response::BackupExported { report },
+                Err(e) => Response::Error {
+                    message: format!("{e:#}"),
+                },
+            };
+        }
+        Request::BackupImport { source, name } => {
+            return tokio::task::block_in_place(|| {
+                restore_backup(reg, Path::new(&source), &name, cpu_device)
+            });
+        }
         // A file on this device's disk, read here rather than by the CLI, so
         // that the answer is the same whoever asked and from wherever.
         Request::Logs { name, lines } => {
@@ -355,8 +377,101 @@ fn claimed_name(req: &Request) -> Option<&str> {
     match req {
         Request::Create { name, .. } => Some(name),
         Request::Rename { new_name, .. } => Some(new_name),
+        Request::BackupImport { name, .. } => Some(name),
         _ => None,
     }
+}
+
+/// Verify and stage the whole backup before one live path or registry row is
+/// touched, then publish the directory and row as one recoverable operation.
+fn restore_backup(reg: &mut Shard, source: &Path, name: &str, cpu_device: &str) -> Response {
+    if let Ok(existing) = reg.get(name) {
+        return Response::Error {
+            message: registry::taken(existing),
+        };
+    }
+    let live = paths::instance_dir(name);
+    // The same backup gets the same staging directory and resumes there; a
+    // different backup of the same name gets a different one, so files that
+    // were present in an older export can never leak into this restore.
+    let preview = match backup::inspect(source) {
+        Ok(manifest) => manifest,
+        Err(e) => {
+            return Response::Error {
+                message: format!("{e:#}"),
+            }
+        }
+    };
+    let restore_key =
+        blake3::hash(format!("{}:{}", preview.instance.id, preview.created_at).as_bytes()).to_hex();
+    let staging = paths::home_dir()
+        .join("instances")
+        .join(format!(".{name}.restoring-{}", &restore_key[..12]));
+
+    // A power cut after publishing the directory but before saving the row
+    // leaves one distinctive state: a live directory with our restore
+    // receipt and no registry entry. Retrying the same import verifies those
+    // files again and finishes the row instead of stranding the instance.
+    let receipt = live.join(".restore-receipt.json");
+    let recovering_publication = if live.exists() {
+        match std::fs::read(&receipt)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<backup::RestoreReport>(&bytes).ok())
+        {
+            Some(report) if report.instance == name && report.id == preview.instance.id => true,
+            _ => {
+                return Response::Error {
+                    message: format!(
+                        "{} already exists without a matching restore receipt — refusing to overwrite possible instance bytes",
+                        live.display()
+                    ),
+                }
+            }
+        }
+    } else {
+        false
+    };
+    let restore_at = if recovering_publication {
+        &live
+    } else {
+        &staging
+    };
+    let (mut instance, report) = match backup::restore_to(source, restore_at, name) {
+        Ok(restored) => restored,
+        Err(e) => {
+            return Response::Error {
+                message: format!("{e:#}"),
+            }
+        }
+    };
+    if reg.list().iter().any(|held| held.id == instance.id) {
+        return Response::Error {
+            message: format!(
+                "instance identity {} already exists on this device — refusing to create a second writer",
+                instance.id
+            ),
+        };
+    }
+    instance.cpu_device = cpu_device.to_owned();
+    if !recovering_publication {
+        if let Err(e) = durable::publish_dir(&staging, &live) {
+            return Response::Error {
+                message: format!("publishing restored instance: {e:#}"),
+            };
+        }
+    }
+    let adopted = reg.adopt(instance).and_then(|_| reg.save());
+    if let Err(e) = adopted {
+        let _ = reg.remove(name);
+        if !recovering_publication {
+            let _ = durable::publish_rename(&live, &staging);
+        }
+        return Response::Error {
+            message: format!("saving restored instance: {e:#}"),
+        };
+    }
+    let _ = std::fs::remove_file(live.join(".restore-receipt.json"));
+    Response::BackupRestored { report }
 }
 
 /// Claims a name in the orbit's one flat instance namespace.

@@ -15,6 +15,7 @@
 //! behind a projected guest GPU device. [`verify`] is the gate every boot
 //! input passes through on its way into the store and out of it again.
 
+pub mod backup;
 pub mod compat;
 pub mod cow;
 pub mod durable;

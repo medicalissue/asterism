@@ -185,6 +185,8 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         main::volume_rows,
         main::snapshots,
         main::console_tail,
+        main::backup_instance,
+        main::restore_instance,
         // ... and what its buttons do.
         main::act,
         main::copy,

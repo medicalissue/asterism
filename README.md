@@ -63,6 +63,7 @@ ast create dev --image debian:13 --cpus 4 --mem 8G
 ast attach dev --volume ~/work
 ast up dev · ast ssh dev · ast down dev
 ast snapshot dev clean · ast restore dev clean · ast logs dev -f
+ast backup export dev ~/Backups/dev · ast backup inspect ~/Backups/dev · ast backup import ~/Backups/dev
 ast ls · ast status dev · ast rm dev
 ```
 

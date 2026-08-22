@@ -209,6 +209,9 @@ enum Command {
         /// The snapshot to roll back to, as `ast snapshots` lists it.
         tag: String,
     },
+    /// Export, inspect and restore portable content-addressed backups.
+    #[command(subcommand)]
+    Backup(BackupCommand),
     /// List known images and whether they are downloaded.
     ///
     /// This device's image store: the aliases it knows and what is already
@@ -436,6 +439,32 @@ enum SnapshotCommand {
     /// `ast snapshot <instance> [tag]` — take one.
     #[command(external_subcommand)]
     Take(Vec<String>),
+}
+
+#[derive(Subcommand)]
+enum BackupCommand {
+    /// Export a stopped instance's definition, disk and snapshots.
+    Export {
+        name: String,
+        #[arg(value_name = "DIRECTORY")]
+        destination: String,
+    },
+    /// Inspect a backup's redacted manifest without restoring it.
+    Inspect {
+        #[arg(value_name = "DIRECTORY")]
+        source: String,
+        /// Print the complete redacted manifest as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify and transactionally restore a backup on this device.
+    Import {
+        #[arg(value_name = "DIRECTORY")]
+        source: String,
+        /// Restore under another orbit-global name. Identity is preserved.
+        #[arg(long)]
+        name: Option<String>,
+    },
 }
 
 /// `ast volume ...` — the block storage one device puts in the pool.
@@ -702,6 +731,22 @@ fn main() -> Result<()> {
         }
         Command::Snapshots { name } => return print_snapshots(&name, device.as_deref()),
         Command::Restore { name, tag } => return restore_snapshot(&name, &tag, device.as_deref()),
+        Command::Backup(BackupCommand::Export { name, destination }) => Request::BackupExport {
+            name,
+            destination: absolute_path(&destination)?.display().to_string(),
+        },
+        Command::Backup(BackupCommand::Inspect { source, json }) => {
+            local_only("backup inspect", device.as_deref())?;
+            return inspect_backup(&source, json);
+        }
+        Command::Backup(BackupCommand::Import { source, name }) => {
+            let source = absolute_path(&source)?;
+            let manifest = asterism_core::backup::inspect(&source)?;
+            Request::BackupImport {
+                source: source.display().to_string(),
+                name: name.unwrap_or(manifest.instance.name),
+            }
+        }
         // The image store is per device, so both of these are about this one.
         Command::Images { verify } => {
             local_only("images", device.as_deref())?;
@@ -811,6 +856,35 @@ fn main() -> Result<()> {
                 .map(|instance| OrbitRow { instance, live: true })
                 .collect::<Vec<_>>(),
         ),
+        Response::BackupExported { report } => {
+            println!(
+                "exported {} file(s), {} logical bytes to {}",
+                report.files, report.logical_bytes, report.destination
+            );
+            println!(
+                "{} data chunk(s), {} reused",
+                report.data_chunks, report.reused_chunks
+            );
+        }
+        Response::BackupRestored { report } => {
+            println!("{}  restored ({})", report.instance, report.id);
+            if report.rebind.volumes.is_empty() && report.rebind.secrets.is_empty() {
+                println!("no external parts need rebinding");
+            } else {
+                for volume in report.rebind.volumes {
+                    println!(
+                        "rebind volume: {}:{} ({:?})",
+                        volume.source_device, volume.path, volume.kind
+                    );
+                }
+                for secret in report.rebind.secrets {
+                    println!(
+                        "rebind secret: {} to {} (previous source: {})",
+                        secret.secret, secret.authority, secret.source_device
+                    );
+                }
+            }
+        }
         // The handshake owns Pong, `ast snapshots` owns Snapshots, `ast ssh`
         // and `ast logs` return long before here. Any of them arriving is astd
         // answering a different question.
@@ -843,6 +917,39 @@ fn main() -> Result<()> {
         }
         Response::Error { message } => bail!(message),
     }
+    Ok(())
+}
+
+fn absolute_path(path: &str) -> Result<std::path::PathBuf> {
+    let path = std::path::PathBuf::from(path);
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    Ok(std::env::current_dir()?.join(path))
+}
+
+fn inspect_backup(source: &str, json: bool) -> Result<()> {
+    let source = absolute_path(source)?;
+    let manifest = asterism_core::backup::verify(&source)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&manifest)?);
+        return Ok(());
+    }
+    println!("{}  {}", manifest.instance.name, manifest.instance.id);
+    println!(
+        "{} file(s), {} logical bytes, format {}",
+        manifest.files.len(),
+        manifest.files.iter().map(|file| file.len).sum::<u64>(),
+        manifest.version
+    );
+    if let Some(image) = manifest.image {
+        println!("image: {}  {}", image.reference, image.content);
+    }
+    println!(
+        "external parts to rebind: {} volume(s), {} secret(s)",
+        manifest.rebind.volumes.len(),
+        manifest.rebind.secrets.len()
+    );
     Ok(())
 }
 

@@ -102,10 +102,11 @@ use crate::VERSION;
 ///   that answers `Ping` without a `protocol` field is not an unknown
 ///   quantity, it is exactly this, which is why such a daemon is spoken to
 ///   rather than replaced.
-/// * **2** — this build. `Ping` carries the caller's range, `Pong` carries
+/// * **2** — `Ping` carries the caller's range, `Pong` carries
 ///   the daemon's, mesh frames carry both, and [`crate::protocol::Request::Compat`]
 ///   exists.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// * **3** — portable backup export/import frames and their reports.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The wire as it was before it carried a version.
 ///

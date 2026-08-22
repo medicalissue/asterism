@@ -19,8 +19,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use asterism_core::backup;
 use asterism_core::hv::Machine;
-use asterism_core::instance::Shape;
+use asterism_core::instance::{Instance, Shape};
 use asterism_core::ipc;
 use asterism_core::protocol::{Request, Response};
 use asterism_core::registry::Shard;
@@ -108,6 +109,30 @@ impl Daemon {
         let line = serde_json::to_string(request).expect("encoding a request");
         let reply = self.ask(&line);
         serde_json::from_str(&reply).unwrap_or_else(|e| panic!("decoding {reply:?}: {e}"))
+    }
+
+    fn ask_current(&self, request: &Request) -> Response {
+        let mut stream = UnixStream::connect(self.sock()).expect("connecting to astd");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let ours = asterism_core::compat::ours();
+        for request in [
+            Request::Ping {
+                protocol: ours.max,
+                min_protocol: ours.min,
+            },
+            request.clone(),
+        ] {
+            let mut line = serde_json::to_vec(&request).unwrap();
+            line.push(b'\n');
+            stream.write_all(&line).unwrap();
+            let reply = read_line(&mut stream);
+            if !matches!(request, Request::Ping { .. }) {
+                return serde_json::from_str(&reply).unwrap();
+            }
+        }
+        unreachable!()
     }
 
     /// Still there, still answering, still this version.
@@ -271,6 +296,114 @@ fn a_move_refuses_a_mutated_adopted_base_before_fencing_the_source() {
         instance.moving.is_none(),
         "the refused move mutated the source row"
     );
+}
+
+/// Import crosses the real socket and publishes bytes and identity once. A
+/// second import proves the orbit-wide name gate is on the safe side of every
+/// write rather than an overwrite disguised as idempotence.
+#[test]
+fn a_portable_backup_restores_once_and_refuses_a_name_collision() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    let export = dir.path().join("portable");
+    std::fs::create_dir_all(&source).unwrap();
+    let bytes = b"portable root disk\0with bytes";
+    std::fs::write(source.join("disk.raw"), bytes).unwrap();
+    let mut instance = Instance::new(
+        "restored",
+        "source-device",
+        "debian:13",
+        Shape::default(),
+        Machine {
+            backend: "qemu".into(),
+            machine_type: "virt".into(),
+            cpu: "host".into(),
+            hv_version: "test".into(),
+        },
+    );
+    // Import does not need the base image: its verified provenance is useful
+    // for inspection, while the root disk is the complete restorable state.
+    instance.image = None;
+    backup::export(&instance, &source, &export, None).unwrap();
+
+    let home = dir.path().join("home");
+    let astd = Daemon::on(dir, home.clone());
+    let request = Request::BackupImport {
+        source: export.display().to_string(),
+        name: "restored".into(),
+    };
+    let reply = astd.ask_current(&request);
+    let Response::BackupRestored { report } = reply else {
+        panic!("backup import was not restored: {reply:?}");
+    };
+    assert_eq!(report.id, instance.id);
+    assert_eq!(
+        std::fs::read(home.join("instances/restored/disk.raw")).unwrap(),
+        bytes
+    );
+
+    let Response::Error { message } = astd.ask_current(&request) else {
+        panic!("a second import overwrote the first");
+    };
+    assert!(
+        message.contains("already exists in this orbit"),
+        "{message}"
+    );
+    assert_eq!(
+        std::fs::read(home.join("instances/restored/disk.raw")).unwrap(),
+        bytes,
+        "the collision changed the restored bytes"
+    );
+}
+
+/// The import's only cross-file crash window is publication before the shard
+/// commit. Its receipt makes that state distinguishable from somebody's
+/// orphan directory, so the same request can verify and finish it safely.
+#[test]
+fn a_portable_restore_resumes_after_publication_wins_the_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    let export = dir.path().join("portable");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("disk.raw"), b"survived publication").unwrap();
+    let mut instance = Instance::new(
+        "recovered",
+        "source-device",
+        "debian:13",
+        Shape::default(),
+        Machine {
+            backend: "qemu".into(),
+            machine_type: "virt".into(),
+            cpu: "host".into(),
+            hv_version: "test".into(),
+        },
+    );
+    instance.image = None;
+    backup::export(&instance, &source, &export, None).unwrap();
+
+    // Exactly what a kill after publish and before `reg.save()` leaves.
+    let live = home.join("instances/recovered");
+    backup::restore_to(&export, &live, "recovered").unwrap();
+    assert!(live.join(".restore-receipt.json").exists());
+    assert!(!home.join("state.json").exists());
+
+    let astd = Daemon::on(dir, home.clone());
+    let response = astd.ask_current(&Request::BackupImport {
+        source: export.display().to_string(),
+        name: "recovered".into(),
+    });
+    let Response::BackupRestored { report } = response else {
+        panic!("published restore did not converge: {response:?}");
+    };
+    assert_eq!(report.id, instance.id);
+    assert!(!live.join(".restore-receipt.json").exists());
+    let Response::Instance { instance: held } = astd.ask_request(&Request::Status {
+        name: "recovered".into(),
+    }) else {
+        panic!("the recovered row is not in the shard");
+    };
+    assert_eq!(held.id, instance.id);
 }
 
 /// The shape of the whole thing, on the binary that ships: state nobody else
