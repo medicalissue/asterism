@@ -68,6 +68,7 @@ use asterism_core::proc::{ProcId, Signal};
 use asterism_core::protocol::{Request, Response};
 use asterism_core::tools::{run, tool};
 use asterism_core::volume::{self, BlockVolume, Store};
+use asterism_mesh::PathKind;
 
 use crate::mesh::{self, Mesh, Splice, TransferStats};
 use crate::Node;
@@ -81,6 +82,15 @@ const EXPORT_READY: Duration = Duration::from_secs(5);
 /// Named because the e2e asserts on it: an honest failure is a feature here,
 /// and a wall of QEMU errors is not one.
 pub const UNREACHABLE: &str = "could not reach the device holding it";
+
+/// The launch admission bound for a remote block device.
+///
+/// NBD performs a network round trip for I/O the guest cannot make local, so
+/// the roadmap treats five milliseconds as a placement boundary rather than
+/// a cosmetic warning.  This is deliberately an admission rule: an unsuitable
+/// link is refused before a lease epoch, instance record, bridge socket, or
+/// guest is mutated.
+pub const REMOTE_VOLUME_MAX_RTT: Duration = Duration::from_millis(5);
 
 // ---- the plane -------------------------------------------------------------
 
@@ -757,6 +767,10 @@ pub fn bring_up(inst: &Instance, hv: &dyn Hypervisor) -> Result<Raised> {
     // Called from inside `block_in_place`, which is what makes blocking on
     // the runtime here legal: the worker thread has already been handed back.
     tokio::runtime::Handle::current().block_on(async {
+        // Measure every provider before taking the first lease.  Doing this
+        // inside `raise_all`'s per-volume loop would let a later unsuitable
+        // provider refuse the boot only after earlier lease epochs moved.
+        preflight_all(&blocks).await?;
         match raise_all(&name, &blocks).await {
             Ok(disks) => Ok(disks),
             Err(e) => {
@@ -765,6 +779,71 @@ pub fn bring_up(inst: &Instance, hv: &dyn Hypervisor) -> Result<Raised> {
             }
         }
     })
+}
+
+/// Prove that every remote block device has a launch-quality data path before
+/// any boot-side mutation begins.
+async fn preflight_all(blocks: &[Volume]) -> Result<()> {
+    for volume in blocks {
+        preflight_remote_volume(&volume.host).await?;
+    }
+    Ok(())
+}
+
+/// Admit one remote block-volume placement.
+///
+/// The peer probe is a real exchange over the currently selected QUIC path.
+/// A relay remains valid for ordinary orbit control and recovery, but it is
+/// not suitable for the synchronous NBD data plane.  Absence of a selected
+/// path or measured RTT is also a refusal: guessing would turn an SLO into a
+/// label.
+pub async fn preflight_remote_volume(device: &str) -> Result<()> {
+    let plane = plane()?;
+    if device == plane.node.device_name().await {
+        return Ok(());
+    }
+    let mesh = plane
+        .mesh
+        .as_ref()
+        .context("this daemon has no mesh endpoint, so it cannot reach another device's volumes")?;
+    let observation = mesh
+        .measure_link(device)
+        .await
+        .ok_or_else(|| anyhow!("{UNREACHABLE}: {device}"))?;
+    admit_remote_volume_link(device, &observation)
+}
+
+fn admit_remote_volume_link(device: &str, observation: &mesh::LinkObservation) -> Result<()> {
+    let path = observation.path.ok_or_else(|| {
+        anyhow!(
+            "remote volume placement on {device} refused before mutation: the selected path is \
+             not measurable; a direct path with at most {}ms RTT is required",
+            REMOTE_VOLUME_MAX_RTT.as_millis()
+        )
+    })?;
+    if path != PathKind::Direct {
+        bail!(
+            "remote volume placement on {device} refused before mutation: selected path is \
+             {path}; remote volumes require a direct path with at most {}ms RTT",
+            REMOTE_VOLUME_MAX_RTT.as_millis()
+        );
+    }
+    let rtt = observation.rtt_micros.ok_or_else(|| {
+        anyhow!(
+            "remote volume placement on {device} refused before mutation: direct-path RTT is \
+             not measurable; at most {}ms is required",
+            REMOTE_VOLUME_MAX_RTT.as_millis()
+        )
+    })?;
+    if rtt > REMOTE_VOLUME_MAX_RTT.as_micros() as u64 {
+        bail!(
+            "remote volume placement on {device} refused before mutation: direct-path RTT is \
+             {:.1}ms; at most {}ms is required",
+            rtt as f64 / 1_000.0,
+            REMOTE_VOLUME_MAX_RTT.as_millis()
+        );
+    }
+    Ok(())
 }
 
 /// Drop every bridge an instance holds. The lease stays: it belongs to the
@@ -1311,6 +1390,51 @@ mod tests {
         );
         assert!(err.contains("vz"), "{err}");
         assert!(check_backend(&Fake(true)).is_ok());
+    }
+
+    #[test]
+    fn remote_volume_admission_requires_a_measured_direct_path_within_the_slo() {
+        let direct_at_limit = mesh::LinkObservation {
+            path: Some(PathKind::Direct),
+            rtt_micros: Some(REMOTE_VOLUME_MAX_RTT.as_micros() as u64),
+        };
+        assert!(admit_remote_volume_link("provider", &direct_at_limit).is_ok());
+
+        let relay = mesh::LinkObservation {
+            path: Some(PathKind::Relay),
+            rtt_micros: Some(100),
+        };
+        let error = admit_remote_volume_link("provider", &relay)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("refused before mutation"), "{error}");
+        assert!(error.contains("selected path is relay"), "{error}");
+
+        let slow = mesh::LinkObservation {
+            path: Some(PathKind::Direct),
+            rtt_micros: Some(REMOTE_VOLUME_MAX_RTT.as_micros() as u64 + 1),
+        };
+        let error = admit_remote_volume_link("provider", &slow)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("direct-path RTT"), "{error}");
+        assert!(error.contains("at most 5ms"), "{error}");
+
+        for unmeasured in [
+            mesh::LinkObservation {
+                path: None,
+                rtt_micros: Some(100),
+            },
+            mesh::LinkObservation {
+                path: Some(PathKind::Direct),
+                rtt_micros: None,
+            },
+        ] {
+            let error = admit_remote_volume_link("provider", &unmeasured)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("not measurable"), "{error}");
+        }
     }
 
     /// Volume requests must be recognisable *before* the instance shard is
