@@ -428,14 +428,25 @@ fn stable_port(instance: &str) -> Option<u16> {
 /// reissued seed is a working instance, where a refusal would be a machine
 /// that will not boot.
 fn bind_loopback(preferred: Option<u16>) -> Result<(TcpListener, u16)> {
-    let loopback = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
-    let std_listener = preferred
-        .and_then(|port| std::net::TcpListener::bind(loopback(port)).ok())
-        .map_or_else(|| std::net::TcpListener::bind(loopback(0)), Ok)
+    let std_listener = bind_loopback_with(preferred, std::net::TcpListener::bind)
         .context("binding the guest egress proxy on loopback")?;
     std_listener.set_nonblocking(true)?;
     let port = std_listener.local_addr()?.port();
     Ok((TcpListener::from_std(std_listener)?, port))
+}
+
+/// Try the remembered loopback address before asking the OS for a free one.
+///
+/// The binder is a seam for proving the choice without dropping a real port
+/// reservation and racing the machine's parallel ephemeral-port allocator.
+fn bind_loopback_with<T>(
+    preferred: Option<u16>,
+    mut bind: impl FnMut(SocketAddr) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let loopback = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
+    preferred
+        .and_then(|port| bind(loopback(port)).ok())
+        .map_or_else(|| bind(loopback(0)), Ok)
 }
 
 /// What one instance's proxy knows.
@@ -1501,14 +1512,47 @@ mod tests {
     async fn the_listener_is_reachable_from_the_guest_and_from_nothing_on_the_wire() {
         let (listener, port) = bind_loopback(None).expect("a loopback port");
         let addr = listener.local_addr().unwrap();
+        assert_eq!(addr.port(), port);
         assert!(addr.ip().is_loopback(), "{addr} is not loopback");
         assert!(!addr.ip().is_unspecified(), "{addr} is a wildcard bind");
-        // And it comes back on the same port when asked, which is what lets a
-        // seed name one.
         drop(listener);
-        let (again, same) = bind_loopback(Some(port)).expect("the same port again");
-        assert_eq!(same, port);
-        drop(again);
+    }
+
+    /// An available remembered port wins without consulting the allocator.
+    #[test]
+    fn an_available_preferred_port_is_reused_deterministically() {
+        let preferred = 39_000;
+        let expected = SocketAddr::from(([127, 0, 0, 1], preferred));
+        let mut attempts = Vec::new();
+
+        let selected = bind_loopback_with(Some(preferred), |addr| {
+            attempts.push(addr);
+            Ok(addr)
+        })
+        .expect("the preferred bind succeeds");
+
+        assert_eq!(selected, expected);
+        assert_eq!(attempts, [expected], "the allocator fallback was consulted");
+    }
+
+    /// A competing listener keeps the preferred port occupied throughout the
+    /// bind, making fallback a deterministic product behavior rather than an
+    /// ephemeral-port race in the fixture.
+    #[tokio::test]
+    async fn an_occupied_preferred_port_falls_back_on_loopback() {
+        let occupied = std::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .expect("a reservation for the preferred port");
+        let preferred = occupied.local_addr().unwrap().port();
+
+        let (fallback, port) = bind_loopback(Some(preferred)).expect("a fallback loopback port");
+        let addr = fallback.local_addr().unwrap();
+        assert_ne!(port, preferred, "the occupied port was reused");
+        assert_eq!(addr.port(), port);
+        assert!(addr.ip().is_loopback(), "{addr} is not loopback");
+        assert!(!addr.ip().is_unspecified(), "{addr} is a wildcard bind");
+
+        drop(fallback);
+        drop(occupied);
     }
 
     /// A per-instance CA, and its private half stays here.
