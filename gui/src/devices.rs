@@ -477,6 +477,9 @@ mod tests {
             device_id: format!("{name}00000000000000000000000000000000"),
             online,
             path: if online { "direct".to_owned() } else { String::new() },
+            rtt_micros: online.then_some(750),
+            transition_reason: online.then(|| "stored_address".into()),
+            recovery_result: online.then(|| "connected".into()),
             is_self,
         }
     }
