@@ -79,7 +79,7 @@ durability vm     1200  bash scripts/e2e-durability.sh
 persist    vm     1200  bash scripts/e2e-persist.sh
 keys       vm     1200  bash scripts/e2e-keys.sh
 vz         helper 1800  bash scripts/e2e-vz.sh
-volume     vm     2400  bash scripts/e2e-volume.sh
+volume     helper 4800  bash scripts/e2e-volume.sh
 move       vm     2400  bash scripts/e2e-move.sh
 mesh       vm     2400  bash scripts/e2e-mesh.sh
 discovery  net    900   bash scripts/e2e-discovery.sh

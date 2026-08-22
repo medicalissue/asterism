@@ -2,13 +2,13 @@
 # End-to-end for remote block volumes: bytes that live on one device, a guest
 # that runs on another, and a filesystem the guest believes is a local disk.
 #
-# volume create -> attach across the mesh -> a REAL boot -> /dev/vdb in the
-# guest -> mkfs + mount + a marker -> down/up and the marker survives -> a
-# second instance is refused by name -> detach, reattach elsewhere, epoch
-# bumped and the old export socket gone -> the export dies under a live guest
-# and comes back at the same epoch -> the consumer's own daemon is killed and
-# restarted under that live guest, and the disk keeps working -> the
-# provider's daemon is killed and the consumer says something honest.
+# volume create -> attach across the mesh -> a REAL boot -> the attached disk
+# in the guest -> mkfs + mount + a marker -> down/up and the marker survives
+# -> a second instance is refused by name -> detach, reattach elsewhere,
+# epoch bumped and the old export socket gone -> the export dies under a live
+# guest and comes back at the same epoch -> the consumer's own daemon is
+# killed and restarted under that live guest, and the disk keeps working ->
+# the provider's daemon is killed and the consumer says something honest.
 #
 # Nothing here is proved against a mock. The guest really formats the volume,
 # the bytes really cross a QUIC stream to another daemon's qemu-storage-daemon,
@@ -19,12 +19,36 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SCRIPT="$ROOT/scripts/e2e-volume.sh"
 export PATH="$HOME/.cargo/bin:$PATH"
 cd "$ROOT"
+
+# The volume assertions are intentionally backend-neutral. Run the complete
+# lane once per hypervisor so the backend that users get by default is covered
+# as well as the one whose attachment order happens to differ.
+if [ -z "${E2E_VOLUME_BACKEND:-}" ]; then
+  for backend in qemu vz; do
+    echo "== volume e2e backend: $backend =="
+    E2E_VOLUME_BACKEND="$backend" "$SCRIPT" "$@"
+  done
+  exit 0
+fi
+BACKEND="$E2E_VOLUME_BACKEND"
+case "$BACKEND" in
+  qemu|vz) ;;
+  *) echo "VOLUME E2E FAIL: unknown backend: $BACKEND" >&2; exit 2 ;;
+esac
+
 # shellcheck source-path=SCRIPTDIR source=lib/harness.sh
 . "$ROOT/scripts/lib/harness.sh"
 harness_begin volume
 harness_binaries "$ROOT"
+# A source-tree VZ helper is unsigned after cargo builds it. The installed
+# artifact path is already signed by the RC harness, so only sign the local
+# pair here, matching the dedicated VZ lane's setup.
+if [ "$BACKEND" = vz ] && [ -z "${AST_BIN:-}" ]; then
+  "$ROOT/scripts/sign-vz.sh"
+fi
 
 # Fresh, SHORT homes: unix socket paths are capped near 104 bytes, and a volume
 # adds an export socket and a bridge socket to the pile. Deliberately nowhere
@@ -235,6 +259,23 @@ in_guest() {
   ASTERISM_HOME="$A" "$AST" ssh "$INST" -- "$1" 2>&1
 }
 
+# Find the volume by its invariant properties, not by the backend's device
+# naming order. VZ puts its cloud-init seed ahead of the volume, while QEMU
+# currently puts the volume immediately after the root disk. The exact 2 GiB
+# size is the volume's contract and the TYPE=disk check excludes VZ's seed ISO.
+# Keep this as a single-device match:
+# silently choosing among two matches would make every later assertion lie.
+find_volume_device() {
+  local table devices count
+  table="$(in_guest 'lsblk -b -dn -o NAME,SIZE,TYPE,SERIAL')" \
+    || fail "the guest could not list its block devices:"
+  devices="$(awk '$2 == 2147483648 && $3 == "disk" { print "/dev/" $1 }' <<<"$table")"
+  count="$(wc -l <<<"$devices" | tr -d ' ')"
+  [ "$count" = "1" ] \
+    || fail "could not identify the unique 2 GiB volume disk:"$'\n'"$table"
+  printf '%s\n' "$devices"
+}
+
 mkdir -p "$A" "$B"
 start_daemon "$A"
 start_daemon "$B"
@@ -305,18 +346,11 @@ harness_seed_images "$A"
 ASTERISM_HOME="$A" "$AST" pull "$IMAGE" >/dev/null 2>&1 \
   || fail "no $IMAGE image available for A (pull it once: ast pull $IMAGE)"
 
-# qemu by name, because everything below addresses the volume as /dev/vdb.
-#
-# Which letter a virtio disk gets is attachment order, and attachment order
-# is the backend's: on qemu the volume is the second disk, on vz the
-# cloud-init seed ISO takes vdb and the volume moves along. Nothing about
-# leases, epochs or the NBD bridge changes with it, so pinning the backend
-# here buys a deterministic device name without narrowing what is proved.
-#
-# It does mean this lane proves it on qemu only, while an ordinary create
-# now lands on vz — the gap is filed as as-3ge rather than papered over.
-expect "create the instance on A" "$INST  defined" \
-  env ASTERISM_HOME="$A" "$AST" create "$INST" --backend qemu --image "$IMAGE" \
+# The disk's guest name is backend-specific, so the assertions below discover
+# it from lsblk after each boot. The volume itself is still the same 2 GiB
+# block device on both backends.
+expect "create the instance on A ($BACKEND)" "$INST  defined" \
+  env ASTERISM_HOME="$A" "$AST" create "$INST" --backend "$BACKEND" --image "$IMAGE" \
     --mem 2G --disk 10G
 
 ATTACH="$(ASTERISM_HOME="$A" "$AST" attach "$INST" --volume "$B_NAME:$VOL" 2>&1)" \
@@ -379,23 +413,25 @@ LISTENING="$( { lsof -a -p "$A_PID" -iTCP -sTCP:LISTEN -t 2>/dev/null || true; }
 echo "ok: the consumer end is a local unix socket, not a port"
 
 # The guest's view: a plain virtio disk of the right size, with nothing on it.
-LSBLK="$(in_guest 'lsblk -b -n -o NAME,SIZE,FSTYPE /dev/vdb')" \
-  || fail "the guest has no /dev/vdb:"$'\n'"$LSBLK"
-grep -qF "2147483648" <<<"$LSBLK" || fail "/dev/vdb is not 2 GiB:"$'\n'"$LSBLK"
-echo "ok: the guest sees /dev/vdb, 2 GiB, and it is a local disk as far as it knows"
+VOLUME_DEV="$(find_volume_device)"
+LSBLK="$(in_guest "lsblk -b -n -o NAME,SIZE,FSTYPE $VOLUME_DEV")" \
+  || fail "the guest has no $VOLUME_DEV:"$'\n'"$LSBLK"
+grep -qF "2147483648" <<<"$LSBLK" || fail "$VOLUME_DEV is not 2 GiB:"$'\n'"$LSBLK"
+echo "ok: the guest sees $VOLUME_DEV, 2 GiB, and it is a local disk as far as it knows"
 
 # Nothing in the guest may hint that this disk is on another machine.
-MODEL="$(in_guest 'cat /sys/block/vdb/device/../driver/../uevent 2>/dev/null; \
-                   ls -l /sys/block/vdb 2>/dev/null')"
+VOLUME_NAME="${VOLUME_DEV#/dev/}"
+MODEL="$(in_guest "cat /sys/block/$VOLUME_NAME/device/../driver/../uevent 2>/dev/null; \
+                   ls -l /sys/block/$VOLUME_NAME 2>/dev/null")"
 if grep -qiE "nbd|network" <<<"$MODEL"; then
   fail "the guest can tell this disk is remote:"$'\n'"$MODEL"
 fi
-grep -qF "virtio" <<<"$MODEL" || fail "/dev/vdb is not a virtio disk:"$'\n'"$MODEL"
-echo "ok: the guest sees a virtio disk, with no mention of a network anywhere"
+grep -qF "virtio" <<<"$MODEL" || fail "$VOLUME_DEV is not a virtio disk:"$'\n'"$MODEL"
+echo "ok: the guest sees $VOLUME_DEV as a virtio disk, with no mention of a network anywhere"
 
 MARKER="written-by-$INST-at-$(date +%s)"
-FS="$(in_guest "sudo mkfs.ext4 -q -F /dev/vdb && sudo mkdir -p /data && \
-                sudo mount /dev/vdb /data && \
+FS="$(in_guest "sudo mkfs.ext4 -q -F $VOLUME_DEV && sudo mkdir -p /data && \
+                sudo mount $VOLUME_DEV /data && \
                 echo '$MARKER' | sudo tee /data/marker >/dev/null && \
                 sudo umount /data && echo FORMATTED")" \
   || fail "the guest could not make a filesystem on the volume:"$'\n'"$FS"
@@ -423,8 +459,9 @@ expect "and boots again" "$INST  running" env ASTERISM_HOME="$A" "$AST" up "$INS
 E3="$(epoch_now)"
 [ "$E3" -gt "$E2" ] || fail "the second boot did not bump the epoch ($E2 -> $E3)"
 [ ! -e "$B/volumes/$VOL/nbd-e$E2.sock" ] || fail "epoch $E2's export socket survived"
+VOLUME_DEV="$(find_volume_device)"
 
-SURVIVED="$(in_guest "sudo mkdir -p /data && sudo mount /dev/vdb /data && cat /data/marker")" \
+SURVIVED="$(in_guest "sudo mkdir -p /data && sudo mount $VOLUME_DEV /data && cat /data/marker")" \
   || fail "the guest could not mount the volume it made:"$'\n'"$SURVIVED"
 grep -qF "$MARKER" <<<"$SURVIVED" \
   || fail "the marker did not survive the reboot:"$'\n'"$SURVIVED"
@@ -504,7 +541,8 @@ expect "and back to the first" "a disk in the guest" \
 expect "boot with the volume back on the first instance" "$INST  running" \
   env ASTERISM_HOME="$A" "$AST" up "$INST"
 E5="$(epoch_now)"
-MOUNTED="$(in_guest "sudo mkdir -p /data && sudo mount /dev/vdb /data && cat /data/marker")" \
+VOLUME_DEV="$(find_volume_device)"
+MOUNTED="$(in_guest "sudo mkdir -p /data && sudo mount $VOLUME_DEV /data && cat /data/marker")" \
   || fail "the guest could not mount its volume:"$'\n'"$MOUNTED"
 grep -qF "$MARKER" <<<"$MOUNTED" || fail "the marker is gone:"$'\n'"$MOUNTED"
 
@@ -514,7 +552,7 @@ echo "ok: killed the storage daemon serving epoch $E5 under a live guest"
 
 MARKER2="survived-a-dead-export-$(date +%s)"
 RECOVER="$(in_guest "echo '$MARKER2' | sudo tee /data/marker2 >/dev/null && sync && \
-                     sudo umount /data && sudo mount /dev/vdb /data && \
+                     sudo umount /data && sudo mount $VOLUME_DEV /data && \
                      cat /data/marker /data/marker2")" \
   || fail "the guest lost its disk when the export died:"$'\n'"$RECOVER"
 grep -qF "$MARKER" <<<"$RECOVER" || fail "the old marker is gone:"$'\n'"$RECOVER"
@@ -621,7 +659,7 @@ echo "ok: the lease is still $INST's, at the same epoch $E_BEFORE"
 # proof that these bytes crossed a bridge this daemon raised from nothing.
 MARKER3="written-after-astd-restarted-$(date +%s)"
 AFTER="$(in_guest "echo '$MARKER3' | sudo tee /data/marker3 >/dev/null && sync && \
-                   sudo umount /data && sudo mount /dev/vdb /data && \
+                   sudo umount /data && sudo mount $VOLUME_DEV /data && \
                    cat /data/marker /data/marker3")" \
   || fail "the guest lost its volume across the astd restart:"$'\n'"$AFTER"
 grep -qF "$MARKER" <<<"$AFTER" || fail "the old marker is gone:"$'\n'"$AFTER"
