@@ -617,6 +617,55 @@ fn the_state_directory_and_the_socket_are_private() {
     );
 }
 
+/// A daemon's home is private to that daemon, but the short runtime directory
+/// is shared by every home for this uid. Start both children before waiting
+/// for either one so their first-boot runtime preparation overlaps. A fresh
+/// `TMPDIR` on every round makes every round exercise creation rather than an
+/// already-existing directory.
+#[test]
+fn different_homes_concurrently_share_a_new_private_runtime_directory() {
+    const ROUNDS: usize = 8;
+
+    for round in 0..ROUNDS {
+        let runtime_parent = tempfile::tempdir().expect("a fresh runtime parent");
+        let runtime_parent_text = runtime_parent
+            .path()
+            .to_str()
+            .expect("the runtime parent is UTF-8");
+        let first_dir = tempfile::tempdir().expect("a first home parent");
+        let second_dir = tempfile::tempdir().expect("a second home parent");
+        let first_home = first_dir.path().join("home");
+        let second_home = second_dir.path().join("home");
+
+        let first = spawn_logged(&first_home, &[("TMPDIR", runtime_parent_text)]);
+        let second = spawn_logged(&second_home, &[("TMPDIR", runtime_parent_text)]);
+        let mut first = Daemon {
+            child: first.child,
+            home: first_home,
+            _dir: first_dir,
+        };
+        let mut second = Daemon {
+            child: second.child,
+            home: second_home,
+            _dir: second_dir,
+        };
+
+        first.await_ready();
+        second.await_ready();
+        first.assert_serving();
+        second.assert_serving();
+
+        let runtime = runtime_parent
+            .path()
+            .join(format!("asterism-{}", ipc::own_uid()));
+        assert_eq!(
+            mode_of(&runtime),
+            0o700,
+            "round {round} left the shared runtime directory open"
+        );
+    }
+}
+
 /// An `$ASTERISM_HOME` from any earlier astd is `0755`, and refusing to start
 /// on one would refuse to start for every existing user. It is fixed, and
 /// said out loud rather than silently.

@@ -172,24 +172,50 @@ pub enum Privacy {
 /// upgrade, it is a different user's directory, and taking it over is not
 /// this process's business.
 pub fn private_dir(path: &Path) -> Result<Privacy> {
+    private_dir_as(path, own_uid())
+}
+
+/// [`private_dir`], told who "us" is.
+///
+/// Keeping the uid constant through a recursive creation matters less in
+/// production (the real uid cannot change) than it does in the tests that
+/// exercise an adversarial creation collision.
+fn private_dir_as(path: &Path, ours: u32) -> Result<Privacy> {
     match std::fs::symlink_metadata(path) {
-        Ok(md) => audit_dir(path, &md, own_uid()),
+        Ok(md) => audit_dir(path, &md, ours),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             // The parents get the same treatment, one at a time, so that
             // `~/.asterism/guest-keys` cannot be created under a `~/.asterism`
             // this call made world-readable on the way down.
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() && !parent.exists() {
-                    private_dir(parent)?;
+                    private_dir_as(parent, ours)?;
                 }
             }
-            std::fs::DirBuilder::new()
-                .mode(0o700)
-                .create(path)
-                .with_context(|| format!("creating {}", path.display()))?;
-            Ok(Privacy::Created)
+            create_private_dir(path, ours)
         }
         Err(e) => Err(e).with_context(|| format!("looking at {}", path.display())),
+    }
+}
+
+/// Perform the create half of [`private_dir_as`].
+///
+/// The missing-path check and `mkdir(2)` cannot be one atomic operation. Two
+/// independent daemons with different homes still share the per-uid runtime
+/// directory, so both can observe it missing and race here. `EEXIST` means
+/// only that something won the name; it does *not* prove that the winner was
+/// our private directory. Re-auditing the object is what makes a legitimate
+/// concurrent creator idempotent without accepting a directory or symlink an
+/// attacker placed there first.
+fn create_private_dir(path: &Path, ours: u32) -> Result<Privacy> {
+    match std::fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => Ok(Privacy::Created),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            let md = std::fs::symlink_metadata(path)
+                .with_context(|| format!("rechecking {} after it was created", path.display()))?;
+            audit_dir(path, &md, ours)
+        }
+        Err(e) => Err(e).with_context(|| format!("creating {}", path.display())),
     }
 }
 
@@ -643,6 +669,80 @@ mod tests {
             0o700,
             "the parent was left open"
         );
+    }
+
+    /// Different `ASTERISM_HOME`s still share one short runtime directory.
+    /// Drive every racer directly through the missing-path create boundary,
+    /// repeatedly: exactly one `mkdir` wins and every `EEXIST` loser must
+    /// re-audit that winner as the same private directory rather than fail.
+    #[test]
+    fn parallel_private_directory_creation_is_idempotent_and_private() {
+        const ROUNDS: usize = 64;
+        const RACERS: usize = 8;
+
+        let tmp = tempfile::tempdir().unwrap();
+        for round in 0..ROUNDS {
+            let path = std::sync::Arc::new(tmp.path().join(format!("runtime-{round}")));
+            let start = std::sync::Arc::new(std::sync::Barrier::new(RACERS + 1));
+            let racers = (0..RACERS)
+                .map(|_| {
+                    let path = std::sync::Arc::clone(&path);
+                    let start = std::sync::Arc::clone(&start);
+                    std::thread::spawn(move || {
+                        start.wait();
+                        create_private_dir(&path, own_uid())
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            start.wait();
+            let outcomes = racers
+                .into_iter()
+                .map(|racer| racer.join().expect("private-dir racer panicked").unwrap())
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                outcomes
+                    .iter()
+                    .filter(|outcome| **outcome == Privacy::Created)
+                    .count(),
+                1,
+                "round {round} did not have exactly one creator: {outcomes:?}"
+            );
+            assert!(
+                outcomes
+                    .iter()
+                    .all(|outcome| matches!(outcome, Privacy::Created | Privacy::Already)),
+                "round {round} changed the already-private winner: {outcomes:?}"
+            );
+            assert_eq!(mode_of(&path), 0o700, "round {round} left the winner open");
+        }
+    }
+
+    /// An `EEXIST` collision is not success until the object that won the
+    /// name passes the same ownership and symlink checks as any other
+    /// pre-existing directory.
+    #[test]
+    fn a_private_directory_creation_collision_is_reaudited() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let foreign = tmp.path().join("foreign");
+        std::fs::create_dir(&foreign).unwrap();
+        let refusal = format!(
+            "{:#}",
+            create_private_dir(&foreign, somebody_else()).unwrap_err()
+        );
+        assert!(refusal.contains("belongs to uid"), "{refusal}");
+
+        let target = tmp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = tmp.path().join("runtime-link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let refusal = format!(
+            "{:#}",
+            create_private_dir(&link, somebody_else()).unwrap_err()
+        );
+        assert!(refusal.contains("symlink belonging to uid"), "{refusal}");
     }
 
     /// Every `$ASTERISM_HOME` that predates this module is a shared
