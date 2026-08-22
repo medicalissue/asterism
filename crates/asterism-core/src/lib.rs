@@ -11,8 +11,9 @@
 //! the secrets data plane's model and its one substitution rule, and
 //! [`protocol`] is the CLI <-> daemon wire, [`ipc`] is the door that
 //! wire arrives through, and [`compat`] is which version of it two vintages
-//! settle on. [`verify`] is the gate every boot input passes through on its
-//! way into the store and out of it again.
+//! settle on. [`remote_gpu`] is the transport-independent CUDA-semantic ABI
+//! behind a projected guest GPU device. [`verify`] is the gate every boot
+//! input passes through on its way into the store and out of it again.
 
 pub mod compat;
 pub mod cow;
@@ -28,6 +29,7 @@ pub mod power;
 pub mod proc;
 pub mod protocol;
 pub mod registry;
+pub mod remote_gpu;
 pub mod rewrite;
 pub mod secret;
 pub mod seed;

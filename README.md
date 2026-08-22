@@ -75,6 +75,10 @@ GPUs, and instance migration ride the same rails next. We keep every
 client in this repository open source and plan to charge for a hosted
 coordination service.
 
+The versioned CUDA-semantic boundary and its runnable two-role fake
+`/dev/nvidia0` proof are documented in
+[docs/remote-gpu-abi.md](docs/remote-gpu-abi.md).
+
 ## Building
 
 ```console
