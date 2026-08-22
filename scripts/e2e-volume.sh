@@ -487,8 +487,9 @@ echo "ok: the bytes landed on B — the marker is in its image file (${USED}K us
 # A repeating non-zero stream is deterministic and fast to produce, but unlike
 # /dev/zero it cannot be represented as a sparse hole by the provider.  Hash it
 # before and after an unmount/remount, and require the provider's raw image to
-# have allocated at least the payload size.  The completed NBD session below
-# additionally reports its measured payload byte count and throughput.
+# have allocated at least the payload size.  Stopping the guest completes this
+# NBD session, after which status must report its payload byte count and
+# throughput.
 TRANSFER_PROOF="$(in_guest "sudo mount $VOLUME_DEV /data && \
   yes asterism-orbit-e2e | head -c $TRANSFER_BYTES | \
     sudo tee /data/asterism-4g.bin >/dev/null; \
@@ -522,6 +523,27 @@ echo "ok: transferred $TRANSFER_BYTES non-zero bytes; SHA-256 $TRANSFER_HASH; pr
 expect "the instance stops" "$INST  stopped" env ASTERISM_HOME="$A" "$AST" down "$INST"
 [ ! -e "$BRIDGE" ] || fail "the bridge socket outlived the guest that used it"
 echo "ok: stopping the guest took the bridge down with it"
+
+# Transfer telemetry is deliberately session-scoped. Capture the completed
+# four-GiB bridge now, before a later boot starts a new session whose counters
+# correctly begin at zero.
+TRANSFER_STATUS=""
+TRANSFERRED=""
+for _ in $(seq 1 100); do
+  TRANSFER_STATUS="$(ASTERISM_HOME="$A" "$AST" status "$INST" 2>&1 || true)"
+  TRANSFERRED="$(sed -n 's/.*transferred (\([0-9][0-9]*\) bytes).*/\1/p' \
+    <<<"$TRANSFER_STATUS" | head -1)"
+  if [ -n "$TRANSFERRED" ] && [ "$TRANSFERRED" -ge "$TRANSFER_BYTES" ]; then
+    break
+  fi
+  sleep 0.2
+done
+[ -n "$TRANSFERRED" ] && [ "$TRANSFERRED" -ge "$TRANSFER_BYTES" ] \
+  || fail "the completed bridge session did not account for the real $TRANSFER_BYTES-byte transfer (got ${TRANSFERRED:-none}):"$'\n'"$TRANSFER_STATUS"
+grep -qE "direct .* [0-9]+\.[0-9]ms RTT .* MiB/s" <<<"$TRANSFER_STATUS" \
+  || fail "the completed four-GiB bridge session did not report path, RTT and throughput:"$'\n'"$TRANSFER_STATUS"
+printf '%s\n' "$TRANSFER_STATUS" >"$A/transfer-status.txt"
+echo "ok: the completed bridge session measured at least $TRANSFER_BYTES bytes and its throughput"
 
 # The lease survives a stop: it belongs to the attachment, not to the boot.
 [ "$(holder_now)" = "$INST" ] || fail "stopping the guest gave the lease away"
@@ -640,9 +662,9 @@ PARTS="$(ASTERISM_HOME="$A" "$AST" status "$INST" 2>&1)"
 grep -qE "healthy .* direct .* [0-9]+\.[0-9]ms RTT .* MiB/s .* reconnected \(provider_returned\) .* recovery [0-9]+ms" <<<"$PARTS" \
   || fail "the recovered volume did not expose throughput and recovery measurements:"$'\n'"$PARTS"
 TRANSFERRED="$(sed -n 's/.*transferred (\([0-9][0-9]*\) bytes).*/\1/p' <<<"$PARTS" | head -1)"
-[ -n "$TRANSFERRED" ] && [ "$TRANSFERRED" -ge "$TRANSFER_BYTES" ] \
-  || fail "status did not account for at least the real $TRANSFER_BYTES-byte transfer (got ${TRANSFERRED:-none}):"$'\n'"$PARTS"
-echo "ok: status exposes provider recovery duration and measured bridge throughput"
+[ -n "$TRANSFERRED" ] && [ "$TRANSFERRED" -gt 0 ] \
+  || fail "the recovered bridge session did not report its transferred bytes:"$'\n'"$PARTS"
+echo "ok: status exposes provider recovery duration and current-session bridge throughput"
 
 # ---- 8b. the consumer's daemon restarts under a live guest -----------------
 #
