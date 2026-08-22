@@ -199,6 +199,12 @@ impl PartRuntime {
                 bytes_per_sec as f64 / (1024.0 * 1024.0)
             ));
         }
+        if let Some(bytes) = self.transferred_bytes {
+            facts.push(format!(
+                "{} transferred ({bytes} bytes)",
+                crate::volume::format_size(bytes)
+            ));
+        }
         facts.push(format!(
             "{} ({})",
             self.recovery_result, self.transition_reason
@@ -986,6 +992,7 @@ mod tests {
             "relay",
             "12.4ms RTT",
             "64.0 MiB/s",
+            "4G transferred (4294967296 bytes)",
             "retrying (provider_loss)",
         ] {
             assert!(note.contains(fact), "missing {fact:?} from {note:?}");
