@@ -373,13 +373,28 @@ printf '%s\n' "$HOST_MARKER" >"$SHARED/host-marker"
 expect "attach a same-device directory ($BACKEND)" "$SHARED_GUEST" \
   env ASTERISM_HOME="$A" "$AST" attach "$INST" --volume "$SHARED" --at "$SHARED_GUEST"
 
-ATTACH="$(ASTERISM_HOME="$A" "$AST" attach "$INST" --volume "$B_NAME:$VOL" 2>&1)" \
-  || fail "attach failed:"$'\n'"$ATTACH"
+ATTACH=""
+ATTACHED=0
+for ATTEMPT in $(seq 1 100); do
+  if ATTACH="$(ASTERISM_HOME="$A" "$AST" attach "$INST" --volume "$B_NAME:$VOL" 2>&1)"; then
+    ATTACHED=1
+    break
+  fi
+  grep -q "refused before mutation" <<<"$ATTACH" \
+    || fail "attach failed for a reason other than its measured SLO:"$'\n'"$ATTACH"
+  [ "$(holder_now)" = "-" ] || fail "a retryable SLO refusal moved the provider lease"
+  if ASTERISM_HOME="$A" "$AST" status "$INST" | grep -qE "^  volume +$B_NAME +$VOL "; then
+    fail "a retryable SLO refusal wrote a consumer volume record"
+  fi
+  ASTERISM_HOME="$A" "$AST" ping "$B_NAME" >/dev/null 2>&1 || true
+  sleep 0.2
+done
+[ "$ATTACHED" = 1 ] || fail "attach never observed a direct path within 5ms:"$'\n'"$ATTACH"
 grep -qF "$B_NAME:$VOL  ->  a disk in the guest" <<<"$ATTACH" \
   || fail "attach did not describe a disk:"$'\n'"$ATTACH"
 grep -qF "the guest gets a plain disk" <<<"$ATTACH" \
   || fail "attach did not say the guest has to format it:"$'\n'"$ATTACH"
-echo "ok: attach records a disk and says the guest must format it"
+echo "ok: attach records a disk after $ATTEMPT measured attempt(s) and says the guest must format it"
 
 # The lease is on B, taken at attach time, and it names the instance and the
 # device supplying that instance's cpu.
