@@ -29,8 +29,9 @@ use crate::snapshot::Snapshot;
 /// * `Raw` is the one every backend can read, and what Asterism stores and
 ///   creates: copy-on-write comes from the filesystem (`clonefile(2)` on
 ///   APFS) rather than from the format.
-/// * `Qcow2` is legacy — instances created before that, and disk images a
-///   user points at directly. QEMU still boots them; VZ never will.
+/// * `Qcow2` is the published form of most cloud images. QEMU and Cloud
+///   Hypervisor read it directly; VZ never will. Instances created before the
+///   raw store migration and local images a user points at can carry it too.
 /// * `Asif` is Apple's own sparse format (macOS 26+), an opportunistic
 ///   upgrade for VZ hosts and not created yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -660,6 +661,14 @@ pub trait Hypervisor: Send + Sync {
         Ok(String::new())
     }
 
+    /// An optional NoCloud `network-config` document for this backend's
+    /// guest-facing network device. The seed builder carries the document as
+    /// opaque backend data; addressing and device details stay below this
+    /// seam. Most hypervisors provide DHCP and need no document.
+    fn guest_network_config(&self, _inst: &Instance) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Create anything missing on disk: root overlay, firmware vars.
     /// Idempotent.
     fn prepare(&self, req: &BootReq) -> Result<Prepared>;
@@ -766,6 +775,8 @@ mod tests {
             proc: Some(ProcId {
                 pid: 4242,
                 started_us: 1_700_000_000_000_000,
+                boot_id: None,
+                started_ticks: None,
                 exec: None,
             }),
             ctl: ControlChannel::Qmp {

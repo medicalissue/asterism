@@ -1028,10 +1028,12 @@ const AGENT_UNIT: &str = "\
 [Unit]
 Description=Asterism guest agent (the host's control channel, over vsock)
 After=local-fs.target
-# Before ssh, so that by the time the host can see this guest's sshd it can
-# already ask the guest about it. The same ordering the host-key unit takes,
-# and for the same reason: what runs after sshd cannot answer for it.
-Before=ssh.service sshd.service ssh.socket sshd.socket
+# Order ahead of a directly started sshd, but not its sockets.  Ubuntu pulls
+# ssh.socket in through sockets.target (before basic.target), while this unit
+# is enabled under multi-user.target (after basic.target); ordering this unit
+# before that socket would form a boot cycle and leave neither SSH nor the
+# guest agent running on a first boot.
+Before=ssh.service sshd.service
 Documentation=https://asterism.run
 
 [Service]
@@ -1773,6 +1775,12 @@ mod tests {
             std::fs::read_to_string(dir.path().join("etc/systemd/system/asterism-guest.service"))
                 .unwrap();
         assert!(unit.contains("Restart=always"), "{unit}");
+        assert!(unit.contains("Before=ssh.service sshd.service"), "{unit}");
+        assert!(
+            !unit.contains("Before=ssh.socket") && !unit.contains("Before=sshd.socket"),
+            "socket units run before basic.target, so a multi-user service ordered before them \
+             would create a first-boot cycle: {unit}"
+        );
         // The path in the unit is the one the rewrite above moved, so what
         // is checked here is that the unit runs the agent it just wrote.
         assert!(

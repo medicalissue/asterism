@@ -21,6 +21,7 @@ use asterism_core::instance::{Instance, PortForward};
 use asterism_core::proc::{Evidence, Ownership, ProcId};
 use asterism_core::{image, paths, profile, seed};
 
+pub mod chv;
 pub mod qemu;
 pub mod qmp;
 pub mod vz;
@@ -36,7 +37,13 @@ mod conformance;
 fn backends() -> &'static [Arc<dyn Hypervisor>] {
     static BACKENDS: OnceLock<Vec<Arc<dyn Hypervisor>>> = OnceLock::new();
     BACKENDS
-        .get_or_init(|| vec![Arc::new(qemu::Qemu::new()), Arc::new(vz::Vz::new())])
+        .get_or_init(|| {
+            vec![
+                Arc::new(chv::Chv::new()),
+                Arc::new(qemu::Qemu::new()),
+                Arc::new(vz::Vz::new()),
+            ]
+        })
         .as_slice()
 }
 
@@ -151,11 +158,16 @@ fn select_with(
         });
     }
 
-    // VZ is the lightest path on a capable host. Capability mismatches are
-    // ordinary reasons to try QEMU: OCI direct boot, loopback publishing and
-    // qcow2 base images all need facilities VZ does not currently expose.
+    // Native backends lead on their own hosts. Cloud Hypervisor is Linux's
+    // product path; VZ is macOS's. QEMU remains the compatibility floor and
+    // is never tried before a native backend on a host that can run one.
     let mut refusals = Vec::new();
-    for id in [vz::ID, qemu::ID] {
+    let order = if cfg!(target_os = "linux") {
+        [chv::ID, qemu::ID, vz::ID]
+    } else {
+        [vz::ID, qemu::ID, chv::ID]
+    };
+    for id in order {
         match resolve(id).and_then(|hv| runnable(hv, requirements)) {
             Ok(selection) => return Ok(selection),
             Err(error) => refusals.push(format!("{id}: {error:#}")),
@@ -279,17 +291,24 @@ pub fn image_ref_recording(reference: &str) -> Result<ImageRef> {
     })
 }
 
-/// The same, having first made sure the base image is in the format an
-/// instance can actually be built from.
+/// The same, having first selected verified bytes in a format this instance's
+/// backend can consume.
 ///
-/// This is where the lazy qcow2 migration happens: a store filled by an
-/// older Asterism holds `<slug>.qcow2` and no raw image, and the first `up`
-/// or `snapshot` after the upgrade converts it once (BACKENDS.md §4).
-/// Failing here is right — the alternative is telling the user their image
-/// is not pulled when it plainly is. On a vz host it is not optional at
-/// all: Virtualization.framework cannot read qcow2.
-fn materialised_image_ref(reference: &str) -> Result<ImageRef> {
+/// A qcow2-capable backend uses the verified published download directly.
+/// A raw-only backend materialises it once (BACKENDS.md §4). Failing here is
+/// right — the alternative is telling the user their image is not pulled
+/// when it plainly is. On a VZ host conversion is not optional because
+/// Virtualization.framework cannot read qcow2.
+fn materialised_image_ref(reference: &str, accepted: &[DiskFormat]) -> Result<ImageRef> {
     let resolved = image::resolve(reference)?;
+    if let Some((path, format)) = resolved.retained_download(accepted)? {
+        return Ok(ImageRef {
+            kind: resolved.kind(),
+            name: resolved.name,
+            path,
+            format,
+        });
+    }
     if resolved.materialise()? {
         eprintln!("astd: converted {} to a raw base image", resolved.name);
     }
@@ -317,10 +336,11 @@ pub fn disk_req(inst: &Instance) -> Result<BootReq<'_>> {
         .image
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("instance has no image — recreate it with --image"))?;
+    let backend = for_instance(inst)?;
     let dir = paths::instance_dir(&inst.name);
     Ok(BootReq {
         instance: inst,
-        base: materialised_image_ref(reference)?,
+        base: materialised_image_ref(reference, backend.caps().disk_formats)?,
         seed: dir.join("seed.iso"),
         console: dir.join("console.log"),
         shares: Vec::new(),
@@ -382,14 +402,20 @@ pub fn boot_req<'a>(inst: &'a Instance, hv: &dyn Hypervisor) -> Result<BootReq<'
     let guest_config = hv
         .guest_config(inst)
         .with_context(|| format!("preparing what the {} backend puts in a guest", hv.id()))?;
+    let guest_network_config = hv
+        .guest_network_config(inst)
+        .with_context(|| format!("preparing the {} backend's guest network", hv.id()))?;
     seed::ensure(
         &inst.name,
         &req.seed,
-        &shares,
-        share_kind,
-        &guest_config,
-        &egress,
-        &bootstrap,
+        seed::Input {
+            shares: &shares,
+            share_kind,
+            extra: &guest_config,
+            network_config: guest_network_config.as_deref(),
+            egress: &egress,
+            bootstrap: &bootstrap,
+        },
     )
     .context("building cloud-init seed")?;
     req.shares = shares;
@@ -440,12 +466,17 @@ const QEMU_EXECS: &[&str] = &["qemu-system-*"];
 /// (and its helper moved) while the guest kept running.
 const VZ_EXECS: &[&str] = &[asterism_vz::HELPER_BIN];
 
+/// Pinned Cloud Hypervisor helper. A family allows an in-place release
+/// upgrade while a v53 guest from the previous daemon remains adopted.
+const CHV_EXECS: &[&str] = &["cloud-hypervisor"];
+
 /// Which executables a handle for this backend may be holding, or `None` for
 /// a backend with no process of its own.
 fn execs_for(backend: &str) -> Option<&'static [&'static str]> {
     match backend {
         qemu::ID => Some(QEMU_EXECS),
         vz::ID => Some(VZ_EXECS),
+        chv::ID => Some(CHV_EXECS),
         _ => None,
     }
 }
@@ -473,6 +504,7 @@ fn instance_evidence(inst: &Instance, h: &Handle) -> Vec<std::path::PathBuf> {
     match h.backend.as_str() {
         qemu::ID => names.push(dir.join("qemu.pid")),
         vz::ID => names.push(dir.join("vz.json")),
+        chv::ID => names.push(dir.join("chv.pid")),
         _ => {}
     }
     names
@@ -981,8 +1013,9 @@ mod tests {
         fn each_backend_names_the_programs_it_spawns() {
             assert_eq!(execs_for(qemu::ID), Some(QEMU_EXECS));
             assert_eq!(execs_for(vz::ID), Some(VZ_EXECS));
-            assert_eq!(execs_for("chv"), None);
+            assert_eq!(execs_for(chv::ID), Some(CHV_EXECS));
             assert_eq!(VZ_EXECS, &["astd-vz"]);
+            assert_eq!(CHV_EXECS, &["cloud-hypervisor"]);
         }
 
         /// And what each backend offers as proof. Every path is inside the
@@ -994,6 +1027,7 @@ mod tests {
             for (backend, expected) in [
                 (qemu::ID, dir.join("qemu.pid")),
                 (vz::ID, dir.join("vz.json")),
+                (chv::ID, dir.join("chv.pid")),
             ] {
                 let h = Handle {
                     backend: backend.into(),
@@ -1126,12 +1160,16 @@ mod tests {
         })
     }
 
-    /// The two-backend host every selection test runs on.
+    /// A host with every registered backend available. Selection order is
+    /// still supplied by production code, so these fixtures exercise the
+    /// native-first policy of the platform running the test.
     fn host(
+        chv: Arc<dyn Hypervisor>,
         vz: Arc<dyn Hypervisor>,
         qemu: Arc<dyn Hypervisor>,
     ) -> impl Fn(&str) -> Result<Arc<dyn Hypervisor>> {
         move |id| match id {
+            "chv" => Ok(chv.clone()),
             "vz" => Ok(vz.clone()),
             "qemu" => Ok(qemu.clone()),
             other => bail!("unknown backend {other:?}"),
@@ -1222,10 +1260,12 @@ mod tests {
     }
 
     #[test]
-    fn the_default_prefers_runnable_capable_vz_then_falls_back_to_qemu() {
+    fn the_default_prefers_the_hosts_native_backend_then_falls_back_to_qemu() {
+        let chv = fake("chv", None, false, false);
         let vz = fake("vz", None, false, false);
         let qemu = fake("qemu", None, true, true);
         let resolve = |id: &str| match id {
+            "chv" => Ok(chv.clone()),
             "vz" => Ok(vz.clone()),
             "qemu" => Ok(qemu.clone()),
             _ => bail!("unknown backend"),
@@ -1233,12 +1273,19 @@ mod tests {
 
         let disk = image(ImageKind::Disk);
         let selected = select_with(None, CreateRequirements::new(&disk, &[]), resolve).unwrap();
-        assert_eq!(selected.backend, "vz", "the lighter capable backend wins");
+        let native = if cfg!(target_os = "linux") {
+            "chv"
+        } else {
+            "vz"
+        };
+        assert_eq!(selected.backend, native, "the host's native backend wins");
 
+        let chv = fake("chv", None, false, false);
         let vz = fake("vz", None, false, false);
         let qemu = fake("qemu", None, true, true);
         let oci = image(ImageKind::OciRootfs);
         let selected = select_with(None, CreateRequirements::new(&oci, &[]), |id| match id {
+            "chv" => Ok(chv.clone()),
             "vz" => Ok(vz.clone()),
             "qemu" => Ok(qemu.clone()),
             _ => bail!("unknown backend"),
@@ -1246,6 +1293,7 @@ mod tests {
         .unwrap();
         assert_eq!(selected.backend, "qemu", "capability refusal falls through");
 
+        let chv = fake("chv", None, false, false);
         let vz = fake("vz", None, false, false);
         let qemu = fake("qemu", None, true, true);
         let port = [PortForward {
@@ -1253,6 +1301,7 @@ mod tests {
             guest: 80,
         }];
         let selected = select_with(None, CreateRequirements::new(&disk, &port), |id| match id {
+            "chv" => Ok(chv.clone()),
             "vz" => Ok(vz.clone()),
             "qemu" => Ok(qemu.clone()),
             _ => bail!("unknown backend"),
@@ -1263,9 +1312,11 @@ mod tests {
             "port forwarding is a create requirement"
         );
 
+        let chv = fake("chv", Some("helper is missing"), false, false);
         let vz = fake("vz", Some("helper is unsigned"), false, false);
         let qemu = fake("qemu", None, true, true);
         let selected = select_with(None, CreateRequirements::new(&disk, &[]), |id| match id {
+            "chv" => Ok(chv.clone()),
             "vz" => Ok(vz.clone()),
             "qemu" => Ok(qemu.clone()),
             _ => bail!("unknown backend"),
@@ -1273,9 +1324,11 @@ mod tests {
         .unwrap();
         assert_eq!(selected.backend, "qemu", "probe refusal falls through");
 
+        let chv = fake("chv", Some("chv missing"), false, false);
         let vz = fake("vz", Some("unsigned helper"), false, false);
         let qemu = fake("qemu", Some("qemu missing"), true, true);
         let error = select_with(None, CreateRequirements::new(&disk, &[]), |id| match id {
+            "chv" => Ok(chv.clone()),
             "vz" => Ok(vz.clone()),
             "qemu" => Ok(qemu.clone()),
             _ => bail!("unknown backend"),
@@ -1288,6 +1341,10 @@ mod tests {
         );
         assert!(
             error.contains("qemu") && error.contains("qemu missing"),
+            "{error}"
+        );
+        assert!(
+            error.contains("chv") && error.contains("chv missing"),
             "{error}"
         );
     }
@@ -1340,6 +1397,13 @@ mod tests {
             .contains(&DiskFormat::Qcow2));
 
         let vz = fake("vz", None, false, false);
+        let chv = fake_reading(
+            "chv",
+            None,
+            true,
+            false,
+            &[DiskFormat::Raw, DiskFormat::Qcow2],
+        );
         let qemu = fake_reading(
             "qemu",
             None,
@@ -1352,11 +1416,16 @@ mod tests {
         let selected = select_with(
             None,
             CreateRequirements::new(&qcow2, &[]),
-            host(vz.clone(), qemu.clone()),
+            host(chv.clone(), vz.clone(), qemu.clone()),
         )
         .unwrap();
+        let expected = if cfg!(target_os = "linux") {
+            "chv"
+        } else {
+            "qemu"
+        };
         assert_eq!(
-            selected.backend, "qemu",
+            selected.backend, expected,
             "the backend that can read the image wins"
         );
 
@@ -1366,17 +1435,22 @@ mod tests {
         let selected = select_with(
             None,
             CreateRequirements::new(&raw, &[]),
-            host(vz.clone(), qemu.clone()),
+            host(chv.clone(), vz.clone(), qemu.clone()),
         )
         .unwrap();
-        assert_eq!(selected.backend, "vz");
+        let native = if cfg!(target_os = "linux") {
+            "chv"
+        } else {
+            "vz"
+        };
+        assert_eq!(selected.backend, native);
 
         // Explicit means explicit: VZ refuses, naming the format it cannot
         // read and the ones it can, instead of being silently swapped out.
         let error = select_with(
             Some("vz"),
             CreateRequirements::new(&qcow2, &[]),
-            host(vz.clone(), qemu.clone()),
+            host(chv.clone(), vz.clone(), qemu.clone()),
         )
         .expect_err("vz cannot read qcow2");
         let error = format!("{error:#}");
@@ -1387,19 +1461,26 @@ mod tests {
         );
         assert!(error.contains("raw"), "and the one it does read: {error}");
 
-        // A host where nothing reads the image says so once, with both
-        // reasons, rather than recording a backend and failing at boot.
+        // A host where nothing reads the image says so once, with every
+        // backend's reason, rather than recording one and failing at boot.
         let error = select_with(
             None,
             CreateRequirements::new(&qcow2, &[]),
-            host(vz, fake("qemu", None, true, true)),
+            host(
+                fake("chv", None, true, false),
+                vz,
+                fake("qemu", None, true, true),
+            ),
         )
-        .expect_err("neither backend reads qcow2");
+        .expect_err("no backend reads qcow2");
         let error = format!("{error:#}");
-        assert!(error.contains("vz") && error.contains("qemu"), "{error}");
+        assert!(
+            error.contains("chv") && error.contains("vz") && error.contains("qemu"),
+            "{error}"
+        );
         assert_eq!(
             error.matches("qcow2").count(),
-            2,
+            3,
             "one reason per backend: {error}"
         );
     }

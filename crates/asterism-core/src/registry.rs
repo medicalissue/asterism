@@ -700,6 +700,8 @@ mod tests {
             proc: Some(ProcId {
                 pid,
                 started_us: 1_700_000_000_000_000,
+                boot_id: None,
+                started_ticks: None,
                 exec: None,
             }),
             ctl: ControlChannel::Qmp {
