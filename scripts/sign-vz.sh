@@ -54,7 +54,15 @@ for arg in "$@"; do
   esac
 done
 
-BIN="$ROOT/target/$PROFILE/astd-vz"
+# Cargo may place artifacts in a shared target directory (for example, when
+# several worktrees reuse one cache). Follow the same CARGO_TARGET_DIR that
+# the build below follows instead of signing a path Cargo did not write.
+TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
+case "$TARGET_DIR" in
+  /*) ;;
+  *) TARGET_DIR="$ROOT/$TARGET_DIR" ;;
+esac
+BIN="$TARGET_DIR/$PROFILE/astd-vz"
 ENTITLEMENTS="$ROOT/crates/asterism-vz/vz.entitlements"
 IDENTITY="${ASTERISM_SIGN_IDENTITY:--}"
 

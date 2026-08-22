@@ -36,22 +36,21 @@ use objc2_foundation::{
     NSRunLoop, NSString, NSURL,
 };
 use objc2_virtualization::{
-    VZDirectorySharingDeviceConfiguration,
-    VZDiskImageCachingMode, VZDiskImageStorageDeviceAttachment, VZDiskImageSynchronizationMode,
-    VZDiskSynchronizationMode, VZEFIBootLoader, VZEFIVariableStore,
-    VZEFIVariableStoreInitializationOptions, VZEntropyDeviceConfiguration,
-    VZFileHandleSerialPortAttachment, VZGenericPlatformConfiguration, VZMACAddress,
-    VZMemoryBalloonDeviceConfiguration, VZNATNetworkDeviceAttachment,
+    VZDirectorySharingDeviceConfiguration, VZDiskImageCachingMode,
+    VZDiskImageStorageDeviceAttachment, VZDiskImageSynchronizationMode, VZDiskSynchronizationMode,
+    VZEFIBootLoader, VZEFIVariableStore, VZEFIVariableStoreInitializationOptions,
+    VZEntropyDeviceConfiguration, VZFileHandleSerialPortAttachment, VZGenericPlatformConfiguration,
+    VZMACAddress, VZMemoryBalloonDeviceConfiguration, VZNATNetworkDeviceAttachment,
     VZNetworkBlockDeviceStorageDeviceAttachment,
     VZNetworkBlockDeviceStorageDeviceAttachmentDelegate, VZNetworkDevice,
     VZNetworkDeviceConfiguration, VZSerialPortConfiguration, VZSharedDirectory,
     VZSingleDirectoryShare, VZSocketDeviceConfiguration, VZStorageDeviceConfiguration,
-    VZVirtioBlockDeviceConfiguration,
-    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioEntropyDeviceConfiguration,
-    VZVirtioFileSystemDeviceConfiguration, VZVirtioNetworkDeviceConfiguration,
-    VZVirtioSocketConnection, VZVirtioSocketDevice, VZVirtioSocketDeviceConfiguration,
-    VZVirtioTraditionalMemoryBalloonDeviceConfiguration, VZVirtualMachine,
-    VZVirtualMachineConfiguration, VZVirtualMachineDelegate, VZVirtualMachineState,
+    VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
+    VZVirtioEntropyDeviceConfiguration, VZVirtioFileSystemDeviceConfiguration,
+    VZVirtioNetworkDeviceConfiguration, VZVirtioSocketConnection, VZVirtioSocketDevice,
+    VZVirtioSocketDeviceConfiguration, VZVirtioTraditionalMemoryBalloonDeviceConfiguration,
+    VZVirtualMachine, VZVirtualMachineConfiguration, VZVirtualMachineDelegate,
+    VZVirtualMachineState,
 };
 
 use asterism_vz::{Config, Disk, State, StopReason, StorageError};
@@ -518,10 +517,8 @@ unsafe fn build_config(
             &url(&share.path),
             false,
         );
-        let single = VZSingleDirectoryShare::initWithDirectory(
-            VZSingleDirectoryShare::alloc(),
-            &directory,
-        );
+        let single =
+            VZSingleDirectoryShare::initWithDirectory(VZSingleDirectoryShare::alloc(), &directory);
         let device = VZVirtioFileSystemDeviceConfiguration::initWithTag(
             VZVirtioFileSystemDeviceConfiguration::alloc(),
             &tag,

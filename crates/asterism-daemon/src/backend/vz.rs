@@ -56,7 +56,7 @@ use asterism_core::snapshot::{self, Snapshot};
 use asterism_core::{cow, paths, tools};
 use asterism_vz::guest;
 use asterism_vz::{
-    Command as VzCommand, Config, Disk as VzDisk, Discovery, Reply, Share as VzShare, StopReason,
+    Command as VzCommand, Config, Discovery, Disk as VzDisk, Reply, Share as VzShare, StopReason,
 };
 
 use super::{alive, grow, owned};

@@ -392,7 +392,7 @@ pub fn boot_req<'a>(inst: &'a Instance, hv: &dyn Hypervisor) -> Result<BootReq<'
         &guest_config,
         &egress,
     )
-        .context("building cloud-init seed")?;
+    .context("building cloud-init seed")?;
     req.shares = shares;
     Ok(req)
 }
