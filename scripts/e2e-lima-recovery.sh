@@ -32,6 +32,7 @@ case "$VM_RUN" in /tmp/asterism-recovery.*) ;; *)
   exit 2
 esac
 EVIDENCE="$(mktemp -d /private/tmp/asterism-recovery-evidence.XXXXXX)"
+SOURCE_SHA="$(git rev-parse HEAD)"
 
 cleanup() {
   set +e
@@ -48,6 +49,7 @@ git archive HEAD | limactl shell kvmhost -- tar -xf - -C "$VM_RUN"
 limactl shell kvmhost -- bash -lc "
   cd '$VM_RUN'
   export CARGO_TARGET_DIR='$VM_RUN/target' CARGO_INCREMENTAL=0
+  export ASTERISM_BUILD_ID='$SOURCE_SHA'
   cargo build --workspace
 " 2>&1 | tee "$EVIDENCE/build.log"
 
@@ -63,6 +65,7 @@ limactl shell kvmhost -- bash -lc "
   export AST_BIN='$VM_RUN/target/debug/ast'
   export ASTD_BIN='$VM_RUN/target/debug/astd'
   export ASTERISM_TEST_ARTIFACTS='$VM_RUN/artifacts'
+  export ASTERISM_TEST_CACHE='$VM_RUN/image-cache'
   export E2E_VOLUME_BACKEND=qemu
   scripts/e2e-volume.sh
 " 2>&1 | tee "$EVIDENCE/volume-4g.log"
