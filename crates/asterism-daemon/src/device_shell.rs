@@ -830,6 +830,14 @@ fn spawn_command(open: &ShellOpen, account: &Account) -> Result<Running> {
 fn spawn_pty(open: &ShellOpen, account: &Account) -> Result<Running> {
     let mut master = -1;
     let mut slave = -1;
+    #[cfg(target_os = "linux")]
+    let size = libc::winsize {
+        ws_row: open.rows,
+        ws_col: open.cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    #[cfg(not(target_os = "linux"))]
     let mut size = libc::winsize {
         ws_row: open.rows,
         ws_col: open.cols,
@@ -844,6 +852,9 @@ fn spawn_pty(open: &ShellOpen, account: &Account) -> Result<Running> {
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
+            #[cfg(target_os = "linux")]
+            &size,
+            #[cfg(not(target_os = "linux"))]
             &mut size,
         )
     } != 0

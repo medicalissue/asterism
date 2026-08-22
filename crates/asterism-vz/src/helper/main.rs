@@ -43,6 +43,7 @@
 //! asks the guest to power down and then pulls the cord, which is the death
 //! `astd`'s supervisor already knows how to act on.
 
+#[cfg(target_os = "macos")]
 use anyhow::Context;
 
 #[cfg(target_os = "macos")]
@@ -63,11 +64,13 @@ mod vm;
 /// exactly like QEMU's qemu.pid, and is removed by the helper on every
 /// ordinary exit. A forced stop leaves it for the owner of that home to
 /// consume and remove.
+#[cfg(target_os = "macos")]
 struct PidFile {
     path: std::path::PathBuf,
     pid: u32,
 }
 
+#[cfg(target_os = "macos")]
 impl PidFile {
     fn create(config_path: &std::path::Path) -> anyhow::Result<Self> {
         let dir = config_path.parent().ok_or_else(|| {
@@ -81,6 +84,7 @@ impl PidFile {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl Drop for PidFile {
     fn drop(&mut self) {
         // Never remove a file a newer helper has replaced. This is normally
@@ -757,7 +761,7 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod pidfile_tests {
     use super::PidFile;
 
