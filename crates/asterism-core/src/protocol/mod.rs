@@ -177,6 +177,18 @@ pub enum Request {
         /// The device that holds them.
         device: String,
     },
+    /// Attach an orbit storage part by its volume name. The daemon holding
+    /// the instance reads the live catalog, checks placement, and only then
+    /// takes a lease. `owner_device` constrains placement when the caller
+    /// wants one provider; absent, local/lowest-latency eligible storage wins.
+    AttachStorage {
+        name: String,
+        volume: String,
+        #[serde(default)]
+        owner_device: Option<String>,
+        #[serde(default)]
+        max_latency_ms: Option<u64>,
+    },
     /// Bind an orbit secret to one authority an instance may reach.
     ///
     /// A separate frame from [`Request::AttachVolume`] and not a flag on it,
@@ -421,6 +433,9 @@ pub enum Request {
     },
     /// This device's block volumes, with their sizes and leases.
     VolumeList,
+    /// Every reachable device's storage contribution, annotated from this
+    /// consumer's point of view. Unlike `volume_list`, this is orbit-scoped.
+    VolumeCatalog,
     /// Delete a block volume and its bytes. Refused while it is leased.
     VolumeRemove {
         name: String,
@@ -436,8 +451,18 @@ pub enum Request {
         volume: String,
         /// The instance that will be writing.
         holder: String,
+        /// Immutable identity of that instance.
+        #[serde(default)]
+        holder_id: String,
         /// The device supplying that instance's cpu and ram.
         holder_device: String,
+        /// Immutable identity of the consumer device.
+        #[serde(default)]
+        holder_device_id: String,
+        /// Idempotency key for this exact attach attempt. Absent on boot-time
+        /// renewals from older peers.
+        #[serde(default)]
+        intent_id: Option<String>,
     },
     /// Pick the lease this instance already has back up, at the epoch it
     /// already holds, and make sure the export serving it is running.
@@ -453,12 +478,27 @@ pub enum Request {
     VolumeReconnect {
         volume: String,
         holder: String,
+        #[serde(default)]
+        holder_id: String,
         epoch: u64,
     },
     /// Hand the lease back and stop the export.
     VolumeRelease {
         volume: String,
         holder: String,
+        #[serde(default)]
+        holder_id: String,
+        /// Compare-and-release fence for a user detach. Absent on legacy
+        /// callers and attach compensation, which uses `intent_id` instead.
+        #[serde(default)]
+        epoch: Option<u64>,
+        #[serde(default)]
+        intent_id: Option<String>,
+        /// Consumer journal identity for diagnostics and replay correlation.
+        /// The provider needs no tombstone: an already-free lease is the
+        /// idempotent success result.
+        #[serde(default)]
+        release_intent_id: Option<String>,
     },
 
     // ---- secrets ------------------------------------------------------------
@@ -630,6 +670,7 @@ impl Request {
             | Request::MarkConflicted { name, .. }
             | Request::AttachVolume { name, .. }
             | Request::AttachBlock { name, .. }
+            | Request::AttachStorage { name, .. }
             | Request::Detach { name, .. }
             | Request::Snapshot { name, .. }
             | Request::SnapshotList { name }
@@ -687,6 +728,7 @@ impl Request {
             // it to whoever happens to hold an instance of that name.
             Request::VolumeCreate { .. }
             | Request::VolumeList
+            | Request::VolumeCatalog
             | Request::VolumeRemove { .. }
             | Request::VolumeLease { .. }
             | Request::VolumeReconnect { .. }
@@ -748,6 +790,11 @@ impl Request {
             Request::Proxy { inner, .. } => inner.since(),
             Request::Compat => 2,
             Request::BackupExport { .. } | Request::BackupImport { .. } => 3,
+            Request::AttachStorage { .. }
+            | Request::VolumeCatalog
+            | Request::VolumeLease { .. }
+            | Request::VolumeReconnect { .. }
+            | Request::VolumeRelease { .. } => 6,
             Request::DeviceShellStatus => 5,
             Request::ImageList | Request::ImagePull { .. } => 6,
             Request::DeviceShellPolicy { .. }
@@ -776,6 +823,11 @@ impl Request {
             Request::Compat => Some("compat"),
             Request::BackupExport { .. } => Some("backup_export"),
             Request::BackupImport { .. } => Some("backup_import"),
+            Request::AttachStorage { .. } => Some("attach_storage"),
+            Request::VolumeCatalog => Some("volume_catalog"),
+            Request::VolumeLease { .. } => Some("volume_lease"),
+            Request::VolumeReconnect { .. } => Some("volume_reconnect"),
+            Request::VolumeRelease { .. } => Some("volume_release"),
             Request::DeviceShellStatus => Some("device_shell_status"),
             Request::DeviceShellPolicy { .. }
             | Request::DeviceShellOpen { .. }
@@ -1017,6 +1069,10 @@ pub enum Response {
     Volumes {
         volumes: Vec<crate::volume::BlockVolume>,
     },
+    /// Reply to [`Request::VolumeCatalog`].
+    VolumeCatalog {
+        catalog: crate::volume::Catalog,
+    },
     /// Reply to [`Request::VolumeLease`]: the lease was granted, at this
     /// epoch, under this export name.
     ///
@@ -1139,7 +1195,9 @@ impl Response {
         match self {
             Response::Compat { .. } => 2,
             Response::BackupExported { .. } | Response::BackupRestored { .. } => 3,
-            Response::Images { .. } | Response::ImagePulled { .. } => 6,
+            Response::Images { .. }
+            | Response::ImagePulled { .. }
+            | Response::VolumeCatalog { .. } => 6,
             Response::DeviceShellStatus { .. }
             | Response::DeviceShellAccepted { .. }
             | Response::DeviceShellRefused { .. }
@@ -1193,6 +1251,51 @@ pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
             "image_pull",
             Request::ImagePull {
                 reference: String::new(),
+            }
+            .since(),
+        ),
+        ("volume_catalog", Request::VolumeCatalog.since()),
+        (
+            "attach_storage",
+            Request::AttachStorage {
+                name: String::new(),
+                volume: String::new(),
+                owner_device: None,
+                max_latency_ms: None,
+            }
+            .since(),
+        ),
+        (
+            "volume_lease",
+            Request::VolumeLease {
+                volume: String::new(),
+                holder: String::new(),
+                holder_id: String::new(),
+                holder_device: String::new(),
+                holder_device_id: String::new(),
+                intent_id: None,
+            }
+            .since(),
+        ),
+        (
+            "volume_reconnect",
+            Request::VolumeReconnect {
+                volume: String::new(),
+                holder: String::new(),
+                holder_id: String::new(),
+                epoch: 0,
+            }
+            .since(),
+        ),
+        (
+            "volume_release",
+            Request::VolumeRelease {
+                volume: String::new(),
+                holder: String::new(),
+                holder_id: String::new(),
+                epoch: None,
+                intent_id: None,
+                release_intent_id: None,
             }
             .since(),
         ),
@@ -1343,6 +1446,7 @@ mod tests {
         assert!(Request::Compat.speakable_at(2));
         assert!(Request::List.speakable_at(1));
         assert_eq!(Request::DeviceShellStatus.since(), 5);
+        assert_eq!(Request::VolumeCatalog.since(), 6);
         assert_eq!(
             serde_json::to_string(&Request::DeviceShellStatus).unwrap(),
             r#"{"cmd":"device_shell_status"}"#
@@ -1418,6 +1522,11 @@ mod tests {
         assert_eq!(table.get("compat"), Some(&Request::Compat.since()));
         assert_eq!(table.get("backup_export"), Some(&3));
         assert_eq!(table.get("backup_import"), Some(&3));
+        assert_eq!(table.get("volume_catalog"), Some(&6));
+        assert_eq!(table.get("attach_storage"), Some(&6));
+        assert_eq!(table.get("volume_lease"), Some(&6));
+        assert_eq!(table.get("volume_reconnect"), Some(&6));
+        assert_eq!(table.get("volume_release"), Some(&6));
         assert_eq!(
             table.get("device-shell"),
             Some(&4),
@@ -1636,6 +1745,12 @@ mod tests {
                 volume: "tank".into(),
                 device: "desktop".into(),
             },
+            Request::AttachStorage {
+                name: "dev".into(),
+                volume: "tank".into(),
+                owner_device: None,
+                max_latency_ms: Some(5),
+            },
             Request::Detach {
                 name: "dev".into(),
                 volume: "tank".into(),
@@ -1744,7 +1859,20 @@ mod tests {
         .unwrap();
         assert!(matches!(lease, Request::VolumeLease { .. }));
         assert_eq!(lease.subject(), None, "a volume is a device's part");
+        let legacy_release: Request = serde_json::from_str(
+            r#"{"cmd":"volume_release","volume":"tank","holder":"dev","holder_id":"instance-id"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            legacy_release,
+            Request::VolumeRelease {
+                epoch: None,
+                release_intent_id: None,
+                ..
+            }
+        ));
         assert_eq!(Request::VolumeList.subject(), None);
+        assert_eq!(Request::VolumeCatalog.subject(), None);
         assert_eq!(
             Request::VolumeCreate {
                 name: "tank".into(),
@@ -1761,6 +1889,16 @@ mod tests {
                 name: "dev".into(),
                 volume: "tank".into(),
                 device: "desktop".into()
+            }
+            .subject(),
+            Some("dev")
+        );
+        assert_eq!(
+            Request::AttachStorage {
+                name: "dev".into(),
+                volume: "tank".into(),
+                owner_device: None,
+                max_latency_ms: None,
             }
             .subject(),
             Some("dev")

@@ -41,6 +41,16 @@ use crate::instance::{
 use crate::proc::ProcId;
 use crate::secret::Binding;
 
+/// Immutable authority carried by a durable block-volume row.
+///
+/// Kept together so callers cannot casually thread the provider identity and
+/// the saga identity through unrelated positional arguments.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlockAuthority {
+    pub provider_device_id: Option<String>,
+    pub attach_intent_id: Option<String>,
+}
+
 /// The shard file format this build writes.
 ///
 /// Version 1 is `{"version": 1, "instances": {...}}`. What came before it had
@@ -52,6 +62,7 @@ use crate::secret::Binding;
 pub const SHARD_VERSION: u32 = 1;
 
 /// One device's shard of the orbit registry, persisted as JSON at `path`.
+#[derive(Clone)]
 pub struct Shard {
     path: PathBuf,
     instances: BTreeMap<String, Instance>,
@@ -256,6 +267,18 @@ impl Shard {
             .context("committing this device's registry shard")
     }
 
+    /// Commit the same shard twice so both the live document and its
+    /// last-known-good recovery copy describe this state.
+    ///
+    /// Cross-file sagas use this before clearing their independent intent.
+    /// A single successful commit is durable, but its backup necessarily
+    /// describes the previous state; clearing the intent at that point would
+    /// let later file damage recover behind an already-acknowledged mutation.
+    pub fn save_confirmed(&self) -> Result<()> {
+        self.save()?;
+        self.save()
+    }
+
     /// This shard in the shape it is written in.
     fn file(&self) -> ShardFile {
         ShardFile {
@@ -343,6 +366,37 @@ impl Shard {
         let inst = self.get_mut(name)?;
         inst.status = Status::Running;
         inst.handle = Some(handle);
+        inst.boot_intent_id = None;
+        Ok(inst.clone())
+    }
+
+    /// Fence a guest launch before any remote lease or hypervisor mutation.
+    pub fn begin_boot(&mut self, name: &str) -> Result<(Instance, String)> {
+        let inst = self.get_mut(name)?;
+        if let Some(intent) = &inst.boot_intent_id {
+            bail!("instance {name:?} has unresolved boot intent {intent}; refusing a second guest");
+        }
+        let intent = uuid::Uuid::new_v4().to_string();
+        // Running is part of the fence, even before there is a handle. It
+        // makes every ordinary mutation path treat an ambiguously launched
+        // guest as live while boot_intent_id tells recovery why no handle is
+        // available to inspect or stop.
+        inst.status = Status::Running;
+        inst.boot_intent_id = Some(intent.clone());
+        Ok((inst.clone(), intent))
+    }
+
+    /// Clear a launch fence only after every pre-launch side effect was
+    /// compensated or a launched guest was proven dead.
+    pub fn clear_boot(&mut self, name: &str, intent_id: &str) -> Result<Instance> {
+        let inst = self.get_mut(name)?;
+        match inst.boot_intent_id.as_deref() {
+            Some(actual) if actual == intent_id => inst.boot_intent_id = None,
+            Some(actual) => {
+                bail!("instance {name:?} has boot intent {actual}, not cleanup intent {intent_id}")
+            }
+            None => {}
+        }
         Ok(inst.clone())
     }
 
@@ -394,6 +448,11 @@ impl Shard {
 
     pub fn set_stopped(&mut self, name: &str) -> Result<Instance> {
         let inst = self.get_mut(name)?;
+        if let Some(intent) = &inst.boot_intent_id {
+            bail!(
+                "instance {name:?} has unresolved boot intent {intent}; prove guest death and clear the launch fence first"
+            );
+        }
         inst.status = Status::Stopped;
         inst.handle = None;
         Ok(inst.clone())
@@ -402,6 +461,11 @@ impl Shard {
     pub fn remove(&mut self, name: &str) -> Result<Instance> {
         if self.get(name)?.status == Status::Running {
             bail!("instance {name:?} is running — `ast down {name}` first");
+        }
+        if let Some(intent) = &self.get(name)?.boot_intent_id {
+            bail!(
+                "instance {name:?} has unresolved boot intent {intent}; refusing to remove its authority row"
+            );
         }
         Ok(self.instances.remove(name).expect("checked above"))
     }
@@ -520,6 +584,29 @@ impl Shard {
         epoch: u64,
         size_bytes: u64,
     ) -> Result<Instance> {
+        self.attach_block_owned(
+            name,
+            volume,
+            host,
+            BlockAuthority::default(),
+            epoch,
+            size_bytes,
+        )
+    }
+
+    pub fn attach_block_owned(
+        &mut self,
+        name: &str,
+        volume: &str,
+        host: &str,
+        authority: BlockAuthority,
+        epoch: u64,
+        size_bytes: u64,
+    ) -> Result<Instance> {
+        let BlockAuthority {
+            provider_device_id: host_id,
+            attach_intent_id,
+        } = authority;
         let inst = self.get_mut(name)?;
         if let Some(existing) = inst
             .volumes
@@ -529,11 +616,26 @@ impl Shard {
             if !existing.is_block() {
                 bail!("{host}:{volume} is already attached to {name:?} as a directory");
             }
+            if let (Some(recorded), Some(requested)) = (&existing.host_id, &host_id) {
+                if recorded != requested {
+                    bail!(
+                        "{host}:{volume} now resolves to device id {requested}, but the attached \
+                         storage authority is {recorded}"
+                    );
+                }
+            }
+            existing.host_id = host_id.or_else(|| existing.host_id.clone());
+            existing.attach_intent_id =
+                attach_intent_id.or_else(|| existing.attach_intent_id.clone());
             existing.epoch = Some(epoch);
             existing.size_bytes = Some(size_bytes);
         } else {
-            inst.volumes
-                .push(Volume::block(volume, host, epoch, size_bytes));
+            inst.volumes.push(Volume::block_owned(
+                volume, host, host_id, epoch, size_bytes,
+            ));
+            if let Some(last) = inst.volumes.last_mut() {
+                last.attach_intent_id = attach_intent_id;
+            }
         }
         Ok(inst.clone())
     }
@@ -1211,6 +1313,283 @@ mod tests {
         let reloaded = Shard::load(&path).unwrap();
         assert!(reloaded.holds("one"));
         assert!(!reloaded.holds("two"));
+    }
+
+    /// The durable launch marker is the authority during the only interval
+    /// in which a backend may have created a guest but no handle has landed.
+    /// An ENOSPC at the handle commit therefore recovers to "fenced", never
+    /// to an ordinary stopped row which a second `up` could launch.
+    #[test]
+    fn a_failed_running_handle_commit_keeps_the_boot_fence() {
+        let path = scratch();
+        let mut shard = shard_with(&path, &["dev"]);
+        let (_, intent) = shard.begin_boot("dev").unwrap();
+        shard.save_confirmed().unwrap();
+
+        let mut running = shard.clone();
+        running.set_running("dev", handle(4242, 22022)).unwrap();
+        let armed = durable::faults::arm_errno(
+            "boot-handle-enospc",
+            durable::faults::Point::Write,
+            path.display().to_string(),
+            libc::ENOSPC,
+        );
+        assert!(running.save_confirmed().is_err());
+        drop(armed);
+
+        let mut recovered = Shard::load(&path).unwrap();
+        let instance = recovered.get("dev").unwrap();
+        assert_eq!(instance.status, Status::Running);
+        assert_eq!(instance.boot_intent_id.as_deref(), Some(intent.as_str()));
+        assert!(
+            recovered.begin_boot("dev").is_err(),
+            "a second guest was admitted"
+        );
+    }
+
+    /// A read-side EIO is not permission to discard the launch fence. Once
+    /// the injected device fault clears, the same confirmed marker remains.
+    #[test]
+    fn an_eio_while_reading_a_boot_fence_fails_closed() {
+        let path = scratch();
+        let mut shard = shard_with(&path, &["dev"]);
+        let (_, intent) = shard.begin_boot("dev").unwrap();
+        shard.save_confirmed().unwrap();
+
+        let armed = durable::faults::arm_errno(
+            "boot-fence-eio",
+            durable::faults::Point::Read,
+            path.display().to_string(),
+            libc::EIO,
+        );
+        assert!(Shard::load(&path).is_err());
+        drop(armed);
+
+        let recovered = Shard::load(&path).unwrap();
+        assert_eq!(
+            recovered.get("dev").unwrap().boot_intent_id.as_deref(),
+            Some(intent.as_str())
+        );
+    }
+
+    /// `set_stopped` is widely used crash bookkeeping. It must not double as
+    /// an escape hatch around the exact compensation path that proves an
+    /// ambiguously launched guest dead.
+    #[test]
+    fn generic_stopped_transition_cannot_clear_a_boot_fence() {
+        let path = scratch();
+        let mut shard = shard_with(&path, &["dev"]);
+        let (_, intent) = shard.begin_boot("dev").unwrap();
+
+        let error = shard.set_stopped("dev").unwrap_err().to_string();
+        assert!(error.contains("prove guest death"), "{error}");
+        let preserved = shard.get("dev").unwrap();
+        assert_eq!(preserved.status, Status::Running);
+        assert_eq!(preserved.boot_intent_id.as_deref(), Some(intent.as_str()));
+    }
+
+    /// The attach saga's refusal path under the real ENOSPC fault model. The
+    /// provider may have durably granted a lease, but a consumer row which
+    /// never lands is recoverable because its independent intent survives;
+    /// compensation can release the writer fence and clear only that intent.
+    #[test]
+    fn a_failed_block_attach_commit_keeps_the_intent_needed_to_compensate() {
+        use crate::volume::{AttachIntent, AttachIntents, Store};
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.json");
+        let intents_path = dir.path().join("volume-attach-intents.json");
+        let volumes_path = dir.path().join("volumes.json");
+        let mut shard = shard_with(&state, &["dev"]);
+        let intent = AttachIntent::new("dev", "instance-id", "tank", "nas", "nas-id", "cpu-id");
+        let mut intents = AttachIntents::load(&intents_path).unwrap();
+        intents.begin_durable(intent.clone()).unwrap();
+
+        let mut provider = Store::load(&volumes_path).unwrap();
+        provider.create("tank", 5 << 30).unwrap();
+        let granted = provider.lease("tank", "dev", "laptop").unwrap();
+        provider.save().unwrap();
+        shard
+            .attach_block("dev", "tank", "nas", granted.epoch, granted.size_bytes)
+            .unwrap();
+
+        let armed = durable::faults::arm_errno(
+            "attach-registry-enospc",
+            durable::faults::Point::Write,
+            state.display().to_string(),
+            libc::ENOSPC,
+        );
+        assert!(shard.save_confirmed().is_err());
+        drop(armed);
+
+        let consumer = Shard::load(&state).unwrap();
+        assert!(
+            consumer.get("dev").unwrap().volumes.is_empty(),
+            "an attach whose registry write failed is not visible"
+        );
+        let mut recovered_intents = AttachIntents::load(&intents_path).unwrap();
+        assert!(recovered_intents.contains(&intent));
+        let mut recovered_provider = Store::load(&volumes_path).unwrap();
+        assert_eq!(
+            recovered_provider
+                .get("tank")
+                .unwrap()
+                .lease
+                .as_ref()
+                .map(|lease| lease.holder.as_str()),
+            Some("dev")
+        );
+
+        recovered_intents.mark_aborting_durable(&intent).unwrap();
+        recovered_provider.release("tank", "dev").unwrap();
+        recovered_provider.save().unwrap();
+        recovered_intents.complete_durable(&intent).unwrap();
+        assert!(Store::load(&volumes_path)
+            .unwrap()
+            .get("tank")
+            .unwrap()
+            .lease
+            .is_none());
+        assert!(AttachIntents::load(&intents_path)
+            .unwrap()
+            .list()
+            .is_empty());
+    }
+
+    /// A directory-sync error happens after rename, so the consumer commit
+    /// can be visible even though save returned an error. Reloading while the
+    /// independent intent still exists identifies that case and lets recovery
+    /// confirm the row rather than releasing a lease the row now names.
+    #[test]
+    fn an_ambiguous_block_attach_commit_rolls_forward_from_the_durable_row() {
+        use crate::volume::{AttachIntent, AttachIntents, Store};
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.json");
+        let intents_path = dir.path().join("volume-attach-intents.json");
+        let volumes_path = dir.path().join("volumes.json");
+        let mut shard = shard_with(&state, &["dev"]);
+        let intent = AttachIntent::new("dev", "instance-id", "tank", "nas", "nas-id", "cpu-id");
+        let mut intents = AttachIntents::load(&intents_path).unwrap();
+        intents.begin_durable(intent.clone()).unwrap();
+
+        let mut provider = Store::load(&volumes_path).unwrap();
+        provider.create("tank", 5 << 30).unwrap();
+        let granted = provider.lease("tank", "dev", "laptop").unwrap();
+        provider.save().unwrap();
+        shard
+            .attach_block("dev", "tank", "nas", granted.epoch, granted.size_bytes)
+            .unwrap();
+
+        let armed = durable::faults::arm_once(
+            "attach-registry-syncdir",
+            durable::faults::Point::SyncDir,
+            dir.path().display().to_string(),
+            std::io::ErrorKind::Other,
+        );
+        assert!(shard.save_confirmed().is_err());
+        drop(armed);
+
+        let committed = Shard::load(&state).unwrap();
+        let row = committed.get("dev").unwrap();
+        assert_eq!(row.volumes.len(), 1, "the published rename is observed");
+        assert_eq!(row.volumes[0].epoch, Some(granted.epoch));
+        assert!(AttachIntents::load(&intents_path)
+            .unwrap()
+            .contains(&intent));
+
+        committed.save_confirmed().unwrap();
+        intents = AttachIntents::load(&intents_path).unwrap();
+        intents.complete_durable(&intent).unwrap();
+        assert_eq!(
+            Store::load(&volumes_path)
+                .unwrap()
+                .get("tank")
+                .unwrap()
+                .lease
+                .as_ref()
+                .map(|lease| lease.epoch),
+            Some(granted.epoch)
+        );
+        assert!(AttachIntents::load(&intents_path)
+            .unwrap()
+            .list()
+            .is_empty());
+    }
+
+    /// Compensation has its own durable phase. Without it, a crash after an
+    /// ambiguous rollback could reload the old attached row and mistake the
+    /// operation for one to roll forward, even though the provider lease was
+    /// already being released.
+    #[test]
+    fn an_interrupted_compensation_restarts_in_abort_mode() {
+        use crate::volume::{AttachIntent, AttachIntents, Store};
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.json");
+        let intents_path = dir.path().join("volume-attach-intents.json");
+        let volumes_path = dir.path().join("volumes.json");
+        let mut shard = shard_with(&state, &["dev"]);
+        let intent = AttachIntent::new("dev", "instance-id", "tank", "nas", "nas-id", "cpu-id");
+        let mut intents = AttachIntents::load(&intents_path).unwrap();
+        intents.begin_durable(intent.clone()).unwrap();
+
+        let mut provider = Store::load(&volumes_path).unwrap();
+        provider.create("tank", 5 << 30).unwrap();
+        let granted = provider.lease("tank", "dev", "laptop").unwrap();
+        provider.save().unwrap();
+        shard
+            .attach_block("dev", "tank", "nas", granted.epoch, granted.size_bytes)
+            .unwrap();
+        shard.save_confirmed().unwrap();
+
+        intents.mark_aborting_durable(&intent).unwrap();
+        shard.detach_volume("dev", "tank", "nas").unwrap();
+        let armed = durable::faults::arm_once(
+            "attach-rollback-syncdir",
+            durable::faults::Point::SyncDir,
+            dir.path().display().to_string(),
+            std::io::ErrorKind::Other,
+        );
+        assert!(shard.save_confirmed().is_err());
+        drop(armed);
+
+        let mut recovered_intents = AttachIntents::load(&intents_path).unwrap();
+        let recovered = recovered_intents.list();
+        assert_eq!(recovered.len(), 1);
+        assert!(recovered[0].aborting, "restart must not roll this forward");
+        let mut recovered_shard = Shard::load(&state).unwrap();
+        if recovered_shard
+            .get("dev")
+            .unwrap()
+            .volumes
+            .iter()
+            .any(|v| v.is_block() && v.path == "tank" && v.host == "nas")
+        {
+            recovered_shard.detach_volume("dev", "tank", "nas").unwrap();
+        }
+        recovered_shard.save_confirmed().unwrap();
+        let mut recovered_provider = Store::load(&volumes_path).unwrap();
+        recovered_provider.release("tank", "dev").unwrap();
+        recovered_provider.save().unwrap();
+        recovered_intents.complete_durable(&recovered[0]).unwrap();
+
+        assert!(Shard::load(&state)
+            .unwrap()
+            .get("dev")
+            .unwrap()
+            .volumes
+            .is_empty());
+        assert!(Store::load(&volumes_path)
+            .unwrap()
+            .get("tank")
+            .unwrap()
+            .lease
+            .is_none());
+        assert!(AttachIntents::load(&intents_path)
+            .unwrap()
+            .list()
+            .is_empty());
     }
 
     /// A shard truncated by the filesystem is repaired from the copy the last

@@ -207,6 +207,12 @@ async fn main() -> Result<()> {
         eprintln!("astd: block volumes are unavailable: {e:#}");
     }
 
+    // An attach spans the provider's lease book and this consumer's instance
+    // shard. Settle its independent journal before resurrection can hand any
+    // ambiguously recorded disk to a hypervisor.
+    instance::reconcile_pending_attaches(&node).await;
+    instance::reconcile_pending_releases(&node).await;
+
     // The egress plane, for the same reason and in the same shape: a bound
     // guest's proxy is put up by the boot that builds its seed, and the
     // source half of a bound request arrives from a mesh stream.
@@ -682,6 +688,9 @@ async fn dispatch(request: Request, node: &Node, mesh: Option<&Arc<Mesh>>) -> Re
     if secret::is_orbit_request(&request) {
         return secret::serve(request, node, mesh).await;
     }
+    if volume::is_orbit_request(&request) {
+        return volume::serve_orbit(request, node, mesh).await;
+    }
     if orbit::claims(&request) {
         return orbit::serve(request, node, mesh).await;
     }
@@ -788,6 +797,35 @@ pub(crate) async fn handle(req: Request, node: &Node) -> Response {
         return images::serve(req).await;
     }
 
+    // Catalog fan-out can wait on every peer. Resolve it before taking the
+    // shard lock so one partitioned storage device cannot stall unrelated
+    // instance commands. The selected authority is revalidated by immutable
+    // device id and by its lease once the shard is locked below.
+    let storage_placement = if let Request::AttachStorage {
+        name,
+        volume: volume_name,
+        owner_device,
+        max_latency_ms,
+    } = &req
+    {
+        match volume::place(volume_name, owner_device.as_deref(), name, *max_latency_ms).await {
+            Ok((device, device_id)) => Some((
+                name.clone(),
+                volume_name.clone(),
+                device,
+                device_id,
+                owner_device.is_none(),
+            )),
+            Err(e) => {
+                return Response::Error {
+                    message: format!("{e:#}"),
+                }
+            }
+        }
+    } else {
+        None
+    };
+
     let cpu_device = node.device_name().await;
     let mut reg = node.shard.lock().await;
     instance::reconcile(&mut reg);
@@ -797,6 +835,18 @@ pub(crate) async fn handle(req: Request, node: &Node) -> Response {
     // they are checked once, here, ahead of every area.
     if let Some(refusal) = instance::refusal(&req, &reg) {
         return refusal;
+    }
+
+    if let Some((name, volume_name, device, device_id, auto_placed)) = storage_placement {
+        return instance::attach_storage_placed(
+            &mut reg,
+            &name,
+            &volume_name,
+            &device,
+            &device_id,
+            auto_placed,
+        )
+        .await;
     }
 
     if swap::is_step(&req) {
