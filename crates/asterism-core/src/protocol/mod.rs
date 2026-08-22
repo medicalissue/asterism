@@ -882,6 +882,7 @@ pub enum Response {
     /// Reply to [`Request::ImagePull`] after durable adoption. A failed pull
     /// is always [`Response::Error`].
     ImagePulled {
+        #[serde(rename = "image")]
         result: Box<ImagePullResult>,
     },
     /// Reply to [`Request::ListOrbit`]: the orbit registry, assembled from
@@ -1371,8 +1372,12 @@ mod tests {
                 changed: true,
             }),
         };
-        let decoded: Response =
-            serde_json::from_str(&serde_json::to_string(&response).unwrap()).unwrap();
+        let wire = serde_json::to_string(&response).unwrap();
+        assert_eq!(
+            wire,
+            r#"{"result":"image_pulled","image":{"reference":"ubuntu:24.04","kind":"disk","bytes":42,"digest":"sha256:abc","progress":[{"phase":"stored","bytes":42,"total_bytes":42,"done":true}],"changed":true}}"#
+        );
+        let decoded: Response = serde_json::from_str(&wire).unwrap();
         assert!(matches!(decoded, Response::ImagePulled { .. }));
         assert_eq!(response.since(), 6);
     }

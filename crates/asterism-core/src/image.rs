@@ -903,9 +903,11 @@ fn catalog_row(reference: &str, depth: Depth) -> Result<ImageRow> {
         .as_deref()
         .map(redact_source)
         .unwrap_or_else(|| resolved.name.clone());
+    let kind = resolved.kind();
+    let reference = resolved.name;
     Ok(ImageRow {
-        reference: resolved.name,
-        kind: resolved.kind(),
+        reference,
+        kind,
         pulled,
         verified,
         bytes,
