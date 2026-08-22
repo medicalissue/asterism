@@ -17,9 +17,10 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
-asterism-vz.workspace = true
+getrandom = "0.4"
 serde.workspace = true
 serde_json.workspace = true
+sha2 = "0.11"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
@@ -28,11 +29,13 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_Storage_Vhd",
+    "Win32_System_Com",
     "Win32_System_HostComputeNetwork",
     "Win32_System_HostComputeSystem",
     "Win32_System_Hypervisor",
-    "Win32_System_Registry",
+    "Win32_System_IO",
     "Win32_System_Services",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
 

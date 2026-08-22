@@ -9,6 +9,28 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  windows-hyperv:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      # This lane links the exact ComputeCore/ComputeNetwork/VirtDisk/
+      # WinSock imports. It deliberately does not mutate the hosted runner:
+      # real VM lifecycle evidence comes only from the elevated host harness.
+      - name: Compile the native helper and every Windows-only adapter
+        run: cargo check --locked --package asterism-hyperv --all-targets
+
+      - name: Run the portable helper protocol suite
+        run: cargo test --locked --package asterism-hyperv --lib
+
+      - name: Enforce the direct API boundary
+        shell: bash
+        run: bash scripts/check-hyperv-boundary.sh
+
   test:
     strategy:
       matrix:

@@ -49,15 +49,16 @@ the helper does not stop or orphan the guest. HCS configuration sets
 | local root/data disks | helper VirtDisk adapter | VirtDisk v2 VHDX create/open/attach/detach plus `HcsGrantVmAccess` |
 | guest control | helper Hyper-V Socket adapter | `AF_HYPERV`/`HV_PROTOCOL_RAW`; Linux `AF_VSOCK`; Asterism port 1023 service-template GUID |
 | stopped snapshots | common backend helper | filesystem clone/copy of a closed VHDX; same tag semantics as other backends |
-| live save/restore | helper HCS adapter | `HcsSaveComputeSystem` to VMRS and HCS restore configuration |
+| live save/restore seam | helper HCS adapter | `HcsSaveComputeSystem` to VMRS and HCS restore configuration; not advertised until real-host validation |
 
 The Rust binding is pinned to `windows-sys = 0.61.2`, already present in the
 workspace lockfile. Only these feature groups are enabled in the helper:
 `Win32_Foundation`, `Win32_Networking_WinSock`, `Win32_Security`,
 `Win32_Storage_FileSystem`, `Win32_Storage_Vhd`,
+`Win32_System_Com`,
 `Win32_System_HostComputeNetwork`, `Win32_System_HostComputeSystem`,
-`Win32_System_Hypervisor`, `Win32_System_Registry`, and
-`Win32_System_SystemInformation`. No downloaded VMM, QEMU executable, WHPX
+`Win32_System_Hypervisor`, `Win32_System_IO`, `Win32_System_Services`,
+`Win32_System_SystemInformation`, and `Win32_System_Threading`. No downloaded VMM, QEMU executable, WHPX
 wrapper, or mutable installer-time component is part of this path.
 
 ### Disk and image contract
@@ -83,8 +84,8 @@ The seed installs the existing authenticated Asterism guest agent. Linux sees
 the built-in Hyper-V socket transport as `AF_VSOCK`; the Windows helper connects
 with `AF_HYPERV` using the compute-system GUID and the service GUID derived from
 port 1023 (`000003ff-facb-11e6-bd58-64006a7986d3`). The HMAC session and status
-request are shared protocol, while socket address construction and the host
-registry registration live only in the helper. Boot does not return until the
+request are shared protocol, while socket address construction and the HCS
+per-VM service table live only in the helper. Boot does not return until the
 agent reports an address and an SSH listener.
 
 ### WMI v2 fallback list
@@ -123,9 +124,10 @@ that requirement rather than attempting elevation.
 3. reject a non-elevated token;
 4. reject disabled or pending-reboot Hyper-V/HCS/HCN services;
 5. query HCS service properties and HCN API availability;
-6. check helper protocol/build identity.
+6. check helper protocol/build identity (release builds pin the source commit;
+   unlabelled source builds report the weaker `+unknown` identity).
 
-No network, endpoint, VHDX, registry service key, compute system, instance
+No network, endpoint, VHDX, compute system, instance
 record, or snapshot is created until all six pass. Error text names the failed
 precondition and the operator action; it never silently selects WHPX/QEMU.
 
@@ -133,8 +135,10 @@ precondition and the operator action; it never silently selects WHPX/QEMU.
 
 Portable unit tests validate protocol compatibility, configuration documents,
 stable IDs, capability gates, disk snapshot semantics, and pre-mutation probe
-ordering. Windows CI must compile the helper and daemon seam and runs the
-non-mutating tests. A dedicated elevated Windows 11 Pro/Enterprise real-host
+ordering. Windows CI compiles every Windows-only helper adapter against the
+pinned SDK bindings, while the host-neutral daemon seam remains in the common
+workspace/conformance lanes; a static gate rejects QEMU/WHPX/PowerShell paths
+inside the helper and Windows API leakage into the daemon. A dedicated elevated Windows 11 Pro/Enterprise real-host
 harness is the only evidence accepted for VM creation, Linux boot, Hyper-V
 Socket readiness, daemon-restart adoption, stop/restart, save/restore, and
 cleanup.
@@ -150,7 +154,8 @@ result, and the final absence of Asterism-owned HCS/HCN objects.
 - Windows-specific mechanisms stay behind one executable seam and common
   capability gates remain the only product branching.
 - Running guests can outlive both daemon and helper processes.
-- Installation adds one pinned Rust helper binary and no VMM runtime.
+- A supported Windows artifact must add the pinned `astd-hyperv` binary and no
+  VMM runtime; this change does not claim a Windows release artifact exists.
 - Cloud-disk images are implementable without QEMU. OCI direct boot remains a
   stated unsupported capability until a native, pinned boot input exists.
 - A green macOS/Linux suite is not proof that Hyper-V works; the Windows host

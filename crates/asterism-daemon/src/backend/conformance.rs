@@ -19,12 +19,13 @@ use asterism_core::hv::{
 use asterism_core::instance::{Instance, Shape};
 use asterism_core::power::{Change, SleepGuard};
 
-use super::{backends, by_id, qemu, vz};
+use super::{backends, by_id, hyperv, qemu, vz};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ControlKind {
     Qmp,
     Rpc,
+    Helper,
 }
 
 impl ControlKind {
@@ -32,6 +33,7 @@ impl ControlKind {
         match self {
             ControlKind::Qmp => ControlChannel::Qmp { path },
             ControlKind::Rpc => ControlChannel::Rpc { path },
+            ControlKind::Helper => ControlChannel::Helper { path },
         }
     }
 
@@ -39,6 +41,7 @@ impl ControlKind {
         match self {
             ControlKind::Qmp => "qmp",
             ControlKind::Rpc => "rpc",
+            ControlKind::Helper => "helper",
         }
     }
 }
@@ -51,6 +54,7 @@ fn control_kind(id: &str) -> ControlKind {
     match id {
         qemu::ID => ControlKind::Qmp,
         vz::ID => ControlKind::Rpc,
+        hyperv::ID => ControlKind::Helper,
         other => panic!("registered backend {other:?} has no conformance profile"),
     }
 }
@@ -138,7 +142,7 @@ impl Fixture {
             ctl: kind.channel(self.control.clone()),
             endpoint: match kind {
                 ControlKind::Qmp => GuestEndpoint::HostForward { ssh_port: 22022 },
-                ControlKind::Rpc => GuestEndpoint::GuestAddr {
+                ControlKind::Rpc | ControlKind::Helper => GuestEndpoint::GuestAddr {
                     addr: "192.0.2.1".parse().unwrap(),
                 },
             },
