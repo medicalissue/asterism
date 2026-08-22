@@ -36,16 +36,17 @@ use objc2_foundation::{
     NSRunLoop, NSString, NSURL,
 };
 use objc2_virtualization::{
-    VZDiskImageCachingMode, VZDiskImageStorageDeviceAttachment, VZDiskImageSynchronizationMode,
-    VZDiskSynchronizationMode, VZEFIBootLoader, VZEFIVariableStore,
-    VZEFIVariableStoreInitializationOptions, VZEntropyDeviceConfiguration,
-    VZFileHandleSerialPortAttachment, VZGenericPlatformConfiguration, VZMACAddress,
-    VZMemoryBalloonDeviceConfiguration, VZNATNetworkDeviceAttachment,
+    VZDirectorySharingDeviceConfiguration, VZDiskImageCachingMode,
+    VZDiskImageStorageDeviceAttachment, VZDiskImageSynchronizationMode, VZDiskSynchronizationMode,
+    VZEFIBootLoader, VZEFIVariableStore, VZEFIVariableStoreInitializationOptions,
+    VZEntropyDeviceConfiguration, VZFileHandleSerialPortAttachment, VZGenericPlatformConfiguration,
+    VZMACAddress, VZMemoryBalloonDeviceConfiguration, VZNATNetworkDeviceAttachment,
     VZNetworkBlockDeviceStorageDeviceAttachment,
     VZNetworkBlockDeviceStorageDeviceAttachmentDelegate, VZNetworkDevice,
-    VZNetworkDeviceConfiguration, VZSerialPortConfiguration, VZSocketDeviceConfiguration,
-    VZStorageDeviceConfiguration, VZVirtioBlockDeviceConfiguration,
-    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioEntropyDeviceConfiguration,
+    VZNetworkDeviceConfiguration, VZSerialPortConfiguration, VZSharedDirectory,
+    VZSingleDirectoryShare, VZSocketDeviceConfiguration, VZStorageDeviceConfiguration,
+    VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
+    VZVirtioEntropyDeviceConfiguration, VZVirtioFileSystemDeviceConfiguration,
     VZVirtioNetworkDeviceConfiguration, VZVirtioSocketConnection, VZVirtioSocketDevice,
     VZVirtioSocketDeviceConfiguration, VZVirtioTraditionalMemoryBalloonDeviceConfiguration,
     VZVirtualMachine, VZVirtualMachineConfiguration, VZVirtualMachineDelegate,
@@ -495,6 +496,37 @@ unsafe fn build_config(
         }
     }
     vm_config.setStorageDevices(&NSArray::from_retained_slice(&disks));
+
+    // ---- directory shares ---------------------------------------------
+    // One virtiofs device per mounted directory. Its tag is the same stable
+    // tag the seed wrote as `What=`, while the framework owns the entire
+    // host side of the transport. These are writable because directory
+    // volumes currently have no read-only mode in the product model.
+    let mut shares: Vec<Retained<VZDirectorySharingDeviceConfiguration>> = Vec::new();
+    for share in &config.shares {
+        if !share.path.is_dir() {
+            bail!("{} is not a directory to share", share.path.display());
+        }
+        let tag = NSString::from_str(&share.tag);
+        VZVirtioFileSystemDeviceConfiguration::validateTag_error(&tag)
+            .map_err(vz_err)
+            .with_context(|| format!("validating virtiofs tag {:?}", share.tag))?;
+
+        let directory = VZSharedDirectory::initWithURL_readOnly(
+            VZSharedDirectory::alloc(),
+            &url(&share.path),
+            false,
+        );
+        let single =
+            VZSingleDirectoryShare::initWithDirectory(VZSingleDirectoryShare::alloc(), &directory);
+        let device = VZVirtioFileSystemDeviceConfiguration::initWithTag(
+            VZVirtioFileSystemDeviceConfiguration::alloc(),
+            &tag,
+        );
+        device.setShare(Some(&Retained::into_super(single)));
+        shares.push(Retained::into_super(device));
+    }
+    vm_config.setDirectorySharingDevices(&NSArray::from_retained_slice(&shares));
 
     // ---- network -------------------------------------------------------
     // NAT needs no entitlement approval; bridged would need the restricted

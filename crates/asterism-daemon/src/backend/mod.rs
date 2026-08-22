@@ -392,7 +392,7 @@ pub fn boot_req<'a>(inst: &'a Instance, hv: &dyn Hypervisor) -> Result<BootReq<'
         &guest_config,
         &egress,
     )
-        .context("building cloud-init seed")?;
+    .context("building cloud-init seed")?;
     req.shares = shares;
     Ok(req)
 }
@@ -1382,25 +1382,14 @@ mod tests {
         assert_eq!(for_instance(&inst).unwrap().id(), "vz");
         assert_eq!(for_handle("vz").unwrap().id(), "vz");
 
-        // A vz instance cannot take a volume — but only a device that can
-        // actually run vz is entitled to say so.
+        // VZ exposes the same directory part through virtiofs, so attaching
+        // it is valid whether or not this test host can actually probe VZ.
         inst.volumes.push(asterism_core::instance::Volume::dir(
             "/tank/media",
             &asterism_core::instance::local_host(),
             None,
         ));
-        if by_id("vz").unwrap().probe().is_ok() {
-            let err = check_can_share(&inst).unwrap_err().to_string();
-            assert!(err.contains("vz"), "{err}");
-            assert!(err.contains("9p"), "{err}");
-            assert!(err.contains("destroy and recreate"), "{err}");
-            assert!(err.contains("ast create dev --backend qemu"), "{err}");
-        } else {
-            assert!(
-                check_can_share(&inst).is_ok(),
-                "a backend we cannot ask cannot refuse"
-            );
-        }
+        assert!(check_can_share(&inst).is_ok());
 
         inst.machine = Machine {
             backend: "qemu".into(),

@@ -76,15 +76,9 @@ harness_seed_images "$ASTERISM_HOME"
 
 # The backend is named, not left to the daemon.
 #
-# This script attaches a host directory, and a host directory reaches a guest
-# over 9p — which vz cannot share. The daemon's own selection is vz-first
-# (scripts/e2e-vz.sh documents the probe), and it makes that choice at create
-# time, before it has been told a volume is coming. So a create with no
-# --backend lands on vz wherever vz works, and the attach below is then
-# refused in words rather than falling through to a backend that could serve
-# it. Asking for qemu here is what makes the rest of this script a test of
-# 9p and snapshots instead of a test of which backend the daemon happened to
-# pick on this machine.
+# This lane pins qemu because it exercises the 9p implementation and QEMU's
+# snapshot path together. The storage-parts lane covers the same directory
+# journey through VZ's virtiofs implementation.
 expect "create"  "$INST  defined"  \
   "$AST" create "$INST" --backend qemu --image "$IMAGE" --mem 2G --disk 10G
 expect "attach"  "/mnt/ast/e2e-vol" "$AST" attach "$INST" --volume "$VOL"
@@ -95,7 +89,7 @@ expect "up"      "$INST  running"  "$AST" up "$INST"
 # it in its output and not in the guest.
 harness_assert_backend "$AST" "$INST" qemu \
   || fail "the marker below would be proving something about a different backend"
-echo "ok: the guest is on qemu, which is the backend that can share a directory"
+echo "ok: the guest is on qemu, exercising the 9p directory transport"
 
 # First boot: sshd can come up before cloud-init has mounted the volumes,
 # so give the marker a bounded retry instead of failing on the race.

@@ -48,14 +48,16 @@ use anyhow::{bail, Context, Result};
 
 use asterism_core::hv::{
     BootReq, Caps, ControlChannel, DiskFormat, DiskSpec, GuestEndpoint, Handle, Hypervisor,
-    Prepared, Ready, RunState, SnapshotId,
+    Prepared, Ready, RunState, ShareKind, SnapshotId,
 };
 use asterism_core::instance::Instance;
 use asterism_core::proc::{ProcId, Signal};
 use asterism_core::snapshot::{self, Snapshot};
 use asterism_core::{cow, paths, tools};
 use asterism_vz::guest;
-use asterism_vz::{Command as VzCommand, Config, Discovery, Disk as VzDisk, Reply, StopReason};
+use asterism_vz::{
+    Command as VzCommand, Config, Discovery, Disk as VzDisk, Reply, Share as VzShare, StopReason,
+};
 
 use super::{alive, grow, owned};
 
@@ -366,12 +368,10 @@ impl Hypervisor for Vz {
             disk_snapshot: true,
             live_migration: false,
             disk_hotplug: false,
-            // VZ's directory sharing is virtiofs
-            // (`VZVirtioFileSystemDevice`), not the 9p the seed writes
-            // mount units for, so honestly: not yet. `boot_req` turns this
-            // into a refusal that names the instance and its volumes rather
-            // than a guest that silently has no /mnt/ast.
-            shared_dir: None,
+            // One VZVirtioFileSystemDeviceConfiguration per same-device
+            // directory. The seed consumes this capability too, so its
+            // mount units name the transport the helper actually attaches.
+            shared_dir: Some(ShareKind::Virtiofs),
             // Both DiskSpec NBD transports are translated to
             // VZNetworkBlockDeviceStorageDeviceAttachment: TCP URLs pass
             // through, while local volume bridges use standard nbd+unix
@@ -466,17 +466,6 @@ impl Hypervisor for Vz {
         if !req.seed.exists() {
             bail!("no cloud-init seed at {}", req.seed.display());
         }
-        if !req.shares.is_empty() {
-            // Belt and braces: `backend::boot_req` gates on `Caps` and
-            // refuses first. Faking a share here would be the one failure
-            // mode worth being loud about.
-            bail!(
-                "the {ID} backend cannot share host directories, so {:?}'s volumes \
-                 cannot reach the guest",
-                inst.name
-            );
-        }
-
         let config = Config {
             instance: inst.name.clone(),
             root: prep.root_path()?.to_owned(),
@@ -489,6 +478,7 @@ impl Hypervisor for Vz {
                 .iter()
                 .map(extra_disk)
                 .collect::<Result<Vec<_>>>()?,
+            shares: req.shares.iter().map(directory_share).collect(),
             cpus: inst.shape.cpus,
             mem_mib: inst.shape.mem_mib,
             mac: asterism_vz::mac_for(&inst.name),
@@ -1002,6 +992,14 @@ fn extra_disk(disk: &DiskSpec) -> Result<VzDisk> {
     }
 }
 
+/// One backend-neutral directory share, reduced to what the VZ helper needs.
+fn directory_share(share: &asterism_core::seed::Share) -> VzShare {
+    VzShare {
+        path: PathBuf::from(&share.host_path),
+        tag: share.tag.clone(),
+    }
+}
+
 /// The instance directory a root disk sits in — where its snapshots go.
 fn instance_dir(disk: &Path) -> Result<&Path> {
     disk.parent()
@@ -1324,10 +1322,7 @@ mod tests {
         );
         assert!(!caps.live_snapshot);
         assert!(!caps.live_migration);
-        assert!(
-            caps.shared_dir.is_none(),
-            "virtiofs is a follow-up, and 9p is QEMU's"
-        );
+        assert_eq!(caps.shared_dir, Some(ShareKind::Virtiofs));
         assert!(caps.nbd_disks);
         assert_eq!(caps.disk_formats, &[DiskFormat::Raw], "no qcow2, ever");
     }
@@ -1440,6 +1435,23 @@ mod tests {
                 socket: "/tmp/asterism.sock".into(),
                 export: "team/data".into(),
                 readonly: true,
+            }
+        );
+    }
+
+    #[test]
+    fn directory_shares_keep_the_seed_tag_at_the_helper_boundary() {
+        let share = asterism_core::seed::Share {
+            host_path: "/workspace/source".into(),
+            guest_path: "/mnt/ast/source".into(),
+            tag: "ast0123456789ab".into(),
+            label: "desktop:/workspace/source".into(),
+        };
+        assert_eq!(
+            directory_share(&share),
+            VzShare {
+                path: "/workspace/source".into(),
+                tag: "ast0123456789ab".into(),
             }
         );
     }

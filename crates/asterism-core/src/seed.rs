@@ -282,11 +282,7 @@ fn build(
 /// One function because it is one cloud-config: `write_files` and `runcmd`
 /// are written once each, whether or not there are volumes, and merged with
 /// the backend's own half by [`merge`].
-fn asterism_config(
-    shares: &[Share],
-    share_kind: Option<ShareKind>,
-    egress: &Egress,
-) -> String {
+fn asterism_config(shares: &[Share], share_kind: Option<ShareKind>, egress: &Egress) -> String {
     let mut out = String::from("bootcmd:\n");
     out.push_str(HOSTKEY_BOOTCMD);
     out.push_str("write_files:\n");
@@ -687,7 +683,11 @@ const INDENT: &str = "  ";
 /// claims, or a list that can absorb ours. `build` runs the same check, but
 /// it runs it at boot — this is here so a backend's test can run it now.
 pub fn mergeable(guest_config: &str) -> Result<()> {
-    merge(&asterism_config(&[], None, &Egress::default()), guest_config).map(|_| ())
+    merge(
+        &asterism_config(&[], None, &Egress::default()),
+        guest_config,
+    )
+    .map(|_| ())
 }
 
 /// One top-level cloud-config key and what is under it.
@@ -899,6 +899,21 @@ mod tests {
                 "unindented line in cloud-config: {line:?}"
             );
         }
+    }
+
+    #[test]
+    fn virtiofs_units_name_only_the_transport_vz_attaches() {
+        let shares = [share("/workspace/source", "/mnt/ast/source")];
+        let config = asterism_config(&shares, Some(ShareKind::Virtiofs), &Egress::default());
+        assert!(config.contains("Type=virtiofs"), "{config}");
+        assert!(config.contains("modprobe virtiofs"), "{config}");
+        assert!(config.contains("asterism-virtiofs.conf"), "{config}");
+        assert!(
+            config.contains(&format!("What={}", shares[0].tag)),
+            "{config}"
+        );
+        assert!(!config.contains("Type=9p"), "{config}");
+        assert!(!config.contains("trans=virtio"), "{config}");
     }
 
     /// Two halves of the user-data can each need `runcmd:`, and YAML would
@@ -1151,6 +1166,17 @@ mod tests {
         assert_eq!(none, fingerprint("dev", &[], None, "", &bare));
         assert_ne!(none, one);
         assert_ne!(one, elsewhere);
+        assert_ne!(
+            one,
+            fingerprint(
+                "dev",
+                &[share("/tank/media", "/mnt/ast/media")],
+                Some(ShareKind::Virtiofs),
+                "",
+                &bare,
+            ),
+            "a backend transport change has to reissue the guest's mount unit"
+        );
         assert_ne!(
             one,
             fingerprint(

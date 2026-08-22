@@ -245,10 +245,11 @@ enum Command {
     /// A DIRECTORY (`--volume /tank/media`) is shared with the guest and
     /// mounted at a path. Three things have to be true, and each of them is
     /// refused in words rather than discovered later: the directory is on
-    /// the same device as the instance's cpu and ram (9p has no network
-    /// transport and never will), the backend can share one (qemu, today —
-    /// not vz), and the guest boots a cloud image whose kernel has 9p in it
-    /// (an OCI instance has no init to mount anything with).
+    /// the same device as the instance's cpu and ram (directory sharing has
+    /// no network transport), the backend offers a share transport (9p on
+    /// qemu or virtiofs on vz), and the guest boots a cloud image whose
+    /// kernel supports that transport (an OCI instance has no init to mount
+    /// anything with).
     ///
     /// A BLOCK VOLUME (`--volume desktop:tank`, made with `ast volume
     /// create`) arrives as a plain disk: /dev/vdb, /dev/vdc and so on. The
@@ -2909,7 +2910,7 @@ fn print_attached(inst: &Instance) {
     } else if !v.is_local() {
         println!(
             "recorded only — a directory on another device cannot be shared into a \
-             guest (9p has no network transport); use a block volume instead: \
+             guest (directory shares have no network transport); use a block volume instead: \
              ast volume create"
         );
     }

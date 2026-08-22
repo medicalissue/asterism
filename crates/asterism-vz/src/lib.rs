@@ -99,6 +99,11 @@ pub struct Config {
     /// Extra raw disks, in the order the guest should see them.
     #[serde(default)]
     pub extra_disks: Vec<Disk>,
+    /// Host directories exposed through virtiofs. Each tag is also written
+    /// into the guest's mount unit, so this is the rendezvous between the
+    /// framework device and the backend-neutral seed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shares: Vec<Share>,
     pub cpus: u32,
     pub mem_mib: u32,
     /// Pinned, because it is the fallback discovery path's only key into
@@ -144,6 +149,17 @@ pub enum Disk {
         #[serde(default)]
         readonly: bool,
     },
+}
+
+/// One host directory exposed to a Linux guest through virtiofs.
+///
+/// Kept as a protocol type instead of passing the core seed type across the
+/// helper boundary: the helper needs only the two values VZ consumes, while
+/// the guest path and human label remain seed concerns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Share {
+    pub path: PathBuf,
+    pub tag: String,
 }
 
 impl Config {
@@ -518,6 +534,10 @@ mod tests {
                 path: "/vol/data.raw".into(),
                 readonly: true,
             }],
+            shares: vec![Share {
+                path: "/workspace".into(),
+                tag: "ast0123456789ab".into(),
+            }],
             cpus: 2,
             mem_mib: 2048,
             mac: mac_for("dev"),
@@ -537,6 +557,7 @@ mod tests {
             "cpus":1,"mem_mib":512,"mac":"52:54:00:aa:bb:cc"}"#;
         let config: Config = serde_json::from_str(json).unwrap();
         assert!(config.extra_disks.is_empty());
+        assert!(config.shares.is_empty());
     }
 
     #[test]

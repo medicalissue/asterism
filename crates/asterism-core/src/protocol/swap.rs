@@ -112,7 +112,7 @@ pub struct MoveManifest {
     pub base: BaseImage,
     /// The files, in the order they will be sent.
     pub files: Vec<MoveFile>,
-    /// Guest paths of volumes that are same-device 9p shares on the source.
+    /// Guest paths of directory volumes that are same-device shares on the source.
     /// They do not survive the move as working parts; they survive as rows
     /// with a flag on them.
     #[serde(default)]
