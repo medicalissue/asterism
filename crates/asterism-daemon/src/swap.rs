@@ -559,9 +559,28 @@ fn movable(inst: &Instance) -> Result<()> {
 /// than dressed up as a problem.
 pub fn probe(manifest: &MoveManifest, device: &str, already_here: bool) -> Response {
     let mut notes = Vec::new();
-    let refusal = probe_refusal(manifest, device, already_here, &mut notes);
-    let needs_base = refusal.is_none() && base_wanted(&manifest.base).unwrap_or(false);
+    let mut refusal = probe_refusal(manifest, device, already_here, &mut notes);
+    let needs_base = if refusal.is_none() {
+        let (base_refusal, wanted) = probe_base(&manifest.base, device);
+        refusal = base_refusal;
+        wanted
+    } else {
+        false
+    };
     Response::MoveProbe { device: device.to_owned(), refusal, notes, needs_base }
+}
+
+fn probe_base(base: &BaseImage, device: &str) -> (Option<String>, bool) {
+    match base_wanted(base) {
+        Ok(wanted) => (None, wanted),
+        Err(e) => (
+            Some(format!(
+                "device {device} cannot receive base image {:?}: {e:#}",
+                base.reference
+            )),
+            false,
+        ),
+    }
 }
 
 fn probe_refusal(
@@ -657,29 +676,57 @@ fn probe_refusal(
 /// the wrong bytes however this answers. A copy already here at the right
 /// length is left alone — other instances on this device are cloned from it,
 /// and rewriting it to settle a doubt about one move would be the wrong
-/// trade.
+/// trade. If a fetch would land outside the replaceable image store, this is
+/// an error: the target has to provide that path itself.
 pub fn base_wanted(base: &BaseImage) -> Result<bool> {
     if base.len == 0 {
         return Ok(false);
     }
-    let resolved = backend::image_ref(&base.reference)?;
-    if !resolved.path.exists() {
-        return Ok(true);
+    let resolved = image::resolve(&base.reference)?;
+    let wanted = !resolved.path.exists() || std::fs::metadata(&resolved.path)?.len() != base.len;
+    if !wanted {
+        return Ok(false);
     }
-    Ok(std::fs::metadata(&resolved.path)?.len() != base.len)
+
+    // A reference can resolve on both devices while naming different bytes
+    // (most importantly, a local `--image` path). Anything outside the image
+    // store is not a cache entry Asterism may refresh: the target's file may
+    // be the user's only copy, and replacing it would be data loss. Refuse
+    // during the probe, before the source is fenced, and tell the user how to
+    // make the move possible.
+    if !resolved.is_ours() {
+        bail!(
+            "this device needs base image {:?} at {}, but that path is outside \
+             Asterism's replaceable image store and does not hold the {}-byte image the \
+             move requires. Asterism will not overwrite it with bytes fetched from a \
+             peer; put that image at {} on this device and retry the move",
+            base.reference,
+            resolved.path.display(),
+            base.len,
+            resolved.path.display()
+        );
+    }
+    Ok(true)
 }
 
 /// Where a fetched base image lands on this device, and where the provenance
 /// record for it has to go.
 ///
-/// Two paths rather than one because they are the same file only for what the
-/// store owns. A reference that names a file the user pointed `--image` at
-/// keeps its record in the store instead of beside the user's bytes, and the
-/// boot gate reads it from there — so a fetch that wrote the record next to
-/// the artifact would leave exactly the unaccountable image this returns two
-/// paths to avoid.
+/// Two paths rather than one because an artifact and its provenance record
+/// are separate durable writes. Only an image-store artifact may be returned:
+/// a peer fetch must never adopt onto a local file the user pointed
+/// `--image` at, even if that file changed after the move probe.
 pub fn base_landing(reference: &str) -> Result<(PathBuf, PathBuf)> {
     let resolved = image::resolve(reference)?;
+    if !resolved.is_ours() {
+        bail!(
+            "base image {reference:?} resolves outside Asterism's replaceable image \
+             store at {}; Asterism will not overwrite that path with bytes fetched \
+             from a peer. Put the required image there on this device and retry the \
+             move",
+            resolved.path.display()
+        );
+    }
     Ok((resolved.path, resolved.record))
 }
 
@@ -1160,6 +1207,48 @@ mod tests {
         // a byte of a multi-gigabyte base image has been asked for.
         let err = format!("{:#}", wire_digest(&format!("md5:{}", "a".repeat(32))).unwrap_err());
         assert!(err.contains("is not one Asterism can check"), "{err}");
+    }
+
+    /// A local `--image` file is the user's only copy, not a cache entry a
+    /// peer fetch may refresh. A different length is enough to know it is not
+    /// the source's base, but never permission to replace it.
+    #[test]
+    fn a_peer_fetch_never_lands_on_a_user_owned_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mine.raw");
+        let original = b"the target user's own image";
+        std::fs::write(&path, original).unwrap();
+        let reference = path.display().to_string();
+        let base = BaseImage {
+            reference: reference.clone(),
+            len: original.len() as u64 + 1,
+            allocated: original.len() as u64 + 1,
+            digest: "ab".repeat(32),
+            derived_from: Vec::new(),
+        };
+
+        let (refusal, needs_base) = probe_base(&base, "desktop");
+        assert!(!needs_base, "an unsafe landing is a refusal, not a fetch");
+        let wanted = refusal.unwrap();
+        assert!(wanted.contains("device desktop cannot receive base image"), "{wanted}");
+        assert!(wanted.contains("outside Asterism's replaceable image store"), "{wanted}");
+        assert!(wanted.contains("will not overwrite it"), "{wanted}");
+        assert!(wanted.contains("put that image at"), "{wanted}");
+        assert!(wanted.contains(&reference), "{wanted}");
+
+        let mut already_there = base.clone();
+        already_there.len = original.len() as u64;
+        assert!(
+            !base_wanted(&already_there).unwrap(),
+            "a target that has the image itself needs no peer fetch"
+        );
+
+        // The adoption boundary repeats the ownership check, closing the
+        // race where the path changes after the probe but before transfer.
+        let landing = format!("{:#}", base_landing(&reference).unwrap_err());
+        assert!(landing.contains("will not overwrite that path"), "{landing}");
+        assert!(landing.contains("retry the move"), "{landing}");
+        assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 
     /// The chain in `crate::handle` runs whichever area claims a frame, so a

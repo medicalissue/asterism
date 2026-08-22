@@ -1923,7 +1923,7 @@ async fn import(
     std::fs::create_dir_all(&staging)
         .with_context(|| format!("making {}", staging.display()))?;
 
-    if swap::base_wanted(&manifest.base).unwrap_or(false) {
+    if swap::base_wanted(&manifest.base)? {
         fetch_base(mesh, from_device, manifest, report).await?;
     }
 
