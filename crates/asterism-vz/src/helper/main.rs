@@ -656,10 +656,6 @@ fn parse_args() -> anyhow::Result<std::path::PathBuf> {
                         .ok_or_else(|| anyhow::anyhow!("--config needs a path"))?,
                 ))
             }
-            "-V" | "--version" => {
-                println!("{} {}", asterism_vz::HELPER_BIN, env!("CARGO_PKG_VERSION"));
-                std::process::exit(0);
-            }
             "-h" | "--help" => {
                 println!(
                     "astd-vz --config <vz.json>\n\n\
