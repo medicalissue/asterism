@@ -2298,7 +2298,7 @@ fn ensure_image_on_device(device: Option<&str>, reference: &str) -> Result<Strin
         {
             return Ok(canonical);
         }
-        let result = pull_image(device, reference)?;
+        let result = pull_image(Some(device), reference)?;
         return Ok(result.reference);
     }
 
