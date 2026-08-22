@@ -74,18 +74,25 @@ harness_cache_image "$AST" "$IMAGE" || fail "could not cache $IMAGE"
 harness_seed_images "$ASTERISM_HOME"
 "$AST" pull "$IMAGE" >/dev/null 2>&1 || fail "pull $IMAGE"
 
-expect "create"  "$INST  defined"  "$AST" create "$INST" --image "$IMAGE" --mem 2G --disk 10G
+# The backend is named, not left to the daemon.
+#
+# This script attaches a host directory, and a host directory reaches a guest
+# over 9p — which vz cannot share. The daemon's own selection is vz-first
+# (scripts/e2e-vz.sh documents the probe), and it makes that choice at create
+# time, before it has been told a volume is coming. So a create with no
+# --backend lands on vz wherever vz works, and the attach below is then
+# refused in words rather than falling through to a backend that could serve
+# it. Asking for qemu here is what makes the rest of this script a test of
+# 9p and snapshots instead of a test of which backend the daemon happened to
+# pick on this machine.
+expect "create"  "$INST  defined"  \
+  "$AST" create "$INST" --backend qemu --image "$IMAGE" --mem 2G --disk 10G
 expect "attach"  "/mnt/ast/e2e-vol" "$AST" attach "$INST" --volume "$VOL"
 expect "up"      "$INST  running"  "$AST" up "$INST"
 
-# Which backend it actually booted on, asserted rather than assumed.
-#
-# The create above names no backend, so the daemon picks — and the two of
-# them boot the same image and pass every other line of this script. What
-# makes the answer qemu here is the attach: a host directory reaches a guest
-# over 9p, which vz cannot share, so a request that needs one falls through
-# to qemu. That is a selection policy, not a coincidence, and this is the
-# line that fails when it changes.
+# And what it actually booted on, asserted rather than assumed: `--backend
+# qemu` is a request, and this is the line that catches a daemon that honours
+# it in its output and not in the guest.
 harness_assert_backend "$AST" "$INST" qemu \
   || fail "the marker below would be proving something about a different backend"
 echo "ok: the guest is on qemu, which is the backend that can share a directory"
