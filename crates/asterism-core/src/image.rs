@@ -782,7 +782,7 @@ pub fn pull(reference: &str) -> Result<ImagePullResult> {
 }
 
 fn ensure_oci_kernel() -> Result<()> {
-    oci::ensure_kernel(|url, dest| download(url, dest)).map(|_| ())
+    oci::ensure_kernel(download).map(|_| ())
 }
 
 fn download(url: &str, dest: &Path) -> Result<()> {
