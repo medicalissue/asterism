@@ -129,6 +129,11 @@ mod tests {
                         daemon_error: None,
                         daemon_build: None,
                         app_build: "0.0.2+0123456789ab".into(),
+                        update_channel: "stable".into(),
+                        update_version: "0.0.2".into(),
+                        update_build: "0.0.2+0123456789ab".into(),
+                        update_manager: "asterism".into(),
+                        update_error: None,
                         home: "/tmp".into(),
                         service: crate::settings::Service {
                             mechanism: "launchd".into(),

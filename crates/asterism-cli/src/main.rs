@@ -435,6 +435,20 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Check or install a release from Asterism's signed update channel.
+    ///
+    /// The desktop app calls this same command. One updater therefore owns
+    /// channel selection, signature policy, staging, activation and rollback
+    /// for both surfaces.
+    #[command(subcommand)]
+    Update(UpdateCommand),
+    /// Restart astd after a transactional update and prove the new build is
+    /// the process that answered. Used only by the shipped updater.
+    #[command(name = "__activate-update", hide = true)]
+    ActivateUpdate {
+        #[arg(long)]
+        build: String,
+    },
     /// Install, remove or inspect astd as a service the OS keeps running.
     #[command(subcommand)]
     Service(ServiceCommand),
@@ -556,6 +570,26 @@ enum ServiceCommand {
     Uninstall,
     /// Show whether astd is installed as a service, and running.
     Status,
+}
+
+/// `ast update ...` — both CLI and desktop app reach this exact surface.
+#[derive(Subcommand)]
+enum UpdateCommand {
+    /// Show this device's channel, installed version/build, and package owner.
+    Status,
+    /// Fetch and authenticate the channel manifest without downloading artifacts.
+    Check,
+    /// Download, verify and transactionally activate the channel release.
+    Apply {
+        /// Confirm replacement of the installed compatible unit.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Print or change the update channel.
+    Channel {
+        /// stable, beta, or nightly. Omit to print the current channel.
+        name: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -844,6 +878,14 @@ fn main() -> Result<()> {
         Command::Compat { json } => {
             local_only("compat", device.as_deref())?;
             return print_compat(json);
+        }
+        Command::Update(cmd) => {
+            local_only("update", device.as_deref())?;
+            return update_command(cmd);
+        }
+        Command::ActivateUpdate { build } => {
+            local_only("__activate-update", device.as_deref())?;
+            return activate_update(&build);
         }
         Command::Service(cmd) => {
             local_only("service", device.as_deref())?;
@@ -3261,6 +3303,103 @@ fn parse_mem_mib(s: &str) -> Result<u32> {
 fn parse_disk_gib(s: &str) -> Result<u32> {
     let g = s.trim().strip_suffix(['G', 'g']).unwrap_or(s.trim());
     g.parse::<u32>().context("bad --disk (try 20G)")
+}
+
+// ---- signed updates -------------------------------------------------------
+
+/// Hand update policy to the updater shipped by this exact build.
+///
+/// It is a separate executable because it must remain alive while `ast`
+/// itself is renamed. Keeping the policy there also lets the desktop app call
+/// the same implementation rather than acquiring a second update backend.
+fn update_command(cmd: UpdateCommand) -> Result<()> {
+    let ast = std::env::current_exe().context("finding the installed ast binary")?;
+    let updater = std::env::var_os("ASTERISM_UPDATER")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            let prefix = ast.parent()?.parent()?;
+            let path = prefix.join("libexec/asterism/asterism-update");
+            path.is_file().then_some(path)
+        })
+        // A source checkout can exercise the same updater without installing
+        // into the developer's prefix. Published binaries never need this.
+        .or_else(|| {
+            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../packaging/update.sh");
+            path.is_file().then_some(path)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "this installation has no asterism-update beside it; reinstall Asterism once, then `ast update` is self-hosting"
+            )
+        })?;
+
+    let mut process = std::process::Command::new(&updater);
+    process.env("ASTERISM_UPDATE_AST_PATH", &ast);
+    if std::env::var_os("ASTERISM_UPDATE_PUBKEY").is_none() {
+        if let Some(pubkey) = option_env!("ASTERISM_UPDATE_PUBKEY") {
+            if !pubkey.is_empty() {
+                process.env("ASTERISM_UPDATE_PUBKEY", pubkey);
+            }
+        }
+    }
+    match cmd {
+        UpdateCommand::Status => {
+            process.arg("status");
+        }
+        UpdateCommand::Check => {
+            process.arg("check");
+        }
+        UpdateCommand::Apply { yes } => {
+            process.arg("apply");
+            if yes {
+                process.arg("--yes");
+            }
+        }
+        UpdateCommand::Channel { name } => {
+            process.arg("channel");
+            if let Some(name) = name {
+                process.arg(name);
+            }
+        }
+    }
+    let status = process
+        .status()
+        .with_context(|| format!("running {}", updater.display()))?;
+    if !status.success() {
+        bail!("update command exited with {status}");
+    }
+    Ok(())
+}
+
+/// Activate the daemon half of an already-committed filesystem transaction.
+///
+/// Guests are independent qemu/VZ-helper processes and are deliberately not
+/// signalled here. The new daemon adopts them through their recorded process
+/// evidence, which is the same live-guest-preserving replacement exercised by
+/// the version-skew suite.
+fn activate_update(want_build: &str) -> Result<()> {
+    if UnixStream::connect(paths::socket_path()).is_ok() {
+        retire_stale_daemon()?;
+    } else {
+        spawn_daemon()?;
+        wait_for_socket(&paths::socket_path())?;
+    }
+    let Some((version, build)) = running_daemon() else {
+        bail!("the replacement astd did not answer after activation");
+    };
+    match build {
+        Some(found) if found == want_build => {
+            println!("activated astd {version} build {found}");
+            Ok(())
+        }
+        Some(found) => {
+            bail!("the replacement astd answered as build {found}, expected {want_build}")
+        }
+        None => {
+            bail!("the replacement astd {version} cannot report a build id; expected {want_build}")
+        }
+    }
 }
 
 // ---- service ---------------------------------------------------------------
