@@ -10,6 +10,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::hv::{ControlChannel, GuestEndpoint, Handle, ImageKind, Machine};
+use crate::remote_gpu::GpuAttachment;
 use crate::secret::Binding;
 
 /// Lifecycle state of an instance.
@@ -551,6 +552,13 @@ pub struct Instance {
     /// silently dropped.
     #[serde(default)]
     pub stranded: Vec<String>,
+    /// A remote GPU part projected into the guest as `/dev/nvidia0`.
+    ///
+    /// This is deliberately token-free. The provider lease capability lives
+    /// only in the authenticated mesh adapter; persisting it here would turn
+    /// an ordinary registry/backup read into authority to execute GPU work.
+    #[serde(default)]
+    pub gpu: Option<GpuAttachment>,
 
     // ---- legacy, read once and folded into `handle` ------------------------
     //
@@ -588,6 +596,7 @@ impl Instance {
             secrets: Vec::new(),
             profiles: Vec::new(),
             stranded: Vec::new(),
+            gpu: None,
             legacy_pid: None,
             legacy_ssh_port: None,
         }
@@ -755,11 +764,26 @@ impl Instance {
             },
             note: Some("exit default: same as cpu".into()),
         });
-        parts.push(Part {
-            kind: "gpu".into(),
-            source: "-".into(),
-            detail: "none".into(),
-            note: None,
+        parts.push(match &self.gpu {
+            Some(gpu) => Part {
+                kind: "gpu".into(),
+                source: gpu.provider_device.clone(),
+                detail: format!(
+                    "{} · {} MiB",
+                    gpu.guest_path(),
+                    gpu.memory_bytes / (1024 * 1024)
+                ),
+                note: Some(format!(
+                    "remote CUDA semantic ABI · {} · provider generation {}",
+                    gpu.provider_gpu_uuid, gpu.provider_generation
+                )),
+            },
+            None => Part {
+                kind: "gpu".into(),
+                source: "-".into(),
+                detail: "none".into(),
+                note: None,
+            },
         });
         parts
     }
@@ -901,6 +925,33 @@ mod tests {
         // Nothing in the pool is supplying a gpu.
         assert_eq!(find("gpu").source, "-");
         assert_eq!(find("gpu").detail, "none");
+    }
+
+    #[test]
+    fn an_attached_remote_gpu_is_a_guest_local_device_without_a_persisted_token() {
+        let mut inst = Instance::new("dev", "laptop", "debian:13", Shape::default(), machine());
+        inst.gpu = Some(GpuAttachment {
+            provider_device: "desktop".into(),
+            provider_device_id: "a".repeat(64),
+            provider_gpu_uuid: "GPU-01234567".into(),
+            memory_bytes: 8 * 1024 * 1024 * 1024,
+            provider_generation: 4,
+            attached_at: 100,
+        });
+
+        let gpu = inst
+            .parts()
+            .into_iter()
+            .find(|part| part.kind == "gpu")
+            .unwrap();
+        assert_eq!(gpu.source, "desktop");
+        assert_eq!(gpu.detail, "/dev/nvidia0 · 8192 MiB");
+        assert!(gpu.note.unwrap().contains("provider generation 4"));
+
+        let persisted = serde_json::to_string(&inst).unwrap();
+        assert!(persisted.contains("GPU-01234567"));
+        assert!(!persisted.contains("capability"));
+        assert!(!persisted.contains("lease_token"));
     }
 
     /// An instance built from a container image is a machine like any other,

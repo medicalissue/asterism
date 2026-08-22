@@ -5,8 +5,10 @@ an instance sees an attached GPU at `/dev/nvidia0`; the device supplying the
 GPU owns the session, allocations, workload cache, and execution. The ABI does
 not expose which host or transport supplies those parts.
 
-This is the production seam, plus a portable proof of it. It is not yet a
-production NVIDIA device implementation. The proof projects a regular file at
+This is the data-plane seam, plus a portable proof of it. The production
+admission, placement, lease, revocation, health and recovery control plane is
+described in [remote-gpu-production.md](remote-gpu-production.md). It is not
+yet a production NVIDIA device implementation. The proof projects a regular file at
 `<guest-root>/dev/nvidia0`, opens it as guest software would, and carries the
 device operations to a separate provider process. A production Linux guest
 projection still needs a guest driver/CUSE device and CUDA library adapter,

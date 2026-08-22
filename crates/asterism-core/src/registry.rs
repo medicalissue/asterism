@@ -39,6 +39,7 @@ use crate::instance::{
     self, now_unix, Conflict, Instance, Moving, Policy, PortForward, Restart, Shape, Status, Volume,
 };
 use crate::proc::ProcId;
+use crate::remote_gpu::GpuAttachment;
 use crate::secret::Binding;
 
 /// The shard file format this build writes.
@@ -573,6 +574,39 @@ impl Shard {
         Ok(inst.clone())
     }
 
+    /// Record a provider-admitted GPU lease as an instance part.
+    ///
+    /// The caller must already hold the live lease returned by the provider;
+    /// only its token-free metadata reaches this durable shard. Existing
+    /// backends cannot hotplug the guest projection, so a running instance is
+    /// refused before the row changes. Revocation is different: detach may
+    /// remove a running instance's authority immediately.
+    pub fn attach_gpu(&mut self, name: &str, attachment: GpuAttachment) -> Result<Instance> {
+        let inst = self.get_mut(name)?;
+        if inst.status == Status::Running {
+            bail!("instance {name:?} is running — `ast down {name}` before attaching a GPU");
+        }
+        if let Some(existing) = &inst.gpu {
+            bail!(
+                "instance {name:?} already has {} from {} — detach it before attaching another GPU",
+                existing.provider_gpu_uuid,
+                existing.provider_device
+            );
+        }
+        inst.gpu = Some(attachment);
+        Ok(inst.clone())
+    }
+
+    /// Remove the durable GPU part after its provider lease has been revoked.
+    pub fn detach_gpu(&mut self, name: &str) -> Result<(Instance, GpuAttachment)> {
+        let inst = self.get_mut(name)?;
+        let attachment = inst
+            .gpu
+            .take()
+            .with_context(|| format!("instance {name:?} has no GPU attached"))?;
+        Ok((inst.clone(), attachment))
+    }
+
     /// Take a secret off an instance, by its orbit name.
     ///
     /// Returns the binding, because revoking one is more than forgetting a
@@ -845,6 +879,61 @@ mod tests {
         assert!(shard
             .attach_volume("dev", "/srv/x", "desktop", Some("rel"))
             .is_err());
+    }
+
+    #[test]
+    fn gpu_attachment_is_token_free_durable_and_refuses_hotplug_before_mutation() {
+        let path = scratch();
+        let mut shard = Shard::load(&path).unwrap();
+        shard
+            .create("dev", "laptop", "ubuntu:24.04", Shape::default(), machine())
+            .unwrap();
+        let attachment = GpuAttachment {
+            provider_device: "desktop".into(),
+            provider_device_id: "a".repeat(64),
+            provider_gpu_uuid: "GPU-01234567".into(),
+            memory_bytes: 8 << 30,
+            provider_generation: 3,
+            attached_at: 100,
+        };
+
+        shard.set_running("dev", handle(11, 2222)).unwrap();
+        let before = serde_json::to_string(shard.get("dev").unwrap()).unwrap();
+        let error = shard.attach_gpu("dev", attachment.clone()).unwrap_err();
+        assert!(error.to_string().contains("before attaching a GPU"));
+        assert_eq!(
+            serde_json::to_string(shard.get("dev").unwrap()).unwrap(),
+            before
+        );
+
+        shard.set_stopped("dev").unwrap();
+        shard.attach_gpu("dev", attachment.clone()).unwrap();
+        let attached = serde_json::to_string(shard.get("dev").unwrap()).unwrap();
+        assert!(!attached.contains("capability"));
+        assert!(shard.attach_gpu("dev", attachment).is_err());
+        assert_eq!(
+            serde_json::to_string(shard.get("dev").unwrap()).unwrap(),
+            attached
+        );
+        shard.save().unwrap();
+        assert_eq!(
+            Shard::load(&path)
+                .unwrap()
+                .get("dev")
+                .unwrap()
+                .gpu
+                .as_ref()
+                .unwrap()
+                .provider_gpu_uuid,
+            "GPU-01234567"
+        );
+
+        // Revocation must not wait for a guest shutdown: once the provider
+        // cuts the live lease, the durable row can be removed immediately.
+        shard.set_running("dev", handle(12, 2223)).unwrap();
+        let (_, removed) = shard.detach_gpu("dev").unwrap();
+        assert_eq!(removed.provider_device, "desktop");
+        assert!(shard.get("dev").unwrap().gpu.is_none());
     }
 
     /// A block volume is a disk, so it has no mount point to collide on, and
