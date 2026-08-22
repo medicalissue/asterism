@@ -728,9 +728,46 @@ mod tests {
     use super::*;
     use std::process::{Child, Command, Stdio};
 
-    /// A process that is definitely there for the length of the test.
+    /// A process that has exec'd `sleep` and will stay there for the test.
+    ///
+    /// `Command::spawn` returns after the fork, before the child is
+    /// necessarily past `exec`. Capturing its identity in that gap can record
+    /// the test binary as the executable; once the child becomes `sleep`, the
+    /// identity check correctly calls that a replacement. Wait for the
+    /// fixture's actual executable before handing its pid to a test.
     fn sleeper() -> std::process::Child {
-        Command::new("sleep").arg("30").spawn().unwrap()
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        let failure = loop {
+            if let Ok(id) = ProcId::capture(pid) {
+                let is_sleep = id
+                    .exec
+                    .as_deref()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name == "sleep");
+                if is_sleep && id.check().is_ours() {
+                    return child;
+                }
+            }
+
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    break format!("sleep fixture exited before readiness: {status}")
+                }
+                Ok(None) => {}
+                Err(error) => break format!("checking sleep fixture {pid}: {error}"),
+            }
+            if Instant::now() >= deadline {
+                break format!("sleep fixture {pid} did not exec within five seconds");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("{failure}");
     }
 
     /// Wait for a child to exit while deliberately leaving its exit status in
