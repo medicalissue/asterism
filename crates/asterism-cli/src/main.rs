@@ -23,12 +23,17 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use zeroize::Zeroize;
 
 use asterism_core::compat;
 use asterism_core::device_shell::{
     ShellData, ShellEnv, ShellOpen, ShellOutput, ShellPolicyAction, ShellPolicyState,
     MAX_DATA_BYTES,
+};
+use asterism_core::hosted_auth::{
+    self, BrowserOpener, CredentialStore, DeviceAuthorization, DeviceAuthorizationRequest,
+    PollAction, PollFailure, PollPolicy, ProtocolError, Provider, Session,
 };
 use asterism_core::hv::{GuestHealth, ImageKind};
 use asterism_core::instance::{now_unix, Instance, PortForward, Restart, Shape};
@@ -448,6 +453,10 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Sign in to the optional hosted coordinator. Local orbit commands do
+    /// not require an account and never consult this session.
+    #[command(subcommand)]
+    Auth(AuthCommand),
     /// Check or install a release from Asterism's signed update channel.
     ///
     /// The desktop app calls this same command. One updater therefore owns
@@ -614,6 +623,45 @@ enum UpdateCommand {
     Channel {
         /// stable, beta, or nightly. Omit to print the current channel.
         name: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum AuthProvider {
+    Google,
+    Github,
+}
+
+impl From<AuthProvider> for Provider {
+    fn from(provider: AuthProvider) -> Self {
+        match provider {
+            AuthProvider::Google => Self::Google,
+            AuthProvider::Github => Self::Github,
+        }
+    }
+}
+
+/// `ast auth ...` — one client for the coordinator seam shared with Desktop.
+#[derive(Subcommand)]
+enum AuthCommand {
+    /// Start a browser device-authorization flow.
+    Login {
+        /// The only supported identity providers.
+        #[arg(long, value_enum)]
+        provider: AuthProvider,
+        /// Hosted coordinator authority. Useful for a compatible self-hosted Worker.
+        #[arg(long, default_value = hosted_auth::DEFAULT_AUTHORITY)]
+        coordinator: String,
+        /// Print the URL/code without attempting to open a browser.
+        #[arg(long)]
+        no_browser: bool,
+    },
+    /// Show the locally stored hosted-account session.
+    Status,
+    /// Revoke the hosted session and remove it from the OS credential store.
+    Logout {
+        #[arg(long, default_value = hosted_auth::DEFAULT_AUTHORITY)]
+        coordinator: String,
     },
 }
 
@@ -934,6 +982,10 @@ fn main() -> Result<()> {
             local_only("compat", device.as_deref())?;
             return print_compat(json);
         }
+        Command::Auth(command) => {
+            local_only("auth", device.as_deref())?;
+            return auth_command(command);
+        }
         Command::Update(cmd) => {
             local_only("update", device.as_deref())?;
             return update_command(cmd);
@@ -1090,6 +1142,413 @@ fn main() -> Result<()> {
         Response::Error { message } => bail!(message),
     }
     Ok(())
+}
+
+struct OsCredentialStore;
+
+impl OsCredentialStore {
+    fn entry(&self) -> Result<keyring::Entry> {
+        keyring::Entry::new(
+            hosted_auth::CREDENTIAL_SERVICE,
+            hosted_auth::CREDENTIAL_ACCOUNT,
+        )
+        .context("opening the OS credential store")
+    }
+}
+
+impl CredentialStore for OsCredentialStore {
+    fn save(&self, session: &Session) -> Result<()> {
+        let mut encoded = serde_json::to_string(session).context("encoding the hosted session")?;
+        let stored = self
+            .entry()?
+            .set_password(&encoded)
+            .context("saving the hosted session in the OS credential store");
+        encoded.zeroize();
+        stored
+    }
+
+    fn load(&self) -> Result<Option<Session>> {
+        match self.entry()?.get_password() {
+            Ok(mut encoded) => {
+                let session = serde_json::from_str(&encoded)
+                    .map(Some)
+                    .context("reading the hosted session from the OS credential store");
+                encoded.zeroize();
+                session
+            }
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(error) => Err(error).context("reading the OS credential store"),
+        }
+    }
+
+    fn delete(&self) -> Result<()> {
+        match self.entry()?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => {
+                Err(error).context("deleting the hosted session from the OS credential store")
+            }
+        }
+    }
+}
+
+struct SystemBrowser;
+
+impl BrowserOpener for SystemBrowser {
+    fn open(&self, url: &str) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        let mut command = std::process::Command::new("open");
+        #[cfg(target_os = "linux")]
+        let mut command = std::process::Command::new("xdg-open");
+        #[cfg(target_os = "windows")]
+        let mut command = {
+            let mut command = std::process::Command::new("cmd");
+            command.args(["/C", "start", ""]);
+            command
+        };
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        bail!("this platform has no system-browser opener");
+
+        let status = command
+            .arg(url)
+            .status()
+            .context("opening the system browser")?;
+        if !status.success() {
+            bail!("the system browser opener exited with {status}");
+        }
+        Ok(())
+    }
+}
+
+struct AuthHttp {
+    client: reqwest::blocking::Client,
+    authority: String,
+}
+
+enum AuthReply<T> {
+    Ok(T),
+    Protocol(ProtocolError),
+}
+
+trait CoordinatorClient {
+    fn issue(&self, provider: Provider) -> Result<DeviceAuthorization>;
+    fn poll(&self, device_code: &str) -> Result<AuthReply<Session>>;
+    fn revoke(&self, access_token: &str) -> Result<()>;
+}
+
+trait PollSleeper {
+    fn sleep(&self, duration: Duration);
+}
+
+trait Clock {
+    fn now(&self) -> u64;
+}
+
+struct SystemTime;
+
+impl PollSleeper for SystemTime {
+    fn sleep(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+}
+
+impl Clock for SystemTime {
+    fn now(&self) -> u64 {
+        unix_seconds()
+    }
+}
+
+impl AuthHttp {
+    fn new(authority: &str) -> Result<Self> {
+        let parsed =
+            reqwest::Url::parse(authority).context("parsing the hosted coordinator URL")?;
+        let local_http =
+            parsed.scheme() == "http" && matches!(parsed.host_str(), Some("127.0.0.1" | "::1"));
+        if parsed.scheme() != "https" && !local_http {
+            bail!("the hosted coordinator must use https (plain http is allowed only on loopback)");
+        }
+        if parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || !matches!(parsed.path(), "" | "/")
+        {
+            bail!("the hosted coordinator must be an origin URL without credentials or a path");
+        }
+        // This binary owns its TLS client. `reqwest` is deliberately linked
+        // without an implicit provider so the choice is explicit and matches
+        // the ring provider already used elsewhere in the workspace.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        Ok(Self {
+            client: reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .context("constructing the hosted authorization client")?,
+            authority: parsed.origin().ascii_serialization(),
+        })
+    }
+
+    fn post<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+        bearer: Option<&str>,
+    ) -> Result<AuthReply<T>> {
+        let mut request = self
+            .client
+            .post(format!("{}{path}", self.authority))
+            .header("Asterism-Protocol", hosted_auth::PROTOCOL)
+            .json(body);
+        if let Some(token) = bearer {
+            request = request.bearer_auth(token);
+        }
+        let response = request
+            .send()
+            .context("contacting the hosted authorization service")?;
+        let status = response.status();
+        if response
+            .headers()
+            .get("Asterism-Protocol")
+            .and_then(|value| value.to_str().ok())
+            != Some(hosted_auth::PROTOCOL)
+        {
+            bail!("hosted coordinator protocol is incompatible");
+        }
+        // Every authorization response is tiny. Capping before deserialization
+        // prevents an untrusted coordinator from turning a failure into an
+        // unbounded allocation.
+        let mut bytes = Vec::new();
+        response
+            .take(64 * 1024)
+            .read_to_end(&mut bytes)
+            .context("reading the authorization response")?;
+        if status.is_success() {
+            serde_json::from_slice(&bytes)
+                .map(AuthReply::Ok)
+                .context("decoding the authorization response")
+        } else {
+            let mut error: ProtocolError =
+                serde_json::from_slice(&bytes).unwrap_or(ProtocolError {
+                    error: "server_error".into(),
+                    error_description: None,
+                    interval: None,
+                });
+            if !matches!(
+                error.error.as_str(),
+                "invalid_request"
+                    | "invalid_grant"
+                    | "invalid_token"
+                    | "authorization_pending"
+                    | "slow_down"
+                    | "access_denied"
+                    | "expired_token"
+                    | "temporarily_unavailable"
+                    | "server_error"
+            ) {
+                error.error = "server_error".into();
+                error.error_description = None;
+                error.interval = None;
+            }
+            Ok(AuthReply::Protocol(error))
+        }
+    }
+
+    fn validate_authorization(&self, authorization: &DeviceAuthorization) -> Result<()> {
+        if authorization.device_code.is_empty()
+            || authorization.device_code.len() > 4096
+            || authorization.user_code.is_empty()
+            || authorization.user_code.len() > 64
+            || !(1..=1800).contains(&authorization.expires_in)
+            || !(1..=30).contains(&authorization.interval)
+        {
+            bail!("hosted coordinator returned an invalid device authorization");
+        }
+        for candidate in [
+            &authorization.verification_uri,
+            &authorization.verification_uri_complete,
+        ] {
+            let url = reqwest::Url::parse(candidate)
+                .context("parsing the coordinator verification URL")?;
+            if candidate.len() > 8192
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.fragment().is_some()
+                || url.origin().ascii_serialization() != self.authority
+            {
+                bail!("hosted coordinator returned a verification URL on another origin");
+            }
+        }
+        Ok(())
+    }
+}
+
+impl CoordinatorClient for AuthHttp {
+    fn issue(&self, provider: Provider) -> Result<DeviceAuthorization> {
+        let request = serde_json::to_value(DeviceAuthorizationRequest::cli(provider))?;
+        match self.post("/oauth/device/code", &request, None)? {
+            AuthReply::Ok(reply) => {
+                self.validate_authorization(&reply)?;
+                Ok(reply)
+            }
+            AuthReply::Protocol(error) => bail!("authorization refused: {}", error.error),
+        }
+    }
+
+    fn poll(&self, device_code: &str) -> Result<AuthReply<Session>> {
+        let reply: AuthReply<Session> = self.post(
+            "/oauth/device/token",
+            &serde_json::json!({
+                "device_code": device_code,
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code"
+            }),
+            None,
+        )?;
+        if let AuthReply::Ok(session) = &reply {
+            if session.token_type != "Bearer"
+                || session.account.id.is_empty()
+                || session.account.id.len() > 256
+                || session.account.display_name.is_empty()
+                || session.account.display_name.len() > 256
+            {
+                bail!("hosted coordinator returned an invalid session");
+            }
+        }
+        Ok(reply)
+    }
+
+    fn revoke(&self, access_token: &str) -> Result<()> {
+        match self.post::<serde_json::Value>(
+            "/oauth/revoke",
+            &serde_json::json!({}),
+            Some(access_token),
+        )? {
+            AuthReply::Ok(_) => Ok(()),
+            AuthReply::Protocol(error) => bail!("remote revocation refused: {}", error.error),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn login_with(
+    provider: Provider,
+    coordinator: &dyn CoordinatorClient,
+    store: &dyn CredentialStore,
+    browser: &dyn BrowserOpener,
+    sleeper: &dyn PollSleeper,
+    clock: &dyn Clock,
+    no_browser: bool,
+    output: &mut dyn Write,
+    errors: &mut dyn Write,
+) -> Result<()> {
+    let authorization = coordinator.issue(provider)?;
+    // Print first: browser launch is convenience and may fail on a headless
+    // host. The actionable path is never hidden by it.
+    writeln!(output, "Open: {}", authorization.verification_uri)?;
+    writeln!(output, "Code: {}", authorization.user_code)?;
+    if !no_browser {
+        if let Err(error) = browser.open(&authorization.verification_uri_complete) {
+            writeln!(errors, "could not open a browser: {error:#}")?;
+            writeln!(errors, "continue with the URL and code above")?;
+        }
+    }
+
+    let mut policy = PollPolicy::new(clock.now(), &authorization)?;
+    let mut wait = Duration::from_secs(authorization.interval.clamp(1, 30));
+    loop {
+        sleeper.sleep(wait);
+        let polled = match coordinator.poll(&authorization.device_code) {
+            Ok(AuthReply::Ok(session)) => Ok(session),
+            Ok(AuthReply::Protocol(error)) => Err(PollFailure::Protocol(error)),
+            Err(error) if transient_transport_error(&error) => Err(PollFailure::Offline),
+            Err(error) => return Err(error),
+        };
+        match policy.next(clock.now(), &polled) {
+            PollAction::Complete => {
+                let session = polled.expect("complete means a session reply");
+                store.save(&session)?;
+                writeln!(
+                    output,
+                    "signed in as {} ({})",
+                    session.account.display_name,
+                    session.account.provider.as_str()
+                )?;
+                return Ok(());
+            }
+            PollAction::Wait(next) => wait = next,
+            PollAction::Denied => bail!("authorization was denied"),
+            PollAction::Expired => bail!("authorization expired; run ast auth login again"),
+            PollAction::Failed(code) => bail!("authorization failed: {code}"),
+        }
+    }
+}
+
+fn transient_transport_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<reqwest::Error>().is_some()
+            || cause.downcast_ref::<std::io::Error>().is_some()
+    })
+}
+
+fn auth_command(command: AuthCommand) -> Result<()> {
+    let store = OsCredentialStore;
+    match command {
+        AuthCommand::Login {
+            provider,
+            coordinator,
+            no_browser,
+        } => {
+            let http = AuthHttp::new(&coordinator)?;
+            login_with(
+                provider.into(),
+                &http,
+                &store,
+                &SystemBrowser,
+                &SystemTime,
+                &SystemTime,
+                no_browser,
+                &mut std::io::stdout(),
+                &mut std::io::stderr(),
+            )
+        }
+        AuthCommand::Status => match store.load()? {
+            Some(session) => {
+                println!(
+                    "signed in  {}  {}",
+                    session.account.provider.as_str(),
+                    session.account.display_name
+                );
+                Ok(())
+            }
+            None => {
+                println!("signed out");
+                Ok(())
+            }
+        },
+        AuthCommand::Logout { coordinator } => {
+            let Some(session) = store.load()? else {
+                println!("signed out");
+                return Ok(());
+            };
+            let remote = AuthHttp::new(&coordinator)
+                .and_then(|http| http.revoke(session.access_token.expose()));
+            store.delete()?;
+            if let Err(error) = remote {
+                eprintln!(
+                    "local session removed; remote revocation could not be confirmed: {error:#}"
+                );
+            }
+            println!("signed out");
+            Ok(())
+        }
+    }
+}
+
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn absolute_path(path: &str) -> Result<std::path::PathBuf> {
@@ -3904,6 +4363,326 @@ fn service_command(cmd: ServiceCommand) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    struct MemoryStore(Mutex<Option<Session>>);
+
+    impl CredentialStore for MemoryStore {
+        fn save(&self, session: &Session) -> Result<()> {
+            *self.0.lock().unwrap() = Some(session.clone());
+            Ok(())
+        }
+
+        fn load(&self) -> Result<Option<Session>> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+
+        fn delete(&self) -> Result<()> {
+            *self.0.lock().unwrap() = None;
+            Ok(())
+        }
+    }
+
+    struct FailedBrowser;
+
+    impl BrowserOpener for FailedBrowser {
+        fn open(&self, _url: &str) -> Result<()> {
+            bail!("no graphical session")
+        }
+    }
+
+    struct TestTime(Cell<u64>);
+
+    impl Clock for TestTime {
+        fn now(&self) -> u64 {
+            self.0.get()
+        }
+    }
+
+    impl PollSleeper for TestTime {
+        fn sleep(&self, duration: Duration) {
+            self.0.set(self.0.get() + duration.as_secs());
+        }
+    }
+
+    struct MockCoordinator {
+        authorization: DeviceAuthorization,
+        replies: Mutex<VecDeque<Result<AuthReply<Session>>>>,
+    }
+
+    impl CoordinatorClient for MockCoordinator {
+        fn issue(&self, _provider: Provider) -> Result<DeviceAuthorization> {
+            Ok(self.authorization.clone())
+        }
+
+        fn poll(&self, _device_code: &str) -> Result<AuthReply<Session>> {
+            self.replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("a mock reply")
+        }
+
+        fn revoke(&self, _access_token: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn auth_session(provider: Provider) -> Session {
+        Session {
+            access_token: hosted_auth::Secret::new("token-not-for-logs".into()).unwrap(),
+            token_type: "Bearer".into(),
+            account: hosted_auth::Account {
+                id: "acct_opaque".into(),
+                provider,
+                display_name: "Octo".into(),
+            },
+            issued_at: 100,
+        }
+    }
+
+    fn auth_error(code: &str, interval: Option<u64>) -> AuthReply<Session> {
+        AuthReply::Protocol(ProtocolError {
+            error: code.into(),
+            error_description: None,
+            interval,
+        })
+    }
+
+    #[test]
+    fn device_login_recovers_offline_and_browser_failure_without_hiding_the_code() {
+        let coordinator = MockCoordinator {
+            authorization: DeviceAuthorization {
+                device_code: "device-code".into(),
+                user_code: "ABCD-EFGH".into(),
+                verification_uri: "https://auth.example/oauth/device".into(),
+                verification_uri_complete: "https://auth.example/oauth/device?user_code=ABCD-EFGH"
+                    .into(),
+                expires_in: 120,
+                interval: 1,
+            },
+            replies: Mutex::new(VecDeque::from([
+                Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "offline").into()),
+                Ok(auth_error("authorization_pending", None)),
+                Ok(auth_error("slow_down", Some(2))),
+                Ok(AuthReply::Ok(auth_session(Provider::Github))),
+            ])),
+        };
+        let store = MemoryStore(Mutex::new(None));
+        let time = TestTime(Cell::new(100));
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+        login_with(
+            Provider::Github,
+            &coordinator,
+            &store,
+            &FailedBrowser,
+            &time,
+            &time,
+            false,
+            &mut output,
+            &mut errors,
+        )
+        .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        let errors = String::from_utf8(errors).unwrap();
+        assert!(output.contains("Open: https://auth.example/oauth/device"));
+        assert!(output.contains("Code: ABCD-EFGH"));
+        assert!(output.contains("signed in as Octo (github)"));
+        assert!(errors.contains("could not open a browser"));
+        assert!(errors.contains("continue with the URL and code above"));
+        assert!(!output.contains("token-not-for-logs"));
+        assert!(!errors.contains("token-not-for-logs"));
+        assert_eq!(store.load().unwrap().unwrap().account.id, "acct_opaque");
+    }
+
+    #[test]
+    fn device_login_stops_on_denial() {
+        let coordinator = MockCoordinator {
+            authorization: DeviceAuthorization {
+                device_code: "device-code".into(),
+                user_code: "ABCD-EFGH".into(),
+                verification_uri: "https://auth.example/oauth/device".into(),
+                verification_uri_complete: "https://auth.example/oauth/device?user_code=ABCD-EFGH"
+                    .into(),
+                expires_in: 120,
+                interval: 1,
+            },
+            replies: Mutex::new(VecDeque::from([Ok(auth_error("access_denied", None))])),
+        };
+        let store = MemoryStore(Mutex::new(None));
+        let time = TestTime(Cell::new(100));
+        let error = login_with(
+            Provider::Google,
+            &coordinator,
+            &store,
+            &FailedBrowser,
+            &time,
+            &time,
+            true,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("denied"));
+        assert!(store.load().unwrap().is_none());
+    }
+
+    #[test]
+    fn protocol_incompatibility_is_fatal_instead_of_an_offline_retry() {
+        let coordinator = MockCoordinator {
+            authorization: DeviceAuthorization {
+                device_code: "device-code".into(),
+                user_code: "ABCD-EFGH".into(),
+                verification_uri: "https://auth.example/oauth/device".into(),
+                verification_uri_complete: "https://auth.example/oauth/device?user_code=ABCD-EFGH"
+                    .into(),
+                expires_in: 120,
+                interval: 1,
+            },
+            replies: Mutex::new(VecDeque::from([Err(anyhow::anyhow!(
+                "hosted coordinator protocol is incompatible"
+            ))])),
+        };
+        let store = MemoryStore(Mutex::new(None));
+        let time = TestTime(Cell::new(100));
+        let error = login_with(
+            Provider::Github,
+            &coordinator,
+            &store,
+            &FailedBrowser,
+            &time,
+            &time,
+            true,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("protocol is incompatible"));
+        assert_eq!(time.now(), 101, "one initial poll, then immediate refusal");
+    }
+
+    #[test]
+    fn google_and_github_mock_device_flows_both_complete() {
+        for provider in [Provider::Google, Provider::Github] {
+            let coordinator = MockCoordinator {
+                authorization: DeviceAuthorization {
+                    device_code: "device-code".into(),
+                    user_code: "ABCD-EFGH".into(),
+                    verification_uri: "https://auth.example/oauth/device".into(),
+                    verification_uri_complete:
+                        "https://auth.example/oauth/device?user_code=ABCD-EFGH".into(),
+                    expires_in: 120,
+                    interval: 1,
+                },
+                replies: Mutex::new(VecDeque::from([Ok(AuthReply::Ok(auth_session(provider)))])),
+            };
+            let store = MemoryStore(Mutex::new(None));
+            let time = TestTime(Cell::new(100));
+            login_with(
+                provider,
+                &coordinator,
+                &store,
+                &FailedBrowser,
+                &time,
+                &time,
+                true,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            )
+            .unwrap();
+            assert_eq!(store.load().unwrap().unwrap().account.provider, provider);
+        }
+    }
+
+    #[test]
+    fn external_coordinator_request_pins_the_protocol_and_rfc_grant() {
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sent, received) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut head = String::new();
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = value.trim().parse::<usize>().unwrap();
+                }
+                head.push_str(&line);
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            sent.send((head, String::from_utf8(body).unwrap())).unwrap();
+            let response = format!(
+                r#"{{"device_code":"opaque","user_code":"ABCD-EFGH","verification_uri":"http://{address}/oauth/device","verification_uri_complete":"http://{address}/oauth/device?user_code=ABCD-EFGH","expires_in":600,"interval":5}}"#
+            );
+            let mut stream = stream;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAsterism-Protocol: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                hosted_auth::PROTOCOL,
+                response.len(),
+                response
+            )
+            .unwrap();
+        });
+
+        let client = AuthHttp::new(&format!("http://{address}")).unwrap();
+        let issued = client.issue(Provider::Github).unwrap();
+        assert_eq!(issued.user_code, "ABCD-EFGH");
+        let (head, body) = received.recv().unwrap();
+        assert!(head.starts_with("POST /oauth/device/code HTTP/1.1"));
+        assert!(head
+            .to_ascii_lowercase()
+            .contains(&format!("asterism-protocol: {}", hosted_auth::PROTOCOL)));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"provider":"github"})
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn coordinator_and_browser_urls_cannot_escape_the_https_origin() {
+        assert!(AuthHttp::new("http://auth.example").is_err());
+        assert!(AuthHttp::new("https://user@auth.example").is_err());
+        assert!(AuthHttp::new("https://auth.example/a/path").is_err());
+
+        let client = AuthHttp::new("http://127.0.0.1:12345").unwrap();
+        let authorization = DeviceAuthorization {
+            device_code: "opaque".into(),
+            user_code: "ABCD-EFGH".into(),
+            verification_uri: "https://attacker.example/oauth/device".into(),
+            verification_uri_complete: "https://attacker.example/oauth/device?user_code=ABCD-EFGH"
+                .into(),
+            expires_in: 600,
+            interval: 5,
+        };
+        assert!(client.validate_authorization(&authorization).is_err());
+    }
+
+    #[test]
+    fn auth_cli_vocabulary_is_google_github_only_and_local_commands_still_parse() {
+        assert!(Cli::try_parse_from(["ast", "auth", "login", "--provider", "google"]).is_ok());
+        assert!(Cli::try_parse_from(["ast", "auth", "login", "--provider", "github"]).is_ok());
+        assert!(Cli::try_parse_from(["ast", "auth", "login", "--provider", "email"]).is_err());
+        assert!(Cli::try_parse_from(["ast", "auth", "status"]).is_ok());
+        assert!(Cli::try_parse_from(["ast", "auth", "logout"]).is_ok());
+        assert!(Cli::try_parse_from(["ast", "create", "dev"]).is_ok());
+        assert!(Cli::try_parse_from(["ast", "devices"]).is_ok());
+    }
 
     #[test]
     fn ssh_guest_and_device_forms_remain_unambiguous() {

@@ -21,6 +21,7 @@ pub mod compat;
 pub mod cow;
 pub mod device_shell;
 pub mod durable;
+pub mod hosted_auth;
 pub mod hv;
 pub mod image;
 pub mod instance;
