@@ -288,7 +288,7 @@ enum Command {
         /// A path may carry one too.
         image: String,
     },
-    /// Attach a part to an instance: a volume, or a secret.
+    /// Attach a part to an instance: a volume, secret, or network exit point.
     ///
     /// Two kinds of volume, and they reach the guest differently.
     ///
@@ -353,8 +353,25 @@ enum Command {
         /// than one source. Not `--host`, for the same reason as `--to`.
         #[arg(long, value_name = "DEVICE", requires = "secret")]
         from: Option<String>,
+        /// Device that should provide this instance's network exit.
+        #[arg(long, value_name = "DEVICE", conflicts_with_all = ["volume", "secret"])]
+        exit: Option<String>,
+        /// Ordered fallback exit device. Repeat to add more than one.
+        #[arg(long, value_name = "DEVICE", requires = "exit")]
+        failover: Vec<String>,
+        /// CIDR routed through the exit. Repeatable; defaults to IPv4+IPv6
+        /// default routes when omitted.
+        #[arg(long, value_name = "CIDR", requires = "exit")]
+        route: Vec<String>,
+        /// CIDR kept out of the exit even when an enclosing route includes it.
+        #[arg(long, value_name = "CIDR", requires = "exit")]
+        exclude_route: Vec<String>,
+        /// DNS ownership: `exit` (default), `cpu`, or comma-separated resolver
+        /// IPs carried through the exit.
+        #[arg(long, value_name = "POLICY", requires = "exit")]
+        dns: Option<String>,
     },
-    /// Take a volume or a secret off an instance.
+    /// Take a volume, secret, or explicit network exit off an instance.
     ///
     /// A VOLUME comes off a stopped instance only. Its lease goes back to the
     /// device that holds the bytes, so something else may take it, and
@@ -379,6 +396,10 @@ enum Command {
         /// The secret to revoke, by its orbit name.
         #[arg(long, value_name = "NAME")]
         secret: Option<String>,
+        /// Return network egress to the CPU device. The guest's virtual
+        /// interface, gateway and DNS address stay unchanged.
+        #[arg(long, conflicts_with_all = ["volume", "secret"])]
+        exit: bool,
     },
     /// Change one of an instance's parts.
     ///
@@ -748,7 +769,12 @@ fn main() -> Result<()> {
             placement,
             env,
             from,
-        } => match attaching(volume, secret)? {
+            exit,
+            failover,
+            route,
+            exclude_route,
+            dns,
+        } => match attaching(volume, secret, exit)? {
             Attaching::Secret(secret) => Request::AttachSecret {
                 name,
                 secret,
@@ -786,13 +812,36 @@ fn main() -> Result<()> {
                     mount_point: at,
                 },
             },
+            Attaching::Exit(primary) => {
+                let include = if route.is_empty() {
+                    asterism_core::network::RoutePolicy::default().include
+                } else {
+                    parse_routes(&route)?
+                };
+                let routes = asterism_core::network::RoutePolicy {
+                    include,
+                    exclude: parse_routes(&exclude_route)?,
+                };
+                let exit = asterism_core::network::ExitPoint::new(
+                    primary,
+                    failover,
+                    routes,
+                    parse_dns(dns.as_deref())?,
+                )
+                .map_err(anyhow::Error::msg)?;
+                Request::AttachExitPoint {
+                    name,
+                    exit: Box::new(exit),
+                }
+            }
         },
         Command::Detach {
             name,
             volume,
             host,
             secret,
-        } => match attaching(volume, secret)? {
+            exit,
+        } => match attaching(volume, secret, exit.then(String::new))? {
             Attaching::Secret(secret) => Request::DetachSecret { name, secret },
             Attaching::Volume(volume) => match block_ref(&volume, host.as_deref()) {
                 Some((device, volume)) => Request::Detach {
@@ -806,6 +855,7 @@ fn main() -> Result<()> {
                     host,
                 },
             },
+            Attaching::Exit(_) => Request::DetachExitPoint { name },
         },
         // A move reports as it goes — a preflight, a fence, a disk crossing a
         // network — so it takes the connection the way pairing and wake do.
@@ -996,6 +1046,7 @@ fn main() -> Result<()> {
                 print_attached(&instance)
             }
             Request::AttachSecret { ref secret, .. } => print_bound(&instance, secret),
+            Request::AttachExitPoint { .. } => print_exit_point(&instance),
             Request::DetachSecret { ref secret, .. } => {
                 println!("{}  {secret} revoked", instance.name);
                 println!(
@@ -1007,6 +1058,10 @@ fn main() -> Result<()> {
             Request::Detach { volume, .. } => {
                 println!("{}  {volume} detached", instance.name)
             }
+            Request::DetachExitPoint { .. } => println!(
+                "{}  network exit follows cpu on {} (guest configuration unchanged)",
+                instance.name, instance.cpu_device
+            ),
             _ => println!("{}  {}", instance.name, instance.status),
         },
         Response::Volumes { volumes } => match request {
@@ -3588,22 +3643,72 @@ fn local_disk(inst: &Instance) -> Option<String> {
 enum Attaching {
     Volume(String),
     Secret(String),
+    Exit(String),
 }
 
-fn attaching(volume: Option<String>, secret: Option<String>) -> Result<Attaching> {
-    match (volume, secret) {
-        (Some(volume), None) => Ok(Attaching::Volume(volume)),
-        (None, Some(secret)) => Ok(Attaching::Secret(secret)),
+fn attaching(
+    volume: Option<String>,
+    secret: Option<String>,
+    exit: Option<String>,
+) -> Result<Attaching> {
+    match (volume, secret, exit) {
+        (Some(volume), None, None) => Ok(Attaching::Volume(volume)),
+        (None, Some(secret), None) => Ok(Attaching::Secret(secret)),
+        (None, None, Some(exit)) => Ok(Attaching::Exit(exit)),
         // clap refuses this one first; the arm exists so that adding a third
         // part later cannot make it fall through to "say which".
-        (Some(_), Some(_)) => bail!(
-            "--volume and --secret are two different parts — attach them one command at a time"
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) | (_, Some(_), Some(_)) => bail!(
+            "--volume, --secret and --exit are different parts — attach them one command at a time"
         ),
-        (None, None) => bail!(
+        (None, None, None) => bail!(
             "say which part: --volume /tank/media, --volume desktop:tank, or \
-             --secret anthropic --to api.anthropic.com"
+             --secret anthropic --to api.anthropic.com, or --exit desktop"
         ),
     }
+}
+
+fn parse_routes(values: &[String]) -> Result<Vec<asterism_core::network::IpPrefix>> {
+    values
+        .iter()
+        .map(|value| value.parse().map_err(anyhow::Error::msg))
+        .collect()
+}
+
+fn parse_dns(value: Option<&str>) -> Result<asterism_core::network::DnsPolicy> {
+    use asterism_core::network::DnsPolicy;
+    match value.unwrap_or("exit") {
+        "exit" => Ok(DnsPolicy::ExitPoint),
+        "cpu" => Ok(DnsPolicy::CpuDevice),
+        value => {
+            let servers = value
+                .split(',')
+                .map(|server| {
+                    server.parse().map_err(|_| {
+                        anyhow::anyhow!(
+                            "DNS policy is `exit`, `cpu`, or resolver IPs (got {value:?})"
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if servers.is_empty() {
+                bail!("custom DNS needs at least one resolver address");
+            }
+            Ok(DnsPolicy::Custom(servers))
+        }
+    }
+}
+
+fn print_exit_point(inst: &Instance) {
+    let Some(exit) = &inst.exit_point else { return };
+    let failover = match exit.providers.get(1..) {
+        Some([]) | None => "fail closed".to_owned(),
+        Some(rest) => format!("failover {}", rest.join(" -> ")),
+    };
+    println!(
+        "{}  network exit {}  ({failover}; guest configuration unchanged)",
+        inst.name,
+        exit.primary()
+    );
 }
 
 /// Report on the secret that was just bound — the one at the end.

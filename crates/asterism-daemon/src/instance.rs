@@ -74,6 +74,7 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
                 Ok(instance) => {
                     let mut instance = instance.clone();
                     volume::annotate_runtime(&mut instance).await;
+                    crate::exit_point::annotate_runtime(&mut instance).await;
                     status_response(instance)
                 }
                 Err(e) => Response::Error {
@@ -235,6 +236,8 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             .await
         }
         Request::DetachSecret { name, secret } => detach_secret(reg, &name, &secret),
+        Request::AttachExitPoint { name, exit } => reg.attach_exit_point(&name, *exit),
+        Request::DetachExitPoint { name } => reg.detach_exit_point(&name),
         Request::BackupExport { name, destination } => {
             let exported = reg.get(&name).cloned().and_then(|inst| {
                 let provenance = backup::image_provenance(&inst)?;

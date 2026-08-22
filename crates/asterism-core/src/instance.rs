@@ -10,6 +10,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::hv::{ControlChannel, GuestEndpoint, Handle, ImageKind, Machine};
+use crate::network::{DnsPolicy, ExitPoint};
 use crate::secret::Binding;
 
 /// Lifecycle state of an instance.
@@ -551,6 +552,13 @@ pub struct Instance {
     /// silently dropped.
     #[serde(default)]
     pub stranded: Vec<String>,
+    /// An explicitly selected network exit point and its ordered failovers.
+    ///
+    /// `None` is the original/default placement: traffic leaves on the device
+    /// supplying cpu/ram. The guest-facing edge is stable either way, so this
+    /// policy may be attached, failed over or detached while the guest runs.
+    #[serde(default)]
+    pub exit_point: Option<ExitPoint>,
 
     // ---- legacy, read once and folded into `handle` ------------------------
     //
@@ -588,6 +596,7 @@ impl Instance {
             secrets: Vec::new(),
             profiles: Vec::new(),
             stranded: Vec::new(),
+            exit_point: None,
             legacy_pid: None,
             legacy_ssh_port: None,
         }
@@ -746,14 +755,55 @@ impl Instance {
             });
         }
         let published: Vec<String> = self.publish.iter().map(|p| p.to_string()).collect();
+        let (network_source, network_note) = match &self.exit_point {
+            Some(exit) => {
+                let dns = match &exit.dns {
+                    DnsPolicy::ExitPoint => "dns via exit".to_owned(),
+                    DnsPolicy::CpuDevice => "dns via cpu device".to_owned(),
+                    DnsPolicy::Custom(servers) => format!(
+                        "dns {} via exit",
+                        servers
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ),
+                };
+                let locality = if exit.primary() == self.cpu_device {
+                    "local"
+                } else {
+                    "remote"
+                };
+                let failover = match exit.providers.get(1..) {
+                    Some([]) | None => "fail closed".to_owned(),
+                    Some(rest) => format!("failover {}", rest.join(" -> ")),
+                };
+                let runtime = exit
+                    .runtime
+                    .as_ref()
+                    .map(|runtime| format!(" · {}", runtime.summary()))
+                    .unwrap_or_default();
+                (
+                    exit.primary().to_owned(),
+                    format!(
+                        "exit explicit · {locality} · {} · {dns} · {failover}{runtime}",
+                        exit.routes.summary(),
+                    ),
+                )
+            }
+            None => (
+                self.cpu_device.clone(),
+                "exit default: same as cpu".to_owned(),
+            ),
+        };
         parts.push(Part {
             kind: "network".into(),
-            source: self.cpu_device.clone(),
+            source: network_source,
             detail: match published.is_empty() {
                 true => "user-mode NAT".to_owned(),
                 false => format!("user-mode NAT · {}", published.join(", ")),
             },
-            note: Some("exit default: same as cpu".into()),
+            note: Some(network_note),
         });
         parts.push(Part {
             kind: "gpu".into(),
@@ -793,6 +843,7 @@ pub fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::{DnsPolicy, ExitPoint, RoutePolicy};
 
     fn machine() -> Machine {
         Machine {
@@ -901,6 +952,39 @@ mod tests {
         // Nothing in the pool is supplying a gpu.
         assert_eq!(find("gpu").source, "-");
         assert_eq!(find("gpu").detail, "none");
+    }
+
+    #[test]
+    fn an_explicit_network_part_prints_locality_routes_dns_and_failover() {
+        let mut inst = Instance::new("dev", "laptop", "debian:13", Shape::default(), machine());
+        inst.exit_point = Some(
+            ExitPoint::new(
+                "desktop".into(),
+                vec!["phone".into()],
+                RoutePolicy {
+                    include: vec!["0.0.0.0/0".parse().unwrap()],
+                    exclude: vec!["10.0.0.0/8".parse().unwrap()],
+                },
+                DnsPolicy::ExitPoint,
+            )
+            .unwrap(),
+        );
+        let network = inst
+            .parts()
+            .into_iter()
+            .find(|part| part.kind == "network")
+            .unwrap();
+        assert_eq!(network.source, "desktop");
+        let note = network.note.unwrap();
+        for fact in [
+            "exit explicit",
+            "remote",
+            "routes 0.0.0.0/0 except 10.0.0.0/8",
+            "dns via exit",
+            "failover phone",
+        ] {
+            assert!(note.contains(fact), "missing {fact:?} from {note:?}");
+        }
     }
 
     /// An instance built from a container image is a machine like any other,

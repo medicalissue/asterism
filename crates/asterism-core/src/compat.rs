@@ -59,7 +59,7 @@
 //! ### The window
 //!
 //! A build serves its own version and the [`SUPPORTED_BACK`] before it:
-//! currently N-3 through N. That is a floor on how far back it will *serve*, not a
+//! currently N-5 through N. That is a floor on how far back it will *serve*, not a
 //! ceiling on how far forward it will speak — the ceiling is the other side's
 //! range, which is why a newer peer is usable.
 //!
@@ -108,7 +108,8 @@ use crate::VERSION;
 /// * **3** — portable backup export/import frames and their reports.
 /// * **4** — the opt-in, framed device-shell policy and session wire.
 /// * **5** — mesh-safe, read-only device-shell policy status.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// * **6** — attach/detach of the network exit-point part.
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// The wire as it was before it carried a version.
 ///
@@ -121,7 +122,7 @@ pub const FIRST_PROTOCOL: u32 = 1;
 
 /// How many versions back this build still serves. Keep the unnumbered first
 /// wire usable while newer device-shell capabilities negotiate independently.
-pub const SUPPORTED_BACK: u32 = 4;
+pub const SUPPORTED_BACK: u32 = 5;
 
 /// Format version of the home stamp document itself.
 pub const STAMP_VERSION: u32 = 1;
