@@ -226,6 +226,20 @@ pub fn check_can_share(inst: &Instance) -> Result<()> {
     Ok(())
 }
 
+/// Refuse an exit-point part before it is recorded when the chosen backend
+/// cannot project the daemon's stable packet edge into its guest.
+pub fn check_can_network(inst: &Instance) -> Result<()> {
+    let hv = for_instance(inst)?;
+    if hv.caps().guest_packet_network {
+        return Ok(());
+    }
+    bail!(
+        "the {} backend on this device cannot attach a guest packet network — \
+         choose a backend with packet-network support before attaching an exit point",
+        hv.id()
+    )
+}
+
 /// Refuse, at create, an instance this backend could never boot.
 ///
 /// Gated on [`Caps`](asterism_core::hv::Caps) rather than on which backend it
@@ -325,6 +339,7 @@ pub fn disk_req(inst: &Instance) -> Result<BootReq<'_>> {
         console: dir.join("console.log"),
         shares: Vec::new(),
         egress: seed::Egress::default(),
+        network: None,
         bootstrap: Default::default(),
         extra_disks: Vec::new(),
         dir,
@@ -336,6 +351,12 @@ pub fn disk_req(inst: &Instance) -> Result<BootReq<'_>> {
 /// done before any backend is asked to do anything (BACKENDS.md §2).
 pub fn boot_req<'a>(inst: &'a Instance, hv: &dyn Hypervisor) -> Result<BootReq<'a>> {
     let mut req = disk_req(inst)?;
+
+    if hv.caps().guest_packet_network {
+        req.network = Some(crate::exit_point::bring_up(inst)?);
+    } else if inst.exit_point.is_some() {
+        check_can_network(inst)?;
+    }
 
     let shares = seed::shares(inst);
     let share_kind = hv.caps().shared_dir;
@@ -1068,6 +1089,7 @@ mod tests {
                 direct_kernel: self.direct_kernel,
                 port_forward: self.port_forward,
                 guest_egress: None,
+                guest_packet_network: false,
                 disk_formats: self.disk_formats,
             }
         }

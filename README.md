@@ -176,6 +176,25 @@ operations across the mesh.
   $ ast attach agent --secret anthropic --to api.anthropic.com
   ```
 
+- **Network exit points** select the orbit device whose uplink and DNS
+  resolver an instance uses. The default follows CPU placement. An explicit
+  exit fails closed when its provider sleeps; fallbacks are used only when
+  named, in order. Route exclusions always win, and orbit control traffic is
+  never captured by a guest route.
+
+  ```console
+  $ ast attach agent --exit desktop --failover phone
+  $ ast attach agent --exit desktop --route 0.0.0.0/0 \
+      --exclude-route 10.0.0.0/8 --dns exit
+  $ ast detach agent --exit
+  ```
+
+  The guest keeps one Asterism-owned virtual gateway and DNS address while an
+  exit is attached, failed over, or detached, so no guest reconfiguration is
+  needed. `ast status agent` shows the primary's locality, route/DNS policy,
+  failover order, live selected path and RTT, degraded/failover health, and
+  whether the policy has failed closed.
+
 Remote block volumes currently require the QEMU backend. Directory shares
 must be on the same device as the instance's CPU and memory.
 

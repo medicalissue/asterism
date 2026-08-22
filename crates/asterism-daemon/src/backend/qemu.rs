@@ -44,7 +44,7 @@ use asterism_core::hv::{
     BootReq, Caps, ControlChannel, DirectKernel, DiskFormat, DiskSpec, Firmware, GuestEgress,
     GuestEndpoint, Handle, Hypervisor, ImageKind, Prepared, Ready, RunState, ShareKind, SnapshotId,
 };
-use asterism_core::instance::{now_unix, PortForward};
+use asterism_core::instance::{now_unix, Instance, PortForward};
 use asterism_core::proc::{ProcId, Signal};
 use asterism_core::snapshot::{self, Snapshot};
 use asterism_core::tools::{output, run, tool};
@@ -273,11 +273,19 @@ impl Hypervisor for Qemu {
             guest_egress: Some(GuestEgress::LoopbackGateway {
                 gateway: GUEST_GATEWAY,
             }),
+            guest_packet_network: true,
             // Raw first: it is what new instances get, and what a VZ host
             // would be able to boot. qcow2 stays readable for the instances
             // and the hand-supplied images that are already in it.
             disk_formats: &[DiskFormat::Raw, DiskFormat::Qcow2],
         }
+    }
+
+    /// Give every QEMU guest the stable packet edge up front. Attach,
+    /// failover, and detach then change only daemon-side policy; cloud-init
+    /// never has to rename or reconfigure a NIC while the guest is running.
+    fn guest_config(&self, inst: &Instance) -> Result<String> {
+        Ok(packet_edge_cloud_config(inst))
     }
 
     /// Idempotent, and the disk it settles on is the disk every other
@@ -320,7 +328,7 @@ impl Hypervisor for Qemu {
                 kernel: Some(DirectKernel {
                     kernel,
                     initrd: Some(initrd),
-                    cmdline: cmdline(),
+                    cmdline: cmdline(req.instance),
                 }),
             });
         }
@@ -459,11 +467,31 @@ impl Hypervisor for Qemu {
             }
         }
 
+        let (primary_mac, edge_mac) = req
+            .network
+            .as_ref()
+            .map(|network| (network.primary_mac, Some(network.edge_mac)))
+            .unwrap_or_else(|| {
+                let (primary, _) = asterism_core::network::guest_macs(&inst.id);
+                (primary, None)
+            });
         cmd.arg("-netdev")
             .arg(netdev_arg(ssh_port, &inst.publish))
             .arg("-device")
-            .arg("virtio-net-pci,netdev=n0")
-            .arg("-device")
+            .arg(format!(
+                "virtio-net-pci,netdev=n0,mac={}",
+                mac_string(primary_mac)
+            ));
+        if let (Some(network), Some(edge_mac)) = (&req.network, edge_mac) {
+            cmd.arg("-netdev")
+                .arg(packet_netdev_arg(network.endpoint))
+                .arg("-device")
+                .arg(format!(
+                    "virtio-net-pci,netdev=astx,mac={}",
+                    mac_string(edge_mac)
+                ));
+        }
+        cmd.arg("-device")
             .arg("virtio-rng-pci")
             .arg("-qmp")
             .arg(format!("unix:{},server,nowait", qmp.display()))
@@ -774,7 +802,7 @@ const GUEST_DNS: &str = "10.0.2.3";
 /// which is what container images expect to find. `panic=10` means a guest
 /// that cannot boot reboots instead of sitting there, and `ast logs` has the
 /// reason either way.
-fn cmdline() -> String {
+fn cmdline(inst: &Instance) -> String {
     // The serial device is per-architecture, and it has to be right: it is
     // where the kernel talks, where the image's stdout goes, and what
     // `ast logs` reads.
@@ -782,11 +810,15 @@ fn cmdline() -> String {
         "aarch64" => "ttyAMA0",
         _ => "ttyS0",
     };
+    let (_, edge_mac) = asterism_core::network::guest_macs(&inst.id);
     format!(
         "root=/dev/vda rw console={console} net.ifnames=0 panic=10 \
          init={init} asterism.ip={GUEST_IP} asterism.gw={GUEST_GATEWAY} \
-         asterism.dns={GUEST_DNS} asterism.time={now}",
+         asterism.dns={GUEST_DNS} asterism.edge_mac={edge_mac} \
+         asterism.edge_ip=100.64.0.2/24 asterism.edge_gw=100.64.0.1 \
+         asterism.edge_dns=100.64.0.53 asterism.time={now}",
         init = oci::INIT_PATH,
+        edge_mac = mac_string(edge_mac),
         // The guest has no RTC driver loaded this early and no network time;
         // this host knows what time it is, and it is the one booting it.
         now = now_unix(),
@@ -805,6 +837,56 @@ fn netdev_arg(ssh_port: u16, publish: &[PortForward]) -> String {
         arg.push_str(&format!(",hostfwd=tcp:127.0.0.1:{}-:{}", p.host, p.guest));
     }
     arg
+}
+
+/// A reconnecting QEMU packet stream. The daemon end is loopback-only and
+/// reads the documented four-byte length plus Ethernet-frame wire format.
+fn packet_netdev_arg(endpoint: std::net::SocketAddr) -> String {
+    format!(
+        "stream,id=astx,server=off,addr.type=inet,addr.host={},addr.port={},\
+         addr.ipv4=on,addr.ipv6=off,reconnect-ms=1000",
+        endpoint.ip(),
+        endpoint.port()
+    )
+}
+
+fn mac_string(mac: [u8; 6]) -> String {
+    mac.iter()
+        .map(|octet| format!("{octet:02x}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// Cloud-config for the backend-neutral guest edge. Matching by stable MAC
+/// avoids depending on whether an image calls the second NIC `eth1`, `ens4`,
+/// or something else. The direct primary subnet remains in the kernel's route
+/// table, so SSH and published-port replies keep using QEMU user-net.
+fn packet_edge_cloud_config(inst: &Instance) -> String {
+    let (_, edge_mac) = asterism_core::network::guest_macs(&inst.id);
+    let edge_mac = mac_string(edge_mac);
+    format!(
+        "bootcmd:\n\
+         \x20 - |\n\
+         \x20   edge=\n\
+         \x20   for path in /sys/class/net/*; do\n\
+         \x20     [ \"$(tr 'A-F' 'a-f' < \"$path/address\")\" = \"{edge_mac}\" ] || continue\n\
+         \x20     edge=${{path##*/}}\n\
+         \x20     break\n\
+         \x20   done\n\
+         \x20   [ -n \"$edge\" ] || {{ echo 'asterism: stable packet edge is missing' >&2; exit 1; }}\n\
+         \x20   ip link set \"$edge\" up\n\
+         \x20   ip address replace 100.64.0.2/24 dev \"$edge\"\n\
+         \x20   ip -6 address replace fd64:6173:7400::2/64 dev \"$edge\"\n\
+         \x20   ip route replace default via 100.64.0.1 dev \"$edge\" metric 10\n\
+         \x20   ip -6 route replace default via fd64:6173:7400::1 dev \"$edge\" metric 10\n\
+         \x20   if command -v resolvectl >/dev/null 2>&1; then\n\
+         \x20     resolvectl dns \"$edge\" 100.64.0.53 fd64:6173:7400::53\n\
+         \x20     resolvectl domain \"$edge\" '~.'\n\
+         \x20     resolvectl default-route \"$edge\" yes\n\
+         \x20   else\n\
+         \x20     printf 'nameserver 100.64.0.53\\nnameserver fd64:6173:7400::53\\n' > /etc/resolv.conf\n\
+         \x20   fi\n"
+    )
 }
 
 // ---- QMP -------------------------------------------------------------------
@@ -1235,6 +1317,7 @@ mod tests {
             seed: dir.join("seed.iso"),
             shares: Vec::new(),
             egress: Default::default(),
+            network: None,
             bootstrap: Default::default(),
             extra_disks: Vec::new(),
             console: dir.join("console.log"),
@@ -1484,7 +1567,8 @@ mod tests {
     /// and what its address is.
     #[test]
     fn the_kernel_cmdline_tells_the_guest_everything_it_cannot_discover() {
-        let line = cmdline();
+        let inst = instance(2);
+        let line = cmdline(&inst);
         assert!(line.contains("root=/dev/vda rw"), "{line}");
         assert!(line.contains("init=/asterism-init"), "{line}");
         assert!(
@@ -1494,6 +1578,10 @@ mod tests {
         assert!(line.contains("asterism.ip=10.0.2.15/24"), "{line}");
         assert!(line.contains("asterism.gw=10.0.2.2"), "{line}");
         assert!(line.contains("asterism.dns=10.0.2.3"), "{line}");
+        assert!(line.contains("asterism.edge_mac="), "{line}");
+        assert!(line.contains("asterism.edge_ip=100.64.0.2/24"), "{line}");
+        assert!(line.contains("asterism.edge_gw=100.64.0.1"), "{line}");
+        assert!(line.contains("asterism.edge_dns=100.64.0.53"), "{line}");
         assert!(line.contains("asterism.time="), "{line}");
         // One console, and the right one for this architecture.
         let console = match image::host_arch() {
@@ -1502,6 +1590,18 @@ mod tests {
         };
         assert_eq!(line.matches("console=").count(), 1, "{line}");
         assert!(line.contains(console), "{line}");
+    }
+
+    #[test]
+    fn every_qemu_guest_gets_one_stable_packet_edge_before_parts_change() {
+        let inst = instance(2);
+        let config = Qemu::new().guest_config(&inst).unwrap();
+        let (_, edge_mac) = asterism_core::network::guest_macs(&inst.id);
+        assert!(config.contains(&mac_string(edge_mac)), "{config}");
+        assert!(config.contains("100.64.0.2/24"), "{config}");
+        assert!(config.contains("default via 100.64.0.1"), "{config}");
+        assert!(config.contains("nameserver 100.64.0.53"), "{config}");
+        asterism_core::seed::mergeable(&config).unwrap();
     }
 
     /// Published ports ride the same user-net as ssh, which is the point:

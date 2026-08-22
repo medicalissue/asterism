@@ -210,6 +210,21 @@ enum MeshRequest {
         /// The epoch that lease was granted at.
         epoch: u64,
     },
+    /// Open an outbound TCP flow on this device and turn the stream into the
+    /// flow's byte pipe. `system_dns` resolves the virtual guest DNS address
+    /// against this provider's resolver policy before connecting.
+    ExitTcp {
+        destination: std::net::SocketAddr,
+        system_dns: bool,
+    },
+    /// Send one outbound UDP datagram on this device and return its first
+    /// reply. UDP remains framed because it has message rather than stream
+    /// semantics.
+    ExitUdp {
+        destination: std::net::SocketAddr,
+        system_dns: bool,
+        payload: Vec<u8>,
+    },
 
     // ---- moving an instance's cpu part --------------------------------------
     //
@@ -254,6 +269,7 @@ impl MeshRequest {
         match self {
             MeshRequest::Rpc { request } => request.since(),
             MeshRequest::DeviceShell { .. } => 4,
+            MeshRequest::ExitTcp { .. } | MeshRequest::ExitUdp { .. } => 6,
             _ => compat::FIRST_PROTOCOL,
         }
     }
@@ -283,6 +299,8 @@ impl MeshRequest {
             MeshRequest::SshSplice { .. } => "an ssh connection",
             MeshRequest::DeviceShell { .. } => "a device shell",
             MeshRequest::VolumeSplice { .. } => "a volume connection",
+            MeshRequest::ExitTcp { .. } => "an exit TCP flow",
+            MeshRequest::ExitUdp { .. } => "an exit UDP datagram",
             MeshRequest::MoveExport { .. } => "an instance export",
             MeshRequest::MoveBase { .. } => "a base image",
             MeshRequest::MoveImport { .. } => "an instance import",
@@ -379,6 +397,10 @@ enum MeshReply {
     /// The last framed message on a stream that is becoming a pipe — an ssh
     /// session, or a volume's NBD connection.
     SpliceReady,
+    /// The response to one exit UDP datagram.
+    ExitDatagram {
+        payload: Vec<u8>,
+    },
     /// The private half of this device's guest key, in OpenSSH format.
     GuestKey {
         key: String,
@@ -1472,6 +1494,65 @@ impl Mesh {
         Ok((stream, observation))
     }
 
+    /// Open an authenticated orbit stream whose far device owns the actual
+    /// outbound TCP socket. QUIC path choice supplies direct/relay failover;
+    /// the packet plane chooses which device before it gets here.
+    pub(crate) async fn open_exit_tcp(
+        self: &Arc<Self>,
+        device: &str,
+        destination: std::net::SocketAddr,
+        system_dns: bool,
+    ) -> Result<asterism_mesh::MeshStream> {
+        let peer = self.device(device).await?;
+        let connection = self.live_connection(&peer).await?;
+        let mut stream = connection.open_stream().await?;
+        open_stream_with(
+            &mut stream.send,
+            &MeshRequest::ExitTcp {
+                destination,
+                system_dns,
+            },
+        )
+        .await?;
+        match read_frame::<MeshReply>(&mut stream.recv).await? {
+            MeshReply::SpliceReady => Ok(stream),
+            MeshReply::Rpc {
+                response: Response::Error { message },
+            } => bail!(message),
+            MeshReply::Incompatible { message, .. } => bail!(message),
+            other => bail!("device {device:?} refused an exit TCP flow: {other:?}"),
+        }
+    }
+
+    /// Send one UDP request through the selected exit device.
+    pub(crate) async fn send_exit_udp(
+        self: &Arc<Self>,
+        device: &str,
+        destination: std::net::SocketAddr,
+        system_dns: bool,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        let peer = self.device(device).await?;
+        let connection = self.live_connection(&peer).await?;
+        match ask(
+            &connection,
+            &MeshRequest::ExitUdp {
+                destination,
+                system_dns,
+                payload,
+            },
+        )
+        .await?
+        {
+            MeshReply::ExitDatagram { payload } => Ok(payload),
+            MeshReply::Rpc {
+                response: Response::Error { message },
+            } => bail!(message),
+            MeshReply::Incompatible { message, .. } => bail!(message),
+            other => bail!("device {device:?} refused an exit UDP datagram: {other:?}"),
+        }
+    }
+
     // ---- moving an instance's cpu part --------------------------------------
 
     /// Is `name` a device this orbit has heard of?
@@ -2521,6 +2602,85 @@ async fn serve_volume_splice(
     pump(export, stream).await.map(|_| ())
 }
 
+/// Become the selected provider's outbound TCP socket. The opening mesh
+/// stream is already authenticated as an orbit peer; after the ready frame,
+/// both halves are an ordinary byte pipe.
+async fn serve_exit_tcp(
+    mut stream: asterism_mesh::MeshStream,
+    destination: std::net::SocketAddr,
+    system_dns: bool,
+) -> Result<()> {
+    let upstream = async {
+        let target = crate::exit_point::resolve_dns_target(destination, system_dns)?;
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::net::TcpStream::connect(target),
+        )
+        .await
+        .context("exit TCP connect timed out")?
+        .context("opening exit TCP socket")
+    }
+    .await;
+    let upstream = match upstream {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            write_frame(
+                &mut stream.send,
+                &MeshReply::Rpc {
+                    response: Response::Error {
+                        message: format!("{error:#}"),
+                    },
+                },
+            )
+            .await?;
+            let _ = stream.send.finish();
+            return Ok(());
+        }
+    };
+    write_frame(&mut stream.send, &MeshReply::SpliceReady).await?;
+    pump(upstream, stream).await.map(|_| ())
+}
+
+/// Send one datagram from the selected provider and return its first reply.
+/// UDP stays framed instead of becoming a pipe so datagram boundaries cannot
+/// be lost in the QUIC byte stream.
+async fn serve_exit_udp(
+    mut stream: asterism_mesh::MeshStream,
+    destination: std::net::SocketAddr,
+    system_dns: bool,
+    payload: Vec<u8>,
+) -> Result<()> {
+    let result = async {
+        let target = crate::exit_point::resolve_dns_target(destination, system_dns)?;
+        let bind = if target.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let socket = tokio::net::UdpSocket::bind(bind).await?;
+        socket.connect(target).await?;
+        socket.send(&payload).await?;
+        let mut reply = vec![0; 65_507];
+        let count = tokio::time::timeout(Duration::from_secs(30), socket.recv(&mut reply))
+            .await
+            .context("exit UDP reply timed out")??;
+        reply.truncate(count);
+        Ok::<_, anyhow::Error>(reply)
+    }
+    .await;
+    let reply = match result {
+        Ok(payload) => MeshReply::ExitDatagram { payload },
+        Err(error) => MeshReply::Rpc {
+            response: Response::Error {
+                message: format!("{error:#}"),
+            },
+        },
+    };
+    write_frame(&mut stream.send, &reply).await?;
+    let _ = stream.send.finish();
+    Ok(())
+}
+
 // ---- moving an instance's bytes ---------------------------------------------
 //
 // Sparse-aware, one file at a time, with the holes never leaving the source.
@@ -3283,6 +3443,15 @@ async fn serve_stream(
             )
             .await
         }
+        MeshRequest::ExitTcp {
+            destination,
+            system_dns,
+        } => return serve_exit_tcp(stream, destination, system_dns).await,
+        MeshRequest::ExitUdp {
+            destination,
+            system_dns,
+            payload,
+        } => return serve_exit_udp(stream, destination, system_dns, payload).await,
         // Bulk, not request/reply: each of these stops being a framed RPC
         // after this line and becomes a stream of `MoveFrame`s.
         MeshRequest::MoveExport { name, epoch } => {

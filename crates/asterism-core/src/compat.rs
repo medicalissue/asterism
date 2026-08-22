@@ -59,7 +59,7 @@
 //! ### The window
 //!
 //! A build serves its own version and the [`SUPPORTED_BACK`] before it:
-//! currently N-3 through N. That is a floor on how far back it will *serve*, not a
+//! currently N-5 through N. That is a floor on how far back it will *serve*, not a
 //! ceiling on how far forward it will speak — the ceiling is the other side's
 //! range, which is why a newer peer is usable.
 //!
@@ -109,7 +109,8 @@ use crate::VERSION;
 /// * **4** — the opt-in, framed device-shell policy and session wire.
 /// * **5** — mesh-safe, read-only device-shell policy status.
 /// * **6** — device-local structured image catalog and pull results.
-pub const PROTOCOL_VERSION: u32 = 6;
+/// * **7** — attach/detach of the network exit-point part.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// The wire as it was before it carried a version.
 ///
