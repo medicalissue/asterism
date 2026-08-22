@@ -302,15 +302,34 @@ WAKE_PING="$(wait_ping b "$A_NAME" direct)"
 echo "ok: sleep/wake recovered the same endpoint — $WAKE_PING"
 
 # The direct link is now admissible; this also proves the earlier refusal did
-# not leave a hidden lease behind.
-ast_b attach "$INST" --volume "$A_NAME:$VOL" >/dev/null \
-  || fail "the same remote volume was not admissible after direct roam"
+# not leave a hidden lease behind. The transport estimator may retain a slow
+# pre-roam sample briefly, so retry the actual admission gate. Every refusal
+# must remain pre-mutation; only the sample that measures direct <=5ms may
+# commit the lease and attachment.
+ADMITTED=""
+ATTACH_OUT=""
+for ATTEMPT in $(seq 1 100); do
+  if ATTACH_OUT="$(ast_b attach "$INST" --volume "$A_NAME:$VOL" 2>&1)"; then
+    ADMITTED=1
+    break
+  fi
+  grep -q "refused before mutation" <<<"$ATTACH_OUT" \
+    || fail "remote-volume admission failed for a reason other than its measured SLO:"$'\n'"$ATTACH_OUT"
+  no_lease || fail "a retryable SLO refusal moved the provider lease"
+  if ast_b status "$INST" | grep -q " $VOL ("; then
+    fail "a retryable SLO refusal wrote a consumer volume record"
+  fi
+  ast_b ping "$A_NAME" >/dev/null 2>&1 || true
+  sleep 0.2
+done
+[ -n "$ADMITTED" ] \
+  || fail "the same remote volume was not admissible after direct roam:"$'\n'"$ATTACH_OUT"
 python3 - "$A/volumes.json" "$VOL" "$INST" <<'PY'
 import json, sys
 lease = json.load(open(sys.argv[1]))["volumes"][sys.argv[2]].get("lease")
 assert lease and lease["holder"] == sys.argv[3] and lease["epoch"] == 1, lease
 PY
-echo "ok: suitable placement committed exactly one epoch after the refusal"
+echo "ok: suitable placement committed exactly one epoch after $ATTEMPT measured admission attempt(s)"
 
 # Restore Wi-Fi/WAN, disappear the provider daemon, forge a stale address, and
 # restart both sides.  Discovery by public key must find the provider's new
