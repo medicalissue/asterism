@@ -194,7 +194,20 @@ impl Frames {
                     )
                 });
             }
-            if let Some(at) = chunk.iter().position(|b| *b == b'\n') {
+            // What this frame would be if it ended in this chunk: everything
+            // kept so far, plus the part of this chunk before its newline.
+            // The cap is checked against that on *both* paths below, and the
+            // newline path is the one that used to skip it — a peer could
+            // fill the buffer to exactly the limit, then send the last byte
+            // and the terminator together, and the frame was accepted one
+            // byte over. Anything that decides the length of a frame has to
+            // be counted before the frame is handed on.
+            let ends_here = chunk.iter().position(|b| *b == b'\n');
+            let would_be = self.buf.len() + ends_here.unwrap_or(chunk.len());
+            if would_be > ipc::MAX_REQUEST_FRAME {
+                return Ok(Framing::Refused(oversize()));
+            }
+            if let Some(at) = ends_here {
                 self.buf.extend_from_slice(&chunk[..at]);
                 self.reader.consume(at + 1);
                 return Ok(match String::from_utf8(std::mem::take(&mut self.buf)) {
@@ -203,9 +216,6 @@ impl Frames {
                         "a request frame was not utf-8; astd reads JSON".to_owned(),
                     ),
                 });
-            }
-            if self.buf.len() + chunk.len() > ipc::MAX_REQUEST_FRAME {
-                return Ok(Framing::Refused(oversize()));
             }
             let taken = chunk.len();
             self.buf.extend_from_slice(chunk);
@@ -220,7 +230,7 @@ impl Frames {
 
 fn oversize() -> String {
     format!(
-        "a request went past {} bytes without a newline. astd reads one JSON request \
+        "a request went past {} bytes before its newline. astd reads one JSON request \
          per line; nothing this protocol carries is that large.",
         ipc::MAX_REQUEST_FRAME
     )
@@ -316,7 +326,7 @@ mod tests {
         });
         match frames.next().await.unwrap() {
             Framing::Refused(message) => {
-                assert!(message.contains("without a newline"), "{message}");
+                assert!(message.contains("before its newline"), "{message}");
                 assert!(
                     message.contains(&ipc::MAX_REQUEST_FRAME.to_string()),
                     "the refusal says what the limit is: {message}"
@@ -331,6 +341,61 @@ mod tests {
         );
         drop(frames);
         writer.await.unwrap();
+    }
+
+    /// Exactly the limit is a frame. The cap is on what a peer may make the
+    /// daemon hold, so the boundary belongs on the accepting side of it —
+    /// and a reader that refused at exactly the limit would refuse a frame
+    /// the mesh, which shares this ceiling, is willing to send.
+    #[tokio::test]
+    async fn a_frame_of_exactly_the_limit_is_a_frame() {
+        let (mut theirs, mut frames) = pair().await;
+        let writer = tokio::spawn(async move {
+            theirs.write_all(&vec![b'a'; ipc::MAX_REQUEST_FRAME]).await.unwrap();
+            theirs.write_all(b"\n").await.unwrap();
+            theirs
+        });
+        match frames.next().await.unwrap() {
+            Framing::Frame(line) => assert_eq!(line.len(), ipc::MAX_REQUEST_FRAME),
+            _ => panic!("a frame of exactly the limit was refused"),
+        }
+        drop(writer.await.unwrap());
+    }
+
+    /// The bypass the merge queue caught, in the shape it caught it in.
+    ///
+    /// The cap used to be checked only on the path where a chunk carried no
+    /// newline. So a peer filled the buffer to exactly the limit — allowed,
+    /// see above — waited for it to be consumed, and then sent the byte that
+    /// went over *together with* the terminator. That put the last byte on
+    /// the newline path, which counted nothing, and a limit+1 frame went
+    /// through to the JSON parser. The limit has to be decided by every byte
+    /// that is in the frame, not by every byte that arrives without one.
+    #[tokio::test]
+    async fn a_frame_that_goes_over_in_the_chunk_carrying_its_newline_is_refused() {
+        let (mut theirs, mut frames) = pair().await;
+        let writer = tokio::spawn(async move {
+            // Exactly the limit, and no terminator. `write_all` returns once
+            // the reader has taken it, which is the "waited for consumption"
+            // half of the repro: the buffer now holds exactly the limit and
+            // the next chunk is the one with the newline in it.
+            theirs.write_all(&vec![b'a'; ipc::MAX_REQUEST_FRAME]).await.unwrap();
+            theirs.write_all(b"x\n").await.unwrap();
+            theirs
+        });
+        match frames.next().await.unwrap() {
+            Framing::Refused(message) => {
+                assert!(message.contains("before its newline"), "{message}");
+                assert!(message.contains(&ipc::MAX_REQUEST_FRAME.to_string()), "{message}");
+            }
+            Framing::Frame(line) => panic!(
+                "a {}-byte frame was accepted; the limit is {}",
+                line.len(),
+                ipc::MAX_REQUEST_FRAME
+            ),
+            Framing::Eof => panic!("the peer was cut off instead of refused"),
+        }
+        drop(writer.await.unwrap());
     }
 
     /// A frame that has begun has a deadline; one that has not begun does

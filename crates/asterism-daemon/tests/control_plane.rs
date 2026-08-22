@@ -278,7 +278,64 @@ fn an_oversized_frame_is_refused_in_words_and_the_daemon_keeps_serving() {
         sent += chunk.len();
     }
     let refusal = read_line(&mut stream);
-    assert!(refusal.contains("without a newline"), "no refusal came back: {refusal:?}");
+    assert!(refusal.contains("before its newline"), "no refusal came back: {refusal:?}");
+    drop(stream);
+
+    astd.assert_serving();
+}
+
+/// A request of exactly the limit is served, on the shipped binary.
+///
+/// The cap is on what a peer may make the daemon hold, so the boundary is on
+/// the accepting side of it — and the padding is whitespace because that is
+/// what makes a frame of exactly this length still a request the daemon can
+/// answer, rather than a refusal that would have looked the same either way.
+#[test]
+fn a_request_of_exactly_the_limit_is_answered() {
+    let astd = Daemon::start();
+    let mut frame = String::from(r#"{"cmd":"ping"}"#);
+    frame.push_str(&" ".repeat(ipc::MAX_REQUEST_FRAME - frame.len()));
+    assert_eq!(frame.len(), ipc::MAX_REQUEST_FRAME);
+
+    let mut stream = UnixStream::connect(astd.sock()).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+    stream.write_all(frame.as_bytes()).unwrap();
+    stream.write_all(b"
+").unwrap();
+    let reply = read_line(&mut stream);
+    assert!(reply.contains("pong"), "a frame of exactly the limit was refused: {reply:?}");
+}
+
+/// The merge queue's own repro, against the shipped binary.
+///
+/// Exactly the limit, then — once the daemon has taken it — one more byte
+/// together with the terminator. The cap used to be consulted only on the
+/// path where a chunk carried no newline, so that last byte arrived on the
+/// path that counted nothing and a limit+1 frame reached the JSON parser: the
+/// tell was `bad request: expected value` where the oversize refusal should
+/// have been. Asserting on the refusal alone would not catch a regression
+/// that merely changed the parse error, so this asserts on both.
+#[test]
+fn a_request_that_goes_over_in_the_chunk_carrying_its_newline_is_refused() {
+    let astd = Daemon::start();
+    let mut stream = UnixStream::connect(astd.sock()).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+
+    // Exactly the limit, no terminator. `write_all` returns once the daemon
+    // has drained it, which leaves its buffer holding exactly the limit.
+    stream.write_all(&vec![b'a'; ipc::MAX_REQUEST_FRAME]).unwrap();
+    stream.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    // The byte that goes over, and the newline, in one write.
+    stream.write_all(b"x
+").unwrap();
+
+    let reply = read_line(&mut stream);
+    assert!(
+        !reply.contains("bad request"),
+        "a frame one byte over the limit reached the parser: {reply:?}"
+    );
+    assert!(reply.contains("before its newline"), "expected the oversize refusal: {reply:?}");
     drop(stream);
 
     astd.assert_serving();

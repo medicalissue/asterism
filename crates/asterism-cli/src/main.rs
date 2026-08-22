@@ -1796,14 +1796,21 @@ fn read_frame(reader: &mut impl BufRead) -> Result<Option<String>> {
             }
             bail!("astd stopped in the middle of a reply");
         }
-        if let Some(at) = chunk.iter().position(|b| *b == b'\n') {
+        // What this reply would be if it ended in this chunk: everything kept
+        // so far, plus the part of this chunk before its newline. Checked on
+        // *both* paths below — the newline path used to skip it, so a reply
+        // that reached exactly the cap and then sent its last byte and
+        // terminator together came back one byte over. See the daemon's
+        // `Frames::next`, which had the same ordering.
+        let ends_here = chunk.iter().position(|b| *b == b'\n');
+        if buf.len() + ends_here.unwrap_or(chunk.len()) > ipc::MAX_RESPONSE_FRAME {
+            bail!("astd sent more than {} bytes without ending a reply", ipc::MAX_RESPONSE_FRAME);
+        }
+        if let Some(at) = ends_here {
             buf.extend_from_slice(&chunk[..at]);
             reader.consume(at + 1);
             let line = String::from_utf8(buf).context("astd sent a reply that is not utf-8")?;
             return Ok(if line.trim().is_empty() { None } else { Some(line) });
-        }
-        if buf.len() + chunk.len() > ipc::MAX_RESPONSE_FRAME {
-            bail!("astd sent more than {} bytes without ending a reply", ipc::MAX_RESPONSE_FRAME);
         }
         let taken = chunk.len();
         buf.extend_from_slice(chunk);
@@ -2392,6 +2399,35 @@ mod tests {
 
         let endless = vec![b'x'; ipc::MAX_RESPONSE_FRAME + 4096];
         let mut reader = BufReader::new(std::io::Cursor::new(endless));
+        let refusal = format!("{:#}", read_frame(&mut reader).unwrap_err());
+        assert!(refusal.contains("without ending a reply"), "{refusal}");
+    }
+
+    /// Exactly the limit is a reply, and one byte past it is not — with the
+    /// newline landing in the final buffer, which is where the check used to
+    /// be skipped. `read_frame` had the same ordering bug as the daemon's
+    /// `Frames::next`: the cap was consulted only on the path where a chunk
+    /// carried no newline, so a reply that reached the cap and then sent its
+    /// last byte and terminator together came back one byte over.
+    ///
+    /// The arithmetic is deliberate. `BufReader`'s buffer is 8 KiB and
+    /// divides `MAX_RESPONSE_FRAME`, so a payload of exactly the limit fills
+    /// whole chunks and the terminator arrives alone; a payload of limit+1
+    /// puts the last byte and the terminator in the same final chunk, which
+    /// is precisely the case under test.
+    #[test]
+    fn a_reply_is_measured_up_to_its_newline_and_not_past_it() {
+        let mut exact = Vec::with_capacity(ipc::MAX_RESPONSE_FRAME + 1);
+        exact.resize(ipc::MAX_RESPONSE_FRAME, b'a');
+        exact.push(b'\n');
+        let mut reader = BufReader::new(std::io::Cursor::new(exact));
+        let line = read_frame(&mut reader).unwrap().expect("a reply at the limit is a reply");
+        assert_eq!(line.len(), ipc::MAX_RESPONSE_FRAME);
+
+        let mut over = Vec::with_capacity(ipc::MAX_RESPONSE_FRAME + 2);
+        over.resize(ipc::MAX_RESPONSE_FRAME + 1, b'a');
+        over.push(b'\n');
+        let mut reader = BufReader::new(std::io::Cursor::new(over));
         let refusal = format!("{:#}", read_frame(&mut reader).unwrap_err());
         assert!(refusal.contains("without ending a reply"), "{refusal}");
     }
