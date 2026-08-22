@@ -1338,11 +1338,12 @@ async fn run(
         }
     };
 
-    // The waiter can win the race with its stdout reader. Drain the bounded
-    // queue briefly so a command's final line is not lost behind its status.
-    while let Ok(Some(output)) =
-        tokio::time::timeout(Duration::from_millis(50), running.output.recv()).await
-    {
+    // The waiter can win the race with its output reader. The reader owns the
+    // last sender, so channel close is the kernel-backed EOF boundary: every
+    // byte read before the child closed its descriptors is forwarded before
+    // the exit frame. A wall-clock drain would turn this ordering guarantee
+    // into a fixture race.
+    while let Some(output) = running.output.recv().await {
         if send_bounded(&mut wire, &output).await.is_err() {
             exit.reason
                 .get_or_insert_with(|| "client disconnected before final output".to_owned());
@@ -1609,31 +1610,85 @@ mod tests {
         if privilege_refusal().is_some() {
             return;
         }
-        let open = ShellOpen {
-            command: Some("stty size; exit 37".into()),
-            pty: true,
-            cols: 93,
-            rows: 41,
-            env: vec![],
-        };
-        let mut running = spawn(&open).unwrap();
-        resize(running.pty_master.as_ref().unwrap(), 94, 42).unwrap();
-        let mut bytes = Vec::new();
-        let exit = loop {
-            tokio::select! {
-                frame = running.output.recv() => {
-                    if let Some(ShellFrame::Output { data, .. }) = frame {
+        for iteration in 0..128 {
+            let open = ShellOpen {
+                command: Some(
+                    "printf 'ready\\n'; IFS= read -r marker; stty size; printf 'done-%s\\n' \"$marker\"; exit 37".into(),
+                ),
+                pty: true,
+                cols: 93,
+                rows: 41,
+                env: vec![],
+            };
+            let mut running = spawn(&open).unwrap();
+            let mut bytes = Vec::new();
+            loop {
+                match running.output.recv().await {
+                    Some(ShellFrame::Output { data, .. }) => {
                         bytes.extend_from_slice(data.as_bytes());
+                        if bytes
+                            .windows(b"ready\r\n".len())
+                            .any(|window| window == b"ready\r\n")
+                        {
+                            break;
+                        }
+                    }
+                    Some(_) => {}
+                    None => panic!("pty output closed before the resize handshake"),
+                }
+            }
+
+            resize(running.pty_master.as_ref().unwrap(), 94, 42).unwrap();
+            running
+                .input
+                .send(ProcessInput::Data(
+                    format!("marker-{iteration}\n").into_bytes(),
+                ))
+                .await
+                .unwrap();
+
+            let mut exit = None;
+            let mut output_open = true;
+            while exit.is_none() || output_open {
+                tokio::select! {
+                    frame = running.output.recv(), if output_open => {
+                        match frame {
+                            Some(ShellFrame::Output { data, .. }) => bytes.extend_from_slice(data.as_bytes()),
+                            Some(_) => {},
+                            None => output_open = false,
+                        }
+                    }
+                    result = &mut running.exit, if exit.is_none() => {
+                        exit = Some(result.unwrap());
                     }
                 }
-                exit = &mut running.exit => break exit.unwrap(),
             }
-        };
-        assert_eq!(exit.code, Some(37));
-        let output = String::from_utf8_lossy(&bytes);
-        assert!(
-            output.contains("42 94") || output.contains("41 93"),
-            "{output:?}"
-        );
+
+            let exit = exit.unwrap();
+            assert_eq!(exit.code, Some(37), "iteration {iteration}");
+            let output = String::from_utf8_lossy(&bytes);
+            assert!(
+                output.contains("ready\r\n"),
+                "iteration {iteration}: {output:?}"
+            );
+            assert!(
+                output.contains("42 94\r\n"),
+                "iteration {iteration}: {output:?}"
+            );
+            assert!(
+                output.contains(&format!("done-marker-{iteration}\r\n")),
+                "iteration {iteration}: {output:?}"
+            );
+            assert_eq!(
+                unsafe { libc::kill(running.pid, 0) },
+                -1,
+                "child leaked in iteration {iteration}"
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH),
+                "child pid remained live in iteration {iteration}"
+            );
+        }
     }
 }
