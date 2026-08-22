@@ -44,7 +44,31 @@ impl Daemon {
     /// Start one on a home somebody else prepared — the tests about what a
     /// previous daemon left behind.
     fn on(dir: tempfile::TempDir, home: PathBuf) -> Daemon {
-        let daemon = Daemon { child: spawn(&home), home, _dir: dir };
+        let daemon = Daemon { child: spawn(&home, &[]), home, _dir: dir };
+        daemon.await_socket();
+        daemon
+    }
+
+    /// Start one standing in for a build of another vintage.
+    ///
+    /// The same binary with a different range on it, which is the only way to
+    /// hold two vintages in one tree without testing a previous release's
+    /// bugs instead of this build's negotiation. See
+    /// `asterism_core::compat`.
+    fn speaking(min: u32, max: u32) -> Daemon {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let home = dir.path().join("home");
+        let daemon = Daemon {
+            child: spawn(
+                &home,
+                &[
+                    ("ASTERISM_MIN_PROTOCOL_VERSION", &min.to_string()),
+                    ("ASTERISM_PROTOCOL_VERSION", &max.to_string()),
+                ],
+            ),
+            home,
+            _dir: dir,
+        };
         daemon.await_socket();
         daemon
     }
@@ -112,10 +136,13 @@ impl Drop for Daemon {
     }
 }
 
-fn spawn(home: &Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_astd"))
-        .env("ASTERISM_HOME", home)
-        .env("ASTERISM_MESH", "local")
+fn spawn(home: &Path, extra: &[(&str, &str)]) -> Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_astd"));
+    command.env("ASTERISM_HOME", home).env("ASTERISM_MESH", "local");
+    for (key, value) in extra {
+        command.env(key, value);
+    }
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -266,7 +293,7 @@ fn a_home_an_older_daemon_left_open_is_tightened_and_reported() {
 fn only_one_of_a_storm_of_daemons_takes_the_home() {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("home");
-    let mut racers: Vec<Child> = (0..6).map(|_| spawn(&home)).collect();
+    let mut racers: Vec<Child> = (0..6).map(|_| spawn(&home, &[])).collect();
 
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut lost = 0;
@@ -495,4 +522,219 @@ fn connections_past_the_cap_are_turned_away_and_the_slots_come_back() {
     held.clear();
     std::thread::sleep(Duration::from_millis(500));
     astd.assert_serving();
+}
+
+// ---- skew: two vintages on one socket ---------------------------------------
+//
+// The unit tests in `asterism_core::compat` make the selection rule true.
+// These make it true of the shipped `astd`, which is the different claim that
+// matters: a negotiation that has only ever run in a unit test is a
+// negotiation that has never met a socket.
+//
+// Every leg is a real daemon, started with a real range on it, asked in the
+// bytes `ast` really writes.
+
+/// A daemon one release behind — protocol 1, the wire as it was before it had
+/// a number — is *spoken to*, at protocol 1, and it serves.
+///
+/// This is the leg the old behaviour got wrong twice: it compared crate
+/// versions, found a difference, and replaced a running daemon that was
+/// perfectly able to answer. Here the answer arrives.
+#[test]
+fn a_daemon_one_release_behind_is_spoken_to_at_its_own_wire() {
+    let astd = Daemon::speaking(1, 1);
+
+    // `ast` opens with its range. The old daemon's reply says what it has.
+    let pong = astd.ask(r#"{"cmd":"ping","protocol":2,"min_protocol":1}"#);
+    assert!(pong.contains(r#""result":"pong""#), "{pong}");
+    assert!(pong.contains(r#""protocol":1"#), "the old daemon says what it speaks: {pong}");
+
+    // And then it serves, because protocol 1 is inside this build's window.
+    let listed = astd.ask(r#"{"cmd":"list"}"#);
+    assert!(listed.contains(r#""result":"instances""#), "{listed}");
+
+    // The one frame that is newer than that wire is refused by name, in a
+    // sentence naming the version it needs — not as a serde error about a
+    // variant the user never typed, and not by dropping the connection.
+    let refused = astd.ask(r#"{"cmd":"compat"}"#);
+    assert!(refused.contains(r#""result":"error""#), "{refused}");
+    assert!(refused.contains("compat frame"), "the refusal names the frame: {refused}");
+    assert!(refused.contains("protocol 2"), "and the version it needs: {refused}");
+    assert!(
+        refused.contains("Every other command works"),
+        "and that it is the one command affected: {refused}"
+    );
+    assert!(!refused.contains("unknown variant"), "{refused}");
+
+    astd.assert_serving();
+}
+
+/// The mirrored leg: an *older* `ast` against a daemon of this build. The old
+/// CLI sends the bare `ping` it has always sent, and every command it knows
+/// keeps working — at protocol 1, chosen by the daemon from the absence of a
+/// range rather than guessed.
+#[test]
+fn an_older_cli_is_served_at_the_wire_it_has() {
+    let astd = Daemon::start();
+
+    let pong = astd.ask(r#"{"cmd":"ping"}"#);
+    assert!(pong.contains(r#""result":"pong""#), "{pong}");
+
+    let listed = astd.ask(r#"{"cmd":"list"}"#);
+    assert!(listed.contains(r#""result":"instances""#), "{listed}");
+
+    astd.assert_serving();
+}
+
+/// A daemon from the future that has dropped this build's wire. Refused in a
+/// sentence on the connection that asked — and the connection is the only
+/// thing that ends. Nothing is signalled, because taking a newer daemon's
+/// place is a downgrade.
+#[test]
+fn a_daemon_that_has_left_our_wire_behind_refuses_in_words_and_keeps_serving() {
+    let astd = Daemon::speaking(40, 41);
+
+    let refusal = astd.ask(r#"{"cmd":"ping","protocol":2,"min_protocol":1}"#);
+    assert!(refusal.contains(r#""result":"error""#), "{refusal}");
+    assert!(refusal.contains("protocol"), "{refusal}");
+    assert!(
+        refusal.contains("upgrade"),
+        "a refusal with no repair in it is half a sentence: {refusal}"
+    );
+
+    // The refusal ended that conversation, not the daemon. A peer of its own
+    // vintage is still served.
+    let pong = astd.ask(r#"{"cmd":"ping","protocol":41,"min_protocol":40}"#);
+    assert!(pong.contains(r#""result":"pong""#), "{pong}");
+}
+
+/// The window is a range, so a daemon whose ceiling is *above* ours is not a
+/// refusal — it is a conversation at our ceiling, as long as its floor still
+/// reaches us. Without this, two halves could never be one release apart and
+/// every upgrade would be a flag day.
+#[test]
+fn a_newer_daemon_that_still_serves_our_wire_is_spoken_to_at_ours() {
+    let astd = Daemon::speaking(1, 9);
+
+    let pong = astd.ask(r#"{"cmd":"ping","protocol":2,"min_protocol":1}"#);
+    assert!(pong.contains(r#""result":"pong""#), "{pong}");
+    assert!(pong.contains(r#""protocol":9"#), "{pong}");
+
+    // Frames at the version we chose are served. The daemon is newer; the
+    // conversation is not.
+    let listed = astd.ask(r#"{"cmd":"list"}"#);
+    assert!(listed.contains(r#""result":"instances""#), "{listed}");
+
+    astd.assert_serving();
+}
+
+/// A downgrade is refused before anything is touched.
+///
+/// The home is stamped by a build from the future, and then a daemon of this
+/// vintage is started on it. It must not come up — and it must not come up
+/// *without having written anything*, which is the whole difference between
+/// refusing at the door and refusing three stores into startup.
+#[test]
+fn a_home_a_newer_build_wrote_is_refused_before_the_daemon_touches_it() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let stamped = r#"{"version":1,"protocol":99,"asterism":"99.0.0",
+            "stores":{"registry":99,"orbit":1,"volumes":1,"secrets":1,"seed":4},
+            "written_at":1700000000}"#;
+    std::fs::write(home.join("home.json"), stamped).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_astd"))
+        .env("ASTERISM_HOME", &home)
+        .env("ASTERISM_MESH", "local")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("running astd");
+
+    // Bounded on purpose. A daemon that comes up anyway is the regression
+    // this test exists to catch, and a regression must fail rather than hang.
+    let status = wait_for_exit(&mut child, Duration::from_secs(30))
+        .expect("astd started on a home a newer build wrote");
+    assert!(!status.success(), "a downgrade started anyway");
+
+    let mut said = String::new();
+    child.stderr.take().unwrap().read_to_string(&mut said).unwrap();
+    assert!(said.contains("registry format 99"), "it must name what it would drop: {said}");
+    assert!(said.contains("99.0.0"), "and the build that wrote it: {said}");
+    assert!(said.contains("upgrade Asterism"), "and the repair: {said}");
+
+    // Refused *before mutation*: the daemon never got as far as opening a
+    // door or writing a store, so the home is exactly as it was found.
+    assert!(!home.join("astd.sock").exists(), "the door was opened before the refusal");
+    assert!(!home.join("state.json").exists(), "a store was written before the refusal");
+    assert_eq!(
+        std::fs::read_to_string(home.join("home.json")).unwrap(),
+        stamped,
+        "the stamp itself was rewritten, so the evidence of the newer build is gone"
+    );
+}
+
+/// And the ordinary case it must not break: a home this build owns is stamped
+/// and served, and starting again on the same home writes nothing.
+#[test]
+fn a_home_this_build_owns_is_stamped_once_and_then_left_alone() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let home = dir.path().join("home");
+    let astd = Daemon::on(dir, home);
+    astd.assert_serving();
+
+    let stamp = std::fs::read_to_string(astd.home.join("home.json"))
+        .expect("a daemon that came up stamped the home it came up on");
+    let written: asterism_core::compat::HomeStamp = serde_json::from_str(&stamp).unwrap();
+    assert_eq!(written.protocol, asterism_core::compat::PROTOCOL_VERSION);
+    assert_eq!(written.stores, asterism_core::compat::stores());
+
+    // A second daemon on the same home rewrites nothing: a stamp that churned
+    // on every start would be a write on every boot, for no news.
+    let home = astd.home.clone();
+    drop(astd);
+    let mut second = Command::new(env!("CARGO_BIN_EXE_astd"))
+        .env("ASTERISM_HOME", &home)
+        .env("ASTERISM_MESH", "local")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("starting astd");
+    await_socket(&home.join("astd.sock"));
+    assert_eq!(
+        std::fs::read_to_string(home.join("home.json")).unwrap(),
+        stamp,
+        "the stamp was rewritten for no news"
+    );
+    let _ = second.kill();
+    let _ = second.wait();
+}
+
+/// Wait for a child to exit, or give up.
+fn wait_for_exit(child: &mut Child, patience: Duration) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + patience;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(e) => panic!("waiting on astd: {e}"),
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
+}
+
+fn await_socket(sock: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if UnixStream::connect(sock).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("astd did not come up on {}", sock.display());
 }

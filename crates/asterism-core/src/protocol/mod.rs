@@ -45,7 +45,39 @@ pub use wake::{CheckRow, Verdict};
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
     // ---- the handshake -------------------------------------------------------
-    Ping,
+    /// What version of this wire the caller speaks, asked of whoever is
+    /// listening — and, in the answer, told.
+    ///
+    /// The two fields are `#[serde(default)]` and were added after the
+    /// variant, so a build that predates them sends `{"cmd":"ping"}` and a
+    /// build that predates them *reads* a frame carrying them as the same
+    /// bare `Ping` it always did. That is what makes the negotiation itself
+    /// backward compatible: the first frame of the conversation is one both
+    /// vintages can already read.
+    ///
+    /// Zero in either position is the absence of the field rather than a
+    /// version — see [`compat::Speaks::claimed`].
+    ///
+    /// [`compat::Speaks::claimed`]: crate::compat::Speaks::claimed
+    Ping {
+        /// The newest version the caller speaks.
+        #[serde(default)]
+        protocol: u32,
+        /// The oldest it still serves.
+        #[serde(default)]
+        min_protocol: u32,
+    },
+    /// What this build speaks, what the daemon speaks, and what they have
+    /// settled on: `ast compat`.
+    ///
+    /// Introduced at protocol 2, and so the one frame in this enum that a
+    /// daemon at protocol 1 is not sent. It is also the frame that says so —
+    /// which is deliberate, because a build whose only version-aware command
+    /// is the one that cannot run against an old peer would be a poor
+    /// advertisement for negotiating at all. `ast compat` answers from this
+    /// build's own table when the daemon cannot contribute, and says which
+    /// half of the answer is missing.
+    Compat,
 
     // ---- instances -----------------------------------------------------------
     //
@@ -537,7 +569,11 @@ impl Request {
 
             // The handshake, and the two views of the registry. A list is
             // about every instance, which is not one instance.
-            Request::Ping | Request::Create { .. } | Request::List | Request::ListOrbit => None,
+            Request::Ping { .. }
+            | Request::Compat
+            | Request::Create { .. }
+            | Request::List
+            | Request::ListOrbit => None,
 
             // About the orbit and the devices in it.
             Request::Proxy { .. }
@@ -598,6 +634,50 @@ impl Request {
         }
     }
 
+    /// The protocol version that introduced this frame.
+    ///
+    /// What a selected version *means*: every frame at or below it may be
+    /// sent, and no frame above it may be. Both ends check this, so a command
+    /// the other half cannot serve is refused by name — see
+    /// [`compat::frame_too_new`] — rather than arriving as serde's "unknown
+    /// variant" and being reported as a bad request the user did not make.
+    ///
+    /// The default arm is [`compat::FIRST_PROTOCOL`] and is the honest one:
+    /// every frame here except the ones listed above it shipped before the
+    /// wire had a number, so they are all as old as the wire itself. A frame
+    /// added from now on gets an arm here in the same commit that bumps
+    /// [`compat::PROTOCOL_VERSION`], and [`versioned_frames`] is where it is
+    /// named for `ast compat` and the e2e.
+    ///
+    /// [`compat::frame_too_new`]: crate::compat::frame_too_new
+    /// [`compat::FIRST_PROTOCOL`]: crate::compat::FIRST_PROTOCOL
+    /// [`compat::PROTOCOL_VERSION`]: crate::compat::PROTOCOL_VERSION
+    pub fn since(&self) -> u32 {
+        match self {
+            Request::Compat => 2,
+            _ => crate::compat::FIRST_PROTOCOL,
+        }
+    }
+
+    /// What this frame is called on the wire, for the frames whose age is
+    /// worth naming.
+    ///
+    /// Only the versioned ones, because only they are ever refused for their
+    /// version, and a refusal that cannot say which command it is about is
+    /// half a sentence. Everything else answers `None` and is never in that
+    /// position.
+    pub fn versioned_name(&self) -> Option<&'static str> {
+        match self {
+            Request::Compat => Some("compat"),
+            _ => None,
+        }
+    }
+
+    /// Whether this frame may be sent to a peer speaking `spoken`.
+    pub fn speakable_at(&self, spoken: u32) -> bool {
+        self.since() <= spoken
+    }
+
     /// Whether an instance in conflict will answer this request.
     ///
     /// `rename` is the remedy, so it must go through. `status` and `down` go
@@ -634,25 +714,37 @@ impl Request {
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Response {
     Ok,
-    /// Reply to [`Request::Ping`], carrying the daemon's crate version and
-    /// the build it was compiled from.
+    /// Reply to [`Request::Ping`]: the daemon's crate/build identity and the
+    /// range of wire versions it speaks.
     ///
     /// A daemon older than this variant answers `Ping` with plain `Ok`, so
-    /// the *absence* of a version is itself the mismatch signal — which is
-    /// what makes this a backward-compatible change rather than a break. The
-    /// build id arrived later still and is optional for the same reason: a
-    /// daemon that predates it sends a `Pong` without one, and `None` means
-    /// "too old to say", never "no build".
-    ///
-    /// Version is what the handshake compares, because a version mismatch is
-    /// what breaks the wire. The build id is not a compatibility signal — it
-    /// is the identity an operator (or a release-candidate run) asserts on
-    /// when the question is whether this daemon is the artifact that was
-    /// shipped.
+    /// the *absence* of a version is itself a signal. One older than the
+    /// range answers with `version` and no `protocol`, and that absence is a
+    /// signal too — but a precise one: it is
+    /// [`compat::FIRST_PROTOCOL`](crate::compat::FIRST_PROTOCOL), the wire as
+    /// it stood before it had a number, and this build serves it. That is why
+    /// meeting one is an ordinary conversation rather than a restart.
     Pong {
         version: String,
+        /// Immutable build identity. Absent from a daemon that predates it;
+        /// it is diagnostic evidence, not a compatibility signal.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         build_id: Option<String>,
+        /// The newest wire the daemon speaks. Absent from a daemon that
+        /// predates the number.
+        #[serde(default)]
+        protocol: u32,
+        /// The oldest it still serves.
+        #[serde(default)]
+        min_protocol: u32,
+    },
+    /// Reply to [`Request::Compat`]: what the daemon speaks, and its own copy
+    /// of the skew matrix.
+    ///
+    /// Boxed because it is a table and the rest of this enum is a sentence:
+    /// unboxed it would set the size of every reply the daemon ever writes.
+    Compat {
+        compat: Box<crate::compat::Compat>,
     },
 
     // ---- instances -----------------------------------------------------------
@@ -868,11 +960,47 @@ impl std::fmt::Debug for SecretValue {
     }
 }
 
+impl Response {
+    /// The protocol version that introduced this frame. The mirror of
+    /// [`Request::since`], and checked in the same places: a daemon must not
+    /// answer at a version above the one in force, or the reply is a parse
+    /// error on a command that worked.
+    pub fn since(&self) -> u32 {
+        match self {
+            Response::Compat { .. } => 2,
+            _ => crate::compat::FIRST_PROTOCOL,
+        }
+    }
+
+    /// Whether this reply may be sent to a peer speaking `spoken`.
+    pub fn speakable_at(&self, spoken: u32) -> bool {
+        self.since() <= spoken
+    }
+}
+
+/// Every frame newer than the wire itself, and the version that brought it.
+///
+/// Printed by `ast compat` and walked by `scripts/e2e-skew.sh`, so the frames
+/// a given version may carry are data rather than a paragraph. A frame here
+/// and a frame in [`Request::since`] that disagree is a test failure, not a
+/// discovery made on a socket.
+pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
+    [("compat", Request::Compat.since())]
+        .into_iter()
+        .map(|(name, version)| (name.to_owned(), version))
+        .collect()
+}
+
 /// How a daemon that is too old to understand us gives itself away: serde
 /// rejects the request variant it has never heard of, and the daemon dutifully
 /// reports the parse error. Matching on the text is unlovely, but it is the
 /// only signal an old binary can send — and it is stable, because it is
 /// serde's own wording for an unknown enum variant.
+///
+/// With a negotiated version in force this is a fallback rather than the
+/// mechanism: `ast` knows before it sends a frame whether the daemon has it,
+/// so the only way to land here is a daemon that was replaced between the
+/// handshake and the command. It stays because that race is real.
 pub fn is_unknown_variant_error(message: &str) -> bool {
     message.contains("unknown variant")
 }
@@ -901,6 +1029,68 @@ mod tests {
         assert!(
             matches!(both, Response::Pong { build_id: Some(id), .. } if id == "0.0.2+abc123")
         );
+
+        let new: Response =
+            serde_json::from_str(r#"{"result":"pong","version":"0.0.2","protocol":2}"#).unwrap();
+        assert!(matches!(new, Response::Pong { version, protocol, .. }
+            if version == "0.0.2" && protocol == 2));
+    }
+
+    /// The handshake had to be readable by the builds it is meant to
+    /// negotiate with, or the first frame of every conversation would be the
+    /// one that broke it. Both directions, against the shapes that actually
+    /// exist on disk today.
+    #[test]
+    fn the_handshake_crosses_the_release_that_introduced_it() {
+        // A daemon that predates the range answers with a version and no
+        // numbers. That is not an unknown quantity — it is the wire this
+        // build grew out of, and `Speaks::claimed` says so.
+        let pong: Response = serde_json::from_str(r#"{"result":"pong","version":"0.0.1"}"#).unwrap();
+        let Response::Pong { protocol, min_protocol, .. } = pong else {
+            panic!("a pong is a pong")
+        };
+        assert_eq!(
+            crate::compat::Speaks::claimed(protocol, min_protocol),
+            crate::compat::Speaks::unversioned()
+        );
+
+        // And a `Ping` carrying the range is still the bare `Ping` an older
+        // daemon reads, because the fields hang off a variant it already
+        // parses as a map.
+        let wire = serde_json::to_string(&Request::Ping { protocol: 2, min_protocol: 1 }).unwrap();
+        assert_eq!(wire, r#"{"cmd":"ping","protocol":2,"min_protocol":1}"#);
+        // A build with no fields on the variant sees the tag and ignores the
+        // rest, which is what this stands in for.
+        let back: Request = serde_json::from_str(r#"{"cmd":"ping"}"#).unwrap();
+        assert!(matches!(back, Request::Ping { protocol: 0, min_protocol: 0 }));
+    }
+
+    #[test]
+    fn a_frame_is_as_old_as_the_wire_unless_it_says_otherwise() {
+        assert_eq!(Request::List.since(), crate::compat::FIRST_PROTOCOL);
+        assert_eq!(Request::Ping { protocol: 0, min_protocol: 0 }.since(), 1);
+        assert_eq!(Request::Compat.since(), 2);
+        assert!(!Request::Compat.speakable_at(1));
+        assert!(Request::Compat.speakable_at(2));
+        assert!(Request::List.speakable_at(1));
+    }
+
+    /// The table `ast compat` prints and the rule the code follows are the
+    /// same rule, or the matrix the e2e walks is fiction.
+    #[test]
+    fn the_frame_table_and_the_frames_agree() {
+        let table = versioned_frames();
+        assert_eq!(table.get("compat"), Some(&Request::Compat.since()));
+        for (name, version) in &table {
+            assert!(
+                *version > crate::compat::FIRST_PROTOCOL,
+                "{name} is listed as versioned but is as old as the wire"
+            );
+            assert!(
+                *version <= crate::compat::PROTOCOL_VERSION,
+                "{name} claims a version this build does not speak"
+            );
+        }
     }
 
     #[test]

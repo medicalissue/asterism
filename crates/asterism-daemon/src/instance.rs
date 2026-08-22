@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
+use asterism_core::compat;
 use asterism_core::durable;
 use asterism_core::hv::{ImageKind, RunState, STOP_DEADLINE};
 use asterism_core::instance::{local_host, Instance, Policy, Status};
@@ -48,11 +49,17 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
         // `ast` sends it before every command, and a daemon that has just
         // noticed a dead guest should have reconciled that before it says it
         // is well.
-        Request::Ping => {
+        Request::Ping { .. } => {
+            let ours = compat::ours();
             return Response::Pong {
                 version: VERSION.to_owned(),
                 build_id: Some(asterism_core::BUILD_ID.to_owned()),
-            }
+                protocol: ours.max,
+                min_protocol: ours.min,
+            };
+        }
+        Request::Compat => {
+            return Response::Compat { compat: Box::new(compat::Compat::current()) }
         }
         Request::List => return Response::Instances { instances: reg.list() },
         Request::Status { name } => {

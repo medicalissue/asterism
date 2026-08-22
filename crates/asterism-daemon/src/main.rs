@@ -46,6 +46,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tokio::sync::Mutex;
 
+use asterism_core::compat;
 use asterism_core::ipc;
 use asterism_core::orbit::Orbit;
 use asterism_core::protocol::{Request, Response};
@@ -112,10 +113,21 @@ async fn main() -> Result<()> {
     // it open. See `asterism_core::ipc`.
     private_state(&home)?;
 
-    // Before anything is served: a cpu-part swap this device was receiving
-    // when it died left a staging directory, and this is the "next contact"
-    // that clears it. It was never bootable and no shard row ever pointed at
-    // it, so there is nothing to consult first.
+    // First, and before every line below it. Each of them changes something
+    // — a staging directory is swept, a store is read and written back
+    // migrated, a restore is converged — and each would meet a newer build's
+    // state one file at a time, part-way through a startup that had already
+    // begun. This is the last moment at which refusing a downgrade costs
+    // nothing, so it is where the refusal is. See `asterism_core::compat`.
+    if let Some(note) = compat::stamp_home(&home)? {
+        eprintln!("astd: {note}");
+    }
+
+    // Now that this build has been established as one that may touch this
+    // home: a cpu-part swap this device was receiving when it died left a
+    // staging directory, and this is the "next contact" that clears it. It
+    // was never bootable and no shard row ever pointed at it, so there is
+    // nothing to consult first.
     swap::sweep_staging();
 
     let node = Node {
@@ -393,6 +405,16 @@ async fn serve(conn: Admitted, node: Node, mesh: Option<Arc<Mesh>>) -> Result<()
     // running, so dropping these when the loop ends *is* the teardown.
     let mut splices: Vec<Splice> = Vec::new();
 
+    // The version this connection is being spoken at.
+    //
+    // Per connection rather than per process, because a connection is the
+    // only thing that has one peer: `ast` opens one per command and hands
+    // over its range on the first frame, and a daemon replaced mid-session
+    // would otherwise inherit the last client's answer. Until a `Ping`
+    // arrives it is the wire that predates the number — the conservative
+    // reading, and the true one for the only clients that never send a range.
+    let mut spoken = compat::FIRST_PROTOCOL;
+
     loop {
         let line = match frames.next().await? {
             Framing::Frame(line) => line,
@@ -412,13 +434,59 @@ async fn serve(conn: Admitted, node: Node, mesh: Option<Arc<Mesh>>) -> Result<()
         let request = match serde_json::from_str::<Request>(&line) {
             Ok(req) => req,
             // A CLI newer than this daemon lands here, on a variant we have
-            // never heard of. The wording matters: `ast` classifies it and
-            // restarts us rather than showing the user a serde error.
+            // never heard of. With a negotiated version this is the race
+            // rather than the mechanism — the client knew what we speak
+            // before it sent anything — but the race is real, and the wording
+            // still matters: `ast` classifies it and restarts us rather than
+            // showing the user a serde error.
             Err(e) => {
                 write.send(&Response::Error { message: format!("bad request: {e}") }).await?;
                 continue;
             }
         };
+
+        // The first frame of the conversation settles what the rest of it is
+        // spoken in. Both ends run the same rule on the same pair of ranges,
+        // so neither has to be told the answer.
+        if let Request::Ping { protocol, min_protocol } = &request {
+            let theirs = compat::Speaks::claimed(*protocol, *min_protocol);
+            match compat::select(theirs) {
+                compat::Selection::Common(version) => spoken = version,
+                // No version in common. The refusal is a sentence rather than
+                // a dropped connection, because this is the one frame whose
+                // whole job is to be answerable by a build that cannot answer
+                // anything else.
+                // Both halves are on this device, so the refusal is written
+                // for a half-finished local upgrade rather than for a skew
+                // between two machines — and from the reader's side, which is
+                // the terminal that ran `ast`.
+                compat::Selection::TooOld { theirs, ours } => {
+                    let why = compat::client_too_old(theirs, ours, VERSION);
+                    write.refuse(&format!("{why:#}")).await;
+                    break;
+                }
+                compat::Selection::TooNew { theirs, ours } => {
+                    let why = compat::client_too_new(theirs, ours, VERSION);
+                    write.refuse(&format!("{why:#}")).await;
+                    break;
+                }
+            }
+        }
+
+        // A frame from after the version in force. A well-behaved `ast` never
+        // sends one — it holds the same table — so this is the daemon that
+        // was replaced between a client's handshake and its command. Named,
+        // because "unknown variant" is what this exists to stop being the
+        // answer.
+        if !request.speakable_at(spoken) {
+            let what = request
+                .versioned_name()
+                .map(|name| format!("the {name} frame"))
+                .unwrap_or_else(|| "that request".to_owned());
+            let refusal = compat::frame_too_new(&what, request.since(), spoken, "this daemon");
+            write.send(&Response::Error { message: format!("{refusal:#}") }).await?;
+            continue;
+        }
 
         // Pairing is a conversation, not a question — a ticket to print, a
         // code to compare, a verdict to take — so it borrows the connection
@@ -470,9 +538,25 @@ async fn serve(conn: Admitted, node: Node, mesh: Option<Arc<Mesh>>) -> Result<()
         }
 
         let response = dispatch(request, &node, mesh.as_ref()).await;
-        write.send(&response).await?;
+        write.send(&at_most(response, spoken)).await?;
     }
     Ok(())
+}
+
+/// A reply this connection's peer can read, or a sentence saying why there
+/// isn't one.
+///
+/// The mirror of the check on the way in, and it is not redundant with it: a
+/// request old enough to send is not automatically a request whose *answer*
+/// is, once a later version adds a richer reply to an existing command. A
+/// peer that gets a variant it has never heard of sees a parse error on a
+/// command that worked, which is the worst of both.
+fn at_most(response: Response, spoken: u32) -> Response {
+    if response.speakable_at(spoken) {
+        return response;
+    }
+    let refusal = compat::frame_too_new("that reply", response.since(), spoken, "this client");
+    Response::Error { message: format!("{refusal:#}") }
 }
 
 /// Routes one request that came off the unix socket.
@@ -557,14 +641,23 @@ pub(crate) async fn handle(req: Request, node: &Node) -> Response {
     // daemon that has just noticed a dead guest writing that down before it
     // says it is well — and a courtesy is exactly what `try_lock` is for. It
     // happens when the registry is free and is skipped when it is not.
-    if matches!(req, Request::Ping) {
+    if let Request::Ping { .. } = req {
         if let Ok(mut reg) = node.shard.try_lock() {
             instance::reconcile(&mut reg);
         }
+        let ours = compat::ours();
         return Response::Pong {
             version: VERSION.to_owned(),
             build_id: Some(asterism_core::BUILD_ID.to_owned()),
+            protocol: ours.max,
+            min_protocol: ours.min,
         };
+    }
+    // What this build speaks, answered from the constants rather than from
+    // anything on disk, so it is the one command that still works when the
+    // registry is wedged. `ast` merges it with its own view.
+    if let Request::Compat = req {
+        return Response::Compat { compat: Box::new(compat::Compat::current()) };
     }
     if secret::is_source_request(&req) {
         return secret::serve_source(req).await;
@@ -629,7 +722,7 @@ mod tests {
 
         let answered = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            handle(Request::Ping, &node),
+            handle(Request::Ping { protocol: 0, min_protocol: 0 }, &node),
         )
         .await
         .expect("the handshake waited on the registry");
@@ -638,6 +731,7 @@ mod tests {
             Response::Pong {
                 version,
                 build_id: Some(build_id),
+                ..
             } if version == VERSION && build_id == asterism_core::BUILD_ID
         ));
 
@@ -652,7 +746,7 @@ mod tests {
     async fn a_free_registry_is_still_reconciled_by_the_handshake() {
         let tmp = tempfile::tempdir().unwrap();
         let node = node_on(tmp.path());
-        let answered = handle(Request::Ping, &node).await;
+        let answered = handle(Request::Ping { protocol: 0, min_protocol: 0 }, &node).await;
         assert!(matches!(answered, Response::Pong { .. }));
         assert!(
             node.shard.try_lock().is_ok(),

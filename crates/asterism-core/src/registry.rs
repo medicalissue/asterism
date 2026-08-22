@@ -158,7 +158,20 @@ impl Shard {
         // the same recovery again, and the second time the backup may be the
         // broken file.
         if repaired.is_some() || migrated {
-            if let Err(e) = shard.save() {
+            // A migration goes through `migrate_json` and a repair does not,
+            // and the difference is what each one would lose. A repair is
+            // already reading from the backup, so insisting on keeping one
+            // would be insisting on keeping the broken file. A migration
+            // rewrites the only copy in the only shape the previous build can
+            // read, so it fails rather than proceed without one — and what it
+            // leaves at `.bak` is what a downgrade would be pointed back at.
+            let written = if migrated {
+                durable::migrate_json(&shard.path, what, &shard.file())
+                    .context("migrating this device's registry shard")
+            } else {
+                shard.save()
+            };
+            if let Err(e) = written {
                 eprintln!("astd: could not write the repaired registry back: {e:#}");
             }
         }
@@ -227,12 +240,13 @@ impl Shard {
     }
 
     pub fn save(&self) -> Result<()> {
-        let file = ShardFile {
-            version: SHARD_VERSION,
-            instances: self.instances.clone(),
-        };
-        durable::commit_json(&self.path, &file)
+        durable::commit_json(&self.path, &self.file())
             .context("committing this device's registry shard")
+    }
+
+    /// This shard in the shape it is written in.
+    fn file(&self) -> ShardFile {
+        ShardFile { version: SHARD_VERSION, instances: self.instances.clone() }
     }
 
     /// Define an instance in this shard, sourcing its cpu and ram from
@@ -1163,6 +1177,36 @@ mod tests {
         assert_eq!(inst.status, Status::Stopped);
         // Shape falls back to the default, as it did before.
         assert_eq!(inst.shape.cpus, Shape::default().cpus);
+    }
+
+    /// The migration a downgrade would have to be pointed back at. An
+    /// upgraded shard is rewritten in the envelope shape, and the shape the
+    /// previous build reads is left at `.bak` — byte for byte, because
+    /// anything less is a shape nobody can read.
+    #[test]
+    fn migrating_a_legacy_shard_leaves_the_old_shape_at_bak() {
+        let path = scratch();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let legacy = r#"{"dev":{"id":"6f1c","name":"dev","anchor":"laptop","status":"stopped",
+                "created_at":1700000000,"volumes":[],"image":"debian:13",
+                "machine":{"backend":"qemu","machine_type":"virt","cpu":"host","hv_version":"9.0.0"}}}"#;
+        std::fs::write(&path, legacy).unwrap();
+
+        let shard = Shard::load(&path).unwrap();
+        assert!(shard.get("dev").is_ok());
+
+        let live = std::fs::read_to_string(&path).unwrap();
+        let envelope: serde_json::Value = serde_json::from_str(&live).unwrap();
+        assert_eq!(
+            envelope.get("version").and_then(serde_json::Value::as_u64),
+            Some(SHARD_VERSION as u64),
+            "the live shard is in this build's shape"
+        );
+        assert_eq!(
+            std::fs::read_to_string(durable::backup_path(&path)).unwrap(),
+            legacy,
+            "the pre-migration shape is on the disk exactly as it was"
+        );
     }
 
     #[test]

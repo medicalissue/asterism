@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
+use asterism_core::compat;
 use asterism_core::instance::{Instance, Shape};
 use asterism_core::orbit::DeviceStatus;
 use asterism_core::paths;
@@ -94,8 +95,9 @@ pub fn devices() -> Result<Vec<DeviceStatus>> {
 /// `None` there says the same thing about a narrower gap — the daemon is
 /// running and cannot tell us which build it is.
 pub fn daemon_build() -> Result<(String, Option<String>)> {
-    match send(&Request::Ping)? {
-        Response::Pong { version, build_id } => Ok((version, build_id)),
+    let ours = compat::ours();
+    match send(&Request::Ping { protocol: ours.max, min_protocol: ours.min })? {
+        Response::Pong { version, build_id, .. } => Ok((version, build_id)),
         Response::Ok => Ok(("older than 0.0.2".to_owned(), None)),
         Response::Error { message } => bail!(message),
         other => bail!("unexpected reply from astd: {other:?}"),

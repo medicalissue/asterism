@@ -9,10 +9,12 @@
 //! hypervisor boundary, [`volume`] is the block
 //! storage a device contributes to the pool, [`secret`] and [`rewrite`] are
 //! the secrets data plane's model and its one substitution rule, and
-//! [`protocol`] is the CLI <-> daemon wire and [`ipc`] is the door that
-//! wire arrives through. [`verify`] is the gate every boot input passes
-//! through on its way into the store and out of it again.
+//! [`protocol`] is the CLI <-> daemon wire, [`ipc`] is the door that
+//! wire arrives through, and [`compat`] is which version of it two vintages
+//! settle on. [`verify`] is the gate every boot input passes through on its
+//! way into the store and out of it again.
 
+pub mod compat;
 pub mod cow;
 pub mod durable;
 pub mod hv;
@@ -35,10 +37,12 @@ pub mod tools;
 pub mod verify;
 pub mod volume;
 
-/// Version of the `astd`/`ast` pair this binary was built from. The CLI and
-/// the daemon must agree on it: the wire protocol is a serde enum, so a
-/// daemon left running across an upgrade answers newer requests with an
-/// "unknown variant" parse error rather than anything a user could act on.
+/// Version of the `astd`/`ast` pair this binary was built from.
+///
+/// Reported and printed; never compared. What decides whether two vintages
+/// can talk is [`compat::PROTOCOL_VERSION`], which moves when the wire moves
+/// and not when a patch release does — comparing these strings is what used
+/// to make every upgrade a forced daemon replacement.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The exact build this binary came from: `<version>+<source>`, where source

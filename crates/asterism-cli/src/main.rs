@@ -26,6 +26,7 @@ use clap::{Parser, Subcommand};
 
 use asterism_core::hv::ImageKind;
 use asterism_core::instance::{now_unix, Instance, PortForward, Restart, Shape};
+use asterism_core::compat;
 use asterism_core::ipc;
 use asterism_core::proc::{ProcId, Signal};
 use asterism_core::protocol::{self, Request, Response};
@@ -385,6 +386,17 @@ enum Command {
         #[arg(value_name = "DEVICE")]
         peer: String,
     },
+    /// What wire versions this build speaks, what the daemon speaks, and
+    /// what the two of them have settled on.
+    ///
+    /// The command to run when an upgrade is half-done and something is
+    /// refusing. It answers from this build's own table even when the daemon
+    /// cannot contribute, so it works in exactly the situation it exists for.
+    Compat {
+        /// Print the whole table, including the skew matrix, as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Install, remove or inspect astd as a service the OS keeps running.
     #[command(subcommand)]
     Service(ServiceCommand),
@@ -688,6 +700,10 @@ fn main() -> Result<()> {
             local_only("ping", device.as_deref())?;
             return ping(&peer);
         }
+        Command::Compat { json } => {
+            local_only("compat", device.as_deref())?;
+            return print_compat(json);
+        }
         Command::Service(cmd) => {
             local_only("service", device.as_deref())?;
             return service_command(cmd);
@@ -767,6 +783,7 @@ fn main() -> Result<()> {
         | Response::Log { .. }
         | Response::SshEndpoint { .. }
         | Response::Pong { .. }
+        | Response::Compat { .. }
         | Response::Devices { .. }
         | Response::Ticket { .. }
         | Response::Sas { .. }
@@ -940,6 +957,113 @@ fn ping(device: &str) -> Result<()> {
         }
         Response::Error { message } => bail!(message),
         other => bail!("unexpected reply from astd: {other:?}"),
+    }
+}
+
+/// `ast compat` — what this build speaks, what the daemon speaks, and what
+/// the two of them settled on.
+///
+/// The command a half-finished upgrade sends people to, so it is built to
+/// survive one. This build's own table needs nothing but constants; the
+/// daemon's half is asked for and may not arrive, and when it does not the
+/// output says which half is missing rather than failing whole. The daemon
+/// leg is also the one command in this CLI that is newer than the wire it
+/// travels on, so it is the working example of a frame being withheld: a
+/// daemon at protocol 1 is never sent it.
+fn print_compat(json: bool) -> Result<()> {
+    let mut table = compat::Compat::current();
+    let mut trouble: Option<String> = None;
+
+    match Client::open() {
+        Ok(mut client) => {
+            let speaking = client.spoken;
+            let facts = client.daemon.clone();
+            // Ask the daemon for its own table only if the version in force
+            // carries the frame. This is the whole mechanism, used on itself.
+            let daemon_asterism = if Request::Compat.speakable_at(speaking) {
+                match client.ask(&Request::Compat) {
+                    Ok(Response::Compat { compat }) => compat.asterism,
+                    Ok(Response::Error { message }) => {
+                        trouble = Some(message);
+                        facts.version.clone()
+                    }
+                    Ok(other) => {
+                        trouble = Some(format!("unexpected reply from astd: {other:?}"));
+                        facts.version.clone()
+                    }
+                    Err(e) => {
+                        trouble = Some(format!("{e:#}"));
+                        facts.version.clone()
+                    }
+                }
+            } else {
+                trouble = Some(format!(
+                    "astd {} speaks protocol {speaking}, which predates the compat \
+                     frame — the daemon's own table is not available, and everything \
+                     below is this build's",
+                    facts.version
+                ));
+                facts.version.clone()
+            };
+            table.daemon = Some(compat::DaemonView {
+                asterism: daemon_asterism,
+                protocol: facts.speaks.max,
+                min_supported: facts.speaks.min,
+                speaking,
+            });
+        }
+        Err(e) => trouble = Some(format!("{e:#}")),
+    }
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&table)?);
+        return Ok(());
+    }
+
+    println!("ast {}  speaks {}", table.asterism, describe(table.min_supported, table.protocol));
+    match &table.daemon {
+        Some(daemon) => println!(
+            "astd {}  speaks {}  —  talking at protocol {}",
+            daemon.asterism,
+            describe(daemon.min_supported, daemon.protocol),
+            daemon.speaking
+        ),
+        None => println!("astd       not reachable"),
+    }
+    if let Some(why) = &trouble {
+        println!("\n{why}");
+    }
+
+    println!("\nframes newer than the wire itself:");
+    for (name, version) in &table.frames {
+        println!("  {name:<20} protocol {version}");
+    }
+    println!("\non-disk formats this build writes:");
+    for (name, version) in &table.stores {
+        println!("  {name:<20} version {version}");
+    }
+    println!("\nwhat this build does about a peer that speaks:");
+    println!("  {:<18} {:<9} {:<9} then", "peer speaks", "as daemon", "as peer");
+    for row in &table.matrix {
+        println!(
+            "  {:<18} {:<9} {:<9} {}",
+            describe(row.peer_min, row.peer_max),
+            row.daemon_action,
+            row.peer_action,
+            match row.speaks {
+                Some(v) => format!("protocol {v}"),
+                None => "nothing in common".to_owned(),
+            }
+        );
+    }
+    Ok(())
+}
+
+fn describe(min: u32, max: u32) -> String {
+    if min == max {
+        format!("protocol {max}")
+    } else {
+        format!("protocols {min}-{max}")
     }
 }
 
@@ -1705,50 +1829,185 @@ fn drain(file: &mut File, out: &mut std::io::Stdout) -> Result<u64> {
 
 // ---- daemon plumbing -------------------------------------------------------
 
-/// Send a request, having first established that the daemon on the other
-/// end speaks our version of the protocol.
+/// Send a request to this device's daemon at a version they have agreed on.
+///
+/// Every connection negotiates. That is one extra round trip on a unix socket
+/// per command, and it buys the thing a once-per-process handshake could not:
+/// the version in force belongs to the connection carrying the frame, so a
+/// daemon replaced between two commands is met by a fresh answer rather than
+/// by the last one's.
 fn send(request: &Request) -> Result<Response> {
-    ensure_current_daemon()?;
-    let response = send_once(request)?;
+    let mut client = Client::open()?;
+    let response = client.ask(request)?;
     // Belt and braces: a daemon that was replaced between the handshake and
-    // now still cannot produce a baffling serde error for the user.
+    // the request still cannot produce a baffling serde error for the user.
+    // The negotiation makes this a race rather than the mechanism, and a race
+    // is exactly what a retry is for.
     if let Response::Error { message } = &response {
         if protocol::is_unknown_variant_error(message) {
-            retire_stale_daemon()?;
-            return send_once(request);
+            return Client::open()?.ask(request);
         }
     }
     Ok(response)
 }
 
-/// Connect to astd, spawning it first if the socket is not answering.
-fn send_once(request: &Request) -> Result<Response> {
-    exchange(request, None)
+/// One connection to this device's daemon, and the wire version it is being
+/// spoken at.
+struct Client {
+    stream: UnixStream,
+    /// The version both ends settled on. Every frame sent on this connection
+    /// is at or below it.
+    spoken: u32,
+    /// What the daemon said about itself, for `ast compat`.
+    daemon: DaemonFacts,
 }
 
-/// One request, one reply, optionally with a limit on how long the reply may
-/// take to start arriving.
-///
-/// Only the handshake passes a deadline. Everything else is a command whose
-/// honest duration is whatever the work takes — `ast up` on an image that has
-/// to be converted is minutes — so a deadline on those would be a timeout on
-/// success.
-fn exchange(request: &Request, patience: Option<Duration>) -> Result<Response> {
-    let stream = connect()?;
-    stream.set_read_timeout(patience)?;
+/// What the daemon answered the handshake with.
+#[derive(Clone)]
+struct DaemonFacts {
+    version: String,
+    speaks: asterism_core::compat::Speaks,
+}
 
-    let mut writer = stream.try_clone()?;
+impl Client {
+    /// Connect, agree a version, and be ready to send.
+    ///
+    /// The daemon that answers may be older than this build, newer than it,
+    /// or neither, and the three have three different answers — see
+    /// [`asterism_core::compat`]. Only the first is a restart, and it is a
+    /// restart because restarting a process this build can restart *is* the
+    /// upgrade. A newer daemon is never signalled.
+    fn open() -> Result<Client> {
+        let (stream, facts) = handshake()?;
+        let ours = compat::ours();
+        match compat::select(facts.speaks) {
+            compat::Selection::Common(spoken) => Ok(Client { stream, spoken, daemon: facts }),
+            // Older than anything this build serves. Replace it once, and
+            // then insist: a daemon that comes back still too old is a
+            // situation only a human can end, and killing it repeatedly is
+            // not a plan.
+            compat::Selection::TooOld { .. } => {
+                eprintln!(
+                    "ast: astd {} speaks {}, and this is ast {VERSION} which serves \
+                     nothing older than protocol {} — restarting the daemon",
+                    facts.version,
+                    facts.speaks.describe(),
+                    ours.min,
+                );
+                retire_stale_daemon()?;
+                let (stream, facts) = handshake()?;
+                match compat::select(facts.speaks) {
+                    compat::Selection::Common(spoken) => {
+                        Ok(Client { stream, spoken, daemon: facts })
+                    }
+                    _ => bail!(
+                        "astd {} speaks {} after a restart, and this is ast {VERSION} \
+                         speaking {}. Stop astd by hand and try again.",
+                        facts.version,
+                        facts.speaks.describe(),
+                        ours.describe(),
+                    ),
+                }
+            }
+            // Newer, and with nothing in common. Left alone on purpose.
+            compat::Selection::TooNew { theirs, ours } => Err(compat::too_new(
+                &format!("astd {}", facts.version),
+                theirs,
+                ours,
+            )),
+        }
+    }
+
+    /// One request, one reply, at the agreed version.
+    ///
+    /// No deadline: a command's honest duration is whatever the work takes —
+    /// `ast up` on an image that has to be converted is minutes — so a
+    /// timeout here would be a timeout on success. The handshake is the one
+    /// exchange with a clock on it, and it has already happened.
+    fn ask(&mut self, request: &Request) -> Result<Response> {
+        self.refuse_unspeakable(request)?;
+        self.stream.set_read_timeout(None)?;
+        write_line(&mut self.stream, request)?;
+        let mut reader = BufReader::new(self.stream.try_clone()?);
+        match read_frame(&mut reader)? {
+            Some(reply) => Ok(serde_json::from_str(&reply)?),
+            None => bail!("astd closed the connection without answering"),
+        }
+    }
+
+    /// Stop a frame the daemon cannot read before it is written.
+    ///
+    /// This is what the negotiated version is *for*. Without it the frame
+    /// goes out, serde rejects a variant the daemon has never heard of, and
+    /// the user is shown `bad request: unknown variant` — a true statement
+    /// about nothing they did. With it they are told which command needs
+    /// which version, while every other command keeps working.
+    fn refuse_unspeakable(&self, request: &Request) -> Result<()> {
+        if request.speakable_at(self.spoken) {
+            return Ok(());
+        }
+        let what = request
+            .versioned_name()
+            .map(|name| format!("`ast {name}`"))
+            .unwrap_or_else(|| "that command".to_owned());
+        Err(compat::frame_too_new(
+            &what,
+            request.since(),
+            self.spoken,
+            &format!("astd {} on this device", self.daemon.version),
+        ))
+    }
+}
+
+/// Open a connection and exchange ranges on it.
+///
+/// The first frame either way, and the only exchange with a clock on it:
+/// astd answers this without touching its registry, so a daemon that will not
+/// answer *this* is wedged rather than busy — and since it goes in front of
+/// every command, a hang here is a hang everywhere with nothing on the screen
+/// to say so.
+fn handshake() -> Result<(UnixStream, DaemonFacts)> {
+    let stream = connect()?;
+    stream.set_read_timeout(Some(ipc::HANDSHAKE_DEADLINE))?;
+    let ours = compat::ours();
+    write_line(&stream, &Request::Ping { protocol: ours.max, min_protocol: ours.min })?;
+
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let reply = match read_frame(&mut reader) {
+        Ok(Some(reply)) => reply,
+        Ok(None) => bail!("astd closed the connection without answering"),
+        Err(e) if timed_out(&e) => return Err(wedged(ipc::HANDSHAKE_DEADLINE)),
+        Err(e) => return Err(e),
+    };
+    let facts = match serde_json::from_str::<Response>(&reply)? {
+        Response::Pong { version, protocol, min_protocol, .. } => DaemonFacts {
+            version,
+            speaks: compat::Speaks::claimed(protocol, min_protocol),
+        },
+        // A daemon older than the `Pong` reply answers `Ping` with plain
+        // `Ok`, and one older still rejects the variant. Both are the wire
+        // that predates the number, which this build serves — so both are
+        // spoken to rather than replaced.
+        Response::Ok => {
+            DaemonFacts { version: "(older)".to_owned(), speaks: compat::Speaks::unversioned() }
+        }
+        Response::Error { message } if protocol::is_unknown_variant_error(&message) => {
+            DaemonFacts { version: "(older)".to_owned(), speaks: compat::Speaks::unversioned() }
+        }
+        // The daemon refused the handshake in words. That is a sentence
+        // written for the user — a peer out of the window says why here —
+        // so it is passed through rather than summarised.
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected reply to ping from astd: {other:?}"),
+    };
+    Ok((stream, facts))
+}
+
+fn write_line<W: Write>(mut out: W, request: &Request) -> Result<()> {
     let mut line = serde_json::to_string(request)?;
     line.push('\n');
-    writer.write_all(line.as_bytes())?;
-
-    let mut reader = BufReader::new(stream);
-    match read_frame(&mut reader) {
-        Ok(Some(reply)) => Ok(serde_json::from_str(&reply)?),
-        Ok(None) => bail!("astd closed the connection without answering"),
-        Err(e) if patience.is_some() && timed_out(&e) => Err(wedged(patience.unwrap_or_default())),
-        Err(e) => Err(e),
-    }
+    out.write_all(line.as_bytes())?;
+    Ok(())
 }
 
 /// Open a connection to this home's daemon, starting one if there is none.
@@ -1878,18 +2137,20 @@ struct Conversation {
 
 impl Conversation {
     fn open(request: &Request) -> Result<Self> {
-        ensure_current_daemon()?;
-        let stream = connect()?;
+        // Through the same negotiated door as everything else: a
+        // conversation is a longer exchange on the same wire, not a
+        // different one, so it settles its version the same way.
+        let client = Client::open()?;
+        client.refuse_unspeakable(request)?;
+        client.stream.set_read_timeout(None)?;
+        let stream = client.stream;
         let mut conn = Self { write: stream.try_clone()?, read: BufReader::new(stream) };
         conn.send(request)?;
         Ok(conn)
     }
 
     fn send(&mut self, request: &Request) -> Result<()> {
-        let mut line = serde_json::to_string(request)?;
-        line.push('\n');
-        self.write.write_all(line.as_bytes())?;
-        Ok(())
+        write_line(&mut self.write, request)
     }
 
     fn next(&mut self) -> Result<Response> {
@@ -1914,62 +2175,18 @@ fn wait_for_socket(sock: &std::path::Path) -> Result<UnixStream> {
     }
 }
 
-// ---- version handshake -----------------------------------------------------
+// ---- retiring a daemon this build has outgrown -------------------------------
 //
-// The wire protocol is a pair of serde enums, so a daemon left running
-// across an upgrade does not fail politely: it rejects the first request
-// carrying a variant it has never heard of, and the user sees
-// `bad request: unknown variant ...`. That is a true statement about
-// nothing the user did. So `ast` asks the daemon its version before
-// trusting it, and retires it if the answer is wrong.
-
-/// Once per process: make sure the daemon we are about to talk to is ours.
-fn ensure_current_daemon() -> Result<()> {
-    use std::sync::OnceLock;
-    static CHECKED: OnceLock<()> = OnceLock::new();
-    if CHECKED.get().is_some() {
-        return Ok(());
-    }
-
-    if let Some(found) = stale_version()? {
-        eprintln!(
-            "ast: astd {found} is running, but this is ast {VERSION} — restarting the daemon"
-        );
-        retire_stale_daemon()?;
-        if let Some(still) = stale_version()? {
-            bail!(
-                "astd {still} is still running after a restart, but this is ast {VERSION}. \
-                 Stop it by hand and try again."
-            );
-        }
-    }
-
-    let _ = CHECKED.set(());
-    Ok(())
-}
-
-/// The version of the running daemon if it disagrees with ours, or `None`
-/// if it matches. Spawns a daemon if none is running.
-fn stale_version() -> Result<Option<String>> {
-    // The one exchange `ast` puts a clock on. astd answers the handshake
-    // without touching its registry, so a daemon that will not answer *this*
-    // is wedged rather than busy — and since the handshake goes in front of
-    // every command, a hang here is a hang everywhere, with nothing on the
-    // screen to say so.
-    match exchange(&Request::Ping, Some(ipc::HANDSHAKE_DEADLINE))? {
-        Response::Pong { version, .. } if version == VERSION => Ok(None),
-        Response::Pong { version, .. } => Ok(Some(version)),
-        // A daemon older than the Pong reply answers Ping with plain Ok.
-        // The absence of a version is the mismatch.
-        Response::Ok => Ok(Some(format!("older than {VERSION}"))),
-        // Older still, or a build whose Ping means something else entirely.
-        Response::Error { message } if protocol::is_unknown_variant_error(&message) => {
-            Ok(Some(format!("older than {VERSION}")))
-        }
-        Response::Error { message } => bail!(message),
-        other => bail!("unexpected reply to ping from astd: {other:?}"),
-    }
-}
+// One direction only, and that asymmetry is the point. A daemon older than
+// anything this build serves is replaced, because restarting a process this
+// build can restart is what an upgrade *is*. A daemon newer than this build
+// is never touched: taking its place would downgrade the device, and it may
+// hold state this build would drop. See `asterism_core::compat`.
+//
+// Neither of those is a version *difference*. A daemon one release behind
+// that still serves a wire this build speaks is left running and spoken to at
+// that wire — which is what stops a patch release from killing a daemon that
+// is supervising live guests for no reason at all.
 
 /// Stop the daemon that is running and start ours in its place.
 fn retire_stale_daemon() -> Result<()> {
@@ -2141,18 +2358,40 @@ fn running_daemon() -> Option<(String, Option<String>)> {
     // Serialized from the type rather than written out by hand: the wire
     // spelling of a request is the protocol's business, and a literal here
     // would be a second copy of it to keep in step.
-    let mut line = serde_json::to_string(&Request::Ping).ok()?;
+    let ours = compat::ours();
+    let mut line = serde_json::to_string(&Request::Ping {
+        protocol: ours.max,
+        min_protocol: ours.min,
+    })
+    .ok()?;
     line.push('\n');
     writer.write_all(line.as_bytes()).ok()?;
     let mut reply = String::new();
     BufReader::new(stream).read_line(&mut reply).ok()?;
     match serde_json::from_str(&reply).ok()? {
-        Response::Pong { version, build_id } => Some((version, build_id)),
+        Response::Pong { version, build_id, .. } => Some((version, build_id)),
         // A daemon too old to send a `Pong` still answered, which is the
         // fact that matters: it is running, and it is old.
         Response::Ok => Some((format!("older than {VERSION}"), None)),
         _ => None,
     }
+}
+
+/// Ask an already-running daemon one protocol-1 question without starting
+/// or replacing anything.
+///
+/// The daemon accepts the original, unnumbered wire until a `Ping` settles a
+/// newer one, and `List` is part of that first wire. This is deliberately not
+/// `Client::open`: a bug report observes whether a daemon exists and must not
+/// make one exist while collecting that answer.
+fn send_to_running(request: &Request) -> Option<Response> {
+    let mut stream = UnixStream::connect(paths::socket_path()).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+    stream.set_write_timeout(Some(Duration::from_secs(3))).ok()?;
+    write_line(&mut stream, request).ok()?;
+    let mut reader = BufReader::new(stream);
+    let reply = read_frame(&mut reader).ok()??;
+    serde_json::from_str(&reply).ok()
 }
 
 /// Where the desktop app lives once it is installed. One place, because a
@@ -2240,10 +2479,10 @@ fn print_bugreport() -> Result<()> {
     // This device's own shard, not the orbit: a bug report that went out on
     // the mesh would hang on a device that is asleep, which is exactly when
     // somebody is writing one.
-    // `and_then`, not `and`: the argument to `and` is evaluated whether or
-    // not the option is `Some`, and evaluating this one means `send_once`
-    // spawning a daemon — which is precisely what a bug report must not do.
-    match running_daemon().and_then(|_| send_once(&Request::List).ok()) {
+    // `and_then`, not `and`: do not send the list probe unless the daemon
+    // answered the identity probe first. Both helpers connect only to an
+    // existing socket and never create or replace a process.
+    match running_daemon().and_then(|_| send_to_running(&Request::List)) {
         Some(Response::Instances { instances }) if instances.is_empty() => {
             println!("none on this device")
         }
