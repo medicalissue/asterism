@@ -726,7 +726,7 @@ fn boot_time_us() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Child, Command};
 
     /// A process that has exec'd `sleep` and will stay there for the test.
     ///
@@ -1027,15 +1027,17 @@ mod tests {
     ///
     /// `sleep 30 <path>` is not a fixture: GNU sleep treats the path as an
     /// invalid second duration and exits immediately, while other sleep
-    /// implementations disagree about extra operands. `tail -f` is a
-    /// portable Unix long-lived helper and keeps the path in its own argv.
-    /// Return the executable name observed from the kernel as well, since
-    /// `/usr/bin/tail` and `/bin/tail` are both valid installations.
+    /// implementations disagree about extra operands. The shell keeps the
+    /// path as its own argument while its short-lived `sleep` child receives
+    /// only a valid duration, which works with BSD and GNU `sleep`.
+    ///
+    /// Return the executable name observed from the kernel as well: `/bin/sh`
+    /// is an alias on some hosts, and adoption compares executable identities
+    /// exactly.
     fn holder(path: &Path) -> (Child, String) {
-        let child = Command::new("tail")
-            .args(["-f", "/dev/null"])
+        let child = Command::new("/bin/sh")
+            .args(["-c", "while :; do sleep 1; done", "asterism-proc-fixture"])
             .arg(path)
-            .stderr(Stdio::null())
             .spawn()
             .unwrap();
         let exec = ProcId::capture(child.id())
@@ -1084,7 +1086,7 @@ mod tests {
         let legacy_started_at = crate::instance::now_unix();
 
         // Somebody else's qemu, started 30s later, serving its own instance.
-        // `tail` stands in for the binary; the executable family is checked
+        // The shell stands in for the binary; the executable family is checked
         // separately and is not what this test turns on.
         let theirs = PathBuf::from("/tmp/asterism-adopt-test/instances/theirs/qmp.sock");
         let (mut foreign, exec) = holder(&theirs);
