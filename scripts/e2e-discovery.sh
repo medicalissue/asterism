@@ -116,6 +116,13 @@ path_of() {
   ASTERISM_HOME="$1" "$AST" devices 2>&1 | awk -v n="$2" '$1 == n { print $4 }'
 }
 
+# The measurement and transition fields for one peer. Device names contain no
+# spaces, so these stay stable even though the table is padded for humans.
+telemetry_of() {
+  ASTERISM_HOME="$1" "$AST" devices 2>&1 \
+    | awk -v n="$2" '$1 == n { print $5, $6, $7 }'
+}
+
 # A real path is direct or relay. On one machine it will usually be direct —
 # the two endpoints share a loopback — and that is a pass: the assertion is
 # that the word came off the live connection, not that it is a particular one.
@@ -185,6 +192,10 @@ echo "ok: B paired with A over a relay hint alone (A's IPs were hidden)"
 DEVICES="$(ASTERISM_HOME="$B" "$AST" devices 2>&1)" || fail "ast devices failed:"$'\n'"$DEVICES"
 grep -qE "^$A_NAME +\S+ +online" <<<"$DEVICES" || fail "B does not see A online:"$'\n'"$DEVICES"
 assert_real_path "ast devices reports B's path to A" "$(path_of "$B" "$A_NAME")"
+LINK="$(telemetry_of "$B" "$A_NAME")"
+grep -qE '^[0-9]+\.[0-9]ms +stored_address +connected$' <<<"$LINK" \
+  || fail "ast devices did not expose RTT and the initial path decision (got: $LINK)"
+echo "ok: ast devices exposes RTT, transition and recovery — $LINK"
 
 PING="$(ASTERISM_HOME="$B" "$AST" ping "$A_NAME" 2>&1)" || fail "ast ping failed:"$'\n'"$PING"
 grep -qE "^pong from $A_NAME \(\S+\) via (direct|relay) in [0-9]+\.[0-9]ms$" <<<"$PING" \
@@ -241,6 +252,10 @@ start_daemon "$B"
 expect "a peer at a wrong address is found by its key" "$INST" \
   env ASTERISM_HOME="$B" "$AST" --device "$A_NAME" ls
 assert_real_path "and reports a real path afterwards" "$(path_of "$B" "$A_NAME")"
+RECOVERY="$(telemetry_of "$B" "$A_NAME")"
+grep -qE '^[0-9]+\.[0-9]ms +stale_address_recovered_by_discovery +recovered$' <<<"$RECOVERY" \
+  || fail "stale-address recovery was not explicit and measured (got: $RECOVERY)"
+echo "ok: stale-address recovery is explicit and measured — $RECOVERY"
 
 # ...and the forgery has been corrected, rather than being re-learned wrong on
 # every command.
@@ -272,6 +287,10 @@ PING="$(ASTERISM_HOME="$B" "$AST" ping "$A_NAME" 2>&1)" \
   || fail "a peer known only by key could not be reached:"$'\n'"$PING"
 grep -qE "via (direct|relay)" <<<"$PING" || fail "no path reported:"$'\n'"$PING"
 echo "ok: a peer known only by its public key was found — $PING"
+RECOVERY="$(telemetry_of "$B" "$A_NAME")"
+grep -qE '^[0-9]+\.[0-9]ms +address_recovered_by_discovery +recovered$' <<<"$RECOVERY" \
+  || fail "address recovery from a public key was not explicit and measured (got: $RECOVERY)"
+echo "ok: key-only address recovery is explicit and measured — $RECOVERY"
 
 # ---- 8. across two real networks -------------------------------------------
 #

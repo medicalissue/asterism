@@ -71,9 +71,11 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
         }
         Request::Status { name } => {
             return match reg.get(&name) {
-                Ok(instance) => Response::Instance {
-                    instance: instance.clone(),
-                },
+                Ok(instance) => {
+                    let mut instance = instance.clone();
+                    volume::annotate_runtime(&mut instance).await;
+                    Response::Instance { instance }
+                }
                 Err(e) => Response::Error {
                     message: format!("{e:#}"),
                 },

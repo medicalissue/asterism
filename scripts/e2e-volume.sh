@@ -401,6 +401,11 @@ echo "ok: ast status shows the volume sourced from $B_NAME with its epoch"
 expect "the instance boots with the volume" "$INST  running" \
   env ASTERISM_HOME="$A" "$AST" up "$INST"
 
+PARTS="$(ASTERISM_HOME="$A" "$AST" status "$INST" 2>&1)"
+grep -qE "nbd over the mesh .* healthy .* direct .* [0-9]+\.[0-9]ms RTT .* connected \(guest_boot\)" <<<"$PARTS" \
+  || fail "the live volume has no measured path and initial transition:"$'\n'"$PARTS"
+echo "ok: status exposes the live volume's path, RTT and initial transition"
+
 SHARED_READ="$(in_guest "cat $SHARED_GUEST/host-marker")" \
   || fail "the guest could not read its same-device directory:"$'\n'"$SHARED_READ"
 grep -qF "$HOST_MARKER" <<<"$SHARED_READ" \
@@ -584,6 +589,11 @@ QSD_NEW="$(cat "$B/volumes/$VOL/nbd-e$E5.pid")"
   || fail "restarting a dead export moved the epoch, which would fence the holder"
 echo "ok: the export was restarted at the same epoch and the guest never noticed"
 
+PARTS="$(ASTERISM_HOME="$A" "$AST" status "$INST" 2>&1)"
+grep -qE "healthy .* direct .* [0-9]+\.[0-9]ms RTT .* MiB/s .* reconnected \(provider_returned\) .* recovery [0-9]+ms" <<<"$PARTS" \
+  || fail "the recovered volume did not expose throughput and recovery measurements:"$'\n'"$PARTS"
+echo "ok: status exposes provider recovery duration and measured bridge throughput"
+
 # ---- 8b. the consumer's daemon restarts under a live guest -----------------
 #
 # The bridge is a unix socket A's astd binds and an accept loop it runs, so
@@ -689,15 +699,35 @@ grep -qa "$MARKER3" "$B/volumes/$VOL/disk.raw" \
   || fail "what the guest wrote after the restart is not in B's image"
 echo "ok: the guest wrote to the volume after the restart, and the bytes are on B"
 
+PARTS="$(ASTERISM_HOME="$A" "$AST" status "$INST" 2>&1)"
+grep -qE "healthy .* reconnected \(daemon_restart\) .* recovery [0-9]+ms" <<<"$PARTS" \
+  || fail "the daemon restart recovery was not explicit and timed:"$'\n'"$PARTS"
+echo "ok: status names and times the daemon-restart recovery"
+
 # ---- 9. the provider goes away, and the consumer is honest about it --------
 #
 # The failure that matters is not "it broke" but "what does the user read". A
-# volume whose device is not answering must say so in one sentence naming the
-# device, not bury it in a hypervisor's error.
+# live guest is still alive when one sourced part disappears: status must keep
+# the instance running and degrade only that volume. A later boot must say
+# which device is absent rather than burying it in a hypervisor's error.
 
-expect "stop the guest first" "$INST  stopped" env ASTERISM_HOME="$A" "$AST" down "$INST"
 stop_daemon "$B" -KILL
 echo "ok: B's daemon was killed"
+
+DEGRADED=""
+for _ in $(seq 1 100); do
+  DEGRADED="$(ASTERISM_HOME="$A" "$AST" status "$INST" 2>&1 || true)"
+  if grep -q "degraded .* retrying (provider_loss)" <<<"$DEGRADED"; then break; fi
+  sleep 0.2
+done
+grep -q '^status:  running' <<<"$DEGRADED" \
+  || fail "provider loss was misreported as instance death:"$'\n'"$DEGRADED"
+grep -q "degraded .* retrying (provider_loss)" <<<"$DEGRADED" \
+  || fail "the absent provider did not degrade its volume part:"$'\n'"$DEGRADED"
+echo "ok: provider loss degrades only the remote part; the instance stays running"
+
+expect "the guest can still be stopped locally" "$INST  stopped" \
+  env ASTERISM_HOME="$A" "$AST" down "$INST"
 
 BOOT="$(ASTERISM_HOME="$A" "$AST" up "$INST" 2>&1 || true)"
 grep -qF "could not reach the device holding it: $B_NAME" <<<"$BOOT" \
