@@ -25,36 +25,28 @@ pub mod qemu;
 pub mod qmp;
 pub mod vz;
 
+#[cfg(test)]
+mod conformance;
+
 /// The backends this build has, constructed once.
 ///
 /// Once, because [`Hypervisor::probe`] caches: rebuilding them per call
 /// would re-run tool discovery and `codesign` on every request the daemon
 /// serves.
-struct Backends {
-    qemu: Arc<dyn Hypervisor>,
-    vz: Arc<dyn Hypervisor>,
-}
-
-fn backends() -> &'static Backends {
-    static BACKENDS: OnceLock<Backends> = OnceLock::new();
-    BACKENDS.get_or_init(|| Backends {
-        qemu: Arc::new(qemu::Qemu::new()),
-        vz: Arc::new(vz::Vz::new()),
-    })
+fn backends() -> &'static [Arc<dyn Hypervisor>] {
+    static BACKENDS: OnceLock<Vec<Arc<dyn Hypervisor>>> = OnceLock::new();
+    BACKENDS
+        .get_or_init(|| vec![Arc::new(qemu::Qemu::new()), Arc::new(vz::Vz::new())])
+        .as_slice()
 }
 
 /// A backend by its stable id, or the list of the ones that exist.
 pub fn by_id(id: &str) -> Result<Arc<dyn Hypervisor>> {
-    let b = backends();
-    match id {
-        qemu::ID => Ok(b.qemu.clone()),
-        vz::ID => Ok(b.vz.clone()),
-        other => bail!(
-            "no {other:?} backend in this build — there is {} and {}",
-            qemu::ID,
-            vz::ID
-        ),
+    if let Some(backend) = backends().iter().find(|backend| backend.id() == id) {
+        return Ok(backend.clone());
     }
+    let available = backends().iter().map(|backend| backend.id()).collect::<Vec<_>>().join(", ");
+    bail!("no {id:?} backend in this build — available backends: {available}")
 }
 
 /// The capabilities a backend must have for one create request.

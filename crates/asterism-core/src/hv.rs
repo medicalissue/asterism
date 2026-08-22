@@ -393,6 +393,43 @@ pub enum GuestEgress {
     },
 }
 
+/// One optional operation at the backend boundary.
+///
+/// This is deliberately enumerable.  [`Caps`] used to be a collection of
+/// fields that each caller interpreted separately, which made it possible to
+/// add a backend whose tests happened not to ask about one of them.  The
+/// backend conformance suite walks [`Capability::ALL`], so a new capability
+/// has one compiler-visible place to join the contract and every registered
+/// backend is made to answer it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capability {
+    LiveSnapshot,
+    DiskSnapshot,
+    LiveMigration,
+    DiskHotplug,
+    SharedDirectories,
+    NbdDisks,
+    ForeignArchitecture,
+    DirectKernelBoot,
+    PortForward,
+    GuestEgress,
+}
+
+impl Capability {
+    pub const ALL: [Capability; 10] = [
+        Capability::LiveSnapshot,
+        Capability::DiskSnapshot,
+        Capability::LiveMigration,
+        Capability::DiskHotplug,
+        Capability::SharedDirectories,
+        Capability::NbdDisks,
+        Capability::ForeignArchitecture,
+        Capability::DirectKernelBoot,
+        Capability::PortForward,
+        Capability::GuestEgress,
+    ];
+}
+
 /// What a backend can do. Callers gate on this, never on [`Hypervisor::id`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Caps {
@@ -420,6 +457,29 @@ pub struct Caps {
     /// [`GuestEgress`]; `None` is what the secrets data plane refuses on.
     pub guest_egress: Option<GuestEgress>,
     pub disk_formats: &'static [DiskFormat],
+}
+
+impl Caps {
+    /// Whether this backend offers one optional part of the contract.
+    ///
+    /// Product code may keep using the typed fields where it needs the
+    /// capability's data (the share kind or guest route).  This view exists
+    /// for policy, diagnostics and, most importantly, the common executable
+    /// contract that walks every capability for every registered backend.
+    pub fn supports(&self, capability: Capability) -> bool {
+        match capability {
+            Capability::LiveSnapshot => self.live_snapshot,
+            Capability::DiskSnapshot => self.disk_snapshot,
+            Capability::LiveMigration => self.live_migration,
+            Capability::DiskHotplug => self.disk_hotplug,
+            Capability::SharedDirectories => self.shared_dir.is_some(),
+            Capability::NbdDisks => self.nbd_disks,
+            Capability::ForeignArchitecture => self.foreign_arch,
+            Capability::DirectKernelBoot => self.direct_kernel,
+            Capability::PortForward => self.port_forward,
+            Capability::GuestEgress => self.guest_egress.is_some(),
+        }
+    }
 }
 
 /// What [`Hypervisor::probe`] found: this host can run this backend, and
