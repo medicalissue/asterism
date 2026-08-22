@@ -21,9 +21,15 @@ client protocol concepts.
 Successful bearer material is stored through the OS credential-store seam.
 The CLI implementation uses the platform backend supplied by `keyring`:
 Keychain on macOS, Secret Service on Linux, and Credential Manager on Windows.
-There is no plaintext-file fallback. `ast auth status` reads that local entry;
-`ast auth logout` attempts coordinator revocation and always removes the local
-entry. Bearer values redact their `Debug` representation and are never printed.
+There is no plaintext-file fallback. Every session records the canonical origin
+that issued it, and its credential-store account is derived from that origin.
+A separate non-secret pointer selects the active issuer. `ast auth status` and
+`ast auth logout` use that stored issuer; an optional `--coordinator` is only an
+assertion and a mismatch is rejected before an HTTP client is constructed.
+Credentials written by older clients to the unbound `default` slot are removed
+locally and never sent to any coordinator. Logout attempts revocation only at
+the bound issuer and always removes the local entry after that attempt. Bearer
+values redact their `Debug` representation and are never printed.
 
 Desktop uses the same device-code request, polling state machine, browser
 opener, and credential-store capabilities. Its request adds the exact callback

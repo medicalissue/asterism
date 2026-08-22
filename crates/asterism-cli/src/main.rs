@@ -657,11 +657,18 @@ enum AuthCommand {
         no_browser: bool,
     },
     /// Show the locally stored hosted-account session.
-    Status,
+    Status {
+        /// Assert that the session belongs to this coordinator. No network
+        /// request is made; a mismatch is rejected locally.
+        #[arg(long)]
+        coordinator: Option<String>,
+    },
     /// Revoke the hosted session and remove it from the OS credential store.
     Logout {
-        #[arg(long, default_value = hosted_auth::DEFAULT_AUTHORITY)]
-        coordinator: String,
+        /// Assert the expected coordinator. When omitted, the session's
+        /// bound issuer is used.
+        #[arg(long)]
+        coordinator: Option<String>,
     },
 }
 
@@ -1147,47 +1154,99 @@ fn main() -> Result<()> {
 struct OsCredentialStore;
 
 impl OsCredentialStore {
-    fn entry(&self) -> Result<keyring::Entry> {
-        keyring::Entry::new(
-            hosted_auth::CREDENTIAL_SERVICE,
-            hosted_auth::CREDENTIAL_ACCOUNT,
-        )
-        .context("opening the OS credential store")
-    }
-}
-
-impl CredentialStore for OsCredentialStore {
-    fn save(&self, session: &Session) -> Result<()> {
-        let mut encoded = serde_json::to_string(session).context("encoding the hosted session")?;
-        let stored = self
-            .entry()?
-            .set_password(&encoded)
-            .context("saving the hosted session in the OS credential store");
-        encoded.zeroize();
-        stored
+    fn entry(&self, account: &str) -> Result<keyring::Entry> {
+        keyring::Entry::new(hosted_auth::CREDENTIAL_SERVICE, account)
+            .context("opening the OS credential store")
     }
 
-    fn load(&self) -> Result<Option<Session>> {
-        match self.entry()?.get_password() {
-            Ok(mut encoded) => {
-                let session = serde_json::from_str(&encoded)
-                    .map(Some)
-                    .context("reading the hosted session from the OS credential store");
-                encoded.zeroize();
-                session
-            }
+    fn read(&self, account: &str) -> Result<Option<String>> {
+        match self.entry(account)?.get_password() {
+            Ok(value) => Ok(Some(value)),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(error) => Err(error).context("reading the OS credential store"),
         }
     }
 
-    fn delete(&self) -> Result<()> {
-        match self.entry()?.delete_credential() {
+    fn delete_account(&self, account: &str) -> Result<()> {
+        match self.entry(account)?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(error) => {
-                Err(error).context("deleting the hosted session from the OS credential store")
-            }
+            Err(error) => Err(error).context("deleting an OS credential-store entry"),
         }
+    }
+
+    /// Old clients put an unbound bearer in one global slot. It is impossible
+    /// to infer a safe remote destination for that token, so discovery only
+    /// clears it locally.
+    fn clear_legacy(&self) -> Result<()> {
+        self.delete_account(hosted_auth::CREDENTIAL_ACCOUNT)
+    }
+}
+
+impl CredentialStore for OsCredentialStore {
+    fn save(&self, session: &Session) -> Result<()> {
+        let issuer = canonical_authority(&session.issuer)?;
+        if issuer != session.issuer {
+            bail!("the hosted session issuer is not canonical");
+        }
+        let account = hosted_auth::credential_account(&issuer);
+        let previous = self.read(hosted_auth::ACTIVE_ISSUER_ACCOUNT)?;
+        let mut encoded = serde_json::to_string(session).context("encoding the hosted session")?;
+        let stored = self
+            .entry(&account)?
+            .set_password(&encoded)
+            .context("saving the hosted session in the OS credential store");
+        encoded.zeroize();
+        stored?;
+
+        if let Err(error) = self
+            .entry(hosted_auth::ACTIVE_ISSUER_ACCOUNT)?
+            .set_password(&issuer)
+            .context("saving the hosted session issuer in the OS credential store")
+        {
+            let _ = self.delete_account(&account);
+            return Err(error);
+        }
+        self.clear_legacy()?;
+        if let Some(previous) = previous.filter(|previous| previous != &issuer) {
+            self.delete_account(&hosted_auth::credential_account(&previous))?;
+        }
+        Ok(())
+    }
+
+    fn load(&self) -> Result<Option<Session>> {
+        let Some(issuer) = self.read(hosted_auth::ACTIVE_ISSUER_ACCOUNT)? else {
+            self.clear_legacy()?;
+            return Ok(None);
+        };
+        let canonical = canonical_authority(&issuer)
+            .context("the stored hosted-session issuer is invalid; refusing remote use")?;
+        if canonical != issuer {
+            bail!("the stored hosted-session issuer is not canonical; refusing remote use");
+        }
+        let account = hosted_auth::credential_account(&issuer);
+        let Some(mut encoded) = self.read(&account)? else {
+            self.delete_account(hosted_auth::ACTIVE_ISSUER_ACCOUNT)?;
+            self.clear_legacy()?;
+            return Ok(None);
+        };
+        let session: Result<Session> = serde_json::from_str(&encoded)
+            .context("reading the hosted session from the OS credential store");
+        encoded.zeroize();
+        let session = session?;
+        if session.issuer != issuer {
+            bail!(
+                "the hosted session does not match its credential namespace; refusing remote use"
+            );
+        }
+        Ok(Some(session))
+    }
+
+    fn delete(&self) -> Result<()> {
+        if let Some(issuer) = self.read(hosted_auth::ACTIVE_ISSUER_ACCOUNT)? {
+            self.delete_account(&hosted_auth::credential_account(&issuer))?;
+        }
+        self.delete_account(hosted_auth::ACTIVE_ISSUER_ACCOUNT)?;
+        self.clear_legacy()
     }
 }
 
@@ -1230,6 +1289,7 @@ enum AuthReply<T> {
 }
 
 trait CoordinatorClient {
+    fn authority(&self) -> &str;
     fn issue(&self, provider: Provider) -> Result<DeviceAuthorization>;
     fn poll(&self, device_code: &str) -> Result<AuthReply<Session>>;
     fn revoke(&self, access_token: &str) -> Result<()>;
@@ -1257,24 +1317,28 @@ impl Clock for SystemTime {
     }
 }
 
+fn canonical_authority(authority: &str) -> Result<String> {
+    let parsed = reqwest::Url::parse(authority).context("parsing the hosted coordinator URL")?;
+    let local_http =
+        parsed.scheme() == "http" && matches!(parsed.host_str(), Some("127.0.0.1" | "::1"));
+    if parsed.scheme() != "https" && !local_http {
+        bail!("the hosted coordinator must use https (plain http is allowed only on loopback)");
+    }
+    if parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !matches!(parsed.path(), "" | "/")
+    {
+        bail!("the hosted coordinator must be an origin URL without credentials or a path");
+    }
+    Ok(parsed.origin().ascii_serialization())
+}
+
 impl AuthHttp {
     fn new(authority: &str) -> Result<Self> {
-        let parsed =
-            reqwest::Url::parse(authority).context("parsing the hosted coordinator URL")?;
-        let local_http =
-            parsed.scheme() == "http" && matches!(parsed.host_str(), Some("127.0.0.1" | "::1"));
-        if parsed.scheme() != "https" && !local_http {
-            bail!("the hosted coordinator must use https (plain http is allowed only on loopback)");
-        }
-        if parsed.host_str().is_none()
-            || !parsed.username().is_empty()
-            || parsed.password().is_some()
-            || parsed.query().is_some()
-            || parsed.fragment().is_some()
-            || !matches!(parsed.path(), "" | "/")
-        {
-            bail!("the hosted coordinator must be an origin URL without credentials or a path");
-        }
+        let authority = canonical_authority(authority)?;
         // This binary owns its TLS client. `reqwest` is deliberately linked
         // without an implicit provider so the choice is explicit and matches
         // the ring provider already used elsewhere in the workspace.
@@ -1285,7 +1349,7 @@ impl AuthHttp {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .context("constructing the hosted authorization client")?,
-            authority: parsed.origin().ascii_serialization(),
+            authority,
         })
     }
 
@@ -1384,6 +1448,10 @@ impl AuthHttp {
 }
 
 impl CoordinatorClient for AuthHttp {
+    fn authority(&self) -> &str {
+        &self.authority
+    }
+
     fn issue(&self, provider: Provider) -> Result<DeviceAuthorization> {
         let request = serde_json::to_value(DeviceAuthorizationRequest::cli(provider))?;
         match self.post("/oauth/device/code", &request, None)? {
@@ -1465,7 +1533,11 @@ fn login_with(
         };
         match policy.next(clock.now(), &polled) {
             PollAction::Complete => {
-                let session = polled.expect("complete means a session reply");
+                let mut session = polled.expect("complete means a session reply");
+                // The transport origin, not response JSON, is the authority
+                // that issued this bearer. Persist that canonical binding as
+                // part of the session before it reaches a credential store.
+                session.issuer = coordinator.authority().to_owned();
                 store.save(&session)?;
                 writeln!(
                     output,
@@ -1511,37 +1583,96 @@ fn auth_command(command: AuthCommand) -> Result<()> {
                 &mut std::io::stderr(),
             )
         }
-        AuthCommand::Status => match store.load()? {
-            Some(session) => {
-                println!(
-                    "signed in  {}  {}",
-                    session.account.provider.as_str(),
-                    session.account.display_name
-                );
-                Ok(())
-            }
-            None => {
-                println!("signed out");
-                Ok(())
-            }
-        },
-        AuthCommand::Logout { coordinator } => {
-            let Some(session) = store.load()? else {
-                println!("signed out");
-                return Ok(());
-            };
-            let remote = AuthHttp::new(&coordinator)
-                .and_then(|http| http.revoke(session.access_token.expose()));
-            store.delete()?;
-            if let Err(error) = remote {
-                eprintln!(
-                    "local session removed; remote revocation could not be confirmed: {error:#}"
-                );
-            }
-            println!("signed out");
-            Ok(())
+        AuthCommand::Status { coordinator } => {
+            auth_status_with(&store, coordinator.as_deref(), &mut std::io::stdout())
+        }
+        AuthCommand::Logout { coordinator } => logout_with(
+            &store,
+            coordinator.as_deref(),
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        ),
+    }
+}
+
+fn bound_issuer(session: &Session, expected: Option<&str>) -> Result<String> {
+    if session.issuer.is_empty() {
+        bail!("legacy hosted session has no bound issuer; refusing remote use");
+    }
+    let issuer = canonical_authority(&session.issuer)
+        .context("the hosted session issuer is invalid; refusing remote use")?;
+    if issuer != session.issuer {
+        bail!("the hosted session issuer is not canonical; refusing remote use");
+    }
+    if let Some(expected) = expected {
+        let expected = canonical_authority(expected)?;
+        if expected != issuer {
+            bail!(
+                "the requested coordinator {expected} does not match the session issuer {issuer}; refusing before network"
+            );
         }
     }
+    Ok(issuer)
+}
+
+fn auth_status_with(
+    store: &dyn CredentialStore,
+    expected: Option<&str>,
+    output: &mut dyn Write,
+) -> Result<()> {
+    let Some(session) = store.load()? else {
+        writeln!(output, "signed out")?;
+        return Ok(());
+    };
+    let issuer = match bound_issuer(&session, expected) {
+        Ok(issuer) => issuer,
+        Err(error) if session.issuer.is_empty() => {
+            store.delete()?;
+            return Err(error).context("legacy session removed locally; sign in again");
+        }
+        Err(error) => return Err(error),
+    };
+    writeln!(
+        output,
+        "signed in  {}  {}  {}",
+        session.account.provider.as_str(),
+        session.account.display_name,
+        issuer
+    )?;
+    Ok(())
+}
+
+fn logout_with(
+    store: &dyn CredentialStore,
+    expected: Option<&str>,
+    output: &mut dyn Write,
+    errors: &mut dyn Write,
+) -> Result<()> {
+    let Some(session) = store.load()? else {
+        writeln!(output, "signed out")?;
+        return Ok(());
+    };
+    let issuer = match bound_issuer(&session, expected) {
+        Ok(issuer) => issuer,
+        Err(error) if session.issuer.is_empty() => {
+            store.delete()?;
+            return Err(error).context("legacy session removed locally; sign in again");
+        }
+        Err(error) => return Err(error),
+    };
+
+    // Do not construct a client until all local issuer checks have passed.
+    // That ordering is the zero-request boundary for a mismatched override.
+    let remote = AuthHttp::new(&issuer).and_then(|http| http.revoke(session.access_token.expose()));
+    store.delete()?;
+    if let Err(error) = remote {
+        writeln!(
+            errors,
+            "local session removed; remote revocation could not be confirmed: {error:#}"
+        )?;
+    }
+    writeln!(output, "signed out")?;
+    Ok(())
 }
 
 fn unix_seconds() -> u64 {
@@ -4408,11 +4539,16 @@ mod tests {
     }
 
     struct MockCoordinator {
+        authority: String,
         authorization: DeviceAuthorization,
         replies: Mutex<VecDeque<Result<AuthReply<Session>>>>,
     }
 
     impl CoordinatorClient for MockCoordinator {
+        fn authority(&self) -> &str {
+            &self.authority
+        }
+
         fn issue(&self, _provider: Provider) -> Result<DeviceAuthorization> {
             Ok(self.authorization.clone())
         }
@@ -4440,6 +4576,7 @@ mod tests {
                 display_name: "Octo".into(),
             },
             issued_at: 100,
+            issuer: String::new(),
         }
     }
 
@@ -4454,6 +4591,7 @@ mod tests {
     #[test]
     fn device_login_recovers_offline_and_browser_failure_without_hiding_the_code() {
         let coordinator = MockCoordinator {
+            authority: "https://auth.example".into(),
             authorization: DeviceAuthorization {
                 device_code: "device-code".into(),
                 user_code: "ABCD-EFGH".into(),
@@ -4496,12 +4634,15 @@ mod tests {
         assert!(errors.contains("continue with the URL and code above"));
         assert!(!output.contains("token-not-for-logs"));
         assert!(!errors.contains("token-not-for-logs"));
-        assert_eq!(store.load().unwrap().unwrap().account.id, "acct_opaque");
+        let stored = store.load().unwrap().unwrap();
+        assert_eq!(stored.account.id, "acct_opaque");
+        assert_eq!(stored.issuer, "https://auth.example");
     }
 
     #[test]
     fn device_login_stops_on_denial() {
         let coordinator = MockCoordinator {
+            authority: "https://auth.example".into(),
             authorization: DeviceAuthorization {
                 device_code: "device-code".into(),
                 user_code: "ABCD-EFGH".into(),
@@ -4534,6 +4675,7 @@ mod tests {
     #[test]
     fn protocol_incompatibility_is_fatal_instead_of_an_offline_retry() {
         let coordinator = MockCoordinator {
+            authority: "https://auth.example".into(),
             authorization: DeviceAuthorization {
                 device_code: "device-code".into(),
                 user_code: "ABCD-EFGH".into(),
@@ -4569,6 +4711,7 @@ mod tests {
     fn google_and_github_mock_device_flows_both_complete() {
         for provider in [Provider::Google, Provider::Github] {
             let coordinator = MockCoordinator {
+                authority: "https://auth.example".into(),
                 authorization: DeviceAuthorization {
                     device_code: "device-code".into(),
                     user_code: "ABCD-EFGH".into(),
@@ -4652,6 +4795,102 @@ mod tests {
             serde_json::json!({"provider":"github"})
         );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn a_token_logout_b_is_rejected_before_b_sees_a_request_or_token() {
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        let issuer_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let issuer = format!("http://{}", issuer_listener.local_addr().unwrap());
+        let other_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        other_listener.set_nonblocking(true).unwrap();
+        let other = format!("http://{}", other_listener.local_addr().unwrap());
+
+        let (sent, received) = mpsc::channel();
+        let issuer_server = std::thread::spawn(move || {
+            let (stream, _) = issuer_listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut head = String::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                head.push_str(&line);
+            }
+            sent.send(head).unwrap();
+            let body = "{}";
+            let mut stream = stream;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAsterism-Protocol: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                hosted_auth::PROTOCOL,
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let mut session = auth_session(Provider::Github);
+        session.issuer = issuer.clone();
+        let store = MemoryStore(Mutex::new(Some(session)));
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+        let mismatch = logout_with(&store, Some(&other), &mut output, &mut errors).unwrap_err();
+
+        let mismatch = format!("{mismatch:#}");
+        assert!(mismatch.contains("does not match the session issuer"));
+        assert!(mismatch.contains("refusing before network"));
+        assert!(!mismatch.contains("token-not-for-logs"));
+        assert!(
+            store.load().unwrap().is_some(),
+            "mismatch keeps the A session"
+        );
+        assert_eq!(
+            other_listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "coordinator B must see zero connections and therefore zero token bytes"
+        );
+
+        logout_with(&store, None, &mut output, &mut errors).unwrap();
+        let issuer_request = received.recv().unwrap().to_ascii_lowercase();
+        assert!(issuer_request.starts_with("post /oauth/revoke http/1.1"));
+        assert!(issuer_request.contains("authorization: bearer token-not-for-logs"));
+        assert_eq!(
+            other_listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "coordinator B must still see zero connections after issuer-bound logout"
+        );
+        assert!(!String::from_utf8(output)
+            .unwrap()
+            .contains("token-not-for-logs"));
+        assert!(!String::from_utf8(errors)
+            .unwrap()
+            .contains("token-not-for-logs"));
+        assert!(store.load().unwrap().is_none());
+        issuer_server.join().unwrap();
+    }
+
+    #[test]
+    fn legacy_unbound_session_is_cleared_locally_without_remote_use() {
+        let store = MemoryStore(Mutex::new(Some(auth_session(Provider::Google))));
+        let mut output = Vec::new();
+        let error = logout_with(
+            &store,
+            Some("http://127.0.0.1:9"),
+            &mut output,
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("legacy session removed locally"));
+        assert!(error.contains("refusing remote use"));
+        assert!(!error.contains("token-not-for-logs"));
+        assert!(store.load().unwrap().is_none());
+        assert!(output.is_empty());
     }
 
     #[test]

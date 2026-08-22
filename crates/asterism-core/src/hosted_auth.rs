@@ -17,7 +17,20 @@ use zeroize::Zeroize;
 pub const PROTOCOL: &str = "asterism-device-authorization/1";
 pub const DEFAULT_AUTHORITY: &str = "https://auth.asterism.run";
 pub const CREDENTIAL_SERVICE: &str = "run.asterism.auth";
+/// The pre-issuer credential slot. New clients only remove this entry: a
+/// bearer read from it has no trustworthy destination and must never leave
+/// the machine.
 pub const CREDENTIAL_ACCOUNT: &str = "default";
+/// A non-secret pointer to the issuer-scoped credential that is currently
+/// active. The bearer itself never occupies this global slot.
+pub const ACTIVE_ISSUER_ACCOUNT: &str = "active-issuer";
+
+/// Derive an opaque OS credential-store namespace from a canonical issuer
+/// origin. Keeping the full URL out of platform account names also avoids
+/// backend-specific punctuation and length rules.
+pub fn credential_account(issuer: &str) -> String {
+    format!("issuer-{}", blake3::hash(issuer.as_bytes()).to_hex())
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -205,6 +218,12 @@ pub struct Session {
     pub token_type: String,
     pub account: Account,
     pub issued_at: u64,
+    /// Canonical origin of the coordinator that issued `access_token`.
+    ///
+    /// `default` exists solely so old keyring JSON can be recognized and
+    /// cleared locally. An empty issuer is never eligible for remote use.
+    #[serde(default)]
+    pub issuer: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -353,12 +372,25 @@ mod tests {
                 display_name: "Octo".into(),
             },
             issued_at: 1,
+            issuer: DEFAULT_AUTHORITY.into(),
         };
         let debug = format!("{session:?}");
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("super-secret"));
         assert!(serde_json::from_str::<Secret>(r#"""#).is_err());
         assert!(serde_json::from_str::<Secret>(&format!(r#""{}""#, "x".repeat(8193))).is_err());
+    }
+
+    #[test]
+    fn credential_namespaces_are_bound_to_the_exact_canonical_issuer() {
+        let production = credential_account("https://auth.asterism.run");
+        assert_eq!(production, credential_account("https://auth.asterism.run"));
+        assert_ne!(
+            production,
+            credential_account("https://auth.asterism.run:443")
+        );
+        assert_ne!(production, credential_account("https://other.example"));
+        assert!(!production.contains("auth.asterism.run"));
     }
 
     #[test]
