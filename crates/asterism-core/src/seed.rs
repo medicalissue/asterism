@@ -16,6 +16,7 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
+use crate::hv::ShareKind;
 use crate::instance::{Instance, Volume};
 use crate::tools::{run, tool};
 use crate::{instance, paths};
@@ -91,11 +92,11 @@ impl Egress {
 
 /// The directory volumes this device can actually share into the guest.
 ///
-/// Two filters, and they are different rules. 9p (like virtiofs) has no
-/// network transport and never will — the backend has to map the guest's
-/// memory — so a directory on another device is a record and nothing more.
-/// And a block volume is not a share at all: it reaches the guest as a disk,
-/// over NBD, and the guest mounts whatever filesystem it finds on it.
+/// Two filters, and they are different rules. Neither 9p nor virtiofs has a
+/// network transport, and neither ever will — the backend has to map the
+/// guest's memory — so a directory on another device is a record and nothing
+/// more. And a block volume is not a share at all: it reaches the guest as a
+/// disk, over NBD, and the guest mounts whatever filesystem it finds on it.
 pub fn shares(inst: &Instance) -> Vec<Share> {
     inst.volumes
         .iter()
