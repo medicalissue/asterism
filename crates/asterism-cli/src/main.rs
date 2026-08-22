@@ -1250,7 +1250,10 @@ fn print_devices() -> Result<()> {
         Response::Error { message } => bail!(message),
         other => bail!("unexpected reply from astd: {other:?}"),
     };
-    println!("{:<24} {:<14} {:<8} PATH", "NAME", "DEVICE ID", "STATUS");
+    println!(
+        "{:<24} {:<14} {:<8} {:<7} {:>8}  {:<34} RECOVERY",
+        "NAME", "DEVICE ID", "STATUS", "PATH", "RTT", "TRANSITION"
+    );
     for d in &devices {
         let status = if d.online { "online" } else { "offline" };
         let name = if d.is_self {
@@ -1258,7 +1261,20 @@ fn print_devices() -> Result<()> {
         } else {
             d.name.clone()
         };
-        println!("{:<24} {:<14} {:<8} {}", name, d.short_id(), status, d.path);
+        let rtt = d
+            .rtt_micros
+            .map(|us| format!("{:.1}ms", us as f64 / 1_000.0))
+            .unwrap_or_else(|| "-".into());
+        println!(
+            "{:<24} {:<14} {:<8} {:<7} {:>8}  {:<34} {}",
+            name,
+            d.short_id(),
+            status,
+            d.path,
+            rtt,
+            d.transition_reason.as_deref().unwrap_or("-"),
+            d.recovery_result.as_deref().unwrap_or("-"),
+        );
     }
     if devices.len() == 1 {
         println!("\nno other devices yet — add one with: ast device invite");

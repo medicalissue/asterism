@@ -83,6 +83,14 @@ pub struct Volume {
     /// Size of a block volume as its provider reported it, for `ast status`.
     #[serde(default)]
     pub size_bytes: Option<u64>,
+    /// What the daemon supplying cpu/ram most recently observed about this
+    /// part while the guest was running.
+    ///
+    /// Runtime-only: registries never populate it, but a `status` reply may.
+    /// Keeping it on the part rather than on [`Instance::status`] is what lets
+    /// a provider disappear without falsely reporting that the guest died.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<PartRuntime>,
 }
 
 impl Volume {
@@ -95,6 +103,7 @@ impl Volume {
             kind: VolumeKind::Dir,
             epoch: None,
             size_bytes: None,
+            runtime: None,
         }
     }
 
@@ -107,6 +116,7 @@ impl Volume {
             kind: VolumeKind::Block,
             epoch: Some(epoch),
             size_bytes: Some(size_bytes),
+            runtime: None,
         }
     }
 
@@ -136,6 +146,70 @@ impl Volume {
             "ast{:012x}",
             fnv1a(&format!("{}:{}", self.host, self.path)) >> 16
         )
+    }
+}
+
+/// A measurement of one remotely sourced part, attached to a `status` reply.
+///
+/// Strings are intentional for `transition_reason` and `recovery_result`:
+/// these are diagnostic vocabulary, not protocol gates, so a newer daemon can
+/// add a more precise reason without making an older CLI reject the reply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartRuntime {
+    /// `healthy`, `recovering`, or `degraded`.
+    pub state: String,
+    /// The selected transport path (`direct`, `relay`, or `local`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Application-observed or selected-path RTT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_micros: Option<u64>,
+    /// Payload throughput from the most recently completed bridge session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub throughput_bytes_per_sec: Option<u64>,
+    /// Payload bytes in that throughput sample, both directions combined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transferred_bytes: Option<u64>,
+    /// Time from detecting a loss/restart to restoring the part.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_millis: Option<u64>,
+    /// Why the current observation replaced the previous one.
+    pub transition_reason: String,
+    /// `connected`, `reconnected`, `retrying`, or `failed`.
+    pub recovery_result: String,
+    /// A bounded, user-facing explanation when more detail is useful.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Unix seconds when the daemon made this observation.
+    pub observed_at: u64,
+}
+
+impl PartRuntime {
+    fn summary(&self) -> String {
+        let mut facts = vec![self.state.clone()];
+        if let Some(path) = &self.path {
+            facts.push(path.clone());
+        }
+        if let Some(us) = self.rtt_micros {
+            facts.push(format!("{:.1}ms RTT", us as f64 / 1_000.0));
+        }
+        if let Some(bytes_per_sec) = self.throughput_bytes_per_sec {
+            facts.push(format!(
+                "{:.1} MiB/s",
+                bytes_per_sec as f64 / (1024.0 * 1024.0)
+            ));
+        }
+        facts.push(format!(
+            "{} ({})",
+            self.recovery_result, self.transition_reason
+        ));
+        if let Some(ms) = self.recovery_millis {
+            facts.push(format!("recovery {ms}ms"));
+        }
+        if let Some(detail) = &self.detail {
+            facts.push(detail.clone());
+        }
+        facts.join(" · ")
     }
 }
 
@@ -626,13 +700,19 @@ impl Instance {
                             .map(|b| format!(" ({})", crate::volume::format_size(b)))
                             .unwrap_or_default()
                     ),
-                    Some(match v.epoch {
-                        Some(epoch) if !v.is_local() => {
-                            format!("nbd over the mesh · lease epoch {epoch}")
-                        }
-                        Some(epoch) => format!("nbd on this device · lease epoch {epoch}"),
-                        None => "nbd · no lease yet".to_owned(),
-                    }),
+                    Some(
+                        match v.epoch {
+                            Some(epoch) if !v.is_local() => {
+                                format!("nbd over the mesh · lease epoch {epoch}")
+                            }
+                            Some(epoch) => format!("nbd on this device · lease epoch {epoch}"),
+                            None => "nbd · no lease yet".to_owned(),
+                        } + &v
+                            .runtime
+                            .as_ref()
+                            .map(|runtime| format!(" · {}", runtime.summary()))
+                            .unwrap_or_default(),
+                    ),
                 ),
             };
             parts.push(Part {
@@ -868,6 +948,60 @@ mod tests {
         .unwrap();
         assert_eq!(inst.image_kind, ImageKind::Disk);
         assert!(inst.publish.is_empty());
+    }
+
+    /// Losing a storage provider degrades that part, not the guest process.
+    /// This is the serialization seam the daemon uses for a live observation:
+    /// registry records without it remain readable, while `status` can carry
+    /// the measurement to a CLI without inventing a lifecycle state.
+    #[test]
+    fn a_remote_part_can_degrade_without_calling_the_instance_dead() {
+        let mut inst = Instance::new("dev", "laptop", "debian:13", Shape::default(), machine());
+        inst.status = Status::Running;
+        let mut volume = Volume::block("tank", "storage", 7, 4 << 30);
+        volume.runtime = Some(PartRuntime {
+            state: "degraded".into(),
+            path: Some("relay".into()),
+            rtt_micros: Some(12_400),
+            throughput_bytes_per_sec: Some(64 << 20),
+            transferred_bytes: Some(4 << 30),
+            recovery_millis: None,
+            transition_reason: "provider_loss".into(),
+            recovery_result: "retrying".into(),
+            detail: Some("the remote NBD session ended".into()),
+            observed_at: 1_700_000_000,
+        });
+        inst.volumes.push(volume);
+
+        assert_eq!(inst.status, Status::Running);
+        let note = inst
+            .parts()
+            .into_iter()
+            .find(|part| part.kind == "volume")
+            .and_then(|part| part.note)
+            .unwrap();
+        for fact in [
+            "lease epoch 7",
+            "degraded",
+            "relay",
+            "12.4ms RTT",
+            "64.0 MiB/s",
+            "retrying (provider_loss)",
+        ] {
+            assert!(note.contains(fact), "missing {fact:?} from {note:?}");
+        }
+
+        let wire = serde_json::to_string(&inst).unwrap();
+        let round_trip: Instance = serde_json::from_str(&wire).unwrap();
+        assert_eq!(round_trip.volumes[0].runtime, inst.volumes[0].runtime);
+
+        let old: Volume =
+            serde_json::from_str(r#"{"path":"tank","host":"storage","kind":"block","epoch":7}"#)
+                .unwrap();
+        assert_eq!(
+            old.runtime, None,
+            "old registry rows default to no observation"
+        );
     }
 
     #[test]
