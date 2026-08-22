@@ -673,6 +673,16 @@ mod tests {
             .unwrap();
         }
 
+        /// A portable stand-in for a guest helper: its argv carries `name`,
+        /// while the shell stays alive waiting for its `sleep` child.
+        fn helper_holding(name: &std::path::Path) -> std::process::Child {
+            std::process::Command::new("sh")
+                .args(["-c", "sleep 30; :", "--"])
+                .arg(name)
+                .spawn()
+                .unwrap()
+        }
+
         /// The daemon has restarted under a live guest whose process really
         /// is holding this instance's own control socket. That is what an
         /// adoption rests on, and it is enough: the guest gets a real
@@ -681,23 +691,15 @@ mod tests {
         fn a_live_guest_holding_its_own_socket_is_adopted() {
             let (_dir, mut reg) = shard();
             let ctl = paths::qmp_socket_path("live");
-            // `sleep` stands in for the helper, holding the path a real one
-            // would have been given on its command line.
-            let mut sleeper = std::process::Command::new("sleep")
-                .arg("30")
-                .arg(&ctl)
-                .spawn()
-                .unwrap();
+            // The helper's argv carries the path a real guest would receive.
+            let mut sleeper = helper_holding(&ctl);
             pre_identity(&mut reg, "live", vz::ID, sleeper.id());
 
             let handle = reg.get("live").unwrap().handle.clone().unwrap();
             let proc = ProcId::adopt(
                 sleeper.id(),
                 handle.started_at,
-                &Evidence {
-                    exec: &["sleep"],
-                    names: &[&ctl],
-                },
+                &Evidence { exec: &["sh"], names: &[&ctl] },
             )
             .unwrap();
             reg.adopt_handle_identity("live", proc).unwrap();
@@ -728,11 +730,7 @@ mod tests {
             let (_dir, mut reg) = shard();
             // Somebody else's instance, and a process holding its socket.
             let theirs = paths::qmp_socket_path("theirs");
-            let mut foreign = std::process::Command::new("sleep")
-                .arg("30")
-                .arg(&theirs)
-                .spawn()
-                .unwrap();
+            let mut foreign = helper_holding(&theirs);
 
             pre_identity(&mut reg, "ours", qemu::ID, foreign.id());
             // Backdate the handle so the foreign process started 30s after
@@ -743,7 +741,7 @@ mod tests {
                     foreign.id(),
                     handle.started_at.saturating_sub(30),
                     &Evidence {
-                        exec: &["sleep"],
+                        exec: &["sh"],
                         names: &[&paths::qmp_socket_path("ours")],
                     },
                 )
