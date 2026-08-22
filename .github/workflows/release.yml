@@ -350,6 +350,9 @@ jobs:
       - name: The updater's signed transaction suite
         run: bash scripts/update-test.sh
 
+      - name: The astd-vz version/build verifier regression
+        run: bash scripts/release-vz-version-test.sh
+
       - name: The desktop bundle has the release identity and a valid signature
         run: |
           set -eu
@@ -456,7 +459,8 @@ jobs:
           # speak a control protocol this astd does not.
           got_vz="$("${prefix}/bin/astd-vz" --version)"
           echo "astd-vz --version: ${got_vz}"
-          [ "$got_vz" = "astd-vz ${version#v}" ] || { echo "expected 'astd-vz ${version#v}'" >&2; exit 1; }
+          scripts/check-release-vz-version.sh \
+            "${prefix}/bin/astd-vz" "${version#v}" "${version#v}+${{ github.sha }}"
 
           # The signature has to cover the bytes as installed — tar, the
           # installer's copy-and-rename, and `strip` are all things that
