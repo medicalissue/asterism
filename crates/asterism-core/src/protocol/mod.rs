@@ -402,7 +402,9 @@ pub enum Request {
     ImageList,
     /// Pull an image into this device's store. The daemon owns the network,
     /// credentials, integrity checks, and atomic adoption.
-    ImagePull { reference: String },
+    ImagePull {
+        reference: String,
+    },
 
     // ---- block volumes ------------------------------------------------------
     //
@@ -874,10 +876,14 @@ pub enum Response {
     },
     /// Reply to [`Request::ImageList`]. These rows are from the answering
     /// device, even when the request arrived through `Proxy`.
-    Images { images: Vec<ImageRow> },
+    Images {
+        images: Vec<ImageRow>,
+    },
     /// Reply to [`Request::ImagePull`] after durable adoption. A failed pull
     /// is always [`Response::Error`].
-    ImagePulled { result: Box<ImagePullResult> },
+    ImagePulled {
+        result: Box<ImagePullResult>,
+    },
     /// Reply to [`Request::ListOrbit`]: the orbit registry, assembled from
     /// every shard that answered plus the cached rows of those that did not.
     Orbit {
@@ -1365,7 +1371,8 @@ mod tests {
                 changed: true,
             }),
         };
-        let decoded: Response = serde_json::from_str(&serde_json::to_string(&response).unwrap()).unwrap();
+        let decoded: Response =
+            serde_json::from_str(&serde_json::to_string(&response).unwrap()).unwrap();
         assert!(matches!(decoded, Response::ImagePulled { .. }));
         assert_eq!(response.since(), 6);
     }

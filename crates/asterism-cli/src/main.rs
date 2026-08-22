@@ -940,9 +940,7 @@ fn main() -> Result<()> {
             return print_image_rows(&image::catalog_rows_full()?);
         }
         Command::Images { verify: _ } => Request::ImageList,
-        Command::Pull { image } => {
-            Request::ImagePull { reference: image }
-        }
+        Command::Pull { image } => Request::ImagePull { reference: image },
         // Which device is running the guest is the daemon's problem, not the
         // user's and not this process's: it answers with a loopback port
         // either way.
@@ -2261,7 +2259,10 @@ fn ensure_image_on_device(device: Option<&str>, reference: &str) -> Result<Strin
     Ok(result.reference)
 }
 
-fn pull_image(device: Option<&str>, reference: &str) -> Result<asterism_core::image::ImagePullResult> {
+fn pull_image(
+    device: Option<&str>,
+    reference: &str,
+) -> Result<asterism_core::image::ImagePullResult> {
     match send(&aimed(
         Request::ImagePull {
             reference: reference.to_owned(),
