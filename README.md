@@ -8,9 +8,15 @@
 <p align="center"><b>Run your AI agents 24/7 on hardware you already own.</b></p>
 
 <p align="center">
+  Everything your agent needs, made local.<br>
+  Assemble compute, storage, GPUs, routes, and secrets from wherever they live.<br>
+  Keep your agent running 24/7.
+</p>
+
+<p align="center">
   <a href="https://github.com/medicalissue/asterism/actions/workflows/ci.yml"><img src="https://github.com/medicalissue/asterism/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-1a7f37" alt="License: MIT OR Apache-2.0"></a>
-  <a href="https://asterism.run"><img src="https://img.shields.io/badge/web-asterism.run-101114" alt="asterism.run"></a>
+  <a href="https://asterism.run"><img src="https://img.shields.io/badge/web-asterism.run-090A0D" alt="asterism.run"></a>
 </p>
 
 <p align="center">
@@ -18,11 +24,15 @@
        alt="Terminal session: ast create agent --image debian:13, ast up agent, ast ssh agent -- uname -a printing the guest kernel, ast down agent, ast snapshot agent clean, ast ls.">
 </p>
 
-Asterism turns a set of devices into an **orbit**: one computer whose CPU,
-memory, storage, secrets, and network reach can come from different places.
-It runs persistent agents in real VMs, keeps each guest isolated behind its
-own kernel and disk, and lets you operate every instance by name from any
-device in the orbit.
+Asterism assembles compute, storage, GPUs, routes, and secrets from wherever
+they live, then keeps your agent running 24/7. The `ast` CLI drives a local
+`astd` daemon and boots isolated instances from cloud or OCI images.
+
+A set of devices becomes an **orbit**: one computer whose CPU, memory, storage,
+secrets, and network reach can come from different places. Asterism runs
+persistent agents in real VMs, keeps each guest isolated behind its own kernel
+and disk, and lets you operate every instance by name from any device in the
+orbit.
 
 No Asterism account or hosted control plane is required. Devices pair
 directly, trust device keys, and communicate over an authenticated, encrypted
@@ -34,18 +44,18 @@ mesh.
 $ curl -fsSL https://asterism.run/install.sh | sh
 ```
 
-The installer selects one tagged release, verifies it against the
-`SHA256SUMS` published with that release, and puts `ast` and `astd` in
-`~/.local/bin`. Re-run it to upgrade or pass `--uninstall` to remove the
-installed files. Release binaries currently target macOS on Apple silicon;
-other hosts can build from source:
+The script chooses the available path for this machine. On macOS it installs
+through Homebrew. On Linux it builds from source into `~/.local/bin`; that path
+is experimental. The script prints every privileged command and waits for
+confirmation. It does not install Homebrew or Rust.
 
 ```console
-$ curl -fsSL https://asterism.run/install.sh | ASTERISM_METHOD=source sh
+$ brew install --HEAD medicalissue/asterism/asterism
 ```
 
-See [packaging/README.md](packaging/README.md) for version pinning, alternate
-prefixes, source refs, Homebrew, and update verification.
+See the [platform-aware install guide](https://asterism.run/install) for the
+current path and [packaging/README.md](packaging/README.md) for version pinning,
+alternate prefixes, source refs, Homebrew, and update verification.
 
 ## Start an agent
 
@@ -122,9 +132,14 @@ not for reaching an instance.
 
 ## Assemble instances from parts
 
-An instance is a stable name and identity plus the parts it uses. `ast status`
-shows where those parts come from. Software inside the guest sees ordinary
-local resources even when Asterism carries their operations across the mesh.
+A device contributes parts. An orbit is the trusted pool of those devices. An
+instance keeps the durable identity assembled from those parts, without a
+special source device. CPU, root disk, and remote block volumes work today;
+GPU and custom egress remain planned.
+
+`ast status` shows where an instance's parts come from. Software inside the
+guest sees ordinary local resources even when Asterism carries their
+operations across the mesh.
 
 - **CPU and memory** come from one device. Move them offline without changing
   the instance's name or identity; its root disk and snapshots transfer

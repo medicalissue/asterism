@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1800" height="420" viewBox="0 0 1800 420" role="img" aria-labelledby="title">
   <title id="title">Asterism orbit function expression</title>
-  <rect width="1800" height="420" rx="52" fill="#101114"/>
-  <text x="900" y="278" text-anchor="middle" fill="#FFFFFF" font-family="Menlo, monospace" font-size="154" font-weight="400" letter-spacing="-6">Asterism(*orbit)</text>
+  <rect width="1800" height="420" rx="52" fill="#090A0D"/>
+  <text x="900" y="278" text-anchor="middle" fill="#F2F3F5" font-family="ui-monospace, Menlo, monospace" font-size="154" font-weight="400" letter-spacing="-6">Asterism(*orbit)</text>
 </svg>
