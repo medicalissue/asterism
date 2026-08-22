@@ -623,6 +623,14 @@ pub trait Hypervisor: Send + Sync {
         Ok(String::new())
     }
 
+    /// An optional NoCloud `network-config` document for this backend's
+    /// guest-facing network device. The seed builder carries the document as
+    /// opaque backend data; addressing and device details stay below this
+    /// seam. Most hypervisors provide DHCP and need no document.
+    fn guest_network_config(&self, _inst: &Instance) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Create anything missing on disk: root overlay, firmware vars.
     /// Idempotent.
     fn prepare(&self, req: &BootReq) -> Result<Prepared>;

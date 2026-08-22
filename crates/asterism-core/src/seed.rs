@@ -126,6 +126,9 @@ pub fn shares(inst: &Instance) -> Vec<Share> {
 /// `extra` is cloud-config the *backend* needs in the guest — see
 /// [`crate::hv::Hypervisor::guest_config`]. It is appended verbatim, so it
 /// arrives in the guest exactly as the backend wrote it.
+/// `network_config`, when present, is an opaque NoCloud `network-config`
+/// document supplied by the backend. It is a separate seed file because
+/// cloud-init must apply networking before user-data commands can run.
 ///
 /// `bootstrap` is the instance's profiles ([`crate::profile`]), and it rides
 /// the same mechanism for the same reason: bump a profile's version and the
@@ -138,6 +141,7 @@ pub fn ensure(
     shares: &[Share],
     share_kind: Option<ShareKind>,
     extra: &str,
+    network_config: Option<&str>,
     egress: &Egress,
     bootstrap: &Bootstrap,
 ) -> Result<()> {
@@ -145,12 +149,29 @@ pub fn ensure(
         bail!("cannot build mount units without a directory-share transport");
     }
     let stamp_path = seed.with_file_name("seed.stamp");
-    let stamp = fingerprint(name, shares, share_kind, extra, egress, bootstrap);
+    let stamp = fingerprint_with_network(
+        name,
+        shares,
+        share_kind,
+        extra,
+        network_config,
+        egress,
+        bootstrap,
+    );
     let current = std::fs::read_to_string(&stamp_path).unwrap_or_default();
     if seed.exists() && current.trim() == stamp {
         return Ok(());
     }
-    build(name, seed, shares, share_kind, extra, egress, bootstrap)?;
+    build(
+        name,
+        seed,
+        shares,
+        share_kind,
+        extra,
+        network_config,
+        egress,
+        bootstrap,
+    )?;
     std::fs::write(&stamp_path, &stamp)?;
     Ok(())
 }
@@ -220,6 +241,25 @@ fn fingerprint(
     format!("{:016x}", instance::fnv1a(&material))
 }
 
+fn fingerprint_with_network(
+    name: &str,
+    shares: &[Share],
+    share_kind: Option<ShareKind>,
+    extra: &str,
+    network_config: Option<&str>,
+    egress: &Egress,
+    bootstrap: &Bootstrap,
+) -> String {
+    let base = fingerprint(name, shares, share_kind, extra, egress, bootstrap);
+    let Some(network_config) = network_config else {
+        return base;
+    };
+    format!(
+        "{:016x}",
+        instance::fnv1a(&format!("{base}\nnetwork-config\n{network_config}"))
+    )
+}
+
 /// Guests get an `ast` user carrying the dedicated Asterism key plus any
 /// keys already in ~/.ssh, so both `ast ssh` and plain ssh work.
 fn build(
@@ -228,10 +268,19 @@ fn build(
     shares: &[Share],
     share_kind: Option<ShareKind>,
     extra: &str,
+    network_config: Option<&str>,
     egress: &Egress,
     bootstrap: &Bootstrap,
 ) -> Result<()> {
-    let stamp = fingerprint(name, shares, share_kind, extra, egress, bootstrap);
+    let stamp = fingerprint_with_network(
+        name,
+        shares,
+        share_kind,
+        extra,
+        network_config,
+        egress,
+        bootstrap,
+    );
     let mut keys = vec![ensure_asterism_key()?];
     if let Ok(home) = std::env::var("HOME") {
         if let Ok(entries) = std::fs::read_dir(PathBuf::from(home).join(".ssh")) {
@@ -276,6 +325,9 @@ fn build(
     std::fs::create_dir_all(&stage)?;
     std::fs::write(stage.join("user-data"), user_data)?;
     std::fs::write(stage.join("meta-data"), meta_data)?;
+    if let Some(network_config) = network_config {
+        std::fs::write(stage.join("network-config"), network_config)?;
+    }
 
     let _ = std::fs::remove_file(seed);
     if cfg!(target_os = "macos") {
@@ -1334,6 +1386,40 @@ mod tests {
         assert_ne!(
             bound,
             fingerprint("dev", &[], None, "", &reminted, &Bootstrap::default())
+        );
+    }
+
+    #[test]
+    fn backend_network_config_moves_the_seed_fingerprint() {
+        let bare = fingerprint_with_network(
+            "dev",
+            &[],
+            None,
+            "",
+            None,
+            &Egress::default(),
+            &Bootstrap::default(),
+        );
+        let configured = fingerprint_with_network(
+            "dev",
+            &[],
+            None,
+            "",
+            Some("version: 2\nethernets: {}\n"),
+            &Egress::default(),
+            &Bootstrap::default(),
+        );
+        assert_ne!(bare, configured);
+        assert_eq!(
+            bare,
+            fingerprint(
+                "dev",
+                &[],
+                None,
+                "",
+                &Egress::default(),
+                &Bootstrap::default()
+            )
         );
     }
 
