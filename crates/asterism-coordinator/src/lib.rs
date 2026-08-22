@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -43,6 +43,14 @@ const MAX_DEVICES_PER_ACCOUNT: usize = 64;
 const MAX_DISCOVERY_BYTES: usize = 4 * 1024;
 const MAX_ACCOUNTS: usize = 4_096;
 const MAX_DURABLE_STATE_BYTES: usize = 16 * 1024 * 1024;
+const AES_GCM_TAG_BYTES: usize = 16;
+// serde_json represents Vec<u8> as decimal values separated by commas. Four
+// bytes per ciphertext byte plus fixed field overhead is its worst-case size.
+const MAX_ENCRYPTED_METADATA_BYTES: usize =
+    (MAX_DURABLE_STATE_BYTES + AES_GCM_TAG_BYTES) * 4 + 4 * 1024;
+const MAX_HIGH_WATERMARK_BYTES: usize = 32;
+const MAX_SESSION_BEARER_BYTES: usize = 8 * 1024;
+const MAX_DEVICE_ID_BYTES: usize = 128;
 
 /// Version advertised by both the Cloudflare edge and native clients.
 pub const DEVICE_AUTHORIZATION_PROTOCOL: &str = "asterism-device-authorization/1";
@@ -374,6 +382,9 @@ impl EnrollmentChallenge {
     }
 
     fn from_token(value: &str) -> Result<Self> {
+        if value.len() != base64url_nopad_encoded_len(64) {
+            bail!("enrollment challenge has invalid length");
+        }
         let token = BASE64URL_NOPAD
             .decode(value.as_bytes())
             .context("decoding enrollment challenge")?;
@@ -404,8 +415,14 @@ impl EnrollmentProof {
     /// Parses a JSON API proof without exposing arbitrary signing internals.
     pub fn from_tokens(device_id: &str, challenge: &str, signature: &str) -> Result<Self> {
         use std::str::FromStr;
+        if device_id.len() > MAX_DEVICE_ID_BYTES {
+            bail!("invalid device id");
+        }
         let public_key = asterism_mesh::iroh_types::PublicKey::from_str(device_id)
             .map_err(|_| anyhow!("invalid device id"))?;
+        if signature.len() != base64url_nopad_encoded_len(Signature::LENGTH) {
+            bail!("invalid enrollment signature");
+        }
         let signature = BASE64URL_NOPAD
             .decode(signature.as_bytes())
             .context("decoding enrollment signature")?;
@@ -423,6 +440,9 @@ impl EnrollmentProof {
 /// Parses the mesh public key form accepted by authenticated device APIs.
 pub fn parse_device_id(value: &str) -> Result<DeviceId> {
     use std::str::FromStr;
+    if value.len() > MAX_DEVICE_ID_BYTES {
+        bail!("invalid device id");
+    }
     let key = asterism_mesh::iroh_types::PublicKey::from_str(value)
         .map_err(|_| anyhow!("invalid device id"))?;
     Ok(DeviceId::from_public_key(key))
@@ -504,9 +524,7 @@ impl Coordinator {
         source: &impl VerifiedIdentitySource,
         bearer: &str,
     ) -> Result<AccountBinding> {
-        if bearer.trim().is_empty() || bearer.len() > 8 * 1024 {
-            bail!("hosted session bearer is invalid");
-        }
+        validate_session_bearer(bearer)?;
         self.sign_in_identity(source.verify_session(bearer)?)
     }
 
@@ -1107,14 +1125,19 @@ impl EncryptedFileStore {
     }
 
     fn read_high_watermark(&self) -> Result<u64> {
-        match fs::read_to_string(self.sidecar_path(".highwater")) {
-            Ok(value) => value
-                .trim()
-                .parse()
-                .context("parsing coordinator sequence high-watermark"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
-            Err(error) => Err(error).context("reading coordinator sequence high-watermark"),
-        }
+        let Some(bytes) = self.read_bounded_file(
+            &self.sidecar_path(".highwater"),
+            MAX_HIGH_WATERMARK_BYTES,
+            "coordinator sequence high-watermark",
+        )?
+        else {
+            return Ok(0);
+        };
+        std::str::from_utf8(&bytes)
+            .context("decoding coordinator sequence high-watermark")?
+            .trim()
+            .parse()
+            .context("parsing coordinator sequence high-watermark")
     }
 
     fn write_high_watermark(&self, sequence: u64, abort_after_publish: bool) -> Result<()> {
@@ -1184,42 +1207,89 @@ impl EncryptedFileStore {
     }
 
     fn needs_active_key_rewrap(&self) -> Result<bool> {
-        match fs::read(&self.path) {
-            Ok(bytes) => {
-                let encrypted: EncryptedMetadata = serde_json::from_slice(&bytes)
-                    .context("parsing encrypted coordinator metadata for key rotation")?;
-                Ok(encrypted.key_version != self.keys.active().version)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error).context("reading coordinator metadata for key rotation"),
-        }
+        let Some(encrypted) = self.read_encrypted_metadata()? else {
+            return Ok(false);
+        };
+        Ok(encrypted.key_version != self.keys.active().version)
     }
 
     fn load(&self) -> Result<DurableCoordinator> {
-        match fs::read(&self.path) {
-            Ok(bytes) => {
-                let encrypted: EncryptedMetadata = serde_json::from_slice(&bytes)
-                    .context("parsing encrypted coordinator metadata")?;
-                let plaintext = encrypted.open_bytes(self.keys.read(&encrypted.key_version)?)?;
-                serde_json::from_slice(&plaintext).context("parsing coordinator metadata")
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Ok(DurableCoordinator::default())
-            }
-            Err(error) => Err(error).context("reading encrypted coordinator metadata"),
+        let Some(encrypted) = self.read_encrypted_metadata()? else {
+            return Ok(DurableCoordinator::default());
+        };
+        let plaintext = encrypted.open_bytes(self.keys.read(&encrypted.key_version)?)?;
+        if plaintext.len() > MAX_DURABLE_STATE_BYTES {
+            bail!("coordinator durable state exceeds {MAX_DURABLE_STATE_BYTES} bytes");
         }
+        serde_json::from_slice(&plaintext).context("parsing coordinator metadata")
+    }
+
+    fn read_encrypted_metadata(&self) -> Result<Option<EncryptedMetadata>> {
+        let Some(bytes) = self.read_bounded_file(
+            &self.path,
+            MAX_ENCRYPTED_METADATA_BYTES,
+            "encrypted coordinator metadata",
+        )?
+        else {
+            return Ok(None);
+        };
+        let encrypted: EncryptedMetadata = serde_json::from_slice(&bytes)
+            .context("parsing encrypted coordinator metadata")?;
+        encrypted.validate_bounds()?;
+        Ok(Some(encrypted))
+    }
+
+    fn read_bounded_file(
+        &self,
+        path: &Path,
+        maximum: usize,
+        description: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {description}"));
+            }
+        };
+        let length = file
+            .metadata()
+            .with_context(|| format!("inspecting {description}"))?
+            .len();
+        if length > maximum as u64 {
+            bail!("{description} exceeds {maximum} bytes");
+        }
+
+        let mut bytes = Vec::with_capacity(length as usize);
+        file.take(maximum as u64 + 1)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("reading {description}"))?;
+        if bytes.len() > maximum {
+            bail!("{description} exceeds {maximum} bytes");
+        }
+        Ok(Some(bytes))
     }
 
     fn save(&self, state: &DurableCoordinator) -> std::result::Result<(), CommitError> {
         let plaintext = serde_json::to_vec(state)
             .context("serializing coordinator metadata")
             .map_err(CommitError::BeforePublish)?;
+        if plaintext.len() > MAX_DURABLE_STATE_BYTES {
+            return Err(CommitError::BeforePublish(anyhow!(
+                "coordinator durable state exceeds {MAX_DURABLE_STATE_BYTES} bytes"
+            )));
+        }
         let active = self.keys.active();
         let encrypted = EncryptedMetadata::seal_bytes(&active.bytes, &active.version, &plaintext)
             .map_err(CommitError::BeforePublish)?;
         let encoded = serde_json::to_vec(&encrypted)
             .context("encoding encrypted coordinator metadata")
             .map_err(CommitError::BeforePublish)?;
+        if encoded.len() > MAX_ENCRYPTED_METADATA_BYTES {
+            return Err(CommitError::BeforePublish(anyhow!(
+                "encrypted coordinator metadata exceeds {MAX_ENCRYPTED_METADATA_BYTES} bytes"
+            )));
+        }
         let parent = self
             .path
             .parent()
@@ -1344,6 +1414,7 @@ impl PersistentCoordinator {
         source: &impl VerifiedIdentitySource,
         bearer: &str,
     ) -> Result<AccountBinding> {
+        validate_session_bearer(bearer)?;
         let identity = source.verify_session(bearer)?;
         self.sign_in_identity(identity)
     }
@@ -1488,10 +1559,21 @@ impl EncryptedMetadata {
     }
 
     fn open_bytes(&self, key: &[u8; 32]) -> Result<Vec<u8>> {
+        self.validate_bounds()?;
         let cipher = Aes256Gcm::new_from_slice(key).expect("AES-256 keys are exactly 32 bytes");
         cipher
             .decrypt(Nonce::from_slice(&self.nonce), self.ciphertext.as_ref())
             .map_err(|_| anyhow!("account metadata cannot be decrypted"))
+    }
+
+    fn validate_bounds(&self) -> Result<()> {
+        if self.key_version.trim().is_empty() || self.key_version.len() > 128 {
+            bail!("encrypted metadata key version is invalid");
+        }
+        if self.ciphertext.len() > MAX_DURABLE_STATE_BYTES + AES_GCM_TAG_BYTES {
+            bail!("encrypted coordinator ciphertext exceeds its durable state bound");
+        }
+        Ok(())
     }
 }
 
@@ -1549,7 +1631,21 @@ fn enrollment_generation_binding(generation: &str) -> [u8; 32] {
     *hash.finalize().as_bytes()
 }
 
+const fn base64url_nopad_encoded_len(decoded_bytes: usize) -> usize {
+    (decoded_bytes * 8 + 5) / 6
+}
+
+fn validate_session_bearer(bearer: &str) -> Result<()> {
+    if bearer.trim().is_empty() || bearer.len() > MAX_SESSION_BEARER_BYTES {
+        bail!("hosted session bearer is invalid");
+    }
+    Ok(())
+}
+
 fn validate_generation(value: &str) -> Result<()> {
+    if value.len() != base64url_nopad_encoded_len(32) {
+        bail!("account generation is invalid");
+    }
     let decoded = BASE64URL_NOPAD
         .decode(value.as_bytes())
         .map_err(|_| anyhow!("account generation is invalid"))?;
@@ -1608,6 +1704,48 @@ mod tests {
             .sign_in(&Edge("unused", "unused", false), "forged-session")
             .is_err());
         assert!(VerifiedIdentity::new("", "subject").is_err());
+    }
+
+    #[test]
+    fn encoded_enrollment_fields_enforce_bounds_before_base64_decode() {
+        let mut service = Coordinator::new([1; 32]);
+        let binding = service.sign_in(&google(), "opaque-session").unwrap();
+        let challenge = service.begin_enrollment(&binding).unwrap().token();
+        let device_id = DeviceIdentity::generate().device_id().to_string();
+        let signature = BASE64URL_NOPAD.encode(&[0; Signature::LENGTH]);
+        let generation = BASE64URL_NOPAD.encode(&[0; 32]);
+
+        assert_eq!(challenge.len(), base64url_nopad_encoded_len(64));
+        assert!(EnrollmentChallenge::from_token(&challenge).is_ok());
+        assert!(EnrollmentChallenge::from_token(&format!("{challenge}A")).is_err());
+
+        assert_eq!(signature.len(), base64url_nopad_encoded_len(Signature::LENGTH));
+        assert!(EnrollmentProof::from_tokens(&device_id, &challenge, &signature).is_ok());
+        assert!(EnrollmentProof::from_tokens(
+            &device_id,
+            &challenge,
+            &format!("{signature}A")
+        )
+        .is_err());
+
+        assert_eq!(generation.len(), base64url_nopad_encoded_len(32));
+        assert!(validate_generation(&generation).is_ok());
+        assert!(validate_generation(&format!("{generation}A")).is_err());
+    }
+
+    #[test]
+    fn persistent_sign_in_enforces_the_session_bearer_limit() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.enc");
+        let keys = MetadataKeyRing::new(MetadataKey::new("kms-v1", [1; 32]).unwrap(), []).unwrap();
+        let mut service = PersistentCoordinator::open(&path, keys, [2; 32]).unwrap();
+
+        assert!(service
+            .sign_in(&google(), &"x".repeat(MAX_SESSION_BEARER_BYTES))
+            .is_ok());
+        assert!(service
+            .sign_in(&google(), &"x".repeat(MAX_SESSION_BEARER_BYTES + 1))
+            .is_err());
     }
 
     #[test]
@@ -2333,6 +2471,49 @@ mod tests {
             .join("state.enc.highwater.tmp-stale")
             .exists());
         drop(restarted);
+    }
+
+    #[test]
+    fn startup_high_watermark_accepts_limit_and_rejects_limit_plus_one() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.enc");
+        let high_watermark = directory.path().join("state.enc.highwater");
+        let keys = MetadataKeyRing::new(MetadataKey::new("kms-v1", [17; 32]).unwrap(), []).unwrap();
+
+        fs::write(&high_watermark, "0".repeat(MAX_HIGH_WATERMARK_BYTES)).unwrap();
+        let service = PersistentCoordinator::open(&path, keys.clone(), [18; 32]).unwrap();
+        drop(service);
+
+        fs::write(
+            &high_watermark,
+            "0".repeat(MAX_HIGH_WATERMARK_BYTES + 1),
+        )
+        .unwrap();
+        let error = PersistentCoordinator::open(&path, keys, [18; 32]).unwrap_err();
+        assert!(format!("{error:#}").contains("high-watermark exceeds"));
+    }
+
+    #[test]
+    fn startup_encrypted_envelope_accepts_limit_and_rejects_limit_plus_one() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.enc");
+        let keys = MetadataKeyRing::new(MetadataKey::new("kms-v1", [19; 32]).unwrap(), []).unwrap();
+
+        File::create(&path)
+            .unwrap()
+            .set_len(MAX_ENCRYPTED_METADATA_BYTES as u64)
+            .unwrap();
+        let at_limit = PersistentCoordinator::open(&path, keys.clone(), [20; 32]).unwrap_err();
+        let at_limit = format!("{at_limit:#}");
+        assert!(at_limit.contains("parsing encrypted coordinator metadata"));
+        assert!(!at_limit.contains("exceeds"));
+
+        File::create(&path)
+            .unwrap()
+            .set_len(MAX_ENCRYPTED_METADATA_BYTES as u64 + 1)
+            .unwrap();
+        let over_limit = PersistentCoordinator::open(&path, keys, [20; 32]).unwrap_err();
+        assert!(format!("{over_limit:#}").contains("encrypted coordinator metadata exceeds"));
     }
 
     #[test]

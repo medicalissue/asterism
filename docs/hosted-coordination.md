@@ -36,6 +36,7 @@ The core validates that authorization responses are bounded and use HTTPS. It
 does not initiate a browser flow, exchange a code, handle a callback, set a
 cookie, or retain bearer material. `as-4j7` owns bounded polling, browser/deep
 link behavior, and OS credential-store integration using the same wire shape.
+Session bearers are rejected above 8 KiB before the trusted verifier is called.
 
 ## Minimal coordinator state
 
@@ -53,6 +54,13 @@ per account. Hosted state is capped at 64 devices per account, 4 KiB per
 discovery configuration, 4,096 accounts, and 16 MiB in total. Revocation removes
 hosted discovery configuration; it cannot mutate a local orbit ACL. Export
 includes only the minimal durable record.
+
+Encoded challenges, signatures, and account generations are checked at their
+exact base64url lengths before decoding. Startup checks file metadata before
+allocation, caps the high-watermark sidecar at 32 bytes and the JSON encrypted
+envelope at the worst-case representation of a 16 MiB ciphertext, and then
+rechecks both encrypted ciphertext and decrypted plaintext bounds before JSON
+state parsing.
 
 Deletion checks the caller's account generation and removes the account in one
 durable transaction. Every existing binding becomes invalid as soon as the
