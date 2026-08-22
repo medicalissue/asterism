@@ -554,8 +554,11 @@ for _ in $(seq 1 100); do
   fi
   sleep 0.2
 done
-[ -n "$TRANSFERRED" ] && [ "$TRANSFERRED" -ge "$TRANSFER_BYTES" ] \
-  || fail "the completed bridge event did not account for the real $TRANSFER_BYTES-byte transfer (got ${TRANSFERRED:-none}):"$'\n'"$TRANSFER_EVENT"
+if [ -n "$TRANSFERRED" ] && [ "$TRANSFERRED" -ge "$TRANSFER_BYTES" ]; then
+  :
+else
+  fail "the completed bridge event did not account for the real $TRANSFER_BYTES-byte transfer (got ${TRANSFERRED:-none}):"$'\n'"$TRANSFER_EVENT"
+fi
 grep -qE 'state=degraded path=direct bytes=[0-9]+ throughput_Bps=[1-9][0-9]* transition=' \
   <<<"$TRANSFER_EVENT" \
   || fail "the completed four-GiB bridge event did not report path, throughput and transition:"$'\n'"$TRANSFER_EVENT"
@@ -679,8 +682,11 @@ PARTS="$(ASTERISM_HOME="$A" "$AST" status "$INST" 2>&1)"
 grep -qE "healthy .* direct .* [0-9]+\.[0-9]ms RTT .* MiB/s .* reconnected \(provider_returned\) .* recovery [0-9]+ms" <<<"$PARTS" \
   || fail "the recovered volume did not expose throughput and recovery measurements:"$'\n'"$PARTS"
 TRANSFERRED="$(sed -n 's/.*transferred (\([0-9][0-9]*\) bytes).*/\1/p' <<<"$PARTS" | head -1)"
-[ -n "$TRANSFERRED" ] && [ "$TRANSFERRED" -gt 0 ] \
-  || fail "the recovered bridge session did not report its transferred bytes:"$'\n'"$PARTS"
+if [ -n "$TRANSFERRED" ] && [ "$TRANSFERRED" -gt 0 ]; then
+  :
+else
+  fail "the recovered bridge session did not report its transferred bytes:"$'\n'"$PARTS"
+fi
 echo "ok: status exposes provider recovery duration and current-session bridge throughput"
 
 # ---- 8b. the consumer's daemon restarts under a live guest -----------------

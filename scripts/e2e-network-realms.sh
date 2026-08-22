@@ -327,8 +327,11 @@ for d in json.load(open(sys.argv[1]))["devices"]:
         break
 PY
 )
-[ "$ADDRS" = 0 ] && [ "$RELAYS" -gt 0 ] \
-  || fail "the forced-relay enrollment carried direct addresses ($ADDRS/$RELAYS)"
+if [ "$ADDRS" = 0 ] && [ "$RELAYS" -gt 0 ]; then
+  :
+else
+  fail "the forced-relay enrollment carried direct addresses ($ADDRS/$RELAYS)"
+fi
 echo "ok: pairing crossed two NATs from a relay-only ticket (0 direct hints, $RELAYS relay hint)"
 
 TWO_NAT_PING="$(wait_ping b "$A_NAME" relay)"
