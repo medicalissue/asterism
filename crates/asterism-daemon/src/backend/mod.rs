@@ -634,6 +634,8 @@ pub(crate) fn observed_running(h: &Handle) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use std::process::{Child, Command};
     use std::time::Duration;
 
     // ---- the startup migration ---------------------------------------------
@@ -643,6 +645,39 @@ mod tests {
         use asterism_core::hv::{ControlChannel, GuestEndpoint};
         use asterism_core::instance::{now_unix, Shape, Status};
         use asterism_core::registry::Shard;
+
+        /// A process that remains alive while its argv carries an
+        /// instance-owned socket path.  The shell keeps the path as a plain
+        /// argument; its short-lived `sleep` child receives only a valid
+        /// duration, which works with both BSD and GNU `sleep`.
+        struct SocketArgFixture(Child);
+
+        impl SocketArgFixture {
+            fn spawn(socket: &Path) -> Self {
+                Self(
+                    Command::new("/bin/sh")
+                        .args([
+                            "-c",
+                            "while :; do sleep 1; done",
+                            "asterism-adoption-fixture",
+                        ])
+                        .arg(socket)
+                        .spawn()
+                        .unwrap(),
+                )
+            }
+
+            fn id(&self) -> u32 {
+                self.0.id()
+            }
+        }
+
+        impl Drop for SocketArgFixture {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
 
         fn shard() -> (tempfile::TempDir, Shard) {
             let dir = tempfile::tempdir().unwrap();
@@ -694,21 +729,15 @@ mod tests {
         fn a_live_guest_holding_its_own_socket_is_adopted() {
             let (_dir, mut reg) = shard();
             let ctl = paths::qmp_socket_path("live");
-            // `sleep` stands in for the helper, holding the path a real one
-            // would have been given on its command line.
-            let mut sleeper = std::process::Command::new("sleep")
-                .arg("30")
-                .arg(&ctl)
-                .spawn()
-                .unwrap();
-            pre_identity(&mut reg, "live", vz::ID, sleeper.id());
+            let guest = SocketArgFixture::spawn(&ctl);
+            pre_identity(&mut reg, "live", vz::ID, guest.id());
 
             let handle = reg.get("live").unwrap().handle.clone().unwrap();
             let proc = ProcId::adopt(
-                sleeper.id(),
+                guest.id(),
                 handle.started_at,
                 &Evidence {
-                    exec: &["sleep"],
+                    exec: &["sh"],
                     names: &[&ctl],
                 },
             )
@@ -720,12 +749,9 @@ mod tests {
             assert!(adopted.owned().unwrap().alive());
             assert_eq!(
                 adopted.pid,
-                Some(sleeper.id()),
+                Some(guest.id()),
                 "the pid is left where it was"
             );
-
-            let _ = sleeper.kill();
-            let _ = sleeper.wait();
         }
 
         /// The rejection this pack was resubmitted for, at the seam the
@@ -741,11 +767,7 @@ mod tests {
             let (_dir, mut reg) = shard();
             // Somebody else's instance, and a process holding its socket.
             let theirs = paths::qmp_socket_path("theirs");
-            let mut foreign = std::process::Command::new("sleep")
-                .arg("30")
-                .arg(&theirs)
-                .spawn()
-                .unwrap();
+            let foreign = SocketArgFixture::spawn(&theirs);
 
             pre_identity(&mut reg, "ours", qemu::ID, foreign.id());
             // Backdate the handle so the foreign process started 30s after
@@ -756,7 +778,7 @@ mod tests {
                     foreign.id(),
                     handle.started_at.saturating_sub(30),
                     &Evidence {
-                        exec: &["sleep"],
+                        exec: &["sh"],
                         names: &[&paths::qmp_socket_path("ours")],
                     },
                 )
@@ -777,9 +799,6 @@ mod tests {
                 ProcId::capture(foreign.id()).unwrap().alive(),
                 "the foreign process is untouched"
             );
-
-            let _ = foreign.kill();
-            let _ = foreign.wait();
         }
 
         /// A handle nobody could adopt is not thereby a dead guest. Its own
