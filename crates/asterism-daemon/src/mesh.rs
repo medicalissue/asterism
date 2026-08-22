@@ -1867,13 +1867,13 @@ where
         Ok::<(), anyhow::Error>(())
     };
 
-    // Whichever direction finishes first ends the session: an ssh that has
-    // hung up, or a QEMU that has closed its NBD connection, is not waiting
-    // for anything from the other side.
-    tokio::select! {
-        r = up => r,
-        r = down => r,
-    }
+    // EOF only closes one half of a stream. In particular, an NBD client may
+    // finish its request direction before the export has written the reply it
+    // is waiting for. Keep the opposite direction alive after forwarding the
+    // half-close, just as `copy_bidirectional` does; dropping it here turns a
+    // healthy, delayed reply into a first-I/O error under scheduler pressure.
+    tokio::try_join!(up, down)?;
+    Ok(())
 }
 
 /// The far end of a splice: connect to the guest and become a pipe.
@@ -2939,6 +2939,7 @@ async fn read_frame<T: serde::de::DeserializeOwned>(recv: &mut RecvStream) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn test_machine() -> asterism_core::hv::Machine {
         asterism_core::hv::Machine {
@@ -3222,6 +3223,63 @@ mod tests {
 
         let connection = client.connect(addr).await.unwrap();
         (client, connection, dir)
+    }
+
+    /// NBD's request and reply directions are independently closed. The
+    /// bridge must relay the provider's reply after QEMU has half-closed its
+    /// request side, rather than treating that half-close as a whole-session
+    /// failure.
+    #[tokio::test]
+    async fn a_half_closed_volume_side_keeps_receiving_the_peer_reply() {
+        let server = MeshEndpoint::bind(&DeviceIdentity::generate(), MeshMode::LocalOnly)
+            .await
+            .unwrap();
+        let client = MeshEndpoint::bind(&DeviceIdentity::generate(), MeshMode::LocalOnly)
+            .await
+            .unwrap();
+        let address = server.direct_addr().await.unwrap();
+        let (request_seen, seen) = tokio::sync::oneshot::channel();
+        let (release_provider, release) = tokio::sync::oneshot::channel();
+        let listener = server.clone();
+
+        let provider = tokio::spawn(async move {
+            let connection = listener.accept().await.unwrap().unwrap();
+            let mut stream = connection.accept_stream().await.unwrap();
+            let request = stream.recv.read_to_end(1024).await.unwrap();
+            assert_eq!(request, b"nbd request");
+            request_seen.send(()).unwrap();
+            stream.send.write_all(b"nbd reply").await.unwrap();
+            let _ = stream.send.finish();
+            release.await.unwrap();
+        });
+
+        let connection = client.connect(address).await.unwrap();
+        let stream = connection.open_stream().await.unwrap();
+        let (bridge, mut nbd) = tokio::net::UnixStream::pair().unwrap();
+        let splice = tokio::spawn(pump(bridge, stream));
+
+        nbd.write_all(b"nbd request").await.unwrap();
+        nbd.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), seen)
+            .await
+            .expect("the provider never received the local half-close")
+            .unwrap();
+        let mut reply = [0u8; b"nbd reply".len()];
+        tokio::time::timeout(Duration::from_secs(3), nbd.read_exact(&mut reply))
+            .await
+            .expect("the provider reply was dropped after the local half-close")
+            .unwrap();
+        assert_eq!(&reply, b"nbd reply");
+
+        release_provider.send(()).unwrap();
+        provider.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), splice)
+            .await
+            .expect("the splice did not close after both peers finished")
+            .unwrap()
+            .unwrap();
+        connection.close(b"done");
+        client.close().await;
     }
 
     #[tokio::test]
