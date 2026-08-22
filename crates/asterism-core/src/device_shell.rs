@@ -67,12 +67,37 @@ pub struct ShellSessionStatus {
 pub struct ShellPolicyStatus {
     pub state: ShellPolicyState,
     pub epoch: u64,
+    /// Unix seconds when the state visible to a reader last changed. This is
+    /// a policy change for disabled/enabled, and a session boundary while
+    /// active. Older daemons omit it, so clients must accept `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled_at: Option<u64>,
     #[serde(default)]
     pub active: Vec<ShellSessionStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unavailable_reason: Option<String>,
+}
+
+impl ShellPolicyStatus {
+    /// A truthful row for a target whose status could not be read. GUI and
+    /// hosted consumers use the same wire model instead of inventing a
+    /// parallel loading/error state.
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self {
+            state: ShellPolicyState::Unavailable,
+            epoch: 0,
+            changed_at: None,
+            enabled_at: None,
+            active: Vec::new(),
+            unavailable_reason: Some(reason.into()),
+        }
+    }
+
+    pub fn active_sessions(&self) -> usize {
+        self.active.len()
+    }
 }
 
 /// One environment entry accepted from the CLI.

@@ -20,6 +20,7 @@
 use anyhow::{bail, Result};
 use serde::Serialize;
 
+use asterism_core::device_shell::{ShellPolicyState, ShellPolicyStatus};
 use asterism_core::orbit::{DeviceStatus, Orbit};
 use asterism_core::paths;
 use asterism_core::protocol::{Request, Response};
@@ -44,10 +45,14 @@ pub struct Row {
     /// something that is already awake is a no-op with a minute of waiting
     /// attached.
     pub wakeable: bool,
+    /// The daemon's first-class read model, unchanged. A hosted panel and
+    /// this local GUI therefore interpret the same tagged state and session
+    /// rows rather than maintaining parallel caches.
+    pub shell: Shell,
 }
 
 impl Row {
-    fn of(device: &DeviceStatus, wakeable: bool) -> Row {
+    fn of(device: &DeviceStatus, wakeable: bool, status: ShellPolicyStatus) -> Row {
         Row {
             name: device.name.clone(),
             short_id: device.short_id(),
@@ -55,6 +60,14 @@ impl Row {
             path: device.path.clone(),
             is_self: device.is_self,
             wakeable,
+            shell: Shell {
+                status,
+                access: if device.is_self {
+                    ShellAccess::LocalOnly
+                } else {
+                    ShellAccess::ReadOnly
+                },
+            },
         }
     }
 
@@ -62,6 +75,22 @@ impl Row {
     pub fn can_wake(&self) -> bool {
         self.wakeable && !self.online && !self.is_self
     }
+}
+
+/// Device-shell data and the authority this consumer has over its target.
+/// `access` is presentation-independent: only the row for this process's
+/// local daemon may expose a mutation control.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Shell {
+    pub status: ShellPolicyStatus,
+    pub access: ShellAccess,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellAccess {
+    LocalOnly,
+    ReadOnly,
 }
 
 /// What the daemon has to say about the orbit.
@@ -81,14 +110,46 @@ pub struct Devices {
 impl Devices {
     pub fn load() -> Devices {
         match client::devices() {
-            Ok(devices) => Devices::of(&devices, &wakeable_ids()),
+            Ok(devices) => {
+                // Each target is independent. Probe them concurrently so an
+                // offline edge costs one mesh timeout, not one timeout for
+                // every later row in the orbit.
+                let mut statuses = shell_statuses(&devices).into_iter();
+                Devices::of_with(&devices, &wakeable_ids(), |_| {
+                    statuses.next().expect("one shell status per device")
+                })
+            }
             Err(e) => Devices { fleet: Fleet::Unreachable { reason: format!("{e:#}") } },
         }
     }
 
     /// Build a section from an answer somebody else already has.
+    #[cfg(test)]
     pub fn of(devices: &[DeviceStatus], wakeable: &[String]) -> Devices {
-        Devices { fleet: Fleet::Rows { rows: rows(devices, wakeable) } }
+        Devices::of_with(devices, wakeable, |_| {
+            ShellPolicyStatus::unavailable("device-shell status was not probed")
+        })
+    }
+
+    fn of_with(
+        devices: &[DeviceStatus],
+        wakeable: &[String],
+        mut shell_status: impl FnMut(&DeviceStatus) -> ShellPolicyStatus,
+    ) -> Devices {
+        Devices {
+            fleet: Fleet::Rows {
+                rows: devices
+                    .iter()
+                    .map(|device| {
+                        Row::of(
+                            device,
+                            wakeable.contains(&device.device_id),
+                            shell_status(device),
+                        )
+                    })
+                    .collect(),
+            },
+        }
     }
 
     /// The section as text, for `--dump-main devices`.
@@ -100,13 +161,22 @@ impl Devices {
             Fleet::Rows { rows } => {
                 for row in rows {
                     out.push(format!(
-                        "device {:<20} {:<14} {:<8} path={:<8} self={} wake={}",
+                        "device {:<20} {:<14} {:<8} path={:<8} self={} wake={} shell={} changed_at={} access={}",
                         row.name,
                         row.short_id,
                         if row.online { "online" } else { "offline" },
                         if row.path.is_empty() { "-" } else { &row.path },
                         yes(row.is_self),
-                        yes(row.can_wake())
+                        yes(row.can_wake()),
+                        shell_label(&row.shell.status),
+                        row.shell
+                            .status
+                            .changed_at
+                            .map_or_else(|| "-".to_owned(), |at| at.to_string()),
+                        match row.shell.access {
+                            ShellAccess::LocalOnly => "local_only",
+                            ShellAccess::ReadOnly => "read_only",
+                        },
                     ));
                 }
             }
@@ -115,11 +185,44 @@ impl Devices {
     }
 }
 
-fn rows(devices: &[DeviceStatus], wakeable: &[String]) -> Vec<Row> {
-    devices
-        .iter()
-        .map(|d| Row::of(d, wakeable.contains(&d.device_id)))
-        .collect()
+fn shell_statuses(devices: &[DeviceStatus]) -> Vec<ShellPolicyStatus> {
+    std::thread::scope(|scope| {
+        let probes: Vec<_> = devices
+            .iter()
+            .map(|device| {
+                scope.spawn(move || {
+                    if !device.online {
+                        return ShellPolicyStatus::unavailable(
+                            "device is offline; its shell policy could not be read",
+                        );
+                    }
+                    let target = (!device.is_self).then_some(device.name.as_str());
+                    client::device_shell_status(target).unwrap_or_else(|error| {
+                        ShellPolicyStatus::unavailable(format!(
+                            "device-shell status could not be read: {error:#}"
+                        ))
+                    })
+                })
+            })
+            .collect();
+        probes
+            .into_iter()
+            .map(|probe| {
+                probe.join().unwrap_or_else(|_| {
+                    ShellPolicyStatus::unavailable("device-shell status probe died")
+                })
+            })
+            .collect()
+    })
+}
+
+fn shell_label(status: &ShellPolicyStatus) -> String {
+    match status.state {
+        ShellPolicyState::Disabled => "disabled".to_owned(),
+        ShellPolicyState::EnabledOrbit => "enabled_orbit_members".to_owned(),
+        ShellPolicyState::Active => format!("active_{}_sessions", status.active_sessions()),
+        ShellPolicyState::Unavailable => "unavailable".to_owned(),
+    }
 }
 
 fn yes(b: bool) -> &'static str {
@@ -145,6 +248,15 @@ fn wakeable_ids() -> Vec<String> {
         .filter(|d| d.wake.wakeable().is_some())
         .map(|d| d.device_id.clone())
         .collect()
+}
+
+/// Local GUI mutation seam. It intentionally has no device argument: remote
+/// rows and hosted readers can observe policy, but cannot aim a mutation.
+pub fn set_shell(enabled: bool) -> Result<Shell> {
+    client::set_device_shell(enabled).map(|status| Shell {
+        status,
+        access: ShellAccess::LocalOnly,
+    })
 }
 
 // ---- pairing ---------------------------------------------------------------
@@ -340,6 +452,25 @@ mod tests {
 
     use asterism_core::orbit::Device;
 
+    fn shell(state: ShellPolicyState, active: usize) -> ShellPolicyStatus {
+        ShellPolicyStatus {
+            state,
+            epoch: 7,
+            changed_at: Some(1_777_777_777),
+            enabled_at: Some(1_777_777_700),
+            active: (0..active)
+                .map(|index| asterism_core::device_shell::ShellSessionStatus {
+                    session_id: format!("session-{index}"),
+                    peer_device_id: format!("peer-{index}"),
+                    peer_name: format!("peer {index}"),
+                    started_at: 1_777_777_710 + index as u64,
+                    pty: true,
+                })
+                .collect(),
+            unavailable_reason: None,
+        }
+    }
+
     fn device(name: &str, online: bool, is_self: bool) -> DeviceStatus {
         DeviceStatus {
             name: name.to_owned(),
@@ -352,7 +483,11 @@ mod tests {
 
     #[test]
     fn a_row_carries_the_identity_as_well_as_the_label() {
-        let row = Row::of(&device("desktop", true, false), false);
+        let row = Row::of(
+            &device("desktop", true, false),
+            false,
+            shell(ShellPolicyState::Disabled, 0),
+        );
         assert_eq!(row.name, "desktop");
         assert_eq!(row.short_id.chars().count(), 12);
         assert!(row.online && !row.is_self);
@@ -364,15 +499,46 @@ mod tests {
     /// button that would do nothing, or wait a minute to find out it did.
     #[test]
     fn wake_is_offered_only_where_it_could_work() {
-        let asleep = Row::of(&device("desktop", false, false), true);
+        let unavailable = || ShellPolicyStatus::unavailable("offline");
+        let asleep = Row::of(&device("desktop", false, false), true, unavailable());
         assert!(asleep.can_wake());
 
         // Awake already.
-        assert!(!Row::of(&device("desktop", true, false), true).can_wake());
+        assert!(!Row::of(&device("desktop", true, false), true, unavailable()).can_wake());
         // Nothing to aim at.
-        assert!(!Row::of(&device("desktop", false, false), false).can_wake());
+        assert!(!Row::of(&device("desktop", false, false), false, unavailable()).can_wake());
         // This machine. It is not asleep; it is running this window.
-        assert!(!Row::of(&device("laptop", false, true), true).can_wake());
+        assert!(!Row::of(&device("laptop", false, true), true, unavailable()).can_wake());
+    }
+
+    #[test]
+    fn shell_rows_use_one_model_for_all_four_rendered_states() {
+        assert_eq!(shell_label(&shell(ShellPolicyState::Disabled, 0)), "disabled");
+        assert_eq!(
+            shell_label(&shell(ShellPolicyState::EnabledOrbit, 0)),
+            "enabled_orbit_members"
+        );
+        assert_eq!(shell_label(&shell(ShellPolicyState::Active, 3)), "active_3_sessions");
+        assert_eq!(
+            shell_label(&ShellPolicyStatus::unavailable("old daemon")),
+            "unavailable"
+        );
+    }
+
+    #[test]
+    fn only_the_local_row_advertises_mutation_authority() {
+        let devices = [device("laptop", true, true), device("desktop", true, false)];
+        let model = Devices::of_with(&devices, &[], |_| shell(ShellPolicyState::Disabled, 0));
+        let Fleet::Rows { rows } = model.fleet else {
+            panic!("expected rows")
+        };
+        assert_eq!(rows[0].shell.access, ShellAccess::LocalOnly);
+        assert_eq!(rows[1].shell.access, ShellAccess::ReadOnly);
+
+        let json = serde_json::to_value(&rows).unwrap();
+        assert_eq!(json[0]["shell"]["access"], "local_only");
+        assert_eq!(json[1]["shell"]["access"], "read_only");
+        assert_eq!(json[0]["shell"]["status"]["changed_at"], 1_777_777_777u64);
     }
 
     #[test]

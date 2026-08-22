@@ -27,10 +27,11 @@ use anyhow::{bail, Context, Result};
 
 use asterism_core::backup::{ExportReport, RestoreReport};
 use asterism_core::compat;
+use asterism_core::device_shell::{ShellPolicyAction, ShellPolicyStatus};
 use asterism_core::instance::{Instance, Shape};
 use asterism_core::orbit::DeviceStatus;
 use asterism_core::paths;
-use asterism_core::protocol::{Request, Response};
+use asterism_core::protocol::{self, Request, Response};
 use asterism_core::registry::OrbitRow;
 use asterism_core::snapshot::Snapshot;
 use asterism_core::volume::BlockVolume;
@@ -88,6 +89,53 @@ pub fn devices() -> Result<Vec<DeviceStatus>> {
         Response::Devices { devices } => Ok(devices),
         Response::Error { message } => bail!(message),
         other => bail!("unexpected reply from astd: {other:?}"),
+    }
+}
+
+/// Read one target's device-shell offer. The inner frame is read-only and
+/// may cross the authenticated mesh; policy mutation has no corresponding
+/// remote helper.
+pub fn device_shell_status(device: Option<&str>) -> Result<ShellPolicyStatus> {
+    let request = match device {
+        Some(device) => Request::Proxy {
+            device: device.to_owned(),
+            inner: Box::new(Request::DeviceShellStatus),
+        },
+        None => Request::DeviceShellStatus,
+    };
+    let mut response = send_with(&request, ORBIT_TIMEOUT)?;
+    // Protocol 4 exposed local status through the policy frame. Preserve
+    // that read during a rolling upgrade, but never use the local-only frame
+    // as a fallback for a remote target.
+    if device.is_none()
+        && matches!(&response, Response::Error { message } if protocol::is_unknown_variant_error(message))
+    {
+        response = send(&Request::DeviceShellPolicy { action: ShellPolicyAction::Status })?;
+    }
+    match response {
+        Response::DeviceShellStatus { status, .. } => Ok(status),
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected reply from astd: {other:?}"),
+    }
+}
+
+/// Change only the daemon behind this app's private local socket. Keeping
+/// the target out of this API makes remote enable structurally impossible.
+pub fn set_device_shell(enabled: bool) -> Result<ShellPolicyStatus> {
+    match send(&device_shell_policy_request(enabled))? {
+        Response::DeviceShellStatus { status, .. } => Ok(status),
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected reply from astd: {other:?}"),
+    }
+}
+
+fn device_shell_policy_request(enabled: bool) -> Request {
+    Request::DeviceShellPolicy {
+        action: if enabled {
+            ShellPolicyAction::Enable
+        } else {
+            ShellPolicyAction::Disable
+        },
     }
 }
 
@@ -608,5 +656,17 @@ mod tests {
         // Anything else is a daemon we do not understand, and saying so
         // beats reporting success we did not get.
         assert!(reply_to_done(r#"{"result":"pong","version":"0.0.2"}"#).is_err());
+    }
+
+    #[test]
+    fn gui_shell_mutation_has_no_remote_target() {
+        assert_eq!(
+            serde_json::to_string(&device_shell_policy_request(true)).unwrap(),
+            r#"{"cmd":"device_shell_policy","action":"enable"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&device_shell_policy_request(false)).unwrap(),
+            r#"{"cmd":"device_shell_policy","action":"disable"}"#
+        );
     }
 }

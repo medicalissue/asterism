@@ -191,6 +191,32 @@ export interface DeviceRow {
   path: string;
   is_self: boolean;
   wakeable: boolean;
+  shell: DeviceShell;
+}
+
+export type ShellPolicyState = 'disabled' | 'enabled_orbit' | 'active' | 'unavailable';
+
+export interface ShellSessionStatus {
+  session_id: string;
+  peer_device_id: string;
+  peer_name: string;
+  started_at: number;
+  pty: boolean;
+}
+
+/** The daemon's wire read model, shared with hosted management consumers. */
+export interface ShellPolicyStatus {
+  state: ShellPolicyState;
+  epoch: number;
+  changed_at?: number;
+  enabled_at?: number;
+  active: ShellSessionStatus[];
+  unavailable_reason?: string;
+}
+
+export interface DeviceShell {
+  status: ShellPolicyStatus;
+  access: 'local_only' | 'read_only';
 }
 
 export interface Devices {
@@ -200,6 +226,12 @@ export interface Devices {
 export function loadDevices(): Promise<Devices> {
   if (browserPreview) return Promise.resolve(PREVIEW_DEVICES);
   return invoke<Devices>('device_rows');
+}
+
+/** Local-only by construction: there is no target device argument. */
+export function setDeviceShell(enabled: boolean): Promise<DeviceShell> {
+  if (browserPreview) return Promise.reject(new Error('device-shell policy is read-only in browser preview'));
+  return invoke<DeviceShell>('set_device_shell', {enabled});
 }
 
 // ---- the main window: Volumes ----------------------------------------------
@@ -348,9 +380,9 @@ const PREVIEW_INSTANCES: Instances = {fleet: {kind: 'rows', rows: [
 ]}};
 
 const PREVIEW_DEVICES: Devices = {fleet: {kind: 'rows', rows: [
-  {name: 'desk-mini', short_id: '7A2F19C4', online: true, path: 'Direct · 1.2 ms', is_self: true, wakeable: false},
-  {name: 'studio', short_id: 'C14B902E', online: true, path: 'Relay · Seoul', is_self: false, wakeable: false},
-  {name: 'nas', short_id: '982DE614', online: false, path: 'Last seen 18m ago', is_self: false, wakeable: true},
+  {name: 'desk-mini', short_id: '7A2F19C4', online: true, path: 'Direct · 1.2 ms', is_self: true, wakeable: false, shell: {access: 'local_only', status: {state: 'disabled', epoch: 2, changed_at: 1777777777, active: []}}},
+  {name: 'studio', short_id: 'C14B902E', online: true, path: 'Relay · Seoul', is_self: false, wakeable: false, shell: {access: 'read_only', status: {state: 'active', epoch: 5, changed_at: 1777777790, enabled_at: 1777777700, active: [{session_id: 'preview-session', peer_device_id: 'desk-mini-key', peer_name: 'desk-mini', started_at: 1777777790, pty: true}]}}},
+  {name: 'nas', short_id: '982DE614', online: false, path: 'Last seen 18m ago', is_self: false, wakeable: true, shell: {access: 'read_only', status: {state: 'unavailable', epoch: 0, active: [], unavailable_reason: 'device is offline; its shell policy could not be read'}}},
 ]}};
 
 const PREVIEW_VOLUMES: Volumes = {inventory: {kind: 'rows', rows: [

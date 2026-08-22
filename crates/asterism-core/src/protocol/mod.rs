@@ -347,9 +347,15 @@ pub enum Request {
     DeviceRemove {
         name: String,
     },
-    /// Read or change this device's shell offer. The daemon accepts this only
-    /// from its private local control socket; a mesh RPC is explicitly
-    /// refused even though the enum remains parseable across versions.
+    /// Read this device's shell offer. Unlike policy mutation, this is safe
+    /// over authenticated mesh RPC and is the read contract used by remote
+    /// and hosted management surfaces.
+    DeviceShellStatus,
+    /// Change this device's shell offer. The daemon accepts this only from
+    /// its private local control socket; a mesh RPC is explicitly refused
+    /// even though the enum remains parseable across versions. `Status` is
+    /// retained for protocol-4 clients, but new readers use
+    /// [`Request::DeviceShellStatus`].
     DeviceShellPolicy {
         action: ShellPolicyAction,
     },
@@ -644,6 +650,7 @@ impl Request {
             | Request::PairConfirm { .. }
             | Request::DeviceRemove { .. }
             | Request::DevicePing { .. }
+            | Request::DeviceShellStatus
             | Request::DeviceShellPolicy { .. }
             | Request::DeviceShellOpen { .. }
             | Request::DeviceShellInput { .. }
@@ -724,6 +731,7 @@ impl Request {
         match self {
             Request::Compat => 2,
             Request::BackupExport { .. } | Request::BackupImport { .. } => 3,
+            Request::DeviceShellStatus => 5,
             Request::DeviceShellPolicy { .. }
             | Request::DeviceShellOpen { .. }
             | Request::DeviceShellInput { .. }
@@ -747,6 +755,7 @@ impl Request {
             Request::Compat => Some("compat"),
             Request::BackupExport { .. } => Some("backup_export"),
             Request::BackupImport { .. } => Some("backup_import"),
+            Request::DeviceShellStatus => Some("device_shell_status"),
             Request::DeviceShellPolicy { .. }
             | Request::DeviceShellOpen { .. }
             | Request::DeviceShellInput { .. }
@@ -1138,6 +1147,7 @@ pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
             }
             .since(),
         ),
+        ("device_shell_status", Request::DeviceShellStatus.since()),
     ]
     .into_iter()
     .map(|(name, version)| (name.to_owned(), version))
@@ -1247,6 +1257,11 @@ mod tests {
         assert!(!Request::Compat.speakable_at(1));
         assert!(Request::Compat.speakable_at(2));
         assert!(Request::List.speakable_at(1));
+        assert_eq!(Request::DeviceShellStatus.since(), 5);
+        assert_eq!(
+            serde_json::to_string(&Request::DeviceShellStatus).unwrap(),
+            r#"{"cmd":"device_shell_status"}"#
+        );
     }
 
     /// The table `ast compat` prints and the rule the code follows are the
