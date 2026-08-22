@@ -1035,7 +1035,10 @@ fn main() -> Result<()> {
         }
         Response::BackupRestored { report } => {
             println!("{}  restored ({})", report.instance, report.id);
-            if report.rebind.volumes.is_empty() && report.rebind.secrets.is_empty() {
+            if report.rebind.volumes.is_empty()
+                && report.rebind.secrets.is_empty()
+                && report.rebind.gpu.is_none()
+            {
                 println!("no external parts need rebinding");
             } else {
                 for volume in report.rebind.volumes {
@@ -1048,6 +1051,15 @@ fn main() -> Result<()> {
                     println!(
                         "rebind secret: {} to {} (previous source: {})",
                         secret.secret, secret.authority, secret.source_device
+                    );
+                }
+                if let Some(gpu) = report.rebind.gpu {
+                    println!(
+                        "rebind gpu: {} on {} ({} bytes; previous provider generation {})",
+                        gpu.provider_gpu_uuid,
+                        gpu.provider_device,
+                        gpu.memory_bytes,
+                        gpu.provider_generation
                     );
                 }
             }
@@ -1118,9 +1130,10 @@ fn inspect_backup(source: &str, json: bool) -> Result<()> {
         println!("image: {}  {}", image.reference, image.content);
     }
     println!(
-        "external parts to rebind: {} volume(s), {} secret(s)",
+        "external parts to rebind: {} volume(s), {} secret(s), {} gpu(s)",
         manifest.rebind.volumes.len(),
-        manifest.rebind.secrets.len()
+        manifest.rebind.secrets.len(),
+        usize::from(manifest.rebind.gpu.is_some())
     );
     Ok(())
 }
