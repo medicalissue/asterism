@@ -56,21 +56,22 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::sync::Mutex;
 
 use asterism_core::hv::{DiskSpec, Hypervisor};
-use asterism_core::instance::{Instance, Volume};
+use asterism_core::instance::{Instance, PartRuntime, Status, Volume};
 use asterism_core::orbit::{Device, Orbit};
 use asterism_core::paths;
 use asterism_core::proc::{ProcId, Signal};
 use asterism_core::protocol::{Request, Response};
 use asterism_core::tools::{run, tool};
 use asterism_core::volume::{self, BlockVolume, Store};
+use asterism_mesh::PathKind;
 
-use crate::mesh::{Mesh, Splice};
+use crate::mesh::{self, Mesh, Splice, TransferStats};
 use crate::Node;
 
 /// How long to wait for a freshly started export to put its socket on disk.
@@ -83,6 +84,15 @@ const EXPORT_READY: Duration = Duration::from_secs(5);
 /// and a wall of QEMU errors is not one.
 pub const UNREACHABLE: &str = "could not reach the device holding it";
 
+/// The launch admission bound for a remote block device.
+///
+/// NBD performs a network round trip for I/O the guest cannot make local, so
+/// the roadmap treats five milliseconds as a placement boundary rather than
+/// a cosmetic warning.  This is deliberately an admission rule: an unsuitable
+/// link is refused before a lease epoch, instance record, bridge socket, or
+/// guest is mutated.
+pub const REMOTE_VOLUME_MAX_RTT: Duration = Duration::from_millis(5);
+
 // ---- the plane -------------------------------------------------------------
 
 struct Plane {
@@ -92,6 +102,38 @@ struct Plane {
     /// Live bridges, keyed by instance name. Dropping one unbinds its socket
     /// and kills every session on it.
     bridges: Mutex<HashMap<String, Vec<Splice>>>,
+    /// Runtime observations keyed by the instance and exact sourced part.
+    /// These are deliberately not registry state: after a restart [`reattach`]
+    /// measures them again before the first request is served.
+    health: Mutex<HashMap<HealthKey, HealthEntry>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct HealthKey {
+    instance: String,
+    device: String,
+    volume: String,
+}
+
+#[derive(Debug, Clone)]
+struct HealthEntry {
+    runtime: PartRuntime,
+    /// Monotonic clock for a recovery duration. Never serialized.
+    degraded_since: Option<Instant>,
+    /// Runtime-only generation of the accepted NBD session. A late completion
+    /// from an older session must not degrade the one which replaced it.
+    session: u64,
+}
+
+impl HealthEntry {
+    fn begin_session(&mut self) -> u64 {
+        self.session = self.session.saturating_add(1);
+        self.session
+    }
+
+    fn owns_session(&self, session: u64) -> bool {
+        self.session == session
+    }
 }
 
 static PLANE: OnceLock<Plane> = OnceLock::new();
@@ -104,8 +146,215 @@ pub fn init(node: Node, mesh: Option<Arc<Mesh>>) -> Result<()> {
         mesh,
         store: Mutex::new(store),
         bridges: Mutex::new(HashMap::new()),
+        health: Mutex::new(HashMap::new()),
     });
     Ok(())
+}
+
+fn health_key(instance: &str, vol: &Volume) -> HealthKey {
+    HealthKey {
+        instance: instance.to_owned(),
+        device: vol.host.clone(),
+        volume: vol.path.clone(),
+    }
+}
+
+/// Add live part observations to a status reply without mutating the shard.
+///
+/// The instance lifecycle remains the backend's fact. A missing provider
+/// changes only the sourced volume row, never `running` to `stopped`.
+pub(crate) async fn annotate_runtime(inst: &mut Instance) {
+    let Ok(plane) = plane() else { return };
+
+    // A quiet NBD session has no bytes with which to discover that its peer
+    // disappeared. Status is already asking for a live observation, so probe
+    // each remote provider here and degrade only that sourced part when it no
+    // longer answers. Run the probes together: several disks on sleeping
+    // devices cost one bounded probe interval, not one interval per disk.
+    if inst.status == Status::Running {
+        if let Some(mesh) = plane.mesh.clone() {
+            let mut probes = tokio::task::JoinSet::new();
+            for vol in inst
+                .volumes
+                .iter()
+                .filter(|vol| vol.is_block() && !vol.is_local())
+                .cloned()
+            {
+                let mesh = mesh.clone();
+                probes.spawn(async move {
+                    let reachable = mesh.measure_link(&vol.host).await.is_some();
+                    (vol, reachable)
+                });
+            }
+            while let Some(result) = probes.join_next().await {
+                if let Ok((vol, false)) = result {
+                    mark_degraded(
+                        &inst.name,
+                        &vol,
+                        "provider_loss",
+                        "the provider did not answer the status liveness probe".into(),
+                        None,
+                        None,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
+    let health = plane.health.lock().await;
+    for vol in inst.volumes.iter_mut().filter(|vol| vol.is_block()) {
+        vol.runtime = health
+            .get(&health_key(&inst.name, vol))
+            .map(|entry| entry.runtime.clone());
+    }
+}
+
+async fn mark_healthy(
+    instance: &str,
+    vol: &Volume,
+    reason: &str,
+    result: &str,
+    measured_recovery: Option<Duration>,
+    measured_link: Option<mesh::LinkObservation>,
+) {
+    let Ok(plane) = plane() else { return };
+    let link = match measured_link {
+        Some(link) => Some((
+            link.path.map(|path| path.as_str().to_owned()),
+            link.rtt_micros,
+        )),
+        None => match (&plane.mesh, vol.is_local()) {
+            (_, true) => Some((Some("local".to_owned()), Some(0))),
+            (Some(mesh), false) => mesh.link_observation(&vol.host).await.map(|link| {
+                (
+                    link.path.map(|path| path.as_str().to_owned()),
+                    link.rtt_micros,
+                )
+            }),
+            (None, false) => None,
+        },
+    };
+    let key = health_key(instance, vol);
+    let mut health = plane.health.lock().await;
+    let previous = health.get(&key).cloned();
+    let recovery = measured_recovery.or_else(|| {
+        previous
+            .as_ref()
+            .and_then(|entry| entry.degraded_since.map(|since| since.elapsed()))
+    });
+    let runtime = PartRuntime {
+        state: "healthy".into(),
+        path: link
+            .as_ref()
+            .and_then(|(path, _)| path.clone())
+            .or_else(|| {
+                previous
+                    .as_ref()
+                    .and_then(|entry| entry.runtime.path.clone())
+            }),
+        rtt_micros: link
+            .as_ref()
+            .and_then(|(_, rtt)| *rtt)
+            .or_else(|| previous.as_ref().and_then(|entry| entry.runtime.rtt_micros)),
+        throughput_bytes_per_sec: previous
+            .as_ref()
+            .and_then(|entry| entry.runtime.throughput_bytes_per_sec),
+        transferred_bytes: previous
+            .as_ref()
+            .and_then(|entry| entry.runtime.transferred_bytes),
+        recovery_millis: recovery.map(duration_millis),
+        transition_reason: reason.to_owned(),
+        recovery_result: result.to_owned(),
+        detail: None,
+        observed_at: asterism_core::instance::now_unix(),
+    };
+    eprintln!(
+        "astd: remote_part instance={instance:?} device={:?} volume={:?} state=healthy path={} rtt_us={} transition={reason} recovery={result} recovery_ms={}",
+        vol.host,
+        vol.path,
+        runtime.path.as_deref().unwrap_or("-"),
+        runtime.rtt_micros.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
+        runtime.recovery_millis.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
+    );
+    health.insert(
+        key,
+        HealthEntry {
+            runtime,
+            degraded_since: None,
+            session: previous.as_ref().map(|entry| entry.session).unwrap_or(0),
+        },
+    );
+}
+
+async fn mark_degraded(
+    instance: &str,
+    vol: &Volume,
+    reason: &str,
+    detail: String,
+    transfer: Option<TransferStats>,
+    ended_session: Option<u64>,
+) {
+    let Ok(plane) = plane() else { return };
+    let key = health_key(instance, vol);
+    let mut health = plane.health.lock().await;
+    let previous = health.get(&key).cloned();
+    if ended_session.is_some_and(|session| {
+        previous
+            .as_ref()
+            .is_some_and(|entry| !entry.owns_session(session))
+    }) {
+        return;
+    }
+    let degraded_since = previous
+        .as_ref()
+        .and_then(|entry| entry.degraded_since)
+        .or_else(|| Some(Instant::now()));
+    let throughput = transfer.and_then(TransferStats::bytes_per_second);
+    let transferred = transfer.map(TransferStats::total_bytes);
+    let detail = detail.chars().take(512).collect::<String>();
+    let runtime = PartRuntime {
+        state: "degraded".into(),
+        path: previous
+            .as_ref()
+            .and_then(|entry| entry.runtime.path.clone()),
+        rtt_micros: previous.as_ref().and_then(|entry| entry.runtime.rtt_micros),
+        throughput_bytes_per_sec: throughput.or_else(|| {
+            previous
+                .as_ref()
+                .and_then(|entry| entry.runtime.throughput_bytes_per_sec)
+        }),
+        transferred_bytes: transferred.or_else(|| {
+            previous
+                .as_ref()
+                .and_then(|entry| entry.runtime.transferred_bytes)
+        }),
+        recovery_millis: None,
+        transition_reason: reason.to_owned(),
+        recovery_result: "retrying".into(),
+        detail: Some(detail.clone()),
+        observed_at: asterism_core::instance::now_unix(),
+    };
+    eprintln!(
+        "astd: remote_part instance={instance:?} device={:?} volume={:?} state=degraded path={} bytes={} throughput_Bps={} transition={reason} recovery=retrying detail={detail:?}",
+        vol.host,
+        vol.path,
+        runtime.path.as_deref().unwrap_or("-"),
+        runtime.transferred_bytes.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
+        runtime.throughput_bytes_per_sec.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
+    );
+    health.insert(
+        key,
+        HealthEntry {
+            runtime,
+            degraded_since,
+            session: previous.as_ref().map(|entry| entry.session).unwrap_or(0),
+        },
+    );
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u64::MAX as u128) as u64
 }
 
 fn plane() -> Result<&'static Plane> {
@@ -721,6 +970,11 @@ pub fn bring_up(inst: &Instance, hv: &dyn Hypervisor) -> Result<Raised> {
     // Called from inside `block_in_place`, which is what makes blocking on
     // the runtime here legal: the worker thread has already been handed back.
     tokio::runtime::Handle::current().block_on(async {
+        // Validate every provider before taking the first renewed lease.
+        // Doing this inside `raise_all`'s per-volume loop would let a later
+        // unsuitable provider refuse the boot only after earlier lease epochs
+        // moved.
+        preflight_all(&blocks).await?;
         match raise_all(&name, &blocks).await {
             Ok(disks) => Ok(disks),
             Err(e) => {
@@ -731,12 +985,129 @@ pub fn bring_up(inst: &Instance, hv: &dyn Hypervisor) -> Result<Raised> {
     })
 }
 
+/// Prove that every established remote block device still has a measurable
+/// direct path before any boot-side mutation begins.
+///
+/// The direct/<=5ms placement SLO was enforced when `attach` created this
+/// holder/provider/lease context. A reboot renews that same context; applying
+/// the placement threshold again after sustained I/O would confuse temporary
+/// queueing with a changed placement and strand the current holder. A path
+/// which has actually fallen back to a relay is still refused here.
+async fn preflight_all(blocks: &[Volume]) -> Result<()> {
+    for volume in blocks {
+        preflight_existing_remote_volume(&volume.host)
+            .await
+            .with_context(|| format!("leasing volume {}:{}", volume.host, volume.path))?;
+    }
+    Ok(())
+}
+
+/// Admit one remote block-volume placement.
+///
+/// The peer probe is a real exchange over the currently selected QUIC path.
+/// A relay remains valid for ordinary orbit control and recovery, but it is
+/// not suitable for the synchronous NBD data plane.  Absence of a selected
+/// path or measured RTT is also a refusal: guessing would turn an SLO into a
+/// label.
+pub async fn preflight_remote_volume(device: &str) -> Result<()> {
+    if device == plane()?.node.device_name().await {
+        return Ok(());
+    }
+    let observation = measure_remote_volume_link(device).await?;
+    admit_remote_volume_link(device, &observation)
+}
+
+/// Validate continuity for an attachment whose provider and holder were
+/// already admitted. The path must remain direct and measurable, but a busy
+/// established volume is not a new placement decision and is not rejected on
+/// a transient RTT sample.
+async fn preflight_existing_remote_volume(device: &str) -> Result<()> {
+    if device == plane()?.node.device_name().await {
+        return Ok(());
+    }
+    let observation = measure_remote_volume_link(device).await?;
+    resume_remote_volume_link(device, &observation)
+}
+
+async fn measure_remote_volume_link(device: &str) -> Result<mesh::LinkObservation> {
+    let plane = plane()?;
+    let mesh = plane
+        .mesh
+        .as_ref()
+        .context("this daemon has no mesh endpoint, so it cannot reach another device's volumes")?;
+    let observation = mesh
+        .measure_link(device)
+        .await
+        .ok_or_else(|| anyhow!("{UNREACHABLE}: {device}"))?;
+    Ok(observation)
+}
+
+fn admit_remote_volume_link(device: &str, observation: &mesh::LinkObservation) -> Result<()> {
+    let path = observation.path.ok_or_else(|| {
+        anyhow!(
+            "remote volume placement on {device} refused before mutation: the selected path is \
+             not measurable; a direct path with at most {}ms RTT is required",
+            REMOTE_VOLUME_MAX_RTT.as_millis()
+        )
+    })?;
+    if path != PathKind::Direct {
+        bail!(
+            "remote volume placement on {device} refused before mutation: selected path is \
+             {path}; remote volumes require a direct path with at most {}ms RTT",
+            REMOTE_VOLUME_MAX_RTT.as_millis()
+        );
+    }
+    let rtt = observation.rtt_micros.ok_or_else(|| {
+        anyhow!(
+            "remote volume placement on {device} refused before mutation: direct-path RTT is \
+             not measurable; at most {}ms is required",
+            REMOTE_VOLUME_MAX_RTT.as_millis()
+        )
+    })?;
+    if rtt > REMOTE_VOLUME_MAX_RTT.as_micros() as u64 {
+        bail!(
+            "remote volume placement on {device} refused before mutation: direct-path RTT is \
+             {:.1}ms; at most {}ms is required",
+            rtt as f64 / 1_000.0,
+            REMOTE_VOLUME_MAX_RTT.as_millis()
+        );
+    }
+    Ok(())
+}
+
+fn resume_remote_volume_link(device: &str, observation: &mesh::LinkObservation) -> Result<()> {
+    let path = observation.path.ok_or_else(|| {
+        anyhow!(
+            "remote volume resume on {device} refused before mutation: the selected path is \
+             not measurable; an existing remote volume still requires a direct path"
+        )
+    })?;
+    if path != PathKind::Direct {
+        bail!(
+            "remote volume resume on {device} refused before mutation: selected path is \
+             {path}; an existing remote volume still requires a direct path"
+        );
+    }
+    if observation.rtt_micros.is_none() {
+        bail!(
+            "remote volume resume on {device} refused before mutation: direct-path RTT is \
+             not measurable"
+        );
+    }
+    Ok(())
+}
+
 /// Drop every bridge an instance holds. The lease stays: it belongs to the
 /// attachment, not to the boot, so `ast down` followed by `ast up` finds the
 /// volume still theirs.
 pub async fn take_down(instance: &str) {
     let Ok(plane) = plane() else { return };
     plane.bridges.lock().await.remove(instance);
+    plane
+        .health
+        .lock()
+        .await
+        .retain(|key, _| key.instance != instance);
 }
 
 /// Raise the bridges again for a guest that outlived this daemon.
@@ -769,6 +1140,7 @@ pub async fn reattach(inst: &Instance) {
     let Ok(plane) = plane() else { return };
     let mut raised = Vec::new();
     for vol in &blocks {
+        let started = Instant::now();
         let Some(epoch) = vol.epoch else {
             eprintln!(
                 "astd: {}:{} is attached to {:?} with no lease recorded, so there \
@@ -778,7 +1150,16 @@ pub async fn reattach(inst: &Instance) {
             continue;
         };
         match reattach_one(&inst.name, vol, epoch).await {
-            Ok(splice) => {
+            Ok((splice, Ok(_export))) => {
+                mark_healthy(
+                    &inst.name,
+                    vol,
+                    "daemon_restart",
+                    "reconnected",
+                    Some(started.elapsed()),
+                    None,
+                )
+                .await;
                 eprintln!(
                     "astd: {:?} kept running through this restart — its volume {}:{} \
                      is bridged again at epoch {epoch}",
@@ -786,11 +1167,49 @@ pub async fn reattach(inst: &Instance) {
                 );
                 raised.push(splice);
             }
-            Err(e) => eprintln!(
-                "astd: could not put {:?}'s volume {}:{} back ({e:#}) — the guest's \
-                 writes to that disk will fail until it is stopped and booted again",
-                inst.name, vol.host, vol.path
-            ),
+            Ok((splice, Err(e))) => {
+                mark_degraded(
+                    &inst.name,
+                    vol,
+                    "daemon_restart",
+                    format!(
+                        "reconnect failed after {}ms: {e:#}",
+                        duration_millis(started.elapsed())
+                    ),
+                    None,
+                    None,
+                )
+                .await;
+                eprintln!(
+                    "astd: could not put {:?}'s volume {}:{} back ({e:#}) — the guest's \
+                     writes to that disk are paused; its local bridge is listening and will \
+                     reconnect at epoch {epoch} when the provider returns",
+                    inst.name, vol.host, vol.path
+                );
+                // The local socket is the recovery seam. QEMU keeps retrying
+                // it; each accepted session asks the provider to validate the
+                // same holder and epoch, so a provider which returns can
+                // recover this part without a new lease or another restart.
+                raised.push(splice);
+            }
+            Err(e) => {
+                mark_degraded(
+                    &inst.name,
+                    vol,
+                    "daemon_restart",
+                    format!(
+                        "could not restore the local bridge after {}ms: {e:#}",
+                        duration_millis(started.elapsed())
+                    ),
+                    None,
+                    None,
+                )
+                .await;
+                eprintln!(
+                    "astd: could not bind {:?}'s local bridge for {}:{} ({e:#})",
+                    inst.name, vol.host, vol.path
+                );
+            }
         }
     }
     if !raised.is_empty() {
@@ -804,15 +1223,23 @@ pub async fn reattach(inst: &Instance) {
     }
 }
 
-async fn reattach_one(instance: &str, vol: &Volume, epoch: u64) -> Result<Splice> {
+async fn reattach_one(
+    instance: &str,
+    vol: &Volume,
+    epoch: u64,
+) -> Result<(Splice, Result<String>)> {
     // The provider is asked first: an export that is not running comes back
-    // here, and a lease that has moved on says so now rather than as a wall
-    // of NBD errors when the guest next writes.
-    confirm_lease(&vol.path, &vol.host, instance, epoch)
+    // here, and a lease that has moved on says so now rather than only as a
+    // wall of NBD errors when the guest next writes. Failure does not prevent
+    // the local listener from being restored: every later QEMU retry repeats
+    // the provider-side epoch check, which is both the safety fence and the
+    // path by which a temporarily absent provider recovers.
+    let confirmed = confirm_lease(&vol.path, &vol.host, instance, epoch)
         .await
-        .with_context(|| format!("reconnecting to volume {}:{}", vol.host, vol.path))?;
+        .with_context(|| format!("reconnecting to volume {}:{}", vol.host, vol.path));
     let socket = paths::volume_bridge_socket(instance, &vol.host, &vol.path);
-    bridge(instance, vol, epoch, &socket).await
+    let splice = bridge(instance, vol, epoch, &socket).await?;
+    Ok((splice, confirmed))
 }
 
 /// Hand back every lease this instance holds — what `ast rm` owes the devices
@@ -962,6 +1389,7 @@ async fn raise_all(instance: &str, blocks: &[Volume]) -> Result<Raised> {
             .with_context(|| format!("leasing volume {}:{}", vol.host, vol.path))?;
         let socket = paths::volume_bridge_socket(instance, &vol.host, &vol.path);
         let splice = bridge(instance, vol, epoch, &socket).await?;
+        mark_healthy(instance, vol, "guest_boot", "connected", None, None).await;
         raised.push(splice);
         out.disks.push(DiskSpec::NbdUnix {
             socket,
@@ -1047,8 +1475,101 @@ async fn splice_one(
         .mesh
         .as_ref()
         .context("this daemon has no mesh endpoint, so it cannot reach a remote volume")?;
-    mesh.volume_splice(device, volume, holder, epoch, stream)
-        .await
+    let vol = Volume::block(volume, device, epoch, 0);
+    let opened = mesh.open_volume_splice(device, volume, holder, epoch).await;
+    let (remote, observation) = match opened {
+        Ok(opened) => opened,
+        Err(e) => {
+            mark_degraded(
+                holder,
+                &vol,
+                "provider_loss",
+                format!("provider connection failed: {e:#}"),
+                None,
+                None,
+            )
+            .await;
+            return Err(e);
+        }
+    };
+    let session = mark_session_ready(holder, &vol, observation).await;
+    match mesh::pump(stream, remote).await {
+        Ok(stats) => {
+            mark_degraded(
+                holder,
+                &vol,
+                "provider_loss",
+                "the remote NBD session ended; QEMU is retrying the local bridge".into(),
+                Some(stats),
+                Some(session),
+            )
+            .await;
+            Ok(())
+        }
+        Err(e) => {
+            mark_degraded(
+                holder,
+                &vol,
+                "provider_loss",
+                format!("remote NBD session failed: {e:#}"),
+                None,
+                Some(session),
+            )
+            .await;
+            Err(e)
+        }
+    }
+}
+
+async fn mark_session_ready(
+    instance: &str,
+    vol: &Volume,
+    observation: mesh::LinkObservation,
+) -> u64 {
+    let Ok(plane) = plane() else { return 0 };
+    let key = health_key(instance, vol);
+    let mut health = plane.health.lock().await;
+    let entry = health.entry(key).or_insert_with(|| HealthEntry {
+        runtime: PartRuntime {
+            state: "healthy".into(),
+            path: None,
+            rtt_micros: None,
+            throughput_bytes_per_sec: None,
+            transferred_bytes: None,
+            recovery_millis: None,
+            transition_reason: "volume_session_ready".into(),
+            recovery_result: "connected".into(),
+            detail: None,
+            observed_at: asterism_core::instance::now_unix(),
+        },
+        degraded_since: None,
+        session: 0,
+    });
+    let degraded = entry.runtime.state == "degraded";
+    let path_changed = entry.runtime.path.as_deref() != observation.path.map(|path| path.as_str());
+
+    if degraded {
+        entry.runtime.state = "healthy".into();
+        entry.runtime.transition_reason = "provider_returned".into();
+        entry.runtime.recovery_result = "reconnected".into();
+        entry.runtime.recovery_millis = entry
+            .degraded_since
+            .map(|since| duration_millis(since.elapsed()));
+        entry.runtime.detail = None;
+        entry.degraded_since = None;
+    } else if path_changed {
+        entry.runtime.transition_reason = "selected_path_changed".into();
+        entry.runtime.recovery_result = "healthy".into();
+    }
+
+    // The control request which opened this bridge measured an application
+    // ping. Once the NBD stream is selected, replace that estimate with the
+    // transport RTT of the path carrying the volume's bytes without erasing
+    // the transition that explains how we got here.
+    entry.runtime.path = observation.path.map(|path| path.as_str().to_owned());
+    entry.runtime.rtt_micros = observation.rtt_micros;
+    entry.runtime.observed_at = asterism_core::instance::now_unix();
+    entry.begin_session()
 }
 
 #[cfg(test)]
@@ -1121,6 +1642,93 @@ mod tests {
         );
         assert!(err.contains("vz"), "{err}");
         assert!(check_backend(&Fake(true)).is_ok());
+    }
+
+    #[test]
+    fn remote_volume_admission_requires_a_measured_direct_path_within_the_slo() {
+        let direct_at_limit = mesh::LinkObservation {
+            path: Some(PathKind::Direct),
+            rtt_micros: Some(REMOTE_VOLUME_MAX_RTT.as_micros() as u64),
+        };
+        assert!(admit_remote_volume_link("provider", &direct_at_limit).is_ok());
+
+        let relay = mesh::LinkObservation {
+            path: Some(PathKind::Relay),
+            rtt_micros: Some(100),
+        };
+        let error = admit_remote_volume_link("provider", &relay)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("refused before mutation"), "{error}");
+        assert!(error.contains("selected path is relay"), "{error}");
+
+        let slow = mesh::LinkObservation {
+            path: Some(PathKind::Direct),
+            rtt_micros: Some(REMOTE_VOLUME_MAX_RTT.as_micros() as u64 + 1),
+        };
+        let error = admit_remote_volume_link("provider", &slow)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("direct-path RTT"), "{error}");
+        assert!(error.contains("at most 5ms"), "{error}");
+
+        for unmeasured in [
+            mesh::LinkObservation {
+                path: None,
+                rtt_micros: Some(100),
+            },
+            mesh::LinkObservation {
+                path: Some(PathKind::Direct),
+                rtt_micros: None,
+            },
+        ] {
+            let error = admit_remote_volume_link("provider", &unmeasured)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("not measurable"), "{error}");
+        }
+    }
+
+    #[test]
+    fn an_existing_lease_requires_direct_continuity_but_not_readmission() {
+        let busy_direct = mesh::LinkObservation {
+            path: Some(PathKind::Direct),
+            rtt_micros: Some(REMOTE_VOLUME_MAX_RTT.as_micros() as u64 + 50_000),
+        };
+        assert!(
+            admit_remote_volume_link("provider", &busy_direct).is_err(),
+            "a new placement must still enforce the <=5ms SLO"
+        );
+        assert!(
+            resume_remote_volume_link("provider", &busy_direct).is_ok(),
+            "a transient RTT sample must not strand an existing holder"
+        );
+
+        let relay = mesh::LinkObservation {
+            path: Some(PathKind::Relay),
+            rtt_micros: Some(100),
+        };
+        let error = resume_remote_volume_link("provider", &relay)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("refused before mutation"), "{error}");
+        assert!(error.contains("selected path is relay"), "{error}");
+
+        for unmeasured in [
+            mesh::LinkObservation {
+                path: None,
+                rtt_micros: Some(100),
+            },
+            mesh::LinkObservation {
+                path: Some(PathKind::Direct),
+                rtt_micros: None,
+            },
+        ] {
+            let error = resume_remote_volume_link("provider", &unmeasured)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("not measurable"), "{error}");
+        }
     }
 
     /// Volume requests must be recognisable *before* the instance shard is
@@ -1477,5 +2085,31 @@ mod tests {
         let socket = dir.path().join("nbd-e1.sock");
         std::fs::write(&socket, b"").unwrap();
         assert!(!export_alive(lease.proc.as_ref(), &socket));
+    }
+
+    #[test]
+    fn a_new_volume_session_fences_a_late_disconnect_observation() {
+        let runtime = PartRuntime {
+            state: "healthy".into(),
+            path: Some("direct".into()),
+            rtt_micros: Some(500),
+            throughput_bytes_per_sec: None,
+            transferred_bytes: None,
+            recovery_millis: None,
+            transition_reason: "guest_boot".into(),
+            recovery_result: "connected".into(),
+            detail: None,
+            observed_at: 1,
+        };
+        let mut entry = HealthEntry {
+            runtime,
+            degraded_since: None,
+            session: 0,
+        };
+
+        let old = entry.begin_session();
+        let current = entry.begin_session();
+        assert!(!entry.owns_session(old));
+        assert!(entry.owns_session(current));
     }
 }

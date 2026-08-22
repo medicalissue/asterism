@@ -773,7 +773,6 @@ fn main() -> Result<()> {
                                  disk and the guest mounts it wherever it likes"
                         );
                     }
-                    warn_if_far(&device);
                     Request::AttachBlock {
                         name,
                         volume,
@@ -1250,7 +1249,10 @@ fn print_devices() -> Result<()> {
         Response::Error { message } => bail!(message),
         other => bail!("unexpected reply from astd: {other:?}"),
     };
-    println!("{:<24} {:<14} {:<8} PATH", "NAME", "DEVICE ID", "STATUS");
+    println!(
+        "{:<24} {:<14} {:<8} {:<7} {:>8}  {:<34} RECOVERY",
+        "NAME", "DEVICE ID", "STATUS", "PATH", "RTT", "TRANSITION"
+    );
     for d in &devices {
         let status = if d.online { "online" } else { "offline" };
         let name = if d.is_self {
@@ -1258,7 +1260,20 @@ fn print_devices() -> Result<()> {
         } else {
             d.name.clone()
         };
-        println!("{:<24} {:<14} {:<8} {}", name, d.short_id(), status, d.path);
+        let rtt = d
+            .rtt_micros
+            .map(|us| format!("{:.1}ms", us as f64 / 1_000.0))
+            .unwrap_or_else(|| "-".into());
+        println!(
+            "{:<24} {:<14} {:<8} {:<7} {:>8}  {:<34} {}",
+            name,
+            d.short_id(),
+            status,
+            d.path,
+            rtt,
+            d.transition_reason.as_deref().unwrap_or("-"),
+            d.recovery_result.as_deref().unwrap_or("-"),
+        );
     }
     if devices.len() == 1 {
         println!("\nno other devices yet — add one with: ast device invite");
@@ -1906,34 +1921,6 @@ fn block_ref(volume: &str, host: Option<&str>) -> Option<(String, String)> {
         volume.starts_with('/') || volume.starts_with('.') || volume.starts_with('~');
     (!looks_like_a_path && asterism_core::volume::check_name(volume).is_ok())
         .then(|| (host.to_owned(), volume.to_owned()))
-}
-
-/// Above this, a block volume is worth thinking about rather than assuming.
-///
-/// NBD does a round trip per I/O the guest's queue cannot hide, so latency is
-/// the number that decides whether a remote volume feels like a disk or like
-/// a mistake. A LAN is well under a millisecond; a WAN is not.
-const SLOW_LINK_MS: f64 = 5.0;
-
-/// Say so, once, if the device holding the bytes is far away.
-///
-/// A note rather than a refusal: a slow volume is exactly right for an
-/// archive and exactly wrong for a database, and only the person attaching it
-/// knows which this is. Silent if the device cannot be reached — the attach
-/// itself is about to say so much better than a ping could.
-fn warn_if_far(device: &str) {
-    let Ok(Response::DevicePong { millis, .. }) = send(&Request::DevicePing {
-        device: device.to_owned(),
-    }) else {
-        return;
-    };
-    if millis > SLOW_LINK_MS {
-        eprintln!(
-            "note: {device} is {millis:.1}ms away — a volume over a link this slow \
-             reads like a slow disk. Fine for archives and backups; poor for a \
-             database or a build tree."
-        );
-    }
 }
 
 /// `ast volume ls`.

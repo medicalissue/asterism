@@ -71,7 +71,11 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
         }
         Request::Status { name } => {
             return match reg.get(&name) {
-                Ok(instance) => status_response(instance.clone()),
+                Ok(instance) => {
+                    let mut instance = instance.clone();
+                    volume::annotate_runtime(&mut instance).await;
+                    status_response(instance)
+                }
                 Err(e) => Response::Error {
                     message: format!("{e:#}"),
                 },
@@ -654,6 +658,10 @@ async fn attach_block(reg: &mut Shard, name: &str, vol: &str, device: &str) -> R
     let inst = reg.get(name)?.clone();
     let hv = backend::for_instance(&inst)?;
     volume::check_backend(&*hv)?;
+    // Admission precedes the provider-side lease bump and the local registry
+    // write.  A relay-only or high-latency placement therefore leaves neither
+    // device half-mutated.
+    volume::preflight_remote_volume(device).await?;
     let (epoch, _export, size) = volume::take_lease(vol, device, name).await?;
     reg.attach_block(name, vol, device, epoch, size)
 }

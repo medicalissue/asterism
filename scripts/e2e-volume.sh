@@ -53,8 +53,14 @@ fi
 
 # Fresh, SHORT homes: unix socket paths are capped near 104 bytes, and a volume
 # adds an export socket and a bridge socket to the pile. Deliberately nowhere
-# near the user's own ~/.asterism.
-RUN="/private/tmp/ast-vol-$$"
+# near the user's own ~/.asterism. macOS exposes its short temporary root at
+# /private/tmp; Linux exposes the same role at /tmp.
+if [ -d /private/tmp ] && [ -w /private/tmp ]; then
+  SHORT_TMP=/private/tmp
+else
+  SHORT_TMP=/tmp
+fi
+RUN="$SHORT_TMP/ast-vol-$$"
 A="$RUN/a"            # supplies cpu/ram: the guest runs here
 B="$RUN/b"            # supplies the bytes: the volume lives here
 A_NAME="vol-a-$$"
@@ -65,6 +71,12 @@ VOL="tank"
 SHARED="$A/host-share"
 SHARED_GUEST="/workspace"
 IMAGE="${E2E_IMAGE:-debian:13}"
+# Five GiB leaves room for the filesystem and a real four-GiB payload.  The
+# transfer is intentionally non-sparse and goes through the guest's virtio
+# disk, the consumer bridge, QUIC, NBD, and the provider's raw image.
+VOLUME_GIB=5
+VOLUME_BYTES=$((VOLUME_GIB * 1024 * 1024 * 1024))
+TRANSFER_BYTES=$((4 * 1024 * 1024 * 1024))
 
 # ---- the processes this test starts ----------------------------------------
 #
@@ -262,18 +274,18 @@ in_guest() {
 
 # Find the volume by its invariant properties, not by the backend's device
 # naming order. VZ puts its cloud-init seed ahead of the volume, while QEMU
-# currently puts the volume immediately after the root disk. The exact 2 GiB
-# size is the volume's contract and the TYPE=disk check excludes VZ's seed ISO.
+# currently puts the volume immediately after the root disk. The exact size is
+# the volume's contract and the TYPE=disk check excludes VZ's seed ISO.
 # Keep this as a single-device match:
 # silently choosing among two matches would make every later assertion lie.
 find_volume_device() {
   local table devices count
   table="$(in_guest 'lsblk -b -dn -o NAME,SIZE,TYPE,SERIAL')" \
     || fail "the guest could not list its block devices:"
-  devices="$(awk '$2 == 2147483648 && $3 == "disk" { print "/dev/" $1 }' <<<"$table")"
+  devices="$(awk -v size="$VOLUME_BYTES" '$2 == size && $3 == "disk" { print "/dev/" $1 }' <<<"$table")"
   count="$(wc -l <<<"$devices" | tr -d ' ')"
   [ "$count" = "1" ] \
-    || fail "could not identify the unique 2 GiB volume disk:"$'\n'"$table"
+    || fail "could not identify the unique $VOLUME_GIB GiB volume disk:"$'\n'"$table"
   printf '%s\n' "$devices"
 }
 
@@ -299,24 +311,24 @@ echo "ok: $A_NAME and $B_NAME are in one orbit"
 
 # ---- 2. a volume on B -------------------------------------------------------
 #
-# 2 GiB, sparse. It is a raw file and nothing else: no filesystem, no
+# Five GiB, sparse. It is a raw file and nothing else: no filesystem, no
 # partition table, and no way for anything but a guest to put one there.
 
-expect "volume create on B" "$VOL  2G  created" \
-  env ASTERISM_HOME="$B" "$AST" volume create "$VOL" --size 2G
+expect "volume create on B" "$VOL  ${VOLUME_GIB}G  created" \
+  env ASTERISM_HOME="$B" "$AST" volume create "$VOL" --size "${VOLUME_GIB}G"
 expect "and it says what an empty disk is" "no filesystem on it yet" \
   env ASTERISM_HOME="$B" "$AST" volume create x-scratch --size 1G
 
 [ -f "$B/volumes/$VOL/disk.raw" ] || fail "no image behind the volume"
 SIZE="$(file_size "$B/volumes/$VOL/disk.raw")"
-[ "$SIZE" = "$((2 * 1024 * 1024 * 1024))" ] || fail "the volume is $SIZE bytes, not 2 GiB"
+[ "$SIZE" = "$VOLUME_BYTES" ] || fail "the volume is $SIZE bytes, not $VOLUME_GIB GiB"
 USED="$(du -k "$B/volumes/$VOL/disk.raw" | cut -f1)"
-[ "$USED" -lt 4096 ] || fail "a fresh 2 GiB volume occupies ${USED}K, so it is not sparse"
-echo "ok: the volume is a 2 GiB sparse raw image and nothing else"
+[ "$USED" -lt 4096 ] || fail "a fresh $VOLUME_GIB GiB volume occupies ${USED}K, so it is not sparse"
+echo "ok: the volume is a $VOLUME_GIB GiB sparse raw image and nothing else"
 
 VOLS="$(ASTERISM_HOME="$B" "$AST" volume ls 2>&1)" || fail "volume ls failed:"$'\n'"$VOLS"
 grep -qE "^NAME +SIZE +AGE +HELD BY$" <<<"$VOLS" || fail "no volume table:"$'\n'"$VOLS"
-grep -qE "^$VOL +2G +\S+ +-$" <<<"$VOLS" || fail "$VOL is not listed unheld:"$'\n'"$VOLS"
+grep -qE "^$VOL +${VOLUME_GIB}G +\S+ +-$" <<<"$VOLS" || fail "$VOL is not listed unheld:"$'\n'"$VOLS"
 echo "ok: ast volume ls shows it, held by nobody"
 
 expect "volume rm takes one away" "x-scratch  removed" \
@@ -348,7 +360,7 @@ ASTERISM_HOME="$A" "$AST" pull "$IMAGE" >/dev/null 2>&1 \
   || fail "no $IMAGE image available for A (pull it once: ast pull $IMAGE)"
 
 # The disk's guest name is backend-specific, so the assertions below discover
-# it from lsblk after each boot. The volume itself is still the same 2 GiB
+# it from lsblk after each boot. The volume itself is still the same sized
 # block device on both backends.
 expect "create the instance on A ($BACKEND)" "$INST  defined" \
   env ASTERISM_HOME="$A" "$AST" create "$INST" --backend "$BACKEND" --image "$IMAGE" \
@@ -361,13 +373,28 @@ printf '%s\n' "$HOST_MARKER" >"$SHARED/host-marker"
 expect "attach a same-device directory ($BACKEND)" "$SHARED_GUEST" \
   env ASTERISM_HOME="$A" "$AST" attach "$INST" --volume "$SHARED" --at "$SHARED_GUEST"
 
-ATTACH="$(ASTERISM_HOME="$A" "$AST" attach "$INST" --volume "$B_NAME:$VOL" 2>&1)" \
-  || fail "attach failed:"$'\n'"$ATTACH"
+ATTACH=""
+ATTACHED=0
+for ATTEMPT in $(seq 1 100); do
+  if ATTACH="$(ASTERISM_HOME="$A" "$AST" attach "$INST" --volume "$B_NAME:$VOL" 2>&1)"; then
+    ATTACHED=1
+    break
+  fi
+  grep -q "refused before mutation" <<<"$ATTACH" \
+    || fail "attach failed for a reason other than its measured SLO:"$'\n'"$ATTACH"
+  [ "$(holder_now)" = "-" ] || fail "a retryable SLO refusal moved the provider lease"
+  if ASTERISM_HOME="$A" "$AST" status "$INST" | grep -qE "^  volume +$B_NAME +$VOL "; then
+    fail "a retryable SLO refusal wrote a consumer volume record"
+  fi
+  ASTERISM_HOME="$A" "$AST" ping "$B_NAME" >/dev/null 2>&1 || true
+  sleep 0.2
+done
+[ "$ATTACHED" = 1 ] || fail "attach never observed a direct path within 5ms:"$'\n'"$ATTACH"
 grep -qF "$B_NAME:$VOL  ->  a disk in the guest" <<<"$ATTACH" \
   || fail "attach did not describe a disk:"$'\n'"$ATTACH"
 grep -qF "the guest gets a plain disk" <<<"$ATTACH" \
   || fail "attach did not say the guest has to format it:"$'\n'"$ATTACH"
-echo "ok: attach records a disk and says the guest must format it"
+echo "ok: attach records a disk after $ATTEMPT measured attempt(s) and says the guest must format it"
 
 # The lease is on B, taken at attach time, and it names the instance and the
 # device supplying that instance's cpu.
@@ -390,7 +417,7 @@ echo "ok: the export is a unix socket and the storage daemon holds no TCP port"
 
 # ast status renders it as a part, sourced from the device with the bytes.
 PARTS="$(ASTERISM_HOME="$A" "$AST" status "$INST" 2>&1)"
-grep -qE "^  volume +$B_NAME +$VOL \(2G\) -> a disk in the guest" <<<"$PARTS" \
+grep -qE "^  volume +$B_NAME +$VOL \(${VOLUME_GIB}G\) -> a disk in the guest" <<<"$PARTS" \
   || fail "the volume is not a part sourced from $B_NAME:"$'\n'"$PARTS"
 grep -qF "nbd over the mesh · lease epoch 1" <<<"$PARTS" \
   || fail "ast status does not show the lease:"$'\n'"$PARTS"
@@ -400,6 +427,11 @@ echo "ok: ast status shows the volume sourced from $B_NAME with its epoch"
 
 expect "the instance boots with the volume" "$INST  running" \
   env ASTERISM_HOME="$A" "$AST" up "$INST"
+
+PARTS="$(ASTERISM_HOME="$A" "$AST" status "$INST" 2>&1)"
+grep -qE "nbd over the mesh .* healthy .* direct .* [0-9]+\.[0-9]ms RTT .* connected \(guest_boot\)" <<<"$PARTS" \
+  || fail "the live volume has no measured path and initial transition:"$'\n'"$PARTS"
+echo "ok: status exposes the live volume's path, RTT and initial transition"
 
 SHARED_READ="$(in_guest "cat $SHARED_GUEST/host-marker")" \
   || fail "the guest could not read its same-device directory:"$'\n'"$SHARED_READ"
@@ -435,8 +467,8 @@ echo "ok: the consumer end is a local unix socket, not a port"
 VOLUME_DEV="$(find_volume_device)"
 LSBLK="$(in_guest "lsblk -b -n -o NAME,SIZE,FSTYPE $VOLUME_DEV")" \
   || fail "the guest has no $VOLUME_DEV:"$'\n'"$LSBLK"
-grep -qF "2147483648" <<<"$LSBLK" || fail "$VOLUME_DEV is not 2 GiB:"$'\n'"$LSBLK"
-echo "ok: the guest sees $VOLUME_DEV, 2 GiB, and it is a local disk as far as it knows"
+grep -qF "$VOLUME_BYTES" <<<"$LSBLK" || fail "$VOLUME_DEV is not $VOLUME_GIB GiB:"$'\n'"$LSBLK"
+echo "ok: the guest sees $VOLUME_DEV, $VOLUME_GIB GiB, and it is a local disk as far as it knows"
 
 # Nothing in the guest may hint that this disk is on another machine.
 VOLUME_NAME="${VOLUME_DEV#/dev/}"
@@ -465,11 +497,70 @@ grep -qa "$MARKER" "$B/volumes/$VOL/disk.raw" \
   || fail "the marker the guest wrote is not in B's image"
 echo "ok: the bytes landed on B — the marker is in its image file (${USED}K used)"
 
+# ---- 4b. a real four-GiB transfer ------------------------------------------
+#
+# A repeating non-zero stream is deterministic and fast to produce, but unlike
+# /dev/zero it cannot be represented as a sparse hole by the provider.  Hash it
+# before and after an unmount/remount, and require the provider's raw image to
+# have allocated at least the payload size.  Stopping the guest completes this
+# NBD session, after which the daemon's structured part event must report its
+# payload byte count and throughput. Live status intentionally omits runtime
+# observations once an instance is stopped.
+TRANSFER_PROOF="$(in_guest "sudo mount $VOLUME_DEV /data && \
+  yes asterism-orbit-e2e | head -c $TRANSFER_BYTES | \
+    sudo tee /data/asterism-4g.bin >/dev/null; \
+  sync; stat -c bytes=%s /data/asterism-4g.bin; \
+  sha256sum /data/asterism-4g.bin; sudo umount /data")" \
+  || fail "the real four-GiB write failed:"$'\n'"$TRANSFER_PROOF"
+grep -qxF "bytes=$TRANSFER_BYTES" <<<"$TRANSFER_PROOF" \
+  || fail "the guest did not write exactly $TRANSFER_BYTES bytes:"$'\n'"$TRANSFER_PROOF"
+TRANSFER_HASH="$(awk '/asterism-4g.bin$/ { print $1; exit }' <<<"$TRANSFER_PROOF")"
+grep -qE '^[0-9a-f]{64}$' <<<"$TRANSFER_HASH" \
+  || fail "the guest did not produce a SHA-256 for the transfer:"$'\n'"$TRANSFER_PROOF"
+
+TRANSFER_READBACK="$(in_guest "sudo mount $VOLUME_DEV /data && \
+  stat -c bytes=%s /data/asterism-4g.bin; sha256sum /data/asterism-4g.bin; \
+  sudo umount /data")" \
+  || fail "the four-GiB readback failed:"$'\n'"$TRANSFER_READBACK"
+grep -qxF "bytes=$TRANSFER_BYTES" <<<"$TRANSFER_READBACK" \
+  || fail "the remounted file changed size:"$'\n'"$TRANSFER_READBACK"
+grep -qF "$TRANSFER_HASH  /data/asterism-4g.bin" <<<"$TRANSFER_READBACK" \
+  || fail "the remounted file changed hash:"$'\n'"$TRANSFER_READBACK"
+
+USED="$(du -k "$B/volumes/$VOL/disk.raw" | cut -f1)"
+[ "$USED" -ge "$((TRANSFER_BYTES / 1024))" ] \
+  || fail "the provider allocated only ${USED}K after a $TRANSFER_BYTES-byte non-zero write"
+printf 'bytes=%s\nsha256=%s\nprovider_allocated_kib=%s\n' \
+  "$TRANSFER_BYTES" "$TRANSFER_HASH" "$USED" >"$A/transfer-proof.txt"
+echo "ok: transferred $TRANSFER_BYTES non-zero bytes; SHA-256 $TRANSFER_HASH; provider allocated ${USED}K"
+
 # ---- 5. down, up, and the filesystem is still there ------------------------
 
 expect "the instance stops" "$INST  stopped" env ASTERISM_HOME="$A" "$AST" down "$INST"
 [ ! -e "$BRIDGE" ] || fail "the bridge socket outlived the guest that used it"
 echo "ok: stopping the guest took the bridge down with it"
+
+# Transfer telemetry is deliberately session-scoped. Capture the completed
+# four-GiB bridge event now, before a later boot starts a new session whose
+# counters correctly begin at zero.
+TRANSFER_EVENT=""
+TRANSFERRED=""
+for _ in $(seq 1 100); do
+  TRANSFER_EVENT="$(grep "remote_part instance=\"$INST\".*bytes=" "$A/astd.log" \
+    2>/dev/null | tail -1 || true)"
+  TRANSFERRED="$(sed -n 's/.* bytes=\([0-9][0-9]*\) .*/\1/p' <<<"$TRANSFER_EVENT")"
+  if [ -n "$TRANSFERRED" ] && [ "$TRANSFERRED" -ge "$TRANSFER_BYTES" ]; then
+    break
+  fi
+  sleep 0.2
+done
+[ -n "$TRANSFERRED" ] && [ "$TRANSFERRED" -ge "$TRANSFER_BYTES" ] \
+  || fail "the completed bridge event did not account for the real $TRANSFER_BYTES-byte transfer (got ${TRANSFERRED:-none}):"$'\n'"$TRANSFER_EVENT"
+grep -qE 'state=degraded path=direct bytes=[0-9]+ throughput_Bps=[1-9][0-9]* transition=' \
+  <<<"$TRANSFER_EVENT" \
+  || fail "the completed four-GiB bridge event did not report path, throughput and transition:"$'\n'"$TRANSFER_EVENT"
+printf '%s\n' "$TRANSFER_EVENT" >"$A/transfer-status.txt"
+echo "ok: the completed bridge event measured at least $TRANSFER_BYTES bytes and its throughput"
 
 # The lease survives a stop: it belongs to the attachment, not to the boot.
 [ "$(holder_now)" = "$INST" ] || fail "stopping the guest gave the lease away"
@@ -542,7 +633,7 @@ echo "ok: reattached elsewhere at epoch $E4, and epoch $E3's door is gone"
 # The instance that used to hold it no longer claims it, and refuses to boot
 # with a volume it does not have rather than booting without one.
 STATUS="$(ASTERISM_HOME="$A" "$AST" status "$INST" 2>&1)"
-if grep -qF "$VOL (2G)" <<<"$STATUS"; then fail "$INST still lists the volume:"$'\n'"$STATUS"; fi
+if grep -qF "$VOL (${VOLUME_GIB}G)" <<<"$STATUS"; then fail "$INST still lists the volume:"$'\n'"$STATUS"; fi
 echo "ok: the old holder's parts table no longer lists it"
 
 # Give it back to the instance that has the filesystem on it, so the last
@@ -583,6 +674,14 @@ QSD_NEW="$(cat "$B/volumes/$VOL/nbd-e$E5.pid")"
 [ "$(epoch_now)" = "$E5" ] \
   || fail "restarting a dead export moved the epoch, which would fence the holder"
 echo "ok: the export was restarted at the same epoch and the guest never noticed"
+
+PARTS="$(ASTERISM_HOME="$A" "$AST" status "$INST" 2>&1)"
+grep -qE "healthy .* direct .* [0-9]+\.[0-9]ms RTT .* MiB/s .* reconnected \(provider_returned\) .* recovery [0-9]+ms" <<<"$PARTS" \
+  || fail "the recovered volume did not expose throughput and recovery measurements:"$'\n'"$PARTS"
+TRANSFERRED="$(sed -n 's/.*transferred (\([0-9][0-9]*\) bytes).*/\1/p' <<<"$PARTS" | head -1)"
+[ -n "$TRANSFERRED" ] && [ "$TRANSFERRED" -gt 0 ] \
+  || fail "the recovered bridge session did not report its transferred bytes:"$'\n'"$PARTS"
+echo "ok: status exposes provider recovery duration and current-session bridge throughput"
 
 # ---- 8b. the consumer's daemon restarts under a live guest -----------------
 #
@@ -689,15 +788,35 @@ grep -qa "$MARKER3" "$B/volumes/$VOL/disk.raw" \
   || fail "what the guest wrote after the restart is not in B's image"
 echo "ok: the guest wrote to the volume after the restart, and the bytes are on B"
 
+PARTS="$(ASTERISM_HOME="$A" "$AST" status "$INST" 2>&1)"
+grep -qE "healthy .* reconnected \(daemon_restart\) .* recovery [0-9]+ms" <<<"$PARTS" \
+  || fail "the daemon restart recovery was not explicit and timed:"$'\n'"$PARTS"
+echo "ok: status names and times the daemon-restart recovery"
+
 # ---- 9. the provider goes away, and the consumer is honest about it --------
 #
 # The failure that matters is not "it broke" but "what does the user read". A
-# volume whose device is not answering must say so in one sentence naming the
-# device, not bury it in a hypervisor's error.
+# live guest is still alive when one sourced part disappears: status must keep
+# the instance running and degrade only that volume. A later boot must say
+# which device is absent rather than burying it in a hypervisor's error.
 
-expect "stop the guest first" "$INST  stopped" env ASTERISM_HOME="$A" "$AST" down "$INST"
 stop_daemon "$B" -KILL
 echo "ok: B's daemon was killed"
+
+DEGRADED=""
+for _ in $(seq 1 100); do
+  DEGRADED="$(ASTERISM_HOME="$A" "$AST" status "$INST" 2>&1 || true)"
+  if grep -q "degraded .* retrying (provider_loss)" <<<"$DEGRADED"; then break; fi
+  sleep 0.2
+done
+grep -q '^status:  running' <<<"$DEGRADED" \
+  || fail "provider loss was misreported as instance death:"$'\n'"$DEGRADED"
+grep -q "degraded .* retrying (provider_loss)" <<<"$DEGRADED" \
+  || fail "the absent provider did not degrade its volume part:"$'\n'"$DEGRADED"
+echo "ok: provider loss degrades only the remote part; the instance stays running"
+
+expect "the guest can still be stopped locally" "$INST  stopped" \
+  env ASTERISM_HOME="$A" "$AST" down "$INST"
 
 BOOT="$(ASTERISM_HOME="$A" "$AST" up "$INST" 2>&1 || true)"
 grep -qF "could not reach the device holding it: $B_NAME" <<<"$BOOT" \

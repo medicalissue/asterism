@@ -258,6 +258,18 @@ pub struct DeviceStatus {
     pub online: bool,
     /// How traffic reaches it: `direct`, `relay`, or `-` when it does not.
     pub path: String,
+    /// RTT measured by the liveness probe which produced this row.
+    ///
+    /// Optional/defaulted in both directions so rolling upgrades keep the
+    /// existing `Devices` frame readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_micros: Option<u64>,
+    /// Why the selected path or reachability result last changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_reason: Option<String>,
+    /// `connected`, `healthy`, `recovered`, `retrying`, or `failed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_result: Option<String>,
     /// Whether this row is the device the command ran on.
     #[serde(default)]
     pub is_self: bool,
@@ -946,6 +958,30 @@ mod tests {
         ] {
             assert_eq!(parse_mac(junk), None, "{junk}");
         }
+    }
+
+    #[test]
+    fn device_measurements_are_rolling_upgrade_safe() {
+        let old =
+            r#"{"name":"desktop","device_id":"aa","online":true,"path":"direct","is_self":false}"#;
+        let status: DeviceStatus = serde_json::from_str(old).unwrap();
+        assert_eq!(status.rtt_micros, None);
+        assert_eq!(status.transition_reason, None);
+        assert_eq!(status.recovery_result, None);
+
+        let measured = DeviceStatus {
+            name: "desktop".into(),
+            device_id: "aa".into(),
+            online: true,
+            path: "relay".into(),
+            rtt_micros: Some(24_000),
+            transition_reason: Some("stale_address_recovered_by_discovery".into()),
+            recovery_result: Some("recovered".into()),
+            is_self: false,
+        };
+        let wire = serde_json::to_string(&measured).unwrap();
+        let back: DeviceStatus = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, measured);
     }
 
     /// A pairing whose commit was killed leaves the orbit exactly as it was.
