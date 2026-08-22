@@ -122,7 +122,7 @@ pub const FIRST_PROTOCOL: u32 = 1;
 
 /// How many versions back this build still serves. Keep the unnumbered first
 /// wire usable while newer device-shell capabilities negotiate independently.
-pub const SUPPORTED_BACK: u32 = 4;
+pub const SUPPORTED_BACK: u32 = 5;
 
 /// Format version of the home stamp document itself.
 pub const STAMP_VERSION: u32 = 1;
