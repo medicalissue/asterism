@@ -120,7 +120,9 @@ pub fn create(name: &str, image: &str, shape: Shape, backend: Option<&str>) -> R
 
 /// The frame [`create`] puts on the wire. Split out from the sending so a
 /// test can check it against the one `ast create` sends without needing a
-/// daemon to send it to.
+/// daemon to send it to. The New Instance model has no profile picker, so
+/// its intentional default is the same as `ast create` without `--profile`:
+/// a stock image with no bootstrap profiles.
 fn create_request(name: &str, image: &str, shape: Shape, backend: Option<&str>) -> Request {
     Request::Create {
         name: name.to_owned(),
@@ -128,6 +130,7 @@ fn create_request(name: &str, image: &str, shape: Shape, backend: Option<&str>) 
         shape,
         backend: backend.map(str::to_owned),
         publish: Vec::new(),
+        profiles: Vec::new(),
     }
 }
 
@@ -531,8 +534,21 @@ mod tests {
         assert_eq!(
             wire,
             r#"{"cmd":"create","name":"dev","image":"debian:13","#.to_owned()
-                + r#""shape":{"cpus":2,"mem_mib":2048,"disk_gib":20},"backend":null,"publish":[]}"#
+                + r#""shape":{"cpus":2,"mem_mib":2048,"disk_gib":20},"backend":null,"publish":[],"profiles":[]}"#
         );
+    }
+
+    /// The form intentionally has no bootstrap-profile control. Its create
+    /// frame must therefore retain the CLI's no-`--profile` semantics rather
+    /// than acquiring a profile merely to satisfy the protocol shape.
+    #[test]
+    fn a_new_instance_form_asks_for_no_bootstrap_profiles() {
+        let Request::Create { profiles, .. } =
+            create_request("dev", "debian:13", Shape::default(), None)
+        else {
+            panic!("should be a create");
+        };
+        assert!(profiles.is_empty());
     }
 
     /// No backend chosen means "this device's default", which is `None`
