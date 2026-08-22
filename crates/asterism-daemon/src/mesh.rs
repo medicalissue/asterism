@@ -231,6 +231,11 @@ enum MeshRequest {
         instance_id: String,
         generation: u64,
     },
+    /// Remove every inactive generation for this consumer attachment. The
+    /// consumer stages this idempotent cleanup before asking for a grant, so
+    /// a crash after the provider reply but before recording its generation
+    /// cannot strand an unknown pending grant.
+    ExitDiscardPending { instance_id: String },
     /// Observe the provider's actual resolver behind an authorized grant.
     ExitProbe {
         instance_id: String,
@@ -301,6 +306,7 @@ impl MeshRequest {
             MeshRequest::ExitGrant { .. }
             | MeshRequest::ExitActivate { .. }
             | MeshRequest::ExitRevoke { .. }
+            | MeshRequest::ExitDiscardPending { .. }
             | MeshRequest::ExitProbe { .. }
             | MeshRequest::ExitTcp { .. }
             | MeshRequest::ExitUdp { .. } => 7,
@@ -336,6 +342,7 @@ impl MeshRequest {
             MeshRequest::ExitGrant { .. } => "an exit grant",
             MeshRequest::ExitActivate { .. } => "an exit grant activation",
             MeshRequest::ExitRevoke { .. } => "an exit revocation",
+            MeshRequest::ExitDiscardPending { .. } => "pending exit cleanup",
             MeshRequest::ExitProbe { .. } => "an exit health probe",
             MeshRequest::ExitTcp { .. } => "an exit TCP flow",
             MeshRequest::ExitUdp { .. } => "an exit UDP datagram",
@@ -1684,6 +1691,32 @@ impl Mesh {
         }
     }
 
+    pub(crate) async fn discard_pending_exit_grants(
+        self: &Arc<Self>,
+        device: &str,
+        instance_id: &str,
+    ) -> Result<()> {
+        let peer = self.device(device).await?;
+        let connection = self.live_connection(&peer).await?;
+        match ask(
+            &connection,
+            &MeshRequest::ExitDiscardPending {
+                instance_id: instance_id.to_owned(),
+            },
+        )
+        .await?
+        {
+            MeshReply::Rpc {
+                response: Response::Ok,
+            } => Ok(()),
+            MeshReply::Rpc {
+                response: Response::Error { message },
+            } => bail!(message),
+            MeshReply::Incompatible { message, .. } => bail!(message),
+            other => bail!("device {device:?} refused pending exit cleanup: {other:?}"),
+        }
+    }
+
     pub(crate) async fn probe_exit_dns(
         self: &Arc<Self>,
         device: &str,
@@ -2842,7 +2875,17 @@ async fn serve_exit_tcp(
     _capacity: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<()> {
     if !lease.allows(destination, system_dns) {
-        bail!("the exit grant refuses this destination or DNS mode");
+        write_frame(
+            &mut stream.send,
+            &MeshReply::Rpc {
+                response: Response::Error {
+                    message: "the exit grant refuses this destination or DNS mode".into(),
+                },
+            },
+        )
+        .await?;
+        let _ = stream.send.finish();
+        return Ok(());
     }
     let opening = async {
         let target = crate::exit_point::resolve_dns_target(destination, system_dns)?;
@@ -2892,7 +2935,17 @@ async fn serve_exit_udp(
     _capacity: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<()> {
     if !lease.allows(destination, system_dns) {
-        bail!("the exit grant refuses this destination or DNS mode");
+        write_frame(
+            &mut stream.send,
+            &MeshReply::Rpc {
+                response: Response::Error {
+                    message: "the exit grant refuses this destination or DNS mode".into(),
+                },
+            },
+        )
+        .await?;
+        let _ = stream.send.finish();
+        return Ok(());
     }
     let opening = async {
         let target = crate::exit_point::resolve_dns_target(destination, system_dns)?;
@@ -3825,6 +3878,18 @@ async fn serve_stream(
             };
             MeshReply::Rpc { response }
         }
+        MeshRequest::ExitDiscardPending { instance_id } => {
+            let response = match node
+                .exit
+                .discard_pending(&requester.device_id, &instance_id)
+            {
+                Ok(()) => Response::Ok,
+                Err(error) => Response::Error {
+                    message: format!("{error:#}"),
+                },
+            };
+            MeshReply::Rpc { response }
+        }
         MeshRequest::ExitProbe {
             instance_id,
             generation,
@@ -4287,6 +4352,9 @@ mod tests {
                 instance_id: "instance".into(),
                 generation: 1,
             },
+            MeshRequest::ExitDiscardPending {
+                instance_id: "instance".into(),
+            },
             MeshRequest::ExitProbe {
                 instance_id: "instance".into(),
                 generation: 1,
@@ -4306,6 +4374,62 @@ mod tests {
         ];
         assert!(frames.iter().all(|frame| frame.since() == 7));
         assert_eq!(Request::DetachExitPoint { name: "dev".into() }.since(), 6);
+    }
+
+    #[tokio::test]
+    async fn protocol_six_serves_attachment_frames_but_refuses_provider_frames() {
+        let (client, connection, _dir) = wired().await;
+        let exit = asterism_core::network::ExitPoint::new(
+            "provider".into(),
+            Vec::new(),
+            asterism_core::network::RoutePolicy::default(),
+            asterism_core::network::DnsPolicy::ExitPoint,
+        )
+        .unwrap();
+        let attach = MeshRequest::Rpc {
+            request: Request::AttachExitPoint {
+                name: "missing".into(),
+                exit: Box::new(exit),
+            },
+        };
+        let mut stream = connection.open_stream().await.unwrap();
+        write_frame(
+            &mut stream.send,
+            &Opening {
+                protocol: 6,
+                min_protocol: 6,
+                request: &attach,
+            },
+        )
+        .await
+        .unwrap();
+        let reply: MeshReply = read_frame(&mut stream.recv).await.unwrap();
+        assert!(matches!(
+            reply,
+            MeshReply::Rpc {
+                response: Response::Error { .. }
+            }
+        ));
+
+        let provider = MeshRequest::ExitGrant {
+            instance_id: "instance".into(),
+            routes: asterism_core::network::RoutePolicy::default(),
+            dns: asterism_core::network::DnsPolicy::ExitPoint,
+        };
+        let mut stream = connection.open_stream().await.unwrap();
+        write_frame(
+            &mut stream.send,
+            &Opening {
+                protocol: 6,
+                min_protocol: 6,
+                request: &provider,
+            },
+        )
+        .await
+        .unwrap();
+        let reply: MeshReply = read_frame(&mut stream.recv).await.unwrap();
+        assert!(matches!(reply, MeshReply::Incompatible { .. }));
+        client.close().await;
     }
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -4800,6 +4924,168 @@ mod tests {
         (client, connection, dir)
     }
 
+    /// An authenticated provider connection with consent enabled for the
+    /// requester's immutable device id. Tests use the private frame enum
+    /// directly so consumer-side route selection cannot hide a provider bug.
+    async fn wired_exit() -> (
+        MeshEndpoint,
+        MeshConnection,
+        Arc<crate::exit_policy::Manager>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let exit = crate::exit_policy::Manager::load_at(&dir.path().join("exit-provider.json"));
+        exit.enable(vec!["test-peer-id".into()]).unwrap();
+        let node = Node {
+            shard: Arc::new(Mutex::new(
+                asterism_core::registry::Shard::load(&dir.path().join("state.json")).unwrap(),
+            )),
+            orbit: Arc::new(Mutex::new(
+                Orbit::load(&dir.path().join("orbit.json")).unwrap(),
+            )),
+            shell: crate::device_shell::Manager::load_at(dir.path()),
+            exit: exit.clone(),
+        };
+        let server = MeshEndpoint::bind(&DeviceIdentity::generate(), MeshMode::LocalOnly)
+            .await
+            .unwrap();
+        let client = MeshEndpoint::bind(&DeviceIdentity::generate(), MeshMode::LocalOnly)
+            .await
+            .unwrap();
+        let addr = server.direct_addr().await.unwrap();
+        tokio::spawn(async move {
+            let conn = server.accept().await.unwrap().unwrap();
+            serve_peer(
+                conn,
+                node,
+                "test-peer".into(),
+                "test-peer-id".into(),
+                "provider-id".into(),
+                PeerCapacity::bounded(),
+            )
+            .await;
+        });
+        let connection = client.connect(addr).await.unwrap();
+        (client, connection, exit, dir)
+    }
+
+    async fn assert_raw_exit_refused(connection: &MeshConnection, request: MeshRequest) {
+        match ask(connection, &request).await {
+            Err(_) => {}
+            Ok(MeshReply::Rpc {
+                response: Response::Error { .. },
+            }) => {}
+            Ok(other) => panic!("raw provider request was not refused: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_raw_exit_frames_cannot_bypass_provider_policy() {
+        let (client, connection, exit, _dir) = wired_exit().await;
+        let oversized = MeshRequest::ExitGrant {
+            instance_id: "oversized".into(),
+            routes: asterism_core::network::RoutePolicy {
+                include: vec![
+                    "1.1.1.0/24".parse().unwrap();
+                    asterism_core::network::MAX_EXIT_ROUTE_PREFIXES + 1
+                ],
+                exclude: Vec::new(),
+            },
+            dns: asterism_core::network::DnsPolicy::ExitPoint,
+        };
+        assert_raw_exit_refused(&connection, oversized).await;
+        let noncanonical = MeshRequest::ExitGrant {
+            instance_id: "noncanonical".into(),
+            routes: asterism_core::network::RoutePolicy {
+                include: vec![asterism_core::network::IpPrefix {
+                    network: "10.9.8.7".parse().unwrap(),
+                    bits: 16,
+                }],
+                exclude: Vec::new(),
+            },
+            dns: asterism_core::network::DnsPolicy::ExitPoint,
+        };
+        assert_raw_exit_refused(&connection, noncanonical).await;
+        let resolver_oracle = MeshRequest::ExitGrant {
+            instance_id: "resolver-oracle".into(),
+            routes: asterism_core::network::RoutePolicy {
+                include: vec!["1.1.1.0/24".parse().unwrap()],
+                exclude: Vec::new(),
+            },
+            dns: asterism_core::network::DnsPolicy::Custom(vec!["10.0.0.53".parse().unwrap()]),
+        };
+        assert_raw_exit_refused(&connection, resolver_oracle).await;
+        assert_eq!(exit.status().grants, 0);
+
+        let routes = asterism_core::network::RoutePolicy {
+            include: vec!["0.0.0.0/0".parse().unwrap(), "::/0".parse().unwrap()],
+            exclude: vec!["1.1.1.1/32".parse().unwrap()],
+        };
+        let granted = ask(
+            &connection,
+            &MeshRequest::ExitGrant {
+                instance_id: "instance-id".into(),
+                routes,
+                dns: asterism_core::network::DnsPolicy::ExitPoint,
+            },
+        )
+        .await
+        .unwrap();
+        let generation = match granted {
+            MeshReply::ExitGranted { grant } => grant.generation,
+            other => panic!("expected provider grant, got {other:?}"),
+        };
+        assert!(matches!(
+            ask(
+                &connection,
+                &MeshRequest::ExitActivate {
+                    instance_id: "instance-id".into(),
+                    generation,
+                },
+            )
+            .await
+            .unwrap(),
+            MeshReply::Rpc {
+                response: Response::Ok
+            }
+        ));
+
+        let denied = [
+            ("1.1.1.1:443".parse().unwrap(), false),
+            ("10.0.0.1:443".parse().unwrap(), false),
+            ("169.254.169.254:80".parse().unwrap(), false),
+            ("[::ffff:127.0.0.1]:443".parse().unwrap(), false),
+            ("[fd00::1]:443".parse().unwrap(), false),
+            ("100.64.0.53:53".parse().unwrap(), false),
+            ("100.64.0.53:80".parse().unwrap(), false),
+            ("100.64.0.53:80".parse().unwrap(), true),
+        ];
+        for (destination, system_dns) in denied {
+            assert_raw_exit_refused(
+                &connection,
+                MeshRequest::ExitTcp {
+                    instance_id: "instance-id".into(),
+                    generation,
+                    destination,
+                    system_dns,
+                },
+            )
+            .await;
+            assert_raw_exit_refused(
+                &connection,
+                MeshRequest::ExitUdp {
+                    instance_id: "instance-id".into(),
+                    generation,
+                    destination,
+                    system_dns,
+                },
+            )
+            .await;
+        }
+        assert_eq!(exit.status().grants, 1);
+        client.close().await;
+    }
+
     /// NBD's request and reply directions are independently closed. The
     /// bridge must relay the provider's reply after QEMU has half-closed its
     /// request side, rather than treating that half-close as a whole-session
@@ -5009,6 +5295,91 @@ mod tests {
         assert!(!mesh.trusts(&client_identity.device_id().to_string()).await);
         assert!(mesh.active.lock().await.is_empty());
 
+        client.close().await;
+        mesh.endpoint.close().await;
+        tokio::time::timeout(Duration::from_secs(1), loop_task)
+            .await
+            .expect("the accept loop stops with its endpoint")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn simultaneous_connections_share_one_opening_frame_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let client_identity = DeviceIdentity::generate();
+        let server = MeshEndpoint::bind(&DeviceIdentity::generate(), MeshMode::LocalOnly)
+            .await
+            .unwrap();
+        let first_addr = server.direct_addr().await.unwrap();
+        let second_addr = server.direct_addr().await.unwrap();
+        let client = MeshEndpoint::bind(&client_identity, MeshMode::LocalOnly)
+            .await
+            .unwrap();
+        let mut orbit = Orbit::load(&dir.path().join("orbit.json")).unwrap();
+        orbit
+            .add(orbit::device_now(
+                "client",
+                &client_identity.device_id().to_string(),
+                Vec::new(),
+                Vec::new(),
+            ))
+            .unwrap();
+        orbit.save().unwrap();
+        let orbit = Arc::new(Mutex::new(orbit));
+        let node = Node {
+            shard: Arc::new(Mutex::new(
+                asterism_core::registry::Shard::load(&dir.path().join("state.json")).unwrap(),
+            )),
+            orbit: orbit.clone(),
+            shell: crate::device_shell::Manager::load_at(dir.path()),
+            exit: crate::exit_policy::Manager::load_at(&dir.path().join("exit-provider.json")),
+        };
+        let mesh = Arc::new(Mesh {
+            endpoint: server,
+            orbit,
+            pending: Arc::new(Mutex::new(None)),
+            conns: Mutex::new(HashMap::new()),
+            telemetry: Mutex::new(HashMap::new()),
+            active: Mutex::new(HashMap::new()),
+            capacity: Mutex::new(HashMap::new()),
+        });
+        let loop_task = tokio::spawn(accept_loop(mesh.clone(), node));
+        let first = client.connect(first_addr).await.unwrap();
+        let second = client.connect(second_addr).await.unwrap();
+
+        let mut stalled = Vec::new();
+        for index in 0..(MAX_OPENING_STREAMS * 2) {
+            let connection = if index % 2 == 0 { &first } else { &second };
+            let mut stream = connection.open_stream().await.unwrap();
+            stream
+                .send
+                .write_all(&(MAX_FRAME as u32).to_be_bytes())
+                .await
+                .unwrap();
+            stalled.push(stream);
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let available = mesh
+                    .capacity
+                    .lock()
+                    .await
+                    .values()
+                    .next()
+                    .map(|capacity| capacity.opening.available_permits());
+                if available == Some(0) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the shared opening-frame budget was not consumed");
+        assert_eq!(mesh.capacity.lock().await.len(), 1);
+
+        drop(stalled);
+        first.close(b"done");
+        second.close(b"done");
         client.close().await;
         mesh.endpoint.close().await;
         tokio::time::timeout(Duration::from_secs(1), loop_task)

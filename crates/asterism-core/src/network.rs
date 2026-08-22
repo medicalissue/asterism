@@ -33,6 +33,13 @@ pub const GUEST_ADDRESS_V6: IpAddr = IpAddr::V6(std::net::Ipv6Addr::new(
     0xfd64, 0x6173, 0x7400, 0, 0, 0, 0, 2,
 ));
 
+/// Hard wire and persistence bounds for one exit attachment. These limits are
+/// enforced again by the provider: an authenticated peer is still untrusted
+/// input and must not be able to turn a grant into a multi-megabyte policy.
+pub const MAX_EXIT_PROVIDERS: usize = 16;
+pub const MAX_EXIT_ROUTE_PREFIXES: usize = 128;
+pub const MAX_EXIT_DNS_SERVERS: usize = 16;
+
 /// Locally administered MAC used by the daemon side of every guest edge.
 pub const EDGE_GATEWAY_MAC: [u8; 6] = [0x02, 0x41, 0x53, 0x54, 0x00, 0x01];
 
@@ -51,9 +58,12 @@ pub fn is_public_unicast(address: IpAddr) -> bool {
                 && !address.is_link_local()
                 && !address.is_multicast()
                 && !address.is_broadcast()
+                && !address.is_documentation()
                 && !(octets[0] == 100 && (64..=127).contains(&octets[1]))
                 && !(octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+                && !(octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
                 && octets[0] != 0
+                && octets[0] < 240
         }
         IpAddr::V6(address) => {
             if let Some(mapped) = address.to_ipv4_mapped() {
@@ -64,6 +74,7 @@ pub fn is_public_unicast(address: IpAddr) -> bool {
                 && !address.is_multicast()
                 && !address.is_unique_local()
                 && !address.is_unicast_link_local()
+                && address.segments()[..2] != [0x2001, 0x0db8]
         }
     }
 }
@@ -188,6 +199,36 @@ impl Default for RoutePolicy {
 }
 
 impl RoutePolicy {
+    /// Validate the raw wire shape before sorting and de-duplicating it.
+    /// Counting before de-duplication also bounds work on repeated entries.
+    pub fn normalize(&mut self) -> Result<(), String> {
+        self.validate()?;
+        self.include.sort();
+        self.include.dedup();
+        self.exclude.sort();
+        self.exclude.dedup();
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.include.len().saturating_add(self.exclude.len()) > MAX_EXIT_ROUTE_PREFIXES {
+            return Err(format!(
+                "an exit route policy may contain at most {MAX_EXIT_ROUTE_PREFIXES} prefixes"
+            ));
+        }
+        for prefix in self.include.iter().chain(&self.exclude) {
+            let width = if prefix.network.is_ipv4() { 32 } else { 128 };
+            if prefix.bits > width {
+                return Err(format!("{prefix} has a prefix longer than {width} bits"));
+            }
+            let canonical: IpPrefix = prefix.to_string().parse()?;
+            if canonical != *prefix {
+                return Err(format!("{prefix} is not a canonical network prefix"));
+            }
+        }
+        Ok(())
+    }
+
     pub fn permits(&self, destination: IpAddr, orbit_control: bool) -> bool {
         !orbit_control
             && self
@@ -232,8 +273,55 @@ pub enum DnsPolicy {
     ExitPoint,
     /// Explicitly keep DNS on the device supplying CPU/RAM.
     CpuDevice,
-    /// Send through the selected exit to these resolvers.
+    /// Send virtual-DNS traffic through the selected exit to the first
+    /// resolver. Additional entries are explicitly authorized for guests
+    /// that address them directly on port 53; they are not automatic health
+    /// failovers, so the first entry alone controls provider DNS health.
     Custom(Vec<IpAddr>),
+}
+
+impl DnsPolicy {
+    pub fn normalize(&mut self) -> Result<(), String> {
+        self.validate()?;
+        if let DnsPolicy::Custom(servers) = self {
+            let mut seen = BTreeSet::new();
+            servers.retain(|server| seen.insert(*server));
+        }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if let DnsPolicy::Custom(servers) = self {
+            if servers.is_empty() {
+                return Err("custom DNS needs at least one resolver address".into());
+            }
+            if servers.len() > MAX_EXIT_DNS_SERVERS {
+                return Err(format!(
+                    "custom DNS may contain at most {MAX_EXIT_DNS_SERVERS} resolver addresses"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Validate the cross-field grant policy. A custom resolver is an explicit
+/// private-destination exception on port 53, so it must also be inside the
+/// attachment's route policy; otherwise a health probe would become a
+/// provider-local resolver oracle for a destination traffic itself forbids.
+pub fn validate_exit_policy(routes: &RoutePolicy, dns: &DnsPolicy) -> Result<(), String> {
+    routes.validate()?;
+    dns.validate()?;
+    if let DnsPolicy::Custom(servers) = dns {
+        for server in servers {
+            if !routes.permits(*server, false) {
+                return Err(format!(
+                    "custom DNS resolver {server} is outside the authorized exit routes"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Immutable provider identity and the provider-issued generation fencing one
@@ -285,9 +373,11 @@ impl ExitPoint {
     pub fn new(
         primary: String,
         failover: Vec<String>,
-        routes: RoutePolicy,
-        dns: DnsPolicy,
+        mut routes: RoutePolicy,
+        mut dns: DnsPolicy,
     ) -> Result<Self, String> {
+        routes.normalize()?;
+        dns.normalize()?;
         let providers: Vec<String> = std::iter::once(primary).chain(failover).collect();
         let exit = ExitPoint {
             providers,
@@ -307,6 +397,11 @@ impl ExitPoint {
         if providers.is_empty() {
             return Err("an exit point needs at least one provider device".into());
         }
+        if providers.len() > MAX_EXIT_PROVIDERS {
+            return Err(format!(
+                "an exit point may contain at most {MAX_EXIT_PROVIDERS} providers"
+            ));
+        }
         if providers.iter().any(|provider| provider.trim().is_empty()) {
             return Err("an exit-point device name cannot be empty".into());
         }
@@ -317,21 +412,9 @@ impl ExitPoint {
         if unique.len() != providers.len() {
             return Err("an exit-point device may appear only once in its failover order".into());
         }
-        if matches!(&self.dns, DnsPolicy::Custom(servers) if servers.is_empty()) {
-            return Err("custom DNS needs at least one resolver address".into());
-        }
+        validate_exit_policy(&self.routes, &self.dns)?;
         if self.grants.keys().any(|name| !providers.contains(name)) {
             return Err("an exit grant names a device outside the provider order".into());
-        }
-        for prefix in self.routes.include.iter().chain(&self.routes.exclude) {
-            let width = if prefix.network.is_ipv4() { 32 } else { 128 };
-            if prefix.bits > width {
-                return Err(format!("{prefix} has a prefix longer than {width} bits"));
-            }
-            let canonical: IpPrefix = prefix.to_string().parse()?;
-            if canonical != *prefix {
-                return Err(format!("{prefix} is not a canonical network prefix"));
-            }
         }
         Ok(())
     }
@@ -575,7 +658,64 @@ mod tests {
         assert!(is_public_unicast("1.1.1.1".parse().unwrap()));
         assert!(!is_public_unicast("127.0.0.1".parse().unwrap()));
         assert!(!is_public_unicast("10.0.0.1".parse().unwrap()));
+        assert!(!is_public_unicast("192.0.2.1".parse().unwrap()));
+        assert!(!is_public_unicast("240.0.0.1".parse().unwrap()));
+        assert!(!is_public_unicast("2001:db8::1".parse().unwrap()));
         assert!(!is_public_unicast("::ffff:127.0.0.1".parse().unwrap()));
         assert!(!is_public_unicast("::ffff:10.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn exit_policy_bounds_raw_vectors_before_deduplicating_them() {
+        let duplicate: IpPrefix = "1.1.1.0/24".parse().unwrap();
+        let mut routes = RoutePolicy {
+            include: vec![duplicate; MAX_EXIT_ROUTE_PREFIXES + 1],
+            exclude: Vec::new(),
+        };
+        assert!(routes.normalize().is_err());
+
+        routes.include.truncate(MAX_EXIT_ROUTE_PREFIXES);
+        routes.normalize().unwrap();
+        assert_eq!(routes.include, [duplicate]);
+
+        let mut dns = DnsPolicy::Custom(vec!["1.1.1.1".parse().unwrap(); MAX_EXIT_DNS_SERVERS + 1]);
+        assert!(dns.normalize().is_err());
+
+        let first: IpAddr = "8.8.8.8".parse().unwrap();
+        let second: IpAddr = "1.1.1.1".parse().unwrap();
+        let mut ordered = DnsPolicy::Custom(vec![first, second, first]);
+        ordered.normalize().unwrap();
+        assert_eq!(ordered, DnsPolicy::Custom(vec![first, second]));
+    }
+
+    #[test]
+    fn exit_policy_rejects_noncanonical_wire_prefixes() {
+        let mut routes = RoutePolicy {
+            include: vec![IpPrefix {
+                network: "10.9.8.7".parse().unwrap(),
+                bits: 16,
+            }],
+            exclude: Vec::new(),
+        };
+        let error = routes.normalize().unwrap_err();
+        assert!(error.contains("not a canonical network prefix"), "{error}");
+    }
+
+    #[test]
+    fn custom_dns_must_also_be_inside_the_authorized_routes() {
+        let error = ExitPoint::new(
+            "desktop".into(),
+            Vec::new(),
+            RoutePolicy {
+                include: vec!["1.1.1.0/24".parse().unwrap()],
+                exclude: Vec::new(),
+            },
+            DnsPolicy::Custom(vec!["10.0.0.53".parse().unwrap()]),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("outside the authorized exit routes"),
+            "{error}"
+        );
     }
 }

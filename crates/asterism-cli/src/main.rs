@@ -372,7 +372,9 @@ enum Command {
         #[arg(long, value_name = "CIDR", requires = "exit")]
         exclude_route: Vec<String>,
         /// DNS ownership: `exit` (default), `cpu`, or comma-separated resolver
-        /// IPs carried through the exit.
+        /// IPs carried through the exit. The first custom IP receives virtual
+        /// DNS and controls health; later IPs are authorized only when a guest
+        /// addresses them directly on port 53.
         #[arg(long, value_name = "POLICY", requires = "exit")]
         dns: Option<String>,
     },
