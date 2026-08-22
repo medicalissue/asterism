@@ -256,6 +256,19 @@ impl Shard {
             .context("committing this device's registry shard")
     }
 
+    /// Replace the in-memory view with the last durable shard bytes.
+    ///
+    /// Durable writes can report a directory-sync error after rename made the
+    /// new document visible, or fail before rename while the caller has
+    /// already mutated this value. Recovery code uses this as its oracle so a
+    /// subsequent request never acts on an in-memory decision that differs
+    /// from the document a restarted daemon would read.
+    pub fn reload(&mut self) -> Result<()> {
+        let durable = Self::load(&self.path).context("reloading this device's registry shard")?;
+        *self = durable;
+        Ok(())
+    }
+
     /// This shard in the shape it is written in.
     fn file(&self) -> ShardFile {
         ShardFile {
@@ -620,6 +633,30 @@ impl Shard {
         Ok(inst.clone())
     }
 
+    /// Clear a failed move fence and consume its epoch.
+    ///
+    /// An aborted target keeps a durable token-bound authority record.  If
+    /// the source reused the same epoch, that record would permanently
+    /// reject the next attempt's fresh token.  Consuming the aborted epoch
+    /// makes the next attempt strictly newer without pretending the move
+    /// itself landed.
+    pub fn finish_aborted_move(&mut self, name: &str, epoch: u64) -> Result<Instance> {
+        let inst = self.get_mut(name)?;
+        let moving = inst
+            .moving
+            .as_ref()
+            .context("instance has no move fence to abort")?;
+        if moving.epoch != epoch {
+            bail!(
+                "instance {name:?} is fenced at epoch {}, not {epoch}",
+                moving.epoch
+            );
+        }
+        inst.moving = None;
+        inst.move_epoch = inst.move_epoch.max(epoch);
+        Ok(inst.clone())
+    }
+
     /// Record which device's guest key opens this instance's guest.
     ///
     /// Written by the boot that built the seed, because the seed is where
@@ -915,8 +952,14 @@ mod tests {
                 "dev",
                 Some(Moving {
                     to_device: "desktop".into(),
+                    to_device_id: "target-id".into(),
                     epoch: 1,
                     started_at: now_unix(),
+                    token: "token".into(),
+                    lane: 0,
+                    coordinator_id: "coordinator-id".into(),
+                    phase: crate::instance::MoveSourcePhase::Fenced,
+                    live: false,
                 }),
             )
             .unwrap();
