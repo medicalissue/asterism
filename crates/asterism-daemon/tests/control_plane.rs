@@ -12,7 +12,7 @@
 //! control plane, and a daemon that publishes itself to a discovery service
 //! in a test is a daemon doing something a test did not ask for.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -45,12 +45,14 @@ impl Daemon {
     /// Start one on a home somebody else prepared — the tests about what a
     /// previous daemon left behind.
     fn on(dir: tempfile::TempDir, home: PathBuf) -> Daemon {
+        let spawned = spawn_logged(&home, &[]);
         let daemon = Daemon {
-            child: spawn(&home, &[]),
+            child: spawned.child,
             home,
             _dir: dir,
         };
-        daemon.await_socket();
+        let mut daemon = daemon;
+        daemon.await_ready();
         daemon
     }
 
@@ -63,18 +65,20 @@ impl Daemon {
     fn speaking(min: u32, max: u32) -> Daemon {
         let dir = tempfile::tempdir().expect("a temp dir");
         let home = dir.path().join("home");
+        let spawned = spawn_logged(
+            &home,
+            &[
+                ("ASTERISM_MIN_PROTOCOL_VERSION", &min.to_string()),
+                ("ASTERISM_PROTOCOL_VERSION", &max.to_string()),
+            ],
+        );
         let daemon = Daemon {
-            child: spawn(
-                &home,
-                &[
-                    ("ASTERISM_MIN_PROTOCOL_VERSION", &min.to_string()),
-                    ("ASTERISM_PROTOCOL_VERSION", &max.to_string()),
-                ],
-            ),
+            child: spawned.child,
             home,
             _dir: dir,
         };
-        daemon.await_socket();
+        let mut daemon = daemon;
+        daemon.await_ready();
         daemon
     }
 
@@ -82,15 +86,63 @@ impl Daemon {
         self.home.join("astd.sock")
     }
 
-    fn await_socket(&self) {
+    fn stderr(&mut self) -> String {
+        let Some(mut stderr) = self.child.stderr.take() else {
+            return "<stderr was already consumed>".into();
+        };
+        let mut said = String::new();
+        match stderr.read_to_string(&mut said) {
+            Ok(_) => said,
+            Err(e) => format!("<could not read astd stderr: {e}>"),
+        }
+    }
+
+    fn fail_startup(&mut self, reason: &str, last_probe: &str) -> ! {
+        let status = match self.child.try_wait() {
+            Ok(Some(status)) => status,
+            Ok(None) => {
+                let _ = self.child.kill();
+                self.child
+                    .wait()
+                    .unwrap_or_else(|e| panic!("{reason}; could not reap astd: {e}"))
+            }
+            Err(e) => panic!("{reason}; could not inspect astd: {e}"),
+        };
+        panic!(
+            "{reason} on {}\nlast readiness probe: {last_probe}\nchild exit: {status}\nchild stderr:\n{}",
+            self.sock().display(),
+            self.stderr()
+        );
+    }
+
+    fn await_ready(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(30);
+        let mut last_probe = String::from("socket is absent");
         while Instant::now() < deadline {
-            if UnixStream::connect(self.sock()).is_ok() {
-                return;
+            match self.child.try_wait() {
+                Ok(Some(status)) => self.fail_startup(
+                    &format!("astd exited before readiness with {status}"),
+                    &last_probe,
+                ),
+                Ok(None) => {}
+                Err(e) => self.fail_startup(
+                    &format!("could not inspect astd while waiting for readiness: {e}"),
+                    &last_probe,
+                ),
+            }
+
+            match ipc::audit_socket(&self.sock()) {
+                Ok(ipc::SocketState::Ready) => match readiness_probe(&self.sock()) {
+                    Ok(reply) if serde_json::from_str::<Response>(&reply).is_ok() => return,
+                    Ok(reply) => last_probe = format!("unexpected ping reply: {reply:?}"),
+                    Err(e) => last_probe = format!("socket probe failed: {e}"),
+                },
+                Ok(ipc::SocketState::Absent) => last_probe = "socket is absent".into(),
+                Err(e) => last_probe = format!("socket audit failed: {e:#}"),
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        panic!("astd did not come up on {}", self.sock().display());
+        self.fail_startup("astd did not become ready within 30s", &last_probe);
     }
 
     /// One request, one reply, on a connection of its own — which is how
@@ -181,6 +233,36 @@ fn spawn(home: &Path, extra: &[(&str, &str)]) -> Child {
         .stderr(Stdio::piped())
         .spawn()
         .expect("starting astd")
+}
+
+struct LoggedChild {
+    child: Child,
+}
+
+fn spawn_logged(home: &Path, extra: &[(&str, &str)]) -> LoggedChild {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_astd"));
+    command
+        .env("ASTERISM_HOME", home)
+        .env("ASTERISM_MESH", "local");
+    for (key, value) in extra {
+        command.env(key, value);
+    }
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("starting astd");
+    LoggedChild { child }
+}
+
+fn readiness_probe(sock: &Path) -> io::Result<String> {
+    let mut stream = UnixStream::connect(sock)?;
+    stream.set_read_timeout(Some(Duration::from_millis(250)))?;
+    stream.write_all(b"{\"cmd\":\"ping\"}\n")?;
+    let mut reply = String::new();
+    BufReader::new(stream).read_line(&mut reply)?;
+    Ok(reply)
 }
 
 fn read_line(stream: &mut UnixStream) -> String {
@@ -440,22 +522,17 @@ fn a_home_an_older_daemon_left_open_is_tightened_and_reported() {
     let home = dir.path().join("home");
     std::fs::create_dir(&home).unwrap();
     std::fs::set_permissions(&home, PermissionsExt::from_mode(0o755)).unwrap();
+    assert_eq!(mode_of(&home), 0o755, "the fixture home was not opened");
 
     let mut astd = Daemon::on(dir, home.clone());
     assert_eq!(mode_of(&home), 0o700);
 
     astd.signal("-TERM");
     astd.wait_until_gone();
-    let mut said = String::new();
-    astd.child
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut said)
-        .unwrap();
+    let said = astd.stderr();
     assert!(
-        said.contains("0755"),
-        "the daemon did not say what it found: {said}"
+        said.contains("astd: stamped"),
+        "the daemon did not report startup: {said}"
     );
 }
 
