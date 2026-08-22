@@ -359,9 +359,10 @@ pub fn boot_req<'a>(inst: &'a Instance, hv: &dyn Hypervisor) -> Result<BootReq<'
     }
 
     let shares = seed::shares(inst);
+    let share_kind = hv.caps().shared_dir;
 
     // Gate on the capability, not on which backend this is.
-    if !shares.is_empty() && hv.caps().shared_dir.is_none() {
+    if !shares.is_empty() && share_kind.is_none() {
         anyhow::bail!(
             "the {} backend on this device cannot share host directories, so the \
              {} volume(s) attached to {:?} cannot reach the guest — detach them, \
@@ -383,7 +384,14 @@ pub fn boot_req<'a>(inst: &'a Instance, hv: &dyn Hypervisor) -> Result<BootReq<'
     let guest_config = hv
         .guest_config(inst)
         .with_context(|| format!("preparing what the {} backend puts in a guest", hv.id()))?;
-    seed::ensure(&inst.name, &req.seed, &shares, &guest_config, &egress)
+    seed::ensure(
+        &inst.name,
+        &req.seed,
+        &shares,
+        share_kind,
+        &guest_config,
+        &egress,
+    )
         .context("building cloud-init seed")?;
     req.shares = shares;
     Ok(req)
