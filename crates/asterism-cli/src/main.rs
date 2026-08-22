@@ -939,7 +939,9 @@ fn main() -> Result<()> {
         Command::Images { verify: true } if device.is_none() => {
             return print_image_rows(&image::catalog_rows_full()?);
         }
+        Command::Images { .. } if device.is_none() => return images_here(),
         Command::Images { verify: _ } => Request::ImageList,
+        Command::Pull { image } if device.is_none() => return pull_here(&image),
         Command::Pull { image } => Request::ImagePull { reference: image },
         // Which device is running the guest is the daemon's problem, not the
         // user's and not this process's: it answers with a loopback port
@@ -2235,6 +2237,48 @@ fn confirmed(yes: bool) -> Result<bool> {
 
 // ---- images ----------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImagePath {
+    DeviceProtocol,
+    LocalCore,
+}
+
+/// Select the image implementation without opening a connection or touching
+/// the image store. Aimed image commands are carried by the outer proxy and
+/// negotiate their image frames with the selected device; only a local
+/// protocol-1-through-5 daemon needs the core fallback.
+fn image_path(device: Option<&str>, spoken: u32) -> ImagePath {
+    let image_pull = Request::ImagePull {
+        reference: String::new(),
+    };
+    if device.is_some() || image_pull.speakable_at(spoken) {
+        ImagePath::DeviceProtocol
+    } else {
+        ImagePath::LocalCore
+    }
+}
+
+fn images_here() -> Result<()> {
+    let mut client = Client::open()?;
+    match image_path(None, client.spoken) {
+        ImagePath::DeviceProtocol => match client.ask(&Request::ImageList)? {
+            Response::Images { images } => print_image_rows(&images),
+            Response::Error { message } => bail!(message),
+            other => bail!("unexpected image catalog reply from astd: {other:?}"),
+        },
+        ImagePath::LocalCore => print_image_rows(&image::catalog_rows()?),
+    }
+}
+
+fn pull_here(reference: &str) -> Result<()> {
+    let mut client = Client::open()?;
+    let result = match image_path(None, client.spoken) {
+        ImagePath::DeviceProtocol => pull_image_with_client(&mut client, reference)?,
+        ImagePath::LocalCore => pull_image_locally(reference)?,
+    };
+    print_image_pull(&result)
+}
+
 /// Make an image available on the device that will own the next operation.
 ///
 /// A remote create first reads the remote catalog and only then asks that same
@@ -2254,8 +2298,33 @@ fn ensure_image_on_device(device: Option<&str>, reference: &str) -> Result<Strin
         {
             return Ok(canonical);
         }
+        let result = pull_image(device, reference)?;
+        return Ok(result.reference);
     }
-    let result = pull_image(device, reference)?;
+
+    // ImageList and ImagePull were added together at protocol 6. A new CLI
+    // can still be talking to a local daemon from protocols 1 through 5,
+    // where Client::ask must refuse those frames. Keep the device-owned
+    // protocol path for a daemon that can speak it, but use the same core
+    // pull implementation locally for the rolling-compatibility window.
+    let mut client = Client::open()?;
+    if image_path(None, client.spoken) == ImagePath::DeviceProtocol {
+        let rows = match client.ask(&Request::ImageList)? {
+            Response::Images { images } => images,
+            Response::Error { message } => bail!(message),
+            other => bail!("unexpected image catalog reply from astd: {other:?}"),
+        };
+        if rows
+            .iter()
+            .any(|row| row.reference == canonical && row.pulled && row.verified)
+        {
+            return Ok(canonical);
+        }
+        let result = pull_image_with_client(&mut client, reference)?;
+        return Ok(result.reference);
+    }
+
+    let result = pull_image_locally(reference)?;
     Ok(result.reference)
 }
 
@@ -2263,24 +2332,51 @@ fn pull_image(
     device: Option<&str>,
     reference: &str,
 ) -> Result<asterism_core::image::ImagePullResult> {
-    match send(&aimed(
+    let response = send(&aimed(
         Request::ImagePull {
             reference: reference.to_owned(),
         },
         device,
-    ))? {
+    ))?;
+    match response {
         Response::ImagePulled { result } => {
-            for progress in &result.progress {
-                if progress.done {
-                    eprintln!("{} ({} bytes)", progress.phase, progress.bytes);
-                } else {
-                    eprintln!("{}", progress.phase);
-                }
-            }
+            report_image_pull(&result);
             Ok(*result)
         }
         Response::Error { message } => bail!(message),
         other => bail!("unexpected image pull reply from astd: {other:?}"),
+    }
+}
+
+fn pull_image_with_client(
+    client: &mut Client,
+    reference: &str,
+) -> Result<asterism_core::image::ImagePullResult> {
+    match client.ask(&Request::ImagePull {
+        reference: reference.to_owned(),
+    })? {
+        Response::ImagePulled { result } => {
+            report_image_pull(&result);
+            Ok(*result)
+        }
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected image pull reply from astd: {other:?}"),
+    }
+}
+
+fn pull_image_locally(reference: &str) -> Result<asterism_core::image::ImagePullResult> {
+    let result = image::pull(reference)?;
+    report_image_pull(&result);
+    Ok(result)
+}
+
+fn report_image_pull(result: &asterism_core::image::ImagePullResult) {
+    for progress in &result.progress {
+        if progress.done {
+            eprintln!("{} ({} bytes)", progress.phase, progress.bytes);
+        } else {
+            eprintln!("{}", progress.phase);
+        }
     }
 }
 
@@ -4768,6 +4864,15 @@ mod tests {
         assert!(Cli::try_parse_from(["ast", "auth", "logout"]).is_ok());
         assert!(Cli::try_parse_from(["ast", "create", "dev"]).is_ok());
         assert!(Cli::try_parse_from(["ast", "devices"]).is_ok());
+    }
+
+    #[test]
+    fn local_image_path_preserves_protocol_one_through_five() {
+        for spoken in 1..=5 {
+            assert_eq!(image_path(None, spoken), ImagePath::LocalCore);
+            assert_eq!(image_path(Some("nas"), spoken), ImagePath::DeviceProtocol);
+        }
+        assert_eq!(image_path(None, 6), ImagePath::DeviceProtocol);
     }
 
     #[test]
