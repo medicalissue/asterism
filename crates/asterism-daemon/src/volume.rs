@@ -1606,6 +1606,7 @@ mod tests {
                 direct_kernel: false,
                 port_forward: false,
                 guest_egress: None,
+                guest_packet_network: false,
                 disk_formats: &[DiskFormat::Raw],
             }
         }

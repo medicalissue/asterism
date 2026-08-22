@@ -8,7 +8,7 @@
 //!
 //! See `docs/BACKENDS.md` for why the boundary sits exactly here.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -422,6 +422,25 @@ pub enum GuestEgress {
     },
 }
 
+/// A backend-neutral packet link projected into a guest.
+///
+/// The daemon owns the listener and the userspace network stack behind it;
+/// the backend's only job is to connect a virtual NIC to this framed packet
+/// stream. Keeping the endpoint here means QEMU, VZ, Cloud Hypervisor, or a
+/// future Windows backend can expose the same guest edge without teaching the
+/// network plane how any one hypervisor spells a device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestNetwork {
+    /// Loopback endpoint accepting QEMU-compatible length-prefixed Ethernet
+    /// frames. It is never bound to a LAN address.
+    pub endpoint: SocketAddr,
+    /// Stable MAC of the ordinary backend NIC, so cloud-init can leave SSH
+    /// and published-port replies on their original path.
+    pub primary_mac: [u8; 6],
+    /// Stable MAC of the packet-plane NIC.
+    pub edge_mac: [u8; 6],
+}
+
 /// One optional operation at the backend boundary.
 ///
 /// This is deliberately enumerable.  [`Caps`] used to be a collection of
@@ -442,10 +461,11 @@ pub enum Capability {
     DirectKernelBoot,
     PortForward,
     GuestEgress,
+    GuestPacketNetwork,
 }
 
 impl Capability {
-    pub const ALL: [Capability; 10] = [
+    pub const ALL: [Capability; 11] = [
         Capability::LiveSnapshot,
         Capability::DiskSnapshot,
         Capability::LiveMigration,
@@ -456,6 +476,7 @@ impl Capability {
         Capability::DirectKernelBoot,
         Capability::PortForward,
         Capability::GuestEgress,
+        Capability::GuestPacketNetwork,
     ];
 }
 
@@ -485,6 +506,10 @@ pub struct Caps {
     /// LAN, or `None` where this backend has no such path. See
     /// [`GuestEgress`]; `None` is what the secrets data plane refuses on.
     pub guest_egress: Option<GuestEgress>,
+    /// Can connect a second guest NIC to [`GuestNetwork`]. Backends that do
+    /// not expose an isolated packet-stream attachment refuse exit points at
+    /// attach time instead of recording a part no guest can use.
+    pub guest_packet_network: bool,
     pub disk_formats: &'static [DiskFormat],
 }
 
@@ -507,6 +532,7 @@ impl Caps {
             Capability::DirectKernelBoot => self.direct_kernel,
             Capability::PortForward => self.port_forward,
             Capability::GuestEgress => self.guest_egress.is_some(),
+            Capability::GuestPacketNetwork => self.guest_packet_network,
         }
     }
 }
@@ -580,6 +606,9 @@ pub struct BootReq<'a> {
     /// its NoCloud seed; an OCI rootfs receives the same public CA, opaque
     /// handles and proxy address through its generated init.
     pub egress: crate::seed::Egress,
+    /// Stable packet edge for guest networking, when the backend can project
+    /// one. The ordinary backend NIC remains present for ingress/SSH.
+    pub network: Option<GuestNetwork>,
     /// Resolved bootstrap profiles. Cloud images receive these in NoCloud;
     /// OCI root filesystems receive the same files and driver through their
     /// generated init.
@@ -820,6 +849,7 @@ mod tests {
                     direct_kernel: false,
                     port_forward: false,
                     guest_egress: None,
+                    guest_packet_network: false,
                     disk_formats: &[DiskFormat::Raw],
                 }
             }

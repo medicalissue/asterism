@@ -210,6 +210,18 @@ pub enum Request {
         name: String,
         secret: String,
     },
+    /// Put an ordered orbit-device exit policy behind the guest's stable
+    /// virtual network edge. Valid for a running guest: the edge does not
+    /// move when its provider does.
+    AttachExitPoint {
+        name: String,
+        exit: Box<crate::network::ExitPoint>,
+    },
+    /// Return egress to the default CPU-device placement without changing
+    /// the guest's interface, gateway or DNS address.
+    DetachExitPoint {
+        name: String,
+    },
     /// Take a volume off an instance: the record goes, and a block volume's
     /// lease is handed back to the device that owns it.
     Detach {
@@ -641,6 +653,8 @@ impl Request {
             // other, and the binding is written on whichever device holds it.
             | Request::AttachSecret { name, .. }
             | Request::DetachSecret { name, .. }
+            | Request::AttachExitPoint { name, .. }
+            | Request::DetachExitPoint { name }
             | Request::BackupExport { name, .. }
             | Request::SshEndpoint { name } => Some(name),
 
@@ -750,6 +764,7 @@ impl Request {
             Request::BackupExport { .. } | Request::BackupImport { .. } => 3,
             Request::DeviceShellStatus => 5,
             Request::ImageList | Request::ImagePull { .. } => 6,
+            Request::AttachExitPoint { .. } | Request::DetachExitPoint { .. } => 7,
             Request::DeviceShellPolicy { .. }
             | Request::DeviceShellOpen { .. }
             | Request::DeviceShellInput { .. }
@@ -777,6 +792,9 @@ impl Request {
             Request::BackupExport { .. } => Some("backup_export"),
             Request::BackupImport { .. } => Some("backup_import"),
             Request::DeviceShellStatus => Some("device_shell_status"),
+            Request::AttachExitPoint { .. } | Request::DetachExitPoint { .. } => {
+                Some("network exit-point")
+            }
             Request::DeviceShellPolicy { .. }
             | Request::DeviceShellOpen { .. }
             | Request::DeviceShellInput { .. }
@@ -1196,6 +1214,13 @@ pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
             }
             .since(),
         ),
+        (
+            "network-exit-point",
+            Request::DetachExitPoint {
+                name: String::new(),
+            }
+            .since(),
+        ),
     ]
     .into_iter()
     .map(|(name, version)| (name.to_owned(), version))
@@ -1343,6 +1368,8 @@ mod tests {
         assert!(Request::Compat.speakable_at(2));
         assert!(Request::List.speakable_at(1));
         assert_eq!(Request::DeviceShellStatus.since(), 5);
+        assert_eq!(Request::DetachExitPoint { name: "dev".into() }.since(), 6);
+        assert!(!Request::DetachExitPoint { name: "dev".into() }.speakable_at(5));
         assert_eq!(
             serde_json::to_string(&Request::DeviceShellStatus).unwrap(),
             r#"{"cmd":"device_shell_status"}"#
@@ -1423,6 +1450,7 @@ mod tests {
             Some(&4),
             "a protocol-3 backup daemon cannot parse device-shell variants"
         );
+        assert_eq!(table.get("network-exit-point"), Some(&6));
         for (name, version) in &table {
             assert!(
                 *version > crate::compat::FIRST_PROTOCOL,

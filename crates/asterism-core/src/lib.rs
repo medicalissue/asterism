@@ -26,6 +26,7 @@ pub mod hv;
 pub mod image;
 pub mod instance;
 pub mod ipc;
+pub mod network;
 pub mod oci;
 pub mod orbit;
 pub mod paths;
