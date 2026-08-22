@@ -33,7 +33,7 @@
 //!
 //! * **An init.** The image config's Entrypoint/Cmd has to run as pid 1 in a
 //!   machine with nothing mounted. [`init_script`] generates
-//!   `/sbin/asterism-init` into the rootfs: it mounts /proc, /sys, /dev, takes
+//!   `/asterism-init` into the rootfs: it mounts /proc, /sys, /dev, takes
 //!   its address from the kernel cmdline the backend wrote, exports the image's
 //!   Env, runs the entrypoint, and powers the machine off when it exits. It
 //!   runs under a static busybox copied into the rootfs at `/.asterism/busybox`
@@ -47,22 +47,29 @@
 //! oci-<hex12>.raw             the ext4 image, named for its manifest digest
 //! oci-<hex12>.json            the image config it was built from
 //! kernel/<arch>-vmlinuz       guest kernel, shared by every OCI instance
+//! kernel/<arch>-vmlinux       verified, uncompressed derivative for VZ
 //! kernel/<arch>-initrd
+//! kernel/<arch>-virtiofs.ko   verified module paired with that kernel
 //! ```
 //! The `.raw` is content-addressed, so two references to the same digest are
 //! one image on disk and a moved tag is a different file rather than a
 //! rewritten one.
 
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
+use data_encoding::BASE64;
 use serde_json::Value;
 
+use crate::durable;
+use crate::hv::ShareKind;
 use crate::image::host_arch;
 use crate::paths;
+use crate::profile::Bootstrap;
+use crate::seed::{self, Egress, Share};
 use crate::tools::{output, run, tool};
 use crate::verify::{self, Algo, Depth, Digest, Pinned, Source};
 
@@ -80,10 +87,25 @@ const BUSYBOX_IMAGE: &str = "docker.io/library/busybox:musl";
 /// answers to `argv[1]` when it is called `busybox`. A dot-directory of our
 /// own is the one path an image is not going to have opinions about.
 pub const GUEST_BUSYBOX: &str = ".asterism/busybox";
-pub const GUEST_INIT: &str = "sbin/asterism-init";
+pub const GUEST_INIT: &str = "asterism-init";
+
+/// Locations used by older builds. `/sbin` is a symlink to `/usr/sbin` in
+/// merged-/usr images, and debugfs deliberately does not follow symlinks, so
+/// both spellings must be removed explicitly during an offline refresh.
+const LEGACY_GUEST_INIT: &str = "sbin/asterism-init";
+const MERGED_USR_GUEST_INIT: &str = "usr/sbin/asterism-init";
+
+/// The legacy standalone DHCP hook. Current guests dispatch udhcpc callbacks
+/// through [`GUEST_INIT`] so personalizing a grown ext4 clone allocates only
+/// one file; this path is removed when an older private disk is refreshed.
+const GUEST_DHCP: &str = ".asterism/udhcpc";
+
+/// The legacy on-disk public egress CA. Current init scripts materialize the
+/// public certificate at boot, again avoiding a second debugfs allocation.
+const GUEST_EGRESS_CA: &str = ".asterism/egress-ca.pem";
 
 /// The kernel cmdline `init=` the backend must pass.
-pub const INIT_PATH: &str = "/sbin/asterism-init";
+pub const INIT_PATH: &str = "/asterism-init";
 
 /// Guest kernel and initrd per host architecture.
 ///
@@ -125,6 +147,35 @@ pub const KERNELS: &[GuestKernel] = &[
         initrd: Pinned {
             url: "https://cloud-images.ubuntu.com/releases/noble/release-20260814/unpacked/ubuntu-24.04-server-cloudimg-amd64-initrd-generic",
             digest: "sha256:194f73c17ca4795f987f2e1713c7184f8d1bb88f063f79a753dada5da6a9987c",
+        },
+    },
+];
+
+/// The one loadable driver the cloud-image initrd does not carry.
+///
+/// Ubuntu builds virtiofs as a module. Its cloud initrd omits that module
+/// because ordinary cloud images load it from their root filesystem later;
+/// an OCI rootfs has no distro module tree. Keep the exact matching Ubuntu
+/// package pinned beside the kernel pair and retain only its small verified
+/// `virtiofs.ko` derivative on the device.
+pub struct GuestModule {
+    pub arch: &'static str,
+    pub package: Pinned,
+}
+
+pub const VIRTIOFS_MODULES: &[GuestModule] = &[
+    GuestModule {
+        arch: "aarch64",
+        package: Pinned {
+            url: "https://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-modules-6.8.0-137-generic_6.8.0-137.137_arm64.deb",
+            digest: "sha256:8bd01ff03569d5d60e1abad54fa9cdb2a0e171b9408ced82432b00195803b45b",
+        },
+    },
+    GuestModule {
+        arch: "x86_64",
+        package: Pinned {
+            url: "https://archive.ubuntu.com/ubuntu/pool/main/l/linux/linux-modules-6.8.0-137-generic_6.8.0-137.137_amd64.deb",
+            digest: "sha256:f8dabfa49fc27e8d680a264b5c60b9492ef20e95ec32a52d7a03b4cf15ae72f0",
         },
     },
 ];
@@ -1087,7 +1138,6 @@ fn furnish(root: &Path, config: &Config, tree: &mut Tree) -> Result<()> {
     let script = init_script(config);
     std::fs::write(&init, &script)?;
     set_mode(&init, 0o755)?;
-    tree.note("sbin", 0, 0);
     tree.note(GUEST_INIT, 0, 0);
     tree.bytes += script.len() as u64;
     Ok(())
@@ -1164,11 +1214,41 @@ fn busybox_binary() -> Result<PathBuf> {
 ///     button arrives, which is how `ast down` reaches a guest with no
 ///     init system to ask.
 pub fn init_script(config: &Config) -> String {
+    init_script_with_parts(config, &[], None, &Egress::default(), &Bootstrap::default())
+}
+
+/// Generate the per-instance init for an OCI rootfs.
+///
+/// The stored OCI image remains immutable and shared. Directory mounts and
+/// secret handles are instance parts, so they are folded into the copy of
+/// this script written to the instance's private root disk immediately
+/// before boot.
+fn init_script_with_parts(
+    config: &Config,
+    shares: &[Share],
+    share_kind: Option<ShareKind>,
+    egress: &Egress,
+    bootstrap: &Bootstrap,
+) -> String {
     let mut s = String::new();
     s.push_str(&format!("#!/{GUEST_BUSYBOX} sh\n"));
     s.push_str(
         "# Generated by Asterism. Runs an OCI image's entrypoint as pid 1.\n\
          BB=/.asterism/busybox\n\
+         # BusyBox udhcpc invokes this same file with `bound` or `renew`.\n\
+         # Keep the callback in pid 1's one generated inode: debugfs can\n\
+         # allocate the same inode twice when adding files to a grown clone.\n\
+         case \"$1\" in\n\
+         bound|renew)\n\
+         \x20 $BB ifconfig \"$interface\" \"$ip\" netmask \"${subnet:-255.255.255.0}\" up\n\
+         \x20 $BB route del default dev \"$interface\" 2>/dev/null || true\n\
+         \x20 for gateway in $router; do $BB route add default gw \"$gateway\" dev \"$interface\"; break; done\n\
+         \x20 : > /etc/resolv.conf\n\
+         \x20 for server in $dns; do echo \"nameserver $server\" >> /etc/resolv.conf; done\n\
+         \x20 exit 0\n\
+         \x20 ;;\n\
+         *) [ -z \"$1\" ] || exit 0 ;;\n\
+         esac\n\
          $BB mkdir -p /proc /sys /dev /tmp /run 2>/dev/null\n\
          $BB mount -t proc proc /proc 2>/dev/null\n\
          $BB mount -t sysfs sys /sys 2>/dev/null\n\
@@ -1178,15 +1258,16 @@ pub fn init_script(config: &Config) -> String {
          $BB mount -t tmpfs shm /dev/shm 2>/dev/null\n\
 \n\
          # What this machine cannot discover for itself, the backend wrote on\n\
-         # the kernel cmdline: its address (nothing here speaks DHCP) and the\n\
-         # time (no RTC driver is loaded this early, and without it every line\n\
-         # the image logs is dated 1970).\n\
-         ip= gw= dns=\n\
+         # the kernel cmdline: either its address or the identity used for\n\
+         # DHCP, plus the time (no RTC driver is loaded this early, and without\n\
+         # it every line the image logs is dated 1970).\n\
+         ip= gw= dns= hostname=\n\
          for w in $($BB cat /proc/cmdline); do\n\
          \x20 case \"$w\" in\n\
          \x20   asterism.ip=*)   ip=${w#asterism.ip=} ;;\n\
          \x20   asterism.gw=*)   gw=${w#asterism.gw=} ;;\n\
          \x20   asterism.dns=*)  dns=${w#asterism.dns=} ;;\n\
+         \x20   asterism.hostname=*) hostname=${w#asterism.hostname=} ;;\n\
          \x20   asterism.time=*) $BB date -s \"@${w#asterism.time=}\" >/dev/null 2>&1 ;;\n\
          \x20 esac\n\
          done\n\
@@ -1202,6 +1283,14 @@ pub fn init_script(config: &Config) -> String {
          \x20 $BB ip addr add \"$ip\" dev \"$nic\" 2>/dev/null\n\
          \x20 $BB ip link set \"$nic\" up 2>/dev/null\n\
          \x20 [ -n \"$gw\" ] && $BB ip route add default via \"$gw\" 2>/dev/null\n\
+         elif [ -n \"$nic\" ]; then\n\
+         \x20 $BB ip link set \"$nic\" up 2>/dev/null\n\
+         \x20 [ -n \"$hostname\" ] && $BB hostname \"$hostname\" 2>/dev/null\n\
+         \x20 if ! $BB udhcpc -n -q -i \"$nic\" ${hostname:+-x hostname:$hostname} \\\n\
+         \x20      -s /asterism-init; then\n\
+         \x20   echo \"asterism: DHCP did not give $nic an address\"\n\
+         \x20   $BB poweroff -f\n\
+         \x20 fi\n\
          fi\n\
          [ -n \"$dns\" ] && echo \"nameserver $dns\" > /etc/resolv.conf 2>/dev/null\n\
          \n\
@@ -1224,12 +1313,111 @@ pub fn init_script(config: &Config) -> String {
          \n",
     );
 
+    if !shares.is_empty() {
+        let kind = share_kind.expect("shares are only passed with a transport");
+        for share in shares {
+            let (fs, options) = match kind {
+                ShareKind::NinePfs => (
+                    "9p",
+                    "-o trans=virtio,version=9p2000.L,msize=262144,access=client",
+                ),
+                ShareKind::Virtiofs => ("virtiofs", ""),
+            };
+            s.push_str(&format!(
+                "$BB mkdir -p {where_}\n\
+                 if ! $BB mount -t {fs} {options} {tag} {where_}; then\n\
+                 \x20 echo {failure}\n\
+                 \x20 halt\n\
+                 fi\n",
+                where_ = sh_quote(&share.guest_path),
+                fs = fs,
+                options = options,
+                tag = sh_quote(&share.tag),
+                failure = sh_quote(&format!(
+                    "asterism: could not mount volume {} at {}",
+                    share.label, share.guest_path
+                )),
+            ));
+        }
+    }
+
     for var in &config.env {
         if let Some((name, value)) = var.split_once('=') {
             if is_env_name(name) {
                 s.push_str(&format!("export {name}={}\n", sh_quote(value)));
             }
         }
+    }
+    // Image Env is untrusted input and may itself name BB, a proxy variable,
+    // or a secret's destination. Reassert the runtime path and instance
+    // bindings afterwards so the image cannot replace Asterism's control
+    // binary or route a handle around the policy proxy.
+    s.push_str("BB=/.asterism/busybox\n");
+    if !egress.is_empty() {
+        s.push_str(
+            "# The per-instance CA is public material. Write it from this one\n\
+             # generated inode rather than allocating another file with debugfs.\n\
+             $BB cat > /.asterism/egress-ca.pem <<'ASTERISM_EGRESS_CA'\n",
+        );
+        s.push_str(&egress.ca_pem);
+        if !egress.ca_pem.ends_with('\n') {
+            s.push('\n');
+        }
+        s.push_str("ASTERISM_EGRESS_CA\n");
+        s.push_str(
+            "# Install the public egress CA without assuming a distribution.\n\
+             for bundle in /etc/ssl/certs/ca-certificates.crt \\\n\
+             \x20 /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do\n\
+             \x20 if [ -s \"$bundle\" ]; then\n\
+             \x20   $BB cat \"$bundle\" /.asterism/egress-ca.pem > /.asterism/ca-bundle.pem\n\
+             \x20   break\n\
+             \x20 fi\n\
+             done\n\
+             [ -s /.asterism/ca-bundle.pem ] || $BB cp /.asterism/egress-ca.pem /.asterism/ca-bundle.pem\n\
+             export SSL_CERT_FILE='/.asterism/ca-bundle.pem'\n\
+             export CURL_CA_BUNDLE='/.asterism/ca-bundle.pem'\n\
+             export REQUESTS_CA_BUNDLE='/.asterism/ca-bundle.pem'\n\
+             export NODE_EXTRA_CA_CERTS='/.asterism/egress-ca.pem'\n",
+        );
+        for (name, value) in seed::egress_environment(egress) {
+            s.push_str(&format!("export {name}={}\n", sh_quote(&value)));
+        }
+    }
+    if !bootstrap.is_empty() {
+        s.push_str(
+            "# OCI guests have no cloud-init or systemd. Materialize the same\n\
+             # resolved bootstrap files here and run the shared driver directly.\n\
+             $BB mkdir -p /bin /var/log\n\
+             [ -e /bin/sh ] || $BB ln -s /.asterism/busybox /bin/sh\n",
+        );
+        for (index, (path, mode, content)) in bootstrap.files().into_iter().enumerate() {
+            let parent = Path::new(&path)
+                .parent()
+                .and_then(Path::to_str)
+                .expect("a bootstrap guest file has an absolute parent");
+            let mut delimiter = format!("ASTERISM_BOOTSTRAP_{index}");
+            while content.lines().any(|line| line == delimiter) {
+                delimiter.push('_');
+            }
+            s.push_str(&format!(
+                "$BB mkdir -p {parent}\n\
+                 $BB cat > {path} <<'{delimiter}'\n",
+                parent = sh_quote(parent),
+                path = sh_quote(&path),
+            ));
+            s.push_str(&content);
+            if !content.ends_with('\n') {
+                s.push('\n');
+            }
+            s.push_str(&format!(
+                "{delimiter}\n$BB chmod {mode} {}\n",
+                sh_quote(&path)
+            ));
+        }
+        s.push_str(
+            "($BB sh /usr/local/sbin/asterism-bootstrap \
+               > /var/log/asterism-bootstrap.log 2>&1) &\n",
+        );
     }
     if let Some(dir) = &config.workdir {
         s.push_str(&format!(
@@ -1265,6 +1453,141 @@ pub fn init_script(config: &Config) -> String {
          halt\n"
     ));
     s
+}
+
+/// Refresh the generated init in one instance's private OCI root disk.
+///
+/// `source` is the verified store image the disk was cloned from. Its JSON
+/// sidecar supplies the image's entrypoint and environment; `root` is the
+/// writable clone that receives only this instance's parts. The operation is
+/// deliberately on the boot path, not `prepare`, because snapshot listing
+/// and other disk-only operations must remain read-only.
+pub fn configure_instance(
+    source: &Path,
+    root: &Path,
+    shares: &[Share],
+    share_kind: Option<ShareKind>,
+    egress: &Egress,
+    bootstrap: &Bootstrap,
+) -> Result<()> {
+    if shares.is_empty() != share_kind.is_none() {
+        bail!("an OCI directory share needs exactly one guest transport");
+    }
+    let sidecar = source.with_extension("json");
+    let private_sidecar = root
+        .parent()
+        .context("an OCI root disk has no directory")?
+        .join("oci-config.json");
+    let text = match std::fs::read_to_string(&sidecar) {
+        Ok(text) => {
+            if std::fs::read_to_string(&private_sidecar).ok().as_deref() != Some(text.as_str()) {
+                durable::commit(&private_sidecar, text.as_bytes()).with_context(|| {
+                    format!("recording OCI config at {}", private_sidecar.display())
+                })?;
+            }
+            text
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::read_to_string(&private_sidecar).with_context(|| {
+                format!(
+                    "the OCI config is absent from both {} and the moved instance at {}",
+                    sidecar.display(),
+                    private_sidecar.display()
+                )
+            })?
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("reading OCI config at {}", sidecar.display()));
+        }
+    };
+    let doc: Value = serde_json::from_str(&text)
+        .with_context(|| format!("reading OCI config at {}", sidecar.display()))?;
+    let config = Config::from_json(&doc);
+    let init = init_script_with_parts(&config, shares, share_kind, egress, bootstrap);
+    rewrite_guest_files(root, &init)
+        .with_context(|| format!("configuring OCI guest disk {}", root.display()))
+}
+
+/// Replace Asterism's generated init inside an ext4 image without mounting it.
+/// This is the same e2fsprogs seam pull uses on macOS.
+///
+/// There is deliberately one write. `debugfs write` has been observed to
+/// reuse one newly allocated inode for two directory entries on a filesystem
+/// grown after cloning. The init doubles as the DHCP hook and writes the
+/// public egress CA at boot, so no second guest file needs allocating here.
+fn rewrite_guest_files(root: &Path, init: &str) -> Result<()> {
+    const S_IFREG: u32 = 0o100000;
+    let e2fsck = e2fs_tool("e2fsck")?;
+    let debugfs = e2fs_tool("debugfs")?;
+    let dir = root.parent().context("an OCI root disk has no directory")?;
+    let suffix = std::process::id();
+    let init_host = dir.join(format!(".asterism-init-{suffix}"));
+    let commands = dir.join(format!(".asterism-debugfs-{suffix}"));
+    for path in [&init_host, &commands] {
+        if path.to_string_lossy().contains('"') {
+            bail!("{} contains a quote debugfs cannot escape", path.display());
+        }
+    }
+
+    // The old multi-write implementation could leave two directory entries
+    // naming an inode whose link count was one. The filesystem still called
+    // itself clean, so force the offline check: this both upgrades those
+    // private disks and makes a disk recovered after a hard stop safe to edit.
+    let check = || -> Result<()> {
+        let checked = Command::new(&e2fsck)
+            .args(["-fy"])
+            .arg(root)
+            .output()
+            .with_context(|| format!("checking OCI guest disk {}", root.display()))?;
+        if !matches!(checked.status.code(), Some(0 | 1)) {
+            bail!(
+                "e2fsck could not repair OCI guest disk {} (status {}): {}{}",
+                root.display(),
+                checked.status,
+                String::from_utf8_lossy(&checked.stdout),
+                String::from_utf8_lossy(&checked.stderr),
+            );
+        }
+        Ok(())
+    };
+    check()?;
+
+    let result = (|| -> Result<()> {
+        std::fs::write(&init_host, init)?;
+        // Deletion and allocation are separate filesystem transactions. A
+        // second check closes the orphan/bitmap state left by deleting a
+        // legacy aliased inode before the sole new inode is allocated.
+        std::fs::write(
+            &commands,
+            format!(
+                "rm /{GUEST_DHCP}\nrm /{GUEST_EGRESS_CA}\n\
+                 rm /{LEGACY_GUEST_INIT}\nrm /{MERGED_USR_GUEST_INIT}\nrm /{GUEST_INIT}\n"
+            ),
+        )?;
+        run(Command::new(&debugfs)
+            .arg("-w")
+            .arg("-f")
+            .arg(&commands)
+            .arg(root))?;
+        check()?;
+
+        let script = format!(
+            "write \"{}\" /{GUEST_INIT}\n\
+             sif /{GUEST_INIT} mode 0{:o}\nsif /{GUEST_INIT} uid 0\nsif /{GUEST_INIT} gid 0\n",
+            init_host.display(),
+            S_IFREG | 0o755,
+        );
+        std::fs::write(&commands, script)?;
+        run(Command::new(&debugfs)
+            .arg("-w")
+            .arg("-f")
+            .arg(&commands)
+            .arg(root))
+    })();
+    for path in [&init_host, &commands] {
+        let _ = std::fs::remove_file(path);
+    }
+    result
 }
 
 fn is_env_name(name: &str) -> bool {
@@ -1438,6 +1761,63 @@ pub fn kernel() -> Result<(PathBuf, PathBuf)> {
     verify::check(&kernel, depth).context("the guest kernel this device fetched")?;
     verify::check(&initrd, depth).context("the guest initrd this device fetched")?;
     Ok((kernel, initrd))
+}
+
+/// The kernel image expected by a native Linux boot loader such as VZ's.
+///
+/// Ubuntu's arm64 `vmlinuz` is gzip-compressed. QEMU accepts that publisher
+/// artifact directly, while Virtualization.framework requires the raw Linux
+/// image. Keep the pinned download as the source of truth and account for the
+/// decompressed bytes as a derived boot artifact beside it.
+pub fn linux_boot_kernel() -> Result<(PathBuf, PathBuf)> {
+    let (kernel, initrd) = kernel()?;
+    let mut magic = [0u8; 2];
+    let mut source = std::fs::File::open(&kernel)?;
+    if source.read_exact(&mut magic).is_err() || magic != [0x1f, 0x8b] {
+        return Ok((kernel, initrd));
+    }
+
+    let parent = verify::provenance(&kernel)
+        .context("the verified guest kernel has no provenance record")?
+        .content
+        .to_string();
+    let raw = kernel.with_file_name(format!("{}-vmlinux", host_arch()));
+    ensure_uncompressed_kernel(&kernel, &raw, &parent)?;
+    Ok((raw, initrd))
+}
+
+fn ensure_uncompressed_kernel(source: &Path, dest: &Path, parent: &str) -> Result<()> {
+    if dest.exists()
+        && verify::check(dest, Depth::from_env()).is_ok()
+        && verify::provenance(dest).is_some_and(|record| record.derived_from == [parent])
+    {
+        return Ok(());
+    }
+
+    let _ = std::fs::remove_file(dest);
+    let _ = std::fs::remove_file(verify::provenance_path(dest));
+    let part = dest.with_extension("part");
+    let _ = std::fs::remove_file(&part);
+    let output_file =
+        std::fs::File::create(&part).with_context(|| format!("creating {}", part.display()))?;
+    let result = run(Command::new(tool("gzip")?)
+        .arg("-dc")
+        .arg(source)
+        .stdout(Stdio::from(output_file)))
+    .context("decompressing the guest kernel for the native Linux boot loader");
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&part);
+        return Err(error);
+    }
+
+    let origin = source.display().to_string();
+    verify::adopt(
+        &part,
+        dest,
+        None,
+        Source::new("linux-kernel", &origin).derived_from([parent.to_owned()]),
+    )?;
+    Ok(())
 }
 
 /// Fetch the guest kernel if this device has not got one. Idempotent.
@@ -1664,6 +2044,177 @@ mod tests {
         // An image with nothing to run says so on the console.
         let empty = init_script(&Config::default());
         assert!(empty.contains("no entrypoint or cmd"));
+    }
+
+    /// Instance parts belong in the private root disk, never in the shared
+    /// OCI store image. The generated pid 1 mounts the selected transport
+    /// and exports only opaque secret handles before starting the image.
+    #[test]
+    fn a_personalized_init_projects_volumes_and_secret_egress() {
+        let config = Config {
+            cmd: vec!["/app".into()],
+            env: vec![
+                "HTTPS_PROXY=http://image.invalid".into(),
+                "EXAMPLE_TOKEN=image-value".into(),
+                "BB=/tmp/not-asterism".into(),
+            ],
+            ..Default::default()
+        };
+        let shares = [Share {
+            host_path: "/host/data".into(),
+            guest_path: "/mnt/ast/data".into(),
+            tag: "ast-deadbeef".into(),
+            label: "device:/host/data".into(),
+        }];
+        let egress = Egress {
+            proxy: "http://10.0.2.2:38123".into(),
+            ca_pem: "-----BEGIN CERTIFICATE-----\npublic\n-----END CERTIFICATE-----\n".into(),
+            authorities: vec!["api.example.com:443".into()],
+            handles: vec![("EXAMPLE_TOKEN".into(), "ast-handle-opaque".into())],
+        };
+        let bootstrap = Bootstrap::resolve(&["base".to_owned()]).unwrap();
+        let script = init_script_with_parts(
+            &config,
+            &shares,
+            Some(ShareKind::NinePfs),
+            &egress,
+            &bootstrap,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let init = dir.path().join("asterism-init");
+        std::fs::write(&init, &script).unwrap();
+        run(Command::new("sh").arg("-n").arg(&init)).expect("the personalized init is valid shell");
+        run(Command::new("sh").arg(&init).arg("deconfig"))
+            .expect("a non-address DHCP callback exits instead of re-entering pid 1");
+
+        assert!(script.contains("mount -t 9p -o trans=virtio"), "{script}");
+        assert!(
+            script.contains("'ast-deadbeef' '/mnt/ast/data'"),
+            "{script}"
+        );
+        assert!(script.contains("export EXAMPLE_TOKEN='ast-handle-opaque'"));
+        assert!(script.contains("export HTTPS_PROXY='http://10.0.2.2:38123'"));
+        assert!(script.contains("SSL_CERT_FILE='/.asterism/ca-bundle.pem'"));
+        assert!(
+            script.contains("udhcpc -n -q") && script.contains("-s /asterism-init"),
+            "the same init can DHCP on vz"
+        );
+        assert!(
+            script.contains("ip link set \"$nic\" up"),
+            "the NIC is usable before DHCP: {script}"
+        );
+        assert!(
+            script.contains(&egress.ca_pem),
+            "the one generated inode materializes the public CA at boot"
+        );
+        assert!(script.contains("/usr/local/sbin/asterism-bootstrap"));
+        assert!(script.contains("base@1"));
+        assert!(
+            script.rfind("export HTTPS_PROXY='http://10.0.2.2:38123'")
+                > script.rfind("export HTTPS_PROXY='http://image.invalid'"),
+            "the instance policy overrides image Env"
+        );
+        assert!(
+            script.rfind("export EXAMPLE_TOKEN='ast-handle-opaque'")
+                > script.rfind("export EXAMPLE_TOKEN='image-value'"),
+            "an image cannot replace its opaque handle"
+        );
+        assert!(
+            script.rfind("BB=/.asterism/busybox") > script.rfind("export BB='/tmp/not-asterism'"),
+            "an image cannot replace Asterism's init runtime"
+        );
+    }
+
+    #[test]
+    fn directory_shares_cannot_be_personalized_without_a_transport() {
+        let dir = tempfile::tempdir().unwrap();
+        let share = Share {
+            host_path: "/host/data".into(),
+            guest_path: "/mnt/data".into(),
+            tag: "ast-data".into(),
+            label: "device:/host/data".into(),
+        };
+        let err = configure_instance(
+            &dir.path().join("source.raw"),
+            &dir.path().join("root.raw"),
+            &[share],
+            None,
+            &Egress::default(),
+            &Bootstrap::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("transport"), "{err}");
+    }
+
+    /// Exercise the actual ext4 seam, not only the text generator: an image
+    /// pulled by an older build already has both files, and boot must replace
+    /// them in place without mounting the filesystem or touching the source.
+    #[test]
+    fn personalization_rewrites_only_the_private_ext4_copy() {
+        let (Ok(mke2fs), Ok(resize2fs), Ok(debugfs), Ok(e2fsck)) = (
+            e2fs_tool("mke2fs"),
+            e2fs_tool("resize2fs"),
+            e2fs_tool("debugfs"),
+            e2fs_tool("e2fsck"),
+        ) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(tree.join("sbin")).unwrap();
+        std::fs::create_dir_all(tree.join(".asterism")).unwrap();
+        std::fs::write(tree.join(LEGACY_GUEST_INIT), "old init\n").unwrap();
+        std::fs::hard_link(tree.join(LEGACY_GUEST_INIT), tree.join(GUEST_DHCP)).unwrap();
+        std::fs::write(tree.join(GUEST_EGRESS_CA), "old ca\n").unwrap();
+
+        let source = dir.path().join("oci-source.raw");
+        std::fs::write(
+            source.with_extension("json"),
+            r#"{"config":{"Cmd":["/app"]}}"#,
+        )
+        .unwrap();
+        let root = dir.path().join("disk.raw");
+        run(Command::new(mke2fs)
+            .args(["-q", "-F", "-t", "ext4", "-d"])
+            .arg(&tree)
+            .arg(&root)
+            .arg("16M"))
+        .unwrap();
+        run(Command::new(resize2fs).arg(&root).arg("64M")).unwrap();
+        run(Command::new(&debugfs)
+            .args(["-w", "-R", "sif /sbin/asterism-init links_count 1"])
+            .arg(&root))
+        .unwrap();
+
+        let egress = Egress {
+            proxy: "http://10.0.2.2:38123".into(),
+            ca_pem: "public egress ca\n".into(),
+            authorities: vec!["api.example.com:443".into()],
+            handles: vec![("EXAMPLE_TOKEN".into(), "ast-handle-opaque".into())],
+        };
+        let bootstrap = Bootstrap::resolve(&["base".to_owned()]).unwrap();
+        configure_instance(&source, &root, &[], None, &egress, &bootstrap).unwrap();
+        assert!(dir.path().join("oci-config.json").exists());
+        std::fs::remove_file(source.with_extension("json")).unwrap();
+        configure_instance(&source, &root, &[], None, &egress, &bootstrap)
+            .expect("a moved instance carries its private OCI config");
+        let init = output(
+            Command::new(&debugfs)
+                .args(["-R", "cat /asterism-init"])
+                .arg(&root),
+        )
+        .unwrap();
+        assert!(init.contains("asterism: starting the image entrypoint"));
+        assert!(init.contains("'/app' &"));
+        assert!(init.contains("ifconfig \"$interface\""));
+        assert!(init.contains("public egress ca"));
+        assert!(init.contains("asterism: applying bootstrap profiles"));
+        run(Command::new(e2fsck).args(["-fn"]).arg(&root))
+            .expect("personalization leaves no duplicate inode references");
+        assert!(std::fs::read_to_string(dir.path().join("oci-config.json"))
+            .unwrap()
+            .contains("/app"));
     }
 
     /// Layer paths are attacker-controlled: a tar entry that climbs out of
@@ -2135,6 +2686,33 @@ mod tests {
         std::fs::write(&kernel, b"tampered with, at a length of its own").unwrap();
         assert!(ensure_kernel_at(&pinned, &kernel, &initrd, serve).unwrap());
         assert_eq!(std::fs::read(&kernel).unwrap(), kbytes);
+    }
+
+    #[test]
+    fn a_native_loader_gets_an_accounted_uncompressed_kernel() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("test-vmlinuz");
+        let raw = dir.path().join("test-vmlinux");
+        let input = dir.path().join("input");
+        std::fs::write(&input, b"the raw Linux kernel bytes").unwrap();
+        let compressed = std::fs::File::create(&source).unwrap();
+        run(Command::new(tool("gzip").unwrap())
+            .arg("-c")
+            .arg(&input)
+            .stdout(Stdio::from(compressed)))
+        .unwrap();
+
+        ensure_uncompressed_kernel(&source, &raw, "sha256:publisher-kernel").unwrap();
+        assert_eq!(std::fs::read(&raw).unwrap(), b"the raw Linux kernel bytes");
+        let record = verify::provenance(&raw).unwrap();
+        assert_eq!(record.kind, "linux-kernel");
+        assert_eq!(record.derived_from, ["sha256:publisher-kernel"]);
+
+        // A cached derivative is executable boot input too: damage must be
+        // detected and repaired from the still-verified source.
+        std::fs::write(&raw, b"damaged").unwrap();
+        ensure_uncompressed_kernel(&source, &raw, "sha256:publisher-kernel").unwrap();
+        assert_eq!(std::fs::read(&raw).unwrap(), b"the raw Linux kernel bytes");
     }
 
     /// A pin is only a pin if the url cannot move under it. Both entries in

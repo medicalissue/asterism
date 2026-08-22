@@ -368,6 +368,16 @@ impl Hypervisor for Qemu {
         if prep.kernel.is_none() && !req.seed.exists() {
             bail!("no cloud-init seed at {}", req.seed.display());
         }
+        if req.base.kind == ImageKind::OciRootfs {
+            oci::configure_instance(
+                &req.base.path,
+                prep.root_path()?,
+                &req.shares,
+                (!req.shares.is_empty()).then_some(ShareKind::NinePfs),
+                &req.egress,
+                &req.bootstrap,
+            )?;
+        }
 
         let ssh_port = free_port()?;
         let pidfile = req.dir.join("qemu.pid");
@@ -1223,6 +1233,8 @@ mod tests {
             base,
             seed: dir.join("seed.iso"),
             shares: Vec::new(),
+            egress: Default::default(),
+            bootstrap: Default::default(),
             extra_disks: Vec::new(),
             console: dir.join("console.log"),
         }
@@ -1473,7 +1485,7 @@ mod tests {
     fn the_kernel_cmdline_tells_the_guest_everything_it_cannot_discover() {
         let line = cmdline();
         assert!(line.contains("root=/dev/vda rw"), "{line}");
-        assert!(line.contains("init=/sbin/asterism-init"), "{line}");
+        assert!(line.contains("init=/asterism-init"), "{line}");
         assert!(
             line.contains("net.ifnames=0"),
             "eth0 is what images expect: {line}"

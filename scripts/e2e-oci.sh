@@ -30,6 +30,8 @@ harness_own_home "$ASTERISM_HOME"
 PORT="${E2E_PORT:-8080}"
 WEB=oci-web
 ONESHOT=oci-once
+VOL="$ASTERISM_HOME/oci-volume"
+VOL_MARKER="oci-volume-$$"
 
 mkdir -p "$ASTERISM_HOME/images"
 # Reuse an already-built store instead of re-pulling half of Docker Hub. The
@@ -103,6 +105,11 @@ expect "status names the published port" "127.0.0.1:$PORT -> :80" \
 expect "the image is recorded fully qualified" "docker.io/library/nginx:latest" \
   "$AST" status "$WEB"
 
+mkdir -p "$VOL"
+printf '%s\n' "$VOL_MARKER" >"$VOL/marker.txt"
+expect "attach a directory to the OCI guest" "/usr/share/nginx/html/volume" \
+  "$AST" attach "$WEB" --volume "$VOL" --at /usr/share/nginx/html/volume
+
 # The store knows what it built, and says so next to the catalog.
 expect "images lists what this device built" "docker.io/library/nginx:latest" \
   "$AST" images
@@ -125,6 +132,9 @@ done
 echo "ok: curl 127.0.0.1:$PORT returned the nginx welcome page (${served}s after up)"
 [ "$served" -le 20 ] || fail "boot to first byte took ${served}s"
 
+expect "the generated init mounted the directory" "$VOL_MARKER" \
+  curl -sS --max-time 2 "http://127.0.0.1:$PORT/volume/marker.txt"
+
 # The console is the whole of an OCI instance's output, so it has to carry
 # the image's own startup as well as the kernel's.
 expect "logs show the entrypoint" "/docker-entrypoint.sh" "$AST" logs "$WEB" -n 400
@@ -134,10 +144,6 @@ expect "logs show nginx itself" "start worker process" "$AST" logs "$WEB" -n 400
 # rather than waiting three minutes for a banner.
 refuse "ssh says why it cannot" "has no ssh server" "$AST" ssh "$WEB" -- true
 refuse "ssh says where to look instead" "ast logs" "$AST" ssh "$WEB" -- true
-
-# A volume needs an init system in the guest to mount it; there is none.
-refuse "volumes are refused with a reason" "no init system" \
-  "$AST" attach "$WEB" --volume "$ASTERISM_HOME"
 
 # Down is a real ACPI powerdown: the generated init hears the power button
 # and stops nginx. Up again on the same disk.
@@ -159,6 +165,8 @@ done
 echo "ok: serving again after down/up"
 
 expect "down 2" "$WEB  stopped" "$AST" down "$WEB"
+expect "detach the directory" "oci-volume detached" \
+  "$AST" detach "$WEB" --volume "$VOL"
 expect "rm" "$WEB  removed" "$AST" rm "$WEB"
 [ -d "$ASTERISM_HOME/instances/$WEB" ] && fail "rm left the instance directory behind"
 echo "ok: rm cleaned up"
@@ -204,17 +212,5 @@ echo "ok: status says stopped once the entrypoint returned"
 sleep 8
 expect "and it is left alone" "status:  stopped" "$AST" status "$ONESHOT"
 expect "rm the one-shot" "$ONESHOT  removed" "$AST" rm "$ONESHOT"
-
-# ---- 3. what is refused ----------------------------------------------------
-
-# On a device with a signed vz helper this is the capability check; on one
-# without, vz refuses to be selected at all, one step earlier. Either way
-# `--backend vz --image nginx` must not produce an instance. (The capability
-# itself is asserted in `backend::check_can_boot`'s unit test, which does not
-# need a signed helper to run.)
-out="$("$AST" create refused --image nginx --backend vz 2>&1)" \
-  && fail "vz accepted an oci image:"$'\n'"$out"
-grep -qF "vz" <<<"$out" || fail "the refusal does not name vz:"$'\n'"$out"
-echo "ok: vz refuses an oci image"
 
 echo "E2E-OCI GREEN (nginx served on 127.0.0.1:$PORT in ${served}s)"

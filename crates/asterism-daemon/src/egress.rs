@@ -247,23 +247,12 @@ pub(crate) fn orbit() -> Result<(Node, Option<Arc<Mesh>>)> {
 ///   and the alternative — binding a wildcard address and calling the result
 ///   guest-only — would put an unauthenticated proxy for somebody's API keys
 ///   on their LAN. See [`GuestEgress`].
-/// * An OCI guest. The handle and the CA reach a guest through cloud-init,
-///   and an OCI image has no init to act on one; there is nothing in it to
-///   install a trust root into.
 ///
 /// There is deliberately no check that this is the device supplying the
 /// instance's cpu part. Reaching here means this device holds the row, which
 /// is the same fact — and writing it down a second time would mean comparing
 /// an orbit name against a hostname, which are not the same string.
 pub(crate) fn check_can_bind(inst: &Instance) -> Result<()> {
-    if inst.image_kind == asterism_core::hv::ImageKind::OciRootfs {
-        bail!(
-            "{:?} boots an OCI image, which has no init system to install a certificate \
-             or read an environment file — a bound secret reaches a guest through \
-             cloud-init, so put it on an instance built from a cloud image",
-            inst.name
-        );
-    }
     let hv = backend::for_instance(inst)?;
     // Only a backend we could actually ask is allowed to refuse: on a device
     // where the hypervisor is not installed yet, `caps()` knows nothing, and
