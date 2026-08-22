@@ -59,6 +59,7 @@ mod backend;
 mod device_shell;
 mod egress;
 mod exit_point;
+mod exit_policy;
 mod images;
 mod instance;
 mod mesh;
@@ -87,6 +88,7 @@ pub(crate) struct Node {
     pub shard: Arc<Mutex<Shard>>,
     pub orbit: Arc<Mutex<Orbit>>,
     pub shell: Arc<device_shell::Manager>,
+    pub exit: Arc<exit_policy::Manager>,
 }
 
 impl Node {
@@ -150,6 +152,7 @@ async fn main() -> Result<()> {
         shard: Arc::new(Mutex::new(Shard::load(&paths::state_path())?)),
         orbit: Arc::new(Mutex::new(Orbit::load(&paths::orbit_path())?)),
         shell: device_shell::Manager::load(),
+        exit: exit_policy::Manager::load(),
     };
 
     // The election, the stale-socket sweep and the bind, in that order and
@@ -168,6 +171,20 @@ async fn main() -> Result<()> {
     // marker of a disk restore that never finished.
     sweep_interrupted_commits();
     converge_restores(&node).await;
+
+    // Identity adoption and the packet-edge fence precede every externally
+    // reachable service. A QEMU written by an older or rolled-back daemon
+    // has no handle-bound proof of restricted slirp; if it cannot be stopped
+    // and observed gone, this daemon refuses startup rather than serving
+    // beside a live privacy bypass.
+    {
+        let mut reg = node.shard.lock().await;
+        if backend::adopt_identities(&mut reg) {
+            reg.save()
+                .context("saving the registry after adopting process identities")?;
+        }
+    }
+    persist::fence_legacy_packet_edges(&node.shard).await?;
 
     // The pid file is how an `ast` newer than this daemon retires it: the
     // socket says something is listening, but only a pid can be acted on.
@@ -221,24 +238,11 @@ async fn main() -> Result<()> {
     // holds a process-wide handle rather than taking one as an argument.
     swap::init(mesh.clone());
 
-    // Records written before a process could be identified only carry a pid,
-    // and a pid is not evidence. This gives the ones whose process can still
-    // be proven a real identity, and everything after it — resurrection, the
-    // supervisor, every stop — deals only in proof. Before `resurrect`,
-    // because resurrect is the first thing that acts on liveness.
-    {
-        let mut reg = node.shard.lock().await;
-        if backend::adopt_identities(&mut reg) {
-            if let Err(e) = reg.save() {
-                eprintln!("astd: saving the registry after adopting process identities: {e:#}");
-            }
-        }
-    }
     volume::adopt_export_identities().await;
 
     // What this device was running, it runs again — before the first
     // request is served, and then continuously (see `persist`).
-    persist::resurrect(&node.shard).await;
+    persist::resurrect(&node.shard).await?;
     persist::supervise(node.shard.clone());
 
     let slots = door.slots();
@@ -794,6 +798,30 @@ pub(crate) async fn handle(req: Request, node: &Node) -> Response {
             compat: Box::new(compat::Compat::current()),
         };
     }
+    if let Request::ExitProviderPolicy { action } = req {
+        use asterism_core::network::ExitProviderAction;
+        let result = match action {
+            ExitProviderAction::Status => Ok(node.exit.status()),
+            ExitProviderAction::Enable => {
+                let allowed = node
+                    .orbit
+                    .lock()
+                    .await
+                    .devices()
+                    .iter()
+                    .map(|device| device.device_id.clone())
+                    .collect();
+                node.exit.enable(allowed)
+            }
+            ExitProviderAction::Disable => node.exit.disable(),
+        };
+        return match result {
+            Ok(status) => Response::ExitProviderStatus { status },
+            Err(error) => Response::Error {
+                message: format!("{error:#}"),
+            },
+        };
+    }
     if secret::is_source_request(&req) {
         return secret::serve_source(req).await;
     }
@@ -838,6 +866,7 @@ mod tests {
             shard: Arc::new(Mutex::new(Shard::load(&home.join("state.json")).unwrap())),
             orbit: Arc::new(Mutex::new(Orbit::load(&home.join("orbit.json")).unwrap())),
             shell: device_shell::Manager::load_at(home),
+            exit: exit_policy::Manager::load_at(&home.join("exit-provider.json")),
         }
     }
 
