@@ -96,6 +96,14 @@ impl Node {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Release activation has to prove the staged daemon before it replaces a
+    // running one. This path touches no state and binds no socket, so a
+    // downgrade refusal remains a refusal before mutation.
+    if matches!(std::env::args().nth(1).as_deref(), Some("-V" | "--version")) {
+        println!("version   {}", asterism_core::VERSION);
+        println!("build     {}", asterism_core::BUILD_ID);
+        return Ok(());
+    }
     // Before anything: the signals that mean "stop". Registering one is what
     // makes it ours — until then the default disposition applies, and for
     // both of these that is death with nothing tidied up. The socket is

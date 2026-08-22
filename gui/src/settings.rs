@@ -58,6 +58,14 @@ pub struct Settings {
     /// and it is here at all because the app and the daemon are shipped
     /// separately and can silently come apart.
     pub app_build: String,
+    /// The signed channel and installed CLI unit, read through `ast update
+    /// status` so the app cannot grow a second channel or package-manager
+    /// policy.
+    pub update_channel: String,
+    pub update_version: String,
+    pub update_build: String,
+    pub update_manager: String,
+    pub update_error: Option<String>,
     /// `ASTERISM_HOME`, resolved. The state every other row is about.
     pub home: String,
     pub service: Service,
@@ -118,6 +126,7 @@ impl Settings {
             Ok((version, build)) => (Some(version), build, None),
             Err(e) => (None, None, Some(format!("{e:#}"))),
         };
+        let update = update_status();
         Settings {
             autostart,
             backends: newinstance::backends(),
@@ -126,6 +135,11 @@ impl Settings {
             daemon_error,
             daemon_build,
             app_build: asterism_core::BUILD_ID.to_owned(),
+            update_channel: update.value("channel"),
+            update_version: update.value("version"),
+            update_build: update.value("build"),
+            update_manager: update.value("manager"),
+            update_error: update.error,
             home: paths::home_dir().display().to_string(),
             service: Service::load(),
         }
@@ -147,6 +161,13 @@ impl Settings {
             }
         }
         out.push(format!("app build {}", self.app_build));
+        out.push(format!(
+            "update channel {} version {} build {} manager {}",
+            self.update_channel, self.update_version, self.update_build, self.update_manager
+        ));
+        if let Some(reason) = &self.update_error {
+            out.push(format!("update unavailable — {reason}"));
+        }
         match (&self.daemon, &self.daemon_error) {
             (Some(version), _) => out.push(format!(
                 "daemon {version} build {}",
@@ -159,6 +180,48 @@ impl Settings {
         out.push(format!("service {} {}", self.service.mechanism, self.service.summary));
         out
     }
+}
+
+#[derive(Default)]
+struct UpdateStatus {
+    lines: Vec<(String, String)>,
+    error: Option<String>,
+}
+
+impl UpdateStatus {
+    fn value(&self, name: &str) -> String {
+        self.lines
+            .iter()
+            .find_map(|(key, value)| (key == name).then(|| value.clone()))
+            .unwrap_or_else(|| "unknown".to_owned())
+    }
+}
+
+fn update_status() -> UpdateStatus {
+    let ast = client::ast_path();
+    let output = match std::process::Command::new(&ast).args(["update", "status"]).output() {
+        Ok(output) => output,
+        Err(e) => {
+            return UpdateStatus {
+                error: Some(format!("running {}: {e}", ast.display())),
+                ..UpdateStatus::default()
+            }
+        }
+    };
+    if !output.status.success() {
+        return UpdateStatus {
+            error: Some(String::from_utf8_lossy(&output.stderr).trim().to_owned()),
+            ..UpdateStatus::default()
+        };
+    }
+    let lines = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once(char::is_whitespace)?;
+            Some((key.to_owned(), value.trim().to_owned()))
+        })
+        .collect();
+    UpdateStatus { lines, error: None }
 }
 
 // ---- the one preference ----------------------------------------------------
@@ -212,6 +275,36 @@ pub fn uninstall() -> Result<()> {
     run_service("uninstall")
 }
 
+/// Authenticate the selected channel through the CLI's one updater.
+pub fn update_check() -> Result<()> {
+    run_update(&["check"])
+}
+
+/// Download and activate through that same updater. Confirmation belongs to
+/// the caller because a headless proof must be able to exercise this function
+/// without an AppleScript dialog.
+pub fn update_apply() -> Result<()> {
+    run_update(&["apply", "--yes"])
+}
+
+fn run_update(args: &[&str]) -> Result<()> {
+    let ast = client::ast_path();
+    let output = std::process::Command::new(&ast)
+        .arg("update")
+        .args(args)
+        .output()
+        .with_context(|| format!("running {} update", ast.display()))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for line in stdout.lines().chain(stderr.lines()) {
+        crate::feedback::echo(line);
+    }
+    if !output.status.success() {
+        bail!("{}", stderr.trim());
+    }
+    Ok(())
+}
+
 fn run_service(verb: &str) -> Result<()> {
     let ast = client::ast_path();
     let out = std::process::Command::new(&ast)
@@ -249,6 +342,11 @@ mod tests {
             daemon_error: None,
             daemon_build: Some("0.0.2+0123456789ab".into()),
             app_build: "0.0.2+0123456789ab".into(),
+            update_channel: "stable".into(),
+            update_version: "0.0.2".into(),
+            update_build: "0.0.2+0123456789ab".into(),
+            update_manager: "asterism".into(),
+            update_error: None,
             home: "/tmp/ast-home".into(),
             service: Service {
                 mechanism: "launchd".into(),
@@ -317,6 +415,25 @@ mod tests {
         s.daemon_error = Some("astd is not answering".into());
         let lines = s.lines().join("\n");
         assert!(!lines.contains("build unknown"), "{lines}");
+    }
+
+    #[test]
+    fn update_identity_and_manager_are_reported_from_the_cli_model() {
+        let mut s = settings();
+        let lines = s.lines().join("\n");
+        assert!(
+            lines.contains(
+                "update channel stable version 0.0.2 build 0.0.2+0123456789ab manager asterism"
+            ),
+            "{lines}"
+        );
+
+        s.update_error = Some("signature did not verify".into());
+        let lines = s.lines().join("\n");
+        assert!(
+            lines.contains("update unavailable — signature did not verify"),
+            "{lines}"
+        );
     }
 
     #[test]
