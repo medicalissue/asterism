@@ -305,8 +305,19 @@ harness_seed_images "$A"
 ASTERISM_HOME="$A" "$AST" pull "$IMAGE" >/dev/null 2>&1 \
   || fail "no $IMAGE image available for A (pull it once: ast pull $IMAGE)"
 
+# qemu by name, because everything below addresses the volume as /dev/vdb.
+#
+# Which letter a virtio disk gets is attachment order, and attachment order
+# is the backend's: on qemu the volume is the second disk, on vz the
+# cloud-init seed ISO takes vdb and the volume moves along. Nothing about
+# leases, epochs or the NBD bridge changes with it, so pinning the backend
+# here buys a deterministic device name without narrowing what is proved.
+#
+# It does mean this lane proves it on qemu only, while an ordinary create
+# now lands on vz — the gap is filed as as-3ge rather than papered over.
 expect "create the instance on A" "$INST  defined" \
-  env ASTERISM_HOME="$A" "$AST" create "$INST" --image "$IMAGE" --mem 2G --disk 10G
+  env ASTERISM_HOME="$A" "$AST" create "$INST" --backend qemu --image "$IMAGE" \
+    --mem 2G --disk 10G
 
 ATTACH="$(ASTERISM_HOME="$A" "$AST" attach "$INST" --volume "$B_NAME:$VOL" 2>&1)" \
   || fail "attach failed:"$'\n'"$ATTACH"
