@@ -22,13 +22,13 @@ jobs:
           fetch-depth: 0
 
       - name: Audit the locked Rust graph and license policy
-        uses: EmbarkStudios/cargo-deny-action@ae8fd5dc5a11c62c128f5f24f23cc7f8891c5ac5 # v2.0.10
+        uses: EmbarkStudios/cargo-deny-action@4de59db63a066737e557c2c4dd3d1f70206de781 # v2.0.10 peeled commit
         with:
           command: check advisories bans licenses sources
           arguments: --all-features --locked
 
       - name: Audit the locked GUI Rust graph and license policy
-        uses: EmbarkStudios/cargo-deny-action@ae8fd5dc5a11c62c128f5f24f23cc7f8891c5ac5 # v2.0.10
+        uses: EmbarkStudios/cargo-deny-action@4de59db63a066737e557c2c4dd3d1f70206de781 # v2.0.10 peeled commit
         with:
           command: check advisories bans licenses sources
           arguments: --all-features --locked
@@ -63,11 +63,11 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3 peeled commit
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch commit, 2026-08-05
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 peeled commit
       - run: cargo build --workspace
       - run: cargo test --workspace
       - run: bash scripts/e2e-remote-gpu.sh
@@ -83,7 +83,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3 peeled commit
 
       - name: Install shellcheck
         run: |
@@ -138,11 +138,11 @@ jobs:
   rc:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3 peeled commit
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch commit, 2026-08-05
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 peeled commit
 
       # The desktop app's crate does not compile without its built frontend
       # (`tauri::generate_context!` reads gui/ui/dist while it expands), so
@@ -164,7 +164,7 @@ jobs:
 
       # Whatever the suites kept, whether they passed or not: a green run's
       # bug report is how the format itself stays reviewed.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2 commit
         if: always()
         with:
           name: rc-evidence
