@@ -224,16 +224,6 @@ pub fn for_handle(backend: &str) -> Result<Arc<dyn Hypervisor>> {
 /// record a volume the instance will be able to use once it is.
 pub fn check_can_share(inst: &Instance) -> Result<()> {
     let hv = for_instance(inst)?;
-    // An OCI guest runs the image's entrypoint under a generated init and
-    // nothing else: there is no cloud-init in it to act on a mount unit, and
-    // no 9p module in the kernel's initrd to mount one with.
-    if inst.image_kind == ImageKind::OciRootfs {
-        bail!(
-            "{:?} boots an OCI image, which has no init system to mount a volume \
-             with — put the volume on an instance built from a cloud image",
-            inst.name
-        );
-    }
     if hv.probe().is_ok() && hv.caps().shared_dir.is_none() {
         bail!(
             "the {} backend on this device cannot share host directories, so a \
@@ -346,6 +336,8 @@ pub fn disk_req(inst: &Instance) -> Result<BootReq<'_>> {
         seed: dir.join("seed.iso"),
         console: dir.join("console.log"),
         shares: Vec::new(),
+        egress: seed::Egress::default(),
+        bootstrap: Default::default(),
         extra_disks: Vec::new(),
         dir,
     })
@@ -356,15 +348,6 @@ pub fn disk_req(inst: &Instance) -> Result<BootReq<'_>> {
 /// done before any backend is asked to do anything (BACKENDS.md §2).
 pub fn boot_req<'a>(inst: &'a Instance, hv: &dyn Hypervisor) -> Result<BootReq<'a>> {
     let mut req = disk_req(inst)?;
-
-    // An OCI guest has no cloud-init to hand a seed to: what a cloud image
-    // learns from one — its hostname, its ssh keys, its mounts — an OCI image
-    // has no way to act on. The generated init is the whole of its
-    // configuration, and it was written into the filesystem at pull time.
-    if req.base.kind == ImageKind::OciRootfs {
-        check_can_boot(hv, &req.base, &inst.publish)?;
-        return Ok(req);
-    }
 
     let shares = seed::shares(inst);
     let share_kind = hv.caps().shared_dir;
@@ -387,12 +370,23 @@ pub fn boot_req<'a>(inst: &'a Instance, hv: &dyn Hypervisor) -> Result<BootReq<'
     let egress = crate::egress::seed_config(inst)?;
 
     // What this instance was asked to become, past the image it boots.
-    // Resolved here rather than at create time as well as there: the catalog
-    // is this binary's, and an instance created by an older one may name a
-    // profile this one has since renamed — which is a refusal to boot with a
-    // reason on it, not a guest quietly missing half its tools.
+    // Resolve it for both cloud and OCI guests; the former receives the
+    // files through NoCloud and the latter through its generated pid 1.
     let bootstrap = profile::Bootstrap::resolve(&inst.profiles)
         .with_context(|| format!("the bootstrap profiles recorded on {:?}", inst.name))?;
+
+    // An OCI image has no cloud-init, but it does have Asterism's generated
+    // pid 1. Carry the same backend-neutral parts data to `prepare`, which
+    // refreshes that init in the instance's private root disk. This removes
+    // the old OCI-specific refusal without teaching orchestration which
+    // hypervisor is underneath it.
+    if req.base.kind == ImageKind::OciRootfs {
+        check_can_boot(hv, &req.base, &inst.publish)?;
+        req.shares = shares;
+        req.egress = egress;
+        req.bootstrap = bootstrap;
+        return Ok(req);
+    }
 
     // The backend gets to add what its own devices need — for vz, the
     // `/dev/hvc0` console no stock cloud image knows about, and the agent
@@ -415,6 +409,8 @@ pub fn boot_req<'a>(inst: &'a Instance, hv: &dyn Hypervisor) -> Result<BootReq<'
     )
     .context("building cloud-init seed")?;
     req.shares = shares;
+    req.egress = egress;
+    req.bootstrap = bootstrap;
     Ok(req)
 }
 
@@ -1203,17 +1199,13 @@ mod tests {
         check_can_boot(&*qemu, &oci, &port).expect("qemu boots a kernel and forwards ports");
 
         let vz = by_id("vz").unwrap();
-        assert!(!vz.caps().direct_kernel, "vz wires up EFI only");
-        let err = check_can_boot(&*vz, &oci, &[]).unwrap_err().to_string();
-        assert!(err.contains("vz"), "{err}");
-        assert!(
-            err.contains("direct kernel"),
-            "the missing capability is named: {err}"
-        );
-        // ...and a cloud image on vz is exactly as fine as it ever was.
+        assert!(vz.caps().direct_kernel, "vz has a native Linux boot loader");
+        check_can_boot(&*vz, &oci, &[]).expect("vz boots an OCI rootfs directly");
+        // A cloud image on vz remains exactly as fine as it ever was.
         check_can_boot(&*vz, &disk, &[]).unwrap();
         // Publishing to loopback needs a guest that is reached that way.
         assert!(check_can_boot(&*vz, &disk, &port).is_err());
+        assert!(check_can_boot(&*vz, &oci, &port).is_err());
     }
 
     #[test]

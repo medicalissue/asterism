@@ -36,9 +36,9 @@ pub(crate) enum Attachment {
     /// refused in words rather than discovered later: the directory is on
     /// the same device as the instance's cpu and ram (directory sharing has
     /// no network transport), the backend offers a share transport (9p on
-    /// qemu or virtiofs on vz), and the guest boots a cloud image whose
-    /// kernel supports that transport (an OCI instance has no init to mount
-    /// anything with).
+    /// qemu or virtiofs on vz), and the guest kernel supports that transport.
+    /// Cloud images receive a mount unit in their seed; OCI images receive
+    /// the same mount in Asterism's generated pid 1.
     ///
     /// A BLOCK VOLUME (`--volume desktop:tank`, made with `ast volume
     /// create`) arrives as a plain disk: /dev/vdb, /dev/vdc and so on. The

@@ -368,6 +368,16 @@ impl Hypervisor for Qemu {
         if prep.kernel.is_none() && !req.seed.exists() {
             bail!("no cloud-init seed at {}", req.seed.display());
         }
+        if req.base.kind == ImageKind::OciRootfs {
+            oci::configure_instance(
+                &req.base.path,
+                prep.root_path()?,
+                &req.shares,
+                (!req.shares.is_empty()).then_some(ShareKind::NinePfs),
+                &req.egress,
+                &req.bootstrap,
+            )?;
+        }
 
         let ssh_port = free_port()?;
         let pidfile = req.dir.join("qemu.pid");
@@ -1190,6 +1200,7 @@ mod tests {
     use asterism_core::hv::ImageRef;
     use asterism_core::instance::{local_host, Instance, Shape};
     use std::process::{Child, Command};
+    use std::time::Instant;
 
     /// An instance record, without a registry file to keep it in.
     fn instance(disk_gib: u32) -> Instance {
@@ -1223,6 +1234,8 @@ mod tests {
             base,
             seed: dir.join("seed.iso"),
             shares: Vec::new(),
+            egress: Default::default(),
+            bootstrap: Default::default(),
             extra_disks: Vec::new(),
             console: dir.join("console.log"),
         }
@@ -1473,7 +1486,7 @@ mod tests {
     fn the_kernel_cmdline_tells_the_guest_everything_it_cannot_discover() {
         let line = cmdline();
         assert!(line.contains("root=/dev/vda rw"), "{line}");
-        assert!(line.contains("init=/sbin/asterism-init"), "{line}");
+        assert!(line.contains("init=/asterism-init"), "{line}");
         assert!(
             line.contains("net.ifnames=0"),
             "eth0 is what images expect: {line}"
@@ -1904,10 +1917,14 @@ mod tests {
         pid
     }
 
-    /// A process that stays available while the stale identity is exercised.
-    /// Keeping the child behind a guard makes the final liveness assertion
-    /// meaningful and ensures a failed assertion cannot leak a foreign
-    /// process into the rest of the test suite.
+    /// A process that has exec'd `sleep` and stays available while the stale
+    /// identity is exercised.
+    ///
+    /// `Command::spawn` can return while the child is still between fork and
+    /// exec. Capturing there records the test binary rather than `sleep`, so
+    /// the later executable check correctly calls the same pid foreign. The
+    /// guard waits for the intended executable before returning its identity,
+    /// and owns cleanup on success, early exit, timeout, and panic alike.
     struct Sleeper(Child);
 
     impl Sleeper {
@@ -1915,15 +1932,53 @@ mod tests {
             Self(Command::new("sleep").arg("30").spawn().unwrap())
         }
 
-        fn identity(&self) -> ProcId {
-            ProcId::capture(self.0.id()).unwrap()
+        fn identity(&mut self) -> ProcId {
+            let pid = self.0.id();
+            let deadline = Instant::now() + Duration::from_secs(5);
+
+            loop {
+                let last_probe = match ProcId::capture(pid) {
+                    Ok(identity) => {
+                        let is_sleep = identity
+                            .exec
+                            .as_deref()
+                            .and_then(Path::file_name)
+                            .is_some_and(|name| name == "sleep");
+                        if is_sleep && identity.check().is_ours() {
+                            return identity;
+                        }
+                        format!("observed executable {:?}", identity.exec)
+                    }
+                    Err(error) => format!("identity capture failed: {error:#}"),
+                };
+
+                let failure = match self.0.try_wait() {
+                    Ok(Some(status)) => Some(format!(
+                        "sleep fixture {pid} exited before readiness: {status}"
+                    )),
+                    Ok(None) if Instant::now() >= deadline => Some(format!(
+                        "sleep fixture {pid} did not exec within five seconds; {last_probe}"
+                    )),
+                    Ok(None) => None,
+                    Err(error) => Some(format!("checking sleep fixture {pid}: {error}")),
+                };
+                if let Some(failure) = failure {
+                    self.reap();
+                    panic!("{failure}");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn reap(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
         }
     }
 
     impl Drop for Sleeper {
         fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
+            self.reap();
         }
     }
 
@@ -1967,7 +2022,7 @@ mod tests {
     #[test]
     fn a_recycled_pid_is_stopped_and_refuses_the_signals() {
         let hv = Qemu::new();
-        let sleeper = Sleeper::spawn();
+        let mut sleeper = Sleeper::spawn();
         let real = sleeper.identity();
         assert!(
             real.alive(),

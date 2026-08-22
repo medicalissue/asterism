@@ -185,14 +185,32 @@ fn main() -> anyhow::Result<()> {
     // bound to (spike landmine 9).
     let found = Arc::new(Mutex::new(Discovered::default()));
     {
-        let (found, mac, host) = (found.clone(), config.mac.clone(), config.instance.clone());
+        let (found, mac, host, lease_is_endpoint) = (
+            found.clone(),
+            config.mac.clone(),
+            config.instance.clone(),
+            config.dhcp_lease_is_endpoint,
+        );
         std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(600);
             while Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(500));
                 // Candidates, not an answer: whichever one sends an ssh
-                // banner is the live guest (spike landmine 8).
+                // banner is the live cloud guest (spike landmine 8). A
+                // directly booted OCI guest is the exception: it has no
+                // sshd, and its generated init requested this lease with the
+                // exact pinned MAC/hostname the helper is querying.
                 for ip in net::lease_candidates(&mac, &host) {
+                    if lease_is_endpoint {
+                        eprintln!(
+                            "astd-vz: {host} received DHCP address {ip} after {:.1}s",
+                            t0.elapsed().as_secs_f64()
+                        );
+                        let mut slot = found.lock().unwrap();
+                        slot.ip = Some(ip);
+                        slot.boot_secs = Some(t0.elapsed().as_secs_f64());
+                        return;
+                    }
                     if let Some(banner) = net::ssh_banner(ip, Duration::from_millis(250)) {
                         eprintln!(
                             "astd-vz: {host} answered at {ip} after {:.1}s — {banner}",
@@ -205,7 +223,11 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-            eprintln!("astd-vz: {host} never answered on port 22");
+            if lease_is_endpoint {
+                eprintln!("astd-vz: {host} never received a matching DHCP lease");
+            } else {
+                eprintln!("astd-vz: {host} never answered on port 22");
+            }
         });
     }
 
