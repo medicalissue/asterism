@@ -142,6 +142,17 @@ struct Spec {
 struct Network {
     api: PathBuf,
     publish: Vec<asterism_core::instance::PortForward>,
+    #[serde(default)]
+    egress: Option<EgressBridge>,
+}
+
+/// The one host service a container may reach while slirp host-loopback access
+/// stays disabled. Only this socket directory is mounted into the namespace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EgressBridge {
+    source: PathBuf,
+    target: PathBuf,
+    guest_port: u16,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -281,6 +292,11 @@ pub fn prepare(inst: &Instance) -> Result<Prepared> {
         network: Network {
             api: dir.join("slirp4netns-api.sock"),
             publish: inst.publish.clone(),
+            egress: (!egress.is_empty()).then(|| EgressBridge {
+                source: crate::egress::container_transport_dir(&inst.name),
+                target: PathBuf::from("/run/asterism-egress"),
+                guest_port: crate::egress::CONTAINER_EGRESS_PORT,
+            }),
         },
         bootstrap: (!bootstrap.is_empty()).then(|| bootstrap.runcmd()),
     };
@@ -416,16 +432,27 @@ pub fn start(prepared: &Prepared) -> Result<Handle> {
         .stderr(Stdio::null())
         .spawn()
         .context("starting the rootless namespace helper")?;
-    let wrapper = ProcId::capture(child.id())?;
+    let wrapper = match ProcId::capture(child.id()) {
+        Ok(wrapper) => wrapper,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error).context("capturing the namespace wrapper identity");
+        }
+    };
     std::thread::spawn(move || {
         let _ = child.wait();
     });
     let deadline = Instant::now() + Duration::from_secs(5);
     let host_pid = loop {
+        let timeout = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default()
+            .min(Duration::from_secs(1));
         match startup_call(
             &spec.control,
             &ControlRequest::Hello,
-            Some(Duration::from_secs(1)),
+            Some(timeout),
         ) {
             Ok((ControlResponse::Ready { host_pid }, peer_pid)) if host_pid == peer_pid => {
                 break Ok(host_pid)
@@ -444,32 +471,27 @@ pub fn start(prepared: &Prepared) -> Result<Handle> {
     let host_pid = match host_pid {
         Ok(host_pid) => host_pid,
         Err(error) => {
-            abort_start(&spec);
-            return Err(error);
+            return Err(failed_start(error, &spec, &wrapper, None));
         }
     };
     let proc = match ProcId::capture(host_pid).context("capturing the namespace holder identity") {
         Ok(proc) => proc,
         Err(error) => {
-            abort_start(&spec);
-            return Err(error);
+            return Err(failed_start(error, &spec, &wrapper, None));
         }
     };
-    // The wrapper merely waits for the namespace holder. Capture both during
-    // launch, but persist and signal only the process that owns the socket.
-    let _ = wrapper;
     match cgroup_populated(&spec.cgroup) {
         Ok(true) => {}
         Ok(false) => {
-            abort_start(&spec);
-            bail!(
+            let error = anyhow::anyhow!(
                 "container control answered, but delegated cgroup {} contains no process",
                 spec.cgroup.display()
             );
+            return Err(failed_start(error, &spec, &wrapper, Some(&proc)));
         }
         Err(error) => {
-            abort_start(&spec);
-            return Err(error).context("validating the launched container cgroup");
+            let error = error.context("validating the launched container cgroup");
+            return Err(failed_start(error, &spec, &wrapper, Some(&proc)));
         }
     }
     let ns = |kind: &str| PathBuf::from(format!("/proc/{host_pid}/ns/{kind}"));
@@ -495,13 +517,13 @@ pub fn start(prepared: &Prepared) -> Result<Handle> {
     let identity = match identity {
         Ok(identity) => identity,
         Err(error) => {
-            abort_start(&spec);
-            return Err(error).context("capturing the native-container runtime identity");
+            let error = error.context("capturing the native-container runtime identity");
+            return Err(failed_start(error, &spec, &wrapper, Some(&proc)));
         }
     };
-    if let Err(error) = start_slirp(host_pid, &spec.network) {
-        abort_start(&spec);
-        return Err(error).context("configuring rootless container networking");
+    if let Err(error) = start_slirp(host_pid, &spec.network, deadline) {
+        let error = error.context("configuring rootless container networking");
+        return Err(failed_start(error, &spec, &wrapper, Some(&proc)));
     }
     Ok(Handle {
         backend: LINUX_ID.into(),
@@ -527,15 +549,58 @@ pub fn start(prepared: &Prepared) -> Result<Handle> {
 /// No failed launch may return while its namespace holder is still alive.
 /// Otherwise a caller sees an error while durable-looking cgroup/socket state
 /// remains for reconciliation to fence forever.
-fn abort_start(spec: &Spec) {
+fn failed_start(
+    launch: anyhow::Error,
+    spec: &Spec,
+    wrapper: &ProcId,
+    holder: Option<&ProcId>,
+) -> anyhow::Error {
+    match abort_start(spec, wrapper, holder) {
+        Ok(()) => launch,
+        Err(cleanup) => anyhow::anyhow!(
+            "container launch failed: {launch:#}; failed launch was not clean: {cleanup:#}"
+        ),
+    }
+}
+
+fn abort_start(spec: &Spec, wrapper: &ProcId, holder: Option<&ProcId>) -> Result<()> {
     let _ = startup_call(&spec.control, &ControlRequest::Stop, Some(CONTROL_DEADLINE));
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while cgroup_populated(&spec.cgroup).unwrap_or(true) && Instant::now() < deadline {
+    let graceful = Instant::now() + Duration::from_millis(500);
+    while cgroup_populated(&spec.cgroup).unwrap_or(true) && Instant::now() < graceful {
         std::thread::sleep(Duration::from_millis(25));
     }
-    if !cgroup_populated(&spec.cgroup).unwrap_or(true) {
-        let _ = fs::remove_file(&spec.control);
-        let _ = fs::remove_dir(&spec.cgroup);
+
+    // The helper may have failed before joining the cgroup, so both exact
+    // identities are retired whether or not cgroup state is already visible.
+    if let Some(holder) = holder {
+        let _ = holder.signal(Signal::Kill);
+    }
+    let _ = wrapper.signal(Signal::Kill);
+    let kill_error = if cgroup_populated(&spec.cgroup).unwrap_or(true) {
+        fs::write(spec.cgroup.join("cgroup.kill"), "1")
+            .err()
+            .map(|error| error.to_string())
+    } else {
+        None
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let populated = cgroup_populated(&spec.cgroup)?;
+        let holder_alive = holder.is_some_and(ProcId::alive);
+        if !populated && !holder_alive && !wrapper.alive() {
+            let _ = fs::remove_file(&spec.control);
+            let _ = fs::remove_dir(&spec.cgroup);
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "container cleanup deadline expired (cgroup populated={populated}, holder alive={holder_alive}, wrapper alive={}, cgroup.kill error={})",
+                wrapper.alive(),
+                kill_error.as_deref().unwrap_or("none")
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -543,7 +608,7 @@ fn abort_start(spec: &Spec) {
 /// install every published loopback forward. No shell command or host firewall
 /// rule can create a listener here; a successful API response is required.
 #[cfg(target_os = "linux")]
-fn start_slirp(host_pid: u32, network: &Network) -> Result<()> {
+fn start_slirp(host_pid: u32, network: &Network, deadline: Instant) -> Result<()> {
     let _ = fs::remove_file(&network.api);
     let slirp = tools::tool("slirp4netns")?;
     let mut child = Command::new(slirp)
@@ -556,7 +621,6 @@ fn start_slirp(host_pid: u32, network: &Network) -> Result<()> {
         .stderr(Stdio::null())
         .spawn()
         .context("starting slirp4netns for the rootless container")?;
-    let deadline = Instant::now() + Duration::from_secs(5);
     while !network.api.exists() {
         if let Some(status) = child.try_wait()? {
             bail!("slirp4netns exited before its control API was ready ({status})");
@@ -583,6 +647,7 @@ fn start_slirp(host_pid: u32, network: &Network) -> Result<()> {
                     "guest_port": forward.guest,
                 }
             }),
+            deadline,
         )
         .with_context(|| format!("publishing {forward} through slirp4netns"));
         if let Err(error) = result {
@@ -598,22 +663,22 @@ fn start_slirp(host_pid: u32, network: &Network) -> Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn start_slirp(_host_pid: u32, _network: &Network) -> Result<()> {
+fn start_slirp(_host_pid: u32, _network: &Network, _deadline: Instant) -> Result<()> {
     bail!("slirp4netns is only available to the Linux rootless adapter")
 }
 
 #[cfg(any(target_os = "linux", all(test, target_family = "unix")))]
-fn slirp_call(socket: &Path, request: serde_json::Value) -> Result<()> {
-    let mut stream = UnixStream::connect(socket)
+fn slirp_call(socket: &Path, request: serde_json::Value, deadline: Instant) -> Result<()> {
+    let mut stream = connect_unix_deadline(socket, deadline)
         .with_context(|| format!("connecting to slirp4netns API {}", socket.display()))?;
-    serde_json::to_writer(&mut stream, &request)?;
-    stream.write_all(b"\n")?;
+    let mut encoded = serde_json::to_vec(&request)?;
+    encoded.push(b'\n');
+    write_deadline(&mut stream, &encoded, deadline)?;
     // slirp4netns processes one request per connection and waits for EOF on
     // the write half before responding; retaining a duplex stream deadlocks
     // a successful port publication.
     stream.shutdown(Shutdown::Write)?;
-    let mut response = String::new();
-    BufReader::new(stream).read_line(&mut response)?;
+    let response = read_line_deadline(&mut stream, deadline)?;
     let response: serde_json::Value =
         serde_json::from_str(&response).context("parsing slirp4netns control response")?;
     if let Some(error) = response.get("error") {
@@ -623,6 +688,149 @@ fn slirp_call(socket: &Path, request: serde_json::Value) -> Result<()> {
         bail!("slirp4netns returned no success value: {response}");
     }
     Ok(())
+}
+
+#[cfg(any(target_os = "linux", all(test, target_family = "unix")))]
+fn connect_unix_deadline(socket: &Path, deadline: Instant) -> Result<UnixStream> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    if Instant::now() >= deadline {
+        bail!("slirp4netns control exceeded the container launch deadline");
+    }
+    let path = socket.as_os_str().as_bytes();
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if path.is_empty() || path.len() >= address.sun_path.len() || path.contains(&0) {
+        bail!("invalid slirp4netns Unix socket path {}", socket.display());
+    }
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    #[cfg(target_os = "macos")]
+    {
+        address.sun_len = std::mem::size_of::<libc::sockaddr_un>() as u8;
+    }
+    for (target, source) in address.sun_path.iter_mut().zip(path) {
+        *target = *source as libc::c_char;
+    }
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("creating slirp API socket");
+    }
+    let stream = unsafe { UnixStream::from_raw_fd(fd) };
+    let result = unsafe {
+        libc::connect(
+            stream.as_raw_fd(),
+            (&address as *const libc::sockaddr_un).cast(),
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINPROGRESS) {
+            return Err(error).context("opening slirp API socket");
+        }
+        poll_deadline(stream.as_raw_fd(), libc::POLLOUT, deadline)?;
+        let mut socket_error = 0;
+        let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                (&mut socket_error as *mut libc::c_int).cast(),
+                &mut length,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error()).context("checking slirp API connect");
+        }
+        if socket_error != 0 {
+            return Err(std::io::Error::from_raw_os_error(socket_error))
+                .context("opening slirp API socket");
+        }
+    }
+    Ok(stream)
+}
+
+#[cfg(any(target_os = "linux", all(test, target_family = "unix")))]
+fn poll_deadline(fd: std::os::fd::RawFd, events: libc::c_short, deadline: Instant) -> Result<()> {
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .context("slirp4netns control exceeded the container launch deadline")?;
+        let millis = remaining.as_millis().max(1).min(i32::MAX as u128) as i32;
+        let mut descriptor = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut descriptor, 1, millis) };
+        if result > 0 {
+            return Ok(());
+        }
+        if result == 0 {
+            bail!("slirp4netns control exceeded the container launch deadline");
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error).context("waiting for slirp4netns control");
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", all(test, target_family = "unix")))]
+fn write_deadline(stream: &mut UnixStream, mut bytes: &[u8], deadline: Instant) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    while !bytes.is_empty() {
+        if Instant::now() >= deadline {
+            bail!("slirp4netns control exceeded the container launch deadline");
+        }
+        match stream.write(bytes) {
+            Ok(0) => bail!("slirp4netns closed its control socket while reading a request"),
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                poll_deadline(stream.as_raw_fd(), libc::POLLOUT, deadline)?;
+            }
+            Err(error) => return Err(error).context("writing slirp4netns control request"),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", all(test, target_family = "unix")))]
+fn read_line_deadline(stream: &mut UnixStream, deadline: Instant) -> Result<String> {
+    use std::os::fd::AsRawFd;
+    const MAX_SLIRP_RESPONSE: usize = 64 * 1024;
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        if Instant::now() >= deadline {
+            bail!("slirp4netns control exceeded the container launch deadline");
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => bail!("slirp4netns closed its control socket without a response"),
+            Ok(read) => {
+                bytes.extend_from_slice(&chunk[..read]);
+                if bytes.len() > MAX_SLIRP_RESPONSE {
+                    bail!("slirp4netns control response exceeded {MAX_SLIRP_RESPONSE} bytes");
+                }
+                if let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') {
+                    bytes.truncate(newline);
+                    return String::from_utf8(bytes)
+                        .context("slirp4netns control response is not UTF-8");
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                poll_deadline(stream.as_raw_fd(), libc::POLLIN, deadline)?;
+            }
+            Err(error) => return Err(error).context("reading slirp4netns control response"),
+        }
+    }
 }
 
 pub fn state(handle: &Handle) -> Result<RunState> {
@@ -927,6 +1135,11 @@ pub fn helper_main(spec_path: &Path) -> Result<()> {
         let target = safe_mount_target(&spec.rootfs, &bind.target)?;
         bind_mount(&bind.source, &target)?;
     }
+    if let Some(egress) = &spec.network.egress {
+        let target = safe_mount_target(&spec.rootfs, &egress.target)?;
+        bind_mount_readonly(&egress.source, &target)
+            .context("mounting the container's narrow secret-egress transport")?;
+    }
     for device in ["null", "zero", "random", "urandom"] {
         bind_device(&spec.rootfs, device)?;
     }
@@ -939,6 +1152,9 @@ pub fn helper_main(spec_path: &Path) -> Result<()> {
     let host_pid = host_pid()?;
     chroot(&spec.rootfs)?;
     mount_proc()?;
+    if let Some(egress) = &spec.network.egress {
+        start_egress_bridge(egress)?;
+    }
     if let Some(bootstrap) = &spec.bootstrap {
         Command::new("/bin/sh")
             .args(["-c", bootstrap])
@@ -953,6 +1169,7 @@ pub fn helper_main(spec_path: &Path) -> Result<()> {
         &spec.env,
         spec.workdir.as_deref(),
         Some(&console),
+        false,
     )?;
     for incoming in listener.incoming() {
         if child.try_wait()?.is_some() {
@@ -968,7 +1185,7 @@ pub fn helper_main(spec_path: &Path) -> Result<()> {
                 let workdir = spec.workdir.clone();
                 std::thread::spawn(move || {
                     let budget = Duration::from_millis(timeout_ms).min(EXEC_DEADLINE);
-                    let response = match spawn(&argv, &env, workdir.as_deref(), None)
+                    let response = match spawn(&argv, &env, workdir.as_deref(), None, true)
                         .and_then(|child| wait_bounded(child, &stream, budget))
                     {
                         Ok((status, stdout, stderr)) => ControlResponse::Exec {
@@ -1024,11 +1241,16 @@ fn spawn(
     env: &[String],
     workdir: Option<&str>,
     console: Option<&fs::File>,
+    isolate_process_group: bool,
 ) -> Result<std::process::Child> {
     let (program, args) = argv
         .split_first()
         .context("container image has no command")?;
     let mut command = Command::new(program);
+    if isolate_process_group {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     command.args(args).env_clear();
     for assignment in env {
         if let Some((name, value)) = assignment.split_once('=') {
@@ -1070,25 +1292,26 @@ fn wait_bounded(
         .stderr
         .take()
         .context("container exec has no stderr pipe")?;
-    let read = |reader: Box<dyn Read + Send>| {
-        std::thread::spawn(move || -> Result<String> {
-            let mut bytes = Vec::new();
-            reader
-                .take((MAX_EXEC_OUTPUT + 1) as u64)
-                .read_to_end(&mut bytes)?;
-            if bytes.len() > MAX_EXEC_OUTPUT {
-                bytes.truncate(MAX_EXEC_OUTPUT);
-                bytes.extend_from_slice(b"\n[output truncated by astd]\n");
-            }
-            Ok(String::from_utf8_lossy(&bytes).into_owned())
-        })
-    };
-    let stdout = read(Box::new(stdout));
-    let stderr = read(Box::new(stderr));
+    set_nonblocking(&stdout)?;
+    set_nonblocking(&stderr)?;
+    let (mut stdout, mut stderr) = (stdout, stderr);
+    let (mut stdout_bytes, mut stderr_bytes) = (Vec::new(), Vec::new());
+    let (mut stdout_truncated, mut stderr_truncated) = (false, false);
+    let (mut stdout_eof, mut stderr_eof) = (false, false);
     let deadline = Instant::now() + budget;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status.code().unwrap_or(128);
+    let mut status = None;
+    loop {
+        stdout_eof |= drain_exec_pipe(&mut stdout, &mut stdout_bytes, &mut stdout_truncated)?;
+        stderr_eof |= drain_exec_pipe(&mut stderr, &mut stderr_bytes, &mut stderr_truncated)?;
+        if status.is_none() {
+            status = child.try_wait()?;
+        }
+        if let Some(status) = status.filter(|_| stdout_eof && stderr_eof) {
+            return Ok((
+                status.code().unwrap_or(128),
+                captured_output(stdout_bytes, stdout_truncated),
+                captured_output(stderr_bytes, stderr_truncated),
+            ));
         }
         let cancellation = if caller_disconnected(caller)? {
             Some("container exec caller disconnected")
@@ -1098,19 +1321,62 @@ fn wait_bounded(
             None
         };
         if let Some(message) = cancellation {
+            // The shell may already have exited while a descendant retains
+            // its pipes. Killing the exec process group and dropping both
+            // nonblocking readers makes this return independent of that
+            // descendant's lifetime.
+            let pid = i32::try_from(child.id()).context("container exec pid exceeds i32")?;
+            let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
             let _ = child.kill();
-            let _ = child.wait();
+            if status.is_none() {
+                let _ = child.wait();
+            }
             bail!(message);
         }
         std::thread::sleep(Duration::from_millis(25));
-    };
-    let stdout = stdout
-        .join()
-        .map_err(|_| anyhow::anyhow!("stdout reader panicked"))??;
-    let stderr = stderr
-        .join()
-        .map_err(|_| anyhow::anyhow!("stderr reader panicked"))??;
-    Ok((status, stdout, stderr))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn set_nonblocking(pipe: &impl std::os::fd::AsRawFd) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let fd = pipe.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("making container exec capture nonblocking");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn drain_exec_pipe(
+    pipe: &mut impl Read,
+    captured: &mut Vec<u8>,
+    truncated: &mut bool,
+) -> Result<bool> {
+    let mut chunk = [0_u8; 16 * 1024];
+    for _ in 0..64 {
+        match pipe.read(&mut chunk) {
+            Ok(0) => return Ok(true),
+            Ok(read) => {
+                let room = MAX_EXEC_OUTPUT.saturating_sub(captured.len());
+                captured.extend_from_slice(&chunk[..read.min(room)]);
+                *truncated |= read > room;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) => return Err(error).context("capturing container exec output"),
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "linux")]
+fn captured_output(mut bytes: Vec<u8>, truncated: bool) -> String {
+    if truncated {
+        bytes.extend_from_slice(b"\n[output truncated by astd]\n");
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 #[cfg(target_os = "linux")]
@@ -1223,6 +1489,71 @@ fn bind_mount(source: &Path, target: &Path) -> Result<()> {
         return Err(std::io::Error::last_os_error())
             .context("binding a container directory volume");
     }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn bind_mount_readonly(source: &Path, target: &Path) -> Result<()> {
+    bind_mount(source, target)?;
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let target = CString::new(target.as_os_str().as_bytes())?;
+    let result = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            target.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND
+                | libc::MS_REMOUNT
+                | libc::MS_RDONLY
+                | libc::MS_NOSUID
+                | libc::MS_NODEV
+                | libc::MS_NOEXEC,
+            std::ptr::null(),
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("making the container egress transport read-only");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn start_egress_bridge(egress: &EgressBridge) -> Result<()> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", egress.guest_port))
+        .context("binding the namespace-local secret-egress bridge")?;
+    let socket = egress.target.join("proxy.sock");
+    std::thread::spawn(move || {
+        for incoming in listener.incoming() {
+            let Ok(client) = incoming else { continue };
+            let socket = socket.clone();
+            std::thread::spawn(move || {
+                if let Err(error) = bridge_egress_connection(client, &socket) {
+                    eprintln!("asterism container egress bridge ended: {error:#}");
+                }
+            });
+        }
+    });
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn bridge_egress_connection(mut client: std::net::TcpStream, socket: &Path) -> Result<()> {
+    let mut proxy = UnixStream::connect(socket)
+        .with_context(|| format!("connecting container egress to {}", socket.display()))?;
+    let mut client_read = client.try_clone()?;
+    let mut proxy_write = proxy.try_clone()?;
+    let upload = std::thread::spawn(move || {
+        let result = std::io::copy(&mut client_read, &mut proxy_write);
+        let _ = proxy_write.shutdown(Shutdown::Write);
+        result
+    });
+    std::io::copy(&mut proxy, &mut client)?;
+    let _ = client.shutdown(std::net::Shutdown::Write);
+    upload
+        .join()
+        .map_err(|_| anyhow::anyhow!("container egress upload bridge panicked"))??;
     Ok(())
 }
 
@@ -1442,19 +1773,19 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
+    #[cfg(unix)]
     #[test]
     fn volume_targets_cannot_follow_image_symlinks() {
         let root = tempfile::tempdir().unwrap();
-        #[cfg(unix)]
         std::os::unix::fs::symlink("/tmp", root.path().join("data")).unwrap();
         assert!(safe_mount_target(root.path(), Path::new("/data/work")).is_err());
         assert!(safe_mount_target(root.path(), Path::new("/../escape")).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn bootstrap_files_cannot_escape_through_an_image_symlink() {
         let root = tempfile::tempdir().unwrap();
-        #[cfg(unix)]
         std::os::unix::fs::symlink("/tmp", root.path().join("etc")).unwrap();
         assert!(safe_file_target(root.path(), Path::new("/etc/profile.d/asterism.sh")).is_err());
         assert!(safe_file_target(root.path(), Path::new("/../../escape")).is_err());
@@ -1465,6 +1796,7 @@ mod tests {
         let network = Network {
             api: "/run/user/1000/asterism/dev/slirp4netns-api.sock".into(),
             publish: vec!["8080:80".parse().unwrap()],
+            egress: None,
         };
         let wire = serde_json::to_string(&network).unwrap();
         assert!(wire.contains("slirp4netns-api.sock"));
@@ -1485,7 +1817,141 @@ mod tests {
             assert!(request.contains("add_hostfwd"));
             stream.write_all(b"{\"return\":{}}\n").unwrap();
         });
-        slirp_call(&socket, serde_json::json!({ "execute": "add_hostfwd" })).unwrap();
+        slirp_call(
+            &socket,
+            serde_json::json!({ "execute": "add_hostfwd" }),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    #[cfg(target_family = "unix")]
+    fn slirp_control_response_is_bounded_by_the_launch_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("slirp-unresponsive.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            stream.read_to_string(&mut request).unwrap();
+            assert!(request.contains("add_hostfwd"));
+            std::thread::sleep(Duration::from_millis(250));
+        });
+        let started = Instant::now();
+        let error = slirp_call(
+            &socket,
+            serde_json::json!({ "execute": "add_hostfwd" }),
+            Instant::now() + Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("launch deadline"), "{error:#}");
+        assert!(started.elapsed() < Duration::from_millis(200));
+        server.join().unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn inherited_pipe_descendant_cannot_outlive_exec_deadline() {
+        use std::os::unix::process::CommandExt;
+        let (server, _client) = UnixStream::pair().unwrap();
+        let child = Command::new("sh")
+            .args(["-c", "sleep 5 & exit 0"])
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        let error = wait_bounded(child, &server, Duration::from_millis(50)).unwrap_err();
+        assert!(
+            error.to_string().contains("lifecycle deadline"),
+            "{error:#}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn failed_post_handshake_launch_drains_holder_and_wrapper() {
+        let dir = tempfile::tempdir().unwrap();
+        let cgroup = dir.path().join("cgroup");
+        fs::create_dir(&cgroup).unwrap();
+        fs::write(cgroup.join("cgroup.events"), "populated 1\n").unwrap();
+        fs::write(cgroup.join("cgroup.kill"), "").unwrap();
+        let spawn_sleeper = || {
+            let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+            let proc = ProcId::capture(child.id()).unwrap();
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            proc
+        };
+        let wrapper = spawn_sleeper();
+        let holder = spawn_sleeper();
+        let events = cgroup.join("cgroup.events");
+        let kill = cgroup.join("cgroup.kill");
+        let kernel = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                if fs::read_to_string(&kill).unwrap_or_default().trim() == "1" {
+                    fs::write(&events, "populated 0\n").unwrap();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("cleanup never requested cgroup.kill");
+        });
+        let spec = Spec {
+            rootfs: dir.path().join("rootfs"),
+            control: dir.path().join("missing-control.sock"),
+            cgroup,
+            console: dir.path().join("console"),
+            argv: vec!["true".into()],
+            env: Vec::new(),
+            workdir: None,
+            binds: Vec::new(),
+            network: Network {
+                api: dir.path().join("slirp.sock"),
+                publish: Vec::new(),
+                egress: None,
+            },
+            bootstrap: None,
+        };
+        abort_start(&spec, &wrapper, Some(&holder)).unwrap();
+        kernel.join().unwrap();
+        assert!(!wrapper.alive());
+        assert!(!holder.alive());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn namespace_bridge_reaches_only_its_unix_proxy() {
+        use std::net::{TcpListener, TcpStream};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("proxy.sock");
+        let unix = UnixListener::bind(&socket).unwrap();
+        let proxy = std::thread::spawn(move || {
+            let (mut stream, _) = unix.accept().unwrap();
+            let mut request = String::new();
+            stream.read_to_string(&mut request).unwrap();
+            assert_eq!(request, "narrow");
+            stream.write_all(b"reachable").unwrap();
+        });
+        let tcp = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        let bridge = std::thread::spawn(move || {
+            let (client, _) = tcp.accept().unwrap();
+            bridge_egress_connection(client, &socket).unwrap();
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client.write_all(b"narrow").unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert_eq!(response, "reachable");
+        bridge.join().unwrap();
+        proxy.join().unwrap();
     }
 }
