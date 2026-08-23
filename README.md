@@ -78,11 +78,14 @@ instance's requirements and otherwise uses QEMU with Hypervisor.framework
 acceleration. Pass `--backend vz` or `--backend qemu` to require one and get a
 specific capability refusal when it cannot serve the instance.
 
-Instances can restart after a guest crash or device reboot. Install `astd` as
-the user service that keeps them running:
+On Linux, a tagged release ships pinned Cloud Hypervisor v53.0 and virtiofsd
+v1.14.0 beside `ast` and `astd`. QEMU remains an explicit compatibility
+backend. After install, persist the daemon across logout and reboot:
 
 ```console
 $ ast service install
+$ loginctl enable-linger $USER
+$ ast doctor
 $ ast up agent --restart always
 $ ast service status
 ```

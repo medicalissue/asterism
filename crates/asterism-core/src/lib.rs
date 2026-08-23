@@ -20,6 +20,7 @@ pub mod backup;
 pub mod compat;
 pub mod cow;
 pub mod device_shell;
+pub mod doctor;
 pub mod durable;
 pub mod hosted_auth;
 pub mod hv;

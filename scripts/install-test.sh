@@ -64,6 +64,22 @@ echo "astd-vz ${version#v}"
 EOF
 		chmod +x "${stage}/astd-vz"
 		members=(ast astd astd-vz)
+	elif [ "$helper" = linux ]; then
+		for bin in cloud-hypervisor virtiofsd; do
+			printf '#!/bin/sh\necho "%s test"\n' "$bin" >"${stage}/${bin}"
+			chmod +x "${stage}/${bin}"
+		done
+		mkdir -p "${stage}/share/asterism/licenses"
+		cp "${ROOT}/packaging/linux-components.env" "${stage}/share/asterism/"
+		cp "${ROOT}/packaging/asterism-nbd" "${stage}/share/asterism/"
+		for license in cloud-hypervisor-Apache-2.0 cloud-hypervisor-BSD-3-Clause \
+			virtiofsd-Apache-2.0 virtiofsd-BSD-3-Clause; do
+			printf 'test license\n' >"${stage}/share/asterism/licenses/${license}.txt"
+		done
+		cp "${ROOT}/LICENSE-APACHE" "${stage}/share/asterism/licenses/LICENSE-APACHE"
+		cp "${ROOT}/LICENSE-MIT" "${stage}/share/asterism/licenses/LICENSE-MIT"
+		cp "${ROOT}/NOTICE" "${stage}/share/asterism/licenses/NOTICE"
+		members=(ast astd cloud-hypervisor virtiofsd share)
 	fi
 	# The first release predates self-update; current releases ship the updater
 	# that `ast update` keeps alive while replacing ast itself.
@@ -134,6 +150,8 @@ if [ "\$1" = "clone" ]; then
 	cp "${ROOT}/scripts/sign-vz.sh" "\$dst/scripts/sign-vz.sh"
 	cp "${ROOT}/crates/asterism-vz/vz.entitlements" "\$dst/crates/asterism-vz/vz.entitlements"
 	cp "${ROOT}/packaging/update.sh" "\$dst/packaging/update.sh"
+	cp "${ROOT}/packaging/linux-components.env" "\$dst/packaging/linux-components.env"
+	cp "${ROOT}/packaging/asterism-nbd" "\$dst/packaging/asterism-nbd"
 	printf '%s' "\$ref" >"${WORK}/cloned-ref"
 	exit 0
 fi
@@ -153,6 +171,33 @@ printf '%s\n' "\$*" >>"${WORK}/cargo-args"
 exit 0
 EOF
 chmod +x "${SHIMS}/cargo"
+
+cat >"${SHIMS}/setcap" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+cat >"${SHIMS}/nbd-client" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+cat >"${SHIMS}/modprobe" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >>"${WORK}/modprobe-args"
+EOF
+cat >"${SHIMS}/visudo" <<'EOF'
+#!/bin/sh
+[ "$1" = "-cf" ] && [ -s "$2" ]
+EOF
+cat >"${SHIMS}/sudo" <<'EOF'
+#!/bin/sh
+exec "$@"
+EOF
+cat >"${SHIMS}/chown" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod +x "${SHIMS}/setcap" "${SHIMS}/nbd-client" "${SHIMS}/modprobe" \
+	"${SHIMS}/visudo" "${SHIMS}/sudo" "${SHIMS}/chown"
 
 # codesign, for the vz helper. Enough of one to answer the three questions
 # asked of it: sign this, does it carry the entitlement, does the signature
@@ -317,6 +362,7 @@ run_install() {
 		HOME="${WORK}/home" \
 		ASTERISM_YES=1 \
 		ASTERISM_PREFIX="$PREFIX" \
+		ASTERISM_SYSTEM_ROOT="${WORK}/system-root" \
 		ASTERISM_BASE_URL="file://${FAKE_RELEASES}" \
 		ASTERISM_INDEX_URL="file://${WORK}/latest.json" \
 		${envs[@]+"${envs[@]}"} sh "$INSTALL" ${args[@]+"${args[@]}"} 2>&1)" || status=$?
@@ -339,13 +385,16 @@ mkdir -p "${WORK}/home"
 # and everything after it carries one.
 make_release v0.0.9 darwin-arm64 novz
 make_release v0.1.0
+make_release v0.1.1 linux-x86_64 linux
 printf '{"tag_name": "v0.1.0", "name": "v0.1.0"}\n' >"${WORK}/latest.json"
 
 # ---- 1. the script itself --------------------------------------------------
 
 sh -n "$INSTALL" || fail "install.sh is not valid POSIX sh"
+sh -n "${ROOT}/packaging/asterism-nbd" || fail "asterism-nbd is not valid POSIX sh"
+bash -n "${ROOT}/scripts/package-linux.sh" || fail "package-linux.sh is not valid bash"
 if command -v shellcheck >/dev/null 2>&1; then
-	shellcheck -s sh "$INSTALL" || fail "shellcheck found problems in install.sh"
+	shellcheck -s sh "$INSTALL" "${ROOT}/packaging/asterism-nbd" || fail "shellcheck found problems in install.sh"
 	ok "sh -n and shellcheck are clean"
 else
 	ok "sh -n is clean (shellcheck not installed)"
@@ -548,7 +597,7 @@ ok "unreachable release assets refuse without touching the prefix"
 
 # ---- 8. unsupported architectures ------------------------------------------
 
-for host in "Darwin x86_64" "Linux arm64" "Linux x86_64" "FreeBSD amd64"; do
+for host in "Darwin x86_64" "Linux riscv64" "FreeBSD amd64"; do
 	# shellcheck disable=SC2086
 	set -- $host
 	fresh_prefix "arch-$1-$2"
@@ -560,6 +609,41 @@ for host in "Darwin x86_64" "Linux arm64" "Linux x86_64" "FreeBSD amd64"; do
 done
 set_host Darwin arm64
 ok "every host without a binary release is refused by name, pointing at source"
+
+# ---- 8b. Linux exact-artifact install --------------------------------------
+
+fresh_prefix linux-release
+set_host Linux x86_64
+rm -rf "${WORK}/system-root" "${WORK}/modprobe-args"
+run_install ok ASTERISM_VERSION=v0.1.1
+says "release v0.1.1 for linux-x86_64"
+says "installed ${PREFIX}/bin/cloud-hypervisor"
+says "installed ${PREFIX}/bin/virtiofsd"
+says "Linux instances default to bundled Cloud Hypervisor v53.0 over KVM."
+says "loginctl enable-linger"
+[ -x "${PREFIX}/bin/cloud-hypervisor" ] || fail "Cloud Hypervisor was not installed"
+[ -x "${PREFIX}/bin/virtiofsd" ] || fail "virtiofsd was not installed"
+[ -f "${PREFIX}/share/asterism/linux-components.env" ] || fail "component lock was not installed"
+[ -x "${WORK}/system-root/usr/local/libexec/asterism/asterism-nbd" ] \
+	|| fail "the root-owned NBD argument boundary was not installed"
+grep -qxF 'nbd' "${WORK}/system-root/etc/modules-load.d/asterism-nbd.conf" \
+	|| fail "the nbd module is not enabled at boot"
+grep -qxF 'options nbd nbds_max=64' "${WORK}/system-root/etc/modprobe.d/asterism-nbd.conf" \
+	|| fail "the installed nbd module options do not expose the supported device pool"
+grep -qxF 'nbd nbds_max=64' "${WORK}/modprobe-args" \
+	|| fail "the installer did not load the nbd module for immediate use"
+policy="${WORK}/system-root/etc/sudoers.d/asterism-nbd-$(id -u)"
+grep -qF 'NOPASSWD:' "$policy" || fail "the NBD helper policy is not non-interactive"
+grep -qF "${WORK}/system-root/usr/local/libexec/asterism/asterism-nbd" "$policy" \
+	|| fail "sudoers grants something other than the root-owned argument boundary"
+[ -e "${WORK}/system-root/run/lock/asterism-nbd.lock" ] \
+	|| fail "the NBD flock inode was not created"
+run_install ok -- --uninstall
+[ ! -e "${PREFIX}/bin/cloud-hypervisor" ] || fail "uninstall left Cloud Hypervisor behind"
+[ ! -e "${PREFIX}/share/asterism/linux-components.env" ] || fail "uninstall left component metadata behind"
+[ ! -e "$policy" ] || fail "uninstall left the account's NBD sudo policy behind"
+set_host Darwin arm64
+ok "a Linux release installs pinned CHV/virtiofsd, NBD policy, and uninstalls exactly"
 
 # ---- 9. the source escape hatch --------------------------------------------
 

@@ -175,6 +175,8 @@ load_manifest() {
 	else
 		case "$(uname -s)-$(uname -m)" in
 		Darwin-arm64 | Darwin-aarch64) host_target=darwin-arm64 ;;
+		Linux-x86_64 | Linux-amd64) host_target=linux-x86_64 ;;
+		Linux-aarch64 | Linux-arm64) host_target=linux-arm64 ;;
 		*) host_target=unsupported ;;
 		esac
 	fi

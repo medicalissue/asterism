@@ -2,7 +2,8 @@
 //!
 //! Secret values never enter `$ASTERISM_HOME`.  The JSON file here is only an
 //! orbit metadata catalog; material is held by [`SecretStore`] (the login
-//! Keychain on macOS, explicitly unavailable elsewhere).  Public operations
+//! Keychain on macOS, FreeDesktop Secret Service on Linux, explicitly
+//! unavailable elsewhere).  Public operations
 //! fan out to independent source devices through the existing authenticated
 //! mesh.
 //!
@@ -33,8 +34,8 @@ use crate::mesh::Mesh;
 use crate::Node;
 
 const CATALOG_VERSION: u32 = 1;
-#[cfg(target_os = "macos")]
-const KEYCHAIN_SERVICE: &str = "dev.asterism.secret";
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const PLATFORM_SERVICE: &str = "dev.asterism.secret";
 
 static PLANE: OnceLock<Arc<SecretPlane>> = OnceLock::new();
 
@@ -64,30 +65,72 @@ impl PlatformSecretStore {
 impl SecretStore for PlatformSecretStore {
     fn put(&self, id: &SecretId, value: &[u8]) -> Result<()> {
         let account = self.account(id);
-        security_framework::passwords::set_generic_password(KEYCHAIN_SERVICE, &account, value)
+        security_framework::passwords::set_generic_password(PLATFORM_SERVICE, &account, value)
             .context("storing secret in the macOS login Keychain")
     }
 
     fn get(&self, id: &SecretId) -> Result<Vec<u8>> {
         let account = self.account(id);
-        security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, &account)
+        security_framework::passwords::get_generic_password(PLATFORM_SERVICE, &account)
             .context("reading secret from the macOS login Keychain")
     }
 
     fn remove(&self, id: &SecretId) -> Result<()> {
         let account = self.account(id);
-        security_framework::passwords::delete_generic_password(KEYCHAIN_SERVICE, &account)
+        security_framework::passwords::delete_generic_password(PLATFORM_SERVICE, &account)
             .context("removing secret from the macOS login Keychain")
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+struct PlatformSecretStore {
+    namespace: String,
+}
+
+#[cfg(target_os = "linux")]
+impl PlatformSecretStore {
+    fn entry(&self, id: &SecretId) -> Result<keyring::Entry> {
+        let account = format!("{}:{}", self.namespace, id.as_str());
+        keyring::Entry::new(PLATFORM_SERVICE, &account).context(
+            "opening FreeDesktop Secret Service (org.freedesktop.secrets); \
+             no plaintext fallback is used",
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl SecretStore for PlatformSecretStore {
+    fn put(&self, id: &SecretId, value: &[u8]) -> Result<()> {
+        self.entry(id)?
+            .set_secret(value)
+            .context("storing secret in FreeDesktop Secret Service")
+    }
+
+    fn get(&self, id: &SecretId) -> Result<Vec<u8>> {
+        match self.entry(id)?.get_secret() {
+            Ok(value) => Ok(value),
+            Err(keyring::Error::NoEntry) => {
+                bail!("secret {:?} is not in Secret Service", id.as_str())
+            }
+            Err(error) => Err(error).context("reading secret from FreeDesktop Secret Service"),
+        }
+    }
+
+    fn remove(&self, id: &SecretId) -> Result<()> {
+        match self.entry(id)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(error).context("removing secret from FreeDesktop Secret Service"),
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 struct PlatformSecretStore {
     #[allow(dead_code)]
     namespace: String,
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 impl SecretStore for PlatformSecretStore {
     fn put(&self, _: &SecretId, _: &[u8]) -> Result<()> {
         bail!("secret storage is unavailable on this platform; no plaintext fallback is used")
