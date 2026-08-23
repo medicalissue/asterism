@@ -364,6 +364,7 @@ impl Hypervisor for Chv {
             port_forward: false,
             guest_egress: None,
             disk_formats: &[DiskFormat::Raw, DiskFormat::Qcow2],
+            guest_gpu_projection: false,
         }
     }
 

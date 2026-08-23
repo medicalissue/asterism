@@ -1198,6 +1198,13 @@ impl LeaseAuthority {
         self.instances.contains_key(instance_id)
     }
 
+    /// Durable instance identities currently authorized by this provider.
+    /// Callers use this snapshot to remove authority absent from a freshly
+    /// assembled orbit catalog; capabilities remain private.
+    pub fn instance_ids(&self) -> Vec<String> {
+        self.instances.keys().cloned().collect()
+    }
+
     pub fn leased_memory_bytes(&self) -> u64 {
         self.leased_memory_bytes
     }
@@ -2038,12 +2045,11 @@ impl Provider {
                         "vector-add needs three equal non-empty f32 ranges",
                     ));
                 }
-                if self.cuda.is_some() {
+                if let Some(engine) = &mut self.cuda {
                     let lhs_ptr = device_ptr(session, &lhs, sequence)?;
                     let rhs_ptr = device_ptr(session, &rhs, sequence)?;
                     let output_ptr = device_ptr(session, &output, sequence)?;
                     let (elapsed, result) = {
-                        let engine = self.cuda.as_mut().expect("cuda");
                         let elapsed = engine.launch_vector_add(
                             lhs_ptr.saturating_add(lhs.offset),
                             rhs_ptr.saturating_add(rhs.offset),

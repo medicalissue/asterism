@@ -95,15 +95,15 @@ fn session(fd: RawFd, key: [u8; 32], instance: &str) -> Result<()> {
                     astd.write_all(b"\n")?;
                     astd.flush()?;
                     if closing {
-                        serde_json::to_writer(&mut astd, &Request::GpuGuestClose)?;
-                        astd.write_all(b"\n")?;
-                        astd.flush()?;
                         break;
                     }
                 }
                 Ok(())
             })();
-            let _ = astd.shutdown(Shutdown::Both);
+            // Preserve the read half owned by the downstream clone until it
+            // forwards GuestReply::Closed. Shutting down both halves here
+            // races and discards the daemon's clean close acknowledgement.
+            let _ = astd.shutdown(Shutdown::Write);
             outcome
         });
         let downstream = scope.spawn(move || -> Result<()> {
@@ -117,7 +117,11 @@ fn session(fd: RawFd, key: [u8; 32], instance: &str) -> Result<()> {
                     let reply: Response = serde_json::from_str(&line)?;
                     match reply {
                         Response::GpuGuestReply { reply } => {
+                            let closed = matches!(reply, GuestReply::Closed);
                             write_frame(&mut writer, &reply).map_err(|err| anyhow!(err.message))?;
+                            if closed {
+                                break;
+                            }
                         }
                         Response::GpuGuestRefused { message, .. } => {
                             write_frame(
@@ -170,4 +174,54 @@ fn read_line(reader: &mut impl std::io::BufRead) -> Result<String> {
 
 fn fresh_nonce() -> Result<String> {
     asterism_vz::guest::nonce()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_half_close_preserves_the_daemon_close_acknowledgement() {
+        let (mut upstream, daemon) = UnixStream::pair().unwrap();
+        let mut downstream = BufReader::new(upstream.try_clone().unwrap());
+        let daemon_thread = std::thread::spawn(move || {
+            let mut reader = BufReader::new(daemon.try_clone().unwrap());
+            let request: Request = serde_json::from_str(&read_line(&mut reader).unwrap()).unwrap();
+            assert!(matches!(
+                request,
+                Request::GpuGuestFrame {
+                    frame: GuestFrame::Close
+                }
+            ));
+            let mut daemon = daemon;
+            serde_json::to_writer(
+                &mut daemon,
+                &Response::GpuGuestReply {
+                    reply: GuestReply::Closed,
+                },
+            )
+            .unwrap();
+            daemon.write_all(b"\n").unwrap();
+        });
+
+        serde_json::to_writer(
+            &mut upstream,
+            &Request::GpuGuestFrame {
+                frame: GuestFrame::Close,
+            },
+        )
+        .unwrap();
+        upstream.write_all(b"\n").unwrap();
+        upstream.shutdown(Shutdown::Write).unwrap();
+
+        let response: Response =
+            serde_json::from_str(&read_line(&mut downstream).unwrap()).unwrap();
+        assert!(matches!(
+            response,
+            Response::GpuGuestReply {
+                reply: GuestReply::Closed
+            }
+        ));
+        daemon_thread.join().unwrap();
+    }
 }

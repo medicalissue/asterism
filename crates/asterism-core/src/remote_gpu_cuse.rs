@@ -12,7 +12,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -38,8 +38,26 @@ const FUSE_OUT_HEADER_LEN: usize = 16;
 const ENOSYS: i32 = 38;
 const ENOTTY: i32 = 25;
 const EIO: i32 = 5;
+const EINTR: i32 = 4;
 const EAGAIN: i32 = 11;
 const FUSE_NOTIFY_POLL: i32 = 1;
+const MAX_PENDING_IO: usize = 32;
+const MAX_POLL_WATCHERS: usize = 32;
+const WATCHER_POLL_MS: i32 = 50;
+
+struct CuseHandle {
+    reader: Arc<Mutex<UnixStream>>,
+    writer: Arc<Mutex<UnixStream>>,
+    poll: UnixStream,
+    cancels: Vec<Arc<AtomicBool>>,
+}
+
+#[derive(Clone, Copy)]
+struct PollRequest {
+    unique: u64,
+    kh: u64,
+    requested: u32,
+}
 
 /// Encode a CUSE_INIT userspace reply. Tests assert the layout without
 /// opening `/dev/cuse`.
@@ -176,7 +194,7 @@ impl CuseService {
         let rx = self
             .accept_rx
             .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "CUSE accept lock poisoned"))?;
+            .map_err(|_| io::Error::other("CUSE accept lock poisoned"))?;
         match rx.recv_timeout(Duration::from_secs(30)) {
             Ok(stream) => Ok(stream),
             Err(RecvTimeoutError::Timeout) => Err(io::Error::new(
@@ -255,7 +273,9 @@ fn serve_cuse(
     // their writes framed even when a poll watcher wakes concurrently with
     // the main request loop.
     let replies = Arc::new(Mutex::new(dev.try_clone()?));
-    let mut fhs: HashMap<u64, UnixStream> = HashMap::new();
+    let pending = Arc::new(Mutex::new(HashMap::<u64, Arc<AtomicBool>>::new()));
+    let active_watchers = Arc::new(AtomicUsize::new(0));
+    let mut fhs: HashMap<u64, CuseHandle> = HashMap::new();
     let mut next_fh = 1u64;
     while !stop.load(Ordering::SeqCst) {
         if !wait_for_cuse_or_stop(dev.as_raw_fd(), wake.as_raw_fd())? || stop.load(Ordering::SeqCst)
@@ -293,12 +313,25 @@ fn serve_cuse(
                         // queue: Drop must always be able to wake and join it.
                         encode_fuse_error(unique, EAGAIN)
                     } else {
-                        fhs.insert(fh, a);
-                        let mut payload = Vec::new();
-                        payload.extend_from_slice(&fh.to_le_bytes());
-                        payload.extend_from_slice(&0u32.to_le_bytes());
-                        payload.extend_from_slice(&0u32.to_le_bytes());
-                        encode_fuse_ok(unique, &payload)
+                        match (a.try_clone(), a.try_clone()) {
+                            (Ok(reader), Ok(poll)) => {
+                                fhs.insert(
+                                    fh,
+                                    CuseHandle {
+                                        reader: Arc::new(Mutex::new(reader)),
+                                        writer: Arc::new(Mutex::new(a)),
+                                        poll,
+                                        cancels: Vec::new(),
+                                    },
+                                );
+                                let mut payload = Vec::new();
+                                payload.extend_from_slice(&fh.to_le_bytes());
+                                payload.extend_from_slice(&0u32.to_le_bytes());
+                                payload.extend_from_slice(&0u32.to_le_bytes());
+                                encode_fuse_ok(unique, &payload)
+                            }
+                            _ => encode_fuse_error(unique, EIO),
+                        }
                     }
                 }
                 Err(_) => encode_fuse_error(unique, EIO),
@@ -310,13 +343,62 @@ fn serve_cuse(
                     let fh = u64::from_le_bytes(rest[0..8].try_into().unwrap());
                     let size = u32::from_le_bytes(rest[16..20].try_into().unwrap()) as usize;
                     let data = rest.get(40..40 + size);
-                    match fhs.get_mut(&fh) {
-                        Some(stream) if data.is_some() => {
-                            let data = data.expect("checked");
-                            cuse_write_reply(stream, &wake, &stop, unique, data)
+                    match (fhs.get_mut(&fh), data) {
+                        (Some(handle), Some(data)) => {
+                            handle
+                                .cancels
+                                .retain(|cancel| !cancel.load(Ordering::SeqCst));
+                            let cancel = Arc::new(AtomicBool::new(false));
+                            if !reserve_pending(&pending, unique, cancel.clone()) {
+                                encode_fuse_error(unique, EAGAIN)
+                            } else {
+                                handle.cancels.push(cancel.clone());
+                                let writer = handle.writer.clone();
+                                let replies = replies.clone();
+                                let worker_pending = pending.clone();
+                                let stop = stop.clone();
+                                let worker_wake = wake.try_clone();
+                                let data = data.to_vec();
+                                let spawned = worker_wake.and_then(|worker_wake| {
+                                    thread::Builder::new()
+                                        .name("asterism-cuse-write".into())
+                                        .spawn(move || {
+                                            let reply = match writer.lock() {
+                                                Ok(mut stream) => cuse_write_reply_cancel(
+                                                    &mut stream,
+                                                    &worker_wake,
+                                                    &stop,
+                                                    &cancel,
+                                                    unique,
+                                                    &data,
+                                                ),
+                                                Err(_) => encode_fuse_error(unique, EIO),
+                                            };
+                                            finish_pending(
+                                                &worker_pending,
+                                                &replies,
+                                                unique,
+                                                reply,
+                                            );
+                                            cancel.store(true, Ordering::SeqCst);
+                                        })
+                                        .map(|_| ())
+                                });
+                                if spawned.is_err() {
+                                    handle
+                                        .cancels
+                                        .last()
+                                        .expect("cancel was just inserted")
+                                        .store(true, Ordering::SeqCst);
+                                    pending.lock().ok().and_then(|mut p| p.remove(&unique));
+                                    encode_fuse_error(unique, EIO)
+                                } else {
+                                    continue;
+                                }
+                            }
                         }
-                        None => encode_fuse_error(unique, EIO),
-                        Some(_) => encode_fuse_error(unique, EIO),
+                        (None, _) => encode_fuse_error(unique, EIO),
+                        (Some(_), None) => encode_fuse_error(unique, EIO),
                     }
                 }
             }
@@ -327,7 +409,58 @@ fn serve_cuse(
                     let fh = u64::from_le_bytes(rest[0..8].try_into().unwrap());
                     let size = u32::from_le_bytes(rest[16..20].try_into().unwrap()) as usize;
                     match fhs.get_mut(&fh) {
-                        Some(stream) => cuse_read_reply(stream, &wake, &stop, unique, size),
+                        Some(handle) => {
+                            handle
+                                .cancels
+                                .retain(|cancel| !cancel.load(Ordering::SeqCst));
+                            let cancel = Arc::new(AtomicBool::new(false));
+                            if !reserve_pending(&pending, unique, cancel.clone()) {
+                                encode_fuse_error(unique, EAGAIN)
+                            } else {
+                                handle.cancels.push(cancel.clone());
+                                let reader = handle.reader.clone();
+                                let replies = replies.clone();
+                                let worker_pending = pending.clone();
+                                let stop = stop.clone();
+                                let worker_wake = wake.try_clone();
+                                let spawned = worker_wake.and_then(|worker_wake| {
+                                    thread::Builder::new()
+                                        .name("asterism-cuse-read".into())
+                                        .spawn(move || {
+                                            let reply = match reader.lock() {
+                                                Ok(mut stream) => cuse_read_reply_cancel(
+                                                    &mut stream,
+                                                    &worker_wake,
+                                                    &stop,
+                                                    &cancel,
+                                                    unique,
+                                                    size,
+                                                ),
+                                                Err(_) => encode_fuse_error(unique, EIO),
+                                            };
+                                            finish_pending(
+                                                &worker_pending,
+                                                &replies,
+                                                unique,
+                                                reply,
+                                            );
+                                            cancel.store(true, Ordering::SeqCst);
+                                        })
+                                        .map(|_| ())
+                                });
+                                if spawned.is_err() {
+                                    handle
+                                        .cancels
+                                        .last()
+                                        .expect("cancel was just inserted")
+                                        .store(true, Ordering::SeqCst);
+                                    pending.lock().ok().and_then(|mut p| p.remove(&unique));
+                                    encode_fuse_error(unique, EIO)
+                                } else {
+                                    continue;
+                                }
+                            }
+                        }
                         None => encode_fuse_error(unique, EIO),
                     }
                 }
@@ -335,7 +468,11 @@ fn serve_cuse(
             FUSE_RELEASE => {
                 if rest.len() >= 8 {
                     let fh = u64::from_le_bytes(rest[0..8].try_into().unwrap());
-                    fhs.remove(&fh);
+                    if let Some(handle) = fhs.remove(&fh) {
+                        for cancel in handle.cancels {
+                            cancel.store(true, Ordering::SeqCst);
+                        }
+                    }
                 }
                 encode_fuse_ok(unique, &[])
             }
@@ -358,7 +495,27 @@ fn serve_cuse(
                     encode_fuse_ok(unique, &payload)
                 }
             }
-            FUSE_FLUSH | FUSE_INTERRUPT => encode_fuse_ok(unique, &[]),
+            FUSE_FLUSH => encode_fuse_ok(unique, &[]),
+            FUSE_INTERRUPT => {
+                let target = rest
+                    .get(0..8)
+                    .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()));
+                let cancelled = target.is_some_and(|target| {
+                    pending
+                        .lock()
+                        .ok()
+                        .and_then(|pending| pending.get(&target).cloned())
+                        .is_some_and(|cancel| {
+                            cancel.store(true, Ordering::SeqCst);
+                            true
+                        })
+                });
+                if cancelled {
+                    encode_fuse_ok(unique, &[])
+                } else {
+                    encode_fuse_error(unique, EAGAIN)
+                }
+            }
             FUSE_POLL => {
                 // fuse_poll_in carries fh at 0 and requested event bits at
                 // 20. Report only readiness the socket actually has; an
@@ -370,9 +527,27 @@ fn serve_cuse(
                     let fh = u64::from_le_bytes(rest[0..8].try_into().unwrap());
                     let kh = u64::from_le_bytes(rest[8..16].try_into().unwrap());
                     let requested = u32::from_le_bytes(rest[20..24].try_into().unwrap());
-                    match fhs.get(&fh) {
-                        Some(stream) => {
-                            cuse_poll_reply(stream, &wake, &stop, &replies, unique, kh, requested)
+                    match fhs.get_mut(&fh) {
+                        Some(handle) => {
+                            handle
+                                .cancels
+                                .retain(|cancel| !cancel.load(Ordering::SeqCst));
+                            let (reply, cancel) = cuse_poll_reply_bounded(
+                                &handle.poll,
+                                &wake,
+                                &stop,
+                                &replies,
+                                &active_watchers,
+                                PollRequest {
+                                    unique,
+                                    kh,
+                                    requested,
+                                },
+                            );
+                            if let Some(cancel) = cancel {
+                                handle.cancels.push(cancel);
+                            }
+                            reply
                         }
                         None => encode_fuse_error(unique, EIO),
                     }
@@ -382,13 +557,52 @@ fn serve_cuse(
         };
         let written = replies
             .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "CUSE reply lock poisoned"))?
+            .map_err(|_| io::Error::other("CUSE reply lock poisoned"))?
             .write_all(&reply);
         if written.is_err() {
             break;
         }
     }
+    for (_, handle) in fhs {
+        for cancel in handle.cancels {
+            cancel.store(true, Ordering::SeqCst);
+        }
+    }
+    if let Ok(pending) = pending.lock() {
+        for cancel in pending.values() {
+            cancel.store(true, Ordering::SeqCst);
+        }
+    }
     Ok(())
+}
+
+fn reserve_pending(
+    pending: &Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>>,
+    unique: u64,
+    cancel: Arc<AtomicBool>,
+) -> bool {
+    let Ok(mut pending) = pending.lock() else {
+        return false;
+    };
+    if pending.len() >= MAX_PENDING_IO || pending.contains_key(&unique) {
+        return false;
+    }
+    pending.insert(unique, cancel);
+    true
+}
+
+fn finish_pending(
+    pending: &Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>>,
+    replies: &Arc<Mutex<File>>,
+    unique: u64,
+    reply: Vec<u8>,
+) {
+    if let Ok(mut pending) = pending.lock() {
+        pending.remove(&unique);
+    }
+    if let Ok(mut dev) = replies.lock() {
+        let _ = dev.write_all(&reply);
+    }
 }
 
 fn wait_for_cuse_or_stop(cuse_fd: RawFd, wake_fd: RawFd) -> io::Result<bool> {
@@ -422,6 +636,7 @@ fn wait_for_cuse_or_stop(cuse_fd: RawFd, wake_fd: RawFd) -> io::Result<bool> {
     }
 }
 
+#[cfg(test)]
 fn cuse_write_reply(
     stream: &mut UnixStream,
     wake: &UnixStream,
@@ -429,7 +644,21 @@ fn cuse_write_reply(
     unique: u64,
     data: &[u8],
 ) -> Vec<u8> {
-    if write_all_wakeable(stream, wake, stop, data).is_err() {
+    cuse_write_reply_cancel(stream, wake, stop, &AtomicBool::new(false), unique, data)
+}
+
+fn cuse_write_reply_cancel(
+    stream: &mut UnixStream,
+    wake: &UnixStream,
+    stop: &AtomicBool,
+    cancel: &AtomicBool,
+    unique: u64,
+    data: &[u8],
+) -> Vec<u8> {
+    if write_all_wakeable_cancel(stream, wake, stop, cancel, data).is_err() {
+        if cancel.load(Ordering::SeqCst) {
+            return encode_fuse_error(unique, EINTR);
+        }
         return encode_fuse_error(unique, EIO);
     }
     let mut payload = Vec::new();
@@ -438,6 +667,7 @@ fn cuse_write_reply(
     encode_fuse_ok(unique, &payload)
 }
 
+#[cfg(test)]
 fn cuse_read_reply(
     stream: &mut UnixStream,
     wake: &UnixStream,
@@ -445,8 +675,22 @@ fn cuse_read_reply(
     unique: u64,
     size: usize,
 ) -> Vec<u8> {
+    cuse_read_reply_cancel(stream, wake, stop, &AtomicBool::new(false), unique, size)
+}
+
+fn cuse_read_reply_cancel(
+    stream: &mut UnixStream,
+    wake: &UnixStream,
+    stop: &AtomicBool,
+    cancel: &AtomicBool,
+    unique: u64,
+    size: usize,
+) -> Vec<u8> {
     let mut buf = vec![0u8; size.min(4 * 1024 * 1024)];
     loop {
+        if cancel.load(Ordering::SeqCst) {
+            return encode_fuse_error(unique, EINTR);
+        }
         match stream.read(&mut buf) {
             Ok(n) => {
                 buf.truncate(n);
@@ -454,18 +698,32 @@ fn cuse_read_reply(
             }
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                if wait_stream_or_stop(stream.as_raw_fd(), wake.as_raw_fd(), libc::POLLIN, stop)
-                    .unwrap_or(false)
+                if wait_stream_or_stop_or_cancel(
+                    stream.as_raw_fd(),
+                    wake.as_raw_fd(),
+                    libc::POLLIN,
+                    stop,
+                    cancel,
+                )
+                .unwrap_or(false)
                 {
                     continue;
                 }
-                return encode_fuse_error(unique, EIO);
+                return encode_fuse_error(
+                    unique,
+                    if cancel.load(Ordering::SeqCst) {
+                        EINTR
+                    } else {
+                        EIO
+                    },
+                );
             }
             Err(_) => return encode_fuse_error(unique, EIO),
         }
     }
 }
 
+#[cfg(test)]
 fn cuse_poll_reply(
     stream: &UnixStream,
     wake: &UnixStream,
@@ -475,43 +733,102 @@ fn cuse_poll_reply(
     kh: u64,
     requested: u32,
 ) -> Vec<u8> {
+    cuse_poll_reply_bounded(
+        stream,
+        wake,
+        stop,
+        replies,
+        &Arc::new(AtomicUsize::new(0)),
+        PollRequest {
+            unique,
+            kh,
+            requested,
+        },
+    )
+    .0
+}
+
+fn cuse_poll_reply_bounded(
+    stream: &UnixStream,
+    wake: &UnixStream,
+    stop: &Arc<AtomicBool>,
+    replies: &Arc<Mutex<File>>,
+    active: &Arc<AtomicUsize>,
+    request: PollRequest,
+) -> (Vec<u8>, Option<Arc<AtomicBool>>) {
+    let PollRequest {
+        unique,
+        kh,
+        requested,
+    } = request;
     let mut fd = libc::pollfd {
         fd: stream.as_raw_fd(),
         events: (requested & u16::MAX as u32) as i16,
         revents: 0,
     };
     if unsafe { libc::poll(&mut fd, 1, 0) } < 0 {
-        return encode_fuse_error(unique, EIO);
+        return (encode_fuse_error(unique, EIO), None);
     }
+    let mut watcher_cancel = None;
     if fd.revents == 0 && kh != 0 {
+        if active
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                (count < MAX_POLL_WATCHERS).then_some(count + 1)
+            })
+            .is_err()
+        {
+            return (encode_fuse_error(unique, EAGAIN), None);
+        }
         let watched = match stream.try_clone() {
             Ok(stream) => stream,
-            Err(_) => return encode_fuse_error(unique, EIO),
+            Err(_) => {
+                active.fetch_sub(1, Ordering::SeqCst);
+                return (encode_fuse_error(unique, EIO), None);
+            }
         };
         let watcher_wake = match wake.try_clone() {
             Ok(wake) => wake,
-            Err(_) => return encode_fuse_error(unique, EIO),
+            Err(_) => {
+                active.fetch_sub(1, Ordering::SeqCst);
+                return (encode_fuse_error(unique, EIO), None);
+            }
         };
         let stop = stop.clone();
         let replies = replies.clone();
+        let active_worker = active.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        watcher_cancel = Some(cancel.clone());
         let events = (requested & u16::MAX as u32) as i16;
-        let _ = thread::Builder::new()
+        if thread::Builder::new()
             .name("asterism-cuse-poll".into())
             .spawn(move || {
-                if wait_stream_or_stop(watched.as_raw_fd(), watcher_wake.as_raw_fd(), events, &stop)
-                    .unwrap_or(false)
+                if wait_stream_or_stop_or_cancel(
+                    watched.as_raw_fd(),
+                    watcher_wake.as_raw_fd(),
+                    events,
+                    &stop,
+                    &cancel,
+                )
+                .unwrap_or(false)
                 {
                     let notify = encode_fuse_poll_notify(kh);
                     if let Ok(mut dev) = replies.lock() {
                         let _ = dev.write_all(&notify);
                     }
                 }
-            });
+                cancel.store(true, Ordering::SeqCst);
+                active_worker.fetch_sub(1, Ordering::SeqCst);
+            })
+            .is_err()
+        {
+            active.fetch_sub(1, Ordering::SeqCst);
+            return (encode_fuse_error(unique, EIO), None);
+        }
     }
     let mut payload = Vec::with_capacity(8);
     payload.extend_from_slice(&(fd.revents as u16 as u32).to_le_bytes());
     payload.extend_from_slice(&0u32.to_le_bytes());
-    encode_fuse_ok(unique, &payload)
+    (encode_fuse_ok(unique, &payload), watcher_cancel)
 }
 
 fn encode_fuse_poll_notify(kh: u64) -> Vec<u8> {
@@ -523,14 +840,15 @@ fn encode_fuse_poll_notify(kh: u64) -> Vec<u8> {
     out
 }
 
-fn wait_stream_or_stop(
+fn wait_stream_or_stop_or_cancel(
     stream_fd: RawFd,
     wake_fd: RawFd,
     events: i16,
     stop: &AtomicBool,
+    cancel: &AtomicBool,
 ) -> io::Result<bool> {
     loop {
-        if stop.load(Ordering::SeqCst) {
+        if stop.load(Ordering::SeqCst) || cancel.load(Ordering::SeqCst) {
             return Ok(false);
         }
         let mut fds = [
@@ -545,7 +863,9 @@ fn wait_stream_or_stop(
                 revents: 0,
             },
         ];
-        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) };
+        // A bounded timeout makes per-request cancellation and RELEASE close
+        // cloned watcher descriptors even when neither socket becomes ready.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, WATCHER_POLL_MS) };
         if ready < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {
@@ -553,7 +873,13 @@ fn wait_stream_or_stop(
             }
             return Err(err);
         }
-        if fds[1].revents & libc::POLLIN != 0 || stop.load(Ordering::SeqCst) {
+        if ready == 0 {
+            continue;
+        }
+        if fds[1].revents & libc::POLLIN != 0
+            || stop.load(Ordering::SeqCst)
+            || cancel.load(Ordering::SeqCst)
+        {
             return Ok(false);
         }
         if fds[0].revents & (events | libc::POLLERR | libc::POLLHUP) != 0 {
@@ -562,13 +888,20 @@ fn wait_stream_or_stop(
     }
 }
 
-fn write_all_wakeable(
+fn write_all_wakeable_cancel(
     stream: &mut UnixStream,
     wake: &UnixStream,
     stop: &AtomicBool,
+    cancel: &AtomicBool,
     mut data: &[u8],
 ) -> io::Result<()> {
     while !data.is_empty() {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "CUSE request interrupted",
+            ));
+        }
         match stream.write(data) {
             Ok(0) => {
                 return Err(io::Error::new(
@@ -579,8 +912,13 @@ fn write_all_wakeable(
             Ok(n) => data = &data[n..],
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                if !wait_stream_or_stop(stream.as_raw_fd(), wake.as_raw_fd(), libc::POLLOUT, stop)?
-                {
+                if !wait_stream_or_stop_or_cancel(
+                    stream.as_raw_fd(),
+                    wake.as_raw_fd(),
+                    libc::POLLOUT,
+                    stop,
+                    cancel,
+                )? {
                     return Err(io::Error::new(
                         io::ErrorKind::Interrupted,
                         "CUSE service stopping",
@@ -691,6 +1029,37 @@ mod tests {
     }
 
     #[test]
+    fn blocked_read_does_not_prevent_a_concurrent_write_and_is_interruptible() {
+        let (service, mut client) = UnixStream::pair().unwrap();
+        service.set_nonblocking(true).unwrap();
+        let mut reader = service.try_clone().unwrap();
+        let mut writer = service;
+        let (_wake_tx, wake) = UnixStream::pair().unwrap();
+        let reader_wake = wake.try_clone().unwrap();
+        let stop = AtomicBool::new(false);
+        let cancel = AtomicBool::new(false);
+        thread::scope(|scope| {
+            let blocked = scope.spawn(|| {
+                cuse_read_reply_cancel(&mut reader, &reader_wake, &stop, &cancel, 21, 128)
+            });
+            thread::sleep(Duration::from_millis(10));
+
+            let written = cuse_write_reply(&mut writer, &wake, &stop, 22, b"pipelined-call");
+            assert_eq!(i32::from_le_bytes(written[4..8].try_into().unwrap()), 0);
+            let mut call = [0u8; 14];
+            client.read_exact(&mut call).unwrap();
+            assert_eq!(&call, b"pipelined-call");
+
+            cancel.store(true, Ordering::SeqCst);
+            let interrupted = blocked.join().unwrap();
+            assert_eq!(
+                i32::from_le_bytes(interrupted[4..8].try_into().unwrap()),
+                -EINTR
+            );
+        });
+    }
+
+    #[test]
     fn nonblocking_cuse_write_resumes_after_partial_io_without_replaying_prefix() {
         let (mut service, mut client) = UnixStream::pair().unwrap();
         service.set_nonblocking(true).unwrap();
@@ -773,6 +1142,62 @@ mod tests {
             FUSE_NOTIFY_POLL
         );
         assert_eq!(u64::from_le_bytes(notify[16..24].try_into().unwrap()), kh);
+    }
+
+    #[test]
+    fn poll_watchers_are_bounded_and_release_cancellation_closes_them() {
+        let (service, _client) = UnixStream::pair().unwrap();
+        service.set_nonblocking(true).unwrap();
+        let (_wake_tx, wake) = UnixStream::pair().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let replies = Arc::new(Mutex::new(tempfile::tempfile().unwrap()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let mut cancels = Vec::new();
+        for unique in 0..MAX_POLL_WATCHERS {
+            let (reply, cancel) = cuse_poll_reply_bounded(
+                &service,
+                &wake,
+                &stop,
+                &replies,
+                &active,
+                PollRequest {
+                    unique: unique as u64 + 100,
+                    kh: unique as u64 + 1,
+                    requested: libc::POLLIN as u32,
+                },
+            );
+            assert_eq!(i32::from_le_bytes(reply[4..8].try_into().unwrap()), 0);
+            cancels.push(cancel.expect("deferred watcher"));
+        }
+        let (refused, cancel) = cuse_poll_reply_bounded(
+            &service,
+            &wake,
+            &stop,
+            &replies,
+            &active,
+            PollRequest {
+                unique: 999,
+                kh: 999,
+                requested: libc::POLLIN as u32,
+            },
+        );
+        assert_eq!(
+            i32::from_le_bytes(refused[4..8].try_into().unwrap()),
+            -EAGAIN
+        );
+        assert!(cancel.is_none());
+
+        for cancel in cancels {
+            cancel.store(true, Ordering::SeqCst);
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while active.load(Ordering::SeqCst) != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "watchers did not exit"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]

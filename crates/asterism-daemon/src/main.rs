@@ -220,46 +220,53 @@ async fn main() -> Result<()> {
                     let reconciliation_node = node.clone();
                     let reconciliation_mesh = mesh.clone();
                     tokio::spawn(async move {
-                        let mut durable_catalog = Vec::new();
-                        match reconciliation_mesh
-                            .orbit_registry(&reconciliation_node)
-                            .await
-                        {
-                            Ok(Response::Orbit { rows }) => {
-                                let instances = rows
-                                    .into_iter()
-                                    .map(|row| row.instance)
-                                    .collect::<Vec<_>>();
-                                match gpu.reconcile_durable_attachments(&instances, &device_ids) {
-                                    Ok(restored) if restored > 0 => eprintln!(
-                                        "astd: reconciled {restored} durable remote GPU attachment(s)"
-                                    ),
-                                    Ok(_) => {}
-                                    Err(error) => eprintln!(
-                                        "astd: durable GPU attachment reconciliation failed: {error:#}"
-                                    ),
-                                }
-                                durable_catalog = instances;
-                            }
-                            Ok(other) => eprintln!(
-                                "astd: orbit GPU reconciliation received unexpected reply: {other:?}"
-                            ),
-                            Err(error) => eprintln!(
-                                "astd: orbit GPU attachment catalog is unavailable: {error:#}"
-                            ),
-                        }
                         let mut interval =
                             tokio::time::interval(std::time::Duration::from_secs(60));
                         loop {
                             interval.tick().await;
-                            if !durable_catalog.is_empty() {
-                                if let Err(error) =
-                                    gpu.reconcile_durable_attachments(&durable_catalog, &device_ids)
-                                {
-                                    eprintln!(
-                                        "astd: durable GPU attachment reconciliation failed: {error:#}"
-                                    );
+                            // Rebuild both views every pass. Reusing startup
+                            // snapshots can resurrect a detached lease and
+                            // cannot remove authority for a deleted instance.
+                            let mut fresh_device_ids = std::collections::HashMap::from([(
+                                reconciliation_node.device_name().await,
+                                reconciliation_mesh.device_id().to_string(),
+                            )]);
+                            {
+                                let orbit = reconciliation_node.orbit.lock().await;
+                                fresh_device_ids.extend(
+                                    orbit.devices().iter().map(|device| {
+                                        (device.name.clone(), device.device_id.clone())
+                                    }),
+                                );
+                            }
+                            match reconciliation_mesh
+                                .orbit_registry(&reconciliation_node)
+                                .await
+                            {
+                                Ok(Response::Orbit { rows }) => {
+                                    let fresh_catalog = rows
+                                        .into_iter()
+                                        .map(|row| row.instance)
+                                        .collect::<Vec<_>>();
+                                    match gpu.reconcile_durable_attachments(
+                                        &fresh_catalog,
+                                        &fresh_device_ids,
+                                    ) {
+                                        Ok(changed) if changed > 0 => eprintln!(
+                                            "astd: reconciled {changed} durable remote GPU authority change(s)"
+                                        ),
+                                        Ok(_) => {}
+                                        Err(error) => eprintln!(
+                                            "astd: durable GPU attachment reconciliation failed: {error:#}"
+                                        ),
+                                    }
                                 }
+                                Ok(other) => eprintln!(
+                                    "astd: orbit GPU reconciliation received unexpected reply: {other:?}"
+                                ),
+                                Err(error) => eprintln!(
+                                    "astd: orbit GPU attachment catalog is unavailable: {error:#}"
+                                ),
                             }
                             if let Err(error) = gpu.renew_durable_leases(now_unix()) {
                                 eprintln!("astd: durable GPU lease renewal failed: {error:#}");

@@ -90,9 +90,19 @@ pub enum GpuMeshFrame {
         id: u64,
         request: Request,
     },
+    /// CUDA calls whose state belongs to this authenticated ABI session but
+    /// which do not consume the monotonic mutation sequence.
+    SessionCall {
+        id: u64,
+        call: CudaCall,
+    },
     Reply {
         id: u64,
         reply: Reply,
+    },
+    SessionReply {
+        id: u64,
+        result: CudaResult,
     },
     Cancel {
         id: u64,
@@ -227,6 +237,10 @@ impl ConsumerHop {
                 self.credits = self.credits.saturating_add(1);
                 Ok(())
             }
+            GpuMeshFrame::SessionReply { id, .. } => {
+                self.inflight.remove(&id);
+                Ok(())
+            }
             GpuMeshFrame::Refused { .. }
             | GpuMeshFrame::DeviceLost { .. }
             | GpuMeshFrame::Revoked { .. }
@@ -235,7 +249,9 @@ impl ConsumerHop {
                 "GPU mesh call failed closed",
             ))),
             GpuMeshFrame::Close => Ok(()),
-            GpuMeshFrame::Call { .. } | GpuMeshFrame::Cancel { .. } => Err(PathError::new(
+            GpuMeshFrame::Call { .. }
+            | GpuMeshFrame::SessionCall { .. }
+            | GpuMeshFrame::Cancel { .. } => Err(PathError::new(
                 "consumer received a provider-originated call frame",
             )),
         }
@@ -443,6 +459,10 @@ impl ProviderHop {
                     window: DEFAULT_CREDIT_WINDOW.saturating_sub(self.queued.len() as u32),
                 })
             }
+            GpuMeshFrame::SessionCall { id, call } => Ok(GpuMeshFrame::SessionReply {
+                id,
+                result: self.session_cuda(&call)?,
+            }),
             GpuMeshFrame::Cancel { id } => {
                 if let Some(pos) = self.queued.iter().position(|(qid, _)| *qid == id) {
                     self.queued.remove(pos);
@@ -1008,6 +1028,111 @@ mod tests {
         assert!(path.crossed.len() >= 4);
         assert!(!path.crossed_text().contains(&capability));
         assert!(!path.crossed_text().contains("backend"));
+    }
+
+    #[test]
+    fn every_generated_session_local_cuda_call_crosses_the_mesh() {
+        let peer = peer(9);
+        let mut production = production("desktop");
+        let (_, attachment) = production
+            .authority_mut()
+            .attach(&peer, "session-calls", 64 * 1024 * 1024, 1_000)
+            .unwrap();
+        let mut provider = ProviderHop::new(peer, production, 1_001);
+        assert!(matches!(
+            provider
+                .accept_open(
+                    GpuMeshOpen::new("session-calls", attachment.provider_generation).unwrap()
+                )
+                .unwrap(),
+            GpuMeshFrame::Accepted { .. }
+        ));
+
+        let mut call_id = 1u64;
+        let mut session_call = |call: CudaCall| {
+            let outbound = GpuMeshFrame::SessionCall { id: call_id, call };
+            let wire = encode_frame(&outbound).unwrap();
+            let decoded = decode_frame(&wire).unwrap();
+            let reply = provider.handle_frame(decoded).unwrap();
+            let GpuMeshFrame::SessionReply { id, result } = reply else {
+                panic!("session call did not receive a session reply: {reply:?}")
+            };
+            assert_eq!(id, call_id);
+            call_id += 1;
+            result
+        };
+
+        assert!(matches!(session_call(CudaCall::Init), CudaResult::Init));
+        assert!(matches!(
+            session_call(CudaCall::DriverGetVersion),
+            CudaResult::DriverVersion { .. }
+        ));
+        assert!(matches!(
+            session_call(CudaCall::DeviceCount),
+            CudaResult::DeviceCount { count: 1 }
+        ));
+        assert!(matches!(
+            session_call(CudaCall::DeviceGet { ordinal: 0 }),
+            CudaResult::Device { ordinal: 0 }
+        ));
+        assert!(matches!(
+            session_call(CudaCall::DeviceName { ordinal: 0 }),
+            CudaResult::DeviceName { .. }
+        ));
+        assert!(matches!(
+            session_call(CudaCall::DeviceUuid { ordinal: 0 }),
+            CudaResult::DeviceUuid { .. }
+        ));
+        assert!(matches!(
+            session_call(CudaCall::DeviceAttribute {
+                ordinal: 0,
+                attribute: "COMPUTE_CAPABILITY_MAJOR".into(),
+            }),
+            CudaResult::DeviceAttribute { .. }
+        ));
+        let CudaResult::Context { context } = session_call(CudaCall::CtxCreate {
+            flags: 0,
+            device: 0,
+        }) else {
+            panic!("context create failed")
+        };
+        assert!(matches!(
+            session_call(CudaCall::CtxGetCurrent),
+            CudaResult::CurrentContext { context: current } if current == context
+        ));
+        assert!(matches!(
+            session_call(CudaCall::CtxSetCurrent { context }),
+            CudaResult::Synced
+        ));
+        assert!(matches!(
+            session_call(CudaCall::CtxSynchronize),
+            CudaResult::Synced
+        ));
+        assert!(matches!(
+            session_call(CudaCall::ModuleGetFunction {
+                module: "module-pin".into(),
+                name: "vector_add_f32".into(),
+            }),
+            CudaResult::Function { .. }
+        ));
+        assert!(matches!(
+            session_call(CudaCall::ModuleUnload {
+                module: "module-pin".into(),
+            }),
+            CudaResult::Unloaded
+        ));
+        assert!(matches!(
+            session_call(CudaCall::GetErrorName { code: 0 }),
+            CudaResult::ErrorName { .. }
+        ));
+        assert!(matches!(
+            session_call(CudaCall::GetErrorString { code: 0 }),
+            CudaResult::ErrorString { .. }
+        ));
+        assert!(matches!(
+            session_call(CudaCall::CtxDestroy { context }),
+            CudaResult::Synced
+        ));
     }
 
     #[test]

@@ -1334,11 +1334,11 @@ pub fn uuid_bytes_from_text(text: &str) -> [u8; 16] {
     let mut out = [0u8; 16];
     let hex: String = text.chars().filter(|c| c.is_ascii_hexdigit()).collect();
     let bytes = hex.as_bytes();
-    for i in 0..16 {
+    for (i, byte) in out.iter_mut().enumerate() {
         let start = i * 2;
         if start + 1 < bytes.len() {
             let pair = std::str::from_utf8(&bytes[start..start + 2]).unwrap_or("00");
-            out[i] = u8::from_str_radix(pair, 16).unwrap_or(0);
+            *byte = u8::from_str_radix(pair, 16).unwrap_or(0);
         }
     }
     out
@@ -1643,11 +1643,8 @@ mod tests {
     fn the_supported_matrix_is_exact_and_fail_closed_outside_it() {
         assert_eq!(SUPPORTED_CUDA_DRIVER_SYMBOLS.len(), 22);
         for symbol in SUPPORTED_CUDA_DRIVER_SYMBOLS {
-            match cuda_call_for_symbol(symbol.as_str()) {
-                CudaCall::Unsupported { symbol: name } => {
-                    panic!("{name} is supported and must not fail closed")
-                }
-                _ => {}
+            if let CudaCall::Unsupported { symbol: name } = cuda_call_for_symbol(symbol.as_str()) {
+                panic!("{name} is supported and must not fail closed")
             }
         }
         assert!(CudaDriverSymbol::parse("cuMemAlloc").is_some());

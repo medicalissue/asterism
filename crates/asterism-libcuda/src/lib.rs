@@ -5,6 +5,12 @@
 //! talks to the projected `/dev/nvidia0` endpoint; it never opens a LAN
 //! listener and never puts a lease bearer in argv, environment, or logs.
 
+// These symbols implement a C ABI whose pointer validity is defined by CUDA,
+// not a callable safe Rust API. Each entrypoint validates null/length bounds
+// before its narrowly scoped unsafe access; changing the exported signatures
+// would not make foreign callers safer.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
 use std::path::Path;

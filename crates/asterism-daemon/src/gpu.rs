@@ -29,6 +29,7 @@ use asterism_core::remote_gpu_path::{
 };
 use asterism_mesh::iroh_types::{RecvStream, SendStream};
 use asterism_mesh::{DeviceId, MeshStream};
+use tokio::sync::watch;
 
 use crate::mesh::{ClientIo, Mesh};
 use crate::Node;
@@ -39,6 +40,12 @@ use crate::Node;
 #[derive(Default)]
 pub struct Manager {
     providers: Mutex<HashMap<String, ProductionProvider>>,
+    active: Mutex<HashMap<String, ActiveProvider>>,
+}
+
+struct ActiveProvider {
+    instance_id: String,
+    revoke: watch::Sender<bool>,
 }
 
 impl Manager {
@@ -142,7 +149,7 @@ impl Manager {
             .providers
             .lock()
             .map_err(|_| anyhow!("GPU provider registry lock poisoned"))?;
-        let mut restored = 0u32;
+        let mut changed = 0u32;
         for (uuid, provider) in providers.iter_mut() {
             let provider_device = provider.authority().provider_device().to_owned();
             let durable = instances
@@ -155,6 +162,15 @@ impl Manager {
                     })
                 })
                 .collect::<Vec<_>>();
+            let desired = durable
+                .iter()
+                .map(|(instance, _)| instance.id.clone())
+                .collect::<std::collections::HashSet<_>>();
+            for stale in provider.authority().instance_ids() {
+                if !desired.contains(&stale) && provider.revoke_instance(&stale) {
+                    changed = changed.saturating_add(1);
+                }
+            }
             let Some(generation) = durable
                 .iter()
                 .map(|(_, attachment)| attachment.provider_generation)
@@ -187,21 +203,57 @@ impl Manager {
                     .ensure_attached(&peer, &instance.id, attachment.memory_bytes, now_unix())
                     .map_err(|error| anyhow!(error.message))?;
                 if !existed {
-                    restored = restored.saturating_add(1);
+                    changed = changed.saturating_add(1);
                 }
             }
         }
-        Ok(restored)
+        drop(providers);
+
+        // A session temporarily owns its ProductionProvider, but catalog
+        // removal must still cut it off immediately rather than waiting for
+        // the socket to close and the provider to return to the registry.
+        let active = self
+            .active
+            .lock()
+            .map_err(|_| anyhow!("active GPU provider registry lock poisoned"))?;
+        for (uuid, session) in active.iter() {
+            let still_durable = instances.iter().any(|instance| {
+                instance.id == session.instance_id
+                    && instance
+                        .gpu
+                        .as_ref()
+                        .is_some_and(|attachment| attachment.provider_gpu_uuid == *uuid)
+            });
+            if !still_durable && !*session.revoke.borrow() {
+                let _ = session.revoke.send(true);
+                changed = changed.saturating_add(1);
+            }
+        }
+        Ok(changed)
     }
 
-    fn take(&self, gpu_uuid: &str) -> Option<(String, ProductionProvider)> {
+    fn take(
+        &self,
+        gpu_uuid: &str,
+        instance_id: &str,
+    ) -> Option<(String, ProductionProvider, watch::Receiver<bool>)> {
         let mut providers = self.providers.lock().ok()?;
-        providers
-            .remove(gpu_uuid)
-            .map(|provider| (gpu_uuid.to_owned(), provider))
+        let provider = providers.remove(gpu_uuid)?;
+        let (revoke, receiver) = watch::channel(false);
+        self.active.lock().ok()?.insert(
+            gpu_uuid.to_owned(),
+            ActiveProvider {
+                instance_id: instance_id.to_owned(),
+                revoke,
+            },
+        );
+        Some((gpu_uuid.to_owned(), provider, receiver))
     }
 
     fn put(&self, gpu_uuid: String, provider: ProductionProvider) {
+        if let Ok(mut active) = self.active.lock() {
+            active.remove(&gpu_uuid);
+        }
         if let Ok(mut providers) = self.providers.lock() {
             providers.insert(gpu_uuid, provider);
         }
@@ -237,12 +289,20 @@ impl Manager {
     }
 
     fn revoke(&self, gpu_uuid: &str, instance_id: &str) -> bool {
-        let Ok(mut providers) = self.providers.lock() else {
+        if let Ok(mut providers) = self.providers.lock() {
+            if providers
+                .get_mut(gpu_uuid)
+                .is_some_and(|provider| provider.revoke_instance(instance_id))
+            {
+                return true;
+            }
+        }
+        let Ok(active) = self.active.lock() else {
             return false;
         };
-        providers
-            .get_mut(gpu_uuid)
-            .is_some_and(|provider| provider.revoke_instance(instance_id))
+        active.get(gpu_uuid).is_some_and(|session| {
+            session.instance_id == instance_id && session.revoke.send(true).is_ok()
+        })
     }
 
     fn attach(
@@ -300,12 +360,19 @@ pub(crate) fn serve_plane(request: Request, node: &Node) -> Response {
         Request::GpuProviderRevoke {
             gpu_uuid,
             instance_id,
-        } => Response::GpuProviders {
-            providers: {
-                node.gpu.revoke(&gpu_uuid, &instance_id);
-                node.gpu.advertisements()
-            },
-        },
+        } => {
+            if node.gpu.revoke(&gpu_uuid, &instance_id) {
+                Response::GpuProviders {
+                    providers: node.gpu.advertisements(),
+                }
+            } else {
+                Response::Error {
+                    message: format!(
+                        "GPU provider {gpu_uuid:?} has no active lease for instance {instance_id:?}"
+                    ),
+                }
+            }
+        }
         _ => Response::Error {
             message: "not a GPU provider-plane request".into(),
         },
@@ -592,7 +659,8 @@ pub(crate) async fn serve_mesh(
             return Ok(());
         }
     };
-    let Some((gpu_uuid, production)) = node.gpu.take(&provider_gpu_uuid) else {
+    let Some((gpu_uuid, production, revoke)) = node.gpu.take(&provider_gpu_uuid, &instance_id)
+    else {
         write_gpu_frame(
             &mut stream.send,
             &GpuMeshFrame::DeviceLost {
@@ -645,7 +713,7 @@ pub(crate) async fn serve_mesh(
         node.gpu.put(gpu_uuid, hop.into_production());
         return Ok(());
     }
-    let result = pump_provider(&mut stream, &mut hop).await;
+    let result = pump_provider(&mut stream, &mut hop, &instance_id, revoke).await;
     match &result {
         Ok(()) => hop.shutdown("close", false),
         Err(_) => hop.shutdown("eof", true),
@@ -654,7 +722,14 @@ pub(crate) async fn serve_mesh(
     result
 }
 
-async fn pump_provider(stream: &mut MeshStream, hop: &mut ProviderHop) -> Result<()> {
+async fn pump_provider(
+    stream: &mut MeshStream,
+    hop: &mut ProviderHop,
+    instance_id: &str,
+    mut revoke: watch::Receiver<bool>,
+) -> Result<()> {
+    let mut renewal = tokio::time::interval(std::time::Duration::from_secs(30));
+    renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         // Keep receiving while work is queued. A Call is acknowledged and
         // left cancellable for at least one scheduler turn; buffered Calls
@@ -663,6 +738,17 @@ async fn pump_provider(stream: &mut MeshStream, hop: &mut ProviderHop) -> Result
         if hop.queued_len() > 0 {
             tokio::select! {
                 biased;
+                changed = revoke.changed() => {
+                    if changed.is_ok() && *revoke.borrow() {
+                        hop.production_mut().revoke_instance(instance_id);
+                        write_gpu_frame(
+                            &mut stream.send,
+                            &GpuMeshFrame::Revoked { instance_id: instance_id.to_owned() },
+                        ).await?;
+                        break;
+                    }
+                }
+                _ = renewal.tick() => hop.set_now(now_unix()),
                 incoming = read_gpu_frame(&mut stream.recv) => {
                     let frame = incoming?;
                     hop.set_now(now_unix());
@@ -678,13 +764,27 @@ async fn pump_provider(stream: &mut MeshStream, hop: &mut ProviderHop) -> Result
                 }
             }
         } else {
-            let frame: GpuMeshFrame = read_gpu_frame(&mut stream.recv).await?;
-            hop.set_now(now_unix());
-            let closing = matches!(frame, GpuMeshFrame::Close);
-            let reply = hop.handle_frame(frame).map_err(|err| anyhow!(err))?;
-            write_gpu_frame(&mut stream.send, &reply).await?;
-            if closing {
-                break;
+            tokio::select! {
+                biased;
+                changed = revoke.changed() => {
+                    if changed.is_ok() && *revoke.borrow() {
+                        hop.production_mut().revoke_instance(instance_id);
+                        write_gpu_frame(
+                            &mut stream.send,
+                            &GpuMeshFrame::Revoked { instance_id: instance_id.to_owned() },
+                        ).await?;
+                        break;
+                    }
+                }
+                _ = renewal.tick() => hop.set_now(now_unix()),
+                incoming = read_gpu_frame(&mut stream.recv) => {
+                    let frame: GpuMeshFrame = incoming?;
+                    hop.set_now(now_unix());
+                    let closing = matches!(frame, GpuMeshFrame::Close);
+                    let reply = hop.handle_frame(frame).map_err(|err| anyhow!(err))?;
+                    write_gpu_frame(&mut stream.send, &reply).await?;
+                    if closing { break; }
+                }
             }
         }
     }
@@ -803,40 +903,26 @@ pub(crate) async fn bridge_client<'a, 'b>(
                         write_gpu_frame(&mut stream.send, &GpuMeshFrame::Cancel { id }).await?;
                         pending_cancels.push_back(id);
                     }
-                    GuestFrame::Cuda {
-                        id,
-                        call: guest::CudaCall::Unsupported { symbol },
-                    } => {
-                        let reply = GuestReply::Cuda { id, result: guest::CudaResult::Error {
-                            cuda: guest::CUDA_ERROR_NOT_SUPPORTED,
-                            message: format!("{symbol} is outside the implemented CUDA Driver surface"),
-                        }};
-                        io.send(&Response::GpuGuestReply { reply }).await?;
-                    }
                     GuestFrame::Cuda { id, call } => {
+                        if pending.contains_key(&id) {
+                            io.send(&Response::GpuGuestReply { reply: GuestReply::Refused {
+                                id: Some(id),
+                                code: "duplicate".into(),
+                                message: "GPU call id is already in flight".into(),
+                            }}).await?;
+                            continue;
+                        }
                         match guest::abi_request_for(&session, sequence.saturating_add(1), &call) {
                             Err(_) => {
-                                let result = match &call {
-                                    guest::CudaCall::Init => guest::CudaResult::Init,
-                                    guest::CudaCall::DriverGetVersion => {
-                                        guest::CudaResult::DriverVersion {
-                                            version: guest::CUDA_DRIVER_VERSION,
-                                        }
-                                    }
-                                    guest::CudaCall::DeviceCount => {
-                                        guest::CudaResult::DeviceCount { count: 1 }
-                                    }
-                                    guest::CudaCall::Synchronize
-                                    | guest::CudaCall::CtxSynchronize => guest::CudaResult::Synced,
-                                    other => guest::CudaResult::Error {
-                                        cuda: guest::CUDA_ERROR_NOT_SUPPORTED,
-                                        message: format!("{other:?} is session-local"),
-                                    },
-                                };
-                                io.send(&Response::GpuGuestReply { reply: GuestReply::Cuda { id, result } }).await?;
+                                write_gpu_frame(
+                                    &mut stream.send,
+                                    &GpuMeshFrame::SessionCall { id, call: call.clone() },
+                                )
+                                .await?;
+                                pending.insert(id, call);
                             }
                             Ok(request) => {
-                                if credits == 0 || pending.contains_key(&id) {
+                                if credits == 0 {
                                     io.send(&Response::GpuGuestReply { reply: GuestReply::Refused {
                                         id: Some(id),
                                         code: "backpressure".into(),
@@ -874,6 +960,14 @@ pub(crate) async fn bridge_client<'a, 'b>(
                         credits = credits.saturating_add(1).min(DEFAULT_CREDIT_WINDOW);
                         io.send(&Response::GpuGuestReply {
                             reply: GuestReply::Cuda { id, result: guest::cuda_result_for(&call, reply) }
+                        }).await?;
+                    }
+                    GpuMeshFrame::SessionReply { id, result } => {
+                        if pending.remove(&id).is_none() {
+                            bail!("GPU provider replied to unknown session call id {id}");
+                        }
+                        io.send(&Response::GpuGuestReply {
+                            reply: GuestReply::Cuda { id, result }
                         }).await?;
                     }
                     GpuMeshFrame::Cancelled { id } => {
@@ -920,7 +1014,7 @@ async fn serve_local_provider<'a, 'b>(
     _memory_bytes: u64,
     io: &'a mut ClientIo<'b>,
 ) -> Result<()> {
-    let Some((gpu_uuid, production)) = node.gpu.take(provider_gpu_uuid) else {
+    let Some((gpu_uuid, production, revoke)) = node.gpu.take(provider_gpu_uuid, instance_id) else {
         io.send(&Response::GpuGuestRefused {
             code: "device_lost".into(),
             message: "this device has no GPU provider service".into(),
@@ -986,7 +1080,7 @@ async fn serve_local_provider<'a, 'b>(
             return Ok(());
         }
     }
-    let result = pump_local(io, &mut hop).await;
+    let result = pump_local(io, &mut hop, instance_id, revoke).await;
     match &result {
         Ok(()) => hop.shutdown("close", false),
         Err(_) => hop.shutdown("eof", true),
@@ -995,13 +1089,34 @@ async fn serve_local_provider<'a, 'b>(
     result
 }
 
-async fn pump_local<'a, 'b>(io: &'a mut ClientIo<'b>, hop: &mut ProviderHop) -> Result<()> {
+async fn pump_local<'a, 'b>(
+    io: &'a mut ClientIo<'b>,
+    hop: &mut ProviderHop,
+    instance_id: &str,
+    mut revoke: watch::Receiver<bool>,
+) -> Result<()> {
     let mut sequence = 0u64;
     let mut pending = VecDeque::new();
+    let mut renewal = tokio::time::interval(std::time::Duration::from_secs(30));
+    renewal.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         if hop.queued_len() > 0 {
             tokio::select! {
                 biased;
+                changed = revoke.changed() => {
+                    if changed.is_ok() && *revoke.borrow() {
+                        hop.production_mut().revoke_instance(instance_id);
+                        io.send(&Response::GpuGuestReply {
+                            reply: GuestReply::Refused {
+                                id: None,
+                                code: "revoked".into(),
+                                message: format!("GPU lease revoked for {instance_id}"),
+                            },
+                        }).await?;
+                        break;
+                    }
+                }
+                _ = renewal.tick() => hop.set_now(now_unix()),
                 request = io.next_request() => {
                     hop.set_now(now_unix());
                     if !handle_local_request(io, hop, request?, &mut sequence, &mut pending).await? {
@@ -1013,10 +1128,28 @@ async fn pump_local<'a, 'b>(io: &'a mut ClientIo<'b>, hop: &mut ProviderHop) -> 
                 }
             }
         } else {
-            let request = io.next_request().await?;
-            hop.set_now(now_unix());
-            if !handle_local_request(io, hop, request, &mut sequence, &mut pending).await? {
-                break;
+            tokio::select! {
+                biased;
+                changed = revoke.changed() => {
+                    if changed.is_ok() && *revoke.borrow() {
+                        hop.production_mut().revoke_instance(instance_id);
+                        io.send(&Response::GpuGuestReply {
+                            reply: GuestReply::Refused {
+                                id: None,
+                                code: "revoked".into(),
+                                message: format!("GPU lease revoked for {instance_id}"),
+                            },
+                        }).await?;
+                        break;
+                    }
+                }
+                _ = renewal.tick() => hop.set_now(now_unix()),
+                request = io.next_request() => {
+                    hop.set_now(now_unix());
+                    if !handle_local_request(io, hop, request?, &mut sequence, &mut pending).await? {
+                        break;
+                    }
+                }
             }
         }
     }
@@ -1243,6 +1376,67 @@ mod tests {
             parse_live_inventory("0, GPU-a, NVIDIA L4, 23034, 8.9", "CUDA Version: 12.4").is_err()
         );
         assert!(Manager::default().advertisements().is_empty());
+    }
+
+    fn reference_manager() -> (Manager, String) {
+        let uuid = "GPU-test-reconciliation".to_owned();
+        let authority = asterism_core::remote_gpu::LeaseAuthority::new(
+            "desktop",
+            "a".repeat(64),
+            uuid.clone(),
+            1,
+            asterism_core::remote_gpu::LeaseLimits::default(),
+        )
+        .unwrap();
+        let manager = Manager::default();
+        manager.providers.lock().unwrap().insert(
+            uuid.clone(),
+            ProductionProvider::new(
+                authority,
+                asterism_core::remote_gpu::Provider::reference("desktop"),
+            ),
+        );
+        (manager, uuid)
+    }
+
+    #[test]
+    fn active_provider_revocation_is_delivered_while_the_session_owns_it() {
+        let (manager, uuid) = reference_manager();
+        manager
+            .attach(&uuid, &"b".repeat(64), "active-instance", 1024)
+            .unwrap();
+        let (key, mut production, receiver) =
+            manager.take(&uuid, "active-instance").expect("provider");
+        assert!(manager.revoke(&uuid, "active-instance"));
+        assert!(
+            *receiver.borrow(),
+            "active session did not receive revocation"
+        );
+        assert!(production.revoke_instance("active-instance"));
+        manager.put(key, production);
+        assert_eq!(manager.advertisements()[0].active_leases, 0);
+    }
+
+    #[test]
+    fn fresh_empty_catalog_removes_stale_provider_authority() {
+        let (manager, uuid) = reference_manager();
+        manager
+            .attach(&uuid, &"b".repeat(64), "stale-instance", 1024)
+            .unwrap();
+        assert_eq!(
+            manager
+                .reconcile_durable_attachments(&[], &HashMap::new())
+                .unwrap(),
+            1
+        );
+        assert!(!manager
+            .providers
+            .lock()
+            .unwrap()
+            .get(&uuid)
+            .unwrap()
+            .authority()
+            .has_instance("stale-instance"));
     }
 
     #[test]

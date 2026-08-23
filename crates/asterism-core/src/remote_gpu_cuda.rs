@@ -389,17 +389,13 @@ impl SimulatedCuda {
 
     fn zeroize_and_free(&mut self, ptr: u64, _bytes: u64) {
         if let Some(mut memory) = self.memory.remove(&ptr) {
-            for byte in &mut memory {
-                *byte = 0;
-            }
+            memory.fill(0);
         }
     }
 
     fn restart(&mut self) {
         for (_, mut memory) in self.memory.drain() {
-            for byte in &mut memory {
-                *byte = 0;
-            }
+            memory.fill(0);
         }
         self.ptx_loaded = false;
         self.next_ptr = 0x1000;
@@ -431,6 +427,7 @@ struct CudaFns {
     cu_device_total_mem: unsafe extern "C" fn(*mut usize, CuDevice) -> CuResult,
     cu_ctx_create: unsafe extern "C" fn(*mut CuContext, c_uint, CuDevice) -> CuResult,
     cu_ctx_destroy: unsafe extern "C" fn(CuContext) -> CuResult,
+    cu_ctx_set_current: unsafe extern "C" fn(CuContext) -> CuResult,
     cu_ctx_synchronize: unsafe extern "C" fn() -> CuResult,
     cu_mem_alloc: unsafe extern "C" fn(*mut CuDevicePtr, usize) -> CuResult,
     cu_mem_free: unsafe extern "C" fn(CuDevicePtr) -> CuResult,
@@ -469,8 +466,9 @@ struct LiveCuda {
     live_ptrs: HashMap<u64, u64>,
 }
 
-// The CUDA driver handle is process-local and the engine is used from one
-// provider thread at a time (ProductionProvider is `&mut self`).
+// The CUDA driver handle is process-local. `&mut self` serializes calls and
+// `make_current` binds the live context to every OS thread before it enters
+// the driver, so moving a provider future between Tokio workers is safe.
 unsafe impl Send for LiveCuda {}
 
 impl std::fmt::Debug for LiveCuda {
@@ -572,6 +570,7 @@ impl LiveCuda {
     }
 
     fn alloc(&mut self, bytes: u64, sequence: u64) -> Result<u64, GpuError> {
+        self.make_current(sequence)?;
         let size = data_len(bytes, sequence)?;
         let mut ptr = 0;
         check_gpu(
@@ -586,6 +585,7 @@ impl LiveCuda {
     }
 
     fn write(&mut self, ptr: u64, offset: u64, data: &[u8], sequence: u64) -> Result<(), GpuError> {
+        self.make_current(sequence)?;
         check_gpu(
             unsafe {
                 (self.fns.cu_memcpy_htod)(
@@ -607,6 +607,7 @@ impl LiveCuda {
         len: usize,
         sequence: u64,
     ) -> Result<Vec<u8>, GpuError> {
+        self.make_current(sequence)?;
         let mut host = vec![0u8; len];
         check_gpu(
             unsafe {
@@ -624,6 +625,7 @@ impl LiveCuda {
     }
 
     fn load_ptx(&mut self, ptx: &[u8], sequence: u64) -> Result<(), GpuError> {
+        self.make_current(sequence)?;
         if ptx != VECTOR_ADD_PTX.as_bytes() {
             return Err(GpuError::new(
                 ErrorCode::WorkloadMismatch,
@@ -661,6 +663,7 @@ impl LiveCuda {
         elements: u32,
         sequence: u64,
     ) -> Result<u64, GpuError> {
+        self.make_current(sequence)?;
         if self.function.is_null() {
             return Err(GpuError::new(
                 ErrorCode::WorkloadMismatch,
@@ -711,6 +714,11 @@ impl LiveCuda {
     }
 
     fn zeroize_and_free(&mut self, ptr: u64, bytes: u64) {
+        if self.context.is_null()
+            || unsafe { (self.fns.cu_ctx_set_current)(self.context) } != CUDA_SUCCESS
+        {
+            return;
+        }
         if bytes > 0 {
             let _ = unsafe { (self.fns.cu_memset_d8)(ptr, 0, bytes as usize) };
         }
@@ -721,6 +729,13 @@ impl LiveCuda {
     }
 
     fn restart(&mut self) -> Result<u64, ControlError> {
+        if !self.context.is_null() {
+            check_ctrl(
+                unsafe { (self.fns.cu_ctx_set_current)(self.context) },
+                "cuCtxSetCurrent",
+                &self.fns,
+            )?;
+        }
         for (ptr, bytes) in self.live_ptrs.drain().collect::<Vec<_>>() {
             self.outstanding_bytes = 0;
             let _ = unsafe { (self.fns.cu_memset_d8)(ptr, 0, bytes as usize) };
@@ -743,10 +758,25 @@ impl LiveCuda {
         self.generation = self.generation.saturating_add(1).max(1);
         Ok(self.generation)
     }
+
+    fn make_current(&self, sequence: u64) -> Result<(), GpuError> {
+        if self.context.is_null() {
+            return Err(gpu_error(sequence, "CUDA context is not available"));
+        }
+        check_gpu(
+            unsafe { (self.fns.cu_ctx_set_current)(self.context) },
+            "cuCtxSetCurrent",
+            sequence,
+            &self.fns,
+        )
+    }
 }
 
 impl Drop for LiveCuda {
     fn drop(&mut self) {
+        if !self.context.is_null() {
+            let _ = unsafe { (self.fns.cu_ctx_set_current)(self.context) };
+        }
         for (ptr, bytes) in self.live_ptrs.drain() {
             let _ = unsafe { (self.fns.cu_memset_d8)(ptr, 0, bytes as usize) };
             let _ = unsafe { (self.fns.cu_mem_free)(ptr) };
@@ -929,6 +959,7 @@ unsafe fn load_fns(handle: *mut c_void) -> Result<CudaFns, ControlError> {
             Ok(f) => f,
             Err(_) => sym(handle, "cuCtxDestroy")?,
         },
+        cu_ctx_set_current: sym(handle, "cuCtxSetCurrent")?,
         cu_ctx_synchronize: sym(handle, "cuCtxSynchronize")?,
         cu_mem_alloc: match sym(handle, "cuMemAlloc_v2") {
             Ok(f) => f,
@@ -1025,6 +1056,23 @@ mod tests {
             "{}",
             error.message
         );
+    }
+
+    #[test]
+    fn live_driver_source_rebinds_context_before_every_execution_entrypoint() {
+        // Source-only regression: CI has no NVIDIA hardware and this test
+        // deliberately makes no execution claim. It prevents removing the
+        // per-OS-thread binding from alloc/copy/module/launch operations.
+        let source = include_str!("remote_gpu_cuda.rs");
+        let implementation = source.split("#[cfg(test)]").next().unwrap();
+        assert_eq!(
+            implementation
+                .matches("self.make_current(sequence)?;")
+                .count(),
+            5
+        );
+        assert!(source.contains("cu_ctx_set_current: sym(handle, \"cuCtxSetCurrent\")?"));
+        assert!(source.contains("moving a provider future between Tokio workers is safe"));
     }
 
     #[test]
