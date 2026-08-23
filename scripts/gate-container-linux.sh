@@ -136,6 +136,9 @@ cleanup() {
   trap - EXIT ERR INT TERM
   set +e
   STAGE=cleanup
+  if [ -f "$MAIN_HOME/instances/$INSTANCE/console.log" ]; then
+    redact <"$MAIN_HOME/instances/$INSTANCE/console.log" >"$ARTIFACTS/container-console.log"
+  fi
   if [ -x "$AST" ]; then
     if [ -n "$INSTANCE_RUNNING" ]; then
       "$AST" down "$INSTANCE" >>"$ARTIFACTS/cleanup.log" 2>&1
