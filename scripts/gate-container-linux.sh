@@ -429,6 +429,7 @@ egress_digest="$("$AST" shell "$INSTANCE" -- sh -c \
   'curl -fsS --max-time 25 https://httpbin.org/bearer -H "Authorization: Bearer $ASTERISM_GATE_SECRET" | jq -r .token | sha256sum | awk "{print \\$1}"' \
   2>&1)" || record_failure "bound egress request failed: $egress_digest"
 assert_contains "secret substitution in flight" "$egress_digest" "$SECRET_DIGEST"
+# shellcheck disable=SC2016 # The quoted program expands inside the container.
 wrong_status="$("$AST" shell "$INSTANCE" -- sh -c \
   'wrong_handle="ast-wrong-"handle; curl -sS --max-time 25 -o /tmp/wrong-handle -w "%{http_code}" https://httpbin.org/bearer -H "Authorization: Bearer $wrong_handle" || true' \
   2>&1)" || record_failure "wrong-handle probe could not run"
