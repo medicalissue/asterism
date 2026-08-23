@@ -6,7 +6,6 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
 const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
 const CTRL_C_EVENT: u32 = 0;
 
@@ -88,9 +87,12 @@ fn send_ctrl_c_to(child_pid: u32) {
             "sending Ctrl-C to astd console: {}",
             std::io::Error::last_os_error()
         );
+        // Handler dispatch is asynchronous.  Reattaching to the runner's
+        // console and clearing this process's ignore flag immediately races
+        // the event we just queued and can kill the test executable itself
+        // with STATUS_CONTROL_C_EXIT.  This executable contains only this
+        // test, so remain detached and keep the sender ignored until exit.
         let _ = FreeConsole();
-        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
-        let _ = SetConsoleCtrlHandler(None, 0);
     }
 }
 
