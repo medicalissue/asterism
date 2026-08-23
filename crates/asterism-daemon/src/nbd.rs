@@ -546,7 +546,7 @@ fn negotiate(
                             *query == BASE_ALLOCATION || BASE_ALLOCATION.starts_with(query)
                         })
                 } else {
-                    queries.iter().any(|query| *query == BASE_ALLOCATION)
+                    queries.contains(&BASE_ALLOCATION)
                 };
                 if option == NBD_OPT_SET_META_CONTEXT {
                     negotiated.allocation = allocation;
@@ -895,7 +895,7 @@ fn write_all_at(file: &File, mut data: &[u8], mut offset: u64) -> io::Result<()>
 }
 
 fn write_zeroes(file: &File, mut offset: u64, mut length: u32) -> io::Result<()> {
-    const ZEROES: [u8; 1024 * 1024] = [0; 1024 * 1024];
+    static ZEROES: [u8; 1024 * 1024] = [0; 1024 * 1024];
     while length != 0 {
         let chunk = usize::min(length as usize, ZEROES.len());
         write_all_at(file, &ZEROES[..chunk], offset)?;
