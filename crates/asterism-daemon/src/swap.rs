@@ -4223,19 +4223,6 @@ pub async fn run(
                 epoch,
                 token: token.clone(),
             },
-            Request::MoveReserveTarget {
-                instance_id: "instance-id".into(),
-                name: "dev".into(),
-                epoch: 1,
-                token: "token".into(),
-            },
-            Request::MoveRecoverTarget {
-                instance_id: "instance-id".into(),
-                name: "dev".into(),
-                epoch: 1,
-                token: "token".into(),
-                from_lane: 1,
-            },
             node,
             mesh,
         )
@@ -4851,6 +4838,17 @@ mod tests {
             name: "dev".into(),
             restart: None
         }));
+    }
+
+    #[test]
+    fn final_source_commit_dispatch_keeps_asks_four_argument_shape() {
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/swap.rs"));
+        assert!(
+            source.contains(
+                "Request::MoveCommitSource {\n                instance_id: manifest.instance.id.clone(),\n                name: name.to_owned(),\n                epoch,\n                token: token.clone(),\n            },\n            node,\n            mesh,"
+            ),
+            "the final source commit must call ask(device, request, node, mesh)"
+        );
     }
 
     #[test]
