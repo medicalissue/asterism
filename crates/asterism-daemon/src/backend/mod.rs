@@ -810,7 +810,8 @@ mod tests {
                     ctl: ControlChannel::Qmp {
                         path: "/tmp/x.sock".into(),
                     },
-                    endpoint: GuestEndpoint::HostForward { ssh_port: 22 },
+                    endpoint: Some(GuestEndpoint::HostForward { ssh_port: 22 }),
+                    container_control: None,
                     started_at: now_unix(),
                 },
             )
@@ -912,7 +913,8 @@ mod tests {
                 pid: Some(std::process::id()),
                 proc: None,
                 ctl: ControlChannel::Qmp { path: ctl.clone() },
-                endpoint: GuestEndpoint::HostForward { ssh_port: 22 },
+                endpoint: Some(GuestEndpoint::HostForward { ssh_port: 22 }),
+                container_control: None,
                 started_at: now_unix(),
             };
             assert!(
@@ -1051,7 +1053,8 @@ mod tests {
                     ctl: ControlChannel::Qmp {
                         path: paths::qmp_socket_path("dev"),
                     },
-                    endpoint: GuestEndpoint::HostForward { ssh_port: 22 },
+                    endpoint: Some(GuestEndpoint::HostForward { ssh_port: 22 }),
+                    container_control: None,
                     started_at: 0,
                 };
                 let inst = Instance::new(

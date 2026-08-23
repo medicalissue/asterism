@@ -22,7 +22,7 @@ use crate::device_shell::{
 };
 use crate::hv::GuestHealth;
 use crate::image::{ImagePullResult, ImageRow};
-use crate::instance::{Instance, PortForward, Restart, Shape};
+use crate::instance::{Instance, PortForward, Restart, RuntimeKind, Shape};
 use crate::orbit::{Device, DeviceStatus, WakeFacts};
 use crate::registry::OrbitRow;
 use crate::secret::Secret;
@@ -108,6 +108,21 @@ pub enum Request {
         /// Bootstrap profiles to apply at first boot (`ast create --profile
         /// claude`). Empty from a CLI that predates them, and empty from
         /// every `ast create` that did not ask for one.
+        #[serde(default)]
+        profiles: Vec<String>,
+    },
+    /// Runtime-aware create. Kept as a distinct versioned frame so a daemon
+    /// that predates native containers cannot ignore an added field and boot
+    /// the requested image as a VM instead.
+    CreateRuntime {
+        name: String,
+        image: String,
+        shape: Shape,
+        runtime: RuntimeKind,
+        #[serde(default)]
+        backend: Option<String>,
+        #[serde(default)]
+        publish: Vec<PortForward>,
         #[serde(default)]
         profiles: Vec<String>,
     },
@@ -280,6 +295,11 @@ pub enum Request {
     Logs {
         name: String,
         lines: u32,
+    },
+    /// Execute inside a native container through its private control socket.
+    ContainerExec {
+        name: String,
+        command: Vec<String>,
     },
     /// Where to point `ssh` at to reach this instance's guest.
     ///
@@ -685,13 +705,15 @@ impl Request {
             | Request::AttachSecret { name, .. }
             | Request::DetachSecret { name, .. }
             | Request::BackupExport { name, .. }
-            | Request::SshEndpoint { name } => Some(name),
+            | Request::SshEndpoint { name }
+            | Request::ContainerExec { name, .. } => Some(name),
 
             // The handshake, and the two views of the registry. A list is
             // about every instance, which is not one instance.
             Request::Ping { .. }
             | Request::Compat
             | Request::Create { .. }
+            | Request::CreateRuntime { .. }
             | Request::BackupImport { .. }
             | Request::List
             | Request::ListOrbit => None,
@@ -799,6 +821,7 @@ impl Request {
             | Request::VolumeRelease { .. } => 7,
             Request::DeviceShellStatus => 5,
             Request::ImageList | Request::ImagePull { .. } => 6,
+            Request::CreateRuntime { .. } | Request::ContainerExec { .. } => 8,
             Request::DeviceShellPolicy { .. }
             | Request::DeviceShellOpen { .. }
             | Request::DeviceShellInput { .. }
@@ -840,6 +863,8 @@ impl Request {
             | Request::DeviceShellClose => Some("device shell"),
             Request::ImageList => Some("image_list"),
             Request::ImagePull { .. } => Some("image_pull"),
+            Request::CreateRuntime { .. } => Some("create_runtime"),
+            Request::ContainerExec { .. } => Some("container_exec"),
             _ => None,
         }
     }
@@ -972,6 +997,12 @@ pub enum Response {
     Log {
         text: String,
         truncated: bool,
+    },
+    /// Bounded result from a command run through [`Request::ContainerExec`].
+    ContainerExec {
+        status: i32,
+        stdout: String,
+        stderr: String,
     },
     /// Reply to [`Request::SshEndpoint`]: a loopback address `ssh` can be
     /// pointed at right now, and the key file that opens the guest. Whose cpu
@@ -1199,6 +1230,22 @@ impl Response {
             Response::BackupExported { .. } | Response::BackupRestored { .. } => 3,
             Response::Images { .. } | Response::ImagePulled { .. } => 6,
             Response::VolumeCatalog { .. } | Response::VolumeLease { .. } => 7,
+            Response::ContainerExec { .. } => 8,
+            Response::Instance { instance, .. } if instance.runtime == RuntimeKind::Container => 8,
+            Response::Instances { instances }
+                if instances
+                    .iter()
+                    .any(|instance| instance.runtime == RuntimeKind::Container) =>
+            {
+                8
+            }
+            Response::Orbit { rows }
+                if rows
+                    .iter()
+                    .any(|row| row.instance.runtime == RuntimeKind::Container) =>
+            {
+                8
+            }
             Response::DeviceShellStatus { .. }
             | Response::DeviceShellAccepted { .. }
             | Response::DeviceShellRefused { .. }
@@ -1252,6 +1299,27 @@ pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
             "image_pull",
             Request::ImagePull {
                 reference: String::new(),
+            }
+            .since(),
+        ),
+        (
+            "create_runtime",
+            Request::CreateRuntime {
+                name: String::new(),
+                image: String::new(),
+                shape: Shape::default(),
+                runtime: RuntimeKind::Container,
+                backend: None,
+                publish: Vec::new(),
+                profiles: Vec::new(),
+            }
+            .since(),
+        ),
+        (
+            "container_exec",
+            Request::ContainerExec {
+                name: String::new(),
+                command: Vec::new(),
             }
             .since(),
         ),
@@ -1543,6 +1611,8 @@ mod tests {
         assert_eq!(table.get("volume_lease"), Some(&7));
         assert_eq!(table.get("volume_reconnect"), Some(&7));
         assert_eq!(table.get("volume_release"), Some(&7));
+        assert_eq!(table.get("create_runtime"), Some(&8));
+        assert_eq!(table.get("container_exec"), Some(&8));
         assert_eq!(
             table.get("device-shell"),
             Some(&4),
@@ -1991,5 +2061,52 @@ mod tests {
         .unwrap();
         assert_eq!(written["other_cpu_device"], "desktop");
         assert!(written.get("other_compute_device").is_none(), "{written}");
+    }
+
+    #[test]
+    fn container_runtime_uses_versioned_fail_closed_frames() {
+        let create = Request::CreateRuntime {
+            name: "web".into(),
+            image: "docker.io/library/nginx:latest".into(),
+            shape: Shape::default(),
+            runtime: RuntimeKind::Container,
+            backend: None,
+            publish: Vec::new(),
+            profiles: Vec::new(),
+        };
+        let wire = serde_json::to_string(&create).unwrap();
+        assert!(wire.contains("\"runtime\":\"container\""));
+        assert_eq!(create.since(), 8);
+        assert_eq!(create.versioned_name(), Some("create_runtime"));
+
+        let exec = Request::ContainerExec {
+            name: "web".into(),
+            command: vec!["/bin/true".into()],
+        };
+        assert_eq!(exec.subject(), Some("web"));
+        assert_eq!(exec.since(), 8);
+
+        let mut instance = Instance::new(
+            "web",
+            "laptop",
+            "docker.io/library/nginx:latest",
+            Shape::default(),
+            crate::hv::Machine {
+                backend: "linux-rootless".into(),
+                machine_type: "linux-userns-cgroup-v2".into(),
+                cpu: "x86_64".into(),
+                hv_version: "native".into(),
+            },
+        );
+        instance.runtime = RuntimeKind::Container;
+        assert_eq!(
+            Response::Instance {
+                instance,
+                guest_health: None,
+            }
+            .since(),
+            8,
+            "an old client must not receive a handle with no SSH endpoint"
+        );
     }
 }

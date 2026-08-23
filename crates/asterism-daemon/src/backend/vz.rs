@@ -1596,9 +1596,10 @@ mod tests {
             ctl: ControlChannel::Rpc {
                 path: "/tmp/nothing-here.sock".into(),
             },
-            endpoint: GuestEndpoint::GuestAddr {
+            endpoint: Some(GuestEndpoint::GuestAddr {
                 addr: "192.168.64.3".parse().unwrap(),
-            },
+            }),
+            container_control: None,
             started_at: 0,
         };
         assert!(hv.stop(&h, Duration::from_millis(1)).is_ok());
@@ -1705,9 +1706,10 @@ mod tests {
             ctl: ControlChannel::Rpc {
                 path: sock.to_owned(),
             },
-            endpoint: GuestEndpoint::GuestAddr {
+            endpoint: Some(GuestEndpoint::GuestAddr {
                 addr: "192.168.64.3".parse().unwrap(),
-            },
+            }),
+            container_control: None,
             started_at: 0,
         }
     }
