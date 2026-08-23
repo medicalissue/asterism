@@ -450,6 +450,10 @@ fn clear_stale_control(inst: &Instance) {
     if !path.exists() {
         return;
     }
+    if matches!(handle.ctl, asterism_core::hv::ControlChannel::Helper { .. }) {
+        return;
+    }
+    #[cfg(unix)]
     if std::os::unix::net::UnixStream::connect(path).is_ok() {
         eprintln!(
             "astd: {} is down but something is still listening on {} — leaving it, \

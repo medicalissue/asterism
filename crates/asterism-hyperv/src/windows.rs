@@ -41,7 +41,7 @@ use windows_sys::Win32::Storage::Vhd::{
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::HostComputeNetwork::{
     HcnCloseEndpoint, HcnCloseNetwork, HcnCreateEndpoint, HcnCreateNetwork, HcnDeleteEndpoint,
-    HcnEnumerateNetworks, HcnOpenEndpoint, HcnOpenNetwork,
+    HcnDeleteNetwork, HcnEnumerateNetworks, HcnOpenEndpoint, HcnOpenNetwork,
 };
 use windows_sys::Win32::System::HostComputeSystem::{
     HcsCloseComputeSystem, HcsCloseOperation, HcsCreateComputeSystem,
@@ -105,10 +105,14 @@ pub fn dispatch(request: Request) -> Result<Reply> {
         Request::Terminate {
             system_id,
             endpoint_id,
+            network_id,
         } => {
             terminate(&system_id)?;
             if let Some(endpoint_id) = endpoint_id {
                 delete_endpoint(&endpoint_id)?;
+            }
+            if let Some(network_id) = network_id {
+                delete_network(&network_id)?;
             }
             Ok(Reply::Stopped)
         }
@@ -410,6 +414,21 @@ fn delete_endpoint(id: &str) -> Result<()> {
     }
     if failed(hr) {
         bail!("deleting HCN endpoint: {}", hcn_result(hr, error));
+    }
+    free_com(error);
+    Ok(())
+}
+
+fn delete_network(id: &str) -> Result<()> {
+    let id = guid(id)?;
+    let mut error = null_mut();
+    let hr = unsafe { HcnDeleteNetwork(&id, &mut error) };
+    if hr == HCN_E_NETWORK_NOT_FOUND {
+        free_com(error);
+        return Ok(());
+    }
+    if failed(hr) {
+        bail!("deleting HCN network: {}", hcn_result(hr, error));
     }
     free_com(error);
     Ok(())

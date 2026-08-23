@@ -44,7 +44,7 @@ the helper does not stop or orphan the guest. HCS configuration sets
 |---|---|---|
 | availability and mutation gate | helper | Windows 11 Pro/Enterprise; `vmcompute` and `hns` services; elevation; HCS service properties |
 | VM lifecycle and adoption | helper HCS adapter | ComputeCore/HCS v2.1: create, open, start, properties, shutdown, terminate, save |
-| network | helper HCN adapter | ComputeNetwork/HCN v2: one private NAT network and one endpoint per VM |
+| network | helper HCN adapter | ComputeNetwork/HCN v2: create/open/delete one private NAT network per device and one endpoint per VM |
 | boot/storage devices | HCS configuration | Generation 2 UEFI, synthetic SCSI, synthetic NIC, serial console, built-in devices only |
 | local root/data disks | helper VirtDisk adapter | VirtDisk v2 VHDX create/open/attach/detach plus `HcsGrantVmAccess` |
 | guest control | helper Hyper-V Socket adapter | `AF_HYPERV`/`HV_PROTOCOL_RAW`; Linux `AF_VSOCK`; Asterism port 1023 service-template GUID |
@@ -130,6 +130,12 @@ that requirement rather than attempting elevation.
 No network, endpoint, VHDX, compute system, instance
 record, or snapshot is created until all six pass. Error text names the failed
 precondition and the operator action; it never silently selects WHPX/QEMU.
+
+Stopping preserves the HCS system and HCN endpoint so a later `ast up` can
+adopt them. Removing a stopped instance terminates its HCS system, deletes its
+endpoint, and deletes the shared Asterism NAT network only when no other
+instance configuration still references it. A cleanup failure leaves the
+instance row and directory intact rather than reporting a successful removal.
 
 ## Verification boundary
 
