@@ -647,9 +647,7 @@ impl Stop {
             let source = match source {
                 // Constructing the listener here registers the console handler
                 // before startup mutates state, matching the Unix contract.
-                StopSource::Console => {
-                    WindowsStop::Console(tokio::signal::windows::ctrl_c().ok())
-                }
+                StopSource::Console => WindowsStop::Console(tokio::signal::windows::ctrl_c().ok()),
                 StopSource::Service => WindowsStop::Service,
             };
             Stop { source }
@@ -674,10 +672,8 @@ impl Stop {
             }
             WindowsStop::Console(None) => std::future::pending().await,
             WindowsStop::Service => {
-                let _ = tokio::task::spawn_blocking(
-                    asterism_core::windows_host::wait_service_stop,
-                )
-                .await;
+                let _ = tokio::task::spawn_blocking(asterism_core::windows_host::wait_service_stop)
+                    .await;
             }
         }
     }

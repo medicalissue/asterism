@@ -496,11 +496,7 @@ fn prepare_delegated_root(root: &Path) -> Result<()> {
             );
         }
     }
-    fs::write(
-        root.join("cgroup.subtree_control"),
-        "+cpu +memory +pids",
-    )
-    .with_context(|| {
+    fs::write(root.join("cgroup.subtree_control"), "+cpu +memory +pids").with_context(|| {
         format!(
             "enabling cpu/memory/pids in delegated cgroup {}",
             root.display()
@@ -1422,7 +1418,10 @@ fn install_fd_links(rootfs: &Path) -> Result<()> {
         let path = dev.join(name);
         match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.is_dir() => {
-                bail!("container device link target {} is a directory", path.display())
+                bail!(
+                    "container device link target {} is a directory",
+                    path.display()
+                )
             }
             Ok(_) => fs::remove_file(&path)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -2140,7 +2139,10 @@ mod tests {
             Instant::now() + Duration::from_secs(1),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("without a response"), "{error:#}");
+        assert!(
+            error.to_string().contains("without a response"),
+            "{error:#}"
+        );
         server.join().unwrap();
     }
 

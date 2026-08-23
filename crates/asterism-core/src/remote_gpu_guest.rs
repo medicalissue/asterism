@@ -24,16 +24,28 @@
 //! root. The host adapter talks to local `astd` over the existing unix
 //! socket. `astd` carries the work over the authenticated orbit mesh.
 
+#[cfg(unix)]
 use std::collections::{HashMap, VecDeque};
-use std::fs::{self, File};
+use std::fs;
+#[cfg(unix)]
+use std::fs::File;
 use std::io::{self, BufRead, Read, Write};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(unix)]
 use std::sync::mpsc::{self, Receiver, SyncSender};
+#[cfg(unix)]
 use std::sync::{Arc, Condvar, Mutex};
+#[cfg(unix)]
 use std::thread;
 
 use data_encoding::BASE64;
@@ -43,6 +55,7 @@ use sha2::{Digest, Sha256};
 use crate::remote_gpu::{
     self as gpu, AbiRange, BufferRange, ErrorCode, Reply, Request, Response, MAX_WIRE_FRAME_BYTES,
 };
+#[cfg(unix)]
 use crate::remote_gpu_cuse;
 
 /// How status and diagnostics name the projection that is actually running.
@@ -606,6 +619,7 @@ pub fn nvidia_ioctl_is_refused(request: u64) -> bool {
 
 /// True when this host could register a CUSE node. Absence is not a skip of
 /// the Unix-endpoint fixture; production Linux guests require CUSE.
+#[cfg(unix)]
 pub fn linux_cuse_available() -> bool {
     Path::new("/dev/cuse").exists()
 }
@@ -616,6 +630,7 @@ pub fn linux_cuse_available() -> bool {
 /// materializes the guest-visible node. When `/dev/cuse` is absent the
 /// portable Unix-domain fixture is bound. The kind always names the
 /// mechanism that is actually running.
+#[cfg(unix)]
 pub fn project_guest_device(guest_root: &Path) -> io::Result<GuestDevice> {
     let directory = guest_root.join("dev");
     fs::create_dir_all(&directory)?;
@@ -646,18 +661,21 @@ pub fn project_guest_device(guest_root: &Path) -> io::Result<GuestDevice> {
     })
 }
 
+#[cfg(unix)]
 enum GuestInner {
     Unix(UnixListener),
     Cuse(remote_gpu_cuse::CuseService),
 }
 
 /// A projected `/dev/nvidia0` that can be connected to.
+#[cfg(unix)]
 pub struct GuestDevice {
     pub path: PathBuf,
     pub kind: GuestDeviceKind,
     inner: GuestInner,
 }
 
+#[cfg(unix)]
 impl GuestDevice {
     pub fn path(&self) -> &Path {
         &self.path
@@ -676,17 +694,20 @@ impl GuestDevice {
     }
 }
 
+#[cfg(unix)]
 impl Drop for GuestDevice {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
 }
 
+#[cfg(unix)]
 enum ShimTransport {
     Unix(UnixStream),
     Char(File),
 }
 
+#[cfg(unix)]
 impl ShimTransport {
     fn try_clone(&self) -> io::Result<Self> {
         match self {
@@ -721,6 +742,7 @@ impl ShimTransport {
     }
 }
 
+#[cfg(unix)]
 impl Read for ShimTransport {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
@@ -738,6 +760,7 @@ impl Read for ShimTransport {
     }
 }
 
+#[cfg(unix)]
 impl Write for ShimTransport {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         loop {
@@ -764,6 +787,7 @@ impl Write for ShimTransport {
 
 /// Generated libcuda client: connects to the projected endpoint and issues
 /// CUDA Driver calls as framed [`GuestFrame`]s.
+#[cfg(unix)]
 pub struct GuestShim {
     writer: Arc<Mutex<ShimTransport>>,
     reader: Option<ShimTransport>,
@@ -774,18 +798,21 @@ pub struct GuestShim {
     control_tx: Option<SyncSender<GuestReply>>,
 }
 
+#[cfg(unix)]
 #[derive(Default)]
 struct PendingReplies {
     by_id: HashMap<u64, SyncSender<GuestReply>>,
     order: VecDeque<u64>,
 }
 
+#[cfg(unix)]
 #[derive(Default)]
 struct FlowControl {
     available: u32,
     closed: bool,
 }
 
+#[cfg(unix)]
 impl GuestShim {
     pub fn connect(device: &Path) -> io::Result<Self> {
         let metadata = fs::metadata(device)?;
@@ -943,6 +970,7 @@ impl GuestShim {
     }
 }
 
+#[cfg(unix)]
 fn take_credit(flow: &Arc<(Mutex<FlowControl>, Condvar)>) -> Result<(), GuestError> {
     let (state, ready) = &**flow;
     let mut state = state
@@ -960,6 +988,7 @@ fn take_credit(flow: &Arc<(Mutex<FlowControl>, Condvar)>) -> Result<(), GuestErr
     Ok(())
 }
 
+#[cfg(unix)]
 fn return_credit(flow: &Arc<(Mutex<FlowControl>, Condvar)>) {
     let (state, ready) = &**flow;
     if let Ok(mut state) = state.lock() {
@@ -968,6 +997,7 @@ fn return_credit(flow: &Arc<(Mutex<FlowControl>, Condvar)>) {
     }
 }
 
+#[cfg(unix)]
 fn remove_pending(pending: &Arc<Mutex<PendingReplies>>, id: u64) {
     if let Ok(mut pending) = pending.lock() {
         pending.by_id.remove(&id);
@@ -977,6 +1007,7 @@ fn remove_pending(pending: &Arc<Mutex<PendingReplies>>, id: u64) {
     }
 }
 
+#[cfg(unix)]
 fn dispatch_replies(
     mut reader: ShimTransport,
     pending: Arc<Mutex<PendingReplies>>,

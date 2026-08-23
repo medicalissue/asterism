@@ -102,9 +102,10 @@ impl Spec {
             let home = spec.home.take().unwrap_or_else(crate::paths::home_dir);
             std::fs::create_dir_all(&home)
                 .with_context(|| format!("creating service home {}", home.display()))?;
-            spec.home = Some(std::fs::canonicalize(&home).with_context(|| {
-                format!("canonicalizing service home {}", home.display())
-            })?);
+            spec.home = Some(
+                std::fs::canonicalize(&home)
+                    .with_context(|| format!("canonicalizing service home {}", home.display()))?,
+            );
             Ok(spec)
         }
         #[cfg(not(windows))]

@@ -270,8 +270,7 @@ fn commit_inner(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<()> {
     //    behind is exactly what a `kill -9` here would leave, and
     //    `sweep_temporaries` is what removes both.
     faults::check(faults::Point::Rename, path)?;
-    rename_write_through(&tmp, path)
-        .with_context(|| format!("committing {}", path.display()))?;
+    rename_write_through(&tmp, path).with_context(|| format!("committing {}", path.display()))?;
 
     // 4. Make the rename itself survive power loss. Until this returns, the
     //    directory entry is a promise the drive has not made.
@@ -492,12 +491,12 @@ pub fn publish_rename(from: &Path, to: &Path) -> Result<()> {
         .with_context(|| format!("putting {} at {}", from.display(), to.display()))?;
     #[cfg(not(windows))]
     {
-    let source_dir = from.parent().unwrap_or_else(|| Path::new("."));
-    let dest_dir = to.parent().unwrap_or_else(|| Path::new("."));
-    sync_dir(dest_dir).with_context(|| format!("flushing {}", dest_dir.display()))?;
-    if source_dir != dest_dir {
-        sync_dir(source_dir).with_context(|| format!("flushing {}", source_dir.display()))?;
-    }
+        let source_dir = from.parent().unwrap_or_else(|| Path::new("."));
+        let dest_dir = to.parent().unwrap_or_else(|| Path::new("."));
+        sync_dir(dest_dir).with_context(|| format!("flushing {}", dest_dir.display()))?;
+        if source_dir != dest_dir {
+            sync_dir(source_dir).with_context(|| format!("flushing {}", source_dir.display()))?;
+        }
     }
     Ok(())
 }

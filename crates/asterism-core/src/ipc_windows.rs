@@ -592,7 +592,9 @@ fn home_for_socket(sock: &Path) -> PathBuf {
     if crate::paths::socket_path() == sock {
         configured
     } else {
-        sock.parent().unwrap_or_else(|| Path::new(".")).to_path_buf()
+        sock.parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
     }
 }
 

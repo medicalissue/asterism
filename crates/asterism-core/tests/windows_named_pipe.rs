@@ -226,7 +226,10 @@ fn revert_failure_is_fail_stop_in_a_subprocess() {
         .env(CHILD_MODE, "revert-failure")
         .output()
         .unwrap();
-    assert!(!output.status.success(), "RevertToSelf failure returned alive");
+    assert!(
+        !output.status.success(),
+        "RevertToSelf failure returned alive"
+    );
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("fatal: RevertToSelf failed"),
         "fail-stop diagnostic was missing: {}",

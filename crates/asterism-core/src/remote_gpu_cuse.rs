@@ -349,9 +349,8 @@ fn unique_devname() -> String {
 fn wait_for_node(path: &Path) -> io::Result<()> {
     let until = std::time::Instant::now() + Duration::from_secs(2);
     while std::time::Instant::now() < until {
-        let accessible = CString::new(path.as_os_str().as_bytes()).is_ok_and(|path| unsafe {
-            libc::access(path.as_ptr(), libc::R_OK | libc::W_OK) == 0
-        });
+        let accessible = CString::new(path.as_os_str().as_bytes())
+            .is_ok_and(|path| unsafe { libc::access(path.as_ptr(), libc::R_OK | libc::W_OK) == 0 });
         if path.exists() && accessible {
             return Ok(());
         }
