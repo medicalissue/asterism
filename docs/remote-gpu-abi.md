@@ -10,11 +10,12 @@ admission, placement, lease, revocation, health and recovery control plane is
 described in [remote-gpu-production.md](remote-gpu-production.md). The
 fail-closed NVIDIA two-device gate is in
 [remote-gpu-nvidia-gate.md](remote-gpu-nvidia-gate.md). It is not
-yet a production NVIDIA device implementation. The proof projects a regular file at
-`<guest-root>/dev/nvidia0`, opens it as guest software would, and carries the
-device operations to a separate provider process. A production Linux guest
-projection still needs a guest driver/CUSE device and CUDA library adapter,
-and production execution still needs a CUDA-backed provider.
+yet a hardware CUDA implementation. The original loopback proof still
+projects a regular file so the vector-add harness stays portable. The
+production guest projection is a CUSE character device (or a Unix-domain
+endpoint in source fixtures) at `/dev/nvidia0` plus generated `libcuda.so.1`;
+see [remote-gpu-guest.md](remote-gpu-guest.md). Production execution still
+needs a CUDA-backed provider and is not claimed here.
 
 ## Run the proof
 

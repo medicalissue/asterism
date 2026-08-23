@@ -3,12 +3,15 @@
 The remote GPU ABI now has a production control-plane seam in
 `asterism_core::remote_gpu`. It makes a GPU an orbit part while preserving the
 guest contract: software inside an attached Linux instance sees
-`/dev/nvidia0`, not a provider hostname, relay URL, or mesh session.
+`/dev/nvidia0` as a projected local endpoint (CUSE character device plus
+generated `libcuda.so.1`), not a provider hostname, relay URL, or mesh
+session. The durable `GpuAttachment` record is still token-free metadata;
+the executable projection lives in [`remote-gpu-guest.md`](remote-gpu-guest.md).
 
-This change deliberately does not claim that a CUDA provider or Linux
-CUSE/library projection exists when it does not. `Executor::Reference` remains
-the portable semantic proof. A provider may advertise `Executor::Cuda` only
-when its executor actually launches the pinned work on NVIDIA hardware.
+`Executor::Reference` remains the portable semantic executor. A provider may
+advertise `Executor::Cuda` only when its executor actually launches the
+pinned work on NVIDIA hardware. This document does not claim that hardware
+path.
 
 ## Admission and placement
 
