@@ -64,6 +64,9 @@ jobs:
           ASTERISM_BUILD_ID: ${{ github.sha }}
         run: cargo check --locked --bin astd --bin ast --bin astd-hyperv
 
+      - name: Exercise named-pipe transport and OS peer admission
+        run: cargo test --locked --package asterism-core --features windows-ipc-conformance --test windows_named_pipe -- --test-threads=1
+
       - name: Console Ctrl-C exits without an SCM waiter hang
         env:
           ASTERISM_BUILD_ID: ${{ github.sha }}

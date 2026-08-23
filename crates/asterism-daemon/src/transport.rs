@@ -24,13 +24,13 @@ use std::io;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+#[cfg(windows)]
+use asterism_core::ipc::{Listener as LocalListener, ServerStream as LocalStream};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[cfg(windows)]
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::io::{ReadHalf as OwnedReadHalf, WriteHalf as OwnedWriteHalf};
 #[cfg(unix)]
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-#[cfg(windows)]
-use tokio::net::{TcpListener as LocalListener, TcpStream as LocalStream};
 #[cfg(unix)]
 use tokio::net::{UnixListener as LocalListener, UnixStream as LocalStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -53,11 +53,14 @@ impl Door {
     /// Win the election, bind, and be ready to accept.
     pub(crate) fn open(home: &std::path::Path, sock: &std::path::Path) -> Result<Door> {
         let (listener, lock, sock) = ipc::Door::open(home, sock)?.into_parts();
-        listener
-            .set_nonblocking(true)
-            .context("putting the astd socket in non-blocking mode")?;
-        let listener = LocalListener::from_std(listener)
-            .with_context(|| format!("serving {}", sock.display()))?;
+        #[cfg(unix)]
+        let listener = {
+            listener
+                .set_nonblocking(true)
+                .context("putting the astd socket in non-blocking mode")?;
+            LocalListener::from_std(listener)
+                .with_context(|| format!("serving {}", sock.display()))?
+        };
         Ok(Door {
             listener,
             slots: Arc::new(Semaphore::new(ipc::MAX_CONNECTIONS)),
@@ -74,7 +77,14 @@ impl Door {
     /// keep every other one out. The examination is [`admit`], on the task
     /// that will serve the connection.
     pub(crate) async fn accept(&self) -> io::Result<LocalStream> {
-        self.listener.accept().await.map(|(stream, _)| stream)
+        #[cfg(unix)]
+        {
+            self.listener.accept().await.map(|(stream, _)| stream)
+        }
+        #[cfg(windows)]
+        {
+            self.listener.accept().await
+        }
     }
 
     pub(crate) fn slots(&self) -> Arc<Semaphore> {
@@ -107,7 +117,10 @@ pub(crate) struct Admitted {
 /// than fixes.
 pub(crate) async fn admit(stream: LocalStream, slots: Arc<Semaphore>) -> Result<Option<Admitted>> {
     let peer = ipc::admit_peer(&stream);
+    #[cfg(unix)]
     let (read, write) = stream.into_split();
+    #[cfg(windows)]
+    let (read, write) = tokio::io::split(stream);
     let mut write = Writer { inner: write };
 
     if let Err(e) = peer {
