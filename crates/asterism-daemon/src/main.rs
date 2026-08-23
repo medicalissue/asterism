@@ -133,7 +133,7 @@ fn main() -> Result<()> {
             apply_service_home_from_args();
             return asterism_core::windows_host::dispatch_service(
                 asterism_core::windows_host::SERVICE_NAME,
-                || runtime().block_on(run_daemon()),
+                || runtime().block_on(run_daemon(StopSource::Service)),
             );
         }
         #[cfg(not(windows))]
@@ -144,7 +144,7 @@ fn main() -> Result<()> {
             );
         }
     }
-    runtime().block_on(run_daemon())
+    runtime().block_on(run_daemon(StopSource::Console))
 }
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -154,7 +154,7 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("tokio runtime")
 }
 
-async fn run_daemon() -> Result<()> {
+async fn run_daemon(stop_source: StopSource) -> Result<()> {
     // Before anything: the signals that mean "stop". Registering one is what
     // makes it ours — until then the default disposition applies, and for
     // both of these that is death with nothing tidied up. The socket is
@@ -164,7 +164,7 @@ async fn run_daemon() -> Result<()> {
     // for the next daemon to trip over. `ast` sends exactly that `SIGTERM`
     // when it retires a daemon across an upgrade, and it sends it as soon as
     // the socket answers — which is inside the window.
-    let mut stop = Stop::listen();
+    let mut stop = Stop::listen(stop_source);
 
     let home = paths::home_dir();
     // Everything this daemon remembers is in here, and until now it was
@@ -458,17 +458,33 @@ fn sweep_interrupted_commits() {
 /// of `main`, before the socket exists, because a signal that arrives before
 /// its handler does is not a shutdown — it is the default disposition, which
 /// is death, and a daemon killed that way leaves both files behind.
+#[derive(Clone, Copy)]
+enum StopSource {
+    Console,
+    #[cfg(windows)]
+    Service,
+}
+
 struct Stop {
+    #[cfg(windows)]
+    source: WindowsStop,
     #[cfg(unix)]
     term: Option<tokio::signal::unix::Signal>,
     #[cfg(unix)]
     int: Option<tokio::signal::unix::Signal>,
 }
 
+#[cfg(windows)]
+enum WindowsStop {
+    Console(Option<tokio::signal::windows::CtrlC>),
+    Service,
+}
+
 impl Stop {
-    fn listen() -> Stop {
+    fn listen(source: StopSource) -> Stop {
         #[cfg(unix)]
         {
+            let StopSource::Console = source;
             use tokio::signal::unix::{signal, SignalKind};
             Stop {
                 term: signal(SignalKind::terminate()).ok(),
@@ -477,13 +493,23 @@ impl Stop {
         }
         #[cfg(windows)]
         {
-            Stop {}
+            let source = match source {
+                // Constructing the listener here registers the console handler
+                // before startup mutates state, matching the Unix contract.
+                StopSource::Console => {
+                    WindowsStop::Console(tokio::signal::windows::ctrl_c().ok())
+                }
+                StopSource::Service => WindowsStop::Service,
+            };
+            Stop { source }
         }
     }
 
-    /// Wait for a unix signal or the SCM stop latch. The latch is what
-    /// `astd --service` actually shuts down on: a flag nobody waits on
-    /// leaves SCM STOP as TerminateProcess.
+    /// Wait only for the source that owns this process. A console daemon must
+    /// never start the blocking SCM waiter: dropping its join handle after
+    /// Ctrl-C does not cancel it, and Tokio waits for blocking tasks while
+    /// dropping the runtime. Conversely, an SCM worker has no console signal
+    /// to race and waits only for STOP/SHUTDOWN.
     async fn next(&mut self) {
         #[cfg(unix)]
         {
@@ -491,9 +517,17 @@ impl Stop {
         }
 
         #[cfg(windows)]
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = tokio::task::spawn_blocking(asterism_core::windows_host::wait_service_stop) => {}
+        match &mut self.source {
+            WindowsStop::Console(Some(ctrl_c)) => {
+                let _ = ctrl_c.recv().await;
+            }
+            WindowsStop::Console(None) => std::future::pending().await,
+            WindowsStop::Service => {
+                let _ = tokio::task::spawn_blocking(
+                    asterism_core::windows_host::wait_service_stop,
+                )
+                .await;
+            }
         }
     }
 
