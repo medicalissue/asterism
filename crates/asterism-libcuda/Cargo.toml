@@ -1,0 +1,15 @@
+[package]
+name = "asterism-libcuda"
+description = "Generated CUDA Driver ABI shim injected as libcuda.so.1 in a guest."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "cuda"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+asterism-core.workspace = true

@@ -244,14 +244,13 @@ $ ast update apply --yes
 
 ## Roadmap
 
-The remote GPU part presents `/dev/nvidia0` inside an instance. Its versioned
-CUDA-semantic ABI and runnable reference proof are in
-[docs/remote-gpu-abi.md](docs/remote-gpu-abi.md); production placement,
-identity-bound leases, quotas, revocation and restart fencing are in
-[docs/remote-gpu-production.md](docs/remote-gpu-production.md). The real CUDA
-two-device gate (fail-closed driver/CUDA matrix, harness, and no-cost dstack
-plan) is in [docs/remote-gpu-nvidia-gate.md](docs/remote-gpu-nvidia-gate.md).
-The portable reference executor is not NVIDIA hardware evidence.
+The remote GPU part presents `/dev/nvidia0` inside an instance as a projected
+local endpoint (CUSE character device plus generated `libcuda.so.1`) and
+carries CUDA-semantic frames over the authenticated orbit mesh. See
+[docs/remote-gpu-guest.md](docs/remote-gpu-guest.md),
+[docs/remote-gpu-abi.md](docs/remote-gpu-abi.md), and
+[docs/remote-gpu-production.md](docs/remote-gpu-production.md). The portable
+reference executor is not NVIDIA hardware evidence.
 
 ## Build from source
 
