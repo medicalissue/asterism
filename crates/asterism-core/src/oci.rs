@@ -1680,6 +1680,11 @@ fn container_utility_init_with_module(config: &Config, shares: &[Share], module:
          \x20 i=$((i + 1))\n\
          done\n\
          [ -n \"$payload\" ] || powerdown\n\
+         if ! echo \"$child\" > /sys/fs/cgroup/asterism/cgroup.procs ||\n\
+         \x20  ! echo \"$payload\" > /sys/fs/cgroup/asterism/cgroup.procs; then\n\
+         \x20 echo 'asterism: could not place the entrypoint in its cgroup'\n\
+         \x20 powerdown\n\
+         fi\n\
          echo go > /run/asterism-userns-go\n\
          i=0\n\
          while [ $i -lt 500 ] && [ ! -f /run/asterism-payload-ready ]; do\n\
@@ -1692,11 +1697,6 @@ fn container_utility_init_with_module(config: &Config, shares: &[Share], module:
          \x20 powerdown\n\
          fi\n\
          $BB rm -f /run/asterism-userns-go /run/asterism-payload-ready\n\
-         if ! echo \"$child\" > /sys/fs/cgroup/asterism/cgroup.procs ||\n\
-         \x20  ! echo \"$payload\" > /sys/fs/cgroup/asterism/cgroup.procs; then\n\
-         \x20 echo 'asterism: could not place the entrypoint in its cgroup'\n\
-         \x20 powerdown\n\
-         fi\n\
          echo \"$payload\" > \"$CTL/child\"\n\
          echo \"/proc/$payload/ns/user\" > \"$CTL/ns_user\"\n\
          echo \"/proc/$payload/ns/mnt\" > \"$CTL/ns_mnt\"\n\
@@ -2573,6 +2573,14 @@ mod tests {
         assert!(script.contains("umount \"$EXEC\""));
         assert!(script.contains("mkfifo \"$EXEC/out\" \"$EXEC/err\""));
         assert!(!script.contains("/run/asterism-exec-out"));
+        let entrypoint_cgroup = script
+            .find("if ! echo \"$child\" > /sys/fs/cgroup/asterism/cgroup.procs")
+            .unwrap();
+        let entrypoint_go = script.find("echo go > /run/asterism-userns-go").unwrap();
+        assert!(
+            entrypoint_cgroup < entrypoint_go,
+            "the initial payload enters cgroup2 before it may exec or fork"
+        );
         let cgroup_first = script
             .find("(if ! echo 0 > /sys/fs/cgroup/asterism/cgroup.procs")
             .unwrap();
