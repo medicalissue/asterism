@@ -1261,11 +1261,22 @@ impl Mesh {
 
     /// Which device holds the row for `name`, if any reachable one does.
     pub async fn locate(self: &Arc<Self>, name: &str) -> Result<Option<String>> {
+        // A fenced source is not an authority.  Suppressing it makes a
+        // coordinator restart converge on a target that already adopted at a
+        // higher epoch, rather than selecting the source by device-name sort.
+        // If a pre-existing bad state did leave two unfenced copies, choose
+        // the later move epoch deterministically; equal epochs remain the
+        // ordinary collision case and retain the stable device-name tie-break.
         Ok(self
             .find(name)
             .await
             .into_iter()
-            .next()
+            .filter(|(_, instance)| instance.moving.is_none())
+            .max_by(|(a_device, a), (b_device, b)| {
+                a.move_epoch
+                    .cmp(&b.move_epoch)
+                    .then_with(|| b_device.cmp(a_device))
+            })
             .map(|(device, _)| device))
     }
 

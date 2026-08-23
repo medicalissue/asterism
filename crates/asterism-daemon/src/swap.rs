@@ -422,7 +422,7 @@ pub(crate) fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Response
             tokio::task::block_in_place(|| commit_source(reg, &name, epoch))
         }
         Request::MoveAbortSource { name, epoch } => abort_source(reg, &name, epoch),
-        Request::MoveAbortTarget { name, epoch } => abort_target(&name, epoch),
+        Request::MoveAbortTarget { name, epoch } => abort_target(reg, &name, epoch),
         other => Response::Error {
             message: format!("{other:?} is not a step of a move"),
         },
@@ -507,6 +507,11 @@ pub fn prepare(reg: &mut Shard, name: &str, to_device: &str, epoch: u64) -> Resp
 pub fn commit_source(reg: &mut Shard, name: &str, epoch: u64) -> Response {
     let inst = match reg.get(name).cloned() {
         Ok(inst) => inst,
+        // The durable moved note is written before the source row is removed.
+        // It is therefore also the receipt for a repeated source commit after
+        // a reply was lost, or after a coordinator restarted at precisely the
+        // wrong point.  A different note is not evidence about this move.
+        Err(_) if moved_to(name, epoch).is_some() => return Response::Ok,
         Err(e) => return error(e),
     };
     let Some(moving) = inst.moving.clone() else {
@@ -523,12 +528,17 @@ pub fn commit_source(reg: &mut Shard, name: &str, epoch: u64) -> Response {
         ));
     }
 
+    // This is the source's durable acknowledgement.  Do it before removing
+    // the row: a crash anywhere after it is safe to retry, while a crash
+    // before it still leaves the source fenced.
+    if let Err(e) = remember_move(name, &moving.to_device, epoch) {
+        return error(e);
+    }
     if let Err(e) = reg.remove(name).and_then(|_| reg.save()) {
         return error(e);
     }
     crate::persist::forget(name);
     let _ = std::fs::remove_dir_all(paths::instance_dir(name));
-    remember_move(name, &moving.to_device, epoch);
     Response::Ok
 }
 
@@ -779,11 +789,32 @@ pub fn commit_target(
 ) -> Response {
     let name = manifest.instance.name.clone();
     let staging = staging_dir(&name, epoch);
+    let live = paths::instance_dir(&name);
+
+    // A reply can disappear after the target durably adopted the row.  The
+    // retry must acknowledge that exact adoption rather than treating the
+    // now-absent staging directory as a failed transfer and reopening the
+    // source.  Anything else at this name remains a hard refusal.
+    if let Ok(existing) = reg.get(&name) {
+        if existing.id == manifest.instance.id
+            && existing.cpu_device == device
+            && existing.move_epoch == epoch
+            && existing.moving.is_none()
+            && live.is_dir()
+        {
+            return Response::Instance {
+                instance: existing.clone(),
+                guest_health: None,
+            };
+        }
+        return error(anyhow!(
+            "device {device} already has a different move state for {name:?}; refusing to adopt it again"
+        ));
+    }
     if let Err(e) = verify(&staging, manifest, epoch) {
         return error(e);
     }
 
-    let live = paths::instance_dir(&name);
     if live.exists() {
         return error(anyhow!(
             "device {device} already has an instance directory at {} — refusing to \
@@ -810,7 +841,11 @@ pub fn commit_target(
             staging.display()
         ));
     }
-    let _ = std::fs::remove_file(Receipt::path(&live));
+    // Keep the durable transition receipt in the live directory.  It is the
+    // target's fence while the source still owns a fenced row, and deleting
+    // it before the source's durable revoke would turn a lost reply into an
+    // indistinguishable failed move.  It is plumbing, so it never migrates
+    // again with a later move.
 
     let mut adopted = manifest.instance.clone();
     adopted.cpu_device = device.to_owned();
@@ -887,7 +922,18 @@ fn verify(staging: &Path, manifest: &MoveManifest, epoch: u64) -> Result<()> {
 }
 
 /// Delete a staging directory. What an abort owes the target.
-pub fn abort_target(name: &str, epoch: u64) -> Response {
+///
+/// A successful abort is the proof the coordinator needs before it may ask
+/// the source to lift its fence.  Never manufacture that proof once this
+/// target has adopted a row, a live directory, or either has survived a
+/// crash independently of the other.
+pub fn abort_target(reg: &Shard, name: &str, epoch: u64) -> Response {
+    let live = paths::instance_dir(name);
+    if reg.get(name).is_ok() || live.exists() {
+        return error(anyhow!(
+            "target still owns {name:?} at move epoch {epoch}; refusing to report a rollback that did not happen"
+        ));
+    }
     let staging = staging_dir(name, epoch);
     match std::fs::remove_dir_all(&staging) {
         Ok(()) | Err(_) => Response::Ok,
@@ -914,7 +960,12 @@ fn load_notes() -> BTreeMap<String, MovedNote> {
         .unwrap_or_default()
 }
 
-fn remember_move(name: &str, to_device: &str, epoch: u64) {
+fn moved_to(name: &str, epoch: u64) -> Option<MovedNote> {
+    let note = load_notes().get(name).cloned()?;
+    (note.epoch == epoch && now_unix().saturating_sub(note.at) < NOTE_TTL_SECS).then_some(note)
+}
+
+fn remember_move(name: &str, to_device: &str, epoch: u64) -> Result<()> {
     let mut notes = load_notes();
     let now = now_unix();
     notes.retain(|_, note| now.saturating_sub(note.at) < NOTE_TTL_SECS);
@@ -930,7 +981,8 @@ fn remember_move(name: &str, to_device: &str, epoch: u64) {
     // `ast status` at the old device, and losing it costs a redirect, not an
     // instance. It is still committed durably, because the alternative is a
     // torn file that the next read has to treat as a lost note anyway.
-    let _ = durable::commit_json(&notes_path(), &notes);
+    durable::commit_json(&notes_path(), &notes)
+        .context("recording the source's durable move acknowledgement")
 }
 
 /// What this device has to say about an instance it no longer holds.
@@ -1097,7 +1149,13 @@ pub async fn run(
     if let Err(e) = outcome {
         // Nothing the target staged is bootable and nothing has been written
         // to its shard, so this is a tidy-up rather than a rollback.
-        let _ = ask(
+        // The source fence is authority, not cosmetic cleanup.  Only lift it
+        // after the target has *proved* it rolled back.  In particular, a
+        // lost target success reply makes MoveAbortTarget refuse (the adopted
+        // row/live directory remains), which deliberately leaves the source
+        // fenced for an idempotent commit retry instead of creating two live
+        // authorities.
+        let rolled_back = match ask(
             device,
             Request::MoveAbortTarget {
                 name: name.to_owned(),
@@ -1106,21 +1164,32 @@ pub async fn run(
             node,
             mesh,
         )
-        .await;
-        let _ = ask(
-            &source,
-            Request::MoveAbortSource {
-                name: name.to_owned(),
-                epoch,
-            },
-            node,
-            mesh,
-        )
-        .await;
-        io.send(&line(format!(
-            "the move did not happen — {source} still supplies {name}'s cpu"
-        )))
-        .await?;
+        .await
+        {
+            Ok(response) => expect_ok(response).is_ok(),
+            Err(_) => false,
+        };
+        if rolled_back {
+            let _ = ask(
+                &source,
+                Request::MoveAbortSource {
+                    name: name.to_owned(),
+                    epoch,
+                },
+                node,
+                mesh,
+            )
+            .await;
+            io.send(&line(format!(
+                "the move did not happen — {source} still supplies {name}'s cpu"
+            )))
+            .await?;
+        } else {
+            io.send(&line(format!(
+                "{name} remains fenced on {source}: target recovery must be retried before any source rollback"
+            )))
+            .await?;
+        }
         return Err(e);
     }
 
@@ -1152,23 +1221,23 @@ async fn transfer_and_commit(
 
     // The target checks what arrived against the manifest and only then does
     // a second copy of this instance exist anywhere.
-    expect_instance(
-        ask(
-            device,
-            Request::MoveCommitTarget {
-                manifest: Box::new(manifest.clone()),
-                epoch,
-            },
-            node,
-            mesh,
-        )
-        .await?,
+    let target_reply = ask(
+        device,
+        Request::MoveCommitTarget {
+            manifest: Box::new(manifest.clone()),
+            epoch,
+        },
+        node,
+        mesh,
     )
-    .with_context(|| format!("{device} would not adopt {name:?}"))?;
+    .await?;
+    move_failpoint("lost-target-ack")?;
+    expect_instance(target_reply).with_context(|| format!("{device} would not adopt {name:?}"))?;
     io.send(&line(format!(
         "{device} has it, verified against the manifest"
     )))
     .await?;
+    move_failpoint("post-target-ack-crash")?;
 
     // Past this point the move has happened. A source that will not answer
     // now leaves a stale copy rather than losing one, and the epoch on the
@@ -1196,9 +1265,30 @@ async fn transfer_and_commit(
     Ok(())
 }
 
+/// Deterministic recovery injection for the two acknowledgement windows.
+/// It is opt-in and deliberately narrow: a comma-separated value in
+/// `ASTERISM_MOVE_FAILPOINT` makes the named boundary return an error, which
+/// exercises the ordinary recovery path without a timing race.
+fn move_failpoint(name: &str) -> Result<()> {
+    let enabled = std::env::var("ASTERISM_MOVE_FAILPOINT").unwrap_or_default();
+    if enabled.split(',').map(str::trim).any(|point| point == name) {
+        bail!("injected move failpoint: {name}");
+    }
+    Ok(())
+}
+
 /// Which device holds this instance's row, in the orbit's own words.
 async fn locate(name: &str, node: &Node, mesh: &Arc<Mesh>) -> Result<String> {
-    if node.shard.lock().await.holds(name) {
+    let local_authoritative = {
+        let local = node.shard.lock().await;
+        // A fenced source is deliberately suppressed after restart: it is
+        // evidence of an in-flight handoff, not permission to reactivate the
+        // old authority.  The orbit lookup can then find an adopted target;
+        // if none answers, the caller gets a safe refusal rather than the
+        // source row being selected merely because it is local.
+        matches!(local.get(name), Ok(instance) if instance.moving.is_none())
+    };
+    if local_authoritative {
         return Ok(node.device_name().await);
     }
     mesh.locate(name)
