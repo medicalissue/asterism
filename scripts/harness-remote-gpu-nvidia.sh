@@ -92,6 +92,8 @@ echo "runner_digest=$RUNNER_DIGEST"
 RUN="$(mktemp -d "${TMPDIR:-/tmp}/asterism-nvidia-release.XXXXXX")"
 trap 'rm -rf "$RUN"' EXIT
 RUNNER_EVIDENCE="$RUN/runner.evidence"
+RUNNER_BUNDLE="$RUN/runner.bundle.json"
+RUNNER_VERIFIER="$RUN/runner.evidence.verifier"
 EVIDENCE="$RUN/release.evidence"
 
 # Runner contract: run a CUDA application inside the Asterism guest/container,
@@ -105,8 +107,16 @@ EVIDENCE="$RUN/release.evidence"
   --first-gpu-uuid "${UUIDS[0]}" \
   --second-gpu-uuid "${UUIDS[1]}"
 [ -s "$RUNNER_EVIDENCE" ] || fail "runner produced no evidence"
+[ -s "$RUNNER_BUNDLE" ] || fail "runner produced no authenticated transcript bundle"
+[ -x "$RUNNER_VERIFIER" ] || fail "runner produced no transcript verifier"
 nvidia_gate_validate_runner_evidence "$RUNNER_EVIDENCE" \
   || fail "runner evidence is incomplete or contains forbidden keys"
+DRIVER_DIGEST="$(nvidia_gate_require_kv "$RUNNER_EVIDENCE" driver_digest)"
+VERIFIER_DIGEST="$(shasum -a 256 "$RUNNER_VERIFIER" | awk '{print "sha256:"$1}')"
+[ "$DRIVER_DIGEST" = "$VERIFIER_DIGEST" ] \
+  || fail "transcript verifier does not match the pinned driver digest"
+"$RUNNER_VERIFIER" verify --bundle "$RUNNER_BUNDLE" \
+  || fail "authenticated transcript verification failed"
 
 {
   echo "candidate_sha=$CANDIDATE_SHA"
@@ -116,6 +126,7 @@ nvidia_gate_validate_runner_evidence "$RUNNER_EVIDENCE" \
   echo "second_gpu_uuid=${UUIDS[1]}"
   echo "driver_version=$DRIVER"
   echo "cuda_runtime_version=$CUDA"
+  echo "provenance_verified=true"
   sed -n '/^[a-z_][a-z_]*=/p' "$RUNNER_EVIDENCE"
 } >"$EVIDENCE"
 

@@ -1,0 +1,20 @@
+[package]
+name = "asterism-nvidia-e2e-driver"
+description = "Pinned real-NVIDIA release-gate process driver."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "asterism-nvidia-e2e-driver"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+asterism-core.workspace = true
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.11"
+uuid.workspace = true

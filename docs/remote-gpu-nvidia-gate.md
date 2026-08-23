@@ -21,7 +21,9 @@ filed as NVIDIA hardware evidence.
 | `crates/asterism-core/src/remote_gpu_nvidia.rs` | Fail-closed driver/CUDA/CC matrix and deterministic two-device harness |
 | `crates/asterism-core/examples/remote_gpu_nvidia_harness.rs` | Source runner for the contract; always prints `hardware_cuda_executed=false` |
 | `scripts/harness-remote-gpu-nvidia.sh` | Hardware wrapper: independently observes SHA/tree/GPU inventory, invokes the pinned-tree E2E runner, and judges its closed evidence schema |
-| `scripts/lib/nvidia-e2e-runner.sh` | Fail-closed adapter to the candidate-built process driver; never fabricates evidence or falls back to reference/local-direct CUDA |
+| `crates/asterism-nvidia-e2e-driver` | Compiled process driver and verifier for hash-chained daemon/helper/guest/route transcripts; refuses synthetic or reference records |
+| `scripts/lib/nvidia-e2e-runner.sh` | Builds the driver, daemon, ABI shim, and guest payload from the clean pinned checkout in a private target directory |
+| `scripts/lib/nvidia-guest-container.sh` | Runs the payload in a digest-pinned read-only container with only projected `/dev/nvidia0` and the audited libcuda mounted |
 | `scripts/lib/guest_remote_cuda_vector_add.c` | CUDA application payload intended to execute inside the Asterism guest/container |
 | `scripts/test-nvidia-release-gate.sh` | Source-only fixtures proving reference, local-direct, stale PID, bearer, Conflict-skew, and hardware-false records are refused |
 | `deploy/dstack/remote-gpu-nvidia.dstack.yml` | Provider-side dstack **task** config. Do not apply from development machines. |
@@ -67,16 +69,17 @@ The matching dstack 0.21.2 CLI validated the task against project `main` at
 
 - 1 on-demand host
 - 2× NVIDIA GPUs, 16 GB+ each, CC 7.5+
-- driver 550+, CUDA 12.4–13.x (dstack default image is CUDA 13.0 + `nvcc: true`)
+- driver 550+, CUDA 12.4–13.x (the provider image is pinned to the CUDA 13.0 development-image digest)
 - `max_price: 2.50` USD/hour
 - `max_duration: 1h`, `idle_duration: 5m`, `retry: false`
 - expected wall clock 20–40 minutes
 - expected spend **about 1–3 USD** if applied once and stopped
 
 The plan reported no fleets, so submission is blocked without spending. The
-pinned-tree runner also refuses execution unless the integrated candidate has
-built `target/release/asterism-nvidia-e2e-driver`; absence cannot fall through
-to a reference or host-direct path.
+pinned-tree runner performs a clean locked release build in a private temporary
+target directory. No environment variable can replace the driver, daemon,
+guest payload, ABI shim, provider image, or guest image. Missing build or
+container prerequisites fail closed.
 
 Preferred SKUs when offers are healthy: 2× L4 24 GB, 2× RTX 4090 24 GB, or
 2× A10 24 GB. Do not use V100/P100; CUDA 13 images do not support them and
@@ -100,6 +103,8 @@ IDs, driver, CUDA runtime, and route kind:
 - provider astd, helper, and guest PID changes across real restarts
 - fresh-session version skew returning `UnsupportedVersion`, never `Conflict`
 - exact candidate SHA, tree digest, runner digest, guest/provider image digests
+- exact driver, ABI shim, and guest-binary digests plus a hash-chained transcript root
+- a second verifier invocation whose executable digest equals the recorded driver digest
 - unsupported driver/CUDA matrix fail-closed
 - `hardware_cuda_executed=true` only from that run
 

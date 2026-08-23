@@ -18,10 +18,10 @@
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #ifndef CU_SUCCESS
@@ -53,6 +53,7 @@ static const char *kPtx =
     ".version 7.0\n"
     ".target sm_50\n"
     ".address_size 64\n"
+    "\n"
     ".visible .entry vector_add_f32(\n"
     "    .param .u64 lhs,\n"
     "    .param .u64 rhs,\n"
@@ -101,11 +102,11 @@ int main(void) {
         libcuda_path = "libcuda.so.1";
     }
 
-    int fd = open(device_path, O_RDWR);
-    if (fd < 0) {
-        fail("open projected /dev/nvidia0");
+    struct stat projected;
+    if (stat(device_path, &projected) != 0 ||
+        (!S_ISSOCK(projected.st_mode) && !S_ISCHR(projected.st_mode))) {
+        fail("projected /dev/nvidia0 is not a local endpoint");
     }
-    close(fd);
     printf("guest_visible_device=%s\n", device_path);
 
     void *lib = dlopen(libcuda_path, RTLD_NOW);
