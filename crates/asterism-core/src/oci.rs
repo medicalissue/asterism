@@ -1221,6 +1221,7 @@ pub fn init_script(config: &Config) -> String {
         &Egress::default(),
         &Bootstrap::default(),
         None,
+        None,
     )
 }
 
@@ -1236,6 +1237,7 @@ fn init_script_with_parts(
     share_kind: Option<ShareKind>,
     egress: &Egress,
     bootstrap: &Bootstrap,
+    gpu_boot: Option<&str>,
     virtiofs_module: Option<&[u8]>,
 ) -> String {
     let mut s = String::new();
@@ -1454,6 +1456,10 @@ fn init_script_with_parts(
                > /var/log/asterism-bootstrap.log 2>&1) &\n",
         );
     }
+    if let Some(gpu_boot) = gpu_boot {
+        s.push_str("# Materialize the attached guest-local GPU projection.\n");
+        s.push_str(gpu_boot);
+    }
     if let Some(dir) = &config.workdir {
         s.push_str(&format!(
             "$BB mkdir -p {0} 2>/dev/null\ncd {0} || exit 1\n",
@@ -1504,6 +1510,7 @@ pub fn configure_instance(
     share_kind: Option<ShareKind>,
     egress: &Egress,
     bootstrap: &Bootstrap,
+    gpu_boot: Option<&str>,
 ) -> Result<()> {
     if shares.is_empty() != share_kind.is_none() {
         bail!("an OCI directory share needs exactly one guest transport");
@@ -1549,6 +1556,7 @@ pub fn configure_instance(
         share_kind,
         egress,
         bootstrap,
+        gpu_boot,
         module.as_deref(),
     );
     rewrite_guest_files(root, &init)
@@ -2259,12 +2267,15 @@ mod tests {
             handles: vec![("EXAMPLE_TOKEN".into(), "ast-handle-opaque".into())],
         };
         let bootstrap = Bootstrap::resolve(&["base".to_owned()]).unwrap();
+        let gpu_boot = "$BB mkdir -p /usr/local/sbin\n\
+                        echo gpu-service > /usr/local/sbin/asterism-gpu-guest\n";
         let script = init_script_with_parts(
             &config,
             &shares,
             Some(ShareKind::NinePfs),
             &egress,
             &bootstrap,
+            Some(gpu_boot),
             None,
         );
         let dir = tempfile::tempdir().unwrap();
@@ -2282,6 +2293,14 @@ mod tests {
         assert!(script.contains("export EXAMPLE_TOKEN='ast-handle-opaque'"));
         assert!(script.contains("export HTTPS_PROXY='http://10.0.2.2:38123'"));
         assert!(script.contains("SSL_CERT_FILE='/.asterism/ca-bundle.pem'"));
+        assert!(script.contains("Materialize the attached guest-local GPU projection"));
+        assert!(script.contains("/usr/local/sbin/asterism-gpu-guest"));
+        assert!(
+            script.find("asterism-gpu-guest").unwrap()
+                < script
+                    .find("asterism: starting the image entrypoint")
+                    .unwrap()
+        );
         assert!(
             script.contains("udhcpc -n -q") && script.contains("-s /asterism-init"),
             "the same init can DHCP on vz"
@@ -2328,6 +2347,7 @@ mod tests {
             None,
             &Egress::default(),
             &Bootstrap::default(),
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -2381,10 +2401,10 @@ mod tests {
             handles: vec![("EXAMPLE_TOKEN".into(), "ast-handle-opaque".into())],
         };
         let bootstrap = Bootstrap::resolve(&["base".to_owned()]).unwrap();
-        configure_instance(&source, &root, &[], None, &egress, &bootstrap).unwrap();
+        configure_instance(&source, &root, &[], None, &egress, &bootstrap, None).unwrap();
         assert!(dir.path().join("oci-config.json").exists());
         std::fs::remove_file(source.with_extension("json")).unwrap();
-        configure_instance(&source, &root, &[], None, &egress, &bootstrap)
+        configure_instance(&source, &root, &[], None, &egress, &bootstrap, None)
             .expect("a moved instance carries its private OCI config");
         let init = output(
             Command::new(&debugfs)

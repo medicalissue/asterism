@@ -201,7 +201,9 @@ enum MeshRequest {
     /// and generation. Subsequent frames are [`GpuMeshFrame`]s.
     Gpu {
         instance_id: String,
+        provider_gpu_uuid: String,
         provider_generation: u64,
+        memory_bytes: u64,
     },
     /// Hand this stream to a block volume's NBD export and stop framing it.
     ///
@@ -947,7 +949,9 @@ impl Mesh {
         self: &Arc<Self>,
         device: &str,
         instance_id: &str,
+        provider_gpu_uuid: &str,
         provider_generation: u64,
+        memory_bytes: u64,
         io: &'a mut ClientIo<'b>,
     ) -> Result<()> {
         let peer = self.device(device).await?;
@@ -957,7 +961,9 @@ impl Mesh {
             &mut stream.send,
             &MeshRequest::Gpu {
                 instance_id: instance_id.to_owned(),
+                provider_gpu_uuid: provider_gpu_uuid.to_owned(),
                 provider_generation,
+                memory_bytes,
             },
         )
         .await?;
@@ -3412,10 +3418,20 @@ async fn serve_stream(
         }
         MeshRequest::Gpu {
             instance_id,
+            provider_gpu_uuid,
             provider_generation,
+            memory_bytes,
         } => {
-            return crate::gpu::serve_mesh(stream, peer, &node, instance_id, provider_generation)
-                .await
+            return crate::gpu::serve_mesh(
+                stream,
+                peer,
+                &node,
+                instance_id,
+                provider_gpu_uuid,
+                provider_generation,
+                memory_bytes,
+            )
+            .await
         }
         MeshRequest::VolumeSplice {
             volume,

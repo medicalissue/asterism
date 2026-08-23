@@ -255,6 +255,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "asterism-gpu-guest"
+version = "0.0.2"
+dependencies = [
+ "anyhow",
+ "asterism-core",
+ "libc",
+]
+
+[[package]]
 name = "asterism-libcuda"
 version = "0.0.2"
 dependencies = [

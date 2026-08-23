@@ -1,0 +1,16 @@
+[package]
+name = "asterism-gpu-guest"
+description = "Guest-side CUSE and vsock service for Asterism GPU projection."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "asterism-gpu-guest"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+asterism-core.workspace = true
+libc = "0.2"

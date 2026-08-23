@@ -2396,6 +2396,7 @@ mod tests {
                 direct_kernel: false,
                 port_forward: false,
                 guest_egress: None,
+                guest_gpu_projection: false,
                 disk_formats: &[DiskFormat::Raw],
             }
         }

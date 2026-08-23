@@ -19,9 +19,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::remote_gpu::ABI_VERSION;
-use crate::remote_gpu_guest::{
-    ioctl_disposition, IoctlDisposition, ASTERISM_IOCTL_MAGIC, DEFAULT_CREDIT_WINDOW,
-};
+use crate::remote_gpu_guest::{ioctl_disposition, IoctlDisposition, DEFAULT_CREDIT_WINDOW};
 
 const FUSE_OPEN: u32 = 14;
 const FUSE_READ: u32 = 15;
@@ -40,6 +38,7 @@ const FUSE_OUT_HEADER_LEN: usize = 16;
 const ENOSYS: i32 = 38;
 const ENOTTY: i32 = 25;
 const EIO: i32 = 5;
+const EAGAIN: i32 = 11;
 
 /// Encode a CUSE_INIT userspace reply. Tests assert the layout without
 /// opening `/dev/cuse`.
@@ -115,6 +114,7 @@ pub struct CuseService {
     host_devname: String,
     accept_rx: Mutex<Receiver<UnixStream>>,
     stop: Arc<AtomicBool>,
+    wake: UnixStream,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -152,12 +152,13 @@ impl CuseService {
         std::os::unix::fs::symlink(&host_node, guest_nvidia0)?;
 
         let (accept_tx, accept_rx) = mpsc::sync_channel(DEFAULT_CREDIT_WINDOW as usize);
+        let (wake_read, wake) = UnixStream::pair()?;
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
         let thread = thread::Builder::new()
             .name("asterism-cuse-nvidia0".into())
             .spawn(move || {
-                let _ = serve_cuse(cuse, accept_tx, thread_stop);
+                let _ = serve_cuse(cuse, wake_read, accept_tx, thread_stop);
             })?;
 
         Ok(Self {
@@ -165,6 +166,7 @@ impl CuseService {
             host_devname: devname,
             accept_rx: Mutex::new(accept_rx),
             stop,
+            wake,
             thread: Some(thread),
         })
     }
@@ -195,6 +197,10 @@ impl CuseService {
 impl Drop for CuseService {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        // The service thread polls this socket beside /dev/cuse. Waking it
+        // makes teardown bounded even when the kernel has no pending CUSE
+        // request; merely setting an atomic cannot wake a blocking read.
+        let _ = self.wake.write_all(&[1]);
         let _ = fs::remove_file(&self.guest_path);
         let _ = fs::remove_file(format!("/dev/{}", self.host_devname));
         if let Some(thread) = self.thread.take() {
@@ -240,12 +246,17 @@ fn read_one_request(dev: &mut File) -> io::Result<(u32, u32, u64)> {
 
 fn serve_cuse(
     mut dev: File,
+    wake: UnixStream,
     accept_tx: SyncSender<UnixStream>,
     stop: Arc<AtomicBool>,
 ) -> io::Result<()> {
     let mut fhs: HashMap<u64, UnixStream> = HashMap::new();
     let mut next_fh = 1u64;
     while !stop.load(Ordering::SeqCst) {
+        if !wait_for_cuse_or_stop(dev.as_raw_fd(), wake.as_raw_fd())? || stop.load(Ordering::SeqCst)
+        {
+            break;
+        }
         let mut header = [0u8; FUSE_IN_HEADER_LEN];
         match dev.read_exact(&mut header) {
             Ok(()) => {}
@@ -272,13 +283,18 @@ fn serve_cuse(
                     let _ = b.set_nonblocking(false);
                     let fh = next_fh;
                     next_fh = next_fh.saturating_add(1);
-                    fhs.insert(fh, a);
-                    let _ = accept_tx.send(b);
-                    let mut payload = Vec::new();
-                    payload.extend_from_slice(&fh.to_le_bytes());
-                    payload.extend_from_slice(&0u32.to_le_bytes());
-                    payload.extend_from_slice(&0u32.to_le_bytes());
-                    encode_fuse_ok(unique, &payload)
+                    if accept_tx.try_send(b).is_err() {
+                        // Never block the only CUSE thread on a full accept
+                        // queue: Drop must always be able to wake and join it.
+                        encode_fuse_error(unique, EAGAIN)
+                    } else {
+                        fhs.insert(fh, a);
+                        let mut payload = Vec::new();
+                        payload.extend_from_slice(&fh.to_le_bytes());
+                        payload.extend_from_slice(&0u32.to_le_bytes());
+                        payload.extend_from_slice(&0u32.to_le_bytes());
+                        encode_fuse_ok(unique, &payload)
+                    }
                 }
                 Err(_) => encode_fuse_error(unique, EIO),
             },
@@ -288,16 +304,14 @@ fn serve_cuse(
                 } else {
                     let fh = u64::from_le_bytes(rest[0..8].try_into().unwrap());
                     let size = u32::from_le_bytes(rest[16..20].try_into().unwrap()) as usize;
-                    let data = rest.get(40..40 + size).unwrap_or(&[]);
+                    let data = rest.get(40..40 + size);
                     match fhs.get_mut(&fh) {
-                        Some(stream) => {
-                            let _ = stream.write_all(data);
-                            let mut payload = Vec::new();
-                            payload.extend_from_slice(&(data.len() as u32).to_le_bytes());
-                            payload.extend_from_slice(&0u32.to_le_bytes());
-                            encode_fuse_ok(unique, &payload)
+                        Some(stream) if data.is_some() => {
+                            let data = data.expect("checked");
+                            cuse_write_reply(stream, unique, data)
                         }
                         None => encode_fuse_error(unique, EIO),
+                        Some(_) => encode_fuse_error(unique, EIO),
                     }
                 }
             }
@@ -308,19 +322,7 @@ fn serve_cuse(
                     let fh = u64::from_le_bytes(rest[0..8].try_into().unwrap());
                     let size = u32::from_le_bytes(rest[16..20].try_into().unwrap()) as usize;
                     match fhs.get_mut(&fh) {
-                        Some(stream) => {
-                            let mut buf = vec![0u8; size.min(4 * 1024 * 1024)];
-                            match stream.read(&mut buf) {
-                                Ok(n) => {
-                                    buf.truncate(n);
-                                    encode_fuse_ok(unique, &buf)
-                                }
-                                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                                    encode_fuse_ok(unique, &[])
-                                }
-                                Err(_) => encode_fuse_error(unique, EIO),
-                            }
-                        }
+                        Some(stream) => cuse_read_reply(stream, unique, size),
                         None => encode_fuse_error(unique, EIO),
                     }
                 }
@@ -336,7 +338,7 @@ fn serve_cuse(
                 let cmd = if rest.len() >= 16 {
                     u32::from_le_bytes(rest[12..16].try_into().unwrap()) as u64
                 } else {
-                    u64::from(ASTERISM_IOCTL_MAGIC) << 8
+                    0
                 };
                 let (result, data) = ioctl_cuse_reply(cmd);
                 if result < 0 {
@@ -351,7 +353,23 @@ fn serve_cuse(
                     encode_fuse_ok(unique, &payload)
                 }
             }
-            FUSE_FLUSH | FUSE_INTERRUPT | FUSE_POLL => encode_fuse_ok(unique, &[]),
+            FUSE_FLUSH | FUSE_INTERRUPT => encode_fuse_ok(unique, &[]),
+            FUSE_POLL => {
+                // fuse_poll_in carries fh at 0 and requested event bits at
+                // 20. Report only readiness the socket actually has; an
+                // empty generic success has the wrong wire shape and causes
+                // clients to busy-loop or miss readable replies.
+                if rest.len() < 24 {
+                    encode_fuse_error(unique, EIO)
+                } else {
+                    let fh = u64::from_le_bytes(rest[0..8].try_into().unwrap());
+                    let requested = u32::from_le_bytes(rest[20..24].try_into().unwrap());
+                    match fhs.get(&fh) {
+                        Some(stream) => cuse_poll_reply(stream, unique, requested),
+                        None => encode_fuse_error(unique, EIO),
+                    }
+                }
+            }
             _ => encode_fuse_error(unique, ENOSYS),
         };
         if dev.write_all(&reply).is_err() {
@@ -359,6 +377,78 @@ fn serve_cuse(
         }
     }
     Ok(())
+}
+
+fn wait_for_cuse_or_stop(cuse_fd: RawFd, wake_fd: RawFd) -> io::Result<bool> {
+    loop {
+        let mut fds = [
+            libc::pollfd {
+                fd: cuse_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: wake_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) };
+        if ready < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if fds[1].revents & libc::POLLIN != 0 {
+            return Ok(false);
+        }
+        if fds[0].revents & libc::POLLIN != 0 {
+            return Ok(true);
+        }
+    }
+}
+
+fn cuse_write_reply(stream: &mut UnixStream, unique: u64, data: &[u8]) -> Vec<u8> {
+    if stream.write_all(data).is_err() {
+        return encode_fuse_error(unique, EIO);
+    }
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    encode_fuse_ok(unique, &payload)
+}
+
+fn cuse_read_reply(stream: &mut UnixStream, unique: u64, size: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; size.min(4 * 1024 * 1024)];
+    match stream.read(&mut buf) {
+        Ok(n) => {
+            buf.truncate(n);
+            encode_fuse_ok(unique, &buf)
+        }
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+            // A successful zero-byte read is EOF. No reply is available yet,
+            // so preserve the stream and tell the caller to retry.
+            encode_fuse_error(unique, EAGAIN)
+        }
+        Err(_) => encode_fuse_error(unique, EIO),
+    }
+}
+
+fn cuse_poll_reply(stream: &UnixStream, unique: u64, requested: u32) -> Vec<u8> {
+    let mut fd = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: (requested & u16::MAX as u32) as i16,
+        revents: 0,
+    };
+    if unsafe { libc::poll(&mut fd, 1, 0) } < 0 {
+        return encode_fuse_error(unique, EIO);
+    }
+    let mut payload = Vec::with_capacity(8);
+    payload.extend_from_slice(&(fd.revents as u16 as u32).to_le_bytes());
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    encode_fuse_ok(unique, &payload)
 }
 
 /// Expose the CUSE fd so tests can prove we opened `/dev/cuse`, not a marker.
@@ -374,6 +464,7 @@ pub fn cuse_fd_is_character(fd: RawFd) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::remote_gpu_guest::ASTERISM_IOCTL_MAGIC;
 
     #[test]
     fn cuse_init_out_carries_devname_and_unrestricted_ioctl() {
@@ -401,6 +492,44 @@ mod tests {
         let (result, data) = ioctl_cuse_reply(contract);
         assert_eq!(result, 0);
         assert_eq!(data, ABI_VERSION.to_le_bytes());
+
+        let unknown_contract = (u64::from(ASTERISM_IOCTL_MAGIC) << 8) | 2;
+        let (result, data) = ioctl_cuse_reply(unknown_contract);
+        assert_eq!(result, -ENOTTY);
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn wake_fd_interrupts_an_idle_cuse_wait() {
+        let (cuse_read, _cuse_write) = UnixStream::pair().unwrap();
+        let (wake_read, mut wake_write) = UnixStream::pair().unwrap();
+        wake_write.write_all(&[1]).unwrap();
+        assert!(!wait_for_cuse_or_stop(cuse_read.as_raw_fd(), wake_read.as_raw_fd()).unwrap());
+    }
+
+    #[test]
+    fn cuse_stream_preserves_eagain_poll_read_and_write_semantics() {
+        let (mut service, mut client) = UnixStream::pair().unwrap();
+        service.set_nonblocking(true).unwrap();
+
+        let empty = cuse_read_reply(&mut service, 7, 128);
+        assert_eq!(i32::from_le_bytes(empty[4..8].try_into().unwrap()), -EAGAIN);
+
+        client.write_all(b"reply").unwrap();
+        let poll = cuse_poll_reply(&service, 8, libc::POLLIN as u32);
+        assert_eq!(i32::from_le_bytes(poll[4..8].try_into().unwrap()), 0);
+        let readiness = u32::from_le_bytes(poll[16..20].try_into().unwrap());
+        assert_ne!(readiness & libc::POLLIN as u32, 0);
+
+        let read = cuse_read_reply(&mut service, 9, 128);
+        assert_eq!(&read[FUSE_OUT_HEADER_LEN..], b"reply");
+
+        let write = cuse_write_reply(&mut service, 10, b"call");
+        assert_eq!(i32::from_le_bytes(write[4..8].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(write[16..20].try_into().unwrap()), 4);
+        let mut received = [0u8; 4];
+        client.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"call");
     }
 
     #[test]
