@@ -14,8 +14,7 @@
 # This is the CLI: `ast`, the `astd` daemon it starts, and `astd-vz`, the
 # code-signed helper that owns Virtualization.framework guests — without it
 # on the machine, `--backend vz` has nothing to run and Asterism falls back
-# to QEMU. The desktop app is a separate DMG — see
-# https://asterism.run/download.
+# to QEMU.
 #
 # Environment:
 #   ASTERISM_VERSION=v0.1.0   install exactly this tag (default: latest release)

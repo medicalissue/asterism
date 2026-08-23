@@ -81,7 +81,6 @@ v0.1.0/
   asterism-v0.1.0-sbom.cdx.json         # deterministic CycloneDX dependency SBOM
   asterism-v0.1.0-licenses.json         # deterministic third-party license manifest
   SHA256SUMS                            # hashes payloads, metadata, and formula
-  SHA256SUMS.sig                        # when a signing key exists
 ```
 
 The CLI tarball is flat on purpose: the installer unpacks it and expects `ast` and
