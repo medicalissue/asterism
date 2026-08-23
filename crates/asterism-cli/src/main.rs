@@ -16,9 +16,9 @@
 //! question about itself, and as the address for the commands that really are
 //! about devices: pairing, and the orbit's own membership.
 
+use asterism_core::ipc::Stream;
 use std::fs::File;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Seek, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -41,7 +41,9 @@ use asterism_core::ipc;
 use asterism_core::proc::{ProcId, Signal};
 use asterism_core::protocol::{self, Request, Response};
 use asterism_core::registry::OrbitRow;
-use asterism_core::{cow, doctor, image, oci, paths, service, snapshot, verify, VERSION};
+use asterism_core::{
+    cow, doctor, image, oci, paths, service, snapshot, verify, windows_host, VERSION,
+};
 
 #[derive(Parser)]
 #[command(
@@ -98,9 +100,9 @@ enum Command {
         #[arg(long, default_value = "20G")]
         disk: String,
         /// Hypervisor to run this instance on: `chv` (Cloud Hypervisor/KVM),
-        /// `vz` (Apple Virtualization.framework), or `qemu` (compatibility).
-        /// Omit it to select this device's native capable backend. Recorded
-        /// on the instance and used for every later boot.
+        /// `vz` (Apple Virtualization.framework), native `hyperv` on Windows,
+        /// or `qemu` (compatibility). Omit it to select this device's first
+        /// capable native backend. Recorded and used for every later boot.
         #[arg(long, value_name = "NAME")]
         backend: Option<String>,
         /// Bootstrap profile to apply at first boot (`ast profiles` lists
@@ -514,8 +516,11 @@ enum Command {
     /// where this device keeps its state and what is running. Nothing here
     /// contacts another device and nothing here prints a secret.
     Bugreport,
-    /// Check whether this host can run Asterism: service, linger, sleep
-    /// inhibition, secret storage, and (on Linux) the pinned VMM helpers.
+    /// Read-only host capability report: service, sleep, secrets, native VMM
+    /// helpers, and the Windows Hyper-V/firewall gate.
+    ///
+    /// Refuses nothing and changes nothing. A machine that cannot run
+    /// Asterism still gets a report saying exactly which check failed.
     Doctor,
 }
 
@@ -2621,11 +2626,7 @@ fn device_shell(device: &str, words: &[String], force_pty: bool) -> Result<()> {
 
     let stdin_is_terminal = std::io::stdin().is_terminal();
     let pty = force_pty || (words.is_empty() && stdin_is_terminal);
-    let (cols, rows) = if pty {
-        terminal_size(libc::STDIN_FILENO)
-    } else {
-        (0, 0)
-    };
+    let (cols, rows) = if pty { terminal_size() } else { (0, 0) };
     let command = (!words.is_empty()).then(|| words.join(" "));
     let open = ShellOpen {
         command,
@@ -2646,7 +2647,7 @@ fn device_shell(device: &str, words: &[String], force_pty: bool) -> Result<()> {
     }
 
     let raw = if pty && stdin_is_terminal {
-        Some(RawTerminal::enter(libc::STDIN_FILENO)?)
+        Some(RawTerminal::enter()?)
     } else {
         None
     };
@@ -2695,10 +2696,10 @@ fn device_shell(device: &str, words: &[String], force_pty: bool) -> Result<()> {
         let resize_requests = requests.clone();
         let stop = stop_resize.clone();
         std::thread::spawn(move || {
-            let mut previous = terminal_size(libc::STDIN_FILENO);
+            let mut previous = terminal_size();
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(100));
-                let now = terminal_size(libc::STDIN_FILENO);
+                let now = terminal_size();
                 if now != previous {
                     previous = now;
                     let _ = resize_requests.try_send(Request::DeviceShellResize {
@@ -2788,7 +2789,9 @@ fn shell_environment() -> Vec<ShellEnv> {
     result
 }
 
-fn terminal_size(fd: libc::c_int) -> (u16, u16) {
+#[cfg(unix)]
+fn terminal_size() -> (u16, u16) {
+    let fd = libc::STDIN_FILENO;
     let mut size = libc::winsize {
         ws_row: 0,
         ws_col: 0,
@@ -2806,13 +2809,24 @@ fn terminal_size(fd: libc::c_int) -> (u16, u16) {
     }
 }
 
+#[cfg(windows)]
+fn terminal_size() -> (u16, u16) {
+    // The protocol still carries a bounded initial size on Windows. Raw
+    // console mode is intentionally left to a future native shell adapter;
+    // the current Windows daemon refuses device-shell sessions explicitly.
+    (80, 24)
+}
+
+#[cfg(unix)]
 struct RawTerminal {
     fd: libc::c_int,
     saved: libc::termios,
 }
 
+#[cfg(unix)]
 impl RawTerminal {
-    fn enter(fd: libc::c_int) -> Result<Self> {
+    fn enter() -> Result<Self> {
+        let fd = libc::STDIN_FILENO;
         let mut saved = std::mem::MaybeUninit::<libc::termios>::uninit();
         // SAFETY: saved points to valid storage and fd is the terminal already
         // identified by IsTerminal.
@@ -2831,12 +2845,23 @@ impl RawTerminal {
     }
 }
 
+#[cfg(unix)]
 impl Drop for RawTerminal {
     fn drop(&mut self) {
         // SAFETY: saved came from this descriptor and remains initialized.
         unsafe {
             libc::tcsetattr(self.fd, libc::TCSANOW, &self.saved);
         }
+    }
+}
+
+#[cfg(windows)]
+struct RawTerminal;
+
+#[cfg(windows)]
+impl RawTerminal {
+    fn enter() -> Result<Self> {
+        Ok(Self)
     }
 }
 
@@ -3291,7 +3316,7 @@ fn send(request: &Request) -> Result<Response> {
 /// One connection to this device's daemon, and the wire version it is being
 /// spoken at.
 struct Client {
-    stream: UnixStream,
+    stream: Stream,
     /// The version both ends settled on. Every frame sent on this connection
     /// is at or below it.
     spoken: u32,
@@ -3409,7 +3434,7 @@ impl Client {
 /// answer *this* is wedged rather than busy — and since it goes in front of
 /// every command, a hang here is a hang everywhere with nothing on the screen
 /// to say so.
-fn handshake() -> Result<(UnixStream, DaemonFacts)> {
+fn handshake() -> Result<(Stream, DaemonFacts)> {
     let stream = connect()?;
     stream.set_read_timeout(Some(ipc::HANDSHAKE_DEADLINE))?;
     let ours = compat::ours();
@@ -3476,10 +3501,10 @@ fn write_line<W: Write>(mut out: W, request: &Request) -> Result<()> {
 /// daemon, rather than something a second user on the machine put there, is a
 /// thing to establish rather than assume. See
 /// [`asterism_core::ipc::audit_socket`].
-fn connect() -> Result<UnixStream> {
+fn connect() -> Result<Stream> {
     let sock = paths::socket_path();
     if ipc::audit_socket(&sock)? == ipc::SocketState::Ready {
-        if let Ok(stream) = UnixStream::connect(&sock) {
+        if let Ok(stream) = ipc::connect(&sock) {
             return Ok(stream);
         }
         // A socket file with nobody behind it: a daemon died without tidying
@@ -3497,10 +3522,10 @@ fn connect() -> Result<UnixStream> {
 /// astd's own election closes that from its side; this closes it from ours,
 /// so the storm never leaves the ground. Whoever holds this lock starts the
 /// daemon and waits for it, and everyone behind them finds it already up.
-fn start_daemon(sock: &std::path::Path) -> Result<UnixStream> {
+fn start_daemon(sock: &std::path::Path) -> Result<Stream> {
     let _turn = spawn_turn();
     // Whoever held the lock before us has already started one.
-    if let Ok(stream) = UnixStream::connect(sock) {
+    if let Ok(stream) = ipc::connect(sock) {
         return Ok(stream);
     }
     spawn_daemon()?;
@@ -3598,8 +3623,8 @@ fn timed_out(e: &anyhow::Error) -> bool {
 /// line-delimited JSON in both directions already, so this is the same wire —
 /// just a conversation on it rather than a question.
 struct Conversation {
-    write: UnixStream,
-    read: BufReader<UnixStream>,
+    write: Stream,
+    read: BufReader<Stream>,
 }
 
 impl Conversation {
@@ -3631,10 +3656,10 @@ impl Conversation {
     }
 }
 
-fn wait_for_socket(sock: &std::path::Path) -> Result<UnixStream> {
+fn wait_for_socket(sock: &std::path::Path) -> Result<Stream> {
     let mut attempt = 0;
     loop {
-        match UnixStream::connect(sock) {
+        match ipc::connect(sock) {
             Ok(s) => return Ok(s),
             Err(e) if attempt >= 50 => return Err(e).context("astd did not come up"),
             Err(_) => {
@@ -3750,22 +3775,38 @@ fn spawn_daemon() -> Result<()> {
 
 /// astd normally sits next to the ast binary; fall back to PATH.
 fn daemon_path() -> Result<std::path::PathBuf> {
+    let names: &[&str] = if cfg!(windows) {
+        &["astd.exe", "astd"]
+    } else {
+        &["astd", "astd.exe"]
+    };
     if let Ok(me) = std::env::current_exe() {
-        let sibling = me.with_file_name("astd");
-        if sibling.exists() {
-            return Ok(sibling);
+        for name in names {
+            let sibling = me.with_file_name(name);
+            if sibling.exists() {
+                return Ok(sibling);
+            }
         }
     }
-    Ok(std::path::PathBuf::from("astd"))
+    Ok(std::path::PathBuf::from(names[0]))
 }
 
 fn exec_daemon() -> anyhow::Error {
-    use std::os::unix::process::CommandExt;
     let astd = match daemon_path() {
         Ok(p) => p,
         Err(e) => return e,
     };
-    std::process::Command::new(astd).exec().into()
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        std::process::Command::new(astd).exec().into()
+    }
+    #[cfg(windows)]
+    match std::process::Command::new(astd).status() {
+        Ok(status) if status.success() => anyhow::anyhow!("astd exited"),
+        Ok(status) => anyhow::anyhow!("astd exited with {status}"),
+        Err(e) => e.into(),
+    }
 }
 
 // ---- identity --------------------------------------------------------------
@@ -3828,7 +3869,7 @@ fn print_version() -> Result<()> {
 /// report should do: "is astd running" is one of the facts being collected,
 /// and collecting it must not change it.
 fn running_daemon() -> Option<(String, Option<String>)> {
-    let stream = UnixStream::connect(paths::socket_path()).ok()?;
+    let stream = ipc::connect(&paths::socket_path()).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
     let mut writer = stream.try_clone().ok()?;
     // Serialized from the type rather than written out by hand: the wire
@@ -3863,7 +3904,7 @@ fn running_daemon() -> Option<(String, Option<String>)> {
 /// `Client::open`: a bug report observes whether a daemon exists and must not
 /// make one exist while collecting that answer.
 fn send_to_running(request: &Request) -> Option<Response> {
-    let mut stream = UnixStream::connect(paths::socket_path()).ok()?;
+    let mut stream = ipc::connect(&paths::socket_path()).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
     stream
         .set_write_timeout(Some(Duration::from_secs(3)))
@@ -3878,7 +3919,16 @@ fn send_to_running(request: &Request) -> Option<Response> {
 /// macOS app bundle has one place; a report that guessed at several would
 /// have to explain which one it found.
 fn gui_binary() -> std::path::PathBuf {
-    std::path::PathBuf::from("/Applications/Asterism.app/Contents/MacOS/asterism-gui")
+    if cfg!(windows) {
+        let mut path = std::env::var_os("LOCALAPPDATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Program Files"));
+        path.push("Asterism");
+        path.push("Asterism.exe");
+        path
+    } else {
+        std::path::PathBuf::from("/Applications/Asterism.app/Contents/MacOS/asterism-gui")
+    }
 }
 
 /// `ast bugreport`: everything worth pasting, and nothing that needs the
@@ -3955,6 +4005,18 @@ fn print_bugreport() -> Result<()> {
     }
     println!();
 
+    println!("[helper]");
+    match asterism_core::hyperv::discover_helper() {
+        Ok(path) => println!("astd-hyperv    {}", path.display()),
+        Err(e) => println!("astd-hyperv    not found ({e:#})"),
+    }
+    println!();
+
+    for line in windows_host::doctor().lines() {
+        println!("{line}");
+    }
+    println!();
+
     println!("[instances]");
     // This device's own shard, not the orbit: a bug report that went out on
     // the mesh would hang on a device that is asleep, which is exactly when
@@ -3985,6 +4047,7 @@ fn print_bugreport() -> Result<()> {
 }
 
 /// `ast doctor` — pass/fail host integration, not a bug report.
+#[cfg(not(windows))]
 fn print_doctor() -> Result<()> {
     let checks = doctor::run();
     for check in &checks {
@@ -4428,11 +4491,21 @@ fn update_command(cmd: UpdateCommand) -> Result<()> {
         .map(std::path::PathBuf::from)
         .or_else(|| {
             let prefix = ast.parent()?.parent()?;
+            // Prefer asterism-update.ps1 on Windows, then .exe, then the POSIX updater.
+            windows_host::update::first_reachable_updater(prefix)
+        })
+        .or_else(|| {
+            let prefix = ast.parent()?.parent()?;
             let path = prefix.join("libexec/asterism/asterism-update");
             path.is_file().then_some(path)
         })
         // A source checkout can exercise the same updater without installing
         // into the developer's prefix. Published binaries never need this.
+        .or_else(|| {
+            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../packaging/update.ps1");
+            path.is_file().then_some(path)
+        })
         .or_else(|| {
             let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../packaging/update.sh");
@@ -4444,7 +4517,21 @@ fn update_command(cmd: UpdateCommand) -> Result<()> {
             )
         })?;
 
-    let mut process = std::process::Command::new(&updater);
+    let is_powershell = updater
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("ps1"));
+    let mut process = if is_powershell {
+        let mut shell = std::process::Command::new(if cfg!(windows) {
+            "powershell.exe"
+        } else {
+            "pwsh"
+        });
+        shell.arg("-NoProfile").arg("-File").arg(&updater);
+        shell
+    } else {
+        std::process::Command::new(&updater)
+    };
     process.env("ASTERISM_UPDATE_AST_PATH", &ast);
     if std::env::var_os("ASTERISM_UPDATE_PUBKEY").is_none() {
         if let Some(pubkey) = option_env!("ASTERISM_UPDATE_PUBKEY") {
@@ -4463,7 +4550,7 @@ fn update_command(cmd: UpdateCommand) -> Result<()> {
         UpdateCommand::Apply { yes } => {
             process.arg("apply");
             if yes {
-                process.arg("--yes");
+                process.arg(if is_powershell { "-Yes" } else { "--yes" });
             }
         }
         UpdateCommand::Channel { name } => {
@@ -4489,7 +4576,7 @@ fn update_command(cmd: UpdateCommand) -> Result<()> {
 /// evidence, which is the same live-guest-preserving replacement exercised by
 /// the version-skew suite.
 fn activate_update(want_build: &str) -> Result<()> {
-    if UnixStream::connect(paths::socket_path()).is_ok() {
+    if ipc::connect(&paths::socket_path()).is_ok() {
         retire_stale_daemon()?;
     } else {
         spawn_daemon()?;
@@ -4552,6 +4639,20 @@ fn sync_update_entry(path: &Path, recursive: bool) -> Result<()> {
         .with_context(|| format!("opening updater path {}", path.display()))?
         .sync_all()
         .with_context(|| format!("syncing updater path {}", path.display()))
+}
+
+#[cfg(windows)]
+fn print_doctor() -> Result<()> {
+    let report = windows_host::doctor();
+    for line in report.lines() {
+        println!("{line}");
+    }
+    println!();
+    println!("{}", report.summary());
+    if !report.supported {
+        bail!("{}", report.summary());
+    }
+    Ok(())
 }
 
 // ---- service ---------------------------------------------------------------
@@ -5118,9 +5219,10 @@ mod tests {
             help.contains("`vz` (Apple Virtualization.framework)"),
             "{help}"
         );
+        assert!(help.contains("native `hyperv` on Windows"), "{help}");
         assert!(help.contains("`qemu` (compatibility)"), "{help}");
         assert!(
-            help.contains("select this device's native capable backend"),
+            help.contains("select this device's first capable native backend"),
             "{help}"
         );
     }

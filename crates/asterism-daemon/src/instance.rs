@@ -177,6 +177,13 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
                         "instance removal refused until every block-volume lease is released",
                     ));
                 }
+                if let Err(e) =
+                    backend::for_instance(&inst).and_then(|hv| hv.remove_instance_resources(&inst))
+                {
+                    return attach_response(
+                        Err(e).context("instance removal refused until backend cleanup completes"),
+                    );
+                }
                 // The instance directory goes below, and this instance's CA
                 // private key is in it.
                 egress::stop(&inst.name);

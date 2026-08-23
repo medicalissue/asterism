@@ -8,7 +8,7 @@
 //!
 //! Which backend runs an instance is decided **once, at create**, and
 //! recorded on the instance ([`asterism_core::hv::Machine`]). Two things
-//! follow: a device can run qemu and vz instances side by side, and an
+//! follow: a device can run qemu, vz, and hyperv instances side by side, and an
 //! instance never silently changes hypervisor underneath its disks.
 
 use std::path::Path;
@@ -21,9 +21,14 @@ use asterism_core::instance::{Instance, PortForward, RuntimeKind};
 use asterism_core::proc::{Evidence, Ownership, ProcId};
 use asterism_core::{image, paths, profile, seed};
 
+#[cfg(unix)]
 pub mod chv;
+pub mod hyperv;
+#[cfg(unix)]
 pub mod qemu;
+#[cfg(unix)]
 pub mod qmp;
+#[cfg(unix)]
 pub mod vz;
 
 #[cfg(test)]
@@ -33,27 +38,44 @@ mod conformance;
 ///
 /// Once, because [`Hypervisor::probe`] caches: rebuilding them per call
 /// would re-run tool discovery and `codesign` on every request the daemon
-/// serves.
+/// serves. Hyper-V is always registered: its helper protocol is portable and
+/// probe refuses on a host that is not Windows 11 Pro/Enterprise. Hiding it
+/// behind `cfg(windows)` would make Unix CI unable to see the product backend.
 fn backends() -> &'static [Arc<dyn Hypervisor>] {
     static BACKENDS: OnceLock<Vec<Arc<dyn Hypervisor>>> = OnceLock::new();
     BACKENDS
         .get_or_init(|| {
-            vec![
-                Arc::new(vz::Vz::new()),
-                Arc::new(chv::Chv::new()),
-                Arc::new(qemu::Qemu::new()),
-            ]
+            #[cfg(unix)]
+            {
+                vec![
+                    Arc::new(hyperv::HyperV::new()),
+                    Arc::new(vz::Vz::new()),
+                    Arc::new(chv::Chv::new()),
+                    Arc::new(qemu::Qemu::new()),
+                ]
+            }
+            #[cfg(windows)]
+            {
+                vec![Arc::new(hyperv::HyperV::new())]
+            }
         })
         .as_slice()
 }
 
 /// Default create order: native product backend first, QEMU last.
 ///
-/// VZ is the Mac path. Cloud Hypervisor is the Linux path. QEMU is the
-/// explicit compatibility backend on both and is never selected ahead of a
-/// native backend that can run the request.
+/// Hyper-V is the Windows path, VZ is the Mac path, and Cloud Hypervisor is
+/// the Linux path. QEMU is the explicit compatibility backend and is never
+/// selected ahead of a native backend that can run the request.
 fn default_backend_ids() -> &'static [&'static str] {
-    &[vz::ID, chv::ID, qemu::ID]
+    #[cfg(unix)]
+    {
+        &[vz::ID, chv::ID, qemu::ID]
+    }
+    #[cfg(windows)]
+    {
+        &[hyperv::ID]
+    }
 }
 
 /// A backend by its stable id, or the list of the ones that exist.
@@ -169,7 +191,7 @@ fn select_with(
 
     // Native product backends first. Capability or probe mismatches fall
     // through: OCI direct boot, loopback publishing and qcow2 base images
-    // all need facilities VZ does not currently expose, and CHV is Linux-only.
+    // need facilities some native backends do not expose.
     let mut refusals = Vec::new();
     for &id in default_backend_ids() {
         match resolve(id).and_then(|hv| runnable(hv, requirements)) {
@@ -186,8 +208,8 @@ fn select_with(
 /// Select and probe the backend for a create request.
 ///
 /// An explicit `--backend` is forced: its own probe or capability refusal is
-/// returned. The default tries the fastest/lightest capable backend now — VZ,
-/// then Cloud Hypervisor, then QEMU — and returns every reason if none can
+/// returned. The default tries Hyper-V, VZ, then Cloud Hypervisor before the
+/// portable QEMU path, and returns every refusal if none can
 /// run the request.
 pub fn select_for(requested: Option<&str>, requirements: CreateRequirements) -> Result<Machine> {
     select_with(requested, requirements, by_id)
@@ -480,23 +502,31 @@ pub(crate) fn grow(disk: &Path, disk_gib: u64) -> Result<()> {
 
 /// Executables a `qemu` handle may legitimately be holding. A family rather
 /// than a path, so upgrading qemu under a running guest does not orphan it.
+#[cfg(unix)]
 const QEMU_EXECS: &[&str] = &["qemu-system-*"];
 
 /// The vz helper. Matched by name because the daemon may have been upgraded
 /// (and its helper moved) while the guest kept running.
+#[cfg(unix)]
 const VZ_EXECS: &[&str] = &[asterism_vz::HELPER_BIN];
 
 /// The pinned Cloud Hypervisor helper. Matched by name so a daemon upgrade
 /// that moves the binary does not orphan a guest that kept running.
+#[cfg(unix)]
 const CHV_EXECS: &[&str] = &["cloud-hypervisor"];
 
 /// Which executables a handle for this backend may be holding, or `None` for
-/// a backend with no process of its own.
+/// a backend with no process of its own. Hyper-V guests are owned by HCS, not
+/// by a helper process that outlives astd.
 fn execs_for(backend: &str) -> Option<&'static [&'static str]> {
     match backend {
+        #[cfg(unix)]
         qemu::ID => Some(QEMU_EXECS),
+        #[cfg(unix)]
         vz::ID => Some(VZ_EXECS),
+        #[cfg(unix)]
         chv::ID => Some(CHV_EXECS),
+        hyperv::ID => None,
         _ => None,
     }
 }
@@ -525,9 +555,13 @@ fn instance_evidence(inst: &Instance, h: &Handle) -> Vec<std::path::PathBuf> {
     let dir = paths::instance_dir(&inst.name);
     let mut names = vec![h.ctl.path().to_owned()];
     match h.backend.as_str() {
+        #[cfg(unix)]
         qemu::ID => names.push(dir.join("qemu.pid")),
+        #[cfg(unix)]
         vz::ID => names.push(dir.join("vz.json")),
+        #[cfg(unix)]
         chv::ID => names.push(dir.join("chv.pid")),
+        hyperv::ID => names.push(dir.join("hyperv.json")),
         _ => {}
     }
     names
@@ -679,7 +713,14 @@ pub(crate) fn observed_running(h: &Handle) -> bool {
     if h.proc.is_some() || h.pid.is_none() {
         return false;
     }
-    std::os::unix::net::UnixStream::connect(h.ctl.path()).is_ok()
+    #[cfg(unix)]
+    {
+        std::os::unix::net::UnixStream::connect(h.ctl.path()).is_ok()
+    }
+    #[cfg(windows)]
+    {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -1042,6 +1083,7 @@ mod tests {
             assert_eq!(execs_for(qemu::ID), Some(QEMU_EXECS));
             assert_eq!(execs_for(vz::ID), Some(VZ_EXECS));
             assert_eq!(execs_for(chv::ID), Some(CHV_EXECS));
+            assert_eq!(execs_for(hyperv::ID), None);
             assert_eq!(VZ_EXECS, &["astd-vz"]);
             assert_eq!(CHV_EXECS, &["cloud-hypervisor"]);
         }
@@ -1056,6 +1098,7 @@ mod tests {
                 (qemu::ID, dir.join("qemu.pid")),
                 (vz::ID, dir.join("vz.json")),
                 (chv::ID, dir.join("chv.pid")),
+                (hyperv::ID, dir.join("hyperv.json")),
             ] {
                 let h = Handle {
                     backend: backend.into(),
@@ -1258,15 +1301,23 @@ mod tests {
         assert_eq!(by_id("qemu").unwrap().id(), "qemu");
         assert_eq!(by_id("vz").unwrap().id(), "vz");
         assert_eq!(by_id(chv::ID).unwrap().id(), chv::ID);
+        assert_eq!(by_id(hyperv::ID).unwrap().id(), hyperv::ID);
         assert_eq!(default_backend_ids(), &[vz::ID, chv::ID, qemu::ID]);
         assert!(
             backends().iter().any(|backend| backend.id() == chv::ID),
             "Linux default cannot resolve CHV unless it is registered"
         );
+        assert!(
+            backends().iter().any(|backend| backend.id() == hyperv::ID),
+            "Unix source-reachability cannot see Hyper-V unless it is registered"
+        );
         let err = format!("{:#}", by_id("xen").err().expect("no xen backend"));
         assert!(err.contains("xen"), "{err}");
         assert!(
-            err.contains("qemu") && err.contains("vz") && err.contains(chv::ID),
+            err.contains("qemu")
+                && err.contains("vz")
+                && err.contains(chv::ID)
+                && err.contains(hyperv::ID),
             "{err}"
         );
     }

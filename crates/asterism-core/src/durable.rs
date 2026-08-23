@@ -270,10 +270,12 @@ fn commit_inner(path: &Path, bytes: &[u8], mode: Option<u32>) -> Result<()> {
     //    behind is exactly what a `kill -9` here would leave, and
     //    `sweep_temporaries` is what removes both.
     faults::check(faults::Point::Rename, path)?;
-    std::fs::rename(&tmp, path).with_context(|| format!("committing {}", path.display()))?;
+    rename_write_through(&tmp, path)
+        .with_context(|| format!("committing {}", path.display()))?;
 
     // 4. Make the rename itself survive power loss. Until this returns, the
     //    directory entry is a promise the drive has not made.
+    #[cfg(not(windows))]
     sync_dir(dir).with_context(|| format!("flushing {}", dir.display()))?;
     Ok(())
 }
@@ -486,15 +488,53 @@ pub fn publish_dir(staging: &Path, dest: &Path) -> Result<()> {
 /// crash between them is how a directory ends up in neither place.
 pub fn publish_rename(from: &Path, to: &Path) -> Result<()> {
     faults::check(faults::Point::Rename, to)?;
-    std::fs::rename(from, to)
+    rename_write_through(from, to)
         .with_context(|| format!("putting {} at {}", from.display(), to.display()))?;
+    #[cfg(not(windows))]
+    {
     let source_dir = from.parent().unwrap_or_else(|| Path::new("."));
     let dest_dir = to.parent().unwrap_or_else(|| Path::new("."));
     sync_dir(dest_dir).with_context(|| format!("flushing {}", dest_dir.display()))?;
     if source_dir != dest_dir {
         sync_dir(source_dir).with_context(|| format!("flushing {}", source_dir.display()))?;
     }
+    }
     Ok(())
+}
+
+#[cfg(not(windows))]
+fn rename_write_through(from: &Path, to: &Path) -> io::Result<()> {
+    std::fs::rename(from, to)
+}
+
+/// Publish a Windows namespace change with the durability primitive Win32
+/// actually provides. `FlushFileBuffers` requires a write-capable *file*
+/// handle and is not a directory flush API; asking `File::sync_all` to flush
+/// a directory therefore returns `ERROR_ACCESS_DENIED` even for LocalSystem.
+/// `MoveFileExW` with `MOVEFILE_WRITE_THROUGH` does not return until the move
+/// is on disk, and `MOVEFILE_REPLACE_EXISTING` preserves `rename` semantics.
+#[cfg(windows)]
+fn rename_write_through(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: both buffers are NUL-terminated and remain alive for the call.
+    if unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 /// Open a file for reading, refusing a symlink.
@@ -535,21 +575,36 @@ fn sync_tree(root: &Path) -> io::Result<()> {
 
 /// Force a directory's own contents — its entries — to the device.
 ///
-/// A directory opens read-only and syncs like anything else on both
-/// platforms Asterism runs on. Not being able to open it is a real error;
-/// not being able to *sync* it after opening it is treated as one too, since
-/// the whole reason the call is here is that skipping it loses the rename.
+/// Unix exposes directory fsync directly. Windows does not: namespace
+/// publications on Windows go through [`rename_write_through`] instead, and
+/// this function only validates that the directory still exists there.
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
     faults::check_io(faults::Point::SyncDir, dir)?;
-    let handle = File::open(dir)?;
-    match handle.sync_all() {
-        Ok(()) => Ok(()),
-        // Some filesystems (and every one under a container runtime that
-        // fakes them) refuse fsync on a directory. The rename is still
-        // ordered; it is only the barrier that is missing, and refusing to
-        // run there would help nobody.
-        Err(e) if matches!(e.raw_os_error(), Some(libc::EINVAL) | Some(libc::ENOTSUP)) => Ok(()),
-        Err(e) => Err(e),
+    #[cfg(windows)]
+    {
+        let meta = std::fs::metadata(dir)?;
+        if !meta.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not a directory", dir.display()),
+            ));
+        }
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    {
+        let handle = File::open(dir)?;
+        match handle.sync_all() {
+            Ok(()) => Ok(()),
+            // Some filesystems (and every one under a container runtime that
+            // fakes them) refuse fsync on a directory. The rename is still
+            // ordered; it is only the barrier that is missing, and refusing
+            // to run there would help nobody.
+            Err(e) if matches!(e.raw_os_error(), Some(libc::EINVAL) | Some(libc::ENOTSUP)) => {
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -985,6 +1040,19 @@ mod tests {
             !tmp_path(&path).exists(),
             "the staging file is consumed by the rename"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_real_windows_rename_replaces_and_publishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("new.tmp");
+        let to = dir.path().join("live");
+        std::fs::write(&from, b"new").unwrap();
+        std::fs::write(&to, b"old").unwrap();
+        publish_rename(&from, &to).unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"new");
+        assert!(!from.exists());
     }
 
     #[test]

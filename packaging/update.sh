@@ -221,6 +221,8 @@ load_manifest() {
 		Darwin-arm64 | Darwin-aarch64) host_target=darwin-arm64 ;;
 		Linux-x86_64 | Linux-amd64) host_target=linux-x86_64 ;;
 		Linux-aarch64 | Linux-arm64) host_target=linux-arm64 ;;
+		MINGW*-x86_64 | MSYS*-x86_64 | CYGWIN*-x86_64 | Windows_NT-x86_64) host_target=windows-x86_64 ;;
+		MINGW*-arm64 | MSYS*-arm64 | CYGWIN*-arm64 | Windows_NT-arm64) host_target=windows-arm64 ;;
 		*) host_target=unsupported ;;
 		esac
 	fi

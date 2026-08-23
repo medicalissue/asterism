@@ -1,0 +1,93 @@
+name: windows-hyperv
+
+on:
+  push:
+    branches: [main, validation/as-m35-windows-7ec8712]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  source-and-conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch commit, 2026-08-05
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 peeled commit
+
+      - name: Portable helper protocol tests
+        run: cargo test --locked --package asterism-hyperv --lib
+
+      - name: Daemon Hyper-V conformance contract
+        run: cargo test --locked --package asterism-daemon backend::conformance
+
+      - name: Direct API boundary
+        run: bash scripts/check-hyperv-boundary.sh
+
+  cross-compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch commit, 2026-08-05
+        with:
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 peeled commit
+
+      # cargo check type-checks windows.rs against windows-sys without
+      # linking and without Hyper-V. This is not real-host evidence.
+      - name: Cross-check the Windows helper from Linux
+        run: cargo check --locked --package asterism-hyperv --target x86_64-pc-windows-gnu --all-targets
+
+      - name: Install the Windows GNU C toolchain for transitive build scripts
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes gcc-mingw-w64-x86-64
+
+      - name: Cross-check the product astd graph from Linux
+        env:
+          ASTERISM_BUILD_ID: ${{ github.sha }}
+        run: cargo check --locked --target x86_64-pc-windows-gnu --bin astd --bin ast --bin astd-hyperv
+
+  windows-compile:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch commit, 2026-08-05
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 peeled commit
+
+      - name: Compile the product astd/ast/astd-hyperv graph
+        env:
+          ASTERISM_BUILD_ID: ${{ github.sha }}
+        run: cargo check --locked --bin astd --bin ast --bin astd-hyperv
+
+      - name: Exercise named-pipe transport and OS peer admission
+        run: cargo test --locked --package asterism-core --features windows-ipc-conformance --test windows_named_pipe -- --test-threads=1
+
+      - name: Exercise LocalSystem service IPC from an interactive ast
+        shell: pwsh
+        run: |
+          cargo build --locked --bin ast --bin astd
+          ./scripts/windows-local-system-ipc.ps1 -Ast ./target/debug/ast.exe -Astd ./target/debug/astd.exe
+
+      - name: Console Ctrl-C exits without an SCM waiter hang
+        env:
+          ASTERISM_BUILD_ID: ${{ github.sha }}
+        run: cargo test --locked --package asterism-daemon --test windows_console_stop -- --test-threads=1
+
+      - name: Compile the native helper and every Windows-only adapter
+        run: cargo check --locked --package asterism-hyperv --all-targets
+
+      - name: Run the portable helper protocol suite
+        run: cargo test --locked --package asterism-hyperv --lib
+
+      - name: Source-only product graph and API boundary
+        shell: pwsh
+        run: ./scripts/check-hyperv-boundary.ps1
+
+      - name: Record the GitHub hosted real-host gap
+        shell: pwsh
+        run: ./scripts/hyperv-real-host-harness.ps1 -ExplainOnly

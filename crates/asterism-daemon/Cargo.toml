@@ -12,8 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 asterism-core.workspace = true
+asterism-hyperv.workspace = true
 asterism-mesh.workspace = true
-asterism-vz.workspace = true
 anyhow.workspace = true
 blake3.workspace = true
 libc = "0.2"
@@ -52,6 +52,9 @@ tokio = { workspace = true, features = ["time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 uuid.workspace = true
 zeroize = "1"
+
+[target.'cfg(unix)'.dependencies]
+asterism-vz.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7"

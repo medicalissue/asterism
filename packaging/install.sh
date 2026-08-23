@@ -44,7 +44,18 @@ REPO_URL="https://github.com/${REPO}.git"
 
 VERSION="${ASTERISM_VERSION:-}"
 METHOD="${ASTERISM_METHOD:-release}"
-PREFIX="${ASTERISM_PREFIX:-${HOME}/.local}"
+if [ -n "${ASTERISM_PREFIX:-}" ]; then
+	PREFIX="$ASTERISM_PREFIX"
+else
+	case "$(uname -s 2>/dev/null || echo unknown)" in
+	MINGW* | MSYS* | CYGWIN* | Windows_NT)
+		PREFIX="${LOCALAPPDATA:-${HOME}/AppData/Local}/Asterism"
+		;;
+	*)
+		PREFIX="${HOME}/.local"
+		;;
+	esac
+fi
 # Test harnesses may stage host integration beneath a disposable root. Real
 # installs leave this empty and therefore use the fixed, root-owned paths that
 # the daemon and sudoers both name.
@@ -322,6 +333,15 @@ detect_target() {
 	Darwin-arm64) printf 'darwin-arm64' ;;
 	Linux-x86_64) printf 'linux-x86_64' ;;
 	Linux-arm64) printf 'linux-arm64' ;;
+	Windows_NT-x86_64 | MINGW*-x86_64 | MSYS*-x86_64 | CYGWIN*-x86_64) printf 'windows-x86_64' ;;
+	Windows_NT-arm64 | MINGW*-arm64 | MSYS*-arm64 | CYGWIN*-arm64) printf 'windows-arm64' ;;
+	*) return 1 ;;
+	esac
+}
+
+is_windows_uname() {
+	case "$(uname -s)" in
+	MINGW* | MSYS* | CYGWIN* | Windows_NT) return 0 ;;
 	*) return 1 ;;
 	esac
 }
@@ -329,10 +349,12 @@ detect_target() {
 unsupported_target() {
 	err "no binary release for $(uname -s) $(uname -m)."
 	err ""
-	err "Asterism publishes binaries for macOS on Apple silicon and Linux on x86-64 or arm64."
+	err "Asterism publishes binaries for macOS on Apple silicon (darwin-arm64),"
+	err "Linux on x86-64 or arm64, and Windows 11 Pro/Enterprise."
 	err "Everything else builds from source, which needs Rust and a few minutes:"
 	err ""
 	err "    curl -fsSL https://asterism.run/install.sh | ASTERISM_METHOD=source sh"
+	err "    irm https://asterism.run/install.ps1 | iex   # native Windows"
 	err ""
 	exit 1
 }
@@ -644,8 +666,12 @@ install_release() {
 	unpack="${TMPDIR_SELF}/unpack"
 	mkdir -p "$unpack"
 	tar -xzf "$tarball" -C "$unpack" || die "could not unpack ${artifact}."
+	exe=""
+	case "$target" in
+	windows-*) exe=".exe" ;;
+	esac
 	for bin in ast astd; do
-		[ -f "${unpack}/${bin}" ] || die "${artifact} has no ${bin} in it. Refusing to install a partial release."
+		[ -f "${unpack}/${bin}${exe}" ] || die "${artifact} has no ${bin}${exe} in it. Refusing to install a partial release."
 	done
 	# `astd-vz` is the Virtualization.framework helper, and it is not
 	# required here the way `ast` and `astd` are: this script installs any
@@ -654,12 +680,28 @@ install_release() {
 	# unable to install half the releases it can name. So it is installed
 	# when the release has it, and its absence is said out loud rather than
 	# discovered later as "vz is unavailable on this machine".
+	#
+	# Windows releases instead ship `astd-hyperv`, and that helper *is*
+	# required: a Windows tarball without it is not a supported artifact.
 	if [ -f "${unpack}/astd-vz" ]; then
 		vz=1
 	else
 		vz=0
 	fi
-	if [ -f "${unpack}/asterism-update" ]; then updater=1; else updater=0; fi
+	hyperv=0
+	if [ -f "${unpack}/astd-hyperv${exe}" ]; then
+		hyperv=1
+	fi
+	if [ "$target" != "${target#windows-}" ] && [ "$hyperv" != "1" ]; then
+		die "${artifact} has no astd-hyperv${exe}. A Windows release without the helper is not installable."
+	fi
+	if [ -f "${unpack}/asterism-update${exe}" ]; then updater=1; else updater=0; fi
+	if [ -f "${unpack}/asterism-update" ]; then updater_sh=1; else updater_sh=0; fi
+	if [ -f "${unpack}/asterism-update.ps1" ]; then updater_ps1=1; else updater_ps1=0; fi
+	if [ -f "${unpack}/install.ps1" ]; then installer_ps1=1; else installer_ps1=0; fi
+	if [ "$target" != "${target#windows-}" ] && { [ "$updater_ps1" != "1" ] || [ "$installer_ps1" != "1" ]; }; then
+		die "${artifact} must package asterism-update.ps1 and install.ps1 together. Refusing a Windows updater that cannot apply."
+	fi
 	case "$target" in
 	linux-*)
 		for helper in cloud-hypervisor virtiofsd; do
@@ -670,15 +712,25 @@ install_release() {
 		;;
 	*) linux_helpers=0 ;;
 	esac
+	receipt_files="bin/ast${exe} bin/astd${exe}"
 	if [ "$vz" = "1" ]; then
-		intent_files="bin/ast bin/astd bin/astd-vz"
+		receipt_files="${receipt_files} bin/astd-vz"
 	elif [ "$linux_helpers" = "1" ]; then
-		intent_files="bin/ast bin/astd bin/cloud-hypervisor bin/virtiofsd share/asterism/linux-components.env share/asterism/asterism-nbd share/asterism/licenses/cloud-hypervisor-Apache-2.0.txt share/asterism/licenses/cloud-hypervisor-BSD-3-Clause.txt share/asterism/licenses/virtiofsd-Apache-2.0.txt share/asterism/licenses/virtiofsd-BSD-3-Clause.txt share/asterism/licenses/LICENSE-APACHE share/asterism/licenses/LICENSE-MIT share/asterism/licenses/NOTICE"
-	else
-		intent_files="bin/ast bin/astd"
+		receipt_files="${receipt_files} bin/cloud-hypervisor bin/virtiofsd share/asterism/linux-components.env share/asterism/asterism-nbd share/asterism/licenses/cloud-hypervisor-Apache-2.0.txt share/asterism/licenses/cloud-hypervisor-BSD-3-Clause.txt share/asterism/licenses/virtiofsd-Apache-2.0.txt share/asterism/licenses/virtiofsd-BSD-3-Clause.txt share/asterism/licenses/LICENSE-APACHE share/asterism/licenses/LICENSE-MIT share/asterism/licenses/NOTICE"
+	fi
+	if [ "$hyperv" = "1" ]; then
+		receipt_files="${receipt_files} bin/astd-hyperv${exe}"
 	fi
 	if [ "$updater" = "1" ]; then
-		intent_files="${intent_files} libexec/asterism/asterism-update"
+		receipt_files="${receipt_files} libexec/asterism/asterism-update${exe}"
+	elif [ "$updater_sh" = "1" ]; then
+		receipt_files="${receipt_files} libexec/asterism/asterism-update"
+	fi
+	if [ "$updater_ps1" = "1" ]; then
+		receipt_files="${receipt_files} libexec/asterism/asterism-update.ps1"
+	fi
+	if [ "$installer_ps1" = "1" ]; then
+		receipt_files="${receipt_files} libexec/asterism/install.ps1"
 	fi
 	if [ "$linux_helpers" = "1" ]; then
 		intent_system_files="$(linux_system_files)"
@@ -686,14 +738,11 @@ install_release() {
 		intent_system_files=""
 	fi
 	# This journal is durable before `place` or any root-side configuration.
-	write_install_intent "$version" "$target" release "$got" "$intent_system_files" "$intent_files"
+	write_install_intent "$version" "$target" release "$got" "$intent_system_files" "$receipt_files"
 
 	ensure_writable_prefix
-	place "${unpack}/ast" ast
-	place "${unpack}/astd" astd
-	if [ "$updater" = "1" ]; then
-		place_at "${unpack}/asterism-update" libexec/asterism/asterism-update
-	fi
+	place "${unpack}/ast${exe}" "ast${exe}"
+	place "${unpack}/astd${exe}" "astd${exe}"
 	if [ "$linux_helpers" = "1" ]; then
 		place "${unpack}/cloud-hypervisor" cloud-hypervisor
 		place "${unpack}/virtiofsd" virtiofsd
@@ -707,49 +756,30 @@ install_release() {
 		[ "$linux_helpers" = "1" ] || drop_stale_linux_helpers
 		place "${unpack}/astd-vz" astd-vz
 		unquarantine "${PREFIX}/bin/ast" "${PREFIX}/bin/astd" "${PREFIX}/bin/astd-vz"
-		if [ "$updater" = "1" ]; then
-			write_receipt "$version" "$target" release "$got" bin/ast bin/astd bin/astd-vz libexec/asterism/asterism-update
-		else
-			write_receipt "$version" "$target" release "$got" bin/ast bin/astd bin/astd-vz
-		fi
 	elif [ "$linux_helpers" = "1" ]; then
 		drop_stale_helper
-		if [ "$updater" = "1" ]; then
-			write_receipt "$version" "$target" release "$got" \
-				bin/ast bin/astd bin/cloud-hypervisor bin/virtiofsd \
-				libexec/asterism/asterism-update \
-				share/asterism/linux-components.env \
-				share/asterism/asterism-nbd \
-				share/asterism/licenses/cloud-hypervisor-Apache-2.0.txt \
-				share/asterism/licenses/cloud-hypervisor-BSD-3-Clause.txt \
-				share/asterism/licenses/virtiofsd-Apache-2.0.txt \
-				share/asterism/licenses/virtiofsd-BSD-3-Clause.txt \
-				share/asterism/licenses/LICENSE-APACHE \
-				share/asterism/licenses/LICENSE-MIT \
-				share/asterism/licenses/NOTICE
-		else
-			write_receipt "$version" "$target" release "$got" \
-				bin/ast bin/astd bin/cloud-hypervisor bin/virtiofsd \
-				share/asterism/linux-components.env \
-				share/asterism/asterism-nbd \
-				share/asterism/licenses/cloud-hypervisor-Apache-2.0.txt \
-				share/asterism/licenses/cloud-hypervisor-BSD-3-Clause.txt \
-				share/asterism/licenses/virtiofsd-Apache-2.0.txt \
-				share/asterism/licenses/virtiofsd-BSD-3-Clause.txt \
-				share/asterism/licenses/LICENSE-APACHE \
-				share/asterism/licenses/LICENSE-MIT \
-				share/asterism/licenses/NOTICE
-		fi
 	else
 		drop_stale_linux_helpers
-		unquarantine "${PREFIX}/bin/ast" "${PREFIX}/bin/astd"
+		unquarantine "${PREFIX}/bin/ast${exe}" "${PREFIX}/bin/astd${exe}"
 		drop_stale_helper
-		if [ "$updater" = "1" ]; then
-			write_receipt "$version" "$target" release "$got" bin/ast bin/astd libexec/asterism/asterism-update
-		else
-			write_receipt "$version" "$target" release "$got" bin/ast bin/astd
-		fi
 	fi
+	if [ "$hyperv" = "1" ]; then
+		place "${unpack}/astd-hyperv${exe}" "astd-hyperv${exe}"
+		verify_windows_authenticode "${PREFIX}/bin/ast${exe}" "${PREFIX}/bin/astd${exe}" "${PREFIX}/bin/astd-hyperv${exe}"
+	fi
+	if [ "$updater" = "1" ]; then
+		place_at "${unpack}/asterism-update${exe}" "libexec/asterism/asterism-update${exe}"
+	elif [ "$updater_sh" = "1" ]; then
+		place_at "${unpack}/asterism-update" libexec/asterism/asterism-update
+	fi
+	if [ "$updater_ps1" = "1" ]; then
+		place_at "${unpack}/asterism-update.ps1" libexec/asterism/asterism-update.ps1
+	fi
+	if [ "$installer_ps1" = "1" ]; then
+		place_at "${unpack}/install.ps1" libexec/asterism/install.ps1
+	fi
+	# shellcheck disable=SC2086
+	write_receipt "$version" "$target" release "$got" $receipt_files
 
 	if [ "$installed" != "" ] && [ "$installed" != "$version" ]; then
 		say "upgraded ${installed} -> ${version}"
@@ -1271,8 +1301,37 @@ uninstall() {
 
 # What the machine can actually run, said at install time rather than left
 # for `ast create --backend vz` to discover.
+verify_windows_authenticode() {
+	# Optional: a pinned thumbprint turns "unsigned" into a refusal. A
+	# Windows Git Bash install without Authenticode tools still checksums.
+	[ -n "${ASTERISM_AUTHENTICODE_THUMBPRINT:-}" ] || return 0
+	have powershell.exe || have pwsh || die "ASTERISM_AUTHENTICODE_THUMBPRINT is set but PowerShell is not on PATH."
+	ps=powershell.exe
+	have pwsh && ps=pwsh
+	for f in "$@"; do
+		[ -f "$f" ] || continue
+		status="$($ps -NoProfile -Command "try { (Get-AuthenticodeSignature -FilePath '$f').Status.ToString() } catch { 'Missing' }")"
+		thumb="$($ps -NoProfile -Command "try { (Get-AuthenticodeSignature -FilePath '$f').SignerCertificate.Thumbprint } catch { '' }")"
+		case "$status" in
+		Valid) ;;
+		*) die "${f} Authenticode status is ${status}, not Valid. Refusing to install." ;;
+		esac
+		want="$(printf '%s' "$ASTERISM_AUTHENTICODE_THUMBPRINT" | tr '[:upper:]' '[:lower:]')"
+		got="$(printf '%s' "$thumb" | tr '[:upper:]' '[:lower:]')"
+		[ "$want" = "$got" ] || die "${f} is signed by ${thumb}, not the pinned thumbprint."
+		say "authenticode ok: ${f}"
+	done
+}
+
 note_vz() {
 	# $1: 1 if a helper was installed
+	if is_windows_uname 2>/dev/null; then
+		say ""
+		say "Windows persistence is a Windows Service. After install:"
+		say "    ast doctor"
+		say "    ast service install"
+		return 0
+	fi
 	[ "$(uname -s)" = "Darwin" ] || return 0
 	if [ "$1" != "1" ]; then
 		say ""

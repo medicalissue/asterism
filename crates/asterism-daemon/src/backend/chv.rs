@@ -85,6 +85,7 @@ impl Chv {
             DiskFormat::Raw => grow(path, u64::from(req.instance.shape.disk_gib)),
             DiskFormat::Qcow2 => check_qcow2_shape(path, u64::from(req.instance.shape.disk_gib)),
             DiskFormat::Asif => bail!("the chv backend cannot read an asif disk"),
+            DiskFormat::Vhdx => bail!("the chv backend cannot read a vhdx disk"),
         };
         if let Err(error) = resize {
             let _ = std::fs::remove_file(path);
@@ -454,6 +455,7 @@ impl Hypervisor for Chv {
                 DiskFormat::Raw => raw,
                 DiskFormat::Qcow2 => qcow,
                 DiskFormat::Asif => bail!("the chv backend cannot read an asif disk"),
+                DiskFormat::Vhdx => bail!("the chv backend cannot read a vhdx disk"),
             };
             self.create_root(req, &path)?
         };
@@ -761,8 +763,8 @@ fn disk_arg(disk: &DiskSpec, id: &str) -> Result<String> {
             bail!("the chv backend accepts remote volumes only after they are exposed as a host block device")
         }
     };
-    if format == DiskFormat::Asif {
-        bail!("Cloud Hypervisor cannot read an asif disk");
+    if matches!(format, DiskFormat::Asif | DiskFormat::Vhdx) {
+        bail!("Cloud Hypervisor cannot read a {format} disk");
     }
     Ok(format!(
         "path={},readonly={},image_type={},id={id}",
@@ -795,6 +797,7 @@ fn api_image_type(format: DiskFormat) -> Result<&'static str> {
         DiskFormat::Raw => Ok("Raw"),
         DiskFormat::Qcow2 => Ok("Qcow2"),
         DiskFormat::Asif => bail!("Cloud Hypervisor cannot read an asif disk"),
+        DiskFormat::Vhdx => bail!("Cloud Hypervisor cannot read a vhdx disk"),
     }
 }
 

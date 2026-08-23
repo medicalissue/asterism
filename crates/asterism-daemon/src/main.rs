@@ -74,6 +74,53 @@ mod wake;
 
 use mesh::{ClientIo, Mesh, Splice};
 
+#[cfg(windows)]
+fn apply_service_home_from_args() {
+    // ImagePath is `astd.exe --service --home <dir>`. SCM starts with almost
+    // no environment, so the home has to be on the command line rather than
+    // inherited from the installing shell.
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--home" {
+            if let Some(home) = args.next() {
+                std::env::set_var("ASTERISM_HOME", home);
+            }
+            return;
+        }
+        if let Some(home) = arg.strip_prefix("--home=") {
+            std::env::set_var("ASTERISM_HOME", home);
+            return;
+        }
+    }
+}
+
+#[cfg(windows)]
+fn service_name_from_args() -> Result<String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        let value = if arg == "--service-name" {
+            args.next()
+        } else {
+            arg.strip_prefix("--service-name=").map(str::to_owned)
+        };
+        if let Some(value) = value {
+            const TEST_PREFIX: &str = "com.asterism.astd.test.";
+            if value.len() > 120
+                || !value.starts_with(TEST_PREFIX)
+                || value.ends_with('.')
+                || value.contains("..")
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+            {
+                anyhow::bail!("invalid temporary Windows service name {value:?}");
+            }
+            return Ok(value);
+        }
+    }
+    Ok(asterism_core::windows_host::SERVICE_NAME.to_owned())
+}
+
 /// This device's own state: its shard of the orbit registry, and the name the
 /// orbit knows it by.
 ///
@@ -96,8 +143,7 @@ impl Node {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     if matches!(
         std::env::args().nth(1).as_deref(),
         Some("__container-helper")
@@ -118,7 +164,57 @@ async fn main() -> Result<()> {
     if print_early_exit() {
         return Ok(());
     }
+    if std::env::args().any(|arg| arg == "--service") {
+        #[cfg(windows)]
+        {
+            apply_service_home_from_args();
+            let service_name = service_name_from_args()?;
+            return asterism_core::windows_host::dispatch_service(
+                &service_name,
+                run_service_daemon,
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            anyhow::bail!(
+                "astd --service is the Windows Service dispatcher; this build is {}",
+                std::env::consts::OS
+            );
+        }
+    }
+    runtime().block_on(run_daemon(StopSource::Console))
+}
 
+#[cfg(windows)]
+fn run_service_daemon() -> Result<()> {
+    let result = runtime().block_on(run_daemon(StopSource::Service));
+    if let Err(error) = &result {
+        // SCM owns the process stdio handles, so an early worker failure would
+        // otherwise disappear while the service merely returns to Stopped.
+        // The installer already names this file as the service log; make that
+        // promise true for the failure path needed to repair the host.
+        use std::io::Write as _;
+
+        let log = paths::home_dir().join("astd.log");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+        {
+            let _ = writeln!(file, "astd: service startup failed: {error:#}");
+        }
+    }
+    result
+}
+
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+}
+
+async fn run_daemon(stop_source: StopSource) -> Result<()> {
     // Before anything: the signals that mean "stop". Registering one is what
     // makes it ours — until then the default disposition applies, and for
     // both of these that is death with nothing tidied up. The socket is
@@ -128,7 +224,7 @@ async fn main() -> Result<()> {
     // for the next daemon to trip over. `ast` sends exactly that `SIGTERM`
     // when it retires a daemon across an upgrade, and it sends it as soon as
     // the socket answers — which is inside the window.
-    let mut stop = Stop::listen();
+    let mut stop = Stop::listen(stop_source);
 
     let home = paths::home_dir();
     // Everything this daemon remembers is in here, and until now it was
@@ -306,7 +402,8 @@ fn print_early_exit() -> bool {
                  Usage: astd\n\n\
                  Options:\n\
                    --help     Print help\n\
-                   --version  Print version"
+                   --version  Print version\n\
+                   --service  Windows Service dispatcher (SCM ImagePath)"
             );
             true
         }
@@ -321,13 +418,14 @@ fn print_early_exit() -> bool {
 /// that is not is a question somebody has to answer later.
 fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
     file.write_all(bytes)
 }
 
@@ -420,23 +518,83 @@ fn sweep_interrupted_commits() {
 /// of `main`, before the socket exists, because a signal that arrives before
 /// its handler does is not a shutdown — it is the default disposition, which
 /// is death, and a daemon killed that way leaves both files behind.
+#[derive(Clone, Copy)]
+enum StopSource {
+    Console,
+    #[cfg(windows)]
+    Service,
+}
+
 struct Stop {
+    #[cfg(windows)]
+    source: WindowsStop,
+    #[cfg(unix)]
     term: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
     int: Option<tokio::signal::unix::Signal>,
 }
 
+#[cfg(windows)]
+enum WindowsStop {
+    Console(Option<tokio::signal::windows::CtrlC>),
+    Service,
+}
+
 impl Stop {
-    fn listen() -> Stop {
-        use tokio::signal::unix::{signal, SignalKind};
-        Stop {
-            term: signal(SignalKind::terminate()).ok(),
-            int: signal(SignalKind::interrupt()).ok(),
+    fn listen(source: StopSource) -> Stop {
+        #[cfg(unix)]
+        {
+            let StopSource::Console = source;
+            use tokio::signal::unix::{signal, SignalKind};
+            Stop {
+                term: signal(SignalKind::terminate()).ok(),
+                int: signal(SignalKind::interrupt()).ok(),
+            }
+        }
+        #[cfg(windows)]
+        {
+            let source = match source {
+                // Constructing the listener here registers the console handler
+                // before startup mutates state, matching the Unix contract.
+                StopSource::Console => {
+                    WindowsStop::Console(tokio::signal::windows::ctrl_c().ok())
+                }
+                StopSource::Service => WindowsStop::Service,
+            };
+            Stop { source }
         }
     }
 
-    /// Wait for either. A signal this process could not register for never
-    /// arrives here, which is correct: it was never ours to catch.
+    /// Wait only for the source that owns this process. A console daemon must
+    /// never start the blocking SCM waiter: dropping its join handle after
+    /// Ctrl-C does not cancel it, and Tokio waits for blocking tasks while
+    /// dropping the runtime. Conversely, an SCM worker has no console signal
+    /// to race and waits only for STOP/SHUTDOWN.
     async fn next(&mut self) {
+        #[cfg(unix)]
+        {
+            self.unix_signal().await;
+        }
+
+        #[cfg(windows)]
+        match &mut self.source {
+            WindowsStop::Console(Some(ctrl_c)) => {
+                let _ = ctrl_c.recv().await;
+            }
+            WindowsStop::Console(None) => std::future::pending().await,
+            WindowsStop::Service => {
+                let _ = tokio::task::spawn_blocking(
+                    asterism_core::windows_host::wait_service_stop,
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Wait for either unix signal. A signal this process could not register
+    /// for never arrives here, which is correct: it was never ours to catch.
+    #[cfg(unix)]
+    async fn unix_signal(&mut self) {
         match (&mut self.term, &mut self.int) {
             (Some(term), Some(int)) => {
                 tokio::select! {

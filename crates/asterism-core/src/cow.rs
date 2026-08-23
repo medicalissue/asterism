@@ -172,8 +172,15 @@ pub fn clone_file(src: &Path, dst: &Path) -> Result<Cloned> {
 /// once costs kilobytes, and a fresh clone costs nothing at all. This is the
 /// number a user wants when they ask what a snapshot cost them.
 pub fn usage(path: &Path) -> Result<u64> {
-    use std::os::unix::fs::MetadataExt;
-    Ok(std::fs::metadata(path)?.blocks() * 512)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(std::fs::metadata(path)?.blocks() * 512)
+    }
+    #[cfg(windows)]
+    {
+        Ok(std::fs::metadata(path)?.len())
+    }
 }
 
 // ---- the sparse copy -------------------------------------------------------
@@ -342,46 +349,53 @@ pub fn extents(path: &Path) -> Result<Vec<Extent>> {
 /// The walk, and whether to believe it. [`extents`] throws the second half
 /// away; the copy cannot afford to, or it would call a blind copy sparse.
 fn walk(file: &File, len: u64) -> (Vec<Extent>, Support) {
-    use std::os::unix::io::AsRawFd;
-
     let whole = || (vec![Extent { offset: 0, len }], Support::Assumed);
     if len == 0 {
         return (Vec::new(), Support::Reported);
     }
-
-    let fd = file.as_raw_fd();
-    let mut out = Vec::new();
-    let mut pos = 0u64;
-    while pos < len {
-        // SAFETY: `fd` is owned by `file`, which outlives the call, and the
-        // offsets are in range for a file of this length.
-        let data = unsafe { libc::lseek(fd, pos as libc::off_t, imp::SEEK_DATA) };
-        if data < 0 {
-            return match std::io::Error::last_os_error().raw_os_error() {
-                Some(libc::ENXIO) => (out, Support::Reported),
-                _ => whole(),
-            };
-        }
-        let hole = unsafe { libc::lseek(fd, data, imp::SEEK_HOLE) };
-        if hole < 0 {
-            return match std::io::Error::last_os_error().raw_os_error() {
-                Some(libc::ENXIO) => (out, Support::Reported),
-                _ => whole(),
-            };
-        }
-        // SEEK_HOLE answers with the file's length at the last extent, and
-        // a file can grow between the metadata read and here.
-        let (start, end) = (data as u64, (hole as u64).min(len));
-        if end <= start {
-            break;
-        }
-        out.push(Extent {
-            offset: start,
-            len: end - start,
-        });
-        pos = end;
+    #[cfg(windows)]
+    {
+        let _ = file;
+        whole()
     }
-    (out, Support::Reported)
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+
+        let fd = file.as_raw_fd();
+        let mut out = Vec::new();
+        let mut pos = 0u64;
+        while pos < len {
+            // SAFETY: `fd` is owned by `file`, which outlives the call, and the
+            // offsets are in range for a file of this length.
+            let data = unsafe { libc::lseek(fd, pos as libc::off_t, imp::SEEK_DATA) };
+            if data < 0 {
+                return match std::io::Error::last_os_error().raw_os_error() {
+                    Some(libc::ENXIO) => (out, Support::Reported),
+                    _ => whole(),
+                };
+            }
+            let hole = unsafe { libc::lseek(fd, data, imp::SEEK_HOLE) };
+            if hole < 0 {
+                return match std::io::Error::last_os_error().raw_os_error() {
+                    Some(libc::ENXIO) => (out, Support::Reported),
+                    _ => whole(),
+                };
+            }
+            // SEEK_HOLE answers with the file's length at the last extent, and
+            // a file can grow between the metadata read and here.
+            let (start, end) = (data as u64, (hole as u64).min(len));
+            if end <= start {
+                break;
+            }
+            out.push(Extent {
+                offset: start,
+                len: end - start,
+            });
+            pos = end;
+        }
+        (out, Support::Reported)
+    }
 }
 
 /// What a set of extents costs to carry.

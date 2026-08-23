@@ -14,7 +14,7 @@
 //! |---|---|
 //! | macOS | IOKit `IOPMAssertionCreateWithName`, `PreventUserIdleSystemSleep` |
 //! | Linux | a `systemd-inhibit --what=sleep:idle --mode=block` child process |
-//! | Windows | not implemented — `SetThreadExecutionState` is the decided row |
+//! | Windows | `SetThreadExecutionState(ES_CONTINUOUS \| ES_SYSTEM_REQUIRED)` |
 //!
 //! macOS caveat: `PreventUserIdleSystemSleep` is what `caffeinate -s`
 //! takes. It stops *idle* sleep, which is the case that matters (the
@@ -265,9 +265,24 @@ mod imp {
     }
 }
 
-// ---- Windows: undecided ----------------------------------------------------
+// ---- Windows: SetThreadExecutionState --------------------------------------
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(windows)]
+mod imp {
+    use anyhow::Result;
+
+    use crate::windows_host::{hold_sleep, SleepHeld};
+
+    pub const MECHANISM: &str = "SetThreadExecutionState ES_CONTINUOUS|ES_SYSTEM_REQUIRED";
+
+    pub struct Held(SleepHeld);
+
+    pub fn hold(reason: &str) -> Result<Held> {
+        Ok(Held(hold_sleep(reason)?))
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 mod imp {
     use anyhow::{bail, Result};
 
@@ -277,8 +292,8 @@ mod imp {
 
     pub fn hold(_reason: &str) -> Result<Held> {
         bail!(
-            "this device cannot prevent sleep yet — the Windows row of \
-             docs/PLATFORM.md (SetThreadExecutionState) is not built"
+            "this device cannot prevent sleep yet — the decided rows are \
+             IOKit, systemd-inhibit, and SetThreadExecutionState"
         )
     }
 }

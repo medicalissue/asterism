@@ -1121,9 +1121,18 @@ fn remove(path: &Path) -> std::io::Result<()> {
     }
 }
 
+#[cfg(unix)]
 fn set_mode(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
+    // Windows ACLs do not have a Unix mode equivalent. The containing
+    // Asterism home is the Windows privacy boundary; keep recording the
+    // image's mode in the tree so a later Unix consumer does not lose it.
     Ok(())
 }
 

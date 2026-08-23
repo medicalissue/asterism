@@ -228,7 +228,9 @@ dependencies = [
  "sha2 0.11.0",
  "tar",
  "tempfile",
+ "tokio",
  "uuid",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 
@@ -238,6 +240,7 @@ version = "0.0.2"
 dependencies = [
  "anyhow",
  "asterism-core",
+ "asterism-hyperv",
  "asterism-mesh",
  "asterism-vz",
  "blake3",
@@ -260,6 +263,19 @@ dependencies = [
  "tokio-rustls",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "asterism-hyperv"
+version = "0.0.2"
+dependencies = [
+ "anyhow",
+ "getrandom 0.4.3",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

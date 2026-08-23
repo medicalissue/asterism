@@ -6,6 +6,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Enables only the deliberate SID-mismatch probe used by hosted Windows
+# conformance. Product builds never expose an alternate admission SID.
+windows-ipc-conformance = []
+
 [dependencies]
 anyhow.workspace = true
 # The content address for bytes Asterism produces itself: a converted base
@@ -46,6 +51,21 @@ uuid.workspace = true
 # platform store; wiping the buffer on drop is cheap and the crate is already
 # in the tree behind rustls.
 zeroize = "1"
+
+[target.'cfg(windows)'.dependencies]
+# The Windows local control plane is a real kernel named pipe. Tokio owns the
+# overlapped server handles; windows-sys supplies the pipe ACL and peer-token
+# admission primitives kept behind ipc_windows.rs.
+tokio = { workspace = true, features = ["net", "sync"] }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tempfile = "3"
