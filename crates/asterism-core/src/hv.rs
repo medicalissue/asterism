@@ -102,9 +102,8 @@ pub enum DiskSpec {
 ///
 /// A cloud image is a whole disk: partition table, bootloader, kernel, the
 /// firmware finds it and that is the end of the backend's involvement. An OCI
-/// image is a root filesystem and nothing else — MODEL.md makes container
-/// images an image *source*, not a second kind of instance — so a backend
-/// booting one has to supply the kernel itself ([`crate::oci`]).
+/// image is a root filesystem and nothing else. A VM runtime supplies a
+/// kernel; a native-container runtime supplies namespaces and a cgroup.
 ///
 /// Data on the image and recorded on the instance, rather than inferred from
 /// the reference: what a name meant when the instance was created is not
@@ -226,6 +225,21 @@ pub enum GuestEndpoint {
     GuestAddr { addr: IpAddr },
 }
 
+/// The private control plane for a native container.
+///
+/// This is intentionally not a [`GuestEndpoint`]. A container has no SSH
+/// listener to invent: readiness means this Unix socket answers from the
+/// process holding the recorded namespaces and delegated cgroup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerControlEndpoint {
+    pub socket: PathBuf,
+    pub user_namespace: PathBuf,
+    pub mount_namespace: PathBuf,
+    pub pid_namespace: PathBuf,
+    pub network_namespace: PathBuf,
+    pub cgroup: PathBuf,
+}
+
 impl GuestEndpoint {
     /// Where an ssh client should connect: host and port.
     pub fn ssh_target(&self) -> (String, u16) {
@@ -272,7 +286,12 @@ pub struct Handle {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proc: Option<ProcId>,
     pub ctl: ControlChannel,
-    pub endpoint: GuestEndpoint,
+    /// SSH reachability for a VM. Native containers leave this absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<GuestEndpoint>,
+    /// Namespace-bound command/lifecycle channel for a native container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_control: Option<ContainerControlEndpoint>,
     /// Unix seconds, matching `Instance::created_at`.
     pub started_at: u64,
 }
@@ -291,7 +310,8 @@ impl Handle {
             pid: Some(proc.pid),
             proc: Some(proc),
             ctl,
-            endpoint,
+            endpoint: Some(endpoint),
+            container_control: None,
             started_at: crate::instance::now_unix(),
         }
     }
@@ -777,7 +797,8 @@ mod tests {
             ctl: ControlChannel::Qmp {
                 path: "/tmp/qmp.sock".into(),
             },
-            endpoint: GuestEndpoint::HostForward { ssh_port: 22022 },
+            endpoint: Some(GuestEndpoint::HostForward { ssh_port: 22022 }),
+            container_control: None,
             started_at: 1_700_000_000,
         };
         let json = serde_json::to_string(&h).unwrap();

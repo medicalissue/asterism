@@ -1904,7 +1904,8 @@ mod tests {
             ctl: ControlChannel::Qmp {
                 path: "/tmp/x.sock".into(),
             },
-            endpoint: GuestEndpoint::HostForward { ssh_port: 22 },
+            endpoint: Some(GuestEndpoint::HostForward { ssh_port: 22 }),
+            container_control: None,
             started_at: 0,
         }
     }
