@@ -257,8 +257,6 @@ pub fn manifest(inst: &Instance) -> Result<MoveManifest> {
 }
 
 fn collect(root: &Path, dir: &Path, out: &mut Vec<MoveFile>) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         // An instance that has never booted has no directory, and moving it
@@ -290,10 +288,21 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<MoveFile>) -> Result<()> {
             path: relative,
             len: meta.len(),
             allocated: cow::allocated(&cow::extents(&path)?),
-            mode: meta.permissions().mode() & 0o777,
+            mode: file_mode(&meta),
         });
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn file_mode(meta: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o777
+}
+
+#[cfg(windows)]
+fn file_mode(_meta: &std::fs::Metadata) -> u32 {
+    0o600
 }
 
 /// The base image this instance's disk was cloned from, content-addressed.

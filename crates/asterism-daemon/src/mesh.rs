@@ -2934,6 +2934,7 @@ fn safe_join(root: &Path, relative: &str) -> Result<std::path::PathBuf> {
     Ok(out)
 }
 
+#[cfg(unix)]
 fn set_mode(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     // Whatever the sender says, never more than the owner. A disk image is
@@ -2943,10 +2944,25 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
         .with_context(|| format!("setting permissions on {}", path.display()))
 }
 
+#[cfg(windows)]
+fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn file_mode(meta: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o777
+}
+
+#[cfg(windows)]
+fn file_mode(_meta: &std::fs::Metadata) -> u32 {
+    0o600
+}
+
 /// Send one file's allocated ranges and nothing else.
 async fn send_file(send: &mut SendStream, path: &Path, wire_name: &str) -> Result<u64> {
     use std::io::{Read, Seek, SeekFrom};
-    use std::os::unix::fs::PermissionsExt;
 
     let meta = std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
     let extents = cow::extents(path)?;
@@ -2955,7 +2971,7 @@ async fn send_file(send: &mut SendStream, path: &Path, wire_name: &str) -> Resul
         &MoveFrame::File {
             path: wire_name.to_owned(),
             len: meta.len(),
-            mode: meta.permissions().mode() & 0o777,
+            mode: file_mode(&meta),
         },
     )
     .await?;
@@ -3129,10 +3145,16 @@ async fn fail(send: &mut SendStream, e: anyhow::Error) -> Result<()> {
 
 /// Locks a key file down to mode 0600. ssh refuses one that anyone else on the
 /// machine can read, and it is right to.
+#[cfg(unix)]
 fn set_private(path: &std::path::Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("securing {}", path.display()))
+}
+
+#[cfg(windows)]
+fn set_private(_path: &std::path::Path) -> Result<()> {
+    Ok(())
 }
 
 /// This device's guest key, for a peer that needs to open a guest we seeded.
