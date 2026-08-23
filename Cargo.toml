@@ -8,6 +8,8 @@ members = [
     "crates/asterism-coordinator",
     "crates/asterism-hyperv",
     "crates/asterism-vz",
+    "crates/asterism-libcuda",
+    "crates/asterism-gpu-guest",
 ]
 
 [workspace.package]

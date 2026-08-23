@@ -14,9 +14,14 @@
 //! [`protocol`] is the CLI <-> daemon wire, [`ipc`] is the door that
 //! wire arrives through, and [`compat`] is which version of it two vintages
 //! settle on. [`remote_gpu`] is the transport-independent CUDA-semantic ABI
-//! behind a projected guest GPU device. [`verify`] is the gate every boot
-//! input passes through on its way into the store and out of it again, and
-//! [`profile`] is what a guest is asked to become once it has booted.
+//! behind a projected guest GPU device. [`remote_gpu_guest`] is the
+//! guest-local `/dev/nvidia0` CUSE + generated libcuda projection.
+//! [`remote_gpu_path`] carries CUDA-semantic frames over the authenticated
+//! mesh. [`remote_gpu_nvidia`] is the fail-closed NVIDIA inventory/matrix
+//! and two-device harness around that ABI. [`verify`] is the gate every boot
+//! input passes through on its way
+//! into the store and out of it again, and [`profile`] is what a guest is
+//! asked to become once it has booted.
 
 pub mod backup;
 pub mod compat;
@@ -41,6 +46,11 @@ pub mod protocol;
 mod qcow2;
 pub mod registry;
 pub mod remote_gpu;
+pub mod remote_gpu_cuda;
+pub mod remote_gpu_cuse;
+pub mod remote_gpu_guest;
+pub mod remote_gpu_nvidia;
+pub mod remote_gpu_path;
 pub mod rewrite;
 pub mod secret;
 pub mod seed;

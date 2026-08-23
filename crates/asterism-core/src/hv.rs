@@ -507,10 +507,11 @@ pub enum Capability {
     DirectKernelBoot,
     PortForward,
     GuestEgress,
+    GuestGpuProjection,
 }
 
 impl Capability {
-    pub const ALL: [Capability; 10] = [
+    pub const ALL: [Capability; 11] = [
         Capability::LiveSnapshot,
         Capability::DiskSnapshot,
         Capability::LiveMigration,
@@ -521,6 +522,7 @@ impl Capability {
         Capability::DirectKernelBoot,
         Capability::PortForward,
         Capability::GuestEgress,
+        Capability::GuestGpuProjection,
     ];
 }
 
@@ -550,6 +552,9 @@ pub struct Caps {
     /// LAN, or `None` where this backend has no such path. See
     /// [`GuestEgress`]; `None` is what the secrets data plane refuses on.
     pub guest_egress: Option<GuestEgress>,
+    /// Can attach an instance-bound virtio socket and carry the production
+    /// CUSE/libcuda payload into a Linux guest.
+    pub guest_gpu_projection: bool,
     pub disk_formats: &'static [DiskFormat],
 }
 
@@ -572,6 +577,7 @@ impl Caps {
             Capability::DirectKernelBoot => self.direct_kernel,
             Capability::PortForward => self.port_forward,
             Capability::GuestEgress => self.guest_egress.is_some(),
+            Capability::GuestGpuProjection => self.guest_gpu_projection,
         }
     }
 }
@@ -923,6 +929,7 @@ mod tests {
                     direct_kernel: false,
                     port_forward: false,
                     guest_egress: None,
+                    guest_gpu_projection: false,
                     disk_formats: &[DiskFormat::Raw],
                 }
             }

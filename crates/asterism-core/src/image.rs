@@ -451,6 +451,7 @@ fn convert_to_raw(src: &Path, from: DiskFormat, part: &Path) -> Result<()> {
         DiskFormat::Raw => crate::cow::copy_sparse(src, part)
             .with_context(|| format!("copying raw image {}", src.display())),
         DiskFormat::Asif => bail!("ASIF images cannot be materialized as raw"),
+        DiskFormat::Vhdx => bail!("VHDX images cannot be materialized as raw"),
     }
 }
 

@@ -192,6 +192,7 @@ fn expected_support(caps: &Caps, capability: Capability) -> bool {
         Capability::DirectKernelBoot => caps.direct_kernel,
         Capability::PortForward => caps.port_forward,
         Capability::GuestEgress => caps.guest_egress.is_some(),
+        Capability::GuestGpuProjection => caps.guest_gpu_projection,
     }
 }
 

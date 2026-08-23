@@ -1,0 +1,21 @@
+[package]
+name = "asterism-libcuda"
+description = "Generated CUDA Driver ABI shim injected as libcuda.so.1 in a guest."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "cuda"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[package.metadata.asterism]
+# Packaging keeps the fully versioned file and both loader/development
+# aliases together. `build.rs` supplies the ELF SONAME on Linux.
+guest-soname = "libcuda.so.1"
+guest-versioned-file = "libcuda.so.1.0.0"
+
+[dependencies]
+asterism-core.workspace = true

@@ -71,6 +71,11 @@ cp "$ROOT/LICENSE-MIT" "$WORK/root/share/asterism/licenses/LICENSE-MIT"
 cp "$ROOT/NOTICE" "$WORK/root/share/asterism/licenses/NOTICE"
 chmod 0755 "$WORK/root/share/asterism/asterism-nbd"
 
+# The daemon injects these exact ELF artifacts into attached Linux guests.
+# Keep them beside astd, where GuestProjectionArtifacts::discover looks,
+# rather than relying on an unshipped developer build directory.
+"$ROOT/scripts/build-guest-gpu-artifacts.sh" "$WORK/root/guest-gpu"
+
 cp "$CARGO_TARGET_DIR/release/ast" "$CARGO_TARGET_DIR/release/astd" "$WORK/root/bin/"
 cp "$ROOT/packaging/update.sh" "$WORK/root/bin/asterism-update"
 chmod 0755 "$WORK/root/bin/asterism-update"
@@ -80,7 +85,7 @@ strip "$WORK/root/bin/ast" "$WORK/root/bin/astd"
 # same signed-channel updater Darwin ships, so `ast update` is reachable.
 tar -czf "$DIST/asterism-${VERSION}-${TARGET}.tar.gz" \
   -C "$WORK/root/bin" ast astd cloud-hypervisor virtiofsd asterism-update \
-  -C "$WORK/root" share LICENSE-APACHE LICENSE-MIT NOTICE
+  -C "$WORK/root" guest-gpu share LICENSE-APACHE LICENSE-MIT NOTICE
 archive="asterism-${VERSION}-${TARGET}.tar.gz"
 # SHA256SUMS is consumed by install.sh with an exact basename lookup. DIST is
 # commonly nested (for example dist/v0.1.0), so hashing its path directly

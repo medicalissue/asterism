@@ -203,6 +203,7 @@ impl Hypervisor for HyperV {
             port_forward: false,
             guest_egress: None,
             disk_formats: &[DiskFormat::Raw],
+            guest_gpu_projection: false,
         }
     }
 
@@ -256,7 +257,8 @@ impl Hypervisor for HyperV {
             ctl: ControlChannel::Helper {
                 path: config_path(&req.dir),
             },
-            endpoint: GuestEndpoint::GuestAddr { addr: guest_addr },
+            endpoint: Some(GuestEndpoint::GuestAddr { addr: guest_addr }),
+            container_control: None,
             started_at: asterism_core::instance::now_unix(),
         })
     }

@@ -406,6 +406,7 @@ impl Hypervisor for Chv {
             // materialized once and can be grown safely to the requested
             // shape without an external converter.
             disk_formats: &[DiskFormat::Raw],
+            guest_gpu_projection: false,
         }
     }
 

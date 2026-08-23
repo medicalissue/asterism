@@ -25,6 +25,7 @@ use crate::image::{ImagePullResult, ImageRow};
 use crate::instance::{Instance, PortForward, Restart, RuntimeKind, Shape};
 use crate::orbit::{Device, DeviceStatus, WakeFacts};
 use crate::registry::OrbitRow;
+use crate::remote_gpu_guest::{GuestFrame, GuestReply};
 use crate::secret::Secret;
 use crate::snapshot::Snapshot;
 
@@ -205,6 +206,39 @@ pub enum Request {
         #[serde(default)]
         max_latency_ms: Option<u64>,
     },
+    /// Attach one hardware GPU provider to a stopped instance. The initiating
+    /// daemon resolves this into token-free durable metadata before routing
+    /// it to the shard that owns the instance.
+    AttachGpu {
+        name: String,
+        #[serde(default)]
+        provider_device: Option<String>,
+        #[serde(default)]
+        gpu_uuid: Option<String>,
+        memory_bytes: u64,
+    },
+    /// Internal resolved form. It contains no lease bearer and is safe to
+    /// persist verbatim in the instance registry.
+    AttachGpuResolved {
+        name: String,
+        attachment: crate::remote_gpu::GpuAttachment,
+    },
+    DetachGpu {
+        name: String,
+    },
+    /// Provider-plane inventory and revoke frames. They are accepted only by
+    /// a local daemon or an authenticated orbit RPC.
+    GpuProviderList,
+    GpuProviderAttach {
+        gpu_uuid: String,
+        consumer_device_id: String,
+        instance_id: String,
+        memory_bytes: u64,
+    },
+    GpuProviderRevoke {
+        gpu_uuid: String,
+        instance_id: String,
+    },
     /// Bind an orbit secret to one authority an instance may reach.
     ///
     /// A separate frame from [`Request::AttachVolume`] and not a flag on it,
@@ -332,6 +366,19 @@ pub enum Request {
         signal: i32,
     },
     DeviceShellClose,
+    /// Open the guest NVIDIA projection for one instance. The hypervisor
+    /// helper (or a source fixture) carries framed CUDA-semantic calls from
+    /// the projected `/dev/nvidia0` onto this unix socket. It is
+    /// instance-bound and never a LAN listener.
+    GpuGuestOpen {
+        name: String,
+    },
+    /// Frames sent after [`Request::GpuGuestOpen`] on the same local
+    /// connection. Invalid as standalone RPC.
+    GpuGuestFrame {
+        frame: GuestFrame,
+    },
+    GpuGuestClose,
 
     // ---- the mesh ----------------------------------------------------------
     //
@@ -693,12 +740,16 @@ impl Request {
             | Request::AttachVolume { name, .. }
             | Request::AttachBlock { name, .. }
             | Request::AttachStorage { name, .. }
+            | Request::AttachGpu { name, .. }
+            | Request::AttachGpuResolved { name, .. }
+            | Request::DetachGpu { name }
             | Request::Detach { name, .. }
             | Request::Snapshot { name, .. }
             | Request::SnapshotList { name }
             | Request::SnapshotRestore { name, .. }
             | Request::SnapshotRemove { name, .. }
             | Request::Logs { name, .. }
+            | Request::GpuGuestOpen { name }
             // Binding a secret is an instance command: `ast attach dev
             // --secret anthropic` resolves `dev` across the orbit like every
             // other, and the binding is written on whichever device holds it.
@@ -733,7 +784,12 @@ impl Request {
             | Request::DeviceShellEof
             | Request::DeviceShellResize { .. }
             | Request::DeviceShellSignal { .. }
-            | Request::DeviceShellClose => None,
+            | Request::DeviceShellClose
+            | Request::GpuGuestFrame { .. }
+            | Request::GpuGuestClose => None,
+            Request::GpuProviderList
+            | Request::GpuProviderAttach { .. }
+            | Request::GpuProviderRevoke { .. } => None,
 
             // About devices, not instances. `ast device wake desktop` names a
             // device on purpose — it is the one command whose subject really
@@ -821,7 +877,17 @@ impl Request {
             | Request::VolumeRelease { .. } => 7,
             Request::DeviceShellStatus => 5,
             Request::ImageList | Request::ImagePull { .. } => 6,
-            Request::CreateRuntime { .. } | Request::ContainerExec { .. } => 8,
+            Request::CreateRuntime { .. }
+            | Request::ContainerExec { .. }
+            | Request::GpuGuestOpen { .. }
+            | Request::GpuGuestFrame { .. }
+            | Request::GpuGuestClose
+            | Request::AttachGpu { .. }
+            | Request::AttachGpuResolved { .. }
+            | Request::DetachGpu { .. }
+            | Request::GpuProviderList
+            | Request::GpuProviderAttach { .. }
+            | Request::GpuProviderRevoke { .. } => 8,
             Request::DeviceShellPolicy { .. }
             | Request::DeviceShellOpen { .. }
             | Request::DeviceShellInput { .. }
@@ -865,6 +931,15 @@ impl Request {
             Request::ImagePull { .. } => Some("image_pull"),
             Request::CreateRuntime { .. } => Some("create_runtime"),
             Request::ContainerExec { .. } => Some("container_exec"),
+            Request::GpuGuestOpen { .. }
+            | Request::GpuGuestFrame { .. }
+            | Request::GpuGuestClose => Some("gpu_guest"),
+            Request::AttachGpu { .. }
+            | Request::AttachGpuResolved { .. }
+            | Request::DetachGpu { .. }
+            | Request::GpuProviderList
+            | Request::GpuProviderAttach { .. }
+            | Request::GpuProviderRevoke { .. } => Some("gpu_control"),
             _ => None,
         }
     }
@@ -1037,6 +1112,23 @@ pub enum Response {
     /// Exactly one terminal result for an accepted session.
     DeviceShellExit {
         exit: ShellExit,
+    },
+    GpuGuestAccepted {
+        session_id: String,
+        projection_kind: String,
+    },
+    GpuGuestRefused {
+        code: String,
+        message: String,
+    },
+    GpuGuestReply {
+        reply: GuestReply,
+    },
+    GpuProviders {
+        providers: Vec<crate::remote_gpu::ProviderAdvertisement>,
+    },
+    GpuProviderAttached {
+        attachment: crate::remote_gpu::GpuAttachment,
     },
 
     // ---- the mesh ----------------------------------------------------------
@@ -1251,6 +1343,11 @@ impl Response {
             | Response::DeviceShellRefused { .. }
             | Response::DeviceShellOutput { .. }
             | Response::DeviceShellExit { .. } => 4,
+            Response::GpuGuestAccepted { .. }
+            | Response::GpuGuestRefused { .. }
+            | Response::GpuGuestReply { .. }
+            | Response::GpuProviders { .. }
+            | Response::GpuProviderAttached { .. } => 8,
             _ => crate::compat::FIRST_PROTOCOL,
         }
     }
@@ -1294,6 +1391,14 @@ pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
             .since(),
         ),
         ("device_shell_status", Request::DeviceShellStatus.since()),
+        (
+            "gpu_guest",
+            Request::GpuGuestOpen {
+                name: String::new(),
+            }
+            .since(),
+        ),
+        ("gpu_control", Request::GpuProviderList.since()),
         ("image_list", Request::ImageList.since()),
         (
             "image_pull",

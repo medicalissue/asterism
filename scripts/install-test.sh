@@ -72,6 +72,12 @@ EOF
 		mkdir -p "${stage}/share/asterism/licenses"
 		cp "${ROOT}/packaging/linux-components.env" "${stage}/share/asterism/"
 		cp "${ROOT}/packaging/asterism-nbd" "${stage}/share/asterism/"
+		mkdir -p "${stage}/guest-gpu/bin" "${stage}/guest-gpu/lib"
+		printf '#!/bin/sh\nexit 1\n' >"${stage}/guest-gpu/bin/asterism-gpu-guest"
+		printf 'ELF guest libcuda\n' >"${stage}/guest-gpu/lib/libcuda.so.1.0.0"
+		ln -s libcuda.so.1.0.0 "${stage}/guest-gpu/lib/libcuda.so.1"
+		ln -s libcuda.so.1 "${stage}/guest-gpu/lib/libcuda.so"
+		chmod +x "${stage}/guest-gpu/bin/asterism-gpu-guest"
 		for license in cloud-hypervisor-Apache-2.0 cloud-hypervisor-BSD-3-Clause \
 			virtiofsd-Apache-2.0 virtiofsd-BSD-3-Clause; do
 			printf 'test license\n' >"${stage}/share/asterism/licenses/${license}.txt"
@@ -83,7 +89,7 @@ EOF
 		else
 			printf 'NOTICE\n' >"${stage}/share/asterism/licenses/NOTICE"
 		fi
-		members=(ast astd cloud-hypervisor virtiofsd share)
+		members=(ast astd cloud-hypervisor virtiofsd guest-gpu share)
 	fi
 	# The first release predates self-update; current releases ship the updater
 	# that `ast update` keeps alive while replacing ast itself.
@@ -672,6 +678,12 @@ says "loginctl enable-linger"
 [ -x "${PREFIX}/bin/virtiofsd" ] || fail "virtiofsd was not installed"
 [ -f "${PREFIX}/share/asterism/linux-components.env" ] || fail "component lock was not installed"
 [ -x "${PREFIX}/libexec/asterism/asterism-update" ] || fail "the Linux updater was not installed"
+[ -x "${PREFIX}/bin/guest-gpu/bin/asterism-gpu-guest" ] \
+	|| fail "the Linux guest GPU service was not installed beside astd"
+[ -f "${PREFIX}/bin/guest-gpu/lib/libcuda.so.1.0.0" ] \
+	|| fail "the generated guest libcuda was not installed beside astd"
+grep -q 'bin/guest-gpu/bin/asterism-gpu-guest' <<<"$(receipt)" \
+	|| fail "the receipt does not own the shipped guest GPU unit"
 [ -x "${WORK}/system-root/usr/local/libexec/asterism/asterism-nbd" ] \
 	|| fail "the root-owned NBD argument boundary was not installed"
 grep -qxF 'nbd' "${WORK}/system-root/etc/modules-load.d/asterism-nbd.conf" \
@@ -701,9 +713,22 @@ says "cleanup authority were kept"
 [ -e "$policy" ] || fail "uninstall removed sudoers cleanup authority while a live claim existed"
 [ -x "${PREFIX}/bin/cloud-hypervisor" ] || fail "refused uninstall still removed prefix files"
 rm -rf "${WORK}/system-root/run/asterism-nbd/nbd0"
+# A signed updater predating receipt migration can add guest-gpu to an older
+# Linux install. Cloud Hypervisor is the unambiguous ownership marker that
+# lets uninstall adopt and remove that exact internal unit.
+sed -E \
+	-e 's# bin/guest-gpu/bin/asterism-gpu-guest##' \
+	-e 's# bin/guest-gpu/lib/libcuda.so\.1\.0\.0##' \
+	-e 's# bin/guest-gpu/lib/libcuda\.so\.1##' \
+	-e 's# bin/guest-gpu/lib/libcuda\.so##' \
+	"${PREFIX}/share/asterism/install-receipt.env" \
+	>"${PREFIX}/share/asterism/install-receipt.env.new"
+mv "${PREFIX}/share/asterism/install-receipt.env.new" \
+	"${PREFIX}/share/asterism/install-receipt.env"
 run_install ok -- --uninstall
 [ ! -e "${PREFIX}/bin/cloud-hypervisor" ] || fail "uninstall left Cloud Hypervisor behind"
 [ ! -e "${PREFIX}/share/asterism/linux-components.env" ] || fail "uninstall left component metadata behind"
+[ ! -e "${PREFIX}/bin/guest-gpu" ] || fail "uninstall left guest GPU artifacts behind"
 [ ! -e "$policy" ] || fail "uninstall left the account's NBD sudo policy behind"
 
 # The shared artifact lock is exclusive across install/update/uninstall.
@@ -723,6 +748,33 @@ ok "a Linux release installs pinned CHV/virtiofsd, NBD policy, and uninstalls ex
 set_host Darwin arm64
 
 # ---- 9. the source escape hatch --------------------------------------------
+
+# Keep the Linux source lane tied to an installer-owned absolute directory.
+# This is deliberately a source-contract check: the hermetic Darwin fixture
+# below does not execute Linux builds, while the hosted gate exercises the
+# real compiler and /dev/cuse boundary. Ordering matters because the guest
+# payload must be complete before prepare_chv_source can install host packages.
+source_contract="$(sed -n '/^install_source()/,/^prepare_chv_source()/p' "$INSTALL")"
+# These are literal source snippets; expansion would defeat the regression.
+# shellcheck disable=SC2016
+grep -qF 'guest_artifacts="${TMPDIR_SELF}/guest-gpu"' <<<"$source_contract" \
+	|| fail "the Linux source build has no nonempty installer-owned guest artifact root"
+# shellcheck disable=SC2016
+build_guest_line="$(grep -nF '"${src}/scripts/build-guest-gpu-artifacts.sh" "$guest_artifacts"' <<<"$source_contract" | cut -d: -f1)"
+# shellcheck disable=SC2016
+validate_guest_line="$(grep -nF 'validate_linux_guest_artifacts "$guest_artifacts"' <<<"$source_contract" | cut -d: -f1)"
+# shellcheck disable=SC2016
+prepare_chv_line="$(grep -nF 'prepare_chv_source "$src"' <<<"$source_contract" | cut -d: -f1)"
+[ -n "$build_guest_line" ] && [ -n "$validate_guest_line" ] && [ -n "$prepare_chv_line" ] \
+	|| fail "the Linux source guest artifact contract is incomplete"
+[ "$build_guest_line" -lt "$validate_guest_line" ] && [ "$validate_guest_line" -lt "$prepare_chv_line" ] \
+	|| fail "Linux source artifacts are not validated before privileged preparation"
+# shellcheck disable=SC2016
+grep -qF '$(linux_guest_files)' <<<"$source_contract" \
+	|| fail "the source install journal does not own the guest GPU payload"
+grep -qF 'remove_receipt_files || return 1' <<<"$(sed -n '/^rollback_incomplete_install()/,/^receipt_lists()/p' "$INSTALL")" \
+	|| fail "interrupted-install rollback does not remove journal-owned payloads"
+ok "the Linux source artifact path is absolute, validated before root mutation, and journal-owned"
 
 fresh_prefix source
 rm -f "${WORK}/cloned-ref" "${WORK}/cargo-args"

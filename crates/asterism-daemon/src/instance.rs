@@ -137,6 +137,8 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             .map(|_| ())
             .and_then(|_| check_profiles(&profiles))
             .and_then(|_| reg.set_profiles(&name, profiles)),
+        Request::AttachGpuResolved { name, attachment } => reg.attach_gpu(&name, attachment),
+        Request::DetachGpu { name } => reg.detach_gpu(&name).map(|(instance, _)| instance),
         // `--restart` is recorded before the boot, so an instance that comes
         // up and immediately dies is already carrying the policy the user
         // asked for when the supervisor looks at the corpse.
@@ -1820,6 +1822,7 @@ mod tests {
                 asterism_core::orbit::Orbit::load(&dir.join("orbit.json")).unwrap(),
             )),
             shell: crate::device_shell::Manager::load_at(dir),
+            gpu: crate::gpu::Manager::new(),
         }
     }
 

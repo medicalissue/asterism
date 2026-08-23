@@ -171,6 +171,11 @@ impl Key {
         hex(&self.0)
     }
 
+    /// Borrow the raw key for protocols that derive a separate scoped key.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
     /// The proof one side sends for this handshake.
     ///
     /// `side` is `"host"` or `"guest"` and is part of the message, so the

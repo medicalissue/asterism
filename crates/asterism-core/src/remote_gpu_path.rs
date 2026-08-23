@@ -1,0 +1,1353 @@
+//! Authenticated instance-bound GPU path:
+//! guest control → local astd → iroh mesh → provider GPU service.
+//!
+//! The mesh opening frame names the orbit-global instance and the provider
+//! generation. It does not carry a lease bearer, a backend id, or a
+//! diagnostic consumer string used as authority. Typed frames are
+//! length-prefixed and bounded by [`gpu::MAX_WIRE_FRAME_BYTES`]. A credit
+//! window supplies backpressure; cancel drops a not-yet-applied call.
+//! Device loss, revocation, and generation skew fail closed without
+//! touching ABI memory.
+//!
+//! This module is the production adapter. Source fixtures encode and decode
+//! the same bytes a mesh stream would carry. They never bind a LAN TCP
+//! listener.
+
+use std::collections::{HashSet, VecDeque};
+
+use serde::{Deserialize, Serialize};
+
+use crate::remote_gpu::{
+    self as gpu, AbiRange, AuthenticatedPeer, ControlError, ControlErrorCode, Executor,
+    ProductionProvider, Reply, Request, Response, MAX_WIRE_FRAME_BYTES,
+};
+use crate::remote_gpu_guest::{
+    self as guest, CudaCall, CudaResult, GuestDeviceKind, GuestFrame, GuestReply,
+    CUDA_DRIVER_VERSION, CUDA_ERROR_INVALID_CONTEXT, CUDA_ERROR_INVALID_DEVICE,
+    CUDA_ERROR_NOT_SUPPORTED, DEFAULT_CREDIT_WINDOW, PROJECTION_KIND,
+};
+
+/// Protocol version that introduced the GPU mesh stream.
+pub const GPU_MESH_PROTOCOL: u32 = 8;
+
+/// Opening frame of a dedicated GPU mesh stream. QUIC already authenticated
+/// the peer; this only names which instance and generation the stream is for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuMeshOpen {
+    pub instance_id: String,
+    pub provider_generation: u64,
+}
+
+impl GpuMeshOpen {
+    pub fn new(
+        instance_id: impl Into<String>,
+        provider_generation: u64,
+    ) -> Result<Self, PathError> {
+        let instance_id = instance_id.into();
+        if instance_id.trim().is_empty() || instance_id.len() > 128 {
+            return Err(PathError::new(
+                "gpu mesh open requires an orbit-global instance id of 1..128 bytes",
+            ));
+        }
+        if provider_generation == 0 {
+            return Err(PathError::new(
+                "gpu mesh open requires a non-zero provider generation",
+            ));
+        }
+        Ok(Self {
+            instance_id,
+            provider_generation,
+        })
+    }
+
+    /// JSON object keys this frame is allowed to carry. A bearer, backend id,
+    /// or capability field is a protocol bug, not an extension.
+    pub fn allowed_keys() -> &'static [&'static str] {
+        &["instance_id", "provider_generation"]
+    }
+}
+
+/// Typed frames after [`GpuMeshOpen`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum GpuMeshFrame {
+    Accepted {
+        abi: u32,
+        executor: Executor,
+        credit: u32,
+        session: String,
+    },
+    Refused {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<u64>,
+        code: ControlErrorCode,
+        message: String,
+    },
+    Credit {
+        window: u32,
+    },
+    Call {
+        id: u64,
+        request: Request,
+    },
+    /// CUDA calls whose state belongs to this authenticated ABI session but
+    /// which do not consume the monotonic mutation sequence.
+    SessionCall {
+        id: u64,
+        call: CudaCall,
+    },
+    Reply {
+        id: u64,
+        reply: Reply,
+    },
+    SessionReply {
+        id: u64,
+        result: CudaResult,
+    },
+    Cancel {
+        id: u64,
+    },
+    Cancelled {
+        id: u64,
+    },
+    DeviceLost {
+        reason: String,
+    },
+    Revoked {
+        instance_id: String,
+    },
+    Skew {
+        expected_generation: u64,
+        observed: u64,
+    },
+    Close,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathError {
+    pub message: String,
+}
+
+impl PathError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for PathError {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for PathError {}
+
+impl From<ControlError> for PathError {
+    fn from(err: ControlError) -> Self {
+        Self::new(err.message)
+    }
+}
+
+impl From<guest::GuestError> for PathError {
+    fn from(err: guest::GuestError) -> Self {
+        Self::new(err.message)
+    }
+}
+
+/// Encode one bounded length-prefixed JSON frame. This is the mesh byte
+/// layout; fixtures assert these bytes, not just in-memory structs.
+pub fn encode_frame(value: &impl Serialize) -> Result<Vec<u8>, PathError> {
+    let body = serde_json::to_vec(value).map_err(|err| PathError::new(err.to_string()))?;
+    if body.len() > MAX_WIRE_FRAME_BYTES {
+        return Err(PathError::new(format!(
+            "GPU mesh frame is {} bytes, above the {MAX_WIRE_FRAME_BYTES} byte limit",
+            body.len()
+        )));
+    }
+    let len = u32::try_from(body.len()).map_err(|_| PathError::new("GPU mesh frame too large"))?;
+    let mut frame = Vec::with_capacity(4 + body.len());
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(&body);
+    Ok(frame)
+}
+
+pub fn decode_frame<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, PathError> {
+    if bytes.len() < 4 {
+        return Err(PathError::new("GPU mesh frame is truncated"));
+    }
+    let len = u32::from_be_bytes(bytes[0..4].try_into().expect("four-byte length")) as usize;
+    if len > MAX_WIRE_FRAME_BYTES {
+        return Err(PathError::new(format!(
+            "GPU mesh frame of {len} bytes exceeds the {MAX_WIRE_FRAME_BYTES} byte limit"
+        )));
+    }
+    if bytes.len() != 4 + len {
+        return Err(PathError::new(
+            "GPU mesh frame length does not match the prefix",
+        ));
+    }
+    serde_json::from_slice(&bytes[4..]).map_err(|err| PathError::new(err.to_string()))
+}
+
+/// Consumer-side hop: guest frames in, mesh frames out. Owns the credit
+/// window and call ids. Never holds a lease bearer.
+#[derive(Debug)]
+pub struct ConsumerHop {
+    pub instance_id: String,
+    pub provider_generation: u64,
+    credits: u32,
+    next_id: u64,
+    inflight: HashSet<u64>,
+    session: Option<String>,
+    sequence: u64,
+}
+
+impl ConsumerHop {
+    pub fn new(
+        instance_id: impl Into<String>,
+        provider_generation: u64,
+    ) -> Result<Self, PathError> {
+        let open = GpuMeshOpen::new(instance_id, provider_generation)?;
+        Ok(Self {
+            instance_id: open.instance_id,
+            provider_generation: open.provider_generation,
+            credits: 0,
+            next_id: 0,
+            inflight: HashSet::new(),
+            session: None,
+            sequence: 0,
+        })
+    }
+
+    pub fn open_bytes(&self) -> Result<Vec<u8>, PathError> {
+        let open = GpuMeshOpen::new(&self.instance_id, self.provider_generation)?;
+        encode_frame(&open)
+    }
+
+    pub fn apply_mesh(&mut self, frame: GpuMeshFrame) -> Result<(), PathError> {
+        match frame {
+            GpuMeshFrame::Accepted { credit, .. } | GpuMeshFrame::Credit { window: credit } => {
+                self.credits = credit;
+                Ok(())
+            }
+            GpuMeshFrame::Reply { id, .. } | GpuMeshFrame::Cancelled { id } => {
+                self.inflight.remove(&id);
+                self.credits = self.credits.saturating_add(1);
+                Ok(())
+            }
+            GpuMeshFrame::SessionReply { id, .. } => {
+                self.inflight.remove(&id);
+                Ok(())
+            }
+            GpuMeshFrame::Refused { .. }
+            | GpuMeshFrame::DeviceLost { .. }
+            | GpuMeshFrame::Revoked { .. }
+            | GpuMeshFrame::Skew { .. } => Err(PathError::new(format_fail_closed(
+                &frame,
+                "GPU mesh call failed closed",
+            ))),
+            GpuMeshFrame::Close => Ok(()),
+            GpuMeshFrame::Call { .. }
+            | GpuMeshFrame::SessionCall { .. }
+            | GpuMeshFrame::Cancel { .. } => Err(PathError::new(
+                "consumer received a provider-originated call frame",
+            )),
+        }
+    }
+
+    fn take_credit(&mut self) -> Result<u64, PathError> {
+        if self.credits == 0 {
+            return Err(PathError::new(
+                "GPU mesh credit window is empty; wait for a reply or a credit frame",
+            ));
+        }
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| PathError::new("GPU mesh call id space exhausted"))?;
+        self.credits -= 1;
+        self.inflight.insert(self.next_id);
+        Ok(self.next_id)
+    }
+
+    pub fn encode_call(&mut self, request: Request) -> Result<(u64, Vec<u8>), PathError> {
+        let id = self.take_credit()?;
+        Ok((id, encode_frame(&GpuMeshFrame::Call { id, request })?))
+    }
+
+    pub fn encode_cancel(&mut self, id: u64) -> Result<Vec<u8>, PathError> {
+        if !self.inflight.contains(&id) {
+            return Err(PathError::new("cancel names a call that is not in flight"));
+        }
+        encode_frame(&GpuMeshFrame::Cancel { id })
+    }
+
+    pub fn next_sequence(&mut self) -> Result<u64, PathError> {
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| PathError::new("ABI sequence exhausted"))?;
+        Ok(self.sequence)
+    }
+
+    pub fn set_session(&mut self, session: String) {
+        self.session = Some(session);
+    }
+
+    pub fn session(&self) -> Result<&str, PathError> {
+        self.session
+            .as_deref()
+            .ok_or_else(|| PathError::new("GPU ABI session is not open"))
+    }
+}
+
+fn format_fail_closed(frame: &GpuMeshFrame, fallback: &str) -> String {
+    match frame {
+        GpuMeshFrame::Skew {
+            expected_generation,
+            observed,
+        } => format!("GPU generation skew: attachment {expected_generation}, provider {observed}"),
+        GpuMeshFrame::DeviceLost { reason } => format!("GPU device lost: {reason}"),
+        GpuMeshFrame::Revoked { instance_id } => format!("GPU lease revoked for {instance_id}"),
+        GpuMeshFrame::Refused { message, .. } => message.clone(),
+        _ => fallback.to_owned(),
+    }
+}
+
+/// Provider-side hop. Authorizes by authenticated peer + instance +
+/// generation, then feeds [`ProductionProvider`].
+#[derive(Debug)]
+pub struct ProviderHop {
+    peer: AuthenticatedPeer,
+    production: ProductionProvider,
+    instance_id: Option<String>,
+    generation: Option<u64>,
+    abi_session: Option<String>,
+    executor: Executor,
+    queued: VecDeque<(u64, Request)>,
+    now: u64,
+    last_sequence: u64,
+    next_context: u64,
+    current_context: Option<u64>,
+    contexts: HashSet<u64>,
+    modules: HashSet<String>,
+    functions: HashSet<String>,
+}
+
+impl ProviderHop {
+    pub fn new(peer: AuthenticatedPeer, production: ProductionProvider, now: u64) -> Self {
+        Self {
+            peer,
+            production,
+            instance_id: None,
+            generation: None,
+            abi_session: None,
+            executor: Executor::Reference,
+            queued: VecDeque::new(),
+            now,
+            last_sequence: 0,
+            next_context: 1,
+            current_context: None,
+            contexts: HashSet::new(),
+            modules: HashSet::new(),
+            functions: HashSet::new(),
+        }
+    }
+
+    /// Re-evaluate authorization time on every hop. Frozen construction
+    /// time would let an expired lease keep serving.
+    pub fn set_now(&mut self, now: u64) {
+        self.now = now;
+        if let Some(instance_id) = &self.instance_id {
+            let _ = self
+                .production
+                .authority_mut()
+                .renew_durable_instance(instance_id, now);
+        }
+        self.production.authority_mut().reap_expired(now);
+    }
+
+    pub fn production_mut(&mut self) -> &mut ProductionProvider {
+        &mut self.production
+    }
+
+    pub fn abi_session(&self) -> Option<&str> {
+        self.abi_session.as_deref()
+    }
+
+    pub fn executor(&self) -> Executor {
+        self.executor
+    }
+
+    pub fn into_production(self) -> ProductionProvider {
+        self.production
+    }
+
+    pub fn accept_open(&mut self, open: GpuMeshOpen) -> Result<GpuMeshFrame, PathError> {
+        match self.production.open_session_for_instance(
+            &self.peer,
+            &open.instance_id,
+            open.provider_generation,
+            AbiRange::ours(),
+            self.now,
+        ) {
+            Ok(Response::SessionOpened {
+                abi,
+                session,
+                capabilities,
+            }) => {
+                self.instance_id = Some(open.instance_id);
+                self.generation = Some(open.provider_generation);
+                self.abi_session = Some(session.clone());
+                self.executor = capabilities.executor;
+                Ok(GpuMeshFrame::Accepted {
+                    abi,
+                    executor: capabilities.executor,
+                    credit: DEFAULT_CREDIT_WINDOW,
+                    session,
+                })
+            }
+            Ok(_) => Err(PathError::new(
+                "provider hello returned a non-session reply",
+            )),
+            Err(err) if err.code == ControlErrorCode::StaleGeneration => Ok(GpuMeshFrame::Skew {
+                expected_generation: open.provider_generation,
+                observed: self.production.authority().generation(),
+            }),
+            Err(err) if err.code == ControlErrorCode::Revoked => Ok(GpuMeshFrame::Revoked {
+                instance_id: open.instance_id,
+            }),
+            Err(err) if err.code == ControlErrorCode::Unavailable => Ok(GpuMeshFrame::DeviceLost {
+                reason: err.message,
+            }),
+            Err(err) => Ok(GpuMeshFrame::Refused {
+                id: None,
+                code: err.code,
+                message: err.message,
+            }),
+        }
+    }
+
+    pub fn handle_frame(&mut self, frame: GpuMeshFrame) -> Result<GpuMeshFrame, PathError> {
+        let _instance_id = self
+            .instance_id
+            .clone()
+            .ok_or_else(|| PathError::new("GPU mesh stream is not accepted"))?;
+        let _generation = self
+            .generation
+            .ok_or_else(|| PathError::new("GPU mesh stream is not accepted"))?;
+        match frame {
+            GpuMeshFrame::Call { id, request } => {
+                if self.queued.len() as u32 >= DEFAULT_CREDIT_WINDOW {
+                    return Ok(GpuMeshFrame::Refused {
+                        id: Some(id),
+                        code: ControlErrorCode::LimitExceeded,
+                        message: "GPU mesh credit window is exhausted".into(),
+                    });
+                }
+                if self.queued.iter().any(|(qid, _)| *qid == id) {
+                    return Ok(GpuMeshFrame::Refused {
+                        id: Some(id),
+                        code: ControlErrorCode::InvalidRequest,
+                        message: "GPU call id is already queued".into(),
+                    });
+                }
+                self.queued.push_back((id, request));
+                Ok(GpuMeshFrame::Credit {
+                    window: DEFAULT_CREDIT_WINDOW.saturating_sub(self.queued.len() as u32),
+                })
+            }
+            GpuMeshFrame::SessionCall { id, call } => Ok(GpuMeshFrame::SessionReply {
+                id,
+                result: self.session_cuda(&call)?,
+            }),
+            GpuMeshFrame::Cancel { id } => {
+                if let Some(pos) = self.queued.iter().position(|(qid, _)| *qid == id) {
+                    self.queued.remove(pos);
+                    Ok(GpuMeshFrame::Cancelled { id })
+                } else {
+                    Ok(GpuMeshFrame::Refused {
+                        id: Some(id),
+                        code: ControlErrorCode::InvalidRequest,
+                        message: "GPU call already executed or unknown".into(),
+                    })
+                }
+            }
+            GpuMeshFrame::Close => {
+                self.shutdown("close", false);
+                Ok(GpuMeshFrame::Close)
+            }
+            other => Ok(GpuMeshFrame::Refused {
+                id: None,
+                code: ControlErrorCode::InvalidRequest,
+                message: format!("provider rejected unexpected mesh frame {other:?}"),
+            }),
+        }
+    }
+
+    /// Apply the oldest queued call. Cancel of a still-queued id succeeds
+    /// because Call does not execute in the same step.
+    pub fn apply_next(&mut self) -> Result<Option<GpuMeshFrame>, PathError> {
+        let Some((id, request)) = self.queued.pop_front() else {
+            return Ok(None);
+        };
+        let instance_id = self
+            .instance_id
+            .clone()
+            .ok_or_else(|| PathError::new("GPU mesh stream is not accepted"))?;
+        let generation = self
+            .generation
+            .ok_or_else(|| PathError::new("GPU mesh stream is not accepted"))?;
+        if let Some((_, sequence)) = request.session_and_sequence() {
+            self.last_sequence = sequence;
+        }
+        Ok(Some(
+            match self.production.handle_for_instance(
+                &self.peer,
+                &instance_id,
+                generation,
+                request,
+                self.now,
+            ) {
+                Ok(reply) => GpuMeshFrame::Reply { id, reply },
+                Err(err) if err.code == ControlErrorCode::StaleGeneration => GpuMeshFrame::Skew {
+                    expected_generation: generation,
+                    observed: self.production.authority().generation(),
+                },
+                Err(err) if err.code == ControlErrorCode::Revoked => {
+                    GpuMeshFrame::Revoked { instance_id }
+                }
+                Err(err) if err.code == ControlErrorCode::Unavailable => GpuMeshFrame::DeviceLost {
+                    reason: err.message,
+                },
+                Err(err) => GpuMeshFrame::Refused {
+                    id: Some(id),
+                    code: err.code,
+                    message: err.message,
+                },
+            },
+        ))
+    }
+
+    /// Session-local Init and device queries execute on this provider after
+    /// a current-time authorization, not as a GuestMeshPath stub.
+    pub fn session_cuda(&mut self, call: &CudaCall) -> Result<CudaResult, PathError> {
+        let instance_id = self
+            .instance_id
+            .clone()
+            .ok_or_else(|| PathError::new("GPU mesh stream is not accepted"))?;
+        let generation = self
+            .generation
+            .ok_or_else(|| PathError::new("GPU mesh stream is not accepted"))?;
+        self.production
+            .authority()
+            .authorize_instance(&self.peer, &instance_id, generation, self.now)
+            .map_err(|err| PathError::new(err.message))?;
+        let capabilities = self.production.capabilities().clone();
+        let uuid = self.production.authority().gpu_uuid().to_owned();
+        match call {
+            CudaCall::Init => Ok(CudaResult::Init),
+            CudaCall::DriverGetVersion => Ok(CudaResult::DriverVersion {
+                version: CUDA_DRIVER_VERSION,
+            }),
+            CudaCall::DeviceCount => Ok(CudaResult::DeviceCount { count: 1 }),
+            CudaCall::DeviceGet { ordinal } if *ordinal == 0 => {
+                Ok(CudaResult::Device { ordinal: 0 })
+            }
+            CudaCall::DeviceGet { .. } => Ok(CudaResult::Error {
+                cuda: CUDA_ERROR_INVALID_DEVICE,
+                message: "only device ordinal 0 is projected".into(),
+            }),
+            CudaCall::DeviceName { ordinal } if *ordinal == 0 => Ok(CudaResult::DeviceName {
+                name: capabilities.device_name,
+            }),
+            CudaCall::DeviceName { .. } => Ok(CudaResult::Error {
+                cuda: CUDA_ERROR_INVALID_DEVICE,
+                message: "only device ordinal 0 is projected".into(),
+            }),
+            CudaCall::DeviceUuid { ordinal } if *ordinal == 0 => {
+                Ok(CudaResult::DeviceUuid { uuid })
+            }
+            CudaCall::DeviceUuid { .. } => Ok(CudaResult::Error {
+                cuda: CUDA_ERROR_INVALID_DEVICE,
+                message: "only device ordinal 0 is projected".into(),
+            }),
+            CudaCall::DeviceAttribute { ordinal, attribute } if *ordinal == 0 => {
+                let name =
+                    guest::device_attribute_name(attribute.parse::<i32>().unwrap_or(i32::MIN))
+                        .unwrap_or(attribute.as_str());
+                let value = match name {
+                    "COMPUTE_CAPABILITY_MAJOR" => 7,
+                    "COMPUTE_CAPABILITY_MINOR" => 0,
+                    "MULTIPROCESSOR_COUNT" => 1,
+                    _ => {
+                        return Ok(CudaResult::Error {
+                            cuda: CUDA_ERROR_NOT_SUPPORTED,
+                            message: format!("{attribute} is outside the ABI 1 attribute surface"),
+                        })
+                    }
+                };
+                Ok(CudaResult::DeviceAttribute { value })
+            }
+            CudaCall::DeviceAttribute { .. } => Ok(CudaResult::Error {
+                cuda: CUDA_ERROR_INVALID_DEVICE,
+                message: "only device ordinal 0 is projected".into(),
+            }),
+            CudaCall::CtxCreate { device, .. } if *device == 0 => {
+                let context = self.next_context;
+                self.next_context = self.next_context.saturating_add(1);
+                self.contexts.insert(context);
+                self.current_context = Some(context);
+                Ok(CudaResult::Context { context })
+            }
+            CudaCall::CtxCreate { .. } => Ok(CudaResult::Error {
+                cuda: CUDA_ERROR_INVALID_DEVICE,
+                message: "only device ordinal 0 is projected".into(),
+            }),
+            CudaCall::CtxDestroy { context } => {
+                if self.contexts.remove(context) {
+                    if self.current_context == Some(*context) {
+                        self.current_context = None;
+                    }
+                    Ok(CudaResult::Synced)
+                } else {
+                    Ok(CudaResult::Error {
+                        cuda: CUDA_ERROR_INVALID_CONTEXT,
+                        message: "context is not current on this session".into(),
+                    })
+                }
+            }
+            CudaCall::CtxGetCurrent => Ok(CudaResult::CurrentContext {
+                context: self.current_context.unwrap_or(0),
+            }),
+            CudaCall::CtxSetCurrent { context } => {
+                if *context == 0 {
+                    self.current_context = None;
+                    Ok(CudaResult::Synced)
+                } else if self.contexts.contains(context) {
+                    self.current_context = Some(*context);
+                    Ok(CudaResult::Synced)
+                } else {
+                    Ok(CudaResult::Error {
+                        cuda: CUDA_ERROR_INVALID_CONTEXT,
+                        message: "context is not current on this session".into(),
+                    })
+                }
+            }
+            CudaCall::CtxSynchronize | CudaCall::Synchronize => Ok(CudaResult::Synced),
+            CudaCall::ModuleUnload { module } => {
+                self.modules.remove(module);
+                Ok(CudaResult::Unloaded)
+            }
+            CudaCall::ModuleGetFunction { module, name } => {
+                if name != "vector_add_f32" {
+                    return Ok(CudaResult::Error {
+                        cuda: CUDA_ERROR_NOT_SUPPORTED,
+                        message: format!("{name} is outside the pinned vector-add entrypoint"),
+                    });
+                }
+                self.modules.insert(module.clone());
+                self.functions.insert(name.clone());
+                Ok(CudaResult::Function {
+                    function: name.clone(),
+                })
+            }
+            CudaCall::GetErrorName { code } => Ok(CudaResult::ErrorName {
+                name: guest::cuda_error_name(*code)
+                    .trim_end_matches('\0')
+                    .to_owned(),
+            }),
+            CudaCall::GetErrorString { code } => Ok(CudaResult::ErrorString {
+                text: guest::cuda_error_string(*code)
+                    .trim_end_matches('\0')
+                    .to_owned(),
+            }),
+            CudaCall::Unsupported { symbol } => Ok(CudaResult::Error {
+                cuda: CUDA_ERROR_NOT_SUPPORTED,
+                message: format!("{symbol} is outside the implemented CUDA Driver surface"),
+            }),
+            _ => Err(PathError::new(
+                "this CUDA call is an ABI mutation, not a session-local query",
+            )),
+        }
+    }
+
+    /// Close this transient ABI session while preserving the durable GPU
+    /// attachment and its lease. A socket EOF says the guest process or one
+    /// route disappeared; it is not evidence that the NVIDIA provider died
+    /// and must never silently turn an ordinary close into `ast gpu detach`.
+    pub fn shutdown(&mut self, _reason: &str, _lost: bool) {
+        self.queued.clear();
+        if let (Some(session), Some(instance_id), Some(generation)) = (
+            self.abi_session.take(),
+            self.instance_id.clone(),
+            self.generation,
+        ) {
+            let sequence = self.last_sequence.saturating_add(1);
+            let _ = self.production.handle_for_instance(
+                &self.peer,
+                &instance_id,
+                generation,
+                Request::Close { session, sequence },
+                self.now,
+            );
+            self.production.guest_lost(&instance_id);
+        }
+        self.production.authority_mut().reap_expired(self.now);
+        self.instance_id = None;
+        self.generation = None;
+        self.current_context = None;
+        self.contexts.clear();
+        self.modules.clear();
+        self.functions.clear();
+    }
+
+    pub fn queued_len(&self) -> usize {
+        self.queued.len()
+    }
+}
+
+/// In-process path that still serializes every hop to bytes. This is the
+/// source fixture: CUDA calls enter as guest frames, cross encoded mesh
+/// frames, and come back as CUDA results.
+pub struct GuestMeshPath {
+    consumer: ConsumerHop,
+    provider: ProviderHop,
+    session: String,
+    /// Encoded frames that actually crossed the mesh direction, for proofs.
+    pub crossed: Vec<Vec<u8>>,
+}
+
+impl GuestMeshPath {
+    /// Attach a lease, then open the mesh path. Returns the token-free
+    /// attachment and the in-memory capability string so tests can prove the
+    /// capability never appears in crossed bytes.
+    pub fn attach(
+        peer: AuthenticatedPeer,
+        mut production: ProductionProvider,
+        instance_id: &str,
+        memory_bytes: u64,
+        now: u64,
+    ) -> Result<(Self, gpu::GpuAttachment, String), PathError> {
+        let (lease, attachment) =
+            production
+                .authority_mut()
+                .attach(&peer, instance_id, memory_bytes, now)?;
+        let capability = lease.capability().to_owned();
+        let generation = attachment.provider_generation;
+        let mut consumer = ConsumerHop::new(instance_id, generation)?;
+        let mut provider = ProviderHop::new(peer, production, now);
+        let open_bytes = consumer.open_bytes()?;
+        let open: GpuMeshOpen = decode_frame(&open_bytes)?;
+        assert_open_has_no_bearer(&open_bytes)?;
+        let accepted = provider.accept_open(open)?;
+        let accepted_bytes = encode_frame(&accepted)?;
+        consumer.apply_mesh(accepted)?;
+        let session = provider
+            .abi_session()
+            .ok_or_else(|| PathError::new("provider did not capture an ABI session"))?
+            .to_owned();
+        consumer.set_session(session.clone());
+        Ok((
+            Self {
+                consumer,
+                provider,
+                session,
+                crossed: vec![open_bytes, accepted_bytes],
+            },
+            attachment,
+            capability,
+        ))
+    }
+
+    pub fn crossed_text(&self) -> String {
+        self.crossed
+            .iter()
+            .filter_map(|frame| std::str::from_utf8(&frame[4.min(frame.len())..]).ok())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    pub fn guest_open_reply(&self, kind: GuestDeviceKind) -> GuestReply {
+        GuestReply::Accepted {
+            abi: gpu::ABI_VERSION,
+            projection_kind: PROJECTION_KIND.into(),
+            device_kind: kind,
+            executor: self.provider.executor(),
+            credit: DEFAULT_CREDIT_WINDOW,
+        }
+    }
+
+    pub fn apply_guest(&mut self, frame: GuestFrame) -> Result<GuestReply, PathError> {
+        match frame {
+            GuestFrame::Open { .. } => Ok(self.guest_open_reply(GuestDeviceKind::UnixEndpoint)),
+            GuestFrame::Cuda { id, call } => {
+                let result = self.apply_cuda(call)?;
+                Ok(GuestReply::Cuda { id, result })
+            }
+            GuestFrame::Cancel { id } => {
+                let bytes = self.consumer.encode_cancel(id)?;
+                self.crossed.push(bytes.clone());
+                let frame: GpuMeshFrame = decode_frame(&bytes)?;
+                let reply = self.provider.handle_frame(frame)?;
+                let reply_bytes = encode_frame(&reply)?;
+                self.crossed.push(reply_bytes);
+                self.consumer.apply_mesh(reply.clone())?;
+                match reply {
+                    GpuMeshFrame::Cancelled { id } => Ok(GuestReply::Cancelled { id }),
+                    GpuMeshFrame::Refused { id, message, .. } => Ok(GuestReply::Refused {
+                        id,
+                        code: "cancel".into(),
+                        message,
+                    }),
+                    other => Err(PathError::new(format!("unexpected cancel reply {other:?}"))),
+                }
+            }
+            GuestFrame::Close => {
+                let close = self.provider.handle_frame(GpuMeshFrame::Close)?;
+                self.crossed.push(encode_frame(&close)?);
+                Ok(GuestReply::Closed)
+            }
+        }
+    }
+
+    pub fn cuda(&mut self, call: CudaCall) -> Result<CudaResult, PathError> {
+        self.apply_cuda(call)
+    }
+
+    fn apply_cuda(&mut self, call: CudaCall) -> Result<CudaResult, PathError> {
+        match &call {
+            CudaCall::Init
+            | CudaCall::DriverGetVersion
+            | CudaCall::DeviceCount
+            | CudaCall::DeviceGet { .. }
+            | CudaCall::DeviceName { .. }
+            | CudaCall::DeviceUuid { .. }
+            | CudaCall::DeviceAttribute { .. }
+            | CudaCall::CtxCreate { .. }
+            | CudaCall::CtxDestroy { .. }
+            | CudaCall::CtxGetCurrent
+            | CudaCall::CtxSetCurrent { .. }
+            | CudaCall::CtxSynchronize
+            | CudaCall::Synchronize
+            | CudaCall::ModuleUnload { .. }
+            | CudaCall::ModuleGetFunction { .. }
+            | CudaCall::GetErrorName { .. }
+            | CudaCall::GetErrorString { .. }
+            | CudaCall::Unsupported { .. } => self.provider.session_cuda(&call),
+            other => {
+                let sequence = self.consumer.next_sequence()?;
+                let request = guest::abi_request_for(&self.session, sequence, other)?;
+                let reply = self.round_trip(request)?;
+                Ok(guest::cuda_result_for(other, reply))
+            }
+        }
+    }
+
+    fn round_trip(&mut self, request: Request) -> Result<Reply, PathError> {
+        let (id, call_bytes) = self.consumer.encode_call(request)?;
+        self.crossed.push(call_bytes.clone());
+        let frame: GpuMeshFrame = decode_frame(&call_bytes)?;
+        let ack = self.provider.handle_frame(frame)?;
+        let ack_bytes = encode_frame(&ack)?;
+        self.crossed.push(ack_bytes);
+        self.consumer.apply_mesh(ack.clone())?;
+        let reply_frame = self
+            .provider
+            .apply_next()?
+            .ok_or_else(|| PathError::new("queued GPU call was cancelled before apply"))?;
+        let reply_bytes = encode_frame(&reply_frame)?;
+        self.crossed.push(reply_bytes.clone());
+        self.consumer.apply_mesh(reply_frame.clone())?;
+        match reply_frame {
+            GpuMeshFrame::Reply {
+                id: reply_id,
+                reply,
+            } if reply_id == id => Ok(reply),
+            other => Err(fail_closed_error(&other)),
+        }
+    }
+
+    pub fn set_now(&mut self, now: u64) {
+        self.provider.set_now(now);
+    }
+
+    pub fn revoke_instance(&mut self, instance_id: &str) -> bool {
+        self.provider.production_mut().revoke_instance(instance_id)
+    }
+
+    pub fn provider_lost(&mut self, reason: &str) -> u32 {
+        self.provider.production_mut().provider_lost(reason)
+    }
+}
+
+impl Drop for GuestMeshPath {
+    fn drop(&mut self) {
+        if self.provider.abi_session().is_some() {
+            self.provider.shutdown("drop", true);
+        }
+    }
+}
+
+fn fail_closed_error(frame: &GpuMeshFrame) -> PathError {
+    PathError::new(format_fail_closed(frame, "GPU mesh call failed closed"))
+}
+
+fn assert_open_has_no_bearer(bytes: &[u8]) -> Result<(), PathError> {
+    let body = std::str::from_utf8(&bytes[4..]).map_err(|err| PathError::new(err.to_string()))?;
+    for forbidden in ["capability", "bearer", "lease_token", "token", "backend"] {
+        if body.contains(forbidden) {
+            return Err(PathError::new(format!(
+                "GPU mesh open must not carry {forbidden}: {body}"
+            )));
+        }
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|err| PathError::new(err.to_string()))?;
+    let keys: Vec<_> = value
+        .as_object()
+        .ok_or_else(|| PathError::new("GPU mesh open is not a JSON object"))?
+        .keys()
+        .cloned()
+        .collect();
+    for key in &keys {
+        if !GpuMeshOpen::allowed_keys().contains(&key.as_str()) {
+            return Err(PathError::new(format!(
+                "GPU mesh open carries unexpected key {key}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::remote_gpu::{LeaseAuthority, LeaseLimits, Provider};
+
+    fn peer(label: u8) -> AuthenticatedPeer {
+        AuthenticatedPeer::from_mesh_identity(format!("{label:064x}")).unwrap()
+    }
+
+    fn production(name: &str) -> ProductionProvider {
+        let authority = LeaseAuthority::new(
+            name,
+            "a".repeat(64),
+            "GPU-01234567",
+            7,
+            LeaseLimits::default(),
+        )
+        .unwrap();
+        ProductionProvider::new(authority, Provider::reference(name))
+    }
+
+    fn mesh_path() -> (GuestMeshPath, gpu::GpuAttachment, String) {
+        GuestMeshPath::attach(
+            peer(1),
+            production("desktop"),
+            "inst-1",
+            64 * 1024 * 1024,
+            1_000,
+        )
+        .unwrap()
+    }
+
+    fn alloc(path: &mut GuestMeshPath, bytes: u64) -> String {
+        match path.cuda(CudaCall::MemAlloc { bytes }).unwrap() {
+            CudaResult::Alloc { allocation } => allocation,
+            other => panic!("allocate failed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vector_add_bytes_cross_the_authenticated_mesh_path() {
+        let (mut path, attachment, capability) = mesh_path();
+        assert_eq!(attachment.guest_path(), gpu::GUEST_DEVICE_PATH);
+        assert_eq!(attachment.projection_kind(), PROJECTION_KIND);
+        assert!(!capability.is_empty());
+        assert!(!path.crossed_text().contains(&capability));
+        assert!(!format!("{:?}", path.crossed).contains(&capability));
+
+        path.cuda(CudaCall::Init).unwrap();
+        let lhs = alloc(&mut path, 16);
+        let rhs = alloc(&mut path, 16);
+        let output = alloc(&mut path, 16);
+        let lhs_bytes: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let rhs_bytes: Vec<u8> = [10.0f32, 20.0, 30.0, 40.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        path.cuda(CudaCall::MemcpyHtoD {
+            allocation: lhs.clone(),
+            offset: 0,
+            data: lhs_bytes,
+        })
+        .unwrap();
+        path.cuda(CudaCall::MemcpyHtoD {
+            allocation: rhs.clone(),
+            offset: 0,
+            data: rhs_bytes,
+        })
+        .unwrap();
+        let loaded = path
+            .cuda(CudaCall::ModuleLoadData {
+                image: gpu::VECTOR_ADD_PTX.as_bytes().to_vec(),
+            })
+            .unwrap();
+        let CudaResult::Module { pin } = loaded else {
+            panic!("module load failed: {loaded:?}");
+        };
+        path.cuda(CudaCall::LaunchVectorAdd {
+            workload_pin: pin,
+            lhs,
+            rhs,
+            output: output.clone(),
+            elements: 4,
+        })
+        .unwrap();
+        let data = path
+            .cuda(CudaCall::MemcpyDtoH {
+                allocation: output,
+                offset: 0,
+                bytes: 16,
+            })
+            .unwrap();
+        let CudaResult::Data { data } = data else {
+            panic!("read failed: {data:?}");
+        };
+        let values: Vec<f32> = data
+            .chunks(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(values, vec![11.0, 22.0, 33.0, 44.0]);
+        assert!(path.crossed.len() >= 4);
+        assert!(!path.crossed_text().contains(&capability));
+        assert!(!path.crossed_text().contains("backend"));
+    }
+
+    #[test]
+    fn every_generated_session_local_cuda_call_crosses_the_mesh() {
+        let peer = peer(9);
+        let mut production = production("desktop");
+        let (_, attachment) = production
+            .authority_mut()
+            .attach(&peer, "session-calls", 64 * 1024 * 1024, 1_000)
+            .unwrap();
+        let mut provider = ProviderHop::new(peer, production, 1_001);
+        assert!(matches!(
+            provider
+                .accept_open(
+                    GpuMeshOpen::new("session-calls", attachment.provider_generation).unwrap()
+                )
+                .unwrap(),
+            GpuMeshFrame::Accepted { .. }
+        ));
+
+        let mut call_id = 1u64;
+        let mut session_call = |call: CudaCall| {
+            let outbound = GpuMeshFrame::SessionCall { id: call_id, call };
+            let wire = encode_frame(&outbound).unwrap();
+            let decoded = decode_frame(&wire).unwrap();
+            let reply = provider.handle_frame(decoded).unwrap();
+            let GpuMeshFrame::SessionReply { id, result } = reply else {
+                panic!("session call did not receive a session reply: {reply:?}")
+            };
+            assert_eq!(id, call_id);
+            call_id += 1;
+            result
+        };
+
+        assert!(matches!(session_call(CudaCall::Init), CudaResult::Init));
+        assert!(matches!(
+            session_call(CudaCall::DriverGetVersion),
+            CudaResult::DriverVersion { .. }
+        ));
+        assert!(matches!(
+            session_call(CudaCall::DeviceCount),
+            CudaResult::DeviceCount { count: 1 }
+        ));
+        assert!(matches!(
+            session_call(CudaCall::DeviceGet { ordinal: 0 }),
+            CudaResult::Device { ordinal: 0 }
+        ));
+        assert!(matches!(
+            session_call(CudaCall::DeviceName { ordinal: 0 }),
+            CudaResult::DeviceName { .. }
+        ));
+        assert!(matches!(
+            session_call(CudaCall::DeviceUuid { ordinal: 0 }),
+            CudaResult::DeviceUuid { .. }
+        ));
+        assert!(matches!(
+            session_call(CudaCall::DeviceAttribute {
+                ordinal: 0,
+                attribute: "COMPUTE_CAPABILITY_MAJOR".into(),
+            }),
+            CudaResult::DeviceAttribute { .. }
+        ));
+        let CudaResult::Context { context } = session_call(CudaCall::CtxCreate {
+            flags: 0,
+            device: 0,
+        }) else {
+            panic!("context create failed")
+        };
+        assert!(matches!(
+            session_call(CudaCall::CtxGetCurrent),
+            CudaResult::CurrentContext { context: current } if current == context
+        ));
+        assert!(matches!(
+            session_call(CudaCall::CtxSetCurrent { context }),
+            CudaResult::Synced
+        ));
+        assert!(matches!(
+            session_call(CudaCall::CtxSynchronize),
+            CudaResult::Synced
+        ));
+        assert!(matches!(
+            session_call(CudaCall::ModuleGetFunction {
+                module: "module-pin".into(),
+                name: "vector_add_f32".into(),
+            }),
+            CudaResult::Function { .. }
+        ));
+        assert!(matches!(
+            session_call(CudaCall::ModuleUnload {
+                module: "module-pin".into(),
+            }),
+            CudaResult::Unloaded
+        ));
+        assert!(matches!(
+            session_call(CudaCall::GetErrorName { code: 0 }),
+            CudaResult::ErrorName { .. }
+        ));
+        assert!(matches!(
+            session_call(CudaCall::GetErrorString { code: 0 }),
+            CudaResult::ErrorString { .. }
+        ));
+        assert!(matches!(
+            session_call(CudaCall::CtxDestroy { context }),
+            CudaResult::Synced
+        ));
+    }
+
+    #[test]
+    fn unsupported_cuda_symbols_fail_closed_without_a_mesh_mutation() {
+        let (mut path, _, _) = mesh_path();
+        let before = path.crossed.len();
+        let result = path
+            .cuda(CudaCall::Unsupported {
+                symbol: "cuMemAllocManaged".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            result,
+            CudaResult::Error {
+                cuda: CUDA_ERROR_NOT_SUPPORTED,
+                ..
+            }
+        ));
+        assert_eq!(path.crossed.len(), before);
+    }
+
+    #[test]
+    fn revoke_and_device_loss_fail_closed() {
+        let (mut path, _, _) = mesh_path();
+        let allocation = alloc(&mut path, 8);
+        assert!(path.revoke_instance("inst-1"));
+        let err = path
+            .cuda(CudaCall::MemcpyDtoH {
+                allocation,
+                offset: 0,
+                bytes: 8,
+            })
+            .unwrap_err();
+        assert!(
+            err.message.contains("revoked")
+                || err.message.contains("no live GPU lease")
+                || err.message.contains("unknown"),
+            "{err}"
+        );
+
+        let (mut path, _, _) = mesh_path();
+        alloc(&mut path, 8);
+        path.provider_lost("provider process gone");
+        let err = path.cuda(CudaCall::MemAlloc { bytes: 8 }).unwrap_err();
+        assert!(
+            err.message.contains("lost")
+                || err.message.contains("not ready")
+                || err.message.contains("offline")
+                || err.message.contains("no live GPU lease")
+                || err.message.contains("skew"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn generation_skew_fails_closed() {
+        let peer = peer(2);
+        let mut production = production("desktop");
+        let (_, attachment) = production
+            .authority_mut()
+            .attach(&peer, "inst-skew", 64 * 1024 * 1024, 1_000)
+            .unwrap();
+        production.authority_mut().provider_lost("restart");
+        production.authority_mut().recover().unwrap();
+        let consumer = ConsumerHop::new("inst-skew", attachment.provider_generation).unwrap();
+        let mut provider = ProviderHop::new(peer, production, 1_000);
+        let open: GpuMeshOpen = decode_frame(&consumer.open_bytes().unwrap()).unwrap();
+        let reply = provider.accept_open(open).unwrap();
+        assert!(
+            matches!(
+                reply,
+                GpuMeshFrame::Skew { .. }
+                    | GpuMeshFrame::Revoked { .. }
+                    | GpuMeshFrame::Refused { .. }
+            ),
+            "{reply:?}"
+        );
+    }
+
+    #[test]
+    fn credit_window_supplies_backpressure() {
+        let mut hop = ConsumerHop::new("inst-1", 7).unwrap();
+        let err = hop
+            .encode_call(Request::Close {
+                session: "s".into(),
+                sequence: 1,
+            })
+            .unwrap_err();
+        assert!(err.message.contains("credit window"), "{err}");
+        hop.apply_mesh(GpuMeshFrame::Credit { window: 1 }).unwrap();
+        let _ = hop
+            .encode_call(Request::Close {
+                session: "s".into(),
+                sequence: 1,
+            })
+            .unwrap();
+        let err = hop
+            .encode_call(Request::Close {
+                session: "s".into(),
+                sequence: 2,
+            })
+            .unwrap_err();
+        assert!(err.message.contains("credit window"), "{err}");
+    }
+
+    #[test]
+    fn ordinary_session_shutdown_preserves_durable_lease_for_reconnect() {
+        let peer = peer(4);
+        let mut production = production("desktop");
+        let (_, attachment) = production
+            .authority_mut()
+            .attach(&peer, "durable", 64 * 1024 * 1024, 1_000)
+            .unwrap();
+        let mut hop = ProviderHop::new(peer.clone(), production, 1_001);
+        assert!(matches!(
+            hop.accept_open(GpuMeshOpen::new("durable", attachment.provider_generation).unwrap())
+                .unwrap(),
+            GpuMeshFrame::Accepted { .. }
+        ));
+        hop.shutdown("ordinary close", false);
+        let mut production = hop.into_production();
+        assert!(production.authority().has_instance("durable"));
+        assert!(matches!(
+            production
+                .open_session_for_instance(
+                    &peer,
+                    "durable",
+                    attachment.provider_generation,
+                    AbiRange::ours(),
+                    1_002,
+                )
+                .unwrap(),
+            Response::SessionOpened { .. }
+        ));
+    }
+
+    #[test]
+    fn mesh_open_json_is_only_instance_and_generation() {
+        let open = GpuMeshOpen::new("inst-1", 7).unwrap();
+        let bytes = encode_frame(&open).unwrap();
+        assert_open_has_no_bearer(&bytes).unwrap();
+        let decoded: GpuMeshOpen = decode_frame(&bytes).unwrap();
+        assert_eq!(decoded, open);
+    }
+
+    #[test]
+    fn queued_work_is_cancellable_before_apply() {
+        let (mut path, _, _) = mesh_path();
+        path.cuda(CudaCall::Init).unwrap();
+        let request = Request::Allocate {
+            session: path.session.clone(),
+            sequence: 1,
+            bytes: 16,
+        };
+        let queued = GpuMeshFrame::Call {
+            id: 7,
+            request: request.clone(),
+        };
+        let ack = path.provider.handle_frame(queued).unwrap();
+        assert!(matches!(ack, GpuMeshFrame::Credit { .. }), "{ack:?}");
+        assert_eq!(path.provider.queued_len(), 1);
+        let cancelled = path
+            .provider
+            .handle_frame(GpuMeshFrame::Cancel { id: 7 })
+            .unwrap();
+        assert!(
+            matches!(cancelled, GpuMeshFrame::Cancelled { id: 7 }),
+            "{cancelled:?}"
+        );
+        assert_eq!(path.provider.queued_len(), 0);
+        assert!(path.provider.apply_next().unwrap().is_none());
+    }
+
+    #[test]
+    fn close_ends_only_the_session_and_active_paths_renew_the_durable_lease() {
+        let (mut path, _, _) = mesh_path();
+        path.cuda(CudaCall::Init).unwrap();
+        path.apply_guest(GuestFrame::Close).unwrap();
+        let err = path.cuda(CudaCall::DeviceCount).unwrap_err();
+        assert!(
+            err.message.contains("not accepted") || err.message.contains("session"),
+            "{err}"
+        );
+
+        let (mut path, _, _) = mesh_path();
+        path.cuda(CudaCall::Init).unwrap();
+        path.set_now(1_000 + 10_000);
+        assert_eq!(
+            path.cuda(CudaCall::DeviceCount).unwrap(),
+            CudaResult::DeviceCount { count: 1 }
+        );
+    }
+
+    #[test]
+    fn vsock_hmac_then_provider_executes_init() {
+        use crate::remote_gpu_guest::{gpu_vsock_guest_handshake, gpu_vsock_host_handshake};
+        use std::io::BufReader;
+        use std::os::unix::net::UnixStream;
+
+        let key = [11u8; 32];
+        let (guest, host) = UnixStream::pair().unwrap();
+        let join = std::thread::spawn(move || {
+            let mut reader = BufReader::new(guest.try_clone().unwrap());
+            let mut writer = guest;
+            gpu_vsock_guest_handshake(&mut reader, &mut writer, &key, "g")
+        });
+        let mut reader = BufReader::new(host.try_clone().unwrap());
+        let mut writer = host;
+        gpu_vsock_host_handshake(&mut reader, &mut writer, &key, "h").unwrap();
+        join.join().unwrap().unwrap();
+
+        let (mut path, _, _) = mesh_path();
+        let result = path.cuda(CudaCall::Init).unwrap();
+        assert_eq!(result, CudaResult::Init);
+        let count = path.cuda(CudaCall::DeviceCount).unwrap();
+        assert!(matches!(count, CudaResult::DeviceCount { count: 1 }));
+    }
+}

@@ -306,7 +306,7 @@ enum Command {
         /// A path may carry one too.
         image: String,
     },
-    /// Attach a part to an instance: a volume, or a secret.
+    /// Attach a part to an instance: a volume, secret, or hardware GPU.
     ///
     /// Two kinds of volume, and they reach the guest differently.
     ///
@@ -376,6 +376,13 @@ enum Command {
         /// than one source. Not `--host`, for the same reason as `--to`.
         #[arg(long, value_name = "DEVICE", requires = "secret")]
         from: Option<String>,
+        /// Hardware GPU provider device, optionally followed by its UUID:
+        /// `desktop` or `desktop:GPU-...`.
+        #[arg(long, value_name = "DEVICE[:GPU-UUID]", conflicts_with_all = ["volume", "secret"])]
+        gpu: Option<String>,
+        /// GPU memory reservation (default 1G).
+        #[arg(long, value_name = "SIZE", requires = "gpu")]
+        gpu_memory: Option<String>,
     },
     /// Take a volume or a secret off an instance.
     ///
@@ -402,6 +409,9 @@ enum Command {
         /// The secret to revoke, by its orbit name.
         #[arg(long, value_name = "NAME")]
         secret: Option<String>,
+        /// Revoke and detach the instance's GPU part.
+        #[arg(long, conflicts_with_all = ["volume", "secret"])]
+        gpu: bool,
     },
     /// Change one of an instance's parts.
     ///
@@ -840,7 +850,9 @@ fn main() -> Result<()> {
             placement,
             env,
             from,
-        } => match attaching(volume, secret)? {
+            gpu,
+            gpu_memory,
+        } => match attaching(volume, secret, gpu)? {
             Attaching::Secret(secret) => Request::AttachSecret {
                 name,
                 secret,
@@ -884,13 +896,28 @@ fn main() -> Result<()> {
                     }
                 }
             },
+            Attaching::Gpu(provider) => {
+                let (provider_device, gpu_uuid) = provider
+                    .split_once(':')
+                    .map(|(device, uuid)| (device.to_owned(), Some(uuid.to_owned())))
+                    .unwrap_or((provider, None));
+                Request::AttachGpu {
+                    name,
+                    provider_device: Some(provider_device),
+                    gpu_uuid,
+                    memory_bytes: asterism_core::volume::parse_size(
+                        gpu_memory.as_deref().unwrap_or("1G"),
+                    )?,
+                }
+            }
         },
         Command::Detach {
             name,
             volume,
             host,
             secret,
-        } => match attaching(volume, secret)? {
+            gpu,
+        } => match attaching(volume, secret, gpu.then(String::new))? {
             Attaching::Secret(secret) => Request::DetachSecret { name, secret },
             Attaching::Volume(volume) => match storage_ref(&volume, host.as_deref()) {
                 Some((device, volume)) => Request::Detach {
@@ -904,6 +931,7 @@ fn main() -> Result<()> {
                     host,
                 },
             },
+            Attaching::Gpu(_) => Request::DetachGpu { name },
         },
         // A move reports as it goes — a preflight, a fence, a disk crossing a
         // network — so it takes the connection the way pairing and wake do.
@@ -1101,7 +1129,9 @@ fn main() -> Result<()> {
             }
             Request::AttachVolume { .. }
             | Request::AttachBlock { .. }
-            | Request::AttachStorage { .. } => {
+            | Request::AttachStorage { .. }
+            | Request::AttachGpu { .. }
+            | Request::AttachGpuResolved { .. } => {
                 print_attached(&instance)
             }
             Request::AttachSecret { ref secret, .. } => print_bound(&instance, secret),
@@ -1116,6 +1146,7 @@ fn main() -> Result<()> {
             Request::Detach { volume, .. } => {
                 println!("{}  {volume} detached", instance.name)
             }
+            Request::DetachGpu { .. } => println!("{}  GPU detached and revoked", instance.name),
             _ => println!("{}  {}", instance.name, instance.status),
         },
         Response::Volumes { volumes } => match request {
@@ -1147,7 +1178,10 @@ fn main() -> Result<()> {
         }
         Response::BackupRestored { report } => {
             println!("{}  restored ({})", report.instance, report.id);
-            if report.rebind.volumes.is_empty() && report.rebind.secrets.is_empty() {
+            if report.rebind.volumes.is_empty()
+                && report.rebind.secrets.is_empty()
+                && report.rebind.gpu.is_none()
+            {
                 println!("no external parts need rebinding");
             } else {
                 for volume in report.rebind.volumes {
@@ -1160,6 +1194,15 @@ fn main() -> Result<()> {
                     println!(
                         "rebind secret: {} to {} (previous source: {})",
                         secret.secret, secret.authority, secret.source_device
+                    );
+                }
+                if let Some(gpu) = report.rebind.gpu {
+                    println!(
+                        "rebind gpu: {} on {} ({} bytes; previous provider generation {})",
+                        gpu.provider_gpu_uuid,
+                        gpu.provider_device,
+                        gpu.memory_bytes,
+                        gpu.provider_generation
                     );
                 }
             }
@@ -1201,6 +1244,25 @@ fn main() -> Result<()> {
             bail!("unexpected reply from astd: {request:?}")
         }
         Response::Error { message } => bail!(message),
+        Response::GpuProviders { providers } => {
+            for provider in providers {
+                println!(
+                    "{}  {}  {} bytes  {:?}",
+                    provider.device_name,
+                    provider.gpu_uuid,
+                    provider
+                        .total_memory_bytes
+                        .saturating_sub(provider.leased_memory_bytes),
+                    provider.health
+                );
+            }
+        }
+        Response::GpuGuestAccepted { .. }
+        | Response::GpuGuestRefused { .. }
+        | Response::GpuGuestReply { .. }
+        | Response::GpuProviderAttached { .. } => {
+            bail!("GPU guest session response reached the command RPC path")
+        }
     }
     Ok(())
 }
@@ -1762,9 +1824,10 @@ fn inspect_backup(source: &str, json: bool) -> Result<()> {
         println!("image: {}  {}", image.reference, image.content);
     }
     println!(
-        "external parts to rebind: {} volume(s), {} secret(s)",
+        "external parts to rebind: {} volume(s), {} secret(s), {} gpu(s)",
         manifest.rebind.volumes.len(),
-        manifest.rebind.secrets.len()
+        manifest.rebind.secrets.len(),
+        usize::from(manifest.rebind.gpu.is_some())
     );
     Ok(())
 }
@@ -4348,20 +4411,26 @@ fn local_disk(inst: &Instance) -> Option<String> {
 enum Attaching {
     Volume(String),
     Secret(String),
+    Gpu(String),
 }
 
-fn attaching(volume: Option<String>, secret: Option<String>) -> Result<Attaching> {
-    match (volume, secret) {
-        (Some(volume), None) => Ok(Attaching::Volume(volume)),
-        (None, Some(secret)) => Ok(Attaching::Secret(secret)),
+fn attaching(
+    volume: Option<String>,
+    secret: Option<String>,
+    gpu: Option<String>,
+) -> Result<Attaching> {
+    match (volume, secret, gpu) {
+        (Some(volume), None, None) => Ok(Attaching::Volume(volume)),
+        (None, Some(secret), None) => Ok(Attaching::Secret(secret)),
+        (None, None, Some(gpu)) => Ok(Attaching::Gpu(gpu)),
         // clap refuses this one first; the arm exists so that adding a third
         // part later cannot make it fall through to "say which".
-        (Some(_), Some(_)) => bail!(
-            "--volume and --secret are two different parts — attach them one command at a time"
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) | (_, Some(_), Some(_)) => bail!(
+            "--volume, --secret, and --gpu are different parts — attach them one command at a time"
         ),
-        (None, None) => bail!(
+        (None, None, None) => bail!(
             "say which part: --volume /tank/media, --volume desktop:tank, or \
-             --secret anthropic --to api.anthropic.com"
+             --secret anthropic --to api.anthropic.com, or --gpu desktop"
         ),
     }
 }
@@ -5195,6 +5264,38 @@ mod tests {
         assert!(Cli::try_parse_from(["ast", "auth", "logout"]).is_ok());
         assert!(Cli::try_parse_from(["ast", "create", "dev"]).is_ok());
         assert!(Cli::try_parse_from(["ast", "devices"]).is_ok());
+    }
+
+    #[test]
+    fn gpu_attach_and_detach_are_unambiguous_parts() {
+        let parsed = Cli::try_parse_from([
+            "ast",
+            "attach",
+            "guest",
+            "--gpu",
+            "desktop:GPU-01234567",
+            "--gpu-memory",
+            "2G",
+        ])
+        .unwrap();
+        match parsed.command {
+            Command::Attach {
+                name,
+                gpu,
+                gpu_memory,
+                ..
+            } => {
+                assert_eq!(name, "guest");
+                assert_eq!(gpu.as_deref(), Some("desktop:GPU-01234567"));
+                assert_eq!(gpu_memory.as_deref(), Some("2G"));
+            }
+            _ => panic!("parsed the wrong GPU command"),
+        }
+        assert!(Cli::try_parse_from([
+            "ast", "attach", "guest", "--gpu", "desktop", "--volume", "tank"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from(["ast", "detach", "guest", "--gpu"]).is_ok());
     }
 
     #[test]

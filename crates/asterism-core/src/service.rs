@@ -91,9 +91,10 @@ pub struct Spec {
 impl Spec {
     /// The spec for the astd that belongs to the running binary.
     pub fn current() -> Result<Spec> {
-        let mut spec = Spec::for_program(&daemon_program()?)?;
+        let spec = Spec::for_program(&daemon_program()?)?;
         #[cfg(windows)]
         {
+            let mut spec = spec;
             // LocalSystem's USERPROFILE is not the installing user's profile.
             // Always materialize and record the intended home while still in
             // the interactive process, making its filesystem owner the
@@ -104,8 +105,12 @@ impl Spec {
             spec.home = Some(std::fs::canonicalize(&home).with_context(|| {
                 format!("canonicalizing service home {}", home.display())
             })?);
+            Ok(spec)
         }
-        Ok(spec)
+        #[cfg(not(windows))]
+        {
+            Ok(spec)
+        }
     }
 
     pub fn for_program(program: &Path) -> Result<Spec> {

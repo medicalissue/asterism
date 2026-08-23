@@ -47,6 +47,7 @@ use anyhow::{Context, Result};
 use tokio::sync::Mutex;
 
 use asterism_core::compat;
+use asterism_core::instance::now_unix;
 use asterism_core::ipc;
 use asterism_core::orbit::Orbit;
 use asterism_core::protocol::{Request, Response};
@@ -59,6 +60,7 @@ mod backend;
 mod container;
 mod device_shell;
 mod egress;
+mod gpu;
 mod images;
 mod instance;
 mod mesh;
@@ -134,6 +136,7 @@ pub(crate) struct Node {
     pub shard: Arc<Mutex<Shard>>,
     pub orbit: Arc<Mutex<Orbit>>,
     pub shell: Arc<device_shell::Manager>,
+    pub gpu: Arc<gpu::Manager>,
 }
 
 impl Node {
@@ -255,6 +258,7 @@ async fn run_daemon(stop_source: StopSource) -> Result<()> {
         shard: Arc::new(Mutex::new(Shard::load(&paths::state_path())?)),
         orbit: Arc::new(Mutex::new(Orbit::load(&paths::orbit_path())?)),
         shell: device_shell::Manager::load(),
+        gpu: gpu::Manager::new(),
     };
 
     // The election, the stale-socket sweep and the bind, in that order and
@@ -292,6 +296,92 @@ async fn run_daemon(stop_source: StopSource) -> Result<()> {
                 mesh.device_id().short(),
                 mesh.self_name().await
             );
+            let name = node.device_name().await;
+            let instances = node.shard.lock().await.list();
+            let mut device_ids =
+                std::collections::HashMap::from([(name.clone(), mesh.device_id().to_string())]);
+            {
+                let orbit = node.orbit.lock().await;
+                device_ids.extend(
+                    orbit
+                        .devices()
+                        .iter()
+                        .map(|device| (device.name.clone(), device.device_id.clone())),
+                );
+            }
+            match node
+                .gpu
+                .register_hardware(
+                    &name,
+                    &mesh.device_id().to_string(),
+                    &instances,
+                    &device_ids,
+                )
+                .await
+            {
+                Ok(0) => {}
+                Ok(count) => {
+                    eprintln!("astd: registered {count} NVIDIA GPU provider(s)");
+                    let gpu = node.gpu.clone();
+                    let reconciliation_node = node.clone();
+                    let reconciliation_mesh = mesh.clone();
+                    tokio::spawn(async move {
+                        let mut interval =
+                            tokio::time::interval(std::time::Duration::from_secs(60));
+                        loop {
+                            interval.tick().await;
+                            // Rebuild both views every pass. Reusing startup
+                            // snapshots can resurrect a detached lease and
+                            // cannot remove authority for a deleted instance.
+                            let mut fresh_device_ids = std::collections::HashMap::from([(
+                                reconciliation_node.device_name().await,
+                                reconciliation_mesh.device_id().to_string(),
+                            )]);
+                            {
+                                let orbit = reconciliation_node.orbit.lock().await;
+                                fresh_device_ids.extend(
+                                    orbit.devices().iter().map(|device| {
+                                        (device.name.clone(), device.device_id.clone())
+                                    }),
+                                );
+                            }
+                            match reconciliation_mesh
+                                .orbit_registry(&reconciliation_node)
+                                .await
+                            {
+                                Ok(Response::Orbit { rows }) => {
+                                    let fresh_catalog = rows
+                                        .into_iter()
+                                        .map(|row| row.instance)
+                                        .collect::<Vec<_>>();
+                                    match gpu.reconcile_durable_attachments(
+                                        &fresh_catalog,
+                                        &fresh_device_ids,
+                                    ) {
+                                        Ok(changed) if changed > 0 => eprintln!(
+                                            "astd: reconciled {changed} durable remote GPU authority change(s)"
+                                        ),
+                                        Ok(_) => {}
+                                        Err(error) => eprintln!(
+                                            "astd: durable GPU attachment reconciliation failed: {error:#}"
+                                        ),
+                                    }
+                                }
+                                Ok(other) => eprintln!(
+                                    "astd: orbit GPU reconciliation received unexpected reply: {other:?}"
+                                ),
+                                Err(error) => eprintln!(
+                                    "astd: orbit GPU attachment catalog is unavailable: {error:#}"
+                                ),
+                            }
+                            if let Err(error) = gpu.renew_durable_leases(now_unix()) {
+                                eprintln!("astd: durable GPU lease renewal failed: {error:#}");
+                            }
+                        }
+                    });
+                }
+                Err(err) => eprintln!("astd: NVIDIA GPU inventory refused: {err:#}"),
+            }
             Some(mesh)
         }
         Err(e) => {
@@ -729,6 +819,25 @@ async fn serve(conn: Admitted, node: Node, mesh: Option<Arc<Mesh>>) -> Result<()
         // process. It borrows this private unix-socket connection and either
         // enters the local target through the same policy path or bridges it
         // to one dedicated authenticated mesh stream.
+        if let Request::GpuGuestOpen { name } = &request {
+            let mut io = ClientIo {
+                frames: &mut frames,
+                write: &mut write,
+            };
+            if let Err(e) = gpu::serve_local(name, &node, mesh.as_ref(), &mut io).await {
+                io.send(&Response::GpuGuestRefused {
+                    code: "unreachable".into(),
+                    message: format!("{e:#}"),
+                })
+                .await?;
+                // This unix connection is the local counterpart of one GPU
+                // data path. Once the remote side is gone, retaining it in
+                // the ordinary RPC loop leaves the guest/CUSE pump blocked.
+                break;
+            }
+            continue;
+        }
+
         if let Request::DeviceShellOpen { device, open } = &request {
             let mut io = ClientIo {
                 frames: &mut frames,
@@ -852,6 +961,45 @@ fn at_most(response: Response, spoken: u32) -> Response {
 /// resolved across the orbit and forwarded to whichever device holds that
 /// row — which is where `--device` stops being necessary.
 async fn dispatch(request: Request, node: &Node, mesh: Option<&Arc<Mesh>>) -> Response {
+    if let Request::AttachGpu {
+        name,
+        provider_device,
+        gpu_uuid,
+        memory_bytes,
+    } = &request
+    {
+        return match gpu::resolve_attach(
+            name.clone(),
+            provider_device.clone(),
+            gpu_uuid.clone(),
+            *memory_bytes,
+            node,
+            mesh,
+        )
+        .await
+        {
+            Ok(resolved) => route(resolved, node, mesh).await,
+            Err(err) => Response::Error {
+                message: format!("{err:#}"),
+            },
+        };
+    }
+    if let Request::DetachGpu { name } = &request {
+        if let Err(err) = gpu::revoke_for_detach(name, node, mesh).await {
+            return Response::Error {
+                message: format!("{err:#}"),
+            };
+        }
+    }
+    if let Request::Remove { name } = &request {
+        if let Err(err) = gpu::revoke_for_remove(name, node, mesh).await {
+            return Response::Error {
+                message: format!(
+                    "instance removal refused until its GPU lease is revoked: {err:#}"
+                ),
+            };
+        }
+    }
     if secret::is_orbit_request(&request) {
         return secret::serve(request, node, mesh).await;
     }
@@ -969,6 +1117,9 @@ pub(crate) async fn handle(req: Request, node: &Node) -> Response {
     // consequently proceed even when the command or its control peer stalls.
     if matches!(&req, Request::ContainerExec { .. }) {
         return container_exec(node, req).await;
+    }
+    if gpu::is_plane_request(&req) {
+        return gpu::serve_plane(req, node);
     }
 
     // Catalog fan-out can wait on every peer. Resolve it before taking the
@@ -1104,6 +1255,7 @@ mod tests {
             shard: Arc::new(Mutex::new(Shard::load(&home.join("state.json")).unwrap())),
             orbit: Arc::new(Mutex::new(Orbit::load(&home.join("orbit.json")).unwrap())),
             shell: device_shell::Manager::load_at(home),
+            gpu: gpu::Manager::new(),
         }
     }
 

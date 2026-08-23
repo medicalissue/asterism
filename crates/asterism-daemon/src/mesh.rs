@@ -196,6 +196,15 @@ enum MeshRequest {
     /// Open the target daemon user's explicitly enabled shell. The opening
     /// frame is followed by bounded [`ShellFrame`]s, never a raw pipe.
     DeviceShell { open: ShellOpen },
+    /// Dedicated GPU ABI stream. Instance-bound and token-free: the provider
+    /// looks up the live lease from the authenticated peer plus instance id
+    /// and generation. Subsequent frames are [`GpuMeshFrame`]s.
+    Gpu {
+        instance_id: String,
+        provider_gpu_uuid: String,
+        provider_generation: u64,
+        memory_bytes: u64,
+    },
     /// Hand this stream to a block volume's NBD export and stop framing it.
     ///
     /// The other pipe, and the fenced one: the far side checks `holder` and
@@ -261,6 +270,7 @@ impl MeshRequest {
             // and epoch are the provider-side writer fence, so an older peer
             // must refuse it rather than treating it as an ordinary splice.
             MeshRequest::VolumeSplice { .. } => 7,
+            MeshRequest::Gpu { .. } => asterism_core::remote_gpu_path::GPU_MESH_PROTOCOL,
             _ => compat::FIRST_PROTOCOL,
         }
     }
@@ -305,6 +315,7 @@ impl MeshRequest {
             MeshRequest::GuestKey => "a guest key",
             MeshRequest::SshSplice { .. } => "an ssh connection",
             MeshRequest::DeviceShell { .. } => "a device shell",
+            MeshRequest::Gpu { .. } => "a GPU session",
             MeshRequest::VolumeSplice { .. } => "a volume connection",
             MeshRequest::MoveExport { .. } => "an instance export",
             MeshRequest::MoveBase { .. } => "a base image",
@@ -930,6 +941,33 @@ impl Mesh {
         let mut stream = connection.open_stream().await?;
         open_stream_with(&mut stream.send, &MeshRequest::DeviceShell { open }).await?;
         crate::device_shell::bridge_client(stream, io).await
+    }
+
+    /// Open a dedicated GPU stream to a provider device. The opening frame
+    /// is instance-bound and token-free.
+    pub async fn gpu_session<'a, 'b>(
+        self: &Arc<Self>,
+        device: &str,
+        instance_id: &str,
+        provider_gpu_uuid: &str,
+        provider_generation: u64,
+        memory_bytes: u64,
+        io: &'a mut ClientIo<'b>,
+    ) -> Result<()> {
+        let peer = self.device(device).await?;
+        let connection = self.live_connection(&peer).await?;
+        let mut stream = connection.open_stream().await?;
+        open_stream_with(
+            &mut stream.send,
+            &MeshRequest::Gpu {
+                instance_id: instance_id.to_owned(),
+                provider_gpu_uuid: provider_gpu_uuid.to_owned(),
+                provider_generation,
+                memory_bytes,
+            },
+        )
+        .await?;
+        crate::gpu::bridge_client(stream, io).await
     }
 
     // ---- wake ---------------------------------------------------------------
@@ -3342,6 +3380,20 @@ async fn serve_stream(
                     },
                 )
                 .await?;
+            } else if matches!(arriving.request, MeshRequest::Gpu { .. }) {
+                let message = match &*refusal {
+                    MeshReply::Incompatible { message, .. } => message.clone(),
+                    _ => "the GPU stream is incompatible".to_owned(),
+                };
+                let bytes = asterism_core::remote_gpu_path::encode_frame(
+                    &asterism_core::remote_gpu_path::GpuMeshFrame::Refused {
+                        id: None,
+                        code: asterism_core::remote_gpu::ControlErrorCode::InvalidRequest,
+                        message,
+                    },
+                )
+                .map_err(|err| anyhow!(err))?;
+                stream.send.write_all(&bytes).await?;
             } else if !arriving.request.answered_in_bulk() {
                 write_frame(&mut stream.send, &*refusal).await?;
             } else if let MeshReply::Incompatible { message, .. } = &*refusal {
@@ -3386,6 +3438,23 @@ async fn serve_stream(
         MeshRequest::SshSplice { name } => return serve_splice(stream, &node, &name).await,
         MeshRequest::DeviceShell { open } => {
             return crate::device_shell::serve_mesh(stream, peer, &node, open).await
+        }
+        MeshRequest::Gpu {
+            instance_id,
+            provider_gpu_uuid,
+            provider_generation,
+            memory_bytes,
+        } => {
+            return crate::gpu::serve_mesh(
+                stream,
+                peer,
+                &node,
+                instance_id,
+                provider_gpu_uuid,
+                provider_generation,
+                memory_bytes,
+            )
+            .await
         }
         MeshRequest::VolumeSplice {
             volume,
@@ -3434,6 +3503,9 @@ async fn serve_stream(
                 },
                 request if crate::device_shell::local_only_request(&request) => Response::Error {
                     message: "device-shell policy and sessions are accepted only on the target's local control socket or a dedicated shell stream".into(),
+                },
+                request if crate::gpu::local_only_request(&request) => Response::Error {
+                    message: "GPU guest frames are accepted only on the instance's local control socket or a dedicated GPU stream".into(),
                 },
                 // About this device's NIC rather than about its shard, so
                 // they stop here instead of going on to `crate::handle`. The
@@ -4276,6 +4348,7 @@ mod tests {
                 Orbit::load(&dir.path().join("orbit.json")).unwrap(),
             )),
             shell: crate::device_shell::Manager::load_at(dir.path()),
+            gpu: crate::gpu::Manager::new(),
         };
 
         let server = MeshEndpoint::bind(&DeviceIdentity::generate(), MeshMode::LocalOnly)
@@ -4363,6 +4436,7 @@ mod tests {
                 Orbit::load(&dir.path().join("orbit.json")).unwrap(),
             )),
             shell: crate::device_shell::Manager::load_at(dir.path()),
+            gpu: crate::gpu::Manager::new(),
         };
         let server = MeshEndpoint::bind(&DeviceIdentity::generate(), MeshMode::LocalOnly)
             .await
@@ -4454,6 +4528,7 @@ mod tests {
             )),
             orbit: orbit.clone(),
             shell: crate::device_shell::Manager::load_at(dir.path()),
+            gpu: crate::gpu::Manager::new(),
         };
         let mesh = Arc::new(Mesh {
             endpoint: server,

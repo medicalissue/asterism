@@ -155,6 +155,9 @@ jobs:
       - run: cargo build --workspace
       - run: cargo test --workspace
       - run: bash scripts/e2e-remote-gpu.sh
+      - name: Audit Linux guest libcuda ELF and exported Driver ABI (source-only; no NVIDIA claim)
+        if: runner.os == 'Linux'
+        run: bash scripts/build-guest-gpu-artifacts.sh "${RUNNER_TEMP}/asterism-gpu-guest"
       - run: bash scripts/check-rust-source-graph.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
 

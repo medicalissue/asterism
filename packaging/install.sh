@@ -289,6 +289,35 @@ place_at() {
 	say "installed ${dest}"
 }
 
+linux_guest_files() {
+	printf '%s' 'bin/guest-gpu/bin/asterism-gpu-guest bin/guest-gpu/lib/libcuda.so.1.0.0 bin/guest-gpu/lib/libcuda.so.1 bin/guest-gpu/lib/libcuda.so'
+}
+
+validate_linux_guest_artifacts() {
+	source_dir="${1:-}"
+	[ -n "$source_dir" ] || die "guest GPU artifact root is empty. Refusing to copy from an ambient /bin path."
+	case "$source_dir" in
+	/*) ;;
+	*) die "guest GPU artifact root is not absolute: ${source_dir}" ;;
+	esac
+	[ -x "${source_dir}/bin/asterism-gpu-guest" ] ||
+		die "guest GPU artifact root has no executable service: ${source_dir}"
+	[ -f "${source_dir}/lib/libcuda.so.1.0.0" ] ||
+		die "guest GPU artifact root has no generated libcuda: ${source_dir}"
+	[ "$(readlink "${source_dir}/lib/libcuda.so.1" 2>/dev/null || true)" = libcuda.so.1.0.0 ] ||
+		die "guest GPU artifact root has no exact libcuda.so.1 link: ${source_dir}"
+	[ "$(readlink "${source_dir}/lib/libcuda.so" 2>/dev/null || true)" = libcuda.so.1 ] ||
+		die "guest GPU artifact root has no exact libcuda.so link: ${source_dir}"
+}
+
+place_linux_guest() {
+	source_dir="${1:-}"
+	validate_linux_guest_artifacts "$source_dir"
+	for rel in bin/asterism-gpu-guest lib/libcuda.so.1.0.0 lib/libcuda.so.1 lib/libcuda.so; do
+		place_at "${source_dir}/${rel}" "bin/guest-gpu/${rel}"
+	done
+}
+
 # macOS marks a file a *browser* downloaded with com.apple.quarantine, and
 # tar hands that mark to every file it extracts. Gatekeeper then assesses
 # what execs, and an ad-hoc signature does not pass an assessment — so the
@@ -459,13 +488,32 @@ remove_receipt_files() {
 	files="$(receipt_field files || true)"
 	for rel in $files; do
 		f="${PREFIX}/${rel}"
-		if [ -e "$f" ]; then
+		if [ -e "$f" ] || [ -L "$f" ]; then
 			rm -f "$f" || return 1
 			say "removed ${f}"
 		else
 			say "already gone: ${f}"
 		fi
 	done
+	# Releases predating the packaged guest projection do not name this unit
+	# in their receipt. The presence of the installer-owned Cloud Hypervisor
+	# entry identifies that Linux ownership lane; a signed update may then
+	# have added guest-gpu atomically without rewriting the bootstrap receipt.
+	if receipt_lists bin/cloud-hypervisor; then
+		for rel in bin/guest-gpu/bin/asterism-gpu-guest \
+			bin/guest-gpu/lib/libcuda.so.1.0.0 \
+			bin/guest-gpu/lib/libcuda.so.1 bin/guest-gpu/lib/libcuda.so; do
+			receipt_lists "$rel" && continue
+			f="${PREFIX}/${rel}"
+			if [ -e "$f" ] || [ -L "$f" ]; then
+				rm -f "$f" || return 1
+				say "removed ${f} — adopted from a signed Linux update"
+			fi
+		done
+	fi
+	rmdir "${PREFIX}/bin/guest-gpu/lib" 2>/dev/null || true
+	rmdir "${PREFIX}/bin/guest-gpu/bin" 2>/dev/null || true
+	rmdir "${PREFIX}/bin/guest-gpu" 2>/dev/null || true
 }
 
 remove_receipt_system_files() {
@@ -527,6 +575,9 @@ drop_stale_helper() {
 
 drop_stale_linux_helpers() {
 	for rel in bin/cloud-hypervisor bin/virtiofsd \
+		bin/guest-gpu/bin/asterism-gpu-guest \
+		bin/guest-gpu/lib/libcuda.so.1.0.0 bin/guest-gpu/lib/libcuda.so.1 \
+		bin/guest-gpu/lib/libcuda.so \
 		share/asterism/linux-components.env \
 		share/asterism/asterism-nbd \
 		share/asterism/licenses/cloud-hypervisor-Apache-2.0.txt \
@@ -541,6 +592,9 @@ drop_stale_linux_helpers() {
 		say "removed ${PREFIX}/${rel} — this target ships no Linux helper"
 	done
 	rmdir "${PREFIX}/share/asterism/licenses" 2>/dev/null || true
+	rmdir "${PREFIX}/bin/guest-gpu/lib" 2>/dev/null || true
+	rmdir "${PREFIX}/bin/guest-gpu/bin" 2>/dev/null || true
+	rmdir "${PREFIX}/bin/guest-gpu" 2>/dev/null || true
 }
 
 # ---- resolving a version ---------------------------------------------------
@@ -708,6 +762,8 @@ install_release() {
 			[ -f "${unpack}/${helper}" ] || die "${artifact} has no ${helper}. Refusing to install a Linux release without its pinned native backend."
 		done
 		[ -f "${unpack}/share/asterism/asterism-nbd" ] || die "${artifact} has no checked NBD privilege wrapper. Refusing a partial Linux runtime."
+		[ -x "${unpack}/guest-gpu/bin/asterism-gpu-guest" ] || die "${artifact} has no Linux guest GPU service. Refusing an unprojectable GPU runtime."
+		[ -f "${unpack}/guest-gpu/lib/libcuda.so.1.0.0" ] || die "${artifact} has no generated guest libcuda. Refusing an unprojectable GPU runtime."
 		linux_helpers=1
 		;;
 	*) linux_helpers=0 ;;
@@ -716,7 +772,7 @@ install_release() {
 	if [ "$vz" = "1" ]; then
 		receipt_files="${receipt_files} bin/astd-vz"
 	elif [ "$linux_helpers" = "1" ]; then
-		receipt_files="${receipt_files} bin/cloud-hypervisor bin/virtiofsd share/asterism/linux-components.env share/asterism/asterism-nbd share/asterism/licenses/cloud-hypervisor-Apache-2.0.txt share/asterism/licenses/cloud-hypervisor-BSD-3-Clause.txt share/asterism/licenses/virtiofsd-Apache-2.0.txt share/asterism/licenses/virtiofsd-BSD-3-Clause.txt share/asterism/licenses/LICENSE-APACHE share/asterism/licenses/LICENSE-MIT share/asterism/licenses/NOTICE"
+		receipt_files="${receipt_files} bin/cloud-hypervisor bin/virtiofsd $(linux_guest_files) share/asterism/linux-components.env share/asterism/asterism-nbd share/asterism/licenses/cloud-hypervisor-Apache-2.0.txt share/asterism/licenses/cloud-hypervisor-BSD-3-Clause.txt share/asterism/licenses/virtiofsd-Apache-2.0.txt share/asterism/licenses/virtiofsd-BSD-3-Clause.txt share/asterism/licenses/LICENSE-APACHE share/asterism/licenses/LICENSE-MIT share/asterism/licenses/NOTICE"
 	fi
 	if [ "$hyperv" = "1" ]; then
 		receipt_files="${receipt_files} bin/astd-hyperv${exe}"
@@ -746,6 +802,7 @@ install_release() {
 	if [ "$linux_helpers" = "1" ]; then
 		place "${unpack}/cloud-hypervisor" cloud-hypervisor
 		place "${unpack}/virtiofsd" virtiofsd
+		place_linux_guest "${unpack}/guest-gpu"
 		if [ -d "${unpack}/share/asterism" ]; then
 			mkdir -p "${PREFIX}/share/asterism"
 			cp -R "${unpack}/share/asterism/." "${PREFIX}/share/asterism/"
@@ -831,6 +888,13 @@ install_source() {
 		--package asterism-cli --package asterism-daemon)
 	linux_helpers=0
 	if [ "$(uname -s)" = "Linux" ]; then
+		# The destination is installer-owned and absolute. Never derive a copy
+		# root from build output: an empty line would otherwise collapse the
+		# service source to /bin/asterism-gpu-guest. Build and validate the exact
+		# checked-out ref before prepare_chv_source performs any root mutation.
+		guest_artifacts="${TMPDIR_SELF}/guest-gpu"
+		"${src}/scripts/build-guest-gpu-artifacts.sh" "$guest_artifacts"
+		validate_linux_guest_artifacts "$guest_artifacts"
 		prepare_chv_source "$src"
 		linux_helpers=1
 	fi
@@ -854,7 +918,7 @@ install_source() {
 	if [ "$vz" = "1" ]; then
 		intent_files="bin/ast bin/astd bin/astd-vz libexec/asterism/asterism-update"
 	elif [ "$linux_helpers" = "1" ]; then
-		intent_files="bin/ast bin/astd bin/cloud-hypervisor bin/virtiofsd libexec/asterism/asterism-update"
+		intent_files="bin/ast bin/astd bin/cloud-hypervisor bin/virtiofsd libexec/asterism/asterism-update $(linux_guest_files)"
 	else
 		intent_files="bin/ast bin/astd libexec/asterism/asterism-update"
 	fi
@@ -874,6 +938,7 @@ install_source() {
 	if [ "$linux_helpers" = "1" ]; then
 		place "$CHV_SOURCE_BIN" cloud-hypervisor
 		place "$VIRTIOFSD_SOURCE_BIN" virtiofsd
+		place_linux_guest "$guest_artifacts"
 		configure_chv_linux "${src}/packaging/asterism-nbd"
 	fi
 	if [ "$vz" = "1" ]; then
@@ -881,7 +946,12 @@ install_source() {
 		write_receipt "$ref" "source" source "" bin/ast bin/astd bin/astd-vz libexec/asterism/asterism-update
 	elif [ "$linux_helpers" = "1" ]; then
 		drop_stale_helper
-		write_receipt "$ref" "source" source "" bin/ast bin/astd bin/cloud-hypervisor bin/virtiofsd libexec/asterism/asterism-update
+		write_receipt "$ref" "source" source "" \
+			bin/ast bin/astd bin/cloud-hypervisor bin/virtiofsd \
+			libexec/asterism/asterism-update \
+			bin/guest-gpu/bin/asterism-gpu-guest \
+			bin/guest-gpu/lib/libcuda.so.1.0.0 \
+			bin/guest-gpu/lib/libcuda.so.1 bin/guest-gpu/lib/libcuda.so
 	else
 		drop_stale_helper
 		write_receipt "$ref" "source" source "" bin/ast bin/astd libexec/asterism/asterism-update
@@ -896,6 +966,25 @@ prepare_chv_source() {
 	# This is data from the checked-out tag/ref, not code from the network.
 	# shellcheck disable=SC1090,SC1091
 	. "${source_root}/packaging/linux-components.env"
+	# Building the pinned virtiofsd source needs only these two native
+	# development libraries. Install them before spending time compiling so
+	# the source lane either has its complete declared toolchain or refuses
+	# without leaving a half-built runtime.
+	if ! have pkg-config || ! pkg-config --exists libseccomp libcap-ng; then
+		if have apt-get; then
+			run_root apt-get update
+			run_root apt-get install -y pkg-config libseccomp-dev libcap-ng-dev
+		elif have dnf; then
+			run_root dnf install -y pkgconf-pkg-config libseccomp-devel libcap-ng-devel
+		elif have zypper; then
+			run_root zypper --non-interactive install pkg-config libseccomp-devel libcap-ng-devel
+		else
+			die "building the pinned virtiofsd needs pkg-config, libseccomp, and libcap-ng development files"
+		fi
+	fi
+	if ! have pkg-config || ! pkg-config --exists libseccomp libcap-ng; then
+		die "the package manager completed but virtiofsd's libseccomp/libcap-ng build inputs are unavailable"
+	fi
 	case "$(uname -m)" in
 	x86_64 | amd64)
 		chv_url="$CLOUD_HYPERVISOR_X86_64_URL"
