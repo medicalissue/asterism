@@ -26,17 +26,17 @@
 //! byte is fetched — because there would be nothing to compare the download
 //! to, and "downloaded successfully" is not a check.
 //!
-//! **Base images in the store are raw** (BACKENDS.md §4). Cloud images ship
-//! as qcow2, so a pull downloads one and converts it: `<slug>.qcow2` is a
-//! staging file, `<slug>.raw` is the image. Raw is what
-//! Virtualization.framework can attach at all, what `clonefile(2)` can share
-//! blocks of, and what QEMU reads fastest — the compression qcow2 bought us
-//! is worth less than any of those, and a sparse raw file on APFS occupies
-//! about what the qcow2 did anyway.
+//! **Catalog pulls keep the publisher-verified qcow2.** Cloud images ship as
+//! qcow2; a pull downloads one, adopts it, and stops. Cloud Hypervisor (and
+//! QEMU) read that file directly, so a Linux host never needs `qemu-img` to
+//! finish a pull. Raw-only backends still convert lazily on first use
+//! ([`Resolved::materialise`]): `<slug>.qcow2` is the verified source,
+//! `<slug>.raw` is the derivative. Conversion failure never deletes the
+//! verified source.
 //!
 //! Nothing is converted eagerly on upgrade: a store left full of qcow2 by an
 //! older Asterism keeps working, and each image is converted the first time
-//! it is used ([`Resolved::materialise`]).
+//! a raw-only backend needs it.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -130,6 +130,36 @@ pub struct Resolved {
 }
 
 impl Resolved {
+    /// Publisher-verified qcow2 a qcow2-capable backend can boot as-is.
+    ///
+    /// Absent when the store has already produced a raw derivative, when the
+    /// staging file is missing or not qcow2, or when it was never adopted —
+    /// older stores without a sidecar still go through lazy conversion.
+    pub fn verified_qcow2_staging(&self) -> Option<&Path> {
+        if self.path.exists() {
+            return None;
+        }
+        let staging = self.staging.as_ref().filter(|path| path.exists())?;
+        if detect_format(staging).ok()? != DiskFormat::Qcow2 {
+            return None;
+        }
+        verify::check_recorded(staging, staging, Depth::from_env()).ok()?;
+        Some(staging)
+    }
+
+    /// An adopted artifact whose provenance record no longer matches the file.
+    ///
+    /// Pull repairs this by replacing the file. Conversion failure is not
+    /// this: a verified source that could not be rewritten stays in place.
+    pub fn adopted_artifact_changed(&self) -> bool {
+        let Ok((path, _)) = self.boot_path() else {
+            return false;
+        };
+        let record = self.active_record();
+        verify::provenance(&record).is_some()
+            && verify::check_recorded(path, &record, Depth::from_env()).is_err()
+    }
+
     /// The verified artifact a backend may consume.
     ///
     /// A store written by an older release can contain only the adopted
@@ -311,10 +341,13 @@ impl Resolved {
         self.path.exists() || self.staging.as_ref().is_some_and(|s| s.exists())
     }
 
-    /// Turn whatever was downloaded into the raw base image instances clone
-    /// from. Idempotent, and a no-op for a local file or an image that is
-    /// already raw — so it is safe to call on every path that is about to
-    /// need a base image, which is what makes the migration lazy.
+    /// Turn whatever was downloaded into the raw base image a raw-only
+    /// backend can attach. Idempotent, a no-op for a local file or an image
+    /// that is already raw, and unused by a qcow2-capable backend that can
+    /// boot the verified staging file as it is.
+    ///
+    /// Conversion is lazy: pull never calls this, so a fresh catalog image
+    /// does not need `qemu-img`. Failure never deletes the verified source.
     ///
     /// Returns whether it converted anything, so a foreground caller can
     /// say so and a background one can stay quiet.
@@ -374,12 +407,21 @@ impl Resolved {
             return Ok(true);
         }
         let part = self.path.with_extension("raw.part");
-        convert_to_raw(staging, from, &part)
-            .with_context(|| format!("converting {} to raw", self.name))?;
-        verify::adopt(&part, &self.path, None, source)?;
+        if let Err(error) = convert_to_raw(staging, from, &part)
+            .with_context(|| format!("converting {} to raw", self.name))
+        {
+            let _ = std::fs::remove_file(&part);
+            return Err(error);
+        }
+        if let Err(error) = verify::adopt(&part, &self.path, None, source) {
+            let _ = std::fs::remove_file(&part);
+            return Err(error);
+        }
         // The staging copy is a cache of a re-downloadable file, and keeping
         // it would double what every image costs. It only ever lives in our
-        // own store — a local file is never staged.
+        // own store — a local file is never staged. Deleted only after the
+        // raw derivative is adopted; a failed convert leaves the verified
+        // source in place.
         let _ = std::fs::remove_file(staging);
         let _ = std::fs::remove_file(verify::provenance_path(staging));
         Ok(true)
@@ -401,7 +443,8 @@ impl Resolved {
 ///
 /// A pure-Rust qcow2 reader would remove the last QEMU dependency from this
 /// path (BACKENDS.md §4, LICENSING.md); until then this is the one place a
-/// non-QEMU backend still needs `qemu-img`, and it runs once per image.
+/// raw-only backend still needs `qemu-img`, and it runs once per image on
+/// first use. qcow2-capable backends never take this path.
 fn convert_to_raw(src: &Path, from: DiskFormat, part: &Path) -> Result<()> {
     let _ = std::fs::remove_file(part);
     run(Command::new(tool("qemu-img")?)
@@ -776,13 +819,16 @@ pub fn pull(reference: &str) -> Result<ImagePullResult> {
         return Ok(pull_result(&resolved, bytes, progress, false));
     };
 
-    if resolved.path.exists() {
-        if resolved.verify_bootable().is_ok() {
-            let bytes = file_len(&resolved.path)?;
-            push_progress(&mut progress, "already_present", bytes, Some(bytes), true);
-            return Ok(pull_result(&resolved, bytes, progress, false));
-        }
-        // This is a store-owned path, so a corrupt image is safe to replace.
+    if resolved.is_pulled() && resolved.verify_bootable().is_ok() {
+        let (path, _) = resolved.boot_path()?;
+        let bytes = file_len(path)?;
+        push_progress(&mut progress, "already_present", bytes, Some(bytes), true);
+        return Ok(pull_result(&resolved, bytes, progress, false));
+    }
+    if resolved.adopted_artifact_changed() {
+        // An adopted file whose record no longer matches is safe to replace.
+        // Legacy staging without a sidecar is not: conversion failure and
+        // older stores must not lose the only copy.
         resolved.discard();
         push_progress(&mut progress, "repair", 0, None, false);
     }
@@ -805,14 +851,12 @@ pub fn pull(reference: &str) -> Result<ImagePullResult> {
         push_progress(&mut progress, "verified", file_len(staging)?, None, false);
     }
 
-    if let Err(error) = resolved.materialise() {
-        // A bad staged file must not become a retry trap. The next pull gets
-        // a fresh `.part`, while an unrelated local file remains untouched.
-        resolved.discard();
-        return Err(error);
-    }
+    // Publisher-verified qcow2 is the pulled artifact. Raw-only backends
+    // convert lazily later; a missing qemu-img must not fail a fresh pull
+    // and must not delete the verified source.
     resolved.verify_bootable()?;
-    let bytes = file_len(&resolved.path)?;
+    let (path, _) = resolved.boot_path()?;
+    let bytes = file_len(path)?;
     push_progress(&mut progress, "stored", bytes, Some(bytes), true);
     Ok(pull_result(&resolved, bytes, progress, true))
 }
@@ -854,7 +898,7 @@ fn pull_result(
         reference: resolved.name.clone(),
         kind: resolved.kind(),
         bytes,
-        digest: verify::provenance(&resolved.path).map(|record| {
+        digest: verify::provenance(&resolved.active_record()).map(|record| {
             record
                 .derived_from
                 .first()
@@ -1023,6 +1067,36 @@ fn shellexpand_home(p: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn verified_staged_qcow2(dir: &Path, slug: &str) -> (Resolved, PathBuf, Vec<u8>) {
+        let path = dir.join(format!("{slug}.raw"));
+        let staging = dir.join(format!("{slug}.qcow2"));
+        let mut bytes = vec![0u8; 72];
+        bytes[..4].copy_from_slice(b"QFI\xfb");
+        bytes[4..8].copy_from_slice(&3u32.to_be_bytes());
+        bytes[24..32].copy_from_slice(&(1u64 << 30).to_be_bytes());
+        let part = dir.join(format!("{slug}.qcow2.part"));
+        std::fs::write(&part, &bytes).unwrap();
+        verify::adopt(
+            &part,
+            &staging,
+            None,
+            Source::new("download", "https://mirror.example/debian.qcow2"),
+        )
+        .unwrap();
+        let r = Resolved {
+            name: format!("{slug}:test"),
+            url: Some("https://mirror.example/debian.qcow2".into()),
+            record: path.clone(),
+            path,
+            format: DiskFormat::Raw,
+            staging: Some(staging.clone()),
+            oci: None,
+            expected: None,
+        };
+        (r, staging, bytes)
+    }
 
     #[test]
     fn aliases_resolve() {
@@ -1329,6 +1403,10 @@ mod tests {
         let text = format!("{:#}", r.materialise().unwrap_err());
         assert!(text.contains("is not what was published"), "{text}");
         assert!(!r.path.exists());
+        assert!(
+            staging.exists(),
+            "conversion failure must not delete the staged source"
+        );
     }
 
     /// The pins in the table are the publishers' own numbers, in the
@@ -1442,6 +1520,10 @@ mod tests {
         let text = format!("{:#}", r.materialise().unwrap_err());
         assert!(text.contains("is not what was published"), "{text}");
         assert!(!r.path.exists(), "nothing bootable was produced");
+        assert!(
+            staging.exists(),
+            "conversion failure must not delete the staged source"
+        );
         assert!(r.verify_bootable().is_err());
     }
 
@@ -1738,6 +1820,14 @@ mod tests {
         // of the migration is testable without one installed.
         std::fs::write(r.staging.as_ref().unwrap(), vec![7u8; 1024]).unwrap();
         assert!(r.is_pulled());
+        assert!(
+            r.verified_qcow2_staging().is_none(),
+            "raw bytes under a qcow2 name are not a verified qcow2"
+        );
+        assert!(
+            !r.adopted_artifact_changed(),
+            "legacy staging without a sidecar is not a repair"
+        );
         assert!(r.materialise().unwrap());
         assert!(r.path.exists());
         assert!(
@@ -1750,33 +1840,9 @@ mod tests {
     #[test]
     fn a_verified_staged_qcow2_is_bootable_without_materialising_it() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("debian-13.raw");
-        let staging = dir.path().join("debian-13.qcow2");
-        let mut bytes = vec![0u8; 72];
-        bytes[..4].copy_from_slice(b"QFI\xfb");
-        bytes[4..8].copy_from_slice(&3u32.to_be_bytes());
-        bytes[24..32].copy_from_slice(&(1u64 << 30).to_be_bytes());
-        let part = dir.path().join("debian-13.qcow2.part");
-        std::fs::write(&part, &bytes).unwrap();
-        verify::adopt(
-            &part,
-            &staging,
-            None,
-            Source::new("download", "https://mirror.example/debian.qcow2"),
-        )
-        .unwrap();
+        let (r, staging, bytes) = verified_staged_qcow2(dir.path(), "debian-13");
         assert!(verify::provenance(&staging).is_some());
 
-        let r = Resolved {
-            name: "debian:13".into(),
-            url: Some("https://mirror.example/debian.qcow2".into()),
-            record: path.clone(),
-            path,
-            format: DiskFormat::Raw,
-            staging: Some(staging.clone()),
-            oci: None,
-            expected: None,
-        };
         let (boot, format) = r.boot_path().unwrap();
         assert_eq!(boot, staging);
         assert_eq!(format, DiskFormat::Qcow2);
@@ -1791,6 +1857,113 @@ mod tests {
             r.verify_bootable().is_err(),
             "tampered staging is fail-closed"
         );
+        assert!(
+            r.adopted_artifact_changed(),
+            "a changed adopted file is what pull repairs"
+        );
+        assert!(
+            staging.exists(),
+            "fail-closed does not delete the tampered file; pull repairs it"
+        );
+        assert!(!r.path.exists());
+    }
+
+    /// A fresh catalog pull stops at the publisher-verified qcow2. Conversion
+    /// is a raw-only concern and must not be required to call the image pulled.
+    #[test]
+    fn a_fresh_verified_qcow2_is_pulled_without_a_converter() {
+        let dir = tempfile::tempdir().unwrap();
+        let (r, staging, _) = verified_staged_qcow2(dir.path(), "debian-13");
+        assert!(r.is_pulled(), "the verified download is the image");
+        r.verify_bootable().unwrap();
+        let (boot, format) = r.boot_path().unwrap();
+        assert_eq!(boot, staging);
+        assert_eq!(format, DiskFormat::Qcow2);
+        assert!(
+            !r.path.exists(),
+            "a qcow2-capable backend must not need qemu-img to finish a pull"
+        );
+        assert!(
+            verify::provenance(&staging).is_some(),
+            "the publisher-verified file keeps its own record"
+        );
+        assert_eq!(r.verified_qcow2_staging(), Some(staging.as_path()));
+        assert!(
+            !r.adopted_artifact_changed(),
+            "a matching record is not a repair"
+        );
+    }
+
+    /// Raw-only backends convert on first use, not at pull. The verified
+    /// source stays until conversion actually succeeds.
+    #[test]
+    fn a_raw_only_backend_converts_lazily() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alpine-3.22.raw");
+        let staging = dir.path().join("alpine-3.22.qcow2");
+        let r = Resolved {
+            name: "alpine:3.22".into(),
+            url: Some("https://dl-cdn.example/a.qcow2".into()),
+            record: path.clone(),
+            path,
+            format: DiskFormat::Raw,
+            staging: Some(staging.clone()),
+            oci: None,
+            expected: None,
+        };
+        // Raw bytes under the staging name: detect_format is raw, so this
+        // half of the lazy path needs no qemu-img.
+        let bytes = vec![3u8; 1024];
+        let part = dir.path().join("alpine-3.22.qcow2.part");
+        std::fs::write(&part, &bytes).unwrap();
+        verify::adopt(
+            &part,
+            &staging,
+            None,
+            Source::new("download", "https://dl-cdn.example/a.qcow2"),
+        )
+        .unwrap();
+
+        assert!(r.is_pulled());
+        r.verify_bootable().unwrap();
+        assert!(!r.path.exists(), "pull left the verified source in place");
+
+        assert!(r.materialise().unwrap(), "first raw-only use converts");
+        assert!(r.path.exists());
+        assert!(
+            !staging.exists(),
+            "successful conversion may drop the staging cache"
+        );
+        r.verify_bootable().unwrap();
+        assert!(!r.materialise().unwrap(), "and again is a no-op");
+    }
+
+    /// qemu-img missing, a broken convert, or a digest mismatch must all
+    /// leave the publisher-verified qcow2 on disk.
+    #[test]
+    fn conversion_failure_keeps_the_verified_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let (r, staging, bytes) = verified_staged_qcow2(dir.path(), "debian-13");
+        let provenance = verify::provenance_path(&staging);
+        assert!(provenance.exists());
+
+        let err = r.materialise().unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("qemu-img")
+                || text.contains("not found")
+                || text.contains("converting")
+                || text.contains("failed"),
+            "conversion of a stub qcow2 must fail closed: {text}"
+        );
+        assert!(!r.path.exists(), "no raw derivative was adopted");
+        assert!(staging.exists(), "the verified source is still there");
+        assert!(
+            provenance.exists(),
+            "and so is the record that makes it bootable"
+        );
+        assert_eq!(std::fs::read(&staging).unwrap(), bytes);
+        r.verify_bootable().unwrap();
     }
 
     #[test]
