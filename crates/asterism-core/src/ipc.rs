@@ -5,12 +5,14 @@
 //! contract. Callers consume one shared surface through this module.
 
 #[cfg(unix)]
+#[path = "ipc_unix.rs"]
 mod ipc_unix;
 
 #[cfg(unix)]
 pub use ipc_unix::*;
 
 #[cfg(windows)]
+#[path = "ipc_windows.rs"]
 mod ipc_windows;
 
 #[cfg(windows)]
