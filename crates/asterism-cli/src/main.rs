@@ -36,7 +36,7 @@ use asterism_core::hosted_auth::{
     PollAction, PollFailure, PollPolicy, ProtocolError, Provider, Session,
 };
 use asterism_core::hv::{GuestHealth, ImageKind};
-use asterism_core::instance::{now_unix, Instance, PortForward, Restart, Shape};
+use asterism_core::instance::{now_unix, Instance, PortForward, Restart, RuntimeKind, Shape};
 use asterism_core::ipc;
 use asterism_core::proc::{ProcId, Signal};
 use asterism_core::protocol::{self, Request, Response};
@@ -74,10 +74,14 @@ enum Command {
         name: String,
         /// Image to boot: an alias (`ast images`), an https:// url, a path to
         /// a qcow2 or raw disk image, or an OCI/Docker reference such as
-        /// `nginx` or `ghcr.io/owner/app:v1` — which is pulled, unpacked and
-        /// booted as a microVM of its own.
+        /// `nginx` or `ghcr.io/owner/app:v1`. OCI image format is independent
+        /// of `--runtime`: it may boot as a VM or enter native namespaces.
         #[arg(long, default_value = "ubuntu:24.04")]
         image: String,
+        /// Isolation runtime. `vm` keeps the existing hypervisor path;
+        /// `container` requires a native OCI-capable host adapter.
+        #[arg(long, value_enum, default_value_t = CliRuntime::Vm)]
+        runtime: CliRuntime,
         /// Publish a guest port on this device's loopback: `-p 8080:80`.
         ///
         /// How an OCI instance is reached: a container image has no ssh
@@ -186,6 +190,13 @@ enum Command {
         #[arg(short = 't', long)]
         tty: bool,
         /// A command to run instead of opening a shell, and its arguments.
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+    /// Run a command inside a native container through its private control
+    /// channel. With no command, runs the image's shell.
+    Shell {
+        name: String,
         #[arg(last = true)]
         command: Vec<String>,
     },
@@ -507,6 +518,12 @@ enum Command {
     Bugreport,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliRuntime {
+    Vm,
+    Container,
+}
+
 /// `ast snapshot ...` — taking one, and deleting one.
 ///
 /// Taking is the bare form (`ast snapshot dev nightly`), which is what
@@ -748,6 +765,7 @@ fn main() -> Result<()> {
         Command::Create {
             name,
             image,
+            runtime,
             publish,
             cpus,
             mem,
@@ -759,25 +777,39 @@ fn main() -> Result<()> {
             // always pulled by the device that will own the instance.
             asterism_core::profile::resolve(&profiles)?;
             let resolved = ensure_image_on_device(device.as_deref(), &image)?;
-            Request::Create {
-                name,
-                image: resolved,
-                shape: Shape {
-                    cpus,
-                    mem_mib: parse_mem_mib(&mem)?,
-                    disk_gib: parse_disk_gib(&disk)?,
+            let shape = Shape {
+                cpus,
+                mem_mib: parse_mem_mib(&mem)?,
+                disk_gib: parse_disk_gib(&disk)?,
+            };
+            let publish = publish
+                .iter()
+                .map(|p| p.parse::<PortForward>())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| anyhow::anyhow!(e))?;
+            match runtime {
+                CliRuntime::Vm => Request::Create {
+                    name,
+                    image: resolved,
+                    shape,
+                    backend,
+                    profiles,
+                    publish,
                 },
-                backend,
-                profiles,
-                publish: publish
-                    .iter()
-                    .map(|p| p.parse::<PortForward>())
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| anyhow::anyhow!(e))?,
+                CliRuntime::Container => Request::CreateRuntime {
+                    name,
+                    image: resolved,
+                    shape,
+                    runtime: RuntimeKind::Container,
+                    backend,
+                    profiles,
+                    publish,
+                },
             }
         }
         Command::Up { name, restart } => Request::Up { name, restart },
         Command::Down { name } => Request::Down { name },
+        Command::Shell { name, command } => return container_shell(&name, command),
         Command::Rm { name } => Request::Remove { name },
         Command::Rename { name, new_name } => Request::Rename { name, new_name },
         // `ast ls` is the orbit's registry; `--local` is one device's shard of
@@ -1044,11 +1076,12 @@ fn main() -> Result<()> {
                 println!("{}  {}", instance.name, instance.status);
                 // An OCI guest has no ssh to offer, so it is told what it
                 // does have: its ports, and its console.
-                if instance.image_kind == ImageKind::OciRootfs {
+                if instance.runtime == RuntimeKind::Container {
                     for p in &instance.publish {
-                        println!("published: http://127.0.0.1:{}  ->  guest :{}", p.host, p.guest);
+                        println!("published: http://127.0.0.1:{}  ->  container :{}", p.host, p.guest);
                     }
-                    println!("the image's output is on the console — ast logs {}", instance.name);
+                    println!("control: ast shell {} -- /bin/sh", instance.name);
+                    println!("output:  ast logs {}", instance.name);
                 } else if let Some(endpoint) = instance.endpoint() {
                     println!(
                         "guest booting; ssh on {endpoint} — try: ast ssh {}",
@@ -1126,6 +1159,7 @@ fn main() -> Result<()> {
         // answering a different question.
         Response::Snapshots { .. }
         | Response::Log { .. }
+        | Response::ContainerExec { .. }
         | Response::SshEndpoint { .. }
         | Response::DeviceShellStatus { .. }
         | Response::DeviceShellAccepted { .. }
@@ -2874,6 +2908,11 @@ fn refuse_ssh_to_an_oci_guest(name: &str) -> Result<()> {
     if instance.image_kind != ImageKind::OciRootfs {
         return Ok(());
     }
+    if instance.runtime == RuntimeKind::Container {
+        bail!(
+            "{name} uses runtime=container and has no SSH endpoint — use `ast shell {name} -- /bin/sh`; output is on `ast logs {name}`"
+        );
+    }
     let ports: Vec<String> = instance.publish.iter().map(|p| p.to_string()).collect();
     let reach = match ports.is_empty() {
         true => format!(
@@ -3147,6 +3186,34 @@ fn logs(name: &str, follow: bool, lines: u32) -> Result<()> {
         };
     }
     logs_here(name, follow)
+}
+
+/// Execute through a native container's namespace-bound Unix control
+/// endpoint. This deliberately shares none of the SSH path.
+fn container_shell(name: &str, mut command: Vec<String>) -> Result<()> {
+    if command.is_empty() {
+        command.push("/bin/sh".into());
+    }
+    match send(&Request::ContainerExec {
+        name: name.into(),
+        command,
+    })? {
+        Response::ContainerExec {
+            status,
+            stdout,
+            stderr,
+        } => {
+            print!("{stdout}");
+            eprint!("{stderr}");
+            if status == 0 {
+                Ok(())
+            } else {
+                bail!("container command exited with status {status}")
+            }
+        }
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected reply from astd: {other:?}"),
+    }
 }
 
 /// The console log as a file on this device's disk.
@@ -3938,8 +4005,8 @@ fn print_table(rows: &[OrbitRow]) {
         return;
     }
     println!(
-        "{:<14} {:<9} {:<14} {:<16} {:<12} {:<6} SSH",
-        "NAME", "STATUS", "IMAGE", "SHAPE", "CPU", "AGE"
+        "{:<14} {:<9} {:<10} {:<14} {:<16} {:<12} {:<6} ACCESS",
+        "NAME", "STATUS", "RUNTIME", "IMAGE", "SHAPE", "CPU", "AGE"
     );
     let mut stale = false;
     let mut conflicts = Vec::new();
@@ -3965,19 +4032,26 @@ fn print_table(rows: &[OrbitRow]) {
             stale = true;
             "unknown".to_owned()
         };
-        let ssh = match (row.live, inst.endpoint()) {
-            (true, Some(e)) => e.to_string(),
+        let access = match (row.live, inst.runtime, inst.handle.as_ref()) {
+            (true, RuntimeKind::Vm, _) => inst
+                .endpoint()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "-".into()),
+            (true, RuntimeKind::Container, Some(handle)) if handle.container_control.is_some() => {
+                "container-control".into()
+            }
             _ => "-".into(),
         };
         println!(
-            "{:<14} {:<9} {:<14} {:<16} {:<12} {:<6} {}",
+            "{:<14} {:<9} {:<10} {:<14} {:<16} {:<12} {:<6} {}",
             inst.name,
             status,
+            inst.runtime,
             short_image(inst.image.as_deref().unwrap_or("-")),
             shape,
             inst.cpu_device,
             age(inst.created_at),
-            ssh,
+            access,
         );
     }
     if stale {
@@ -3994,6 +4068,7 @@ fn print_detail(inst: &Instance, guest_health: Option<&GuestHealth>) {
     println!("name:    {}", inst.name);
     println!("id:      {}", inst.id);
     println!("status:  {}", inst.status);
+    println!("runtime: {}", inst.runtime);
     // What happens when the guest dies, which is half of what "never
     // sleeps" means. Printed always, because the answer matters most for
     // the instance nobody has thought about since they created it.
@@ -4023,7 +4098,15 @@ fn print_detail(inst: &Instance, guest_health: Option<&GuestHealth>) {
     println!("machine: {}", inst.machine);
     if let Some(h) = &inst.handle {
         let pid = h.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
-        println!("running: {} pid {pid}, ssh {}", h.backend, h.endpoint);
+        match (&h.endpoint, &h.container_control) {
+            (Some(endpoint), _) => println!("running: {} pid {pid}, ssh {endpoint}", h.backend),
+            (None, Some(control)) => println!(
+                "running: {} pid {pid}, container control {}",
+                h.backend,
+                control.socket.display()
+            ),
+            (None, None) => println!("running: {} pid {pid}, no endpoint", h.backend),
+        }
         println!("control: {}", h.ctl.path().display());
     }
     if let Some(conflict) = &inst.conflict {
