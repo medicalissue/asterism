@@ -134,14 +134,7 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
         // job; refusing a name the catalog does not know is this one's.
         Request::SetProfiles { name, profiles } => reg
             .get(&name)
-            .and_then(|inst| {
-                if inst.runtime == RuntimeKind::Container {
-                    anyhow::bail!(
-                        "bootstrap profiles are not supported by the native container adapter"
-                    )
-                }
-                Ok(())
-            })
+            .map(|_| ())
             .and_then(|_| check_profiles(&profiles))
             .and_then(|_| reg.set_profiles(&name, profiles)),
         // `--restart` is recorded before the boot, so an instance that comes
@@ -298,25 +291,16 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             env,
             source_device,
         } => {
-            if reg
-                .get(&name)
-                .is_ok_and(|inst| inst.runtime == RuntimeKind::Container)
-            {
-                Err(anyhow::anyhow!(
-                    "secret egress is not supported by the native container adapter"
-                ))
-            } else {
-                attach_secret(
-                    reg,
-                    &name,
-                    &secret,
-                    &authority,
-                    placement,
-                    env,
-                    source_device.as_deref(),
-                )
-                .await
-            }
+            attach_secret(
+                reg,
+                &name,
+                &secret,
+                &authority,
+                placement,
+                env,
+                source_device.as_deref(),
+            )
+            .await
         }
         Request::DetachSecret { name, secret } => detach_secret(reg, &name, &secret),
         Request::BackupExport { name, destination } => {
@@ -418,14 +402,6 @@ fn create_instance(
             }
             if image.kind != ImageKind::OciRootfs {
                 anyhow::bail!("runtime=container requires an OCI image reference");
-            }
-            if !publish.is_empty() {
-                anyhow::bail!("native rootless port publishing is unsupported; no port was reserved or reported ready");
-            }
-            if !profiles.is_empty() {
-                anyhow::bail!(
-                    "bootstrap profiles are not supported by the native container adapter"
-                );
             }
             crate::container::machine()?
         }
