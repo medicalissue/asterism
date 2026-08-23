@@ -17,7 +17,7 @@ use asterism_core::hv::GuestNetwork;
 use asterism_core::instance::{now_unix, Instance, PartRuntime};
 use asterism_core::network::{
     guest_macs, Availability, DnsPolicy, ExitGrant, ExitHealth, ExitPoint, PathKind,
-    ProviderObservation, GUEST_DNS, GUEST_GATEWAY,
+    ProviderObservation, GUEST_DNS, GUEST_DNS_V6, GUEST_GATEWAY,
 };
 use asterism_mesh::PathKind as MeshPathKind;
 use futures::{SinkExt, StreamExt};
@@ -206,6 +206,17 @@ pub(crate) async fn grant(inst: &Instance, mut exit: ExitPoint) -> Result<ExitPo
         });
     }
     Ok(exit)
+}
+
+/// Mint a fresh attachment after a CPU-part move.  The policy is portable,
+/// but its provider generations are not: they were issued to the source
+/// device's immutable mesh identity.
+pub(crate) async fn regrant_for_cpu_move(
+    inst: &Instance,
+    mut exit: ExitPoint,
+) -> Result<ExitPoint> {
+    exit.grants.clear();
+    grant(inst, exit).await
 }
 
 pub(crate) fn stage_transition(inst: &Instance, next: Option<&ExitPoint>) -> Result<()> {
@@ -708,7 +719,7 @@ async fn run_guest_edge(
 }
 
 fn permits(policy: &RwLock<Option<ExitPoint>>, destination: IpAddr) -> bool {
-    if destination == GUEST_DNS {
+    if destination == GUEST_DNS || destination == GUEST_DNS_V6 {
         return true;
     }
     if is_edge_control(destination) {
@@ -944,18 +955,17 @@ async fn select_flow(
     instance_id: &str,
     remote: SocketAddr,
 ) -> Result<(String, SocketAddr, bool, Option<ExitGrant>)> {
-    if remote.ip() == GUEST_DNS && remote.port() != 53 {
+    let virtual_dns = remote.ip() == GUEST_DNS || remote.ip() == GUEST_DNS_V6;
+    if virtual_dns && remote.port() != 53 {
         anyhow::bail!("the virtual DNS endpoint accepts only port 53");
     }
     let Some(exit) = policy else {
-        return Ok((
-            cpu_device.to_owned(),
-            remote,
-            remote.ip() == GUEST_DNS,
-            None,
-        ));
+        return Ok((cpu_device.to_owned(), remote, virtual_dns, None));
     };
-    let dns_flow = remote.ip() == GUEST_DNS;
+    let dns_flow = virtual_dns;
+    if !allows_exit_destination(exit, remote) {
+        anyhow::bail!("the exit policy refuses this destination or port");
+    }
     if dns_flow && exit.dns == DnsPolicy::CpuDevice {
         return Ok((cpu_device.to_owned(), remote, true, None));
     }
@@ -972,6 +982,24 @@ async fn select_flow(
         .then(|| exit.grants.get(&provider).cloned())
         .flatten();
     Ok((provider, remote, system_dns, grant))
+}
+
+/// The packet filter runs before transport ports are available.  Repeat the
+/// narrow private-resolver exception at flow selection so a Custom DNS entry
+/// cannot become authority to connect to arbitrary services on that host.
+fn allows_exit_destination(exit: &ExitPoint, destination: SocketAddr) -> bool {
+    let ip = destination.ip();
+    if ip == GUEST_DNS || ip == GUEST_DNS_V6 {
+        return destination.port() == 53;
+    }
+    let private_resolver = matches!(
+        &exit.dns,
+        DnsPolicy::Custom(servers)
+            if servers.contains(&ip) && !asterism_core::network::is_public_unicast(ip)
+    );
+    (asterism_core::network::is_public_unicast(ip)
+        || (private_resolver && destination.port() == 53))
+        && exit.routes.permits(ip, false)
 }
 
 async fn select_sticky(exit: &ExitPoint, cpu_device: &str, instance_id: &str) -> Result<String> {
@@ -1206,7 +1234,7 @@ pub(crate) fn resolve_dns_target(remote: SocketAddr, system_dns: bool) -> Result
     if !system_dns {
         return Ok(remote);
     }
-    if remote.ip() != GUEST_DNS || remote.port() != 53 {
+    if (remote.ip() != GUEST_DNS && remote.ip() != GUEST_DNS_V6) || remote.port() != 53 {
         anyhow::bail!("system DNS resolution requires the virtual DNS endpoint on port 53");
     }
     let resolv =
@@ -1512,6 +1540,29 @@ mod tests {
         assert!(!permits(&policy, "10.1.2.3".parse().unwrap()));
         assert!(!permits(&policy, "100.64.0.8".parse().unwrap()));
         assert!(permits(&policy, GUEST_DNS));
+        assert!(permits(&policy, GUEST_DNS_V6));
+    }
+
+    #[test]
+    fn local_custom_dns_only_exempts_a_private_resolvers_dns_port() {
+        let policy = ExitPoint::new(
+            "laptop".into(),
+            vec![],
+            RoutePolicy {
+                include: vec!["10.0.0.53/32".parse().unwrap()],
+                exclude: vec![],
+            },
+            DnsPolicy::Custom(vec!["10.0.0.53".parse().unwrap()]),
+        )
+        .unwrap();
+        assert!(allows_exit_destination(
+            &policy,
+            "10.0.0.53:53".parse().unwrap()
+        ));
+        assert!(!allows_exit_destination(
+            &policy,
+            "10.0.0.53:443".parse().unwrap()
+        ));
     }
 
     #[tokio::test]
@@ -1563,6 +1614,12 @@ mod tests {
         assert!(select_flow(&Some(policy), "laptop", "instance-id", address)
             .await
             .is_err());
+        let v6 = SocketAddr::new(GUEST_DNS_V6, 53);
+        let (_, target, system_dns, _) = select_flow(&None, "laptop", "instance-id", v6)
+            .await
+            .unwrap();
+        assert_eq!(target, v6);
+        assert!(system_dns);
     }
 
     #[test]

@@ -14,7 +14,7 @@ use asterism_core::durable;
 use asterism_core::instance::now_unix;
 use asterism_core::network::{
     is_public_unicast, validate_exit_policy, DnsPolicy, ExitGrant, ExitProviderStatus, RoutePolicy,
-    GUEST_DNS,
+    GUEST_DNS, GUEST_DNS_V6,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
@@ -572,7 +572,7 @@ pub(crate) struct FlowLease {
 impl FlowLease {
     pub(crate) fn allows(&self, destination: std::net::SocketAddr, system_dns: bool) -> bool {
         if system_dns {
-            return destination.ip() == GUEST_DNS
+            return (destination.ip() == GUEST_DNS || destination.ip() == GUEST_DNS_V6)
                 && destination.port() == 53
                 && matches!(self.dns, DnsPolicy::ExitPoint);
         }
@@ -650,6 +650,7 @@ mod tests {
             .authorize("consumer-id", "instance-id", grant.generation)
             .unwrap();
         assert!(lease.allows("100.64.0.53:53".parse().unwrap(), true));
+        assert!(lease.allows("[fd64:6173:7400::53]:53".parse().unwrap(), true));
         assert!(!lease.allows("100.64.0.53:80".parse().unwrap(), true));
         manager
             .revoke("consumer-id", "instance-id", grant.generation)

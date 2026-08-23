@@ -1393,8 +1393,9 @@ mod tests {
         assert!(Request::Compat.speakable_at(2));
         assert!(Request::List.speakable_at(1));
         assert_eq!(Request::DeviceShellStatus.since(), 5);
-        assert_eq!(Request::DetachExitPoint { name: "dev".into() }.since(), 6);
-        assert!(!Request::DetachExitPoint { name: "dev".into() }.speakable_at(5));
+        assert_eq!(Request::DetachExitPoint { name: "dev".into() }.since(), 7);
+        assert!(!Request::DetachExitPoint { name: "dev".into() }.speakable_at(6));
+        assert!(Request::DetachExitPoint { name: "dev".into() }.speakable_at(7));
         assert_eq!(
             serde_json::to_string(&Request::DeviceShellStatus).unwrap(),
             r#"{"cmd":"device_shell_status"}"#

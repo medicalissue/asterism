@@ -309,7 +309,7 @@ impl MeshRequest {
             | MeshRequest::ExitDiscardPending { .. }
             | MeshRequest::ExitProbe { .. }
             | MeshRequest::ExitTcp { .. }
-            | MeshRequest::ExitUdp { .. } => 7,
+            | MeshRequest::ExitUdp { .. } => 8,
             _ => compat::FIRST_PROTOCOL,
         }
     }
@@ -4334,7 +4334,7 @@ mod tests {
     }
 
     #[test]
-    fn every_exit_mesh_frame_is_fenced_at_protocol_seven() {
+    fn every_exit_mesh_frame_is_fenced_at_protocol_eight() {
         let routes = asterism_core::network::RoutePolicy::default();
         let dns = asterism_core::network::DnsPolicy::ExitPoint;
         let destination = "1.1.1.1:53".parse().unwrap();
@@ -4372,12 +4372,12 @@ mod tests {
                 system_dns: false,
             },
         ];
-        assert!(frames.iter().all(|frame| frame.since() == 7));
-        assert_eq!(Request::DetachExitPoint { name: "dev".into() }.since(), 6);
+        assert!(frames.iter().all(|frame| frame.since() == 8));
+        assert_eq!(Request::DetachExitPoint { name: "dev".into() }.since(), 7);
     }
 
     #[tokio::test]
-    async fn protocol_six_serves_attachment_frames_but_refuses_provider_frames() {
+    async fn protocol_seven_serves_attachment_frames_but_refuses_provider_frames() {
         let (client, connection, _dir) = wired().await;
         let exit = asterism_core::network::ExitPoint::new(
             "provider".into(),
@@ -4396,8 +4396,8 @@ mod tests {
         write_frame(
             &mut stream.send,
             &Opening {
-                protocol: 6,
-                min_protocol: 6,
+                protocol: 7,
+                min_protocol: 7,
                 request: &attach,
             },
         )
@@ -4420,8 +4420,8 @@ mod tests {
         write_frame(
             &mut stream.send,
             &Opening {
-                protocol: 6,
-                min_protocol: 6,
+                protocol: 7,
+                min_protocol: 7,
                 request: &provider,
             },
         )
