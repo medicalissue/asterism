@@ -34,6 +34,7 @@ harness_own_home "$ASTERISM_HOME"
 export ASTERISM_MESH=local
 IMAGE="${E2E_IMAGE:-debian:13}"
 BACKEND="${E2E_BACKEND:-qemu}"
+DISK_GIB="${E2E_DISK_GIB:-10}"
 INST=e2e
 VOL="$ASTERISM_HOME/e2e-vol"   # dash on purpose: covers systemd \x2d escaping
 MARKER="marker-$$"
@@ -91,7 +92,8 @@ harness_seed_images "$ASTERISM_HOME"
 # explicitly selects CHV, exercising the same product journey through the
 # shipped virtiofsd and Cloud Hypervisor snapshot path.
 expect "create"  "$INST  defined"  \
-  "$AST" create "$INST" --backend "$BACKEND" --image "$IMAGE" --mem 2G --disk 10G
+  "$AST" create "$INST" --backend "$BACKEND" --image "$IMAGE" --mem 2G \
+    --disk "${DISK_GIB}G"
 expect "attach"  "/mnt/ast/e2e-vol" "$AST" attach "$INST" --volume "$VOL"
 expect "up"      "$INST  running"  "$AST" up "$INST"
 

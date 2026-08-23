@@ -71,6 +71,7 @@ VOL="tank"
 SHARED="$A/host-share"
 SHARED_GUEST="/workspace"
 IMAGE="${E2E_IMAGE:-debian:13}"
+ROOT_DISK_GIB="${E2E_DISK_GIB:-10}"
 # Five GiB leaves room for the filesystem and a real four-GiB payload.  The
 # transfer is intentionally non-sparse and goes through the guest's virtio
 # disk, the consumer bridge, QUIC, NBD, and the provider's raw image.
@@ -378,7 +379,7 @@ ASTERISM_HOME="$A" "$AST" pull "$IMAGE" >/dev/null 2>&1 \
 # block device on both backends.
 expect "create the instance on A ($BACKEND)" "$INST  defined" \
   env ASTERISM_HOME="$A" "$AST" create "$INST" --backend "$BACKEND" --image "$IMAGE" \
-    --mem 2G --disk 10G
+    --mem 2G --disk "${ROOT_DISK_GIB}G"
 
 mkdir -p "$SHARED"
 chmod 0777 "$SHARED"

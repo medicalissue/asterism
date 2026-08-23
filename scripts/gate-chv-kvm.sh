@@ -71,13 +71,15 @@ export ASTERISM_TEST_ARTIFACTS="$ARTIFACTS"
 
 # create/up/vsock-ready/SSH, installed-helper identity, virtiofs, disk
 # snapshot/restore, down/rm. E2E_BACKEND is explicit: fallback cannot pass.
-E2E_BACKEND=chv bash "$ROOT/scripts/e2e.sh" 2>&1 | tee "$ARTIFACTS/lifecycle.log"
+E2E_BACKEND=chv E2E_DISK_GIB=3 \
+  bash "$ROOT/scripts/e2e.sh" 2>&1 | tee "$ARTIFACTS/lifecycle.log"
 
 # The same exact binaries now operate a local directory and a remote block
 # part across two daemons, including consumer-daemon restart. Keep the hosted
 # transfer bounded; identity, byte count, digest and provider allocation are
 # still asserted by the lane.
 E2E_VOLUME_BACKEND=chv \
+E2E_DISK_GIB=3 \
 E2E_VOLUME_GIB="${E2E_VOLUME_GIB:-1}" \
 E2E_VOLUME_TRANSFER_BYTES="${E2E_VOLUME_TRANSFER_BYTES:-134217728}" \
   bash "$ROOT/scripts/e2e-volume.sh" 2>&1 | tee "$ARTIFACTS/remote-volume.log"
@@ -100,7 +102,7 @@ ASTERISM_HOME="$FAIL_HOME" ASTERISM_MESH=local \
 ASTERISM_CLOUD_HYPERVISOR="$BAD_CHV" ASTERISM_VIRTIOFSD="$VIRTIOFSD" \
   "$AST" pull debian:13 >/dev/null
 ASTERISM_HOME="$FAIL_HOME" ASTERISM_MESH=local "$AST" create cleanup \
-  --backend chv --image debian:13 --mem 1G --disk 10G >/dev/null
+  --backend chv --image debian:13 --mem 1G --disk 3G >/dev/null
 ASTERISM_HOME="$FAIL_HOME" ASTERISM_MESH=local "$AST" attach cleanup \
   --volume "$FAIL_RUN/share" >/dev/null
 if failure_out="$(ASTERISM_HOME="$FAIL_HOME" ASTERISM_MESH=local \
