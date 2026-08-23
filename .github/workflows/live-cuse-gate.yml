@@ -3,7 +3,7 @@ name: Linux live CUSE lifecycle gate
 on:
   push:
     branches:
-      - polecat/keeper/as-glji.5+cusegate
+      - "polecat/**/as-glji.5**"
 
 permissions:
   contents: read
