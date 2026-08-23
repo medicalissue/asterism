@@ -774,8 +774,10 @@ impl Instance {
                     gpu.memory_bytes / (1024 * 1024)
                 ),
                 note: Some(format!(
-                    "remote CUDA semantic ABI · {} · provider generation {}",
-                    gpu.provider_gpu_uuid, gpu.provider_generation
+                    "projected {} endpoint · {} · provider generation {}",
+                    gpu.projection_kind(),
+                    gpu.provider_gpu_uuid,
+                    gpu.provider_generation
                 )),
             },
             None => Part {
@@ -946,7 +948,9 @@ mod tests {
             .unwrap();
         assert_eq!(gpu.source, "desktop");
         assert_eq!(gpu.detail, "/dev/nvidia0 · 8192 MiB");
-        assert!(gpu.note.unwrap().contains("provider generation 4"));
+        let note = gpu.note.unwrap();
+        assert!(note.contains("provider generation 4"));
+        assert!(note.contains("cuse_char_device_plus_generated_libcuda"));
 
         let persisted = serde_json::to_string(&inst).unwrap();
         assert!(persisted.contains("GPU-01234567"));

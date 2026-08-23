@@ -109,7 +109,12 @@ use crate::VERSION;
 /// * **4** — the opt-in, framed device-shell policy and session wire.
 /// * **5** — mesh-safe, read-only device-shell policy status.
 /// * **6** — device-local structured image catalog and pull results.
-pub const PROTOCOL_VERSION: u32 = 6;
+/// * **7** — orbit storage catalog, placement, leases, and fenced NBD splices.
+/// * **8** — guest NVIDIA projection control frames (`gpu_guest_*`) and the
+///   dedicated GPU mesh stream. The guest contract is a local `/dev/nvidia0`
+///   endpoint plus generated libcuda; the mesh opening frame is
+///   instance-bound and token-free.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// The wire as it was before it carried a version.
 ///
@@ -120,9 +125,10 @@ pub const PROTOCOL_VERSION: u32 = 6;
 /// into a thing to be spoken to.
 pub const FIRST_PROTOCOL: u32 = 1;
 
-/// How many versions back this build still serves. Keep the unnumbered first
-/// wire usable while newer device-shell capabilities negotiate independently.
-pub const SUPPORTED_BACK: u32 = 5;
+/// How many versions back this build still serves. Protocol 8 adds GPU
+/// guest frames; keep the unnumbered protocol-1 release reachable in a
+/// rolling orbit.
+pub const SUPPORTED_BACK: u32 = 7;
 
 /// Format version of the home stamp document itself.
 pub const STAMP_VERSION: u32 = 1;

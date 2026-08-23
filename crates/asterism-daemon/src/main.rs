@@ -57,6 +57,7 @@ use transport::{Admitted, Framing};
 
 mod backend;
 mod device_shell;
+mod gpu;
 mod egress;
 mod images;
 mod instance;
@@ -86,6 +87,7 @@ pub(crate) struct Node {
     pub shard: Arc<Mutex<Shard>>,
     pub orbit: Arc<Mutex<Orbit>>,
     pub shell: Arc<device_shell::Manager>,
+    pub gpu: Arc<gpu::Manager>,
 }
 
 impl Node {
@@ -149,6 +151,7 @@ async fn main() -> Result<()> {
         shard: Arc::new(Mutex::new(Shard::load(&paths::state_path())?)),
         orbit: Arc::new(Mutex::new(Orbit::load(&paths::orbit_path())?)),
         shell: device_shell::Manager::load(),
+        gpu: gpu::Manager::new(),
     };
 
     // The election, the stale-socket sweep and the bind, in that order and
@@ -556,6 +559,21 @@ async fn serve(conn: Admitted, node: Node, mesh: Option<Arc<Mesh>>) -> Result<()
         // process. It borrows this private unix-socket connection and either
         // enters the local target through the same policy path or bridges it
         // to one dedicated authenticated mesh stream.
+        if let Request::GpuGuestOpen { name } = &request {
+            let mut io = ClientIo {
+                frames: &mut frames,
+                write: &mut write,
+            };
+            if let Err(e) = gpu::serve_local(name, &node, mesh.as_ref(), &mut io).await {
+                io.send(&Response::GpuGuestRefused {
+                    code: "unreachable".into(),
+                    message: format!("{e:#}"),
+                })
+                .await?;
+            }
+            continue;
+        }
+
         if let Request::DeviceShellOpen { device, open } = &request {
             let mut io = ClientIo {
                 frames: &mut frames,
@@ -817,6 +835,7 @@ mod tests {
             shard: Arc::new(Mutex::new(Shard::load(&home.join("state.json")).unwrap())),
             orbit: Arc::new(Mutex::new(Orbit::load(&home.join("orbit.json")).unwrap())),
             shell: device_shell::Manager::load_at(home),
+            gpu: gpu::Manager::new(),
         }
     }
 
