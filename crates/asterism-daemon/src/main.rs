@@ -2,7 +2,7 @@
 //!
 //! The orbit is a pool of parts; an instance is a computer assembled from
 //! them. This daemon is one device's contribution to that pool: it holds this
-//! device's shard of the orbit registry, boots the guests whose cpu and ram it
+//! device's shard of the orbit registry, boots the guests whose compute it
 //! supplies, and serves the `ast` CLI over a unix socket (one JSON request per
 //! line, one JSON response per line). Guests are booted through the
 //! [`Hypervisor`] boundary: nothing in this daemon names a hypervisor concept
@@ -77,7 +77,7 @@ use mesh::{ClientIo, Mesh, Splice};
 /// orbit knows it by.
 ///
 /// The two travel together because almost everything needs both — a row is
-/// written with the device that supplies its cpu, and that device is named by
+/// written with the device that supplies its compute, and that device is named by
 /// the orbit, not by its hostname. Two daemons on one machine with different
 /// orbit names are two distinct suppliers of parts, and the tests depend on
 /// that being true.
@@ -139,7 +139,7 @@ async fn main() -> Result<()> {
     }
 
     // Now that this build has been established as one that may touch this
-    // home: a cpu-part swap this device was receiving when it died left a
+    // home: a compute move this device was receiving when it died left a
     // staging directory, and this is the "next contact" that clears it. It
     // was never bootable and no shard row ever pointed at it, so there is
     // nothing to consult first.
@@ -219,7 +219,7 @@ async fn main() -> Result<()> {
         eprintln!("astd: secret egress is unavailable: {e:#}");
     }
 
-    // Moving an instance's cpu part needs the mesh, and the target's half of
+    // Moving an instance's compute needs the mesh, and the target's half of
     // a move is reached from a mesh stream — so, like the volume plane, it
     // holds a process-wide handle rather than taking one as an argument.
     swap::init(mesh.clone());
@@ -622,7 +622,7 @@ async fn serve(conn: Admitted, node: Node, mesh: Option<Arc<Mesh>>) -> Result<()
             continue;
         }
 
-        // A cpu-part swap is a job rather than a question — a preflight, a
+        // A compute move is a job rather than a question — a preflight, a
         // fence, a disk crossing a network, two commits — so it reports as it
         // goes, on the connection that asked, exactly as a wake does.
         if let Request::SetCpu { name, device, down } = &request {

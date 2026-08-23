@@ -3,7 +3,7 @@
 //!
 //! A block volume is a raw image file on the device that created it, living in
 //! `$ASTERISM_HOME/volumes/<name>/disk.raw`. It is attachable to any instance
-//! in the orbit; when that instance's cpu and ram come from another device the
+//! in the orbit; when that instance's compute comes from another device the
 //! bytes travel over the mesh as NBD (`docs/ROADMAP.md` Phase 3), and the
 //! guest still sees nothing but `/dev/vdb`.
 //!
@@ -13,7 +13,7 @@
 //! it, and they would do it quietly, so the rule is enforced on the provider
 //! rather than trusted to the consumer: a volume carries at most one
 //! [`Lease`], naming the instance that holds it and the device supplying that
-//! instance's cpu, stamped with a monotonic [`BlockVolume::epoch`].
+//! instance's compute, stamped with a monotonic [`BlockVolume::epoch`].
 //!
 //! Every grant — an attach, and every boot afterwards — bumps the epoch and
 //! renames the NBD export accordingly (`tank-e7`). The old export is stopped
@@ -62,7 +62,7 @@ pub struct AttachIntent {
     pub device: String,
     /// Immutable authority identity of the provider selected by placement.
     pub provider_device_id: String,
-    /// Immutable identity of the device supplying this instance's CPU.
+    /// Immutable identity of the device supplying this instance's compute.
     pub holder_device_id: String,
     pub created_at: u64,
     /// Once set, recovery always rolls this operation back even if an
@@ -349,7 +349,7 @@ pub struct Lease {
     /// remains the conservative authority until they are renewed.
     #[serde(default)]
     pub holder_id: String,
-    /// The device supplying that instance's cpu and ram — where the bytes are
+    /// The device supplying that instance's compute — where the bytes are
     /// going. Recorded so a refusal can say where, not only who.
     pub holder_device: String,
     /// Immutable identity of the consumer device.

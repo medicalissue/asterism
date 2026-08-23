@@ -3,12 +3,12 @@
 //!
 //! The orbit is a pool of parts; an instance is a computer assembled from
 //! them. There is exactly **one** instance registry per orbit, and it is flat:
-//! `dev` names one instance, wherever in the pool its cpu and ram are being
+//! `dev` names one instance, wherever in the pool its compute is being
 //! sourced from today. "The laptop's dev" is not a thing that can be said.
 //!
 //! That one registry is never stored in one piece, because storing it in one
 //! piece would need a device that is always up to store it on. Instead each
-//! device persists a [`Shard`] — the rows for the instances whose cpu/ram it
+//! device persists a [`Shard`] — the rows for the instances whose compute it
 //! supplies — at `$ASTERISM_HOME/state.json`, and the whole registry is
 //! assembled at read time by asking every reachable device in the orbit for
 //! its shard. `astd`'s mesh module does the assembling; this module is one
@@ -20,7 +20,7 @@
 //!   only refuse a name it already holds; refusing a name held elsewhere needs
 //!   the other shards, so `ast create` asks them before it gets here.
 //! * **A device is not privileged.** It supplies parts. Which device supplies
-//!   an instance's cpu and ram is a mutable attribute of the instance, not a
+//!   an instance's compute is a mutable attribute of the instance, not a
 //!   relationship the device has to it.
 //!
 //! Writes go through [`crate::durable`], so a crash mid-save never leaves a
@@ -132,7 +132,7 @@ impl AnyShard {
 /// One row of the assembled orbit registry, as `ast ls` prints it.
 ///
 /// Separate from [`Instance`] because it carries something the record itself
-/// cannot know: whether the device supplying this instance's cpu/ram answered
+/// cannot know: whether the device supplying this instance's compute answered
 /// while the view was being assembled. A row that came out of the last-seen
 /// cache instead of a live shard says so, and prints its status as `unknown` —
 /// the instance is real, its state is merely stale.
@@ -287,7 +287,7 @@ impl Shard {
         }
     }
 
-    /// Define an instance in this shard, sourcing its cpu and ram from
+    /// Define an instance in this shard, sourcing its compute from
     /// `cpu_device`. `machine` records the runnable backend that was probed
     /// before this row was created.
     ///
@@ -709,7 +709,7 @@ impl Shard {
         Ok((inst.clone(), removed))
     }
 
-    /// Put the fence up (or take it down) on an instance whose cpu part is
+    /// Put the fence up (or take it down) on an instance whose compute is
     /// being swapped onto another device.
     ///
     /// While it is up this device holds the only bootable copy and refuses to
@@ -732,7 +732,7 @@ impl Shard {
         Ok(inst.clone())
     }
 
-    /// Take on an instance whose cpu part has just been moved here.
+    /// Take on an instance whose compute has just been moved here.
     ///
     /// Not [`Shard::create`]: the name was claimed long ago and the id, the
     /// creation time and the snapshots are the ones the instance has always
@@ -768,7 +768,8 @@ impl Shard {
 pub fn taken(existing: &Instance) -> String {
     format!(
         "instance {:?} already exists in this orbit (compute on {})",
-        existing.name, existing.cpu_device
+        existing.name,
+        existing.compute_device()
     )
 }
 
@@ -1003,11 +1004,11 @@ mod tests {
         assert!(err.contains("as a directory"), "{err}");
     }
 
-    /// A cpu-part swap changes one line of an instance's parts table. The
+    /// A compute move changes one line of an instance's parts table. The
     /// rest of it — the id, the creation time, the snapshots — is the
     /// instance's own and does not move, because it was never on a device.
     #[test]
-    fn adopting_a_moved_instance_keeps_everything_but_the_cpu_device() {
+    fn adopting_a_moved_instance_keeps_everything_but_compute() {
         let mut source = Shard::load(&scratch()).unwrap();
         let mut inst = source
             .create("dev", "laptop", "debian:13", Shape::default(), machine())
@@ -1040,12 +1041,12 @@ mod tests {
             "one instance, one id"
         );
         assert_eq!(adopted.created_at, source.get("dev").unwrap().created_at);
-        assert_eq!(adopted.cpu_device, "desktop", "only the part moved");
+        assert_eq!(adopted.compute_device(), "desktop", "only the part moved");
         assert_eq!(adopted.move_epoch, 1);
         assert_eq!(
             adopted.seeded_by(),
             "laptop",
-            "the seed did not move with the cpu"
+            "the seed did not move with compute"
         );
 
         // A shard that already holds the name refuses, in the orbit's words.
@@ -1197,8 +1198,8 @@ mod tests {
         let inst = shard.get("dev").unwrap();
         assert_eq!(inst.status, Status::Running);
         // The device that was called this instance's anchor is the device
-        // supplying its cpu and ram; only the framing changed.
-        assert_eq!(inst.cpu_device, "laptop");
+        // supplying its compute; only the framing changed.
+        assert_eq!(inst.compute_device(), "laptop");
         let h = inst
             .handle
             .as_ref()

@@ -462,7 +462,7 @@ pub fn publish_file(part: &Path, dest: &Path) -> Result<()> {
 
 /// Make a directory built under a staging name the real one, durably.
 ///
-/// Used where a whole instance arrives at once — a cpu-part move, which is
+/// Used where a whole instance arrives at once — a compute move, which is
 /// staged beside the live instances precisely so that adopting it is a
 /// rename. Every file in the tree is forced down before the rename, because
 /// a guest booted from a disk still sitting in the page cache is a guest that
