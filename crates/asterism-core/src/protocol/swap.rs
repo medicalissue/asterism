@@ -213,6 +213,7 @@ mod tests {
             Request::MoveAbortTarget {
                 name: "dev".into(),
                 epoch: 1,
+                instance_id: "instance-id".into(),
             },
         ] {
             assert_eq!(
@@ -227,6 +228,14 @@ mod tests {
         let bare: Request =
             serde_json::from_str(r#"{"cmd":"set_cpu","name":"dev","device":"desktop"}"#).unwrap();
         assert!(matches!(bare, Request::SetCpu { down: false, .. }));
+
+        // An older abort frame names the move, not the instance identity.
+        let legacy_abort: Request =
+            serde_json::from_str(r#"{"cmd":"move_abort_target","name":"dev","epoch":1}"#).unwrap();
+        assert!(matches!(
+            legacy_abort,
+            Request::MoveAbortTarget { ref instance_id, .. } if instance_id.is_empty()
+        ));
 
         // A fenced instance answers what reads and nothing that writes.
         assert!(Request::Status { name: "dev".into() }.survives_a_move());

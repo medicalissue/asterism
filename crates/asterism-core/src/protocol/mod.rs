@@ -614,6 +614,11 @@ pub enum Request {
     MoveAbortTarget {
         name: String,
         epoch: u64,
+        /// Exact durable instance identity. Required to revoke a published
+        /// row after the transition marker is cleared; a missing field
+        /// (legacy frames) fails closed rather than matching on name/epoch.
+        #[serde(default)]
+        instance_id: String,
     },
 }
 

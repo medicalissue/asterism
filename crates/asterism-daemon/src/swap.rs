@@ -218,73 +218,94 @@ fn clear_path(path: &Path, what: &str) -> Result<()> {
 
 /// Finish the target half of a move that crossed the live-directory rename
 /// before its shard row did, and replay grant activation for a stopped target
-/// whose transition marker is still present.  Runs after the shard loads and
-/// before the daemon accepts a request.
+/// whose transition marker is still present.  Source-cleanup journals live
+/// outside the instance tree, so this also discovers them after the source
+/// row and directory are gone and replays until the journal itself is
+/// cleared.  Runs after the shard loads and before the daemon accepts a
+/// request.
 pub async fn reconcile_startup(reg: &mut Shard) -> Result<()> {
     let dir = paths::home_dir().join("instances");
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Ok(());
-    };
-    for entry in entries {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if name.contains(STAGING) || !entry.path().is_dir() {
-            continue;
-        }
-        let live = entry.path();
-        let Some(transition) = TargetTransition::load(&live)? else {
-            continue;
-        };
-        let receipt = Receipt::load(&live)?;
-        if receipt.epoch != transition.epoch {
-            bail!(
-                "target transition for {name:?} is epoch {}, but its receipt is epoch {}",
-                transition.epoch,
-                receipt.epoch
-            );
-        }
-        let Some(mut adopted) = transition.instance.clone() else {
-            bail!("target transition for {name:?} has no adopted instance to recover");
-        };
-        if adopted.name != name {
-            bail!(
-                "target transition at {} names {:?}, not directory {name:?}",
-                live.display(),
-                adopted.name
-            );
-        }
-        if adopted.id != transition.instance_id || adopted.move_epoch != transition.epoch {
-            bail!("target transition for {name:?} does not match its adopted instance");
-        }
-        if let Some(exit) = transition.exit_point.clone() {
-            adopted.exit_point = Some(exit);
-        }
-        let instance = match reg.get(name).cloned() {
-            Ok(instance)
-                if instance.id == transition.instance_id
-                    && instance.move_epoch == transition.epoch =>
-            {
-                reg.save()
-                    .with_context(|| format!("retrying target adoption for {name:?}"))?;
-                instance
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.contains(STAGING) || !entry.path().is_dir() {
+                continue;
             }
-            Ok(instance) => bail!(
-                "target transition for {name:?} conflicts with shard instance {} at epoch {}",
-                instance.id,
-                instance.move_epoch
+            let live = entry.path();
+            let Some(transition) = TargetTransition::load(&live)? else {
+                continue;
+            };
+            let receipt = Receipt::load(&live)?;
+            if receipt.epoch != transition.epoch {
+                bail!(
+                    "target transition for {name:?} is epoch {}, but its receipt is epoch {}",
+                    transition.epoch,
+                    receipt.epoch
+                );
+            }
+            let Some(mut adopted) = transition.instance.clone() else {
+                bail!("target transition for {name:?} has no adopted instance to recover");
+            };
+            if adopted.name != name {
+                bail!(
+                    "target transition at {} names {:?}, not directory {name:?}",
+                    live.display(),
+                    adopted.name
+                );
+            }
+            if adopted.id != transition.instance_id || adopted.move_epoch != transition.epoch {
+                bail!("target transition for {name:?} does not match its adopted instance");
+            }
+            if let Some(exit) = transition.exit_point.clone() {
+                adopted.exit_point = Some(exit);
+            }
+            let instance = match reg.get(name).cloned() {
+                Ok(instance)
+                    if instance.id == transition.instance_id
+                        && instance.move_epoch == transition.epoch =>
+                {
+                    reg.save()
+                        .with_context(|| format!("retrying target adoption for {name:?}"))?;
+                    instance
+                }
+                Ok(instance) => bail!(
+                    "target transition for {name:?} conflicts with shard instance {} at epoch {}",
+                    instance.id,
+                    instance.move_epoch
+                ),
+                Err(_) => reg
+                    .adopt(adopted)
+                    .and_then(|inst| reg.save().map(|()| inst))
+                    .with_context(|| format!("adopting published target {name:?} at startup"))?,
+            };
+            crate::exit_point::activate(&instance).await?;
+            crate::exit_point::update(&instance.name, instance.exit_point.clone());
+            clear_path(
+                &TargetTransition::path(&live),
+                "clearing completed target-side move transition",
+            )?;
+        }
+    }
+    replay_source_journals(reg).await
+}
+
+async fn replay_source_journals(reg: &mut Shard) -> Result<()> {
+    for (name, journal) in SourceTransition::list()? {
+        match commit_source(reg, &name, journal.epoch).await {
+            Response::Ok => {}
+            Response::Error { message } => {
+                bail!(
+                    "replaying source cleanup for {name:?} at epoch {}: {message}",
+                    journal.epoch
+                )
+            }
+            other => bail!(
+                "replaying source cleanup for {name:?} at epoch {} returned {other:?}",
+                journal.epoch
             ),
-            Err(_) => reg
-                .adopt(adopted)
-                .and_then(|inst| reg.save().map(|()| inst))
-                .with_context(|| format!("adopting published target {name:?} at startup"))?,
-        };
-        crate::exit_point::activate(&instance).await?;
-        crate::exit_point::update(&instance.name, instance.exit_point.clone());
-        clear_path(
-            &TargetTransition::path(&live),
-            "clearing completed target-side move transition",
-        )?;
+        }
     }
     Ok(())
 }
@@ -374,8 +395,46 @@ struct SourceTransition {
 }
 
 impl SourceTransition {
+    fn file_name(name: &str) -> String {
+        format!(".move-source-transition-{name}.json")
+    }
+
     fn path(name: &str) -> PathBuf {
-        paths::home_dir().join(format!(".move-source-transition-{name}.json"))
+        paths::home_dir().join(Self::file_name(name))
+    }
+
+    fn name_from_file(file_name: &str) -> Option<&str> {
+        file_name
+            .strip_prefix(".move-source-transition-")
+            .and_then(|rest| rest.strip_suffix(".json"))
+            .filter(|name| asterism_core::registry::check_name(name).is_ok())
+    }
+
+    fn list() -> Result<Vec<(String, Self)>> {
+        let home = paths::home_dir();
+        let Ok(entries) = std::fs::read_dir(&home) else {
+            return Ok(Vec::new());
+        };
+        let mut found = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let fname = entry.file_name();
+            let Some(fname) = fname.to_str() else {
+                continue;
+            };
+            let Some(name) = Self::name_from_file(fname) else {
+                continue;
+            };
+            if !entry.path().is_file() {
+                continue;
+            }
+            let Some(journal) = Self::load(name)? else {
+                continue;
+            };
+            found.push((name.to_owned(), journal));
+        }
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(found)
     }
 
     fn save(&self, name: &str) -> Result<()> {
@@ -592,6 +651,9 @@ pub(crate) fn is_step(req: &Request) -> bool {
 /// persisted by somebody else's `reg.save()` would be a fence whose ordering
 /// against the transfer nobody had thought about.
 pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Response {
+    if let Err(error) = replay_source_journals(reg).await {
+        return error(error);
+    }
     match req {
         Request::MoveOffer { name } => tokio::task::block_in_place(|| offer(reg, &name)),
         Request::MoveProbe { manifest } => {
@@ -608,7 +670,11 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
         }
         Request::MoveCommitSource { name, epoch } => commit_source(reg, &name, epoch).await,
         Request::MoveAbortSource { name, epoch } => abort_source(reg, &name, epoch),
-        Request::MoveAbortTarget { name, epoch } => abort_target(reg, &name, epoch).await,
+        Request::MoveAbortTarget {
+            name,
+            epoch,
+            instance_id,
+        } => abort_target(reg, &name, epoch, &instance_id).await,
         other => Response::Error {
             message: format!("{other:?} is not a step of a move"),
         },
@@ -1261,7 +1327,7 @@ fn verify(staging: &Path, manifest: &MoveManifest, epoch: u64) -> Result<()> {
 /// commit.  It deliberately handles both staging and a published live
 /// directory: after the rename, merely deleting staging and unfencing the
 /// source would create two possible CPU authorities.
-pub async fn abort_target(reg: &mut Shard, name: &str, epoch: u64) -> Response {
+pub async fn abort_target(reg: &mut Shard, name: &str, epoch: u64, instance_id: &str) -> Response {
     let staging = staging_dir(name, epoch);
     let live = paths::instance_dir(name);
     let transition = match TargetTransition::load(&live) {
@@ -1301,10 +1367,30 @@ pub async fn abort_target(reg: &mut Shard, name: &str, epoch: u64) -> Response {
         }
     }
 
-    let known_id = transition.as_ref().map(|t| t.instance_id.clone());
+    let requested_id = instance_id.trim();
+    if let Some(transition) = &transition {
+        if !requested_id.is_empty() && requested_id != transition.instance_id {
+            return error(anyhow!(
+                "target transition for {name:?} is instance {}, not {requested_id}",
+                transition.instance_id
+            ));
+        }
+        if let Some(adopted) = &transition.instance {
+            if adopted.id != transition.instance_id
+                || (!requested_id.is_empty() && requested_id != adopted.id)
+            {
+                return error(anyhow!(
+                    "device already has a distinct instance ID for {name:?}; refusing to turn a name collision into move rollback"
+                ));
+            }
+        }
+    }
+    // Name/epoch/token are not identity. Marker-cleared abort must carry the
+    // exact durable instance ID; an empty or mismatched id fails closed.
+    let expected_id = (!requested_id.is_empty()).then(|| requested_id.to_owned());
     let row = reg.get(name).cloned().ok();
     if let Some(instance) = &row {
-        if known_id.as_ref().is_some_and(|id| instance.id != *id) {
+        if expected_id.as_ref().is_some_and(|id| instance.id != *id) {
             return error(anyhow!(
                 "device already has a distinct instance ID for {name:?}; refusing to turn a name collision into move rollback"
             ));
@@ -1319,7 +1405,7 @@ pub async fn abort_target(reg: &mut Shard, name: &str, epoch: u64) -> Response {
         }
     }
     let row_matches = row.as_ref().is_some_and(|instance| {
-        instance.move_epoch == epoch && known_id.as_ref().is_none_or(|id| instance.id == *id)
+        instance.move_epoch == epoch && expected_id.as_ref().is_some_and(|id| instance.id == *id)
     });
     // A completed target commit clears its marker before the coordinator
     // is known to have the ack.  Abort must still observe the matching
@@ -1329,46 +1415,41 @@ pub async fn abort_target(reg: &mut Shard, name: &str, epoch: u64) -> Response {
         transition.is_some() || receipt.as_ref().is_some_and(|r| r.epoch == epoch) || row_matches;
 
     if claimed {
-        let instance_id = known_id
-            .clone()
-            .or_else(|| row.as_ref().map(|instance| instance.id.clone()));
-        if let Some(instance_id) = &instance_id {
-            let staged_exit =
-                match crate::exit_point::abort_staged_move_transition(name, instance_id).await {
-                    Ok(staged) => staged,
-                    Err(error) => {
-                        return error(
-                            error.context(
-                                "rolling back target exit transition during move rollback",
-                            ),
-                        )
-                    }
-                };
-            if !staged_exit {
-                let exit_point = transition
-                    .as_ref()
-                    .and_then(|t| t.exit_point.clone())
-                    .or_else(|| {
-                        row.as_ref()
-                            .and_then(|instance| instance.exit_point.clone())
-                    });
-                if let Some(exit_point) = exit_point {
-                    if let Err(error) =
-                        crate::exit_point::revoke_staged(instance_id, &exit_point).await
-                    {
-                        return error(
-                            error.context("revoking target exit grants during move rollback"),
-                        );
-                    }
+        let Some(instance_id) = expected_id.filter(|id| !id.is_empty()) else {
+            return error(anyhow!(
+                "abort of {name:?} at epoch {epoch} has no exact instance ID; refusing to revoke by name and epoch alone"
+            ));
+        };
+        let staged_exit =
+            match crate::exit_point::abort_staged_move_transition(name, &instance_id).await {
+                Ok(staged) => staged,
+                Err(error) => {
+                    return error(
+                        error.context("rolling back target exit transition during move rollback"),
+                    )
+                }
+            };
+        if !staged_exit {
+            let exit_point = transition
+                .as_ref()
+                .and_then(|t| t.exit_point.clone())
+                .or_else(|| {
+                    row.as_ref()
+                        .and_then(|instance| instance.exit_point.clone())
+                });
+            if let Some(exit_point) = exit_point {
+                if let Err(error) =
+                    crate::exit_point::revoke_staged(&instance_id, &exit_point).await
+                {
+                    return error(
+                        error.context("revoking target exit grants during move rollback"),
+                    );
                 }
             }
         }
 
         match reg.get(name).cloned() {
-            Ok(instance)
-                if instance.move_epoch == epoch
-                    && known_id.as_ref().is_none_or(|id| instance.id == *id) =>
-            {
+            Ok(instance) if instance.move_epoch == epoch && instance.id == instance_id => {
                 if let Err(error) = reg.remove(name).and_then(|_| reg.save()) {
                     return error(
                         error.context("removing target registry authority during move rollback"),
@@ -1564,6 +1645,7 @@ pub async fn run(
                 Request::MoveAbortTarget {
                     name: name.to_owned(),
                     epoch: moving.epoch,
+                    instance_id: manifest.instance.id.clone(),
                 },
                 node,
                 mesh,
@@ -1710,6 +1792,7 @@ pub async fn run(
                 Request::MoveAbortTarget {
                     name: name.to_owned(),
                     epoch,
+                    instance_id: instance_id.clone(),
                 },
                 node,
                 mesh,
@@ -2208,6 +2291,7 @@ mod tests {
             Request::MoveAbortTarget {
                 name: "dev".into(),
                 epoch: 1,
+                instance_id: "instance-id".into(),
             },
         ] {
             assert!(is_step(&req), "{req:?}");
@@ -2581,7 +2665,7 @@ mod tests {
                 assert!(!TargetTransition::path(&paths::instance_dir("dev")).exists());
                 assert!(paths::instance_dir("dev").exists());
 
-                unwrap_ok(abort_target(&mut shard, "dev", 3).await);
+                unwrap_ok(abort_target(&mut shard, "dev", 3, "instance-id").await);
                 assert!(
                     !shard.holds("dev"),
                     "lost-ack abort must revoke the committed target before source can reopen"
@@ -2621,7 +2705,7 @@ mod tests {
                     needle,
                     std::io::ErrorKind::Other,
                 );
-                let err = unwrap_err(abort_target(&mut shard, "dev", 3).await);
+                let err = unwrap_err(abort_target(&mut shard, "dev", 3, "instance-id").await);
                 assert!(
                     err.contains("removing target registry")
                         || err.contains("injected")
@@ -2634,9 +2718,121 @@ mod tests {
                     "live directory must survive a failed durable revoke"
                 );
 
-                unwrap_ok(abort_target(&mut shard, "dev", 3).await);
+                unwrap_ok(abort_target(&mut shard, "dev", 3, "instance-id").await);
                 assert!(!shard.holds("dev"));
                 assert!(!paths::instance_dir("dev").exists());
+            });
+        });
+    }
+
+    #[test]
+    fn abort_target_refuses_same_epoch_wrong_instance_after_marker_clear() {
+        with_home(|| {
+            block_on(async {
+                let manifest = named_manifest("instance-id");
+                stage_empty("dev", 3, "laptop");
+                let mut shard = load_shard();
+                unwrap_instance(commit_target(&mut shard, &manifest, 3, "desktop").await);
+                assert!(!TargetTransition::path(&paths::instance_dir("dev")).exists());
+
+                let err = unwrap_err(abort_target(&mut shard, "dev", 3, "other-id").await);
+                assert!(
+                    err.contains("distinct instance ID") || err.contains("name collision"),
+                    "{err}"
+                );
+                assert!(shard.holds("dev"));
+                assert_eq!(shard.get("dev").unwrap().id, "instance-id");
+                assert!(paths::instance_dir("dev").exists());
+
+                let mut foreign = shard.get("dev").unwrap().clone();
+                foreign.id = "other-id".into();
+                shard.remove("dev").unwrap();
+                shard.adopt(foreign).unwrap();
+                shard.save().unwrap();
+                let err = unwrap_err(abort_target(&mut shard, "dev", 3, "instance-id").await);
+                assert!(
+                    err.contains("distinct instance ID") || err.contains("name collision"),
+                    "{err}"
+                );
+                assert!(shard.holds("dev"));
+                assert_eq!(shard.get("dev").unwrap().id, "other-id");
+                assert!(paths::instance_dir("dev").exists());
+
+                let err = unwrap_err(abort_target(&mut shard, "dev", 3, "").await);
+                assert!(
+                    err.contains("exact instance ID") || err.contains("name and epoch"),
+                    "{err}"
+                );
+                assert!(shard.holds("dev"));
+                assert_eq!(shard.get("dev").unwrap().id, "other-id");
+            });
+        });
+    }
+
+    #[test]
+    fn source_cleanup_journal_replays_after_row_and_directory_removal_on_restart() {
+        with_home(|| {
+            block_on(async {
+                let mut shard = load_shard();
+                fenced_source(&mut shard, 3);
+                SourceTransition {
+                    epoch: 3,
+                    to_device: "desktop".into(),
+                }
+                .save("dev")
+                .unwrap();
+                shard.remove("dev").unwrap();
+                shard.save().unwrap();
+                std::fs::remove_dir_all(paths::home_dir().join("instances")).unwrap();
+                assert!(SourceTransition::path("dev").exists());
+                assert!(!shard.holds("dev"));
+
+                let mut restarted = load_shard();
+                assert!(!restarted.holds("dev"));
+                reconcile_startup(&mut restarted).await.unwrap();
+                assert!(
+                    !SourceTransition::path("dev").exists(),
+                    "startup must discover an external journal after the source row and directory are gone"
+                );
+                assert!(!paths::instance_dir("dev").exists());
+                assert!(!restarted.holds("dev"));
+                assert!(moved_to("dev", 3).is_some());
+            });
+        });
+    }
+
+    #[test]
+    fn source_cleanup_journal_replays_during_ordinary_serve() {
+        with_home(|| {
+            block_on(async {
+                let mut shard = load_shard();
+                fenced_source(&mut shard, 3);
+                SourceTransition {
+                    epoch: 3,
+                    to_device: "desktop".into(),
+                }
+                .save("dev")
+                .unwrap();
+                shard.remove("dev").unwrap();
+                shard.save().unwrap();
+                std::fs::remove_dir_all(paths::home_dir().join("instances")).unwrap();
+                assert!(SourceTransition::path("dev").exists());
+
+                let _ = serve(
+                    Request::MoveCommitSource {
+                        name: "unrelated".into(),
+                        epoch: 1,
+                    },
+                    &mut shard,
+                    "laptop",
+                )
+                .await;
+                assert!(
+                    !SourceTransition::path("dev").exists(),
+                    "ordinary execution must discover an external journal without a source row"
+                );
+                assert!(!paths::instance_dir("dev").exists());
+                assert!(moved_to("dev", 3).is_some());
             });
         });
     }
