@@ -239,6 +239,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "keyring",
  "libc",
  "rcgen",
  "reqwest",
