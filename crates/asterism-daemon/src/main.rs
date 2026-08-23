@@ -849,7 +849,7 @@ pub(crate) async fn handle(req: Request, node: &Node) -> Response {
     }
 
     if swap::is_step(&req) {
-        return swap::serve(req, &mut reg, &cpu_device);
+        return swap::serve(req, &mut reg, &cpu_device).await;
     }
     if snapshot::claims(&req) {
         return snapshot::serve(req, &reg);

@@ -403,7 +403,7 @@ pub(crate) fn is_step(req: &Request) -> bool {
 /// through the mutation path the instance commands share: a fence that was
 /// persisted by somebody else's `reg.save()` would be a fence whose ordering
 /// against the transfer nobody had thought about.
-pub(crate) fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Response {
+pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Response {
     match req {
         Request::MoveOffer { name } => tokio::task::block_in_place(|| offer(reg, &name)),
         Request::MoveProbe { manifest } => {
@@ -414,13 +414,11 @@ pub(crate) fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Response
             name,
             to_device,
             epoch,
-        } => tokio::task::block_in_place(|| prepare(reg, &name, &to_device, epoch)),
+        } => prepare(reg, &name, &to_device, epoch).await,
         Request::MoveCommitTarget { manifest, epoch } => {
-            tokio::task::block_in_place(|| commit_target(reg, &manifest, epoch, cpu_device))
+            commit_target(reg, &manifest, epoch, cpu_device).await
         }
-        Request::MoveCommitSource { name, epoch } => {
-            tokio::task::block_in_place(|| commit_source(reg, &name, epoch))
-        }
+        Request::MoveCommitSource { name, epoch } => commit_source(reg, &name, epoch).await,
         Request::MoveAbortSource { name, epoch } => abort_source(reg, &name, epoch),
         Request::MoveAbortTarget { name, epoch } => abort_target(&name, epoch),
         other => Response::Error {
@@ -459,7 +457,7 @@ pub fn offer(reg: &Shard, name: &str) -> Response {
 /// A fence already in place is superseded rather than refused: the epoch only
 /// ever goes up, so a move that was interrupted with nobody left to abort it
 /// does not strand the instance for good.
-pub fn prepare(reg: &mut Shard, name: &str, to_device: &str, epoch: u64) -> Response {
+pub async fn prepare(reg: &mut Shard, name: &str, to_device: &str, epoch: u64) -> Response {
     let inst = match reg
         .get(name)
         .cloned()
@@ -504,7 +502,7 @@ pub fn prepare(reg: &mut Shard, name: &str, to_device: &str, epoch: u64) -> Resp
 
 /// The target has the bytes and has said so. Drop the row, drop the disk,
 /// leave a note.
-pub fn commit_source(reg: &mut Shard, name: &str, epoch: u64) -> Response {
+pub async fn commit_source(reg: &mut Shard, name: &str, epoch: u64) -> Response {
     let inst = match reg.get(name).cloned() {
         Ok(inst) => inst,
         Err(e) => return error(e),
@@ -521,6 +519,15 @@ pub fn commit_source(reg: &mut Shard, name: &str, epoch: u64) -> Response {
              commit a move this device is not the source of",
             moving.epoch
         ));
+    }
+
+    // Provider grants are bound to the authenticated consumer device, not
+    // the instance name. The target has already recorded grants minted for
+    // its own identity; revoke the source identity before deleting this row
+    // so a crash leaves a retryable fenced source rather than an orphaned
+    // authority.
+    if let Err(e) = crate::exit_point::revoke(&inst).await {
+        return error(e.context("revoking source-bound exit grants before CPU move commit"));
     }
 
     if let Err(e) = reg.remove(name).and_then(|_| reg.save()) {
@@ -771,7 +778,7 @@ pub fn base_landing(reference: &str) -> Result<(PathBuf, PathBuf)> {
 ///
 /// This is the only moment a second copy of the instance exists, and by the
 /// time it does the source has been fenced for the whole transfer.
-pub fn commit_target(
+pub async fn commit_target(
     reg: &mut Shard,
     manifest: &MoveManifest,
     epoch: u64,
@@ -825,14 +832,33 @@ pub fn commit_target(
     adopted.conflict = None;
     adopted.move_epoch = epoch;
     adopted.stranded = manifest.local_volumes.clone();
+    if let Some(exit) = adopted.exit_point.take() {
+        // The transfer carries policy, never authority. A provider grant is
+        // authenticated as the CPU device that asked for it, so retaining a
+        // source grant here would either fail every flow or authorize the
+        // wrong immutable consumer after a move.
+        match crate::exit_point::regrant_for_cpu_move(&adopted, exit).await {
+            Ok(exit) => adopted.exit_point = Some(exit),
+            Err(e) => return error(e.context("granting exit policy to the moved CPU device")),
+        }
+    }
     match reg
         .adopt(adopted)
         .and_then(|inst| reg.save().map(|()| inst))
     {
-        Ok(instance) => Response::Instance {
-            instance,
-            guest_health: None,
-        },
+        Ok(instance) => {
+            // The registry is durable before activation, matching ordinary
+            // attachment recovery. A restart can therefore retry a pending
+            // activation without ever reviving the source-bound generation.
+            if let Err(e) = crate::exit_point::activate(&instance).await {
+                return error(e.context("activating exit grants for moved CPU device"));
+            }
+            crate::exit_point::update(&instance.name, instance.exit_point.clone());
+            Response::Instance {
+                instance,
+                guest_health: None,
+            }
+        }
         Err(e) => error(e),
     }
 }
