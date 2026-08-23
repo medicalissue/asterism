@@ -151,6 +151,14 @@ async fn main() -> Result<()> {
         shell: device_shell::Manager::load(),
     };
 
+    // A target rename can reach disk before its shard row.  Reconcile that
+    // durable receipt before accepting any request, otherwise a restarted
+    // coordinator may reopen the still-fenced source or select a collision.
+    {
+        let mut shard = node.shard.lock().await;
+        swap::reconcile_startup(&mut shard)?;
+    }
+
     // The election, the stale-socket sweep and the bind, in that order and
     // behind one `flock(2)`. What used to be here — probe the socket, unlink
     // it if nobody answered, bind — could not tell a dead daemon from one

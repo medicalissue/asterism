@@ -175,6 +175,69 @@ pub fn sweep_staging() {
     }
 }
 
+/// Finish the target half of a move that crossed the live-directory rename
+/// before its shard row did.  This runs after the shard loads and before the
+/// daemon accepts a request, so a restarted coordinator observes one target
+/// authority and can safely retry the source revoke.
+pub fn reconcile_startup(reg: &mut Shard) -> Result<()> {
+    let dir = paths::home_dir().join("instances");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Ok(());
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.contains(STAGING) || !entry.path().is_dir() {
+            continue;
+        }
+        let live = entry.path();
+        let Some(transition) = TargetTransition::load(&live)? else {
+            continue;
+        };
+        if transition.instance.name != name {
+            bail!(
+                "target transition at {} names {:?}, not directory {:?}",
+                live.display(),
+                transition.instance.name,
+                name
+            );
+        }
+        let receipt = Receipt::load(&live)?;
+        if receipt.epoch != transition.epoch {
+            bail!(
+                "target transition for {:?} is epoch {}, but its receipt is epoch {}",
+                name,
+                transition.epoch,
+                receipt.epoch
+            );
+        }
+        match reg.get(name).cloned() {
+            Ok(instance)
+                if instance.id == transition.instance.id
+                    && instance.move_epoch == transition.epoch =>
+            {
+                reg.save()
+                    .with_context(|| format!("retrying target adoption for {name:?}"))?;
+            }
+            Ok(instance) => bail!(
+                "target transition for {:?} conflicts with shard instance {} at epoch {}",
+                name,
+                instance.id,
+                instance.move_epoch
+            ),
+            Err(_) => {
+                reg.adopt(transition.instance.clone())
+                    .and_then(|_| reg.save())
+                    .with_context(|| format!("adopting published target {name:?} at startup"))?;
+            }
+        }
+        std::fs::remove_file(TargetTransition::path(&live))
+            .with_context(|| format!("clearing completed target transition for {name:?}"))?;
+    }
+    Ok(())
+}
+
 /// What the target counted as it wrote, kept inside the staging directory.
 ///
 /// The commit turns on this rather than on the importer's word, so a commit
@@ -191,14 +254,78 @@ pub struct Receipt {
     pub files: BTreeMap<String, u64>,
 }
 
+/// The durable proof that a target directory was published but its authority
+/// hand-off has not completed.  It deliberately travels with the staged tree:
+/// a restart can distinguish a real published transfer from an arbitrary
+/// directory bearing the same instance name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TargetTransition {
+    epoch: u64,
+    instance: Instance,
+}
+
+impl TargetTransition {
+    fn path(dir: &Path) -> PathBuf {
+        dir.join(".move-target-transition.json")
+    }
+
+    fn save(&self, dir: &Path) -> Result<()> {
+        durable::commit_json_private(&Self::path(dir), self)
+            .context("recording target-side move transition")
+    }
+
+    fn load(dir: &Path) -> Result<Option<Self>> {
+        match std::fs::read(Self::path(dir)) {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).context("reading target-side move transition"),
+        }
+    }
+}
+
+/// Records the source cleanup outside the directory being removed.  A journal
+/// inside that directory can disappear first during a partial `remove_dir_all`
+/// and make the remaining source bytes look acknowledged on retry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SourceTransition {
+    epoch: u64,
+    to_device: String,
+}
+
+impl SourceTransition {
+    fn path(name: &str) -> PathBuf {
+        paths::home_dir().join(format!(".move-source-transition-{name}.json"))
+    }
+
+    fn save(&self, name: &str) -> Result<()> {
+        durable::commit_json_private(&Self::path(name), self)
+            .context("recording source-side move transition")
+    }
+
+    fn load(name: &str) -> Result<Option<Self>> {
+        match std::fs::read(Self::path(name)) {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).context("reading source-side move transition"),
+        }
+    }
+
+    fn clear(name: &str) -> Result<()> {
+        match std::fs::remove_file(Self::path(name)) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context("clearing source-side move transition"),
+        }
+    }
+}
+
 impl Receipt {
     fn path(dir: &Path) -> PathBuf {
         dir.join(".move-receipt.json")
     }
 
     pub fn save(&self, dir: &Path) -> Result<()> {
-        std::fs::write(Self::path(dir), serde_json::to_vec_pretty(self)?)
-            .context("recording what arrived")
+        durable::commit_json_private(&Self::path(dir), self).context("recording what arrived")
     }
 
     fn load(dir: &Path) -> Result<Self> {
@@ -422,7 +549,7 @@ pub(crate) fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Response
             tokio::task::block_in_place(|| commit_source(reg, &name, epoch))
         }
         Request::MoveAbortSource { name, epoch } => abort_source(reg, &name, epoch),
-        Request::MoveAbortTarget { name, epoch } => abort_target(&name, epoch),
+        Request::MoveAbortTarget { name, epoch } => abort_target(reg, &name, epoch),
         other => Response::Error {
             message: format!("{other:?} is not a step of a move"),
         },
@@ -505,30 +632,85 @@ pub fn prepare(reg: &mut Shard, name: &str, to_device: &str, epoch: u64) -> Resp
 /// The target has the bytes and has said so. Drop the row, drop the disk,
 /// leave a note.
 pub fn commit_source(reg: &mut Shard, name: &str, epoch: u64) -> Response {
-    let inst = match reg.get(name).cloned() {
-        Ok(inst) => inst,
-        Err(e) => return error(e),
+    let live = paths::instance_dir(name);
+    let journal = match SourceTransition::load(name) {
+        Ok(journal) => journal,
+        Err(err) => return error(err),
     };
-    let Some(moving) = inst.moving.clone() else {
-        return error(anyhow!(
-            "instance {name:?} is not being moved from this device — refusing to \
-             delete a copy nothing has taken over from"
-        ));
+    let transition = match reg.get(name).cloned() {
+        Ok(inst) => {
+            let Some(moving) = inst.moving.clone() else {
+                return error(anyhow!(
+                    "instance {name:?} is not being moved from this device — refusing to \
+                     delete a copy nothing has taken over from"
+                ));
+            };
+            if moving.epoch != epoch {
+                return error(anyhow!(
+                    "instance {name:?} is being moved at epoch {}, not {epoch} — refusing to \
+                     commit a move this device is not the source of",
+                    moving.epoch
+                ));
+            }
+            let transition = SourceTransition {
+                epoch,
+                to_device: moving.to_device,
+            };
+            if let Some(journal) = journal {
+                if journal.epoch != transition.epoch || journal.to_device != transition.to_device {
+                    return error(anyhow!(
+                        "source journal for {name:?} belongs to {} at epoch {}, not {} at epoch {epoch}",
+                        journal.to_device, journal.epoch, transition.to_device
+                    ));
+                }
+            } else if let Err(err) = transition.save(name) {
+                return error(err);
+            }
+            // The journal precedes the in-memory revoke.  `remove` changes
+            // the shard before `save`, so a failed save is retried below
+            // instead of being mistaken for a completed move.
+            if let Err(err) = reg.remove(name).and_then(|_| reg.save()) {
+                return error(err.context("persisting source authority revocation"));
+            }
+            transition
+        }
+        Err(_) => match journal {
+            Some(transition) if transition.epoch == epoch => {
+                if let Err(err) = reg.save() {
+                    return error(err.context("retrying source authority revocation"));
+                }
+                transition
+            }
+            Some(transition) => {
+                return error(anyhow!(
+                    "source journal for {name:?} belongs to epoch {}, not {epoch}",
+                    transition.epoch
+                ))
+            }
+            None => {
+                return error(anyhow!(
+                    "no durable source transition exists for {name:?} at epoch {epoch}"
+                ))
+            }
+        },
     };
-    if moving.epoch != epoch {
-        return error(anyhow!(
-            "instance {name:?} is being moved at epoch {}, not {epoch} — refusing to \
-             commit a move this device is not the source of",
-            moving.epoch
-        ));
-    }
 
-    if let Err(e) = reg.remove(name).and_then(|_| reg.save()) {
-        return error(e);
+    if let Err(err) = remember_move(name, &transition.to_device, epoch) {
+        return error(err);
     }
     crate::persist::forget(name);
-    let _ = std::fs::remove_dir_all(paths::instance_dir(name));
-    remember_move(name, &moving.to_device, epoch);
+    if let Err(err) = std::fs::remove_dir_all(&live) {
+        return error(err.into());
+    }
+    if live.exists() {
+        return error(anyhow!(
+            "source directory {} remains after cleanup",
+            live.display()
+        ));
+    }
+    if let Err(err) = SourceTransition::clear(name) {
+        return error(err);
+    }
     Response::Ok
 }
 
@@ -779,58 +961,94 @@ pub fn commit_target(
 ) -> Response {
     let name = manifest.instance.name.clone();
     let staging = staging_dir(&name, epoch);
-    if let Err(e) = verify(&staging, manifest, epoch) {
-        return error(e);
-    }
-
     let live = paths::instance_dir(&name);
-    if live.exists() {
-        return error(anyhow!(
-            "device {device} already has an instance directory at {} — refusing to \
-             put a second copy of {name:?} on top of it",
-            live.display()
-        ));
-    }
-    if let Some(parent) = live.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return error(anyhow!("{e}"));
+    if let Ok(existing) = reg.get(&name) {
+        if existing.id != manifest.instance.id {
+            return error(anyhow!(
+                "device {device} already has a distinct instance ID for {name:?}; refusing to turn a name collision into move recovery"
+            ));
         }
     }
-    // The rename first, then the receipt: a rename that fails leaves the
-    // staging directory exactly as it was, receipt included, so the move can
-    // be aborted or retried against something that still adds up.
-    //
-    // Every byte of the tree is forced down before the rename. This is the
-    // one moment a second copy of the instance exists, and the source is
-    // about to be told it can stop existing: a disk still sitting in the page
-    // cache when the power goes is a move that lost the instance.
-    if let Err(e) = durable::publish_dir(&staging, &live) {
-        return error(anyhow!(
-            "could not adopt {}: {e:#} — it is still staged and still not bootable",
-            staging.display()
-        ));
-    }
-    let _ = std::fs::remove_file(Receipt::path(&live));
-
-    let mut adopted = manifest.instance.clone();
-    adopted.cpu_device = device.to_owned();
-    // A guest that was running was shut down before any of this; anything
-    // else keeps the state it had, so an instance that had never been booted
-    // does not arrive claiming to have been.
-    if adopted.status == Status::Running {
-        adopted.status = Status::Stopped;
-    }
-    adopted.handle = None;
-    adopted.moving = None;
-    adopted.conflict = None;
-    adopted.move_epoch = epoch;
-    adopted.stranded = manifest.local_volumes.clone();
-    match reg
-        .adopt(adopted)
-        .and_then(|inst| reg.save().map(|()| inst))
-    {
+    let adopted = if live.exists() {
+        if let Err(err) = verify(&live, manifest, epoch) {
+            return error(
+                err.context("existing target directory is not this move's durable receipt"),
+            );
+        }
+        match TargetTransition::load(&live) {
+            Ok(Some(transition)) if transition.epoch == epoch && transition.instance.id == manifest.instance.id => transition.instance,
+            Ok(Some(transition)) => return error(anyhow!(
+                "target transition for {name:?} belongs to instance {} at epoch {}, not {} at epoch {epoch}",
+                transition.instance.id, transition.epoch, manifest.instance.id
+            )),
+            Ok(None) => match reg.get(&name).cloned() {
+                Ok(instance) if instance.id == manifest.instance.id && instance.cpu_device == device && instance.move_epoch == epoch => {
+                    if let Err(err) = reg.save() {
+                        return error(err.context("retrying durable target shard save"));
+                    }
+                    return Response::Instance { instance, guest_health: None };
+                }
+                _ => return error(anyhow!(
+                    "target {name:?} has a published receipt but no transition or matching durable shard row"
+                )),
+            },
+            Err(err) => return error(err),
+        }
+    } else {
+        if let Err(err) = verify(&staging, manifest, epoch) {
+            return error(err);
+        }
+        if let Some(parent) = live.parent() {
+            if let Err(err) = std::fs::create_dir_all(parent) {
+                return error(anyhow!("{err}"));
+            }
+        }
+        let mut adopted = manifest.instance.clone();
+        adopted.cpu_device = device.to_owned();
+        if adopted.status == Status::Running {
+            adopted.status = Status::Stopped;
+        }
+        adopted.handle = None;
+        adopted.moving = None;
+        adopted.conflict = None;
+        adopted.move_epoch = epoch;
+        adopted.stranded = manifest.local_volumes.clone();
+        let transition = TargetTransition {
+            epoch,
+            instance: adopted.clone(),
+        };
+        if let Err(err) = transition.save(&staging) {
+            return error(err);
+        }
+        if let Err(err) = durable::publish_dir(&staging, &live) {
+            return error(anyhow!(
+                "could not adopt {}: {err:#} — it is still staged and still not bootable",
+                staging.display()
+            ));
+        }
+        adopted
+    };
+    let committed = match reg.get(&name).cloned() {
+        Ok(instance)
+            if instance.id == adopted.id
+                && instance.cpu_device == device
+                && instance.move_epoch == epoch =>
+        {
+            reg.save().map(|()| instance)
+        }
+        Ok(_) => Err(anyhow!(
+            "target shard already holds a different instance or move epoch for {name:?}"
+        )),
+        Err(_) => reg
+            .adopt(adopted)
+            .and_then(|inst| reg.save().map(|()| inst)),
+    };
+    match committed {
         Ok(instance) => Response::Instance {
-            instance,
+            instance: {
+                let _ = std::fs::remove_file(TargetTransition::path(&live));
+                instance
+            },
             guest_health: None,
         },
         Err(e) => error(e),
@@ -886,11 +1104,61 @@ fn verify(staging: &Path, manifest: &MoveManifest, epoch: u64) -> Result<()> {
     Ok(())
 }
 
-/// Delete a staging directory. What an abort owes the target.
-pub fn abort_target(name: &str, epoch: u64) -> Response {
+/// Remove target-side authority before reopening the source.  A post-publish
+/// abort has a live directory and possibly a shard row, not merely staging.
+pub fn abort_target(reg: &mut Shard, name: &str, epoch: u64) -> Response {
     let staging = staging_dir(name, epoch);
+    let live = paths::instance_dir(name);
+    let transition = match TargetTransition::load(&live) {
+        Ok(transition) => transition,
+        Err(err) => return error(err),
+    };
+    if let Some(transition) = transition {
+        if transition.epoch != epoch {
+            return error(anyhow!(
+                "target directory for {name:?} belongs to move epoch {}, not {epoch}",
+                transition.epoch
+            ));
+        }
+        match reg.get(name).cloned() {
+            Ok(instance)
+                if instance.id == transition.instance.id && instance.move_epoch == epoch =>
+            {
+                if let Err(err) = reg.remove(name).and_then(|_| reg.save()) {
+                    return error(
+                        err.context("removing target registry authority during move rollback"),
+                    );
+                }
+            }
+            Ok(instance) => {
+                return error(anyhow!(
+                    "target row for {name:?} is {} at move epoch {}, not this move",
+                    instance.id,
+                    instance.move_epoch
+                ))
+            }
+            Err(_) => {
+                // A same-process retry after a failed `save` has already
+                // removed the row in memory.  Re-save before deleting proof.
+                if let Err(err) = reg.save() {
+                    return error(err.context("retrying target authority revocation"));
+                }
+            }
+        }
+        if let Err(err) = std::fs::remove_dir_all(&live) {
+            return error(err.into());
+        }
+        if live.exists() {
+            return error(anyhow!(
+                "target directory {} remains after rollback",
+                live.display()
+            ));
+        }
+    }
     match std::fs::remove_dir_all(&staging) {
-        Ok(()) | Err(_) => Response::Ok,
+        Ok(()) => Response::Ok,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Response::Ok,
+        Err(err) => error(err.into()),
     }
 }
 
@@ -914,7 +1182,7 @@ fn load_notes() -> BTreeMap<String, MovedNote> {
         .unwrap_or_default()
 }
 
-fn remember_move(name: &str, to_device: &str, epoch: u64) {
+fn remember_move(name: &str, to_device: &str, epoch: u64) -> Result<()> {
     let mut notes = load_notes();
     let now = now_unix();
     notes.retain(|_, note| now.saturating_sub(note.at) < NOTE_TTL_SECS);
@@ -926,11 +1194,8 @@ fn remember_move(name: &str, to_device: &str, epoch: u64) {
             at: now,
         },
     );
-    // Best effort by design: a note is a courtesy to whoever types
-    // `ast status` at the old device, and losing it costs a redirect, not an
-    // instance. It is still committed durably, because the alternative is a
-    // torn file that the next read has to treat as a lost note anyway.
-    let _ = durable::commit_json(&notes_path(), &notes);
+    durable::commit_json(&notes_path(), &notes)
+        .context("recording the source's durable move acknowledgement")
 }
 
 /// What this device has to say about an instance it no longer holds.
@@ -976,9 +1241,6 @@ pub async fn run(
     // ---- preflight ---------------------------------------------------------
     let here = node.device_name().await;
     let source = locate(name, node, mesh).await?;
-    if source == device {
-        bail!("instance {name:?} already sources its cpu and ram from {device}");
-    }
     // Refuse a device nobody has heard of, and one that is not answering,
     // before anything has been fenced. A device does not list itself among
     // its peers, so moving *here* skips both: this daemon is demonstrably up.
@@ -995,6 +1257,43 @@ pub async fn run(
     }
 
     let mut manifest = offer_of(name, &source, node, mesh).await?;
+    // A coordinator can die after target publication but before source
+    // cleanup.  Locate chose the published target; find only a same-ID,
+    // same-epoch fenced source and retry its durable revoke before starting a
+    // new move.  Distinct IDs are handled as explicit conflicts by `locate`.
+    if manifest.instance.moving.is_none() {
+        if let Some(previous_source) = pending_source(
+            name,
+            &source,
+            &manifest.instance.id,
+            manifest.instance.move_epoch,
+            node,
+            mesh,
+        )
+        .await
+        {
+            expect_ok(
+                ask(
+                    &previous_source,
+                    Request::MoveCommitSource {
+                        name: name.to_owned(),
+                        epoch: manifest.instance.move_epoch,
+                    },
+                    node,
+                    mesh,
+                )
+                .await?,
+            )
+            .with_context(|| format!(
+                "{source} has {name:?} at epoch {}; source cleanup remains pending on {previous_source}",
+                manifest.instance.move_epoch
+            ))?;
+            manifest = offer_of(name, &source, node, mesh).await?;
+        }
+    }
+    if source == device {
+        bail!("instance {name:?} already sources its cpu and ram from {device}");
+    }
     if manifest.instance.status == Status::Running {
         if !down {
             bail!(
@@ -1124,6 +1423,28 @@ pub async fn run(
         return Err(e);
     }
 
+    // Target publication is now authoritative.  Do not feed a failed source
+    // revoke into the rollback path above: that would reopen an old source
+    // beside a durable target.  The source stays fenced and this exact step
+    // is idempotent on a later coordinator run.
+    expect_ok(
+        ask(
+            &source,
+            Request::MoveCommitSource {
+                name: name.to_owned(),
+                epoch,
+            },
+            node,
+            mesh,
+        )
+        .await?,
+    )
+    .with_context(|| format!(
+        "{device} now authoritatively holds {name:?} at epoch {epoch}; {source} remains fenced until source cleanup succeeds"
+    ))?;
+    io.send(&line(format!("{source} has dropped its copy")))
+        .await?;
+
     io.send(&Response::Move {
         text: format!(
             "{name}: cpu/ram now sourced from {device} (move epoch {epoch}) — \
@@ -1134,7 +1455,8 @@ pub async fn run(
     .await
 }
 
-/// Phases two and three: the bytes, then the two commits in order.
+/// Transfer and durable target publication.  Source cleanup is intentionally
+/// separate: a failed source revoke must preserve the target authority.
 #[allow(clippy::too_many_arguments)]
 async fn transfer_and_commit(
     manifest: &MoveManifest,
@@ -1170,40 +1492,52 @@ async fn transfer_and_commit(
     )))
     .await?;
 
-    // Past this point the move has happened. A source that will not answer
-    // now leaves a stale copy rather than losing one, and the epoch on the
-    // target's row is what settles which is which.
-    expect_ok(
-        ask(
-            source,
-            Request::MoveCommitSource {
-                name: name.clone(),
-                epoch,
-            },
-            node,
-            mesh,
-        )
-        .await?,
-    )
-    .with_context(|| {
-        format!(
-            "{device} has {name:?} at epoch {epoch} and {source} would not let go of \
-             its copy — the higher epoch is the live one, and {source}'s copy is stale"
-        )
-    })?;
-    io.send(&line(format!("{source} has dropped its copy")))
-        .await?;
     Ok(())
 }
 
 /// Which device holds this instance's row, in the orbit's own words.
 async fn locate(name: &str, node: &Node, mesh: &Arc<Mesh>) -> Result<String> {
-    if node.shard.lock().await.holds(name) {
-        return Ok(node.device_name().await);
+    let local = node.shard.lock().await.get(name).cloned().ok();
+    let mut hits = mesh.holders(name).await;
+    if let Some(instance) = local {
+        hits.push((node.device_name().await, instance));
     }
-    mesh.locate(name)
-        .await?
-        .ok_or_else(|| anyhow!("no instance named {name:?} in this orbit"))
+    let Some((_, first)) = hits.first() else {
+        bail!("no instance named {name:?} in this orbit");
+    };
+    if hits.iter().any(|(_, instance)| instance.id != first.id) {
+        bail!(
+            "instance name {name:?} is held by distinct instance IDs; resolve the name collision before moving it"
+        );
+    }
+    hits.sort_by(|(left_device, left), (right_device, right)| {
+        left.move_epoch
+            .cmp(&right.move_epoch)
+            .then_with(|| left.moving.is_none().cmp(&right.moving.is_none()))
+            .then_with(|| left_device.cmp(right_device))
+    });
+    Ok(hits.pop().expect("non-empty hits").0)
+}
+
+async fn pending_source(
+    name: &str,
+    target: &str,
+    instance_id: &str,
+    epoch: u64,
+    node: &Node,
+    mesh: &Arc<Mesh>,
+) -> Option<String> {
+    let local = node.shard.lock().await.get(name).cloned().ok();
+    if local.is_some_and(|instance| {
+        instance.id == instance_id
+            && instance
+                .moving
+                .as_ref()
+                .is_some_and(|moving| moving.to_device == target && moving.epoch == epoch)
+    }) {
+        return Some(node.device_name().await);
+    }
+    mesh.moving_source(name, target, instance_id, epoch).await
 }
 
 async fn offer_of(name: &str, source: &str, node: &Node, mesh: &Arc<Mesh>) -> Result<MoveManifest> {
@@ -1463,6 +1797,37 @@ mod tests {
             files,
             local_volumes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn published_target_keeps_receipt_and_transition_for_startup_adoption() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("dev.moving-9");
+        let live = dir.path().join("dev");
+        std::fs::create_dir(&staging).unwrap();
+        Receipt {
+            epoch: 9,
+            from_device: "laptop".into(),
+            bytes: 0,
+            files: BTreeMap::new(),
+        }
+        .save(&staging)
+        .unwrap();
+        let instance = manifest_of(Vec::new()).instance;
+        TargetTransition {
+            epoch: 9,
+            instance: instance.clone(),
+        }
+        .save(&staging)
+        .unwrap();
+        std::fs::rename(&staging, &live).unwrap();
+
+        let transition = TargetTransition::load(&live).unwrap().unwrap();
+        assert_eq!(transition.epoch, 9);
+        assert_eq!(transition.instance.id, instance.id);
+        assert_eq!(Receipt::load(&live).unwrap().epoch, 9);
+        assert!(Receipt::path(&live).exists());
+        assert!(TargetTransition::path(&live).exists());
     }
 
     /// The completeness check is the whole of what the commit rests on, so

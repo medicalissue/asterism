@@ -1261,12 +1261,53 @@ impl Mesh {
 
     /// Which device holds the row for `name`, if any reachable one does.
     pub async fn locate(self: &Arc<Self>, name: &str) -> Result<Option<String>> {
-        Ok(self
-            .find(name)
+        let mut hits = self.find(name).await;
+        let Some((_, first)) = hits.first() else {
+            return Ok(None);
+        };
+        if hits.iter().any(|(_, instance)| instance.id != first.id) {
+            bail!(
+                "instance name {name:?} is held by distinct instance IDs; resolve the name collision before locating it"
+            );
+        }
+        // A fenced source is recovery state rather than current authority.
+        // Same-ID copies can be ordered by move epoch; distinct IDs above are
+        // never silently selected away.
+        hits.sort_by(|(left_device, left), (right_device, right)| {
+            left.move_epoch
+                .cmp(&right.move_epoch)
+                .then_with(|| left.moving.is_none().cmp(&right.moving.is_none()))
+                .then_with(|| left_device.cmp(right_device))
+        });
+        Ok(hits.pop().map(|(device, _)| device))
+    }
+
+    /// Find the fenced source that still owes a durable revoke after this
+    /// exact target instance and epoch have published.
+    pub async fn moving_source(
+        self: &Arc<Self>,
+        name: &str,
+        target: &str,
+        instance_id: &str,
+        epoch: u64,
+    ) -> Option<String> {
+        self.find(name)
             .await
             .into_iter()
-            .next()
-            .map(|(device, _)| device))
+            .find_map(|(device, instance)| {
+                (instance.id == instance_id
+                    && instance
+                        .moving
+                        .as_ref()
+                        .is_some_and(|moving| moving.to_device == target && moving.epoch == epoch))
+                .then_some(device)
+            })
+    }
+
+    /// Reachable peer rows for one name.  Move recovery combines these with
+    /// its local shard so the same collision rule applies to the whole orbit.
+    pub async fn holders(self: &Arc<Self>, name: &str) -> Vec<(String, Instance)> {
+        self.find(name).await
     }
 
     /// Every reachable device whose shard holds `name`. More than one is a
