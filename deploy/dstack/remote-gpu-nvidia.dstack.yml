@@ -15,11 +15,9 @@
 # Apply only when the plan shows 2x NVIDIA, CC 7.5+, under max_price 2.50.
 # Expected spend about 1–3 USD if the gate finishes in under an hour.
 #
-# Hardware PASS is recorded only when dstack uploads the detached exact
-# candidate checkout, ASTERISM_PINNED_SHA matches,
-# ASTERISM_NVIDIA_E2E_RUNNER names an executable from that checkout, and
-# scripts/harness-remote-gpu-nvidia.sh judges the guest→mesh→provider path.
-# CPU reference and host-direct CUDA cannot PASS.
+# The candidate only records live raw observations. A digest-pinned image
+# selected by the independent reviewer receives that completed directory
+# read-only and offline, and exclusively owns the verdict.
 
 type: task
 name: asterism-remote-gpu-nvidia-gate
@@ -40,6 +38,7 @@ env:
   - ASTERISM_SOURCE_ONLY=0
   - ASTERISM_PINNED_SHA
   - ASTERISM_NVIDIA_E2E_RUNNER=/dstack/run/scripts/lib/nvidia-e2e-runner.sh
+  - ASTERISM_NVIDIA_EVIDENCE_DIR=/dstack/evidence/raw
   - ASTERISM_NVIDIA_VERIFIER_IMAGE
   - ASTERISM_NVIDIA_VERIFIER_DIGEST
   - CARGO_HOME=/dstack/cargo
@@ -57,7 +56,11 @@ commands:
   - cc --version
   - docker version
   - nvidia-smi
+  - mkdir -p /dstack/evidence /dstack/verdict
   - bash scripts/harness-remote-gpu-nvidia.sh
+  - echo "$ASTERISM_NVIDIA_VERIFIER_DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'
+  - test "${ASTERISM_NVIDIA_VERIFIER_IMAGE##*@}" = "$ASTERISM_NVIDIA_VERIFIER_DIGEST"
+  - docker run --rm --network none --read-only --mount type=bind,src=/dstack/evidence/raw,dst=/evidence,readonly --mount type=bind,src=/dstack/verdict,dst=/verdict "$ASTERISM_NVIDIA_VERIFIER_IMAGE" /verify --evidence /evidence --output /verdict/release.evidence
 
 resources:
   cpu: 8

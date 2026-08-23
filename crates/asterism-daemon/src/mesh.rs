@@ -202,6 +202,7 @@ enum MeshRequest {
     Gpu {
         instance_id: String,
         provider_generation: u64,
+        versions: asterism_core::remote_gpu::AbiRange,
     },
     /// Hand this stream to a block volume's NBD export and stop framing it.
     ///
@@ -941,12 +942,13 @@ impl Mesh {
     }
 
     /// Open a dedicated GPU stream to a provider device. The opening frame
-    /// is instance-bound and token-free.
+    /// is instance-bound, version-negotiated, and token-free.
     pub async fn gpu_session<'a, 'b>(
         self: &Arc<Self>,
         device: &str,
         instance_id: &str,
         provider_generation: u64,
+        versions: asterism_core::remote_gpu::AbiRange,
         io: &'a mut ClientIo<'b>,
     ) -> Result<()> {
         let peer = self.device(device).await?;
@@ -957,6 +959,7 @@ impl Mesh {
             &MeshRequest::Gpu {
                 instance_id: instance_id.to_owned(),
                 provider_generation,
+                versions,
             },
         )
         .await?;
@@ -3412,9 +3415,17 @@ async fn serve_stream(
         MeshRequest::Gpu {
             instance_id,
             provider_generation,
+            versions,
         } => {
-            return crate::gpu::serve_mesh(stream, peer, &node, instance_id, provider_generation)
-                .await
+            return crate::gpu::serve_mesh(
+                stream,
+                peer,
+                &node,
+                instance_id,
+                provider_generation,
+                versions,
+            )
+            .await
         }
         MeshRequest::VolumeSplice {
             volume,

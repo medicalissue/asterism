@@ -22,7 +22,6 @@ PINNED="${ASTERISM_PINNED_SHA:-}"
 for tool in cargo cc docker; do command -v "$tool" >/dev/null 2>&1 || fail "$tool is required"; done
 
 GUEST_IMAGE='docker.io/library/ubuntu:24.04@sha256:1e0a86e57d247923571b75e0aaf48a1449cf8c543d51fb3e07a4a7d7bfa79316'
-PROVIDER_IMAGE_DIGEST='sha256:435220c0fef35cbf712e11999f8670a83835ef3cdd18564e5e8122f83078c88c'
 BUILD="$(mktemp -d "${TMPDIR:-/tmp}/asterism-nvidia-build.XXXXXX")"
 trap 'jobs -pr | xargs -r kill 2>/dev/null || true; rm -rf "$BUILD"' EXIT
 export CARGO_TARGET_DIR="$BUILD/target"
@@ -44,7 +43,7 @@ export ASTERISM_NVIDIA_ASTD="$ASTD"
 export ASTERISM_NVIDIA_GUEST_LAUNCHER="$ROOT/scripts/lib/nvidia-guest-container.sh"
 export ASTERISM_NVIDIA_GUEST_IMAGE="$GUEST_IMAGE"
 export ASTERISM_NVIDIA_GUEST_IMAGE_DIGEST="${GUEST_IMAGE##*@}"
-export ASTERISM_NVIDIA_PROVIDER_IMAGE_DIGEST="$PROVIDER_IMAGE_DIGEST"
+: "${ASTERISM_NVIDIA_PROVIDER_IMAGE_DIGEST:?outer provider image digest required}"
 
 GUEST_HOME="$BUILD/guest-home"
 PROVIDER_HOME="$BUILD/provider-home"
@@ -129,6 +128,11 @@ start_guest direct "$OUT/direct-guest-astd.log"; wait_socket "$GUEST_HOME/astd.s
 # bootstrap processes' stale addresses.
 pair_devices direct-refresh
 observe direct-success direct none "$FIRST_UUID"
+"$DRIVER" probe-contention --output "$OUT/contention.json" --guest-home "$GUEST_HOME" \
+  --provider-astd-pid "$PROVIDER_PID" --guest-astd-pid "$GUEST_PID"
+# The first held session is closed by the probe; allow the provider stream to
+# return its in-process CUDA engine before the active-loss observation.
+sleep 1
 observe active-loss direct loss "$FIRST_UUID"
 stop_pid "$GUEST_PID"; stop_pid "$PROVIDER_PID"
 
@@ -144,9 +148,18 @@ start_guest relay "$OUT/relay-guest-astd.log"; wait_socket "$GUEST_HOME/astd.soc
 # daemon processes and leaves a transcript with no direct address hints.
 pair_devices relay-refresh
 observe relay-success relay none "$SECOND_UUID"
+"$DRIVER" probe-version-skew --output "$OUT/version-skew-fresh-session.json" \
+  --guest-home "$GUEST_HOME" --provider-astd-pid "$PROVIDER_PID" --guest-astd-pid "$GUEST_PID"
+sleep 1
 observe active-revoke relay revoke "$SECOND_UUID"
 stop_pid "$GUEST_PID"; stop_pid "$PROVIDER_PID"
 
-shasum -a 256 "$DRIVER" "$ASTD" "$AST" "$LIBCUDA" "$BUILD/guest-remote-cuda" \
-  "$ROOT/scripts/lib/nvidia-guest-container.sh" >"$OUT/artifacts.sha256"
+mkdir -p "$OUT/artifacts"
+cp "$DRIVER" "$OUT/artifacts/asterism-nvidia-e2e-driver"
+cp "$ASTD" "$OUT/artifacts/provider-astd"
+cp "$AST" "$OUT/artifacts/ast"
+cp "$LIBCUDA" "$OUT/artifacts/libcuda.so"
+cp "$BUILD/guest-remote-cuda" "$OUT/artifacts/guest-remote-cuda"
+cp "$ROOT/scripts/lib/nvidia-guest-container.sh" "$OUT/artifacts/nvidia-guest-container.sh"
+shasum -a 256 "$OUT"/artifacts/* >"$OUT/artifacts.sha256"
 printf 'candidate_sha=%s\ntree_digest=%s\n' "$(git rev-parse HEAD)" "$(git rev-parse 'HEAD^{tree}')" >"$OUT/candidate"

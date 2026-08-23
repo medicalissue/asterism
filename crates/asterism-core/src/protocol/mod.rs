@@ -25,6 +25,7 @@ use crate::image::{ImagePullResult, ImageRow};
 use crate::instance::{Instance, PortForward, Restart, Shape};
 use crate::orbit::{Device, DeviceStatus, WakeFacts};
 use crate::registry::OrbitRow;
+use crate::remote_gpu::AbiRange;
 use crate::remote_gpu_guest::{GuestFrame, GuestReply};
 use crate::secret::Secret;
 use crate::snapshot::Snapshot;
@@ -318,6 +319,8 @@ pub enum Request {
     /// instance-bound and never a LAN listener.
     GpuGuestOpen {
         name: String,
+        #[serde(default = "AbiRange::ours")]
+        versions: AbiRange,
     },
     /// Frames sent after [`Request::GpuGuestOpen`] on the same local
     /// connection. Invalid as standalone RPC.
@@ -695,7 +698,7 @@ impl Request {
             | Request::SnapshotRestore { name, .. }
             | Request::SnapshotRemove { name, .. }
             | Request::Logs { name, .. }
-            | Request::GpuGuestOpen { name }
+            | Request::GpuGuestOpen { name, .. }
             // Binding a secret is an instance command: `ast attach dev
             // --secret anthropic` resolves `dev` across the orbit like every
             // other, and the binding is written on whichever device holds it.
@@ -1303,6 +1306,7 @@ pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
             "gpu_guest",
             Request::GpuGuestOpen {
                 name: String::new(),
+                versions: AbiRange::ours(),
             }
             .since(),
         ),

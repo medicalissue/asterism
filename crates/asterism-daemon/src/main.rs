@@ -600,12 +600,12 @@ async fn serve(conn: Admitted, node: Node, mesh: Option<Arc<Mesh>>) -> Result<()
         // process. It borrows this private unix-socket connection and either
         // enters the local target through the same policy path or bridges it
         // to one dedicated authenticated mesh stream.
-        if let Request::GpuGuestOpen { name } = &request {
+        if let Request::GpuGuestOpen { name, versions } = &request {
             let mut io = ClientIo {
                 frames: &mut frames,
                 write: &mut write,
             };
-            if let Err(e) = gpu::serve_local(name, &node, mesh.as_ref(), &mut io).await {
+            if let Err(e) = gpu::serve_local(name, *versions, &node, mesh.as_ref(), &mut io).await {
                 io.send(&Response::GpuGuestRefused {
                     code: "unreachable".into(),
                     message: format!("{e:#}"),

@@ -18,7 +18,7 @@ use asterism_core::hv::Machine;
 use asterism_core::instance::Shape;
 use asterism_core::protocol::{Request, Response};
 use asterism_core::registry::Shard;
-use asterism_core::remote_gpu::GpuAttachment;
+use asterism_core::remote_gpu::{AbiRange, GpuAttachment};
 use asterism_core::remote_gpu_guest::{
     project_guest_device, read_frame, write_frame, CudaCall, GuestFrame,
 };
@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-const SCHEMA: &str = "asterism.nvidia.raw-observation/2";
+const SCHEMA: &str = "asterism.nvidia.raw-observation/3";
 const INSTANCE: &str = "nvidia-release-guest";
 const MEMORY_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -47,6 +47,9 @@ struct RawObservation {
     provider_device_id: String,
     gpu_uuid: String,
     provider_astd_pid: u32,
+    provider_runtime_kind: String,
+    provider_runtime_pid: u32,
+    provider_runtime_executable_digest: String,
     guest_astd_pid: u32,
     guest_container_id: String,
     guest_container_pid: u32,
@@ -75,8 +78,12 @@ fn main() -> Result<()> {
         }
         Some("prepare") => prepare(&args[1..]),
         Some("observe") => observe(&args[1..]),
-        Some(other) => bail!("unknown command {other:?}; expected prepare or observe"),
-        None => bail!("expected prepare or observe"),
+        Some("probe-contention") => probe_contention(&args[1..]),
+        Some("probe-version-skew") => probe_version_skew(&args[1..]),
+        Some(other) => bail!(
+            "unknown command {other:?}; expected prepare, observe, probe-contention, or probe-version-skew"
+        ),
+        None => bail!("expected prepare, observe, probe-contention, or probe-version-skew"),
     }
 }
 
@@ -191,6 +198,9 @@ fn observe(args: &[String]) -> Result<()> {
         guest_device_name: guest_name, provider_device_name: provider_name,
         guest_device_id: guest_id, provider_device_id: provider_id, gpu_uuid,
         provider_astd_pid: provider_pid, guest_astd_pid: guest_pid,
+        provider_runtime_kind: "in_process_astd_cuda_engine".into(),
+        provider_runtime_pid: provider_pid,
+        provider_runtime_executable_digest: sha256_file(&astd)?,
         guest_container_id: output_value(&stdout, "guest_container_id")?,
         guest_container_pid: output_value(&stdout, "guest_container_pid")?.parse()?,
         guest_output: if succeeded { "6.0,2.0,6.0".into() } else { String::new() },
@@ -209,6 +219,148 @@ fn observe(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+#[derive(Serialize)]
+struct RuntimeProbe {
+    schema: &'static str,
+    candidate_sha: String,
+    tree_digest: String,
+    probe: &'static str,
+    fresh_session: bool,
+    expected_error: &'static str,
+    observed_error: String,
+    provider_runtime_kind: &'static str,
+    provider_astd_pid: u32,
+    guest_astd_pid: u32,
+    provider_runtime_executable_digest: String,
+    provider_image_digest: String,
+}
+
+fn probe_contention(args: &[String]) -> Result<()> {
+    let output = PathBuf::from(required(args, "--output")?);
+    let guest_home = PathBuf::from(required(args, "--guest-home")?);
+    let provider_pid = required(args, "--provider-astd-pid")?.parse::<u32>()?;
+    let guest_pid = required(args, "--guest-astd-pid")?.parse::<u32>()?;
+    ensure!(process_alive(provider_pid) && process_alive(guest_pid));
+
+    let mut first = open_gpu_session(&guest_home, AbiRange::ours())?;
+    let mut second = JsonConnection::open(&guest_home.join("astd.sock"))?;
+    expect_local_open(&mut second, AbiRange::ours())?;
+    let response = second.call(&Request::GpuGuestFrame {
+        frame: GuestFrame::Open {
+            versions: AbiRange::ours(),
+        },
+    })?;
+    let observed = match response {
+        Response::GpuGuestRefused { code, message } => format!("{code}:{message}"),
+        Response::GpuGuestReply {
+            reply:
+                asterism_core::remote_gpu_guest::GuestReply::Refused { code, message },
+        } => format!("{code}:{message}"),
+        other => bail!("contending fresh session was not refused: {other:?}"),
+    };
+    ensure!(
+        observed.contains("DeviceLost")
+            || observed.contains("device_lost")
+            || observed.contains("no GPU provider")
+    );
+    first.send(&Request::GpuGuestClose)?;
+    write_probe(
+        output,
+        "contention",
+        true,
+        "provider_busy",
+        observed,
+        provider_pid,
+        guest_pid,
+    )
+}
+
+fn probe_version_skew(args: &[String]) -> Result<()> {
+    let output = PathBuf::from(required(args, "--output")?);
+    let guest_home = PathBuf::from(required(args, "--guest-home")?);
+    let provider_pid = required(args, "--provider-astd-pid")?.parse::<u32>()?;
+    let guest_pid = required(args, "--guest-astd-pid")?.parse::<u32>()?;
+    ensure!(process_alive(provider_pid) && process_alive(guest_pid));
+
+    let incompatible = AbiRange { min: 99, max: 99 };
+    let mut session = JsonConnection::open(&guest_home.join("astd.sock"))?;
+    expect_local_open(&mut session, incompatible)?;
+    let response = session.call(&Request::GpuGuestFrame {
+        frame: GuestFrame::Open { versions: incompatible },
+    })?;
+    let observed = match response {
+        Response::GpuGuestRefused { code, message } => format!("{code}:{message}"),
+        Response::GpuGuestReply {
+            reply:
+                asterism_core::remote_gpu_guest::GuestReply::Refused { code, message },
+        } => format!("{code}:{message}"),
+        other => bail!("incompatible fresh session was not refused: {other:?}"),
+    };
+    ensure!(observed.contains("UnsupportedVersion") || observed.contains("unsupported_version"));
+    write_probe(
+        output,
+        "version_skew_fresh_session",
+        true,
+        "unsupported_version",
+        observed,
+        provider_pid,
+        guest_pid,
+    )
+}
+
+fn open_gpu_session(home: &Path, versions: AbiRange) -> Result<JsonConnection> {
+    let mut session = JsonConnection::open(&home.join("astd.sock"))?;
+    expect_local_open(&mut session, versions)?;
+    match session.call(&Request::GpuGuestFrame {
+        frame: GuestFrame::Open { versions },
+    })? {
+        Response::GpuGuestReply {
+            reply: asterism_core::remote_gpu_guest::GuestReply::Accepted { .. },
+        } => Ok(session),
+        other => bail!("GPU session did not open: {other:?}"),
+    }
+}
+
+fn expect_local_open(session: &mut JsonConnection, versions: AbiRange) -> Result<()> {
+    match session.call(&Request::GpuGuestOpen {
+        name: INSTANCE.into(),
+        versions,
+    })? {
+        Response::GpuGuestAccepted { .. } => Ok(()),
+        other => bail!("local GPU projection did not open: {other:?}"),
+    }
+}
+
+fn write_probe(
+    output: PathBuf,
+    probe: &'static str,
+    fresh_session: bool,
+    expected_error: &'static str,
+    observed_error: String,
+    provider_pid: u32,
+    guest_pid: u32,
+) -> Result<()> {
+    let candidate_sha = git("rev-parse", "HEAD")?;
+    ensure!(candidate_sha == env_required("ASTERISM_PINNED_SHA")?);
+    let astd = env_path("ASTERISM_NVIDIA_ASTD")?;
+    let record = RuntimeProbe {
+        schema: "asterism.nvidia.runtime-probe/1",
+        candidate_sha,
+        tree_digest: git("rev-parse", "HEAD^{tree}")?,
+        probe,
+        fresh_session,
+        expected_error,
+        observed_error,
+        provider_runtime_kind: "in_process_astd_cuda_engine",
+        provider_astd_pid: provider_pid,
+        guest_astd_pid: guest_pid,
+        provider_runtime_executable_digest: sha256_file(&astd)?,
+        provider_image_digest: env_required("ASTERISM_NVIDIA_PROVIDER_IMAGE_DIGEST")?,
+    };
+    fs::write(output, serde_json::to_vec_pretty(&record)?)?;
+    Ok(())
+}
+
 struct BridgeResult { frames: Vec<String>, saw_cuda: bool, fault_while_active: bool }
 
 fn bridge_guest(
@@ -217,7 +369,10 @@ fn bridge_guest(
     guest_home: &Path, provider_name: &str,
 ) -> Result<BridgeResult> {
     let mut daemon = JsonConnection::open(socket)?;
-    match daemon.call(&Request::GpuGuestOpen { name: INSTANCE.into() })? {
+    match daemon.call(&Request::GpuGuestOpen {
+        name: INSTANCE.into(),
+        versions: AbiRange::ours(),
+    })? {
         Response::GpuGuestAccepted { .. } => {}
         Response::GpuGuestRefused { code, message } => bail!("GPU guest refused: {code}: {message}"),
         other => bail!("unexpected GPU open response: {other:?}"),
@@ -288,11 +443,16 @@ impl JsonConnection {
         Ok(Self { reader: BufReader::new(writer.try_clone()?), writer })
     }
     fn call(&mut self, request: &Request) -> Result<Response> {
-        serde_json::to_writer(&mut self.writer, request)?;
-        self.writer.write_all(b"\n")?; self.writer.flush()?;
+        self.send(request)?;
         let mut line = String::new();
         ensure!(self.reader.read_line(&mut line)? != 0, "astd closed the control socket");
         Ok(serde_json::from_str(&line)?)
+    }
+    fn send(&mut self, request: &Request) -> Result<()> {
+        serde_json::to_writer(&mut self.writer, request)?;
+        self.writer.write_all(b"\n")?;
+        self.writer.flush()?;
+        Ok(())
     }
 }
 

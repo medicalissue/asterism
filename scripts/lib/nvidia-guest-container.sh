@@ -18,28 +18,10 @@ esac
 [ -S "$PROJECTED_DEVICE" ] || { echo "projected /dev/nvidia0 endpoint is not a socket" >&2; exit 1; }
 [ -f "$LIBCUDA" ] || { echo "generated libcuda is missing" >&2; exit 1; }
 
-# The independent verifier runs this launcher in a container while talking to
-# the host Docker daemon. Translate only the verifier's explicitly shared
-# result directory; refusing every other path prevents an apparently valid
-# run whose guest mounts artifacts the daemon cannot actually see.
-CONTAINER_RESULT="${ASTERISM_NVIDIA_DOCKER_CONTAINER_RESULT:-}"
-HOST_RESULT="${ASTERISM_NVIDIA_DOCKER_HOST_RESULT:-}"
-[ -n "$CONTAINER_RESULT" ] && [ -n "$HOST_RESULT" ] \
-  || { echo "verifier/host result path mapping is required" >&2; exit 1; }
-docker_host_path() {
-  case "$1" in
-    "$CONTAINER_RESULT"/*) printf '%s/%s\n' "$HOST_RESULT" "${1#"$CONTAINER_RESULT"/}" ;;
-    *) echo "path is outside verifier result mount: $1" >&2; return 1 ;;
-  esac
-}
-HOST_GUEST_BINARY="$(docker_host_path "$GUEST_BINARY")"
-HOST_PROJECTED_DEVICE="$(docker_host_path "$PROJECTED_DEVICE")"
-HOST_LIBCUDA="$(docker_host_path "$LIBCUDA")"
-
 CONTAINER_ID="$(docker create --network none --read-only \
-  --mount "type=bind,src=$HOST_GUEST_BINARY,dst=/asterism/guest,readonly" \
-  --mount "type=bind,src=$HOST_PROJECTED_DEVICE,dst=/dev/nvidia0" \
-  --mount "type=bind,src=$HOST_LIBCUDA,dst=/usr/lib/libcuda.so.1,readonly" \
+  --mount "type=bind,src=$GUEST_BINARY,dst=/asterism/guest,readonly" \
+  --mount "type=bind,src=$PROJECTED_DEVICE,dst=/dev/nvidia0" \
+  --mount "type=bind,src=$LIBCUDA,dst=/usr/lib/libcuda.so.1,readonly" \
   --env ASTERISM_GUEST_NVIDIA_DEVICE=/dev/nvidia0 \
   --env ASTERISM_LIBCUDA=/usr/lib/libcuda.so.1 \
   "$IMAGE" /asterism/guest)"

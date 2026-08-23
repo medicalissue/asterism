@@ -3,9 +3,9 @@
 //! This example never claims hardware CUDA. It admits an inventory, then
 //! proves guest-local `/dev/nvidia0`, ABI 1, fencing, restart, revoke and
 //! fail-closed skew through the reference executor. That is ABI evidence
-//! only. The exact hardware PASS is `scripts/harness-remote-gpu-nvidia.sh`
-//! judged by `asterism_core::remote_gpu_release_gate`; a host-direct
-//! `.cu` kernel or this process cannot satisfy it.
+//! only. Exact hardware acceptance is outside the candidate and belongs to a
+//! reviewer-owned immutable offline verifier; a host-direct `.cu` kernel or
+//! this process cannot satisfy it.
 
 use anyhow::{Context, Result};
 use asterism_core::remote_gpu_nvidia::{
@@ -33,7 +33,7 @@ fn main() -> Result<()> {
     if evidence.hardware_cuda_executed {
         anyhow::bail!("reference harness must not set hardware_cuda_executed=true");
     }
-    println!("nvidia_gate=contract_only");
+    println!("nvidia_contract=source_only");
     println!("hardware_cuda_executed=false");
     Ok(())
 }

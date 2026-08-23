@@ -17,15 +17,15 @@ filed as NVIDIA hardware evidence.
 | `crates/asterism-core/src/remote_gpu_guest.rs` | CUSE + generated libcuda guest projection |
 | `crates/asterism-core/src/remote_gpu_path.rs` | Authenticated instance-bound mesh path |
 | `crates/asterism-core/src/remote_gpu_cuda.rs` | NVIDIA CUDA driver executor (`libcuda` via dlopen). Simulated driver for source tests; live driver is the only hardware-PASS path. |
-| `crates/asterism-daemon/src/gpu.rs` | Daemon/mesh routing into the CUDA helper. Unix helper socket, no public listener, no token persistence. |
+| `crates/asterism-daemon/src/gpu.rs` | Daemon/mesh routing into the in-process CUDA engine. The provider runtime is the provider `astd` process; there is no separate helper process. |
 | `crates/asterism-core/src/remote_gpu_nvidia.rs` | Fail-closed driver/CUDA/CC matrix and deterministic two-device harness |
 | `crates/asterism-core/examples/remote_gpu_nvidia_harness.rs` | Source runner for the contract; always prints `hardware_cuda_executed=false` |
-| `scripts/harness-remote-gpu-nvidia.sh` | Hardware wrapper: independently observes SHA/tree/GPU inventory, invokes the pinned-tree E2E runner, and judges its closed evidence schema |
+| `scripts/harness-remote-gpu-nvidia.sh` | Candidate-side live observer: records SHA/tree/GPU inventory and invokes the pinned-tree E2E runner. It cannot normalize or accept evidence. |
 | `crates/asterism-nvidia-e2e-driver` | Guest projection adapter. It talks to the guest `astd` local socket and emits raw observations; it contains no provider, relay, or acceptance verifier. |
-| `scripts/lib/nvidia-e2e-runner.sh` | Builds the exact candidate, pairs two real daemon identities through invite/SAS, then records direct/relay success and active revoke/loss observations. It cannot accept them. |
+| `scripts/lib/nvidia-e2e-runner.sh` | Builds the exact candidate, pairs two real daemon identities through invite/SAS, then performs direct/relay success, active revoke/loss, live contention, and fresh-session skew actions. It records raw JSON and cannot accept it. |
 | `scripts/lib/nvidia-guest-container.sh` | Runs the payload in a digest-pinned read-only container with only projected `/dev/nvidia0` and the audited libcuda mounted |
 | `scripts/lib/guest_remote_cuda_vector_add.c` | CUDA application payload intended to execute inside the Asterism guest/container |
-| `scripts/test-nvidia-release-gate.sh` | Source-only fixtures proving reference, local-direct, stale PID, bearer, Conflict-skew, and hardware-false records are refused |
+| `scripts/test-nvidia-release-gate.sh` | Source-only structural fixtures proving observation and acceptance remain separate and every required claim maps to a runner action |
 | `deploy/dstack/remote-gpu-nvidia.dstack.yml` | Provider-side dstack **task** config. Do not apply from development machines. |
 
 ## Fail-closed matrix
@@ -64,33 +64,50 @@ non-loopback plaintext listener and has no cloud-only dependency.
 
 ## dstack plan (do not apply here)
 
-The matching dstack 0.21.2 CLI validated the task against project `main` at
-`http://127.0.0.1:3001`. Port 3000 is Dagster. The no-cost plan resolved:
+The checked-in task requests:
 
 - 1 on-demand host
 - 2× NVIDIA GPUs, 16 GB+ each, CC 7.5+
 - driver 550+, CUDA 12.4–13.x (the provider image is pinned to the CUDA 13.0 development-image digest)
 - `max_price: 2.50` USD/hour
 - `max_duration: 1h`, `idle_duration: 5m`, `retry: false`
-- expected wall clock 20–40 minutes
-- expected spend **about 1–3 USD** if applied once and stopped
+- a one-hour hard duration cap and no retries
 
-The plan reported no fleets, so submission is blocked without spending. Apply
-must start from a detached checkout of the exact candidate under review and
-supply `ASTERISM_PINNED_SHA`; the task rejects any different `HEAD`. This
-replaces the impossible pattern of embedding a commit's own future object ID
-inside that commit. The runner builds in a private temporary target directory.
+No successful plan or hardware execution is claimed. Two earlier
+`dstack apply --help` attempts failed locally during CLI import with a pydantic
+`ModelMetaclass` ImportError. Neither reached a server, plan, provisioning,
+hardware, or spend. Apply must start from a detached checkout of the exact
+candidate under review and supply `ASTERISM_PINNED_SHA`; the task rejects any
+different `HEAD`. The runner builds in a private temporary target directory.
 
-Execution observation and acceptance are outside the candidate. The independent reviewer supplies
-`ASTERISM_NVIDIA_VERIFIER_IMAGE` and its exact sha256 digest. The candidate
-tree is mounted read-only into that image. Its `/run-and-verify` entrypoint
-invokes the exact runner, observes daemon/container processes while live, and
-then validates raw JSON, daemon logs, container identities, crossed frames, and
-artifact hashes. It is the only component allowed to emit normalized PASS
-evidence. A separate result mount is shared with the host Docker daemon so the
-guest's projected socket and compiled artifacts retain real, verifier-observed
-host paths; every other nested bind path is rejected. The candidate has no
-`verify` subcommand.
+Execution observation and acceptance are two distinct phases. Candidate code
+runs in the digest-pinned provider environment and writes raw JSON, logs,
+artifact hashes, inventory, and a manifest. It then removes write bits. It has
+no normalizer, judge, verifier subcommand, or acceptance emitter.
+
+The independent reviewer supplies `ASTERISM_NVIDIA_VERIFIER_IMAGE` and its
+exact sha256 digest. Only after live processes have stopped does dstack launch
+that immutable image with `--network none`, a read-only root filesystem, and
+the completed raw directory mounted read-only at `/evidence`. The verifier has
+no candidate-tree mount and writes its verdict to a separate `/verdict` mount.
+Its closed schema must bind every record to the same exact SHA/tree, runner and
+artifact digests, image/runtime identity, GPU and device identities, and
+manifest. Unknown, duplicate, missing, mismatched, or unobserved fields fail
+closed. `provenance_verified` is reviewer-owned verdict metadata, not a field
+candidate records or validates.
+
+The raw boundary has two closed record kinds. JSON records with schema
+`asterism.nvidia.raw-observation/3` bind one CUDA application attempt to the
+candidate SHA/tree, paired device identities, selected mesh path, requested
+fault and active-fault timing, GPU UUID, guest container, provider/guest astd
+PIDs, the honest `in_process_astd_cuda_engine` runtime kind, provider-runtime
+executable and image digests, artifact/log digests, crossed frames, and whether
+CUDA work completed. Records with schema `asterism.nvidia.runtime-probe/1`
+bind live contention or fresh-session skew to those same process, image,
+candidate, and tree identities plus the exact observed refusal. The external
+verifier must reject unknown fields and require all fields for each kind; it
+must also require exactly the six named records and recompute every manifest
+entry before considering reviewer-owned provenance metadata.
 
 Preferred SKUs when offers are healthy: 2× L4 24 GB, 2× RTX 4090 24 GB, or
 2× A10 24 GB. Do not use V100/P100; CUDA 13 images do not support them and
@@ -111,8 +128,8 @@ IDs, driver, CUDA runtime, and route kind:
   keys; relay evidence disables IP transports and never uses a Unix proxy
 - provider-process / provider-device loss while work is active
 - peer and instance revocation during an active session
-- concurrent lease-slot fencing
-- provider astd, helper, and guest PID changes across real restarts
+- a second fresh session contending while the first holds the in-process CUDA engine
+- provider `astd` and guest/container PID changes across real restarts; no separate helper PID is claimed
 - fresh-session version skew returning `UnsupportedVersion`, never `Conflict`
 - exact candidate SHA, tree digest, runner digest, guest/provider image digests
 - exact driver, ABI shim, and guest-binary digests plus a hash-chained transcript root

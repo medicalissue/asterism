@@ -153,8 +153,9 @@ pub(crate) async fn serve_mesh(
     node: &Node,
     instance_id: String,
     provider_generation: u64,
+    versions: asterism_core::remote_gpu::AbiRange,
 ) -> Result<()> {
-    let open = match GpuMeshOpen::new(instance_id, provider_generation) {
+    let open = match GpuMeshOpen::new(instance_id, provider_generation, versions) {
         Ok(open) => open,
         Err(err) => {
             write_gpu_frame(
@@ -221,6 +222,7 @@ async fn pump_provider(stream: &mut MeshStream, hop: &mut ProviderHop) -> Result
 /// Bridge local guest-control frames onto the provider mesh stream.
 pub(crate) async fn serve_local<'a, 'b>(
     name: &str,
+    versions: asterism_core::remote_gpu::AbiRange,
     node: &Node,
     mesh: Option<&Arc<Mesh>>,
     io: &'a mut ClientIo<'b>,
@@ -265,6 +267,7 @@ pub(crate) async fn serve_local<'a, 'b>(
             mesh.device_id(),
             &instance.id,
             attachment.provider_generation,
+            versions,
             io,
         )
         .await;
@@ -273,6 +276,7 @@ pub(crate) async fn serve_local<'a, 'b>(
         &attachment.provider_device,
         &instance.id,
         attachment.provider_generation,
+        versions,
         io,
     )
     .await
@@ -391,6 +395,7 @@ async fn serve_local_provider<'a, 'b>(
     self_id: DeviceId,
     instance_id: &str,
     generation: u64,
+    versions: asterism_core::remote_gpu::AbiRange,
     io: &'a mut ClientIo<'b>,
 ) -> Result<()> {
     let Some((gpu_uuid, production)) = node.gpu.take() else {
@@ -404,7 +409,7 @@ async fn serve_local_provider<'a, 'b>(
     let peer = AuthenticatedPeer::from_mesh_identity(self_id.to_string())
         .map_err(|err| anyhow!(err.message))?;
     let mut hop = ProviderHop::new(peer, production, now_unix());
-    let open = GpuMeshOpen::new(instance_id, generation).map_err(|err| anyhow!(err))?;
+    let open = GpuMeshOpen::new(instance_id, generation, versions).map_err(|err| anyhow!(err))?;
     match hop.accept_open(open).map_err(|err| anyhow!(err))? {
         GpuMeshFrame::Accepted { .. } => {}
         GpuMeshFrame::Refused { message, .. }

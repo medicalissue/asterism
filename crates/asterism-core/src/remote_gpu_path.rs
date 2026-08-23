@@ -2,8 +2,9 @@
 //! guest control → local astd → iroh mesh → provider GPU service.
 //!
 //! The mesh opening frame names the orbit-global instance and the provider
-//! generation. It does not carry a lease bearer, a backend id, or a
-//! diagnostic consumer string used as authority. Typed frames are
+//! generation plus the consumer's fresh-session ABI range. It does not carry
+//! a lease bearer, a backend id, or a diagnostic consumer string used as
+//! authority. Typed frames are
 //! length-prefixed and bounded by [`gpu::MAX_WIRE_FRAME_BYTES`]. A credit
 //! window supplies backpressure; cancel drops a not-yet-applied call.
 //! Device loss, revocation, and generation skew fail closed without
@@ -35,12 +36,14 @@ pub const GPU_MESH_PROTOCOL: u32 = 8;
 pub struct GpuMeshOpen {
     pub instance_id: String,
     pub provider_generation: u64,
+    pub versions: AbiRange,
 }
 
 impl GpuMeshOpen {
     pub fn new(
         instance_id: impl Into<String>,
         provider_generation: u64,
+        versions: AbiRange,
     ) -> Result<Self, PathError> {
         let instance_id = instance_id.into();
         if instance_id.trim().is_empty() || instance_id.len() > 128 {
@@ -56,13 +59,14 @@ impl GpuMeshOpen {
         Ok(Self {
             instance_id,
             provider_generation,
+            versions,
         })
     }
 
     /// JSON object keys this frame is allowed to carry. A bearer, backend id,
     /// or capability field is a protocol bug, not an extension.
     pub fn allowed_keys() -> &'static [&'static str] {
-        &["instance_id", "provider_generation"]
+        &["instance_id", "provider_generation", "versions"]
     }
 }
 
@@ -196,7 +200,7 @@ impl ConsumerHop {
         instance_id: impl Into<String>,
         provider_generation: u64,
     ) -> Result<Self, PathError> {
-        let open = GpuMeshOpen::new(instance_id, provider_generation)?;
+        let open = GpuMeshOpen::new(instance_id, provider_generation, AbiRange::ours())?;
         Ok(Self {
             instance_id: open.instance_id,
             provider_generation: open.provider_generation,
@@ -209,7 +213,11 @@ impl ConsumerHop {
     }
 
     pub fn open_bytes(&self) -> Result<Vec<u8>, PathError> {
-        let open = GpuMeshOpen::new(&self.instance_id, self.provider_generation)?;
+        let open = GpuMeshOpen::new(
+            &self.instance_id,
+            self.provider_generation,
+            AbiRange::ours(),
+        )?;
         encode_frame(&open)
     }
 
@@ -346,7 +354,7 @@ impl ProviderHop {
             &self.peer,
             &open.instance_id,
             open.provider_generation,
-            AbiRange::ours(),
+            open.versions,
             self.now,
         ) {
             Ok(Response::SessionOpened {
@@ -873,8 +881,8 @@ mod tests {
     }
 
     #[test]
-    fn mesh_open_json_is_only_instance_and_generation() {
-        let open = GpuMeshOpen::new("inst-1", 7).unwrap();
+    fn mesh_open_json_is_only_identity_generation_and_versions() {
+        let open = GpuMeshOpen::new("inst-1", 7, AbiRange::ours()).unwrap();
         let bytes = encode_frame(&open).unwrap();
         assert_open_has_no_bearer(&bytes).unwrap();
         let decoded: GpuMeshOpen = decode_frame(&bytes).unwrap();
