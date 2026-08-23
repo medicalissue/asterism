@@ -6,10 +6,15 @@
 //! refuse until their managed utility-VM implementation exists.
 
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, target_family = "unix")))]
+use std::io::Read;
+use std::io::{BufRead, BufReader, Write};
+#[cfg(target_family = "unix")]
 use std::net::Shutdown;
-use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(any(target_os = "linux", all(test, target_family = "unix")))]
+use std::os::unix::net::UnixListener;
+#[cfg(target_family = "unix")]
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -18,16 +23,20 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use asterism_core::hv::{
-    ContainerControlEndpoint, ControlChannel, Handle, ImageKind, Machine, RunState,
+    ContainerControlEndpoint, ContainerRuntimeIdentity, ControlChannel, Handle, ImageKind,
+    KernelObjectIdentity, Machine, RunState,
 };
 use asterism_core::instance::{Instance, RuntimeKind};
-use asterism_core::proc::{ProcId, Signal};
+use asterism_core::proc::{Ownership, ProcId, Signal};
 use asterism_core::{paths, tools};
 
 pub const LINUX_ID: &str = "linux-rootless";
 pub const MACOS_ID: &str = "macos-vz-container-utility-vm";
 pub const WINDOWS_ID: &str = "windows-hyperv-container-utility-vm";
+#[cfg(target_os = "linux")]
 const MAX_EXEC_OUTPUT: usize = 1024 * 1024;
+pub const EXEC_DEADLINE: Duration = Duration::from_secs(30);
+const CONTROL_DEADLINE: Duration = Duration::from_secs(2);
 
 trait Adapter: Send + Sync {
     fn id(&self) -> &'static str;
@@ -139,7 +148,7 @@ struct Network {
 #[serde(tag = "command", rename_all = "snake_case")]
 enum ControlRequest {
     Hello,
-    Exec { argv: Vec<String> },
+    Exec { argv: Vec<String>, timeout_ms: u64 },
     Stop,
 }
 
@@ -412,13 +421,18 @@ pub fn start(prepared: &Prepared) -> Result<Handle> {
     });
     let deadline = Instant::now() + Duration::from_secs(5);
     let host_pid = loop {
-        match call(
+        match startup_call(
             &spec.control,
             &ControlRequest::Hello,
             Some(Duration::from_secs(1)),
         ) {
-            Ok(ControlResponse::Ready { host_pid }) => break host_pid,
-            Ok(ControlResponse::Error { message }) => bail!(message),
+            Ok((ControlResponse::Ready { host_pid }, peer_pid)) if host_pid == peer_pid => {
+                break host_pid
+            }
+            Ok((ControlResponse::Ready { host_pid }, peer_pid)) => bail!(
+                "container control claimed pid {host_pid}, but the connected Unix peer is pid {peer_pid}"
+            ),
+            Ok((ControlResponse::Error { message }, _)) => bail!(message),
             _ if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
             _ => bail!(
                 "container helper did not establish its control socket at {}",
@@ -440,7 +454,7 @@ pub fn start(prepared: &Prepared) -> Result<Handle> {
         // No caller may receive a failed launch while the namespace holder is
         // still alive: it would leave a cgroup and control socket that look
         // like a boot the registry must fence forever.
-        let _ = call(
+        let _ = startup_call(
             &spec.control,
             &ControlRequest::Stop,
             Some(Duration::from_secs(2)),
@@ -455,6 +469,23 @@ pub fn start(prepared: &Prepared) -> Result<Handle> {
         return Err(error).context("configuring rootless container networking");
     }
     let ns = |kind: &str| PathBuf::from(format!("/proc/{host_pid}/ns/{kind}"));
+    let user_namespace = ns("user");
+    let mount_namespace = ns("mnt");
+    let pid_namespace = ns("pid");
+    let network_namespace = ns("net");
+    if !cgroup_contains(&spec.cgroup, host_pid)? {
+        bail!(
+            "container control peer pid {host_pid} is not a member of delegated cgroup {}",
+            spec.cgroup.display()
+        );
+    }
+    let identity = runtime_identity(
+        &user_namespace,
+        &mount_namespace,
+        &pid_namespace,
+        &network_namespace,
+        &spec.cgroup,
+    )?;
     Ok(Handle {
         backend: LINUX_ID.into(),
         pid: Some(host_pid),
@@ -465,11 +496,12 @@ pub fn start(prepared: &Prepared) -> Result<Handle> {
         endpoint: None,
         container_control: Some(ContainerControlEndpoint {
             socket: spec.control,
-            user_namespace: ns("user"),
-            mount_namespace: ns("mnt"),
-            pid_namespace: ns("pid"),
-            network_namespace: ns("net"),
+            user_namespace,
+            mount_namespace,
+            pid_namespace,
+            network_namespace,
             cgroup: spec.cgroup,
+            identity: Some(identity),
         }),
         started_at: asterism_core::instance::now_unix(),
     })
@@ -538,7 +570,7 @@ fn start_slirp(_host_pid: u32, _network: &Network) -> Result<()> {
     bail!("slirp4netns is only available to the Linux rootless adapter")
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, target_family = "unix")))]
 fn slirp_call(socket: &Path, request: serde_json::Value) -> Result<()> {
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("connecting to slirp4netns API {}", socket.display()))?;
@@ -565,16 +597,14 @@ pub fn state(handle: &Handle) -> Result<RunState> {
     let Some(control) = &handle.container_control else {
         bail!("container handle has no container control endpoint");
     };
-    match call(
-        &control.socket,
-        &ControlRequest::Hello,
-        Some(Duration::from_secs(1)),
-    ) {
-        Ok(ControlResponse::Ready { .. }) if cgroup_populated(&control.cgroup)? => {
+    match call(handle, &ControlRequest::Hello, Some(Duration::from_secs(1))) {
+        Ok(ControlResponse::Ready { host_pid })
+            if handle.owned().is_some_and(|proc| proc.pid == host_pid) =>
+        {
             Ok(RunState::Running)
         }
-        Ok(ControlResponse::Ready { .. }) => {
-            bail!("container control answered outside its recorded cgroup; refusing the inconsistent handle")
+        Ok(ControlResponse::Ready { host_pid }) => {
+            bail!("container control answered as pid {host_pid}, not the recorded namespace holder")
         }
         Ok(ControlResponse::Error { message }) => bail!(message),
         Ok(_) => bail!("container control returned the wrong response to a liveness probe"),
@@ -594,11 +624,7 @@ pub fn stop(handle: &Handle, deadline: Duration) -> Result<()> {
         .container_control
         .as_ref()
         .context("container handle has no control endpoint")?;
-    let _ = call(
-        &control.socket,
-        &ControlRequest::Stop,
-        Some(Duration::from_secs(2)),
-    )?;
+    let _ = call(handle, &ControlRequest::Stop, Some(CONTROL_DEADLINE))?;
     let until = Instant::now() + deadline;
     while Instant::now() < until {
         if !cgroup_populated(&control.cgroup)? {
@@ -621,15 +647,20 @@ pub fn stop(handle: &Handle, deadline: Duration) -> Result<()> {
     bail!("container did not stop before its lifecycle deadline")
 }
 
-pub fn exec(handle: &Handle, argv: Vec<String>) -> Result<(i32, String, String)> {
+pub fn exec(
+    handle: &Handle,
+    argv: Vec<String>,
+    deadline: Duration,
+) -> Result<(i32, String, String)> {
     if argv.is_empty() {
         bail!("container exec needs a command");
     }
-    let control = handle
-        .container_control
-        .as_ref()
-        .context("container handle has no control endpoint")?;
-    match call(&control.socket, &ControlRequest::Exec { argv }, None)? {
+    let timeout_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
+    match call(
+        handle,
+        &ControlRequest::Exec { argv, timeout_ms },
+        Some(deadline + CONTROL_DEADLINE),
+    )? {
         ControlResponse::Exec {
             status,
             stdout,
@@ -641,18 +672,198 @@ pub fn exec(handle: &Handle, argv: Vec<String>) -> Result<(i32, String, String)>
 }
 
 fn call(
-    socket: &Path,
+    handle: &Handle,
     request: &ControlRequest,
     timeout: Option<Duration>,
 ) -> Result<ControlResponse> {
-    let mut stream = UnixStream::connect(socket)?;
+    let control = handle
+        .container_control
+        .as_ref()
+        .context("container handle has no control endpoint")?;
+    let proc = handle
+        .owned()
+        .context("container handle has no persisted process identity")?;
+    match proc.check() {
+        Ownership::Ours => {}
+        Ownership::Gone => bail!("recorded container process {proc} is gone"),
+        Ownership::Foreign(why) | Ownership::Unknown(why) => {
+            bail!("refusing container control for {proc}: {why}")
+        }
+    }
+    let mut stream = connect(&control.socket, timeout)?;
+    let peer_pid = peer_pid(&stream)?;
+    if peer_pid != proc.pid {
+        bail!(
+            "refusing container control socket {}: peer pid {peer_pid} is not recorded {proc}",
+            control.socket.display()
+        );
+    }
+    validate_runtime(control, proc.pid)?;
+    exchange(&mut stream, request)
+}
+
+#[cfg(target_family = "unix")]
+fn connect(socket: &Path, timeout: Option<Duration>) -> Result<UnixStream> {
+    let stream = UnixStream::connect(socket)?;
     stream.set_read_timeout(timeout)?;
     stream.set_write_timeout(timeout)?;
-    serde_json::to_writer(&mut stream, request)?;
+    Ok(stream)
+}
+
+#[cfg(not(target_family = "unix"))]
+fn connect(_socket: &Path, _timeout: Option<Duration>) -> Result<()> {
+    bail!("native-container Unix control transport is unavailable on this host")
+}
+
+#[cfg(target_family = "unix")]
+fn exchange(stream: &mut UnixStream, request: &ControlRequest) -> Result<ControlResponse> {
+    serde_json::to_writer(&mut *stream, request)?;
     stream.write_all(b"\n")?;
     let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line)?;
+    BufReader::new(stream.try_clone()?).read_line(&mut line)?;
     Ok(serde_json::from_str(&line)?)
+}
+
+#[cfg(not(target_family = "unix"))]
+fn exchange(_stream: &mut (), _request: &ControlRequest) -> Result<ControlResponse> {
+    bail!("native-container Unix control transport is unavailable on this host")
+}
+
+/// The launch handshake has no persisted identity yet.  Its Unix peer PID is
+/// therefore the authority from which the first `ProcId` is captured; the
+/// helper's claimed PID must match it before a handle is ever returned.
+#[cfg(target_family = "unix")]
+fn startup_call(
+    socket: &Path,
+    request: &ControlRequest,
+    timeout: Option<Duration>,
+) -> Result<(ControlResponse, u32)> {
+    let mut stream = connect(socket, timeout)?;
+    let peer_pid = peer_pid(&stream)?;
+    Ok((exchange(&mut stream, request)?, peer_pid))
+}
+
+#[cfg(not(target_family = "unix"))]
+fn startup_call(
+    _socket: &Path,
+    _request: &ControlRequest,
+    _timeout: Option<Duration>,
+) -> Result<(ControlResponse, u32)> {
+    bail!("native-container Unix control transport is unavailable on this host")
+}
+
+#[cfg(target_os = "linux")]
+fn peer_pid(stream: &UnixStream) -> Result<u32> {
+    use std::os::fd::AsRawFd;
+
+    let mut credentials = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("reading native-container Unix peer credentials");
+    }
+    u32::try_from(credentials.pid).context("native-container Unix peer reported an invalid pid")
+}
+
+#[cfg(all(target_family = "unix", not(target_os = "linux")))]
+fn peer_pid(_stream: &UnixStream) -> Result<u32> {
+    bail!("native-container peer PID authentication is only available in the Linux adapter")
+}
+
+#[cfg(not(target_family = "unix"))]
+fn peer_pid(_stream: &()) -> Result<u32> {
+    bail!("native-container Unix peer authentication is unavailable on this host")
+}
+
+fn validate_runtime(control: &ContainerControlEndpoint, pid: u32) -> Result<()> {
+    if !cgroup_contains(&control.cgroup, pid)? {
+        bail!(
+            "recorded container pid {pid} is not in delegated cgroup {}",
+            control.cgroup.display()
+        );
+    }
+    let expected = control
+        .identity
+        .as_ref()
+        .context("container handle predates persisted cgroup/namespace identity")?;
+    let actual = runtime_identity(
+        &control.user_namespace,
+        &control.mount_namespace,
+        &control.pid_namespace,
+        &control.network_namespace,
+        &control.cgroup,
+    )?;
+    if &actual != expected {
+        bail!(
+            "container cgroup or namespace identity changed; refusing the stale control endpoint"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_family = "unix")]
+fn runtime_identity(
+    user_namespace: &Path,
+    mount_namespace: &Path,
+    pid_namespace: &Path,
+    network_namespace: &Path,
+    cgroup: &Path,
+) -> Result<ContainerRuntimeIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let identity = |path: &Path| -> Result<KernelObjectIdentity> {
+        let metadata = fs::metadata(path)
+            .with_context(|| format!("reading kernel identity for {}", path.display()))?;
+        Ok(KernelObjectIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    };
+    Ok(ContainerRuntimeIdentity {
+        user_namespace: identity(user_namespace)?,
+        mount_namespace: identity(mount_namespace)?,
+        pid_namespace: identity(pid_namespace)?,
+        network_namespace: identity(network_namespace)?,
+        cgroup: identity(cgroup)?,
+    })
+}
+
+#[cfg(not(target_family = "unix"))]
+fn runtime_identity(
+    _user_namespace: &Path,
+    _mount_namespace: &Path,
+    _pid_namespace: &Path,
+    _network_namespace: &Path,
+    _cgroup: &Path,
+) -> Result<ContainerRuntimeIdentity> {
+    bail!("native-container namespace identity is unavailable on this host")
+}
+
+fn cgroup_contains(cgroup: &Path, pid: u32) -> Result<bool> {
+    let members = match fs::read_to_string(cgroup.join("cgroup.procs")) {
+        Ok(members) => members,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading cgroup membership from {}", cgroup.display()))
+        }
+    };
+    Ok(members
+        .lines()
+        .any(|member| member.trim() == pid.to_string()))
 }
 
 fn cgroup_populated(cgroup: &Path) -> Result<bool> {
@@ -672,6 +883,7 @@ fn cgroup_populated(cgroup: &Path) -> Result<bool> {
 }
 
 /// Entry point invoked only under `unshare`; never starts the daemon.
+#[cfg(target_os = "linux")]
 pub fn helper_main(spec_path: &Path) -> Result<()> {
     let spec: Spec = serde_json::from_slice(&fs::read(spec_path)?)?;
     let _ = fs::remove_file(&spec.control);
@@ -719,21 +931,23 @@ pub fn helper_main(spec_path: &Path) -> Result<()> {
         BufReader::new(stream.try_clone()?).read_line(&mut line)?;
         let response = match serde_json::from_str::<ControlRequest>(&line) {
             Ok(ControlRequest::Hello) => ControlResponse::Ready { host_pid },
-            Ok(ControlRequest::Exec { argv }) => {
+            Ok(ControlRequest::Exec { argv, timeout_ms }) => {
                 let env = spec.env.clone();
                 let workdir = spec.workdir.clone();
                 std::thread::spawn(move || {
-                    let response =
-                        match spawn(&argv, &env, workdir.as_deref(), None).and_then(wait_bounded) {
-                            Ok((status, stdout, stderr)) => ControlResponse::Exec {
-                                status,
-                                stdout,
-                                stderr,
-                            },
-                            Err(error) => ControlResponse::Error {
-                                message: format!("{error:#}"),
-                            },
-                        };
+                    let budget = Duration::from_millis(timeout_ms).min(EXEC_DEADLINE);
+                    let response = match spawn(&argv, &env, workdir.as_deref(), None)
+                        .and_then(|child| wait_bounded(child, &stream, budget))
+                    {
+                        Ok((status, stdout, stderr)) => ControlResponse::Exec {
+                            status,
+                            stdout,
+                            stderr,
+                        },
+                        Err(error) => ControlResponse::Error {
+                            message: format!("{error:#}"),
+                        },
+                    };
                     let _ = serde_json::to_writer(&mut stream, &response);
                     let _ = stream.write_all(b"\n");
                 });
@@ -760,6 +974,11 @@ pub fn helper_main(spec_path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
+pub fn helper_main(_spec_path: &Path) -> Result<()> {
+    bail!("the native-container namespace helper is only available on Linux")
+}
+
 #[cfg(target_os = "linux")]
 fn bring_loopback_up() -> Result<()> {
     let ip = tools::tool("ip")?;
@@ -767,11 +986,7 @@ fn bring_loopback_up() -> Result<()> {
         .context("bringing up the container loopback interface")
 }
 
-#[cfg(not(target_os = "linux"))]
-fn bring_loopback_up() -> Result<()> {
-    bail!("network namespaces are only available to the Linux rootless adapter")
-}
-
+#[cfg(target_os = "linux")]
 fn spawn(
     argv: &[String],
     env: &[String],
@@ -809,7 +1024,12 @@ fn spawn(
         .with_context(|| format!("executing {program:?} in the container"))
 }
 
-fn wait_bounded(mut child: std::process::Child) -> Result<(i32, String, String)> {
+#[cfg(target_os = "linux")]
+fn wait_bounded(
+    mut child: std::process::Child,
+    caller: &UnixStream,
+    budget: Duration,
+) -> Result<(i32, String, String)> {
     let stdout = child
         .stdout
         .take()
@@ -833,7 +1053,25 @@ fn wait_bounded(mut child: std::process::Child) -> Result<(i32, String, String)>
     };
     let stdout = read(Box::new(stdout));
     let stderr = read(Box::new(stderr));
-    let status = child.wait()?.code().unwrap_or(128);
+    let deadline = Instant::now() + budget;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status.code().unwrap_or(128);
+        }
+        let cancellation = if caller_disconnected(caller)? {
+            Some("container exec caller disconnected")
+        } else if Instant::now() >= deadline {
+            Some("container exec exceeded its lifecycle deadline")
+        } else {
+            None
+        };
+        if let Some(message) = cancellation {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(message);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
     let stdout = stdout
         .join()
         .map_err(|_| anyhow::anyhow!("stdout reader panicked"))??;
@@ -843,9 +1081,27 @@ fn wait_bounded(mut child: std::process::Child) -> Result<(i32, String, String)>
     Ok((status, stdout, stderr))
 }
 
+#[cfg(target_os = "linux")]
+fn caller_disconnected(stream: &UnixStream) -> Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    let mut descriptor = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: libc::POLLHUP | libc::POLLERR | libc::POLLRDHUP,
+        revents: 0,
+    };
+    let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("polling native-container exec caller");
+    }
+    Ok(result > 0 && descriptor.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLRDHUP) != 0)
+}
+
 /// Resolve a guest mount point without following image-controlled symlinks.
 /// A malicious rootfs must not turn `/data` into a host path before the bind
 /// happens, even though the bind itself is private to the mount namespace.
+#[cfg(any(target_os = "linux", test))]
 fn safe_mount_target(rootfs: &Path, guest: &Path) -> Result<PathBuf> {
     use std::path::Component;
     if !guest.is_absolute() {
@@ -885,6 +1141,7 @@ fn safe_mount_target(rootfs: &Path, guest: &Path) -> Result<PathBuf> {
     Ok(target)
 }
 
+#[cfg(target_os = "linux")]
 fn bind_device(rootfs: &Path, name: &str) -> Result<()> {
     let dev = safe_mount_target(rootfs, Path::new("/dev"))?;
     let target = dev.join(name);
@@ -915,11 +1172,6 @@ fn chroot(root: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
-fn chroot(_root: &Path) -> Result<()> {
-    bail!("container helper is Linux-only")
-}
-
 #[cfg(target_os = "linux")]
 fn bind_mount(source: &Path, target: &Path) -> Result<()> {
     use std::ffi::CString;
@@ -942,11 +1194,6 @@ fn bind_mount(source: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
-fn bind_mount(_source: &Path, _target: &Path) -> Result<()> {
-    bail!("container bind mounts are Linux-only")
-}
-
 #[cfg(target_os = "linux")]
 fn mount_proc() -> Result<()> {
     let result = unsafe {
@@ -965,11 +1212,7 @@ fn mount_proc() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
-fn mount_proc() -> Result<()> {
-    bail!("container proc mount is Linux-only")
-}
-
+#[cfg(target_os = "linux")]
 fn host_pid() -> Result<u32> {
     let status = fs::read_to_string("/proc/self/status")?;
     status
@@ -985,6 +1228,55 @@ fn host_pid() -> Result<u32> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    fn control_fixture(dir: &Path, pid: u32) -> ContainerControlEndpoint {
+        let cgroup = dir.join("cgroup");
+        fs::create_dir(&cgroup).unwrap();
+        fs::write(cgroup.join("cgroup.procs"), format!("{pid}\n")).unwrap();
+        fs::write(cgroup.join("cgroup.events"), "populated 1\n").unwrap();
+        let namespace = |name: &str| {
+            let path = dir.join(name);
+            fs::write(&path, name).unwrap();
+            path
+        };
+        let user_namespace = namespace("user.ns");
+        let mount_namespace = namespace("mount.ns");
+        let pid_namespace = namespace("pid.ns");
+        let network_namespace = namespace("network.ns");
+        let identity = runtime_identity(
+            &user_namespace,
+            &mount_namespace,
+            &pid_namespace,
+            &network_namespace,
+            &cgroup,
+        )
+        .unwrap();
+        ContainerControlEndpoint {
+            socket: dir.join("control.sock"),
+            user_namespace,
+            mount_namespace,
+            pid_namespace,
+            network_namespace,
+            cgroup,
+            identity: Some(identity),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn control_handle(control: ContainerControlEndpoint, proc: ProcId) -> Handle {
+        Handle {
+            backend: LINUX_ID.into(),
+            pid: Some(proc.pid),
+            proc: Some(proc),
+            ctl: ControlChannel::Rpc {
+                path: control.socket.clone(),
+            },
+            endpoint: None,
+            container_control: Some(control),
+            started_at: 1,
+        }
+    }
+
     #[test]
     fn control_wire_has_no_tcp_or_ssh_placeholder() {
         let endpoint = ContainerControlEndpoint {
@@ -994,6 +1286,7 @@ mod tests {
             pid_namespace: "/proc/42/ns/pid".into(),
             network_namespace: "/proc/42/ns/net".into(),
             cgroup: "/sys/fs/cgroup/user.slice/asterism-dev".into(),
+            identity: None,
         };
         let wire = serde_json::to_string(&endpoint).unwrap();
         assert!(wire.contains("container-control.sock"));
@@ -1010,6 +1303,7 @@ mod tests {
             pid_namespace: "/proc/42/ns/pid".into(),
             network_namespace: "/proc/42/ns/net".into(),
             cgroup: "/sys/fs/cgroup/user.slice/asterism-dev".into(),
+            identity: None,
         };
         let handle = Handle {
             backend: LINUX_ID.into(),
@@ -1034,6 +1328,86 @@ mod tests {
         assert_eq!(windows.id(), "windows-hyperv-container-utility-vm");
         assert!(macos.probe().is_err());
         assert!(windows.probe().is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn ready_requires_the_recorded_peer_cgroup_and_namespaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let proc = ProcId::capture(std::process::id()).unwrap();
+        let control = control_fixture(dir.path(), proc.pid);
+        let listener = UnixListener::bind(&control.socket).unwrap();
+        let host_pid = proc.pid;
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            assert!(request.contains("hello"));
+            serde_json::to_writer(&mut stream, &ControlResponse::Ready { host_pid }).unwrap();
+            stream.write_all(b"\n").unwrap();
+        });
+        let handle = control_handle(control, proc);
+        assert_eq!(state(&handle).unwrap(), RunState::Running);
+        server.join().unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn same_uid_stale_socket_cannot_impersonate_replaced_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let proc = ProcId::capture(std::process::id()).unwrap();
+        let control = control_fixture(dir.path(), proc.pid);
+        fs::rename(
+            &control.network_namespace,
+            dir.path().join("old-network.ns"),
+        )
+        .unwrap();
+        fs::write(&control.network_namespace, "replacement").unwrap();
+        let listener = UnixListener::bind(&control.socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let _ = listener.accept().unwrap();
+        });
+        let handle = control_handle(control, proc);
+        let error = call(&handle, &ControlRequest::Hello, Some(CONTROL_DEADLINE)).unwrap_err();
+        assert!(error.to_string().contains("identity changed"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn exec_is_killed_when_its_caller_disconnects() {
+        let (server, client) = UnixStream::pair().unwrap();
+        drop(client);
+        let child = Command::new("sh")
+            .args(["-c", "sleep 5"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let started = Instant::now();
+        let error = wait_bounded(child, &server, Duration::from_secs(5)).unwrap_err();
+        assert!(error.to_string().contains("caller disconnected"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(ProcId::capture(pid).is_err());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn exec_is_killed_at_its_explicit_deadline() {
+        let (server, _client) = UnixStream::pair().unwrap();
+        let child = Command::new("sh")
+            .args(["-c", "sleep 5"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        let error = wait_bounded(child, &server, Duration::from_millis(50)).unwrap_err();
+        assert!(error.to_string().contains("lifecycle deadline"));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
@@ -1067,6 +1441,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_family = "unix")]
     fn slirp_control_request_closes_its_write_half_before_reading() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("slirp.sock");
