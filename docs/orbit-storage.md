@@ -14,7 +14,7 @@ enters guest configuration.
 | latency | Live round-trip observation from the device reading the catalog; local is zero and an unmeasured live path is explicit. |
 | durability | `single-device`: this provider is the only promised durable failure domain. |
 | sharing | `single-writer`: at most one writable lease, fenced by a durable monotonic epoch. |
-| held by | Current instance, CPU device and epoch, or availability. |
+| held by | Current instance, compute device and epoch, or availability. |
 
 Provider-local administration remains available with `ast --device DEVICE
 volume ...`. This is useful for creation, removal and diagnosis, but consumers
@@ -102,7 +102,7 @@ provider and each attempt has a 30-second deadline. A timeout leaves the
 durable intent fenced for the next retry; it cannot stall every registry read
 or silently admit a guest.
 
-CPU placement is independent. Moving an instance changes where its CPU and RAM
+Compute placement is independent. Moving an instance changes where its CPU and RAM
 run, while attached volume ownership stays fixed; the bridge becomes local or
 remote as required. Portable backups record the external volume binding and
 restore it as a part that must be rebound rather than copying or silently
@@ -124,7 +124,7 @@ $ scripts/e2e-move.sh
 $ scripts/e2e-durability.sh
 ```
 
-The move lane proves attached-part records survive CPU relocation without
+The move lane proves attached-part records survive compute relocation without
 turning a remote provider into guest-visible topology. The durability lane
 power-cuts and damages real on-disk stores. Portable backup/restore is also
 exercised by `asterism-daemon`'s `control_plane` integration tests.

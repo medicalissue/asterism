@@ -214,7 +214,7 @@ enum MeshRequest {
         epoch: u64,
     },
 
-    // ---- moving an instance's cpu part --------------------------------------
+    // ---- moving an instance's compute ---------------------------------------
     //
     // Three streams, and none of them is a request/reply. A move is bulk, so
     // past the opening frame these carry [`MoveFrame`]s — control frames with
@@ -1193,7 +1193,7 @@ impl Mesh {
     /// A device that is asleep must not make its instances vanish from
     /// `ast ls` — that would read as "deleted" rather than "out of touch" —
     /// so its rows are listed from cache, marked not live, with the device
-    /// supplying their cpu still named. Assembling the view is also the moment
+    /// supplying their compute still named. Assembling the view is also the moment
     /// two shards are compared, so this is where a name collision that a
     /// partition hid comes to light.
     pub async fn orbit_registry(self: &Arc<Self>, node: &Node) -> Result<Response> {
@@ -1382,7 +1382,7 @@ impl Mesh {
     }
 
     /// A loopback port on *this* device that reaches the guest of an instance
-    /// whose cpu and ram come from another one.
+    /// whose compute comes from another one.
     ///
     /// This is `ast ssh dev` when `dev` is not here. The local daemon binds an
     /// ephemeral 127.0.0.1 listener and hands the CLI its port; every
@@ -1427,7 +1427,7 @@ impl Mesh {
         let port = listener.local_addr()?.port();
 
         // The guest only trusts the key of the device that *seeded* it, which
-        // is not always the device running it: a cpu-part swap carries the
+        // is not always the device running it: a compute move carries the
         // seed rather than rebuilding it. So the key comes from the seeding
         // device — which may well be this one.
         let seeder = instance.seeded_by().to_owned();
@@ -1510,7 +1510,7 @@ impl Mesh {
         Ok((stream, observation))
     }
 
-    // ---- moving an instance's cpu part --------------------------------------
+    // ---- moving an instance's compute ---------------------------------------
 
     /// Is `name` a device this orbit has heard of?
     pub async fn knows(&self, name: &str) -> bool {
@@ -2319,7 +2319,7 @@ impl Mesh {
 }
 
 /// Which rows in an assembled view lost a name collision, and which device
-/// supplies cpu for the instance that beat them.
+/// supplies compute for the instance that beat them.
 ///
 /// The rule is `Shard::mark_conflicted`'s: **the newer creation loses**. The
 /// tie-break after `created_at` is the instance id, and that detail is load
@@ -2420,7 +2420,7 @@ impl Drop for Splice {
 }
 
 /// One accepted loopback connection, carried to the guest's ssh port on
-/// whichever device is supplying that guest's cpu.
+/// whichever device is supplying that guest's compute.
 async fn splice_to_guest(
     mesh: &Arc<Mesh>,
     device: &str,
