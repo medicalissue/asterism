@@ -61,14 +61,14 @@ separate remote sink.
 ## Management read model
 
 The daemon exposes device-shell status as a read-only, authenticated mesh
-capability for the packaged GUI and a future hosted management consumer. It
+capability for a future hosted management consumer. It
 returns the same `ShellPolicyStatus` JSON model everywhere: `disabled`, `enabled_orbit`,
 `active` (with the active session rows), or `unavailable`, plus `changed_at`
 as Unix seconds when the visible state last changed. A missing `changed_at`
 means an older daemon or a target whose status could not be read.
 
 Policy mutation is a different request and remains local-control-socket only.
-The local GUI mutation command deliberately accepts only `enabled: boolean`
+The local mutation command deliberately accepts only `enabled: boolean`
 and no device target; remote device rows are read-only by construction. A
 hosted management panel is outside this implementation and can consume the
 same read model without gaining a mutation path.

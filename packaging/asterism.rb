@@ -2,7 +2,7 @@
 #
 # Homebrew is the distributor of record here. `depends_on "qemu"` asks
 # Homebrew to install QEMU under its own terms; Asterism never ships a QEMU
-# binary and never links QEMU code. See docs/LICENSING.md §2.
+# binary and never links QEMU code.
 #
 # Homebrew only installs formulae that live in a tap — a loose .rb path or a
 # raw URL is rejected — so this file is the source of truth and the tap

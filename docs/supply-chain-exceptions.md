@@ -1,7 +1,7 @@
 # Supply-chain gate exceptions
 
-The release gate fails closed. Its Rust advisory/license policy, npm audit,
-and repository secret scan have **no active exceptions**.
+The release gate fails closed. Its Rust advisory/license policy and
+repository secret scan have **no active exceptions**.
 
 An exception is a temporary risk decision, not a way to make CI green. Every
 entry in this file and its matching tool configuration must include all of:

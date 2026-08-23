@@ -13,9 +13,7 @@
 #
 # This is the CLI: `ast`, the `astd` daemon it starts, and `astd-vz`, the
 # code-signed helper that owns Virtualization.framework guests on macOS, or
-# the pinned Cloud Hypervisor and virtiofsd helpers on Linux. The desktop app
-# is a separate DMG — see
-# https://asterism.run/download.
+# the pinned Cloud Hypervisor and virtiofsd helpers on Linux.
 #
 # Environment:
 #   ASTERISM_VERSION=v0.1.0   install exactly this tag (default: latest release)
