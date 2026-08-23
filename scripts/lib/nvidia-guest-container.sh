@@ -18,10 +18,13 @@ esac
 [ -S "$PROJECTED_DEVICE" ] || { echo "projected /dev/nvidia0 endpoint is not a socket" >&2; exit 1; }
 [ -f "$LIBCUDA" ] || { echo "generated libcuda is missing" >&2; exit 1; }
 
-exec docker run --rm --network none --read-only \
+CONTAINER_ID="$(docker create --network none --read-only \
   --mount "type=bind,src=$GUEST_BINARY,dst=/asterism/guest,readonly" \
   --mount "type=bind,src=$PROJECTED_DEVICE,dst=/dev/nvidia0" \
   --mount "type=bind,src=$LIBCUDA,dst=/usr/lib/libcuda.so.1,readonly" \
   --env ASTERISM_GUEST_NVIDIA_DEVICE=/dev/nvidia0 \
   --env ASTERISM_LIBCUDA=/usr/lib/libcuda.so.1 \
-  "$IMAGE" /asterism/guest
+  "$IMAGE" /asterism/guest)"
+trap 'docker rm -f "$CONTAINER_ID" >/dev/null 2>&1 || true' EXIT
+printf 'guest_container_id=%s\n' "$CONTAINER_ID"
+docker start --attach "$CONTAINER_ID"
