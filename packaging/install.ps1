@@ -206,7 +206,7 @@ function Install-Release {
         }
         $got = Get-Sha256 $tarball
         if ($got -ne $want) {
-            Die "checksum mismatch on $artifact:`n    expected $want`n    got      $got`nrefusing to install. Nothing was written."
+            Die "checksum mismatch on ${artifact}:`n    expected $want`n    got      $got`nrefusing to install. Nothing was written."
         }
         Say "sha256 ok: $got"
 
