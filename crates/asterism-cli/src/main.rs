@@ -392,15 +392,14 @@ enum Command {
     },
     /// Change one of an instance's parts.
     ///
-    /// Today there is one: `cpu`, which is the device supplying cpu and ram.
-    /// The orbit is a pool of parts and an instance is a computer assembled
-    /// from them, so this really is one line of a parts table — the
-    /// instance's name, its id and its snapshots do not move, because they
-    /// were never on a device.
+    /// Canonical today: `compute`, the orbit device supplying CPU, physical
+    /// RAM, and VM/container execution state as one placement unit. `cpu`
+    /// remains a compatibility alias. The instance's name, id, and snapshots
+    /// do not move, because they were never on a device.
     Set {
         /// The instance whose part is changing.
         name: String,
-        /// The part to change. `cpu` is the only one today.
+        /// The part to change. `compute` is canonical; `cpu` is an alias.
         #[arg(value_name = "PART")]
         part: String,
         /// The device to source it from.
@@ -409,19 +408,18 @@ enum Command {
         // clap would hand this positional's value to it.
         #[arg(value_name = "DEVICE")]
         to: String,
-        /// Shut the guest down first. Moving cpu/ram is offline on every
+        /// Shut the guest down first. Moving compute is offline on every
         /// backend Asterism has, so a running instance is refused without it.
         #[arg(long)]
         down: bool,
     },
-    /// Move an instance's cpu and ram to another device.
+    /// Move an instance's compute to another device.
     ///
-    /// The same thing as `ast set <instance> cpu <device>`, spelled the way
-    /// people ask for it.
+    /// Alias of `ast set <instance> compute <device>`.
     Move {
         /// The instance to move.
         name: String,
-        /// The device that will supply its cpu and ram from here on.
+        /// The device that will supply its compute from here on.
         #[arg(value_name = "DEVICE")]
         to: String,
         /// Shut the guest down first.
@@ -880,7 +878,7 @@ fn main() -> Result<()> {
         }
         Command::Move { name, to, down } => {
             local_only("move", device.as_deref())?;
-            return set_part(&name, "cpu", &to, down);
+            return set_part(&name, "compute", &to, down);
         }
         // A volume is a device's part of the pool, so these are about the
         // daemon in front of you unless `--device` aims them elsewhere.
@@ -2104,20 +2102,21 @@ fn device_shell_policy(action: Option<DeviceShellCommand>) -> Result<()> {
 
 // ---- parts -----------------------------------------------------------------
 
-/// `ast set <instance> cpu <device>`, and its alias `ast move`.
+/// `ast set <instance> compute <device>`, and its aliases `cpu` and `ast move`.
 ///
 /// The daemon does all of it — resolving the instance across the orbit,
 /// probing the target, fencing the source, moving the bytes and committing —
 /// and reports each step as it happens, because the middle one is a disk
 /// crossing a network and takes as long as it takes. All this end does is
-/// print.
+/// print. The wire command remains `set_cpu` so older daemons still parse it.
 fn set_part(name: &str, part: &str, device: &str, down: bool) -> Result<()> {
-    // One part today, and saying which one is better than a flag: the user
-    // has to be able to see, from the command, what is being changed.
-    if !matches!(part, "cpu" | "cpu/ram" | "ram") {
+    // Compute is one placement unit; CPU and physical RAM cannot be placed
+    // independently.
+    if !asterism_core::instance::is_compute_part(part) {
         bail!(
-            "there is no {part:?} part to set. Today `ast set <instance> cpu <device>` \
-             moves cpu and ram, which come as a pair; volumes are changed with \
+            "there is no {part:?} placement part. `ast set <instance> compute <device>` \
+             moves whole compute (CPU, physical RAM, and execution state); `cpu` and \
+             `ast move` remain aliases. Volumes are changed with \
              `ast attach` and `ast detach`"
         );
     }
@@ -4495,6 +4494,17 @@ mod tests {
     use std::cell::Cell;
     use std::collections::VecDeque;
     use std::sync::Mutex;
+
+    #[test]
+    fn ram_names_are_refused_as_separate_compute_placements() {
+        for part in ["ram", "cpu/ram"] {
+            let error = set_part("agent", part, "desktop", false).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("whole compute"), "{message}");
+            assert!(message.contains("CPU, physical RAM"), "{message}");
+            assert!(message.contains("compute <device>"), "{message}");
+        }
+    }
 
     struct MemoryStore(Mutex<Option<Session>>);
 
