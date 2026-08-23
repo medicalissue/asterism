@@ -21,7 +21,7 @@ cuda_runtime_version=12.4
 provenance_verified=true
 guest_image_digest=sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
 provider_image_digest=sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
-guest_container_id=asterism-guest-1234
+guest_container_id=aaaaaaaaaaaa,bbbbbbbbbbbb
 guest_device_name=guest-gpu
 provider_device_name=provider-gpu
 guest_device_id=11111111111111111111111111111111
@@ -75,6 +75,7 @@ must_refuse executor reference
 must_refuse hardware_cuda_executed false
 must_refuse version_skew_error conflict
 must_refuse provider_helper_pid_after 201
+must_refuse guest_container_id aaaaaaaaaaaa,aaaaaaaaaaaa
 must_refuse mesh_open_bearer true
 must_refuse provenance_verified false
 must_refuse transcript_root caller-authored

@@ -50,6 +50,8 @@ struct Bundle {
     provider_device_name: String,
     guest_device_id: String,
     provider_device_id: String,
+    first_guest_container_id: String,
+    second_guest_container_id: String,
     first_gpu_uuid: String,
     second_gpu_uuid: String,
     events: Vec<Event>,
@@ -76,6 +78,7 @@ struct Observation {
     helper_pid: u32,
     route_pid: u32,
     guest_pid: u32,
+    guest_container_id: String,
     guest_output: String,
     crossed_digest: String,
     mesh_open_bearer: bool,
@@ -206,6 +209,8 @@ fn run(args: &[String]) -> Result<()> {
         provider_device_name: provider_name,
         guest_device_id: guest_id,
         provider_device_id: provider_id,
+        first_guest_container_id: direct.guest_container_id.clone(),
+        second_guest_container_id: relay.guest_container_id.clone(),
         first_gpu_uuid: first_uuid,
         second_gpu_uuid: second_uuid,
         events: Vec::new(),
@@ -375,6 +380,14 @@ fn execute_one(args: &[String]) -> Result<()> {
     let stdout = String::from_utf8(guest_output.stdout)?;
     ensure!(stdout.contains("hardware_path=guest_libcuda_mesh"));
     ensure!(stdout.contains("guest_output=6.0,2.0,6.0"));
+    let guest_container_id = output_value(&stdout, "guest_container_id")?;
+    ensure!(
+        guest_container_id.len() >= 12
+            && guest_container_id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+        "guest launcher did not report a Docker container ID"
+    );
 
     let mut mesh_path = server
         .join()
@@ -407,6 +420,7 @@ fn execute_one(args: &[String]) -> Result<()> {
         helper_pid: std::process::id(),
         route_pid,
         guest_pid,
+        guest_container_id,
         guest_output: "6.0,2.0,6.0".into(),
         crossed_digest,
         mesh_open_bearer,
@@ -472,9 +486,10 @@ fn append_observation(
         generation,
         "projected_cuda_executed",
         &format!(
-            "path={};gpu={};output={};crossed={};bearer={};hardware={}",
+            "path={};gpu={};container={};output={};crossed={};bearer={};hardware={}",
             observation.path,
             observation.gpu_uuid,
+            observation.guest_container_id,
             observation.guest_output,
             observation.crossed_digest,
             observation.mesh_open_bearer,
@@ -590,6 +605,10 @@ fn verify_bundle(bundle: &Bundle) -> Result<()> {
     ensure!(bundle.guest_device_name != bundle.provider_device_name);
     ensure!(bundle.guest_device_id != bundle.provider_device_id);
     ensure!(bundle.first_gpu_uuid != bundle.second_gpu_uuid);
+    ensure!(
+        bundle.first_guest_container_id != bundle.second_guest_container_id,
+        "guest container did not restart"
+    );
     for digest in [
         &bundle.driver_digest,
         &bundle.astd_digest,
@@ -630,6 +649,8 @@ fn verify_bundle(bundle: &Bundle) -> Result<()> {
     }
     ensure!(direct.detail.contains(&bundle.first_gpu_uuid));
     ensure!(relay.detail.contains(&bundle.second_gpu_uuid));
+    ensure!(direct.detail.contains(&bundle.first_guest_container_id));
+    ensure!(relay.detail.contains(&bundle.second_guest_container_id));
     required_event(bundle, "revoke_refused", "revoked")?;
     required_event(bundle, "loss_refused", "device_lost")?;
     required_event(bundle, "contention_refused", "limit_exceeded")?;
@@ -686,10 +707,11 @@ fn write_evidence(path: &Path, bundle: &Bundle) -> Result<()> {
         .digest
         .clone();
     let text = format!(
-        "guest_image_digest={}\nprovider_image_digest={}\nguest_container_id=asterism-container-{}\nguest_device_name={}\nprovider_device_name={}\nguest_device_id={}\nprovider_device_id={}\npath=guest-mesh-provider\ndirect_path=true\nrelay_path=true\nguest_path=/dev/nvidia0\nlibcuda_path=sha256:{}\nexecutor=cuda\nprovider_helper_kind=process\nguest_output=6.0,2.0,6.0\nprovider_astd_pid_before={}\nprovider_astd_pid_after={}\nprovider_helper_pid_before={}\nprovider_helper_pid_after={}\nguest_pid_before={}\nguest_pid_after={}\nprovider_astd_restarted=true\nprovider_helper_restarted=true\nguest_restarted=true\nrevoke=true\ncontention=true\nloss=true\nversion_skew_fresh_session=true\nversion_skew_error=unsupported_version\nmesh_open_bearer=false\nhardware_cuda_executed=true\ndriver_digest={}\nastd_digest={}\nlibcuda_digest={}\nguest_binary_digest={}\nguest_launcher_digest={}\ntranscript_root={}\n",
+        "guest_image_digest={}\nprovider_image_digest={}\nguest_container_id={},{}\nguest_device_name={}\nprovider_device_name={}\nguest_device_id={}\nprovider_device_id={}\npath=guest-mesh-provider\ndirect_path=true\nrelay_path=true\nguest_path=/dev/nvidia0\nlibcuda_path=sha256:{}\nexecutor=cuda\nprovider_helper_kind=process\nguest_output=6.0,2.0,6.0\nprovider_astd_pid_before={}\nprovider_astd_pid_after={}\nprovider_helper_pid_before={}\nprovider_helper_pid_after={}\nguest_pid_before={}\nguest_pid_after={}\nprovider_astd_restarted=true\nprovider_helper_restarted=true\nguest_restarted=true\nrevoke=true\ncontention=true\nloss=true\nversion_skew_fresh_session=true\nversion_skew_error=unsupported_version\nmesh_open_bearer=false\nhardware_cuda_executed=true\ndriver_digest={}\nastd_digest={}\nlibcuda_digest={}\nguest_binary_digest={}\nguest_launcher_digest={}\ntranscript_root={}\n",
         bundle.guest_image_digest,
         bundle.provider_image_digest,
-        bundle.run_id,
+        bundle.first_guest_container_id,
+        bundle.second_guest_container_id,
         bundle.guest_device_name,
         bundle.provider_device_name,
         bundle.guest_device_id,
@@ -888,6 +910,14 @@ fn env_required(name: &str) -> Result<String> {
         .with_context(|| format!("{name} is required"))
 }
 
+fn output_value(text: &str, key: &str) -> Result<String> {
+    text.lines()
+        .find_map(|line| line.strip_prefix(&format!("{key}=")))
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .with_context(|| format!("guest transcript is missing {key}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -938,6 +968,8 @@ mod tests {
             provider_device_name: "provider".into(),
             guest_device_id: "1".repeat(64),
             provider_device_id: "2".repeat(64),
+            first_guest_container_id: "a".repeat(64),
+            second_guest_container_id: "b".repeat(64),
             first_gpu_uuid: "GPU-first".into(),
             second_gpu_uuid: "GPU-second".into(),
             events: Vec::new(),
@@ -961,7 +993,7 @@ mod tests {
         )
         .unwrap();
         let crossed_a = format!("blake3:{}", "a".repeat(64));
-        let direct_detail = format!("path=direct;gpu=GPU-first;output=6.0,2.0,6.0;crossed={crossed_a};bearer=false;hardware=true");
+        let direct_detail = format!("path=direct;gpu=GPU-first;container={};output=6.0,2.0,6.0;crossed={crossed_a};bearer=false;hardware=true", bundle.first_guest_container_id);
         append(
             &mut bundle,
             "guest",
@@ -1008,7 +1040,7 @@ mod tests {
         )
         .unwrap();
         let crossed_b = format!("blake3:{}", "b".repeat(64));
-        let relay_detail = format!("path=relay;gpu=GPU-second;output=6.0,2.0,6.0;crossed={crossed_b};bearer=false;hardware=true");
+        let relay_detail = format!("path=relay;gpu=GPU-second;container={};output=6.0,2.0,6.0;crossed={crossed_b};bearer=false;hardware=true", bundle.second_guest_container_id);
         append(
             &mut bundle,
             "guest",

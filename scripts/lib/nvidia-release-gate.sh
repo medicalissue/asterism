@@ -175,14 +175,21 @@ nvidia_gate_judge() {
     return 1
   fi
 
-  local guest_id provider_id container skew_error guest_output
+  local guest_id provider_id container first_container second_container skew_error guest_output
   guest_id="$(nvidia_gate_require_kv "$file" guest_device_id)" || return 1
   provider_id="$(nvidia_gate_require_kv "$file" provider_device_id)" || return 1
   [[ "$guest_id" =~ ^[0-9a-f]{16,}$ ]] || { echo "NVIDIA GATE FAIL: guest_device_id" >&2; return 1; }
   [[ "$provider_id" =~ ^[0-9a-f]{16,}$ ]] || { echo "NVIDIA GATE FAIL: provider_device_id" >&2; return 1; }
   [ "$guest_id" != "$provider_id" ] || { echo "NVIDIA GATE FAIL: mesh device IDs must differ" >&2; return 1; }
   container="$(nvidia_gate_require_kv "$file" guest_container_id)" || return 1
-  case "$container" in ''|mock|local|host) echo "NVIDIA GATE FAIL: guest_container_id" >&2; return 1 ;; esac
+  first_container="${container%%,*}"
+  second_container="${container#*,}"
+  [[ "$first_container" =~ ^[0-9a-f]{12,64}$ ]] \
+    || { echo "NVIDIA GATE FAIL: first guest container ID" >&2; return 1; }
+  [[ "$second_container" =~ ^[0-9a-f]{12,64}$ ]] \
+    || { echo "NVIDIA GATE FAIL: second guest container ID" >&2; return 1; }
+  [ "$first_container" != "$second_container" ] \
+    || { echo "NVIDIA GATE FAIL: guest container did not restart" >&2; return 1; }
   nvidia_gate_require_kv "$file" driver_version >/dev/null || return 1
   nvidia_gate_require_kv "$file" cuda_runtime_version >/dev/null || return 1
   guest_output="$(nvidia_gate_require_kv "$file" guest_output)" || return 1
