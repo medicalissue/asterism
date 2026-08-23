@@ -9,11 +9,17 @@ projected local endpoint, not a string in instance status.
 | Layer | Mechanism |
 | --- | --- |
 | Guest-visible device | **CUSE character-device service** at `/dev/nvidia0` on Linux when `/dev/cuse` exists (open/read/write/release plus fail-closed NVIDIA ioctl). Portable source fixtures bind a **Unix-domain socket** at `<guest-root>/dev/nvidia0` so `connect(2)` is a real local endpoint. |
-| CUDA API | Injected ELF `libcuda.so.1.0.0` (`crates/asterism-libcuda`) with SONAME `libcuda.so.1`, versioned/unversioned Driver API exports, and the exact matrix below. |
+| CUDA API | Injected ELF `libcuda.so.1.0.0` (`crates/asterism-libcuda`) with SONAME `libcuda.so.1`, unversioned ELF Driver API exports (including explicit `_v2` ABI names), and the exact matrix below. |
 | Guest control | Injected `asterism-gpu-guest` runs as the guest-only `asterism-gpu` system account, owns CUSE through a root-owned 0660 udev rule, and listens on instance-bound AF_VSOCK port **1022**. It authenticates with the per-instance guest key and distinct `asterism-guest-gpu` proof label. There is no TCP listener. |
 | Local astd | Unix-socket frames `gpu_guest_open` / `gpu_guest_frame` (protocol 8). Startup registers only NVIDIA devices discovered and admitted from live `nvidia-smi`; CPU-only hosts advertise zero providers. |
 | Mesh | Dedicated iroh stream `kind=gpu` carrying typed, length-prefixed frames. Opening frame is `{instance_id, provider_generation}` only. |
 | Provider | Attach placement uses live provider advertisements and persists a token-free `GpuAttachment`; detach revokes at the selected provider before deleting metadata. `ProductionProvider` authorizes by authenticated mesh peer + instance + generation, re-evaluating time on every call. Multiple calls may be in flight, queued work is cancellable before apply, and credit bounds backpressure. |
+
+CUDA's documented Driver ABI generations use distinct `_v*` entrypoint names
+and the CUDA-version selector passed to `cuGetProcAddress`; they are not GNU
+ELF symbol versions. The packaged shim therefore audits the literal exported
+names and refuses any accidental `name@version` export. See NVIDIA's
+[Driver Entry Point Access](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/driver-entry-point-access.html).
 
 ## Packaging and injection
 

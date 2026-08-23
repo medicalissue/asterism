@@ -38,7 +38,11 @@ command -v "$nm_tool" >/dev/null 2>&1 || {
 }
 "$readelf_tool" -d "$destination/lib/libcuda.so.1.0.0" | grep -q 'SONAME.*libcuda.so.1'
 
-exports=$("$nm_tool" -D --defined-only "$destination/lib/libcuda.so.1.0.0" | awk '{print $NF}' | sed 's/@.*//')
+exports=$("$nm_tool" -D --defined-only "$destination/lib/libcuda.so.1.0.0" | awk '{print $NF}')
+if printf '%s\n' "$exports" | grep -q '@'; then
+  echo "unexpected ELF-versioned CUDA Driver export" >&2
+  exit 1
+fi
 expected='cuInit cuDriverGetVersion cuDeviceGetCount cuDeviceGet cuDeviceGetName cuDeviceGetUuid cuDeviceGetAttribute cuCtxCreate cuCtxDestroy cuCtxGetCurrent cuCtxSetCurrent cuCtxSynchronize cuMemAlloc cuMemFree cuMemcpyHtoD cuMemcpyDtoH cuModuleLoadData cuModuleUnload cuModuleGetFunction cuLaunchKernel cuGetErrorString cuGetErrorName cuCtxCreate_v2 cuCtxDestroy_v2 cuMemAlloc_v2 cuMemFree_v2 cuMemcpyHtoD_v2 cuMemcpyDtoH_v2'
 for symbol in $expected; do
   printf '%s\n' "$exports" | grep -qx "$symbol" || {

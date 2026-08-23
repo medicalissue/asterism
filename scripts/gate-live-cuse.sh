@@ -94,7 +94,8 @@ fi
 if [ "$gate_rc" -eq 0 ]; then
   [ -x "$INSTALL_PREFIX/bin/guest-gpu/bin/asterism-gpu-guest" ] \
     || { block "product install did not ship the guest CUSE opener beside astd" || gate_rc=1; }
-  [ -f "$INSTALL_PREFIX/bin/guest-gpu/lib/libcuda.so.1.0.0" ] \
+  installed_libcuda="$INSTALL_PREFIX/bin/guest-gpu/lib/libcuda.so.1.0.0"
+  [ -f "$installed_libcuda" ] \
     || { block "product install did not ship the matching guest libcuda" || gate_rc=1; }
   grep -q 'project_guest_device(Path::new("/"))' crates/asterism-gpu-guest/src/main.rs \
     || { block "shipped guest service is not the process that mounts guest /dev/cuse" || gate_rc=1; }
@@ -104,6 +105,46 @@ if [ "$gate_rc" -eq 0 ]; then
   record "host_astd_opens_cuse=false"
   record "udev_placement=guest:/etc/udev/rules.d/70-asterism-cuse.rules"
   record "credential_refresh=system_service_start_no_relogin"
+fi
+
+if [ "$gate_rc" -eq 0 ]; then
+  readelf -d "$installed_libcuda" >"$EVIDENCE/installed-libcuda.dynamic.log" 2>&1 \
+    || { block "installed guest libcuda is not an inspectable ELF shared object" || gate_rc=1; }
+fi
+if [ "$gate_rc" -eq 0 ]; then
+  grep -q 'SONAME.*libcuda.so.1' "$EVIDENCE/installed-libcuda.dynamic.log" \
+    || { block "installed guest libcuda has the wrong SONAME" || gate_rc=1; }
+  nm -D --defined-only "$installed_libcuda" >"$EVIDENCE/installed-libcuda.exports.log" 2>&1 \
+    || { block "installed guest libcuda exports are not inspectable" || gate_rc=1; }
+fi
+if [ "$gate_rc" -eq 0 ]; then
+  installed_cuda_exports="$(awk '{print $NF}' "$EVIDENCE/installed-libcuda.exports.log")"
+  if printf '%s\n' "$installed_cuda_exports" | grep -q '@'; then
+    block "installed guest libcuda invented an ELF symbol-version requirement" || gate_rc=1
+  else
+    expected_cuda_exports='cuInit cuDriverGetVersion cuDeviceGetCount cuDeviceGet cuDeviceGetName cuDeviceGetUuid cuDeviceGetAttribute cuCtxCreate cuCtxDestroy cuCtxGetCurrent cuCtxSetCurrent cuCtxSynchronize cuMemAlloc cuMemFree cuMemcpyHtoD cuMemcpyDtoH cuModuleLoadData cuModuleUnload cuModuleGetFunction cuLaunchKernel cuGetErrorString cuGetErrorName cuCtxCreate_v2 cuCtxDestroy_v2 cuMemAlloc_v2 cuMemFree_v2 cuMemcpyHtoD_v2 cuMemcpyDtoH_v2'
+    for symbol in $expected_cuda_exports; do
+      printf '%s\n' "$installed_cuda_exports" | grep -qx "$symbol" || {
+        block "installed guest libcuda is missing exact Driver export $symbol" || gate_rc=1
+        break
+      }
+    done
+    for symbol in $installed_cuda_exports; do
+      case "$symbol" in
+      cu*)
+        case " $expected_cuda_exports " in
+        *" $symbol "*) ;;
+        *) block "installed guest libcuda has unexpected Driver export $symbol" || gate_rc=1 ;;
+        esac
+        ;;
+      esac
+    done
+  fi
+  if [ "$gate_rc" -eq 0 ]; then
+    record "libcuda_soname=libcuda.so.1"
+    record "libcuda_elf_symbol_versions=none"
+    record "libcuda_abi_generations=explicit_export_names"
+  fi
 fi
 
 if [ "$gate_rc" -eq 0 ]; then
