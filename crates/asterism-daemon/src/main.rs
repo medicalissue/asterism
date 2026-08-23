@@ -64,6 +64,10 @@ mod gpu;
 mod images;
 mod instance;
 mod mesh;
+#[cfg(unix)]
+mod nbd;
+#[cfg(windows)]
+#[path = "nbd_windows.rs"]
 mod nbd;
 mod orbit;
 mod persist;
