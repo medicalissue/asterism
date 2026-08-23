@@ -23,7 +23,10 @@ env:
 jobs:
   exact-kvm-lifecycle:
     name: exact v53.0 lifecycle on real KVM
-    runs-on: ubuntu-24.04
+    # The current 24.04 hosted kernel denies virtiofsd's unprivileged mount
+    # namespace even with a one-entry uid/gid map. Keep namespace isolation
+    # mandatory and use GitHub's supported 22.04 KVM image.
+    runs-on: ubuntu-22.04
     timeout-minutes: 90
     steps:
       # This checkout supplies only the observer workflow and harness. Product
