@@ -8,6 +8,7 @@
 //! (or `ast doctor`) can see exactly which one is missing.
 
 use std::path::{Path, PathBuf};
+#[cfg(any(test, not(windows)))]
 use std::process::Command;
 
 use anyhow::{bail, Result};
