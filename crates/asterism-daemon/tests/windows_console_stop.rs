@@ -98,6 +98,18 @@ fn send_ctrl_c_to(child_pid: u32) {
 fn console_ctrl_c_exits_without_waiting_for_the_scm_latch() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).expect("creating the daemon home");
+    // Windows does not permit opening a directory as a regular file, so its
+    // fresh-home durability barrier currently refuses before a console daemon
+    // can publish readiness. This regression is about process shutdown, not
+    // first-home publication: seed the exact stamp this build recognizes so
+    // startup performs its normal read-only compatibility path.
+    let stamp = asterism_core::compat::HomeStamp::current();
+    std::fs::write(
+        home.join("home.json"),
+        serde_json::to_vec(&stamp).expect("serializing the current home stamp"),
+    )
+    .expect("seeding the current home stamp");
     let child = Command::new(env!("CARGO_BIN_EXE_astd"))
         .env("ASTERISM_HOME", &home)
         .env("ASTERISM_MESH", "local")
