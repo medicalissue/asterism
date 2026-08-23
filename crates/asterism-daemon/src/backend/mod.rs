@@ -393,6 +393,12 @@ pub fn boot_req<'a>(inst: &'a Instance, hv: &dyn Hypervisor) -> Result<BootReq<'
     // the old OCI-specific refusal without teaching orchestration which
     // hypervisor is underneath it.
     if req.base.kind == ImageKind::OciRootfs {
+        if inst.gpu.is_some() && !hv.caps().guest_gpu_projection {
+            anyhow::bail!(
+                "the {} backend cannot project an attached GPU into this guest",
+                hv.id()
+            );
+        }
         check_can_boot(hv, &req.base, &inst.publish)?;
         req.shares = shares;
         req.egress = egress;
@@ -405,9 +411,22 @@ pub fn boot_req<'a>(inst: &'a Instance, hv: &dyn Hypervisor) -> Result<BootReq<'
     // that answers on the guest's virtio socket. A TAP backend that does
     // not run DHCP also supplies a NoCloud network-config document here,
     // through the same trait, so orchestration never branches on id().
-    let guest_config = hv
+    let mut guest_config = hv
         .guest_config(inst)
         .with_context(|| format!("preparing what the {} backend puts in a guest", hv.id()))?;
+    if inst.gpu.is_some() {
+        if !hv.caps().guest_gpu_projection {
+            anyhow::bail!(
+                "the {} backend cannot project an attached GPU into this guest",
+                hv.id()
+            );
+        }
+        let artifacts = asterism_core::remote_gpu_guest::GuestProjectionArtifacts::discover()
+            .context(
+            "finding packaged Linux GPU guest artifacts; run scripts/build-guest-gpu-artifacts.sh",
+        )?;
+        guest_config.push_str(&artifacts.cloud_config());
+    }
     let network_config = hv.guest_network_config(inst).with_context(|| {
         format!(
             "preparing the network-config the {} backend puts in a guest",
@@ -1117,6 +1136,7 @@ mod tests {
                 direct_kernel: self.direct_kernel,
                 port_forward: self.port_forward,
                 guest_egress: None,
+                guest_gpu_projection: false,
                 disk_formats: self.disk_formats,
             }
         }

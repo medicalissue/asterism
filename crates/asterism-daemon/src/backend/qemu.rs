@@ -273,6 +273,7 @@ impl Hypervisor for Qemu {
             guest_egress: Some(GuestEgress::LoopbackGateway {
                 gateway: GUEST_GATEWAY,
             }),
+            guest_gpu_projection: false,
             // Raw first: it is what new instances get, and what a VZ host
             // would be able to boot. qcow2 stays readable for the instances
             // and the hand-supplied images that are already in it.
@@ -376,6 +377,7 @@ impl Hypervisor for Qemu {
                 (!req.shares.is_empty()).then_some(ShareKind::NinePfs),
                 &req.egress,
                 &req.bootstrap,
+                None,
             )?;
         }
 

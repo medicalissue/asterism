@@ -4,7 +4,8 @@
 //! `asterism-guest-gpu` transcript, then forwards length-prefixed guest
 //! frames onto `astd`'s unix socket. No bearer, no public listener.
 
-use std::io::{BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::Shutdown;
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,11 +52,14 @@ fn session(fd: RawFd, key: [u8; 32], instance: &str) -> Result<()> {
     let vsock = unsafe { UnixStream::from_raw_fd(fd) };
     vsock
         .set_read_timeout(Some(std::time::Duration::from_secs(30)))
-        .ok();
+        .context("setting the GPU vsock authentication timeout")?;
     let mut reader = BufReader::new(vsock.try_clone().context("cloning GPU vsock")?);
     let mut writer = vsock;
     gpu_vsock_host_handshake(&mut reader, &mut writer, &key, &fresh_nonce()?)
         .map_err(|err| anyhow!(err.message))?;
+    writer
+        .set_read_timeout(None)
+        .context("clearing the GPU vsock authentication timeout")?;
 
     let mut astd = UnixStream::connect(paths::socket_path())
         .with_context(|| format!("connecting local astd for GPU instance {instance}"))?;
@@ -76,47 +80,90 @@ fn session(fd: RawFd, key: [u8; 32], instance: &str) -> Result<()> {
         other => anyhow::bail!("unexpected astd reply to GPU guest open: {other:?}"),
     }
 
-    loop {
-        let frame: GuestFrame = read_frame(&mut reader).map_err(|err| anyhow!(err.message))?;
-        let closing = matches!(frame, GuestFrame::Close);
-        let body = serde_json::to_vec(&Request::GpuGuestFrame { frame })?;
-        astd.write_all(&body)?;
-        astd.write_all(b"\n")?;
-        astd.flush()?;
-        let reply: Response = serde_json::from_str(&read_line(&mut astd_reader)?)?;
-        match reply {
-            Response::GpuGuestReply { reply } => {
-                write_frame(&mut writer, &reply).map_err(|err| anyhow!(err.message))?;
-            }
-            Response::GpuGuestRefused { message, .. } => {
-                write_frame(
-                    &mut writer,
-                    &GuestReply::Refused {
-                        code: "astd".into(),
-                        message,
-                    },
-                )
-                .map_err(|err| anyhow!(err.message))?;
-            }
-            other => anyhow::bail!("unexpected astd GPU reply: {other:?}"),
-        }
-        if closing {
-            let _ = serde_json::to_writer(&mut astd, &Request::GpuGuestClose);
-            let _ = astd.write_all(b"\n");
-            break;
-        }
-    }
+    // One pump per direction is load-bearing. Waiting for astd's reply
+    // before reading another guest frame made the credit window and Cancel
+    // unreachable on the actual VZ path.
+    std::thread::scope(|scope| -> Result<()> {
+        let upstream = scope.spawn(move || -> Result<()> {
+            let outcome = (|| -> Result<()> {
+                loop {
+                    let frame: GuestFrame =
+                        read_frame(&mut reader).map_err(|err| anyhow!(err.message))?;
+                    let closing = matches!(frame, GuestFrame::Close);
+                    let body = serde_json::to_vec(&Request::GpuGuestFrame { frame })?;
+                    astd.write_all(&body)?;
+                    astd.write_all(b"\n")?;
+                    astd.flush()?;
+                    if closing {
+                        serde_json::to_writer(&mut astd, &Request::GpuGuestClose)?;
+                        astd.write_all(b"\n")?;
+                        astd.flush()?;
+                        break;
+                    }
+                }
+                Ok(())
+            })();
+            let _ = astd.shutdown(Shutdown::Both);
+            outcome
+        });
+        let downstream = scope.spawn(move || -> Result<()> {
+            let outcome = (|| -> Result<()> {
+                loop {
+                    let line = match read_line(&mut astd_reader) {
+                        Ok(line) => line,
+                        Err(err) if err.to_string().contains("closed") => break,
+                        Err(err) => return Err(err),
+                    };
+                    let reply: Response = serde_json::from_str(&line)?;
+                    match reply {
+                        Response::GpuGuestReply { reply } => {
+                            write_frame(&mut writer, &reply).map_err(|err| anyhow!(err.message))?;
+                        }
+                        Response::GpuGuestRefused { message, .. } => {
+                            write_frame(
+                                &mut writer,
+                                &GuestReply::Refused {
+                                    code: "astd".into(),
+                                    message,
+                                },
+                            )
+                            .map_err(|err| anyhow!(err.message))?;
+                        }
+                        other => anyhow::bail!("unexpected astd GPU reply: {other:?}"),
+                    }
+                }
+                Ok(())
+            })();
+            let _ = writer.shutdown(Shutdown::Both);
+            outcome
+        });
+        upstream
+            .join()
+            .map_err(|_| anyhow!("GPU upstream pump panicked"))??;
+        downstream
+            .join()
+            .map_err(|_| anyhow!("GPU downstream pump panicked"))??;
+        Ok(())
+    })?;
     let _ = GUEST_GPU_VSOCK_PORT;
     Ok(())
 }
 
 fn read_line(reader: &mut impl std::io::BufRead) -> Result<String> {
-    let mut line = String::new();
-    let n = reader.read_line(&mut line)?;
+    let mut line = Vec::new();
+    let n = reader
+        .take((asterism_core::ipc::MAX_RESPONSE_FRAME + 1) as u64)
+        .read_until(b'\n', &mut line)?;
     if n == 0 {
         anyhow::bail!("astd closed the GPU guest session");
     }
-    Ok(line)
+    if line.len() > asterism_core::ipc::MAX_RESPONSE_FRAME || !line.ends_with(b"\n") {
+        anyhow::bail!("astd GPU guest response exceeded the local frame limit");
+    }
+    while matches!(line.last(), Some(b'\n' | b'\r')) {
+        line.pop();
+    }
+    String::from_utf8(line).context("astd GPU guest response was not UTF-8")
 }
 
 fn fresh_nonce() -> Result<String> {

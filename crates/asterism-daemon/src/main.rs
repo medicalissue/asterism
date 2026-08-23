@@ -190,11 +190,14 @@ async fn main() -> Result<()> {
                 mesh.self_name().await
             );
             let name = node.device_name().await;
-            if let Err(err) = node
+            match node
                 .gpu
-                .register_reference(&name, &mesh.device_id().to_string())
+                .register_hardware(&name, &mesh.device_id().to_string())
+                .await
             {
-                eprintln!("astd: GPU provider not registered: {err:#}");
+                Ok(0) => {}
+                Ok(count) => eprintln!("astd: registered {count} NVIDIA GPU provider(s)"),
+                Err(err) => eprintln!("astd: NVIDIA GPU inventory refused: {err:#}"),
             }
             Some(mesh)
         }
@@ -709,6 +712,45 @@ fn at_most(response: Response, spoken: u32) -> Response {
 /// resolved across the orbit and forwarded to whichever device holds that
 /// row — which is where `--device` stops being necessary.
 async fn dispatch(request: Request, node: &Node, mesh: Option<&Arc<Mesh>>) -> Response {
+    if let Request::AttachGpu {
+        name,
+        provider_device,
+        gpu_uuid,
+        memory_bytes,
+    } = &request
+    {
+        return match gpu::resolve_attach(
+            name.clone(),
+            provider_device.clone(),
+            gpu_uuid.clone(),
+            *memory_bytes,
+            node,
+            mesh,
+        )
+        .await
+        {
+            Ok(resolved) => route(resolved, node, mesh).await,
+            Err(err) => Response::Error {
+                message: format!("{err:#}"),
+            },
+        };
+    }
+    if let Request::DetachGpu { name } = &request {
+        if let Err(err) = gpu::revoke_for_detach(name, node, mesh).await {
+            return Response::Error {
+                message: format!("{err:#}"),
+            };
+        }
+    }
+    if let Request::Remove { name } = &request {
+        if let Err(err) = gpu::revoke_for_remove(name, node, mesh).await {
+            return Response::Error {
+                message: format!(
+                    "instance removal refused until its GPU lease is revoked: {err:#}"
+                ),
+            };
+        }
+    }
     if secret::is_orbit_request(&request) {
         return secret::serve(request, node, mesh).await;
     }
@@ -819,6 +861,9 @@ pub(crate) async fn handle(req: Request, node: &Node) -> Response {
     }
     if images::is_plane_request(&req) {
         return images::serve(req).await;
+    }
+    if gpu::is_plane_request(&req) {
+        return gpu::serve_plane(req, node);
     }
 
     // Catalog fan-out can wait on every peer. Resolve it before taking the

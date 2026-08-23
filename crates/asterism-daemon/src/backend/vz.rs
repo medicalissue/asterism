@@ -398,6 +398,7 @@ impl Hypervisor for Vz {
             // the secrets data plane refuses to bind on vz rather than
             // opening an unauthenticated proxy for somebody's API keys.
             guest_egress: None,
+            guest_gpu_projection: true,
             disk_formats: &[DiskFormat::Raw],
         }
     }
@@ -478,6 +479,27 @@ impl Hypervisor for Vz {
         if prep.kernel.is_none() && !req.seed.exists() {
             bail!("no cloud-init seed at {}", req.seed.display());
         }
+        let gpu_key = if inst.gpu.is_some() {
+            Some(
+                guest::Key::ensure(&paths::guest_agent_key_path(&inst.name))
+                    .with_context(|| format!("minting {:?}'s GPU guest key", inst.name))?,
+            )
+        } else {
+            None
+        };
+        let gpu_boot = if prep.kernel.is_some() {
+            match gpu_key.as_ref() {
+                Some(key) => {
+                    let artifacts =
+                        asterism_core::remote_gpu_guest::GuestProjectionArtifacts::discover()
+                            .context("finding packaged Linux GPU guest artifacts")?;
+                    Some(artifacts.oci_boot_script(&key.hex()))
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         if req.base.kind == ImageKind::OciRootfs {
             oci::configure_instance(
                 &req.base.path,
@@ -486,6 +508,7 @@ impl Hypervisor for Vz {
                 (!req.shares.is_empty()).then_some(ShareKind::Virtiofs),
                 &req.egress,
                 &req.bootstrap,
+                gpu_boot.as_deref(),
             )?;
         }
 
@@ -523,9 +546,7 @@ impl Hypervisor for Vz {
             // an instance whose seed predates the agent has no key file,
             // and telling the helper to look for one would be a boot that
             // complains instead of one that falls back.
-            agent_key: prep
-                .kernel
-                .is_none()
+            agent_key: (prep.kernel.is_none() || inst.gpu.is_some())
                 .then(|| paths::guest_agent_key_path(&inst.name))
                 .filter(|path| path.exists()),
         };

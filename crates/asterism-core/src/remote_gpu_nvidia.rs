@@ -306,8 +306,8 @@ pub fn prove_two_device_nvidia_contract(
     let guest_a = harness_peer(0x0a);
     let guest_b = harness_peer(0x0b);
     let guest_c = harness_peer(0x0c);
-    let mut left = production_for(&pair.first, 0x11, 1)?;
-    let mut right = production_for(&pair.second, 0x22, 1)?;
+    let mut left = fixture_production_for(&pair.first, 0x11, 1)?;
+    let mut right = fixture_production_for(&pair.second, 0x22, 1)?;
 
     let (left_cap, left_session, left_attachment) = attach_and_open(
         &mut left,
@@ -398,7 +398,37 @@ fn advertisement(admitted: &AdmittedNvidiaDevice, route: ProviderRoute) -> Provi
     }
 }
 
-fn production_for(
+pub fn production_for(
+    admitted: &AdmittedNvidiaDevice,
+    provider_device: &str,
+    provider_device_id: &str,
+    max_leases: u32,
+) -> Result<ProductionProvider, ControlError> {
+    let authority = LeaseAuthority::new(
+        provider_device,
+        provider_device_id,
+        admitted.device.uuid.clone(),
+        1,
+        LeaseLimits {
+            total_memory_bytes: admitted.device.memory_bytes,
+            max_memory_per_lease: admitted.device.memory_bytes,
+            max_leases,
+            lease_ttl_secs: 600,
+        },
+    )?;
+    Ok(ProductionProvider::new(
+        authority,
+        Provider::nvidia(
+            admitted.device.name.clone(),
+            crate::remote_gpu::Limits::default(),
+        ),
+    ))
+}
+
+/// Deterministic source fixture. It is deliberately private and keeps the
+/// reference executor, so synthetic inventory can never escape into product
+/// registration or claim hardware execution.
+fn fixture_production_for(
     admitted: &AdmittedNvidiaDevice,
     identity_nibble: u8,
     max_leases: u32,
@@ -1085,7 +1115,7 @@ gpu index=0 uuid=GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa memory_bytes=257698037
 
     #[test]
     fn version_skew_error_is_unsupported_not_a_session() {
-        let mut production = production_for(
+        let mut production = fixture_production_for(
             &admit_two_device_gate(&sample_two_device_inventory())
                 .unwrap()
                 .first,

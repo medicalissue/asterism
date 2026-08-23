@@ -11,5 +11,11 @@ name = "cuda"
 crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
 
+[package.metadata.asterism]
+# Packaging keeps the fully versioned file and both loader/development
+# aliases together. `build.rs` supplies the ELF SONAME on Linux.
+guest-soname = "libcuda.so.1"
+guest-versioned-file = "libcuda.so.1.0.0"
+
 [dependencies]
 asterism-core.workspace = true

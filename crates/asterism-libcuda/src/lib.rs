@@ -11,9 +11,8 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use asterism_core::remote_gpu_guest::{
-    self as guest, CudaCall, CudaDriverSymbol, CudaResult, GuestShim, CUDA_DRIVER_VERSION,
-    CUDA_ERROR_INVALID_VALUE, CUDA_ERROR_NOT_INITIALIZED, CUDA_ERROR_NOT_SUPPORTED, CUDA_SUCCESS,
-    GUEST_DEVICE_PATH,
+    self as guest, CudaCall, CudaResult, GuestShim, CUDA_DRIVER_VERSION, CUDA_ERROR_INVALID_VALUE,
+    CUDA_ERROR_NOT_INITIALIZED, CUDA_ERROR_NOT_SUPPORTED, CUDA_SUCCESS, GUEST_DEVICE_PATH,
 };
 
 /// Exact export names matching [`SUPPORTED_CUDA_DRIVER_SYMBOLS`].
@@ -40,6 +39,14 @@ pub const EXPORTED_CUDA_DRIVER_SYMBOLS: &[&str] = &[
     "cuLaunchKernel",
     "cuGetErrorString",
     "cuGetErrorName",
+    // CUDA's v2 ABI names are what current headers resolve for the six
+    // pointer-sized/context entrypoints. Keep their legacy aliases too.
+    "cuCtxCreate_v2",
+    "cuCtxDestroy_v2",
+    "cuMemAlloc_v2",
+    "cuMemFree_v2",
+    "cuMemcpyHtoD_v2",
+    "cuMemcpyDtoH_v2",
 ];
 
 struct State {
@@ -373,10 +380,19 @@ pub extern "C" fn cuModuleLoadData(module: *mut u64, image: *const c_void) -> i3
     if module.is_null() || image.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
+    // Validate caller bytes before attempting to open transport state. An
+    // unavailable guest endpoint must not hide that an unsupported module
+    // would otherwise be substituted or accepted on a later retry.
+    let bytes = unsafe { CStr::from_ptr(image as *const c_char) }
+        .to_bytes()
+        .to_vec();
+    if bytes != asterism_core::remote_gpu::VECTOR_ADD_PTX.as_bytes() {
+        return CUDA_ERROR_NOT_SUPPORTED;
+    }
     with_state(|state| {
-        let bytes = asterism_core::remote_gpu::VECTOR_ADD_PTX
-            .as_bytes()
-            .to_vec();
+        // ABI 1 accepts exactly the audited, content-pinned PTX program.
+        // Never replace caller bytes with a built-in payload: that turns an
+        // unsupported module into a different successful program.
         match state.shim.call(CudaCall::ModuleLoadData { image: bytes }) {
             Ok(CudaResult::Module { pin }) => {
                 let handle = state.next_module;
@@ -517,10 +533,36 @@ pub extern "C" fn cuGetErrorString(code: i32, text: *mut *const c_char) -> i32 {
     CUDA_SUCCESS
 }
 
-#[no_mangle]
-pub extern "C" fn cuMemAllocManaged(_dev_ptr: *mut u64, _bytes: usize, _flags: c_uint) -> i32 {
-    let _ = CudaDriverSymbol::CuMemAlloc;
-    CUDA_ERROR_NOT_SUPPORTED
+// ABI-compatible CUDA v2 names. These are deliberate exported aliases, not
+// new semantic operations, so they remain tied to the audited 22-call matrix.
+#[export_name = "cuCtxCreate_v2"]
+pub extern "C" fn cu_ctx_create_v2(pctx: *mut u64, flags: c_uint, device: c_int) -> i32 {
+    cuCtxCreate(pctx, flags, device)
+}
+
+#[export_name = "cuCtxDestroy_v2"]
+pub extern "C" fn cu_ctx_destroy_v2(ctx: u64) -> i32 {
+    cuCtxDestroy(ctx)
+}
+
+#[export_name = "cuMemAlloc_v2"]
+pub extern "C" fn cu_mem_alloc_v2(dev_ptr: *mut u64, bytes: usize) -> i32 {
+    cuMemAlloc(dev_ptr, bytes)
+}
+
+#[export_name = "cuMemFree_v2"]
+pub extern "C" fn cu_mem_free_v2(dev_ptr: u64) -> i32 {
+    cuMemFree(dev_ptr)
+}
+
+#[export_name = "cuMemcpyHtoD_v2"]
+pub extern "C" fn cu_memcpy_htod_v2(dst: u64, src: *const c_void, bytes: usize) -> i32 {
+    cuMemcpyHtoD(dst, src, bytes)
+}
+
+#[export_name = "cuMemcpyDtoH_v2"]
+pub extern "C" fn cu_memcpy_dtoh_v2(dst: *mut c_void, src: u64, bytes: usize) -> i32 {
+    cuMemcpyDtoH(dst, src, bytes)
 }
 
 #[cfg(test)]
@@ -533,8 +575,10 @@ mod tests {
             .iter()
             .map(|symbol| symbol.as_str())
             .collect();
-        assert_eq!(supported, EXPORTED_CUDA_DRIVER_SYMBOLS);
-        assert_eq!(EXPORTED_CUDA_DRIVER_SYMBOLS.len(), 22);
+        assert_eq!(supported, &EXPORTED_CUDA_DRIVER_SYMBOLS[..supported.len()]);
+        assert_eq!(supported.len(), 22);
+        assert_eq!(EXPORTED_CUDA_DRIVER_SYMBOLS.len(), 28);
+        assert!(!EXPORTED_CUDA_DRIVER_SYMBOLS.contains(&"cuMemAllocManaged"));
     }
 
     #[test]
@@ -548,5 +592,16 @@ mod tests {
         assert_eq!(cuGetErrorString(CUDA_SUCCESS, &mut text), CUDA_SUCCESS);
         assert!(!unsafe { CStr::from_ptr(text) }.to_bytes().is_empty());
         assert_eq!(cuGetErrorName(123456, &mut name), CUDA_ERROR_INVALID_VALUE);
+    }
+
+    #[test]
+    fn unsupported_module_bytes_are_never_replaced_by_the_pinned_ptx() {
+        let image = std::ffi::CString::new(".version 99.0\n.not_the_audited_program").unwrap();
+        let mut module = 0u64;
+        assert_eq!(
+            cuModuleLoadData(&mut module, image.as_ptr().cast()),
+            CUDA_ERROR_NOT_SUPPORTED
+        );
+        assert_eq!(module, 0);
     }
 }

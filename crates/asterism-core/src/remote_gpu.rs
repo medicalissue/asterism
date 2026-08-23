@@ -174,6 +174,20 @@ impl Capabilities {
             limits,
         }
     }
+
+    /// Capabilities for a provider admitted from live NVIDIA inventory.
+    /// Construction is intentionally separate from `reference`: product
+    /// code cannot turn a fixture into a CUDA advertisement by changing a
+    /// label after the fact.
+    pub fn nvidia(device_name: impl Into<String>, limits: Limits) -> Self {
+        Self {
+            executor: Executor::Cuda,
+            device_name: device_name.into(),
+            semantic_boundary: "cuda_semantic_v1".into(),
+            workload_formats: vec![WorkloadFormat::CudaPtx],
+            limits,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -976,6 +990,10 @@ impl LeaseAuthority {
         &self.provider_device_id
     }
 
+    pub fn limits(&self) -> LeaseLimits {
+        self.limits
+    }
+
     pub fn has_instance(&self, instance_id: &str) -> bool {
         self.instances.contains_key(instance_id)
     }
@@ -1387,6 +1405,18 @@ impl Provider {
         Self {
             versions: AbiRange::ours(),
             capabilities: Capabilities::reference(device_name, limits),
+            committed_bytes: 0,
+            sessions: HashMap::new(),
+        }
+    }
+
+    /// Construct the ABI state owned by an admitted NVIDIA provider.
+    /// Callers must have obtained `device_name` from fail-closed live
+    /// inventory; unlike `reference`, this advertises hardware CUDA.
+    pub fn nvidia(device_name: impl Into<String>, limits: Limits) -> Self {
+        Self {
+            versions: AbiRange::ours(),
+            capabilities: Capabilities::nvidia(device_name, limits),
             committed_bytes: 0,
             sessions: HashMap::new(),
         }

@@ -30,6 +30,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
+use data_encoding::BASE64;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -53,8 +54,133 @@ pub const GUEST_GPU_PROOF_LABEL: &str = "asterism-guest-gpu";
 pub const NVIDIA_IOCTL_MAGIC: u8 = b'F';
 /// Asterism's own ioctl magic for a one-word contract query on a CUSE node.
 pub const ASTERISM_IOCTL_MAGIC: u8 = b'A';
+/// The sole ioctl implemented by the projection: return the Asterism GPU ABI
+/// version. Matching the magic byte alone is deliberately insufficient;
+/// every other command, including future Asterism commands, fails closed.
+pub const ASTERISM_IOCTL_GET_ABI: u64 = (ASTERISM_IOCTL_MAGIC as u64) << 8 | 1;
 /// In-flight CUDA calls permitted before the consumer must wait for credit.
 pub const DEFAULT_CREDIT_WINDOW: u32 = 4;
+const MAX_GUEST_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Audited Linux payload injected only when an instance has durable GPU
+/// metadata and its backend advertises the guest-projection capability.
+#[derive(Debug, Clone)]
+pub struct GuestProjectionArtifacts {
+    service: Vec<u8>,
+    libcuda: Vec<u8>,
+}
+
+impl GuestProjectionArtifacts {
+    pub fn from_dir(directory: &Path) -> io::Result<Self> {
+        let service = read_guest_artifact(&directory.join("bin/asterism-gpu-guest"))?;
+        let libcuda = read_guest_artifact(&directory.join("lib/libcuda.so.1.0.0"))?;
+        if !service.starts_with(b"\x7fELF") || !libcuda.starts_with(b"\x7fELF") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "GPU guest service and libcuda payloads must be ELF artifacts",
+            ));
+        }
+        Ok(Self { service, libcuda })
+    }
+
+    /// Discover artifacts from explicit packaging configuration, then from
+    /// the installed daemon layout. Absence refuses the boot; it never
+    /// silently starts an attached instance without its projected device.
+    pub fn discover() -> io::Result<Self> {
+        if let Some(directory) = std::env::var_os("ASTERISM_GPU_GUEST_ARTIFACT_DIR") {
+            return Self::from_dir(Path::new(&directory));
+        }
+        let beside_daemon = std::env::current_exe()?
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("guest-gpu");
+        match Self::from_dir(&beside_daemon) {
+            Ok(found) => Ok(found),
+            Err(first) if first.kind() == io::ErrorKind::NotFound => {
+                Self::from_dir(Path::new("/usr/local/lib/asterism/guest-gpu"))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    pub fn cloud_config(&self) -> String {
+        let service = BASE64.encode(&self.service);
+        let libcuda = BASE64.encode(&self.libcuda);
+        format!(
+            "write_files:\n\
+             \x20- path: /usr/local/sbin/asterism-gpu-guest\n\
+             \x20  owner: root:root\n\
+             \x20  permissions: '0755'\n\
+             \x20  encoding: b64\n\
+             \x20  content: {service}\n\
+             \x20- path: /usr/local/lib/asterism/libcuda.so.1.0.0\n\
+             \x20  owner: root:root\n\
+             \x20  permissions: '0755'\n\
+             \x20  encoding: b64\n\
+             \x20  content: {libcuda}\n\
+             \x20- path: /etc/systemd/system/asterism-gpu-guest.service\n\
+             \x20  owner: root:root\n\
+             \x20  permissions: '0644'\n\
+             \x20  content: |\n\
+             \x20    [Unit]\n\
+             \x20    Description=Asterism guest GPU projection\n\
+             \x20    After=systemd-modules-load.service\n\
+             \x20    [Service]\n\
+             \x20    ExecStartPre=/sbin/modprobe cuse\n\
+             \x20    ExecStart=/usr/local/sbin/asterism-gpu-guest\n\
+             \x20    Restart=on-failure\n\
+             \x20    RestartSec=1\n\
+             \x20    [Install]\n\
+             \x20    WantedBy=multi-user.target\n\
+             runcmd:\n\
+             \x20- |\n\
+             \x20  install -d -m 0755 /usr/local/lib/asterism\n\
+             \x20  ln -sfn libcuda.so.1.0.0 /usr/local/lib/asterism/libcuda.so.1\n\
+             \x20  ln -sfn libcuda.so.1 /usr/local/lib/asterism/libcuda.so\n\
+             \x20  printf '%s\\n' /usr/local/lib/asterism > /etc/ld.so.conf.d/asterism-gpu.conf\n\
+             \x20  ldconfig\n\
+             \x20  systemctl daemon-reload\n\
+             \x20  systemctl enable --now asterism-gpu-guest.service\n"
+        )
+    }
+
+    /// Boot fragment for direct-kernel OCI guests, which have no cloud-init
+    /// or systemd. BusyBox materializes the same two verified artifacts and
+    /// starts the service before the image entrypoint.
+    pub fn oci_boot_script(&self, key_hex: &str) -> String {
+        format!(
+            "$BB mkdir -p /etc/asterism /usr/local/sbin /usr/local/lib/asterism\n\
+             printf '%s\\n' '{}' > /etc/asterism/agent.key\n\
+             chmod 0600 /etc/asterism/agent.key\n\
+             printf '%s' '{}' | $BB base64 -d > /usr/local/sbin/asterism-gpu-guest\n\
+             chmod 0755 /usr/local/sbin/asterism-gpu-guest\n\
+             printf '%s' '{}' | $BB base64 -d > /usr/local/lib/asterism/libcuda.so.1.0.0\n\
+             chmod 0755 /usr/local/lib/asterism/libcuda.so.1.0.0\n\
+             $BB ln -sfn libcuda.so.1.0.0 /usr/local/lib/asterism/libcuda.so.1\n\
+             $BB ln -sfn libcuda.so.1 /usr/local/lib/asterism/libcuda.so\n\
+             export LD_LIBRARY_PATH=/usr/local/lib/asterism${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}\n\
+             /usr/local/sbin/asterism-gpu-guest >/var/log/asterism-gpu.log 2>&1 &\n",
+            key_hex,
+            BASE64.encode(&self.service),
+            BASE64.encode(&self.libcuda),
+        )
+    }
+}
+
+fn read_guest_artifact(path: &Path) -> io::Result<Vec<u8>> {
+    let metadata = fs::metadata(path)?;
+    if metadata.len() == 0 || metadata.len() > MAX_GUEST_ARTIFACT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "guest artifact {} has invalid size {}",
+                path.display(),
+                metadata.len()
+            ),
+        ));
+    }
+    fs::read(path)
+}
 
 /// CUDA Driver API error codes the shim returns. Values match CUDA 12/13
 /// `CUresult` so an unmodified application can print them.
@@ -409,8 +535,7 @@ pub enum IoctlDisposition {
 /// Decide an ioctl on the projected `/dev/nvidia0`. Raw NVIDIA commands
 /// never become a mesh frame.
 pub fn ioctl_disposition(request: u64) -> IoctlDisposition {
-    let magic = ((request >> 8) & 0xff) as u8;
-    if magic == ASTERISM_IOCTL_MAGIC {
+    if request == ASTERISM_IOCTL_GET_ABI {
         IoctlDisposition::Contract
     } else {
         IoctlDisposition::FailClosed
@@ -925,15 +1050,23 @@ pub fn gpu_vsock_guest_handshake(
 fn read_vsock_line<T: for<'de> Deserialize<'de>>(
     reader: &mut impl BufRead,
 ) -> Result<T, GuestError> {
-    let mut line = String::new();
-    let n = reader.read_line(&mut line)?;
+    // Bound the read itself, not just the post-read validation. `read_line`
+    // grows its String until newline and therefore lets an unauthenticated
+    // peer allocate an arbitrary amount before the old limit was checked.
+    let mut line = Vec::with_capacity(1024);
+    let n = reader
+        .take((GPU_VSOCK_MAX_LINE + 1) as u64)
+        .read_until(b'\n', &mut line)?;
     if n == 0 {
         return Err(GuestError::new("GPU vsock peer closed during handshake"));
     }
-    if line.len() > GPU_VSOCK_MAX_LINE {
+    if line.len() > GPU_VSOCK_MAX_LINE || !line.ends_with(b"\n") {
         return Err(GuestError::new("GPU vsock handshake line exceeds 64 KiB"));
     }
-    serde_json::from_str(line.trim()).map_err(|err| GuestError::new(err.to_string()))
+    while matches!(line.last(), Some(b'\n' | b'\r')) {
+        line.pop();
+    }
+    serde_json::from_slice(&line).map_err(|err| GuestError::new(err.to_string()))
 }
 
 fn write_vsock_line(writer: &mut impl Write, value: &impl Serialize) -> Result<(), GuestError> {
@@ -1254,7 +1387,6 @@ pub(crate) mod b64 {
 mod tests {
     use super::*;
     use std::io::BufReader;
-    use std::os::unix::fs::FileTypeExt;
     use std::os::unix::net::UnixStream;
 
     #[test]
@@ -1352,6 +1484,39 @@ mod tests {
         let contract = (u64::from(ASTERISM_IOCTL_MAGIC) << 8) | 1;
         assert_eq!(ioctl_disposition(contract), IoctlDisposition::Contract);
         assert!(!nvidia_ioctl_is_refused(contract));
+        let unknown_contract = (u64::from(ASTERISM_IOCTL_MAGIC) << 8) | 2;
+        assert_eq!(
+            ioctl_disposition(unknown_contract),
+            IoctlDisposition::FailClosed
+        );
+    }
+
+    #[test]
+    fn pre_auth_handshake_read_is_bounded_before_json_parsing() {
+        let oversized = vec![b'x'; GPU_VSOCK_MAX_LINE * 8];
+        let mut cursor = std::io::Cursor::new(oversized);
+        let result = read_vsock_line::<GpuVsockHello>(&mut cursor);
+        assert!(result.is_err());
+        assert_eq!(cursor.position(), (GPU_VSOCK_MAX_LINE + 1) as u64);
+    }
+
+    #[test]
+    fn guest_artifacts_render_cloud_and_oci_installation() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("bin")).unwrap();
+        fs::create_dir_all(root.path().join("lib")).unwrap();
+        fs::write(root.path().join("bin/asterism-gpu-guest"), b"\x7fELFguest").unwrap();
+        fs::write(root.path().join("lib/libcuda.so.1.0.0"), b"\x7fELFcuda").unwrap();
+
+        let artifacts = GuestProjectionArtifacts::from_dir(root.path()).unwrap();
+        let cloud = artifacts.cloud_config();
+        assert!(cloud.contains("asterism-gpu-guest.service"));
+        assert!(cloud.contains("libcuda.so.1.0.0"));
+        assert!(cloud.contains("enable --now asterism-gpu-guest.service"));
+        let oci = artifacts.oci_boot_script("0011");
+        assert!(oci.contains("/etc/asterism/agent.key"));
+        assert!(oci.contains("export LD_LIBRARY_PATH="));
+        assert!(oci.contains("asterism-gpu-guest >/var/log/asterism-gpu.log"));
     }
 
     #[test]
