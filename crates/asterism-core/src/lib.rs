@@ -14,9 +14,12 @@
 //! settle on. [`remote_gpu`] is the transport-independent CUDA-semantic ABI
 //! behind a projected guest GPU device. [`remote_gpu_nvidia`] is the
 //! fail-closed NVIDIA inventory/matrix and two-device harness around that
-//! ABI. [`verify`] is the gate every boot input passes through on its way
-//! into the store and out of it again, and [`profile`] is what a guest is
-//! asked to become once it has booted.
+//! ABI. [`remote_gpu_release_gate`] is the exact hardware PASS record that
+//! consumes the guest-projection and real-provider candidates; a CPU
+//! reference or host-direct CUDA run cannot satisfy it. [`verify`] is the
+//! gate every boot input passes through on its way into the store and out
+//! of it again, and [`profile`] is what a guest is asked to become once it
+//! has booted.
 
 pub mod backup;
 pub mod compat;
@@ -39,6 +42,7 @@ pub mod protocol;
 pub mod registry;
 pub mod remote_gpu;
 pub mod remote_gpu_nvidia;
+pub mod remote_gpu_release_gate;
 pub mod rewrite;
 pub mod secret;
 pub mod seed;

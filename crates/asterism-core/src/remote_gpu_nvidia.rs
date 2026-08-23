@@ -334,7 +334,7 @@ pub fn prove_two_device_nvidia_contract(
 
     let kernel_ok = vector_add_on(&mut left, &guest_a, &left_cap, &left_session, 1_010)?;
     let fencing_ok = prove_concurrent_fencing(&mut left, &mut right, &guest_c)?;
-    let (restart_ok, new_right_cap) = prove_provider_restart(
+    let (restart_ok, _new_right_cap) = prove_provider_restart(
         &mut right,
         &guest_b,
         &right_cap,
@@ -343,7 +343,10 @@ pub fn prove_two_device_nvidia_contract(
     )?;
     let guest_restart_ok = prove_guest_restart(&mut left, &guest_a, &left_cap, left_session)?;
     let revoke_ok = prove_revoke(&mut left, &guest_a, &left_cap)?;
-    let skew_ok = prove_version_skew(&mut right, &guest_b, &new_right_cap)?;
+    // Negotiation must run on a lease that has no open ABI session.
+    // Reusing a capability already opened by attach_and_open would return
+    // Conflict and hide the ABI range check.
+    let skew_ok = prove_version_skew(&pair.second)?;
 
     require(
         kernel_ok && fencing_ok && restart_ok && guest_restart_ok && revoke_ok && skew_ok,
@@ -533,20 +536,39 @@ fn prove_revoke(
         ))
 }
 
-fn prove_version_skew(
-    provider: &mut ProductionProvider,
-    peer: &AuthenticatedPeer,
-    capability: &str,
-) -> Result<bool, ControlError> {
-    let skew = provider.open_session(peer, capability, AbiRange { min: 2, max: 2 }, 1_090);
+fn prove_version_skew(admitted: &AdmittedNvidiaDevice) -> Result<bool, ControlError> {
+    let mut provider = production_for(admitted, 0x33, 1)?;
+    let peer = harness_peer(0x0d);
+    let (lease, _) =
+        provider
+            .authority_mut()
+            .attach(&peer, "instance-skew", 16 * 1024 * 1024, 1_090)?;
+    let capability = lease.capability().to_owned();
+    // Fresh lease: Hello is the first call, so negotiation is what fails.
+    let skew = provider.open_session(&peer, &capability, AbiRange { min: 2, max: 2 }, 1_091);
+    if let Err(error) = &skew {
+        if error.code == ControlErrorCode::Conflict {
+            return Err(ControlError::new(
+                ControlErrorCode::Unavailable,
+                "ABI version skew was hidden by Conflict; negotiation was not exercised",
+            ));
+        }
+    }
     if skew.is_ok() {
         return Err(ControlError::new(
             ControlErrorCode::Unavailable,
             "ABI version skew opened a session instead of failing closed",
         ));
     }
-    Ok(refused(&skew, &[ControlErrorCode::Unavailable])
-        && provider.authority().diagnostics().active_leases == 1)
+    Ok(
+        refused(&skew, &[ControlErrorCode::UnsupportedVersion])
+            && skew
+                .as_ref()
+                .err()
+                .map(|error| error.message.contains("no remote GPU ABI is common"))
+                .unwrap_or(false)
+            && provider.authority().diagnostics().active_leases == 1,
+    )
 }
 
 fn refused<T>(result: &Result<T, ControlError>, codes: &[ControlErrorCode]) -> bool {
@@ -1083,7 +1105,17 @@ gpu index=0 uuid=GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa memory_bytes=257698037
     }
 
     #[test]
-    fn version_skew_error_is_unsupported_not_a_session() {
+    fn version_skew_error_is_unsupported_on_a_fresh_session() {
+        assert!(prove_version_skew(
+            &admit_two_device_gate(&sample_two_device_inventory())
+                .unwrap()
+                .first,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn a_second_open_on_the_same_lease_is_conflict_not_skew() {
         let mut production = production_for(
             &admit_two_device_gate(&sample_two_device_inventory())
                 .unwrap()
@@ -1098,9 +1130,30 @@ gpu index=0 uuid=GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa memory_bytes=257698037
         let error = production
             .open_session(&peer, &capability, AbiRange { min: 2, max: 2 }, 2)
             .unwrap_err();
-        assert_eq!(error.code, ControlErrorCode::Unavailable);
-        assert!(
-            error.message.contains("no remote GPU ABI is common") || error.message.contains("ABI")
-        );
+        assert_eq!(error.code, ControlErrorCode::Conflict);
+        assert!(error.message.contains("already has an open ABI session"));
+    }
+
+    #[test]
+    fn fresh_lease_skew_is_unsupported_version_not_conflict() {
+        let mut production = production_for(
+            &admit_two_device_gate(&sample_two_device_inventory())
+                .unwrap()
+                .first,
+            0x11,
+            1,
+        )
+        .unwrap();
+        let peer = harness_peer(0x0a);
+        let (lease, _) = production
+            .authority_mut()
+            .attach(&peer, "fresh-skew", 16 * 1024 * 1024, 1)
+            .unwrap();
+        let error = production
+            .open_session(&peer, lease.capability(), AbiRange { min: 2, max: 2 }, 2)
+            .unwrap_err();
+        assert_eq!(error.code, ControlErrorCode::UnsupportedVersion);
+        assert!(error.message.contains("no remote GPU ABI is common"));
+        assert_ne!(error.code, ControlErrorCode::Conflict);
     }
 }
