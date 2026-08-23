@@ -15,8 +15,7 @@ use uuid::Uuid;
 use asterism_core::instance::now_unix;
 use asterism_core::protocol::{Request, Response};
 use asterism_core::remote_gpu::{
-    AuthenticatedPeer, ControlErrorCode, Executor, LeaseAuthority, LeaseLimits,
-    ProductionProvider,
+    AuthenticatedPeer, ControlErrorCode, Executor, LeaseAuthority, LeaseLimits, ProductionProvider,
 };
 use asterism_core::remote_gpu_cuda::CudaEngine;
 use asterism_core::remote_gpu_guest::{
@@ -87,9 +86,7 @@ impl Manager {
                 gpu_uuid: provider.authority().gpu_uuid().to_owned(),
                 generation: provider.authority().generation(),
                 hardware_cuda_executed: provider.hardware_cuda_executed(),
-                helper_socket: asterism_core::paths::socket_path()
-                    .display()
-                    .to_string(),
+                helper_socket: asterism_core::paths::socket_path().display().to_string(),
             },
             None => Response::GpuProvider {
                 available: false,
@@ -274,7 +271,10 @@ pub(crate) async fn bridge_client<'a, 'b>(
     io: &'a mut ClientIo<'b>,
 ) -> Result<()> {
     let accepted: GpuMeshFrame = read_gpu_frame(&mut stream.recv).await?;
-    let GpuMeshFrame::Accepted { session, credit, .. } = accepted else {
+    let GpuMeshFrame::Accepted {
+        session, credit, ..
+    } = accepted
+    else {
         io.send(&Response::GpuGuestRefused {
             code: "refused".into(),
             message: format!("{accepted:?}"),
@@ -342,11 +342,8 @@ pub(crate) async fn bridge_client<'a, 'b>(
                             let request = guest::abi_request_for(&session, sequence, &call)
                                 .map_err(|err| anyhow!(err))?;
                             credits -= 1;
-                            write_gpu_frame(
-                                &mut stream.send,
-                                &GpuMeshFrame::Call { id, request },
-                            )
-                            .await?;
+                            write_gpu_frame(&mut stream.send, &GpuMeshFrame::Call { id, request })
+                                .await?;
                             match read_gpu_frame(&mut stream.recv).await? {
                                 GpuMeshFrame::Reply { reply, .. } => {
                                     credits = credits.saturating_add(1);
@@ -471,7 +468,9 @@ fn apply_guest_on_hop(
         }),
         GuestFrame::Close => Ok(GuestReply::Closed),
         GuestFrame::Cancel { id } => {
-            let reply = hop.handle_frame(GpuMeshFrame::Cancel { id }).map_err(|err| anyhow!(err))?;
+            let reply = hop
+                .handle_frame(GpuMeshFrame::Cancel { id })
+                .map_err(|err| anyhow!(err))?;
             match reply {
                 GpuMeshFrame::Cancelled { id } => Ok(GuestReply::Cancelled { id }),
                 GpuMeshFrame::Refused { message, .. } => Ok(GuestReply::Refused {
@@ -511,28 +510,28 @@ fn apply_guest_on_hop(
                 },
             }),
             call => {
-            let session = hop
-                .abi_session()
-                .ok_or_else(|| anyhow!("GPU ABI session is not open"))?
-                .to_owned();
-            *sequence = sequence
-                .checked_add(1)
-                .ok_or_else(|| anyhow!("GPU ABI sequence exhausted"))?;
-            let request =
-                guest::abi_request_for(&session, *sequence, &call).map_err(|err| anyhow!(err))?;
-            let reply = hop
-                .handle_frame(GpuMeshFrame::Call { id, request })
-                .map_err(|err| anyhow!(err))?;
-            match reply {
-                GpuMeshFrame::Reply { reply, .. } => Ok(GuestReply::Cuda {
-                    id,
-                    result: guest::cuda_result_for(&call, reply),
-                }),
-                other => Ok(GuestReply::Refused {
-                    code: "mesh".into(),
-                    message: format!("{other:?}"),
-                }),
-            }
+                let session = hop
+                    .abi_session()
+                    .ok_or_else(|| anyhow!("GPU ABI session is not open"))?
+                    .to_owned();
+                *sequence = sequence
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("GPU ABI sequence exhausted"))?;
+                let request = guest::abi_request_for(&session, *sequence, &call)
+                    .map_err(|err| anyhow!(err))?;
+                let reply = hop
+                    .handle_frame(GpuMeshFrame::Call { id, request })
+                    .map_err(|err| anyhow!(err))?;
+                match reply {
+                    GpuMeshFrame::Reply { reply, .. } => Ok(GuestReply::Cuda {
+                        id,
+                        result: guest::cuda_result_for(&call, reply),
+                    }),
+                    other => Ok(GuestReply::Refused {
+                        code: "mesh".into(),
+                        message: format!("{other:?}"),
+                    }),
+                }
             }
         },
     }
