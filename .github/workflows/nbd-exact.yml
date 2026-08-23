@@ -1,0 +1,205 @@
+name: Native NBD exact hosted gate
+
+on:
+  push:
+    branches:
+      - "polecat/feral/as-sx46+mt5yeaez"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-nbd-exact-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TARGET_SHA: 8d44ac517f858229ed2d01b31adbf3e49f6d9765
+  TARGET_TREE: 55a83954eb13a110ec08506bd84d1801ee524973
+  PARENT_SHA: 29c366cff628becf294595126b1db0f441d98cdb
+  PARENT_TREE: 7b9593056b87fa93484b33e1bbfd02c2e4f88829
+  CARGO_TERM_COLOR: always
+
+jobs:
+  exact-rust:
+    name: exact Rust and protocol suite (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable, 2026-08-05
+        with:
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: native-nbd-exact-${{ matrix.os }}
+
+      - name: Materialize and attest the exact candidate
+        shell: bash
+        run: |
+          set -euxo pipefail
+          exact="${RUNNER_TEMP}/exact-source"
+          git worktree add --detach "$exact" "$TARGET_SHA"
+          test "$(git -C "$exact" rev-parse HEAD)" = "$TARGET_SHA"
+          test "$(git -C "$exact" rev-parse 'HEAD^{tree}')" = "$TARGET_TREE"
+          test "$(git -C "$exact" rev-parse HEAD^)" = "$PARENT_SHA"
+          test "$(git -C "$exact" rev-parse 'HEAD^^{tree}')" = "$PARENT_TREE"
+          evidence="${RUNNER_TEMP}/native-nbd-${RUNNER_OS}"
+          mkdir -p "$evidence"
+          {
+            echo "result=pending"
+            echo "source_sha=$TARGET_SHA"
+            echo "source_tree=$TARGET_TREE"
+            echo "immutable_parent_sha=$PARENT_SHA"
+            echo "immutable_parent_tree=$PARENT_TREE"
+            echo "observer_sha=$GITHUB_SHA"
+            echo "host=$(uname -srmo)"
+          } >"$evidence/summary.txt"
+          echo "EXACT_SOURCE=$exact" >>"$GITHUB_ENV"
+          echo "EVIDENCE=$evidence" >>"$GITHUB_ENV"
+
+      - name: Require QEMU exporter and VMM absence
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v qemu-storage-daemon >/dev/null 2>&1; then
+            echo "qemu-storage-daemon is present on PATH" >&2
+            exit 1
+          fi
+          found=""
+          while IFS= read -r directory; do
+            [ -d "$directory" ] || continue
+            match="$(find "$directory" -maxdepth 1 -type f -name 'qemu-system-*' -perm -111 -print -quit 2>/dev/null || true)"
+            [ -z "$match" ] || found="$match"
+          done < <(printf '%s' "$PATH" | tr ':' '\n')
+          [ -z "$found" ] || { echo "qemu-system executable is present: $found" >&2; exit 1; }
+          printf 'qemu_storage_daemon_on_path=0\nqemu_system_on_path=0\n' >>"$EVIDENCE/summary.txt"
+
+      - name: Run exact formatting, unit, protocol, and lint gates
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$EXACT_SOURCE"
+          cargo fmt --all -- --check 2>&1 | tee "$EVIDENCE/fmt.log"
+          cargo test --workspace --locked 2>&1 | tee "$EVIDENCE/test.log"
+          cargo clippy --workspace --all-targets --locked -- -D warnings 2>&1 | tee "$EVIDENCE/clippy.log"
+          bash -n scripts/e2e-volume.sh
+          sed -i.bak 's/^result=pending$/result=pass/' "$EVIDENCE/summary.txt"
+          rm -f "$EVIDENCE/summary.txt.bak"
+
+      - name: Upload exact Rust evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-nbd-${{ matrix.os }}-${{ env.TARGET_SHA }}
+          path: ${{ runner.temp }}/native-nbd-${{ runner.os }}
+          if-no-files-found: error
+
+  exact-chv:
+    name: exact native NBD lifecycle on real KVM CHV
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable, 2026-08-05
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: native-nbd-chv-exact
+
+      - name: Install native CHV gate prerequisites
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cloud-image-utils e2fsprogs iproute2 kmod libcap2-bin libcap-ng-dev \
+            libseccomp-dev nbd-client openssh-client qemu-utils
+
+      - name: Require real KVM, QEMU absence, and exact source
+        run: |
+          set -euxo pipefail
+          test -c /dev/kvm
+          sudo chgrp "$(id -gn)" /dev/kvm
+          sudo chmod 0660 /dev/kvm
+          test -r /dev/kvm
+          test -w /dev/kvm
+          ! command -v qemu-storage-daemon
+          ! find /usr/bin /usr/local/bin -maxdepth 1 -type f -name 'qemu-system-*' -perm -111 | grep -q .
+          exact="${RUNNER_TEMP}/exact-source"
+          git worktree add --detach "$exact" "$TARGET_SHA"
+          test "$(git -C "$exact" rev-parse HEAD)" = "$TARGET_SHA"
+          test "$(git -C "$exact" rev-parse 'HEAD^{tree}')" = "$TARGET_TREE"
+          test "$(git -C "$exact" rev-parse HEAD^)" = "$PARENT_SHA"
+          test "$(git -C "$exact" rev-parse 'HEAD^^{tree}')" = "$PARENT_TREE"
+          evidence="${RUNNER_TEMP}/native-nbd-chv"
+          mkdir -p "$evidence"
+          {
+            echo "result=pending"
+            echo "source_sha=$TARGET_SHA"
+            echo "source_tree=$TARGET_TREE"
+            echo "immutable_parent_sha=$PARENT_SHA"
+            echo "immutable_parent_tree=$PARENT_TREE"
+            echo "observer_sha=$GITHUB_SHA"
+            echo "host=$(uname -srmo) $(stat -c '%A %U:%G %t:%T' /dev/kvm)"
+            echo "qemu_storage_daemon_on_path=0"
+            echo "qemu_system_on_path=0"
+          } >"$evidence/summary.txt"
+          echo "EXACT_SOURCE=$exact" >>"$GITHUB_ENV"
+          echo "EVIDENCE=$evidence" >>"$GITHUB_ENV"
+
+      - name: Build and install only the exact Linux payload
+        env:
+          ASTERISM_BUILD_ID: ${{ env.TARGET_SHA }}
+          CARGO_TARGET_DIR: ${{ runner.temp }}/exact-target
+        run: |
+          set -euxo pipefail
+          cd "$EXACT_SOURCE"
+          cargo build --release --locked --package asterism-cli --package asterism-daemon
+          version="v$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          dist="${RUNNER_TEMP}/dist/${version}"
+          scripts/package-linux.sh "$version" "$dist"
+          prefix="${RUNNER_TEMP}/prefix"
+          ASTERISM_VERSION="$version" ASTERISM_PREFIX="$prefix" \
+          ASTERISM_BASE_URL="file://${RUNNER_TEMP}/dist" ASTERISM_YES=1 \
+            sh packaging/install.sh
+          echo "GATE_VERSION=$version" >>"$GITHUB_ENV"
+          echo "GATE_PREFIX=$prefix" >>"$GITHUB_ENV"
+
+      - name: Run the complete remote-volume lifecycle on Cloud Hypervisor
+        env:
+          AST_BIN: ${{ env.GATE_PREFIX }}/bin/ast
+          ASTD_BIN: ${{ env.GATE_PREFIX }}/bin/astd
+          ASTERISM_CLOUD_HYPERVISOR: ${{ env.GATE_PREFIX }}/bin/cloud-hypervisor
+          ASTERISM_VIRTIOFSD: ${{ env.GATE_PREFIX }}/bin/virtiofsd
+          ASTERISM_TEST_ARTIFACTS: ${{ runner.temp }}/native-nbd-chv
+          ASTERISM_TEST_CACHE: ${{ runner.temp }}/native-nbd-cache
+          E2E_VOLUME_BACKEND: chv
+          E2E_IMAGE: debian:13
+        run: |
+          set -euxo pipefail
+          bash "$EXACT_SOURCE/scripts/e2e-volume.sh" 2>&1 | tee "$EVIDENCE/volume.log"
+          ! command -v qemu-storage-daemon
+          ! find /usr/bin /usr/local/bin -maxdepth 1 -type f -name 'qemu-system-*' -perm -111 | grep -q .
+          sed -i 's/^result=pending$/result=pass/' "$EVIDENCE/summary.txt"
+
+      - name: Upload exact KVM evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-nbd-chv-${{ env.TARGET_SHA }}
+          path: ${{ runner.temp }}/native-nbd-chv
+          if-no-files-found: error
+
+      - name: Remove installed host integration
+        if: always()
+        run: |
+          if [ -n "${GATE_PREFIX:-}" ] && [ -x "${GATE_PREFIX}/bin/ast" ]; then
+            ASTERISM_PREFIX="$GATE_PREFIX" ASTERISM_YES=1 \
+              sh "$EXACT_SOURCE/packaging/install.sh" --uninstall
+          fi
