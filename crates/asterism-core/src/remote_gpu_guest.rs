@@ -24,16 +24,19 @@
 //! root. The host adapter talks to local `astd` over the existing unix
 //! socket. `astd` carries the work over the authenticated orbit mesh.
 
-use std::fs;
-use std::io::{self, Read, Write};
+use std::fs::{self, File};
+use std::io::{self, BufRead, Read, Write};
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::remote_gpu::{
     self as gpu, AbiRange, BufferRange, ErrorCode, Reply, Request, Response, MAX_WIRE_FRAME_BYTES,
 };
+use crate::remote_gpu_cuse;
 
 /// How status and diagnostics name the projection that is actually running.
 pub const PROJECTION_KIND: &str = "cuse_char_device_plus_generated_libcuda";
@@ -57,12 +60,24 @@ pub const DEFAULT_CREDIT_WINDOW: u32 = 4;
 /// `CUresult` so an unmodified application can print them.
 pub const CUDA_SUCCESS: i32 = 0;
 pub const CUDA_ERROR_INVALID_VALUE: i32 = 1;
+pub const CUDA_ERROR_OUT_OF_MEMORY: i32 = 2;
 pub const CUDA_ERROR_NOT_INITIALIZED: i32 = 3;
+pub const CUDA_ERROR_DEINITIALIZED: i32 = 4;
 pub const CUDA_ERROR_NO_DEVICE: i32 = 100;
 pub const CUDA_ERROR_INVALID_DEVICE: i32 = 101;
+pub const CUDA_ERROR_INVALID_CONTEXT: i32 = 201;
+pub const CUDA_ERROR_INVALID_HANDLE: i32 = 400;
 pub const CUDA_ERROR_NOT_FOUND: i32 = 500;
 pub const CUDA_ERROR_NOT_SUPPORTED: i32 = 801;
 pub const CUDA_ERROR_UNKNOWN: i32 = 999;
+/// CUDA 12.0 driver version encoding (`major * 1000`).
+pub const CUDA_DRIVER_VERSION: i32 = 12000;
+/// `CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT`
+pub const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: i32 = 16;
+/// `CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR`
+pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: i32 = 75;
+/// `CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR`
+pub const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: i32 = 76;
 
 /// How `/dev/nvidia0` is materialized in this guest root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,16 +210,9 @@ pub const SUPPORTED_DEVICE_ATTRIBUTES: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum GuestFrame {
-    Open {
-        versions: AbiRange,
-    },
-    Cuda {
-        id: u64,
-        call: CudaCall,
-    },
-    Cancel {
-        id: u64,
-    },
+    Open { versions: AbiRange },
+    Cuda { id: u64, call: CudaCall },
+    Cancel { id: u64 },
     Close,
 }
 
@@ -213,10 +221,33 @@ pub enum GuestFrame {
 #[serde(tag = "call", rename_all = "snake_case")]
 pub enum CudaCall {
     Init,
+    DriverGetVersion,
     DeviceCount,
+    DeviceGet {
+        ordinal: u32,
+    },
     DeviceName {
         ordinal: u32,
     },
+    DeviceUuid {
+        ordinal: u32,
+    },
+    DeviceAttribute {
+        ordinal: u32,
+        attribute: String,
+    },
+    CtxCreate {
+        flags: u32,
+        device: u32,
+    },
+    CtxDestroy {
+        context: u64,
+    },
+    CtxGetCurrent,
+    CtxSetCurrent {
+        context: u64,
+    },
+    CtxSynchronize,
     MemAlloc {
         bytes: u64,
     },
@@ -235,6 +266,27 @@ pub enum CudaCall {
         #[serde(with = "b64")]
         image: Vec<u8>,
     },
+    ModuleUnload {
+        module: String,
+    },
+    ModuleGetFunction {
+        module: String,
+        name: String,
+    },
+    LaunchKernel {
+        function: String,
+        grid_x: u32,
+        grid_y: u32,
+        grid_z: u32,
+        block_x: u32,
+        block_y: u32,
+        block_z: u32,
+        shared_mem: u32,
+        lhs: String,
+        rhs: String,
+        output: String,
+        elements: u64,
+    },
     LaunchVectorAdd {
         workload_pin: String,
         lhs: String,
@@ -246,6 +298,12 @@ pub enum CudaCall {
         allocation: String,
     },
     Synchronize,
+    GetErrorName {
+        code: i32,
+    },
+    GetErrorString {
+        code: i32,
+    },
     /// Any symbol not in [`SUPPORTED_CUDA_DRIVER_SYMBOLS`].
     Unsupported {
         symbol: String,
@@ -281,11 +339,29 @@ pub enum GuestReply {
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum CudaResult {
     Init,
+    DriverVersion {
+        version: i32,
+    },
     DeviceCount {
         count: u32,
     },
+    Device {
+        ordinal: u32,
+    },
     DeviceName {
         name: String,
+    },
+    DeviceUuid {
+        uuid: String,
+    },
+    DeviceAttribute {
+        value: i32,
+    },
+    Context {
+        context: u64,
+    },
+    CurrentContext {
+        context: u64,
     },
     Alloc {
         allocation: String,
@@ -300,11 +376,21 @@ pub enum CudaResult {
     Module {
         pin: String,
     },
+    Unloaded,
+    Function {
+        function: String,
+    },
     Launched {
         provider_elapsed_ns: u64,
     },
     Freed,
     Synced,
+    ErrorName {
+        name: String,
+    },
+    ErrorString {
+        text: String,
+    },
     Error {
         cuda: i32,
         message: String,
@@ -343,11 +429,10 @@ pub fn linux_cuse_available() -> bool {
 
 /// Bind a real local endpoint at `<guest-root>/dev/nvidia0`.
 ///
-/// When `/dev/cuse` exists the kind is [`GuestDeviceKind::Cuse`] and the
-/// Unix socket is still bound so source fixtures and the generated libcuda
-/// have a framed endpoint without claiming a kernel NVIDIA driver. The
-/// character device is the guest-visible contract; the socket is the control
-/// channel the CUSE daemon serves.
+/// When `/dev/cuse` exists this starts a CUSE character-device service and
+/// materializes the guest-visible node. When `/dev/cuse` is absent the
+/// portable Unix-domain fixture is bound. The kind always names the
+/// mechanism that is actually running.
 pub fn project_guest_device(guest_root: &Path) -> io::Result<GuestDevice> {
     let directory = guest_root.join("dev");
     fs::create_dir_all(&directory)?;
@@ -357,29 +442,37 @@ pub fn project_guest_device(guest_root: &Path) -> io::Result<GuestDevice> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => return Err(err),
     }
+    if linux_cuse_available() {
+        let cuse = remote_gpu_cuse::CuseService::mount(&path)?;
+        return Ok(GuestDevice {
+            path,
+            kind: GuestDeviceKind::Cuse,
+            inner: GuestInner::Cuse(cuse),
+        });
+    }
     let listener = UnixListener::bind(&path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o666))?;
     }
-    let kind = if linux_cuse_available() {
-        GuestDeviceKind::Cuse
-    } else {
-        GuestDeviceKind::UnixEndpoint
-    };
     Ok(GuestDevice {
         path,
-        kind,
-        listener,
+        kind: GuestDeviceKind::UnixEndpoint,
+        inner: GuestInner::Unix(listener),
     })
+}
+
+enum GuestInner {
+    Unix(UnixListener),
+    Cuse(remote_gpu_cuse::CuseService),
 }
 
 /// A projected `/dev/nvidia0` that can be connected to.
 pub struct GuestDevice {
     pub path: PathBuf,
     pub kind: GuestDeviceKind,
-    listener: UnixListener,
+    inner: GuestInner,
 }
 
 impl GuestDevice {
@@ -393,7 +486,10 @@ impl GuestDevice {
 
     /// Accept one libcuda connection. The caller serves [`GuestFrame`]s.
     pub fn accept(&self) -> io::Result<UnixStream> {
-        self.listener.accept().map(|(stream, _)| stream)
+        match &self.inner {
+            GuestInner::Unix(listener) => listener.accept().map(|(stream, _)| stream),
+            GuestInner::Cuse(cuse) => cuse.accept(),
+        }
     }
 }
 
@@ -403,20 +499,52 @@ impl Drop for GuestDevice {
     }
 }
 
+enum ShimTransport {
+    Unix(UnixStream),
+    Char(File),
+}
+
+impl Read for ShimTransport {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Unix(stream) => stream.read(buf),
+            Self::Char(file) => file.read(buf),
+        }
+    }
+}
+
+impl Write for ShimTransport {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Unix(stream) => stream.write(buf),
+            Self::Char(file) => file.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Unix(stream) => stream.flush(),
+            Self::Char(file) => file.flush(),
+        }
+    }
+}
+
 /// Generated libcuda client: connects to the projected endpoint and issues
 /// CUDA Driver calls as framed [`GuestFrame`]s.
 pub struct GuestShim {
-    stream: UnixStream,
+    stream: ShimTransport,
     next_id: u64,
 }
 
 impl GuestShim {
     pub fn connect(device: &Path) -> io::Result<Self> {
-        let stream = UnixStream::connect(device)?;
-        Ok(Self {
-            stream,
-            next_id: 0,
-        })
+        let metadata = fs::metadata(device)?;
+        let stream = if metadata.file_type().is_socket() {
+            ShimTransport::Unix(UnixStream::connect(device)?)
+        } else {
+            ShimTransport::Char(File::options().read(true).write(true).open(device)?)
+        };
+        Ok(Self { stream, next_id: 0 })
     }
 
     pub fn open(&mut self) -> Result<GuestReply, GuestError> {
@@ -450,6 +578,10 @@ impl GuestShim {
         }
     }
 
+    pub fn last_id(&self) -> u64 {
+        self.next_id
+    }
+
     pub fn cancel(&mut self, id: u64) -> Result<GuestReply, GuestError> {
         write_frame(&mut self.stream, &GuestFrame::Cancel { id })?;
         read_frame(&mut self.stream)
@@ -470,9 +602,7 @@ impl GuestShim {
                 symbol: symbol.to_owned(),
             });
         }
-        let call = call.ok_or_else(|| {
-            GuestError::new(format!("{symbol} is supported but was dispatched without arguments"))
-        })?;
+        let call = call.unwrap_or_else(|| cuda_call_for_symbol(symbol));
         self.call(call)
     }
 }
@@ -482,27 +612,353 @@ impl GuestShim {
 pub fn cuda_call_for_symbol(symbol: &str) -> CudaCall {
     match CudaDriverSymbol::parse(symbol) {
         Some(CudaDriverSymbol::CuInit) => CudaCall::Init,
+        Some(CudaDriverSymbol::CuDriverGetVersion) => CudaCall::DriverGetVersion,
         Some(CudaDriverSymbol::CuDeviceGetCount) => CudaCall::DeviceCount,
-        Some(_) => CudaCall::Unsupported {
-            symbol: symbol.to_owned(),
+        Some(CudaDriverSymbol::CuDeviceGet) => CudaCall::DeviceGet { ordinal: 0 },
+        Some(CudaDriverSymbol::CuDeviceGetName) => CudaCall::DeviceName { ordinal: 0 },
+        Some(CudaDriverSymbol::CuDeviceGetUuid) => CudaCall::DeviceUuid { ordinal: 0 },
+        Some(CudaDriverSymbol::CuDeviceGetAttribute) => CudaCall::DeviceAttribute {
+            ordinal: 0,
+            attribute: "COMPUTE_CAPABILITY_MAJOR".into(),
         },
+        Some(CudaDriverSymbol::CuCtxCreate) => CudaCall::CtxCreate {
+            flags: 0,
+            device: 0,
+        },
+        Some(CudaDriverSymbol::CuCtxDestroy) => CudaCall::CtxDestroy { context: 0 },
+        Some(CudaDriverSymbol::CuCtxGetCurrent) => CudaCall::CtxGetCurrent,
+        Some(CudaDriverSymbol::CuCtxSetCurrent) => CudaCall::CtxSetCurrent { context: 0 },
+        Some(CudaDriverSymbol::CuCtxSynchronize) => CudaCall::CtxSynchronize,
+        Some(CudaDriverSymbol::CuMemAlloc) => CudaCall::MemAlloc { bytes: 0 },
+        Some(CudaDriverSymbol::CuMemFree) => CudaCall::MemFree {
+            allocation: String::new(),
+        },
+        Some(CudaDriverSymbol::CuMemcpyHtoD) => CudaCall::MemcpyHtoD {
+            allocation: String::new(),
+            offset: 0,
+            data: Vec::new(),
+        },
+        Some(CudaDriverSymbol::CuMemcpyDtoH) => CudaCall::MemcpyDtoH {
+            allocation: String::new(),
+            offset: 0,
+            bytes: 0,
+        },
+        Some(CudaDriverSymbol::CuModuleLoadData) => CudaCall::ModuleLoadData { image: Vec::new() },
+        Some(CudaDriverSymbol::CuModuleUnload) => CudaCall::ModuleUnload {
+            module: String::new(),
+        },
+        Some(CudaDriverSymbol::CuModuleGetFunction) => CudaCall::ModuleGetFunction {
+            module: String::new(),
+            name: "vector_add_f32".into(),
+        },
+        Some(CudaDriverSymbol::CuLaunchKernel) => CudaCall::LaunchKernel {
+            function: "vector_add_f32".into(),
+            grid_x: 1,
+            grid_y: 1,
+            grid_z: 1,
+            block_x: 1,
+            block_y: 1,
+            block_z: 1,
+            shared_mem: 0,
+            lhs: String::new(),
+            rhs: String::new(),
+            output: String::new(),
+            elements: 0,
+        },
+        Some(CudaDriverSymbol::CuGetErrorString) => CudaCall::GetErrorString { code: 0 },
+        Some(CudaDriverSymbol::CuGetErrorName) => CudaCall::GetErrorName { code: 0 },
         None => CudaCall::Unsupported {
             symbol: symbol.to_owned(),
         },
     }
 }
 
+fn cstr(text: &'static str) -> &'static str {
+    text
+}
+
 pub fn cuda_error_name(code: i32) -> &'static str {
     match code {
-        CUDA_SUCCESS => "CUDA_SUCCESS",
-        CUDA_ERROR_INVALID_VALUE => "CUDA_ERROR_INVALID_VALUE",
-        CUDA_ERROR_NOT_INITIALIZED => "CUDA_ERROR_NOT_INITIALIZED",
-        CUDA_ERROR_NO_DEVICE => "CUDA_ERROR_NO_DEVICE",
-        CUDA_ERROR_INVALID_DEVICE => "CUDA_ERROR_INVALID_DEVICE",
-        CUDA_ERROR_NOT_FOUND => "CUDA_ERROR_NOT_FOUND",
-        CUDA_ERROR_NOT_SUPPORTED => "CUDA_ERROR_NOT_SUPPORTED",
-        _ => "CUDA_ERROR_UNKNOWN",
+        CUDA_SUCCESS => cstr("CUDA_SUCCESS\0"),
+        CUDA_ERROR_INVALID_VALUE => cstr("CUDA_ERROR_INVALID_VALUE\0"),
+        CUDA_ERROR_OUT_OF_MEMORY => cstr("CUDA_ERROR_OUT_OF_MEMORY\0"),
+        CUDA_ERROR_NOT_INITIALIZED => cstr("CUDA_ERROR_NOT_INITIALIZED\0"),
+        CUDA_ERROR_DEINITIALIZED => cstr("CUDA_ERROR_DEINITIALIZED\0"),
+        CUDA_ERROR_NO_DEVICE => cstr("CUDA_ERROR_NO_DEVICE\0"),
+        CUDA_ERROR_INVALID_DEVICE => cstr("CUDA_ERROR_INVALID_DEVICE\0"),
+        CUDA_ERROR_INVALID_CONTEXT => cstr("CUDA_ERROR_INVALID_CONTEXT\0"),
+        CUDA_ERROR_INVALID_HANDLE => cstr("CUDA_ERROR_INVALID_HANDLE\0"),
+        CUDA_ERROR_NOT_FOUND => cstr("CUDA_ERROR_NOT_FOUND\0"),
+        CUDA_ERROR_NOT_SUPPORTED => cstr("CUDA_ERROR_NOT_SUPPORTED\0"),
+        CUDA_ERROR_UNKNOWN => cstr("CUDA_ERROR_UNKNOWN\0"),
+        _ => cstr("CUDA_ERROR_UNKNOWN\0"),
     }
+}
+
+pub fn cuda_error_string(code: i32) -> &'static str {
+    match code {
+        CUDA_SUCCESS => cstr("no error\0"),
+        CUDA_ERROR_INVALID_VALUE => cstr("invalid argument\0"),
+        CUDA_ERROR_OUT_OF_MEMORY => cstr("out of memory\0"),
+        CUDA_ERROR_NOT_INITIALIZED => cstr("driver not initialized\0"),
+        CUDA_ERROR_DEINITIALIZED => cstr("driver deinitialized\0"),
+        CUDA_ERROR_NO_DEVICE => cstr("no CUDA-capable device is detected\0"),
+        CUDA_ERROR_INVALID_DEVICE => cstr("invalid device ordinal\0"),
+        CUDA_ERROR_INVALID_CONTEXT => cstr("invalid context\0"),
+        CUDA_ERROR_INVALID_HANDLE => cstr("invalid handle\0"),
+        CUDA_ERROR_NOT_FOUND => cstr("named symbol not found\0"),
+        CUDA_ERROR_NOT_SUPPORTED => cstr("operation not supported\0"),
+        _ => cstr("unknown error\0"),
+    }
+}
+
+pub fn cuda_error_is_named(code: i32) -> bool {
+    matches!(
+        code,
+        CUDA_SUCCESS
+            | CUDA_ERROR_INVALID_VALUE
+            | CUDA_ERROR_OUT_OF_MEMORY
+            | CUDA_ERROR_NOT_INITIALIZED
+            | CUDA_ERROR_DEINITIALIZED
+            | CUDA_ERROR_NO_DEVICE
+            | CUDA_ERROR_INVALID_DEVICE
+            | CUDA_ERROR_INVALID_CONTEXT
+            | CUDA_ERROR_INVALID_HANDLE
+            | CUDA_ERROR_NOT_FOUND
+            | CUDA_ERROR_NOT_SUPPORTED
+            | CUDA_ERROR_UNKNOWN
+    )
+}
+
+pub fn device_attribute_name(code: i32) -> Option<&'static str> {
+    match code {
+        CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT => Some("MULTIPROCESSOR_COUNT"),
+        CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR => Some("COMPUTE_CAPABILITY_MAJOR"),
+        CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR => Some("COMPUTE_CAPABILITY_MINOR"),
+        _ => None,
+    }
+}
+
+/// HMAC-SHA256 over the GPU vsock transcript. Same per-instance key as the
+/// guest agent; the [`GUEST_GPU_PROOF_LABEL`] keeps a control-channel proof
+/// from standing in for this hop.
+pub fn gpu_hmac_proof(
+    key: &[u8; 32],
+    version: u32,
+    side: &str,
+    guest_nonce: &str,
+    host_nonce: &str,
+) -> String {
+    let message = format!("{GUEST_GPU_PROOF_LABEL}/{version} {side} {guest_nonce} {host_nonce}");
+    hex(&hmac_sha256(key, message.as_bytes()))
+}
+
+pub fn verify_gpu_proof(
+    key: &[u8; 32],
+    version: u32,
+    side: &str,
+    guest_nonce: &str,
+    host_nonce: &str,
+    proof: &str,
+) -> bool {
+    let expected = gpu_hmac_proof(key, version, side, guest_nonce, host_nonce);
+    same_proof(proof, &expected)
+}
+
+pub fn guest_agent_style_proof(
+    key: &[u8; 32],
+    version: u32,
+    side: &str,
+    guest_nonce: &str,
+    host_nonce: &str,
+) -> String {
+    let message = format!("asterism-guest/{version} {side} {guest_nonce} {host_nonce}");
+    hex(&hmac_sha256(key, message.as_bytes()))
+}
+
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut padded = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        padded[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        padded[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = Sha256::new();
+    inner.update(padded.map(|b| b ^ 0x36));
+    inner.update(message);
+    let inner = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(padded.map(|b| b ^ 0x5c));
+    outer.update(inner);
+    outer.finalize().into()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const TABLE: &[u8] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(TABLE[(byte >> 4) as usize] as char);
+        out.push(TABLE[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn same_proof(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.bytes()
+        .zip(right.bytes())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
+}
+
+/// Opening hello on guest GPU vsock port [`GUEST_GPU_VSOCK_PORT`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuVsockHello {
+    pub agent: String,
+    pub versions: Vec<u32>,
+    pub nonce: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuVsockAccept {
+    pub version: u32,
+    pub nonce: String,
+    pub proof: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuVsockWelcome {
+    pub ok: bool,
+    pub proof: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+const GPU_VSOCK_MAX_LINE: usize = 64 * 1024;
+
+/// Host half of the instance-HMAC GPU vsock hop. After this returns, the
+/// stream carries length-prefixed [`GuestFrame`]s, not a LAN listener.
+pub fn gpu_vsock_host_handshake(
+    reader: &mut impl BufRead,
+    writer: &mut impl Write,
+    key: &[u8; 32],
+    host_nonce: &str,
+) -> Result<u32, GuestError> {
+    let hello: GpuVsockHello = read_vsock_line(reader)?;
+    if hello.agent != "asterism-gpu" {
+        return Err(GuestError::new(format!(
+            "the service on vsock port {GUEST_GPU_VSOCK_PORT} calls itself {:?}, not asterism-gpu",
+            hello.agent
+        )));
+    }
+    if !hello.versions.contains(&1) {
+        return Err(GuestError::new(
+            "no GPU vsock protocol version in common with this helper",
+        ));
+    }
+    let proof = gpu_hmac_proof(key, 1, "host", &hello.nonce, host_nonce);
+    write_vsock_line(
+        writer,
+        &GpuVsockAccept {
+            version: 1,
+            nonce: host_nonce.to_owned(),
+            proof,
+        },
+    )?;
+    let welcome: GpuVsockWelcome = read_vsock_line(reader)?;
+    if !welcome.ok {
+        return Err(GuestError::new(
+            welcome
+                .error
+                .unwrap_or_else(|| "guest GPU vsock refused the helper".into()),
+        ));
+    }
+    if !verify_gpu_proof(key, 1, "guest", &hello.nonce, host_nonce, &welcome.proof) {
+        return Err(GuestError::new(
+            "the guest GPU hop did not prove it holds this instance's key",
+        ));
+    }
+    Ok(1)
+}
+
+/// Guest half of the same hop. Distinct HMAC side label from the guest agent.
+pub fn gpu_vsock_guest_handshake(
+    reader: &mut impl BufRead,
+    writer: &mut impl Write,
+    key: &[u8; 32],
+    guest_nonce: &str,
+) -> Result<u32, GuestError> {
+    write_vsock_line(
+        writer,
+        &GpuVsockHello {
+            agent: "asterism-gpu".into(),
+            versions: vec![1],
+            nonce: guest_nonce.to_owned(),
+        },
+    )?;
+    let accept: GpuVsockAccept = read_vsock_line(reader)?;
+    if accept.version != 1 {
+        return Err(GuestError::new(format!(
+            "GPU vsock helper picked unsupported version {}",
+            accept.version
+        )));
+    }
+    if !verify_gpu_proof(key, 1, "host", guest_nonce, &accept.nonce, &accept.proof) {
+        return Err(GuestError::new(
+            "GPU vsock helper did not prove it holds this instance's key",
+        ));
+    }
+    write_vsock_line(
+        writer,
+        &GpuVsockWelcome {
+            ok: true,
+            proof: gpu_hmac_proof(key, 1, "guest", guest_nonce, &accept.nonce),
+            error: None,
+        },
+    )?;
+    Ok(1)
+}
+
+fn read_vsock_line<T: for<'de> Deserialize<'de>>(
+    reader: &mut impl BufRead,
+) -> Result<T, GuestError> {
+    let mut line = String::new();
+    let n = reader.read_line(&mut line)?;
+    if n == 0 {
+        return Err(GuestError::new("GPU vsock peer closed during handshake"));
+    }
+    if line.len() > GPU_VSOCK_MAX_LINE {
+        return Err(GuestError::new("GPU vsock handshake line exceeds 64 KiB"));
+    }
+    serde_json::from_str(line.trim()).map_err(|err| GuestError::new(err.to_string()))
+}
+
+fn write_vsock_line(writer: &mut impl Write, value: &impl Serialize) -> Result<(), GuestError> {
+    let mut line = serde_json::to_vec(value).map_err(|err| GuestError::new(err.to_string()))?;
+    if line.len() > GPU_VSOCK_MAX_LINE {
+        return Err(GuestError::new("GPU vsock handshake line exceeds 64 KiB"));
+    }
+    line.push(b'\n');
+    writer.write_all(&line)?;
+    writer.flush()?;
+    Ok(())
+}
+
+pub fn uuid_bytes_from_text(text: &str) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    let hex: String = text.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    let bytes = hex.as_bytes();
+    for i in 0..16 {
+        let start = i * 2;
+        if start + 1 < bytes.len() {
+            let pair = std::str::from_utf8(&bytes[start..start + 2]).unwrap_or("00");
+            out[i] = u8::from_str_radix(pair, 16).unwrap_or(0);
+        }
+    }
+    out
 }
 
 #[derive(Debug)]
@@ -540,16 +996,15 @@ pub fn write_frame(writer: &mut impl Write, value: &impl Serialize) -> Result<()
             body.len()
         )));
     }
-    let len = u32::try_from(body.len()).map_err(|_| GuestError::new("guest GPU frame too large"))?;
+    let len =
+        u32::try_from(body.len()).map_err(|_| GuestError::new("guest GPU frame too large"))?;
     writer.write_all(&len.to_be_bytes())?;
     writer.write_all(&body)?;
     writer.flush()?;
     Ok(())
 }
 
-pub fn read_frame<T: for<'de> Deserialize<'de>>(
-    reader: &mut impl Read,
-) -> Result<T, GuestError> {
+pub fn read_frame<T: for<'de> Deserialize<'de>>(reader: &mut impl Read) -> Result<T, GuestError> {
     let mut len = [0u8; 4];
     reader.read_exact(&mut len)?;
     let len = u32::from_be_bytes(len) as usize;
@@ -571,11 +1026,21 @@ pub fn abi_request_for(
     call: &CudaCall,
 ) -> Result<Request, GuestError> {
     match call {
-        CudaCall::Init | CudaCall::DeviceCount | CudaCall::DeviceName { .. } => {
-            Err(GuestError::new(
-                "init/device queries are session-local and do not become ABI mutations",
-            ))
-        }
+        CudaCall::Init
+        | CudaCall::DriverGetVersion
+        | CudaCall::DeviceCount
+        | CudaCall::DeviceGet { .. }
+        | CudaCall::DeviceName { .. }
+        | CudaCall::DeviceUuid { .. }
+        | CudaCall::DeviceAttribute { .. }
+        | CudaCall::CtxCreate { .. }
+        | CudaCall::CtxDestroy { .. }
+        | CudaCall::CtxGetCurrent
+        | CudaCall::CtxSetCurrent { .. }
+        | CudaCall::GetErrorName { .. }
+        | CudaCall::GetErrorString { .. } => Err(GuestError::new(
+            "init/device queries are session-local and do not become ABI mutations",
+        )),
         CudaCall::MemAlloc { bytes } => Ok(Request::Allocate {
             session: session.to_owned(),
             sequence,
@@ -654,7 +1119,39 @@ pub fn abi_request_for(
             sequence,
             allocation: allocation.clone(),
         }),
-        CudaCall::Synchronize => Err(GuestError::new(
+        CudaCall::LaunchKernel {
+            function,
+            lhs,
+            rhs,
+            output,
+            elements,
+            shared_mem,
+            ..
+        } => {
+            if function != "vector_add_f32" || *shared_mem != 0 {
+                return Err(GuestError::new(
+                    "cuLaunchKernel only launches the pinned vector_add_f32 entrypoint",
+                ));
+            }
+            abi_request_for(
+                session,
+                sequence,
+                &CudaCall::LaunchVectorAdd {
+                    workload_pin: gpu::content_pin(gpu::VECTOR_ADD_PTX.as_bytes()),
+                    lhs: lhs.clone(),
+                    rhs: rhs.clone(),
+                    output: output.clone(),
+                    elements: *elements,
+                },
+            )
+        }
+        CudaCall::ModuleUnload { .. } => Err(GuestError::new(
+            "cuModuleUnload is session-local and does not become an ABI mutation",
+        )),
+        CudaCall::ModuleGetFunction { .. } => Err(GuestError::new(
+            "cuModuleGetFunction is session-local and does not become an ABI mutation",
+        )),
+        CudaCall::CtxSynchronize | CudaCall::Synchronize => Err(GuestError::new(
             "cuCtxSynchronize is a local barrier after the last ABI reply",
         )),
         CudaCall::Unsupported { symbol } => Err(GuestError::new(format!(
@@ -665,34 +1162,62 @@ pub fn abi_request_for(
 
 pub fn cuda_result_for(call: &CudaCall, reply: Reply) -> CudaResult {
     match (call, reply) {
-        (CudaCall::MemAlloc { .. }, Reply::Ok { response: Response::Allocated { allocation, .. } }) => {
-            CudaResult::Alloc { allocation }
-        }
-        (CudaCall::MemcpyHtoD { .. }, Reply::Ok { response: Response::Written { bytes, .. } }) => {
-            CudaResult::Copied { bytes }
-        }
-        (CudaCall::MemcpyDtoH { .. }, Reply::Ok { response: Response::Data { data, .. } }) => {
-            CudaResult::Data { data }
-        }
+        (
+            CudaCall::MemAlloc { .. },
+            Reply::Ok {
+                response: Response::Allocated { allocation, .. },
+            },
+        ) => CudaResult::Alloc { allocation },
+        (
+            CudaCall::MemcpyHtoD { .. },
+            Reply::Ok {
+                response: Response::Written { bytes, .. },
+            },
+        ) => CudaResult::Copied { bytes },
+        (
+            CudaCall::MemcpyDtoH { .. },
+            Reply::Ok {
+                response: Response::Data { data, .. },
+            },
+        ) => CudaResult::Data { data },
         (
             CudaCall::ModuleLoadData { .. },
             Reply::Ok {
                 response: Response::WorkloadLoaded { content_blake3, .. },
             },
-        ) => CudaResult::Module { pin: content_blake3 },
+        ) => CudaResult::Module {
+            pin: content_blake3,
+        },
         (
             CudaCall::LaunchVectorAdd { .. },
             Reply::Ok {
-                response: Response::Launched {
-                    provider_elapsed_ns, ..
-                },
+                response:
+                    Response::Launched {
+                        provider_elapsed_ns,
+                        ..
+                    },
             },
         ) => CudaResult::Launched {
             provider_elapsed_ns,
         },
-        (CudaCall::MemFree { .. }, Reply::Ok { response: Response::Freed { .. } }) => {
-            CudaResult::Freed
-        }
+        (
+            CudaCall::MemFree { .. },
+            Reply::Ok {
+                response: Response::Freed { .. },
+            },
+        ) => CudaResult::Freed,
+        (
+            CudaCall::LaunchKernel { .. },
+            Reply::Ok {
+                response:
+                    Response::Launched {
+                        provider_elapsed_ns,
+                        ..
+                    },
+            },
+        ) => CudaResult::Launched {
+            provider_elapsed_ns,
+        },
         (_, Reply::Error { error }) => CudaResult::Error {
             cuda: match error.code {
                 ErrorCode::LimitExceeded | ErrorCode::OutOfBounds => CUDA_ERROR_INVALID_VALUE,
@@ -728,10 +1253,21 @@ pub(crate) mod b64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::BufReader;
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::net::UnixStream;
 
     #[test]
     fn the_supported_matrix_is_exact_and_fail_closed_outside_it() {
         assert_eq!(SUPPORTED_CUDA_DRIVER_SYMBOLS.len(), 22);
+        for symbol in SUPPORTED_CUDA_DRIVER_SYMBOLS {
+            match cuda_call_for_symbol(symbol.as_str()) {
+                CudaCall::Unsupported { symbol: name } => {
+                    panic!("{name} is supported and must not fail closed")
+                }
+                _ => {}
+            }
+        }
         assert!(CudaDriverSymbol::parse("cuMemAlloc").is_some());
         assert!(CudaDriverSymbol::parse("cuMemAllocManaged").is_none());
         assert!(CudaDriverSymbol::parse("cudaMalloc").is_none());
@@ -739,6 +1275,73 @@ mod tests {
             CudaCall::Unsupported { symbol } => assert_eq!(symbol, "cuMemAllocManaged"),
             other => panic!("expected fail-closed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cuda_status_strings_are_nul_terminated() {
+        for code in [
+            CUDA_SUCCESS,
+            CUDA_ERROR_INVALID_VALUE,
+            CUDA_ERROR_NOT_INITIALIZED,
+            CUDA_ERROR_NOT_SUPPORTED,
+            CUDA_ERROR_UNKNOWN,
+            123456,
+        ] {
+            let name = cuda_error_name(code);
+            let text = cuda_error_string(code);
+            assert!(name.ends_with('\0'), "{name:?}");
+            assert!(text.ends_with('\0'), "{text:?}");
+            assert!(!name[..name.len() - 1].contains('\0'));
+            assert!(!text[..text.len() - 1].contains('\0'));
+        }
+        assert!(!cuda_error_is_named(123456));
+    }
+
+    #[test]
+    fn gpu_hmac_proof_cannot_be_replayed_as_guest_agent_proof() {
+        let key = [9u8; 32];
+        let gpu = gpu_hmac_proof(&key, 1, "host", "guest-nonce", "host-nonce");
+        let agent = guest_agent_style_proof(&key, 1, "host", "guest-nonce", "host-nonce");
+        assert_ne!(gpu, agent);
+        assert!(verify_gpu_proof(
+            &key,
+            1,
+            "host",
+            "guest-nonce",
+            "host-nonce",
+            &gpu
+        ));
+        assert!(!verify_gpu_proof(
+            &key,
+            1,
+            "guest",
+            "guest-nonce",
+            "host-nonce",
+            &gpu
+        ));
+        assert!(!verify_gpu_proof(
+            &key,
+            1,
+            "host",
+            "guest-nonce",
+            "host-nonce",
+            &agent
+        ));
+    }
+
+    #[test]
+    fn gpu_vsock_handshake_proves_instance_key() {
+        let key = [3u8; 32];
+        let (guest, host) = UnixStream::pair().unwrap();
+        let guest_thread = std::thread::spawn(move || {
+            let mut reader = BufReader::new(guest.try_clone().unwrap());
+            let mut writer = guest;
+            gpu_vsock_guest_handshake(&mut reader, &mut writer, &key, "g-nonce")
+        });
+        let mut reader = BufReader::new(host.try_clone().unwrap());
+        let mut writer = host;
+        gpu_vsock_host_handshake(&mut reader, &mut writer, &key, "h-nonce").unwrap();
+        guest_thread.join().unwrap().unwrap();
     }
 
     #[test]
@@ -759,9 +1362,13 @@ mod tests {
         assert_eq!(device.path().file_name().unwrap(), "nvidia0");
         let metadata = fs::metadata(device.path()).unwrap();
         assert!(
-            metadata.file_type().is_socket(),
+            metadata.file_type().is_socket() || metadata.file_type().is_char_device(),
             "projected nvidia0 must be a socket or CUSE node, not a regular file"
         );
+        match device.kind() {
+            GuestDeviceKind::Cuse => assert!(linux_cuse_available()),
+            GuestDeviceKind::UnixEndpoint => assert!(!linux_cuse_available()),
+        }
         let client = std::thread::scope(|scope| {
             let server = scope.spawn(|| device.accept().unwrap());
             let connected = GuestShim::connect(device.path()).unwrap();

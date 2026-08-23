@@ -8,12 +8,12 @@ projected local endpoint, not a string in instance status.
 
 | Layer | Mechanism |
 | --- | --- |
-| Guest-visible device | **CUSE character device** at `/dev/nvidia0` on Linux when `/dev/cuse` exists. Portable source fixtures bind a **Unix-domain socket** at `<guest-root>/dev/nvidia0` so `connect(2)` is a real local endpoint. |
+| Guest-visible device | **CUSE character-device service** at `/dev/nvidia0` on Linux when `/dev/cuse` exists (open/read/write/release plus fail-closed NVIDIA ioctl). Portable source fixtures bind a **Unix-domain socket** at `<guest-root>/dev/nvidia0` so `connect(2)` is a real local endpoint. |
 | CUDA API | **Generated `libcuda.so.1`** (`crates/asterism-libcuda`) exporting the exact Driver API matrix below. |
-| Guest control | Instance-bound virtio-socket port **1022**, HMAC-authenticated with the per-instance guest key and a distinct `asterism-guest-gpu` proof label. No hypervisor-id branch: a backend without virtio-socket fails closed. |
-| Local astd | Unix-socket frames `gpu_guest_open` / `gpu_guest_frame` (protocol 8). Never a LAN listener. |
+| Guest control | Instance-bound virtio-socket port **1022**, HMAC-authenticated with the per-instance guest key and a distinct `asterism-guest-gpu` proof label. The helper forwards that hop into local `astd`; it does not bypass onto `GuestMeshPath`. No hypervisor-id branch: a backend without virtio-socket fails closed. |
+| Local astd | Unix-socket frames `gpu_guest_open` / `gpu_guest_frame` (protocol 8). A reference `ProductionProvider` is registered so Init/device queries execute on the daemon path. Never a LAN listener. |
 | Mesh | Dedicated iroh stream `kind=gpu` carrying typed, length-prefixed frames. Opening frame is `{instance_id, provider_generation}` only. |
-| Provider | `ProductionProvider` authorizes by authenticated mesh peer + instance + generation. The lease bearer stays in provider memory. |
+| Provider | `ProductionProvider` authorizes by authenticated mesh peer + instance + generation, re-evaluating time on every call. Queued work is cancellable before apply. Close/EOF/loss/expiry close the ABI session, revoke, and return the provider. The lease bearer stays in provider memory. |
 
 ## Exact CUDA Driver API matrix (ABI 1)
 

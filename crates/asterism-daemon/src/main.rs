@@ -57,8 +57,8 @@ use transport::{Admitted, Framing};
 
 mod backend;
 mod device_shell;
-mod gpu;
 mod egress;
+mod gpu;
 mod images;
 mod instance;
 mod mesh;
@@ -189,6 +189,13 @@ async fn main() -> Result<()> {
                 mesh.device_id().short(),
                 mesh.self_name().await
             );
+            let name = node.device_name().await;
+            if let Err(err) = node
+                .gpu
+                .register_reference(&name, &mesh.device_id().to_string())
+            {
+                eprintln!("astd: GPU provider not registered: {err:#}");
+            }
             Some(mesh)
         }
         Err(e) => {

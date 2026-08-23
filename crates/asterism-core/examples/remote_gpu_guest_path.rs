@@ -65,7 +65,9 @@ fn main() -> Result<()> {
     .map_err(|err| anyhow::anyhow!(err))?;
     let loaded = path
         .cuda(CudaCall::ModuleLoadData {
-            image: asterism_core::remote_gpu::VECTOR_ADD_PTX.as_bytes().to_vec(),
+            image: asterism_core::remote_gpu::VECTOR_ADD_PTX
+                .as_bytes()
+                .to_vec(),
         })
         .map_err(|err| anyhow::anyhow!(err))?;
     let CudaResult::Module { pin } = loaded else {
@@ -101,10 +103,7 @@ fn main() -> Result<()> {
     println!("opened_projection={}", device.path().display());
     println!("projection_kind={PROJECTION_KIND}");
     println!("device_kind={:?}", device.kind());
-    println!(
-        "cuse_available={}",
-        device.kind() == GuestDeviceKind::Cuse
-    );
+    println!("cuse_available={}", device.kind() == GuestDeviceKind::Cuse);
     println!("mesh_frames_crossed={}", path.crossed.len());
     println!("bearer_in_mesh_open=false");
     println!("hardware_cuda_executed=false");

@@ -41,6 +41,7 @@ pub mod profile;
 pub mod protocol;
 pub mod registry;
 pub mod remote_gpu;
+pub mod remote_gpu_cuse;
 pub mod remote_gpu_guest;
 pub mod remote_gpu_nvidia;
 pub mod remote_gpu_path;

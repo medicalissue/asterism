@@ -14,7 +14,9 @@ use uuid::Uuid;
 
 use asterism_core::instance::now_unix;
 use asterism_core::protocol::{Request, Response};
-use asterism_core::remote_gpu::{AuthenticatedPeer, ControlErrorCode, ProductionProvider};
+use asterism_core::remote_gpu::{
+    AuthenticatedPeer, ControlErrorCode, LeaseAuthority, LeaseLimits, ProductionProvider, Provider,
+};
 use asterism_core::remote_gpu_guest::{
     self as guest, GuestFrame, GuestReply, DEFAULT_CREDIT_WINDOW, PROJECTION_KIND,
 };
@@ -45,6 +47,32 @@ impl Manager {
             .lock()
             .expect("GPU provider registry")
             .insert(gpu_uuid.into(), provider);
+    }
+
+    /// Register a source-only reference provider so daemon-path Init and
+    /// device queries execute. No CUDA crate, no public listener.
+    pub fn register_reference(&self, device_name: &str, device_id: &str) -> Result<()> {
+        if self
+            .providers
+            .lock()
+            .map(|p| !p.is_empty())
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        let authority = LeaseAuthority::new(
+            device_name,
+            device_id,
+            "GPU-ASTERISM-REFERENCE",
+            1,
+            LeaseLimits::default(),
+        )
+        .map_err(|err| anyhow!(err.message))?;
+        self.insert(
+            "GPU-ASTERISM-REFERENCE",
+            ProductionProvider::new(authority, Provider::reference(device_name)),
+        );
+        Ok(())
     }
 
     fn take(&self) -> Option<(String, ProductionProvider)> {
@@ -115,13 +143,19 @@ pub(crate) async fn serve_mesh(
         }
     };
     let mut hop = ProviderHop::new(peer, production, now_unix());
+    hop.set_now(now_unix());
     let accepted = hop.accept_open(open).map_err(|err| anyhow!(err))?;
     write_gpu_frame(&mut stream.send, &accepted).await?;
     if !matches!(accepted, GpuMeshFrame::Accepted { .. }) {
+        hop.shutdown("refused", false);
         node.gpu.put(gpu_uuid, hop.into_production());
         return Ok(());
     }
     let result = pump_provider(&mut stream, &mut hop).await;
+    match &result {
+        Ok(()) => hop.shutdown("close", false),
+        Err(_) => hop.shutdown("eof", true),
+    }
     node.gpu.put(gpu_uuid, hop.into_production());
     result
 }
@@ -129,9 +163,13 @@ pub(crate) async fn serve_mesh(
 async fn pump_provider(stream: &mut MeshStream, hop: &mut ProviderHop) -> Result<()> {
     loop {
         let frame: GpuMeshFrame = read_gpu_frame(&mut stream.recv).await?;
+        hop.set_now(now_unix());
         let closing = matches!(frame, GpuMeshFrame::Close);
         let reply = hop.handle_frame(frame).map_err(|err| anyhow!(err))?;
         write_gpu_frame(&mut stream.send, &reply).await?;
+        while let Some(applied) = hop.apply_next().map_err(|err| anyhow!(err))? {
+            write_gpu_frame(&mut stream.send, &applied).await?;
+        }
         if closing {
             break;
         }
@@ -149,7 +187,7 @@ pub(crate) async fn serve_local<'a, 'b>(
     let Some(mesh) = mesh else {
         io.send(&Response::GpuGuestRefused {
             code: "no_mesh".into(),
-            message: asterism_core::orbit::NO_MESH.into(),
+            message: crate::orbit::NO_MESH.into(),
         })
         .await?;
         return Ok(());
@@ -186,6 +224,7 @@ pub(crate) async fn serve_local<'a, 'b>(
             mesh.device_id(),
             &instance.id,
             attachment.provider_generation,
+            attachment.memory_bytes,
             io,
         )
         .await;
@@ -206,7 +245,10 @@ pub(crate) async fn bridge_client<'a, 'b>(
     io: &'a mut ClientIo<'b>,
 ) -> Result<()> {
     let accepted: GpuMeshFrame = read_gpu_frame(&mut stream.recv).await?;
-    let GpuMeshFrame::Accepted { session, credit, .. } = accepted else {
+    let GpuMeshFrame::Accepted {
+        session, credit, ..
+    } = accepted
+    else {
         io.send(&Response::GpuGuestRefused {
             code: "refused".into(),
             message: format!("{accepted:?}"),
@@ -262,35 +304,62 @@ pub(crate) async fn bridge_client<'a, 'b>(
                         },
                     },
                     GuestFrame::Cuda { id, call } => {
-                        if credits == 0 {
-                            GuestReply::Refused {
-                                code: "backpressure".into(),
-                                message: "GPU mesh credit window is empty".into(),
-                            }
-                        } else {
-                            sequence = sequence
-                                .checked_add(1)
-                                .ok_or_else(|| anyhow!("GPU ABI sequence exhausted"))?;
-                            let request = guest::abi_request_for(&session, sequence, &call)
-                                .map_err(|err| anyhow!(err))?;
-                            credits -= 1;
-                            write_gpu_frame(
-                                &mut stream.send,
-                                &GpuMeshFrame::Call { id, request },
-                            )
-                            .await?;
-                            match read_gpu_frame(&mut stream.recv).await? {
-                                GpuMeshFrame::Reply { reply, .. } => {
-                                    credits = credits.saturating_add(1);
-                                    GuestReply::Cuda {
-                                        id,
-                                        result: guest::cuda_result_for(&call, reply),
+                        match guest::abi_request_for(&session, sequence.saturating_add(1), &call) {
+                            Err(_) => GuestReply::Cuda {
+                                id,
+                                result: match &call {
+                                    guest::CudaCall::Init => guest::CudaResult::Init,
+                                    guest::CudaCall::DriverGetVersion => {
+                                        guest::CudaResult::DriverVersion {
+                                            version: guest::CUDA_DRIVER_VERSION,
+                                        }
+                                    }
+                                    guest::CudaCall::DeviceCount => {
+                                        guest::CudaResult::DeviceCount { count: 1 }
+                                    }
+                                    guest::CudaCall::Synchronize
+                                    | guest::CudaCall::CtxSynchronize => guest::CudaResult::Synced,
+                                    other => guest::CudaResult::Error {
+                                        cuda: guest::CUDA_ERROR_NOT_SUPPORTED,
+                                        message: format!("{other:?} is session-local"),
+                                    },
+                                },
+                            },
+                            Ok(request) => {
+                                if credits == 0 {
+                                    GuestReply::Refused {
+                                        code: "backpressure".into(),
+                                        message: "GPU mesh credit window is empty".into(),
+                                    }
+                                } else {
+                                    sequence = sequence
+                                        .checked_add(1)
+                                        .ok_or_else(|| anyhow!("GPU ABI sequence exhausted"))?;
+                                    credits -= 1;
+                                    write_gpu_frame(
+                                        &mut stream.send,
+                                        &GpuMeshFrame::Call { id, request },
+                                    )
+                                    .await?;
+                                    let mut frame = read_gpu_frame(&mut stream.recv).await?;
+                                    if let GpuMeshFrame::Credit { window } = frame {
+                                        credits = window;
+                                        frame = read_gpu_frame(&mut stream.recv).await?;
+                                    }
+                                    match frame {
+                                        GpuMeshFrame::Reply { reply, .. } => {
+                                            credits = credits.saturating_add(1);
+                                            GuestReply::Cuda {
+                                                id,
+                                                result: guest::cuda_result_for(&call, reply),
+                                            }
+                                        }
+                                        other => GuestReply::Refused {
+                                            code: "mesh".into(),
+                                            message: format!("{other:?}"),
+                                        },
                                     }
                                 }
-                                other => GuestReply::Refused {
-                                    code: "mesh".into(),
-                                    message: format!("{other:?}"),
-                                },
                             }
                         }
                     }
@@ -311,10 +380,11 @@ async fn serve_local_provider<'a, 'b>(
     node: &Node,
     self_id: DeviceId,
     instance_id: &str,
-    generation: u64,
+    _generation: u64,
+    memory_bytes: u64,
     io: &'a mut ClientIo<'b>,
 ) -> Result<()> {
-    let Some((gpu_uuid, production)) = node.gpu.take() else {
+    let Some((gpu_uuid, mut production)) = node.gpu.take() else {
         io.send(&Response::GpuGuestRefused {
             code: "device_lost".into(),
             message: "this device has no GPU provider service".into(),
@@ -324,7 +394,19 @@ async fn serve_local_provider<'a, 'b>(
     };
     let peer = AuthenticatedPeer::from_mesh_identity(self_id.to_string())
         .map_err(|err| anyhow!(err.message))?;
-    let mut hop = ProviderHop::new(peer, production, now_unix());
+    let now = now_unix();
+    if let Err(err) = production.ensure_attached(&peer, instance_id, memory_bytes.max(1), now) {
+        node.gpu.put(gpu_uuid, production);
+        io.send(&Response::GpuGuestRefused {
+            code: "attach".into(),
+            message: err.message,
+        })
+        .await?;
+        return Ok(());
+    }
+    let generation = production.authority().generation();
+    let mut hop = ProviderHop::new(peer, production, now);
+    hop.set_now(now);
     let open = GpuMeshOpen::new(instance_id, generation).map_err(|err| anyhow!(err))?;
     match hop.accept_open(open).map_err(|err| anyhow!(err))? {
         GpuMeshFrame::Accepted { .. } => {}
@@ -366,6 +448,10 @@ async fn serve_local_provider<'a, 'b>(
         }
     }
     let result = pump_local(io, &mut hop, 0).await;
+    match &result {
+        Ok(()) => hop.shutdown("close", false),
+        Err(_) => hop.shutdown("eof", true),
+    }
     node.gpu.put(gpu_uuid, hop.into_production());
     result
 }
@@ -378,6 +464,7 @@ async fn pump_local<'a, 'b>(
     loop {
         match io.next_request().await? {
             Request::GpuGuestFrame { frame } => {
+                hop.set_now(now_unix());
                 let reply = apply_guest_on_hop(hop, frame, &mut sequence)?;
                 io.send(&Response::GpuGuestReply { reply }).await?;
             }
@@ -401,9 +488,14 @@ fn apply_guest_on_hop(
             executor: hop.executor(),
             credit: DEFAULT_CREDIT_WINDOW,
         }),
-        GuestFrame::Close => Ok(GuestReply::Closed),
+        GuestFrame::Close => {
+            hop.shutdown("close", false);
+            Ok(GuestReply::Closed)
+        }
         GuestFrame::Cancel { id } => {
-            let reply = hop.handle_frame(GpuMeshFrame::Cancel { id }).map_err(|err| anyhow!(err))?;
+            let reply = hop
+                .handle_frame(GpuMeshFrame::Cancel { id })
+                .map_err(|err| anyhow!(err))?;
             match reply {
                 GpuMeshFrame::Cancelled { id } => Ok(GuestReply::Cancelled { id }),
                 GpuMeshFrame::Refused { message, .. } => Ok(GuestReply::Refused {
@@ -416,55 +508,32 @@ fn apply_guest_on_hop(
                 }),
             }
         }
-        GuestFrame::Cuda { id, call } => match call {
-            guest::CudaCall::Init => Ok(GuestReply::Cuda {
-                id,
-                result: guest::CudaResult::Init,
-            }),
-            guest::CudaCall::DeviceCount => Ok(GuestReply::Cuda {
-                id,
-                result: guest::CudaResult::DeviceCount { count: 1 },
-            }),
-            guest::CudaCall::DeviceName { ordinal } if ordinal == 0 => Ok(GuestReply::Cuda {
-                id,
-                result: guest::CudaResult::DeviceName {
-                    name: "Asterism remote NVIDIA (projected)".into(),
-                },
-            }),
-            guest::CudaCall::Synchronize => Ok(GuestReply::Cuda {
-                id,
-                result: guest::CudaResult::Synced,
-            }),
-            guest::CudaCall::Unsupported { symbol } => Ok(GuestReply::Cuda {
-                id,
-                result: guest::CudaResult::Error {
-                    cuda: guest::CUDA_ERROR_NOT_SUPPORTED,
-                    message: format!("{symbol} is outside the implemented CUDA Driver surface"),
-                },
-            }),
-            call => {
-            let session = hop
-                .abi_session()
-                .ok_or_else(|| anyhow!("GPU ABI session is not open"))?
-                .to_owned();
-            *sequence = sequence
-                .checked_add(1)
-                .ok_or_else(|| anyhow!("GPU ABI sequence exhausted"))?;
-            let request =
-                guest::abi_request_for(&session, *sequence, &call).map_err(|err| anyhow!(err))?;
-            let reply = hop
-                .handle_frame(GpuMeshFrame::Call { id, request })
-                .map_err(|err| anyhow!(err))?;
-            match reply {
-                GpuMeshFrame::Reply { reply, .. } => Ok(GuestReply::Cuda {
-                    id,
-                    result: guest::cuda_result_for(&call, reply),
-                }),
-                other => Ok(GuestReply::Refused {
-                    code: "mesh".into(),
-                    message: format!("{other:?}"),
-                }),
-            }
+        GuestFrame::Cuda { id, call } => match hop.session_cuda(&call) {
+            Ok(result) => Ok(GuestReply::Cuda { id, result }),
+            Err(_) => {
+                let session = hop
+                    .abi_session()
+                    .ok_or_else(|| anyhow!("GPU ABI session is not open"))?
+                    .to_owned();
+                *sequence = sequence
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("GPU ABI sequence exhausted"))?;
+                let request = guest::abi_request_for(&session, *sequence, &call)
+                    .map_err(|err| anyhow!(err))?;
+                let _ack = hop
+                    .handle_frame(GpuMeshFrame::Call { id, request })
+                    .map_err(|err| anyhow!(err))?;
+                match hop.apply_next().map_err(|err| anyhow!(err))? {
+                    Some(GpuMeshFrame::Reply { reply, .. }) => Ok(GuestReply::Cuda {
+                        id,
+                        result: guest::cuda_result_for(&call, reply),
+                    }),
+                    Some(other) => Ok(GuestReply::Refused {
+                        code: "mesh".into(),
+                        message: format!("{other:?}"),
+                    }),
+                    None => Ok(GuestReply::Cancelled { id }),
+                }
             }
         },
     }

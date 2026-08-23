@@ -256,6 +256,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "asterism-libcuda"
+version = "0.0.2"
+dependencies = [
+ "asterism-core",
+]
+
+[[package]]
 name = "asterism-mesh"
 version = "0.0.2"
 dependencies = [
