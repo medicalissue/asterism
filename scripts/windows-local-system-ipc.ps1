@@ -27,14 +27,26 @@ function Get-AsterismPipes {
 
 function Wait-ServiceState([string]$Name, [string]$State, [int]$Seconds = 30) {
     $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+    $lastRow = $null
     do {
         $row = Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction SilentlyContinue
+        $lastRow = $row
         if ($null -ne $row -and $row.State -eq $State) {
             return $row
         }
         Start-Sleep -Milliseconds 250
     } while ([DateTime]::UtcNow -lt $deadline)
-    throw "service $Name did not reach $State"
+    $observed = if ($null -eq $lastRow) {
+        'missing from SCM'
+    } else {
+        "state=$($lastRow.State) exit=$($lastRow.ExitCode) service_exit=$($lastRow.ServiceSpecificExitCode)"
+    }
+    $daemonLog = Join-Path $script:testHome 'astd.log'
+    if (Test-Path -LiteralPath $daemonLog) {
+        Write-Host '--- temporary LocalSystem astd log ---'
+        Get-Content -LiteralPath $daemonLog | ForEach-Object { Write-Host $_ }
+    }
+    throw "service $Name did not reach $State ($observed)"
 }
 
 $beforePipes = Get-AsterismPipes

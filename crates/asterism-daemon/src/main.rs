@@ -161,7 +161,7 @@ fn main() -> Result<()> {
             let service_name = service_name_from_args()?;
             return asterism_core::windows_host::dispatch_service(
                 &service_name,
-                || runtime().block_on(run_daemon(StopSource::Service)),
+                run_service_daemon,
             );
         }
         #[cfg(not(windows))]
@@ -173,6 +173,28 @@ fn main() -> Result<()> {
         }
     }
     runtime().block_on(run_daemon(StopSource::Console))
+}
+
+#[cfg(windows)]
+fn run_service_daemon() -> Result<()> {
+    let result = runtime().block_on(run_daemon(StopSource::Service));
+    if let Err(error) = &result {
+        // SCM owns the process stdio handles, so an early worker failure would
+        // otherwise disappear while the service merely returns to Stopped.
+        // The installer already names this file as the service log; make that
+        // promise true for the failure path needed to repair the host.
+        use std::io::Write as _;
+
+        let log = paths::home_dir().join("astd.log");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+        {
+            let _ = writeln!(file, "astd: service startup failed: {error:#}");
+        }
+    }
+    result
 }
 
 fn runtime() -> tokio::runtime::Runtime {
