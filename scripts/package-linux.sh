@@ -78,8 +78,11 @@ strip "$WORK/root/bin/ast" "$WORK/root/bin/astd"
 tar -czf "$DIST/asterism-${VERSION}-${TARGET}.tar.gz" \
   -C "$WORK/root/bin" ast astd cloud-hypervisor virtiofsd \
   -C "$WORK/root" share LICENSE-APACHE LICENSE-MIT NOTICE
-sha256sum "$DIST/asterism-${VERSION}-${TARGET}.tar.gz" \
-  >"$DIST/SHA256SUMS"
+archive="asterism-${VERSION}-${TARGET}.tar.gz"
+# SHA256SUMS is consumed by install.sh with an exact basename lookup. DIST is
+# commonly nested (for example dist/v0.1.0), so hashing its path directly
+# would publish `dist/v0.1.0/${archive}` and make the release unverifiable.
+( cd "$DIST" && sha256sum "$archive" >SHA256SUMS )
 # The per-architecture name is consumed when the publish job folds both
 # native archives into the release-wide checksum set. Keep the conventional
 # SHA256SUMS name too so the exact single-architecture artifact can exercise
