@@ -52,8 +52,11 @@ done
 cp "$ROOT/packaging/linux-components.env" "$ROOT/packaging/asterism-nbd" \
 	"$STAGE/share/asterism/"
 for license in cloud-hypervisor-Apache-2.0 cloud-hypervisor-BSD-3-Clause \
-	virtiofsd-Apache-2.0 virtiofsd-BSD-3-Clause; do
+		virtiofsd-Apache-2.0 virtiofsd-BSD-3-Clause; do
 	printf 'installer lifecycle test fixture\n' >"$STAGE/share/asterism/licenses/${license}.txt"
+done
+for license in LICENSE-APACHE LICENSE-MIT NOTICE; do
+	printf 'installer lifecycle test fixture\n' >"$STAGE/share/asterism/licenses/${license}"
 done
 artifact="asterism-${VERSION}-linux-$(uname -m)"
 case "$artifact" in *-linux-aarch64) artifact="${artifact%-aarch64}-arm64" ;; esac

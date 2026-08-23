@@ -28,6 +28,7 @@ WORK="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/asterism-linux-package.XXXXXX
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT
 mkdir -p "$WORK/root/bin" "$WORK/root/share/asterism/licenses" "$DIST"
+cp "$ROOT/LICENSE-APACHE" "$ROOT/LICENSE-MIT" "$ROOT/NOTICE" "$WORK/root/"
 
 fetch() { curl --proto '=https' --tlsv1.2 -fsSL "$1" -o "$2"; }
 verify() {
@@ -65,11 +66,17 @@ cp "$WORK/virtiofsd-${VIRTIOFSD_VERSION}/LICENSE-BSD-3-Clause" \
   "$WORK/root/share/asterism/licenses/virtiofsd-BSD-3-Clause.txt"
 cp "$ROOT/packaging/linux-components.env" "$WORK/root/share/asterism/linux-components.env"
 cp "$ROOT/packaging/asterism-nbd" "$WORK/root/share/asterism/asterism-nbd"
+cp "$ROOT/LICENSE-APACHE" "$WORK/root/share/asterism/licenses/LICENSE-APACHE"
+cp "$ROOT/LICENSE-MIT" "$WORK/root/share/asterism/licenses/LICENSE-MIT"
+cp "$ROOT/NOTICE" "$WORK/root/share/asterism/licenses/NOTICE"
 chmod 0755 "$WORK/root/share/asterism/asterism-nbd"
 
 cp "$CARGO_TARGET_DIR/release/ast" "$CARGO_TARGET_DIR/release/astd" "$WORK/root/bin/"
 strip "$WORK/root/bin/ast" "$WORK/root/bin/astd"
-tar -czf "$DIST/asterism-${VERSION}-${TARGET}.tar.gz" -C "$WORK/root" \
-  bin share
+# The installer consumes a flat CLI payload. Keep runtime data under share,
+# but do not put the four executables below a bin/ prefix.
+tar -czf "$DIST/asterism-${VERSION}-${TARGET}.tar.gz" \
+  -C "$WORK/root/bin" ast astd cloud-hypervisor virtiofsd \
+  -C "$WORK/root" share LICENSE-APACHE LICENSE-MIT NOTICE
 sha256sum "$DIST/asterism-${VERSION}-${TARGET}.tar.gz" \
   >"$DIST/SHA256SUMS.${TARGET}"

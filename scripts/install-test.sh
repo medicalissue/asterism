@@ -76,6 +76,9 @@ EOF
 			virtiofsd-Apache-2.0 virtiofsd-BSD-3-Clause; do
 			printf 'test license\n' >"${stage}/share/asterism/licenses/${license}.txt"
 		done
+		for license in LICENSE-APACHE LICENSE-MIT NOTICE; do
+			printf 'test license\n' >"${stage}/share/asterism/licenses/${license}"
+		done
 		members=(ast astd cloud-hypervisor virtiofsd share)
 	fi
 	# The first release predates self-update; current releases ship the updater
@@ -642,6 +645,8 @@ grep -qxF 'options nbd nbds_max=64' "${WORK}/system-root/etc/modprobe.d/asterism
 	|| fail "the installed nbd module options do not expose the supported device pool"
 grep -qxF 'nbd nbds_max=64' "${WORK}/modprobe-args" \
 	|| fail "the installer did not load the nbd module for immediate use"
+[ -f "${WORK}/system-root/run/lock/asterism-nbd.lock" ] \
+	|| fail "the system-wide NBD claim lock was not installed"
 policy="${WORK}/system-root/etc/sudoers.d/asterism-nbd-$(id -u)"
 grep -qF 'NOPASSWD:' "$policy" || fail "the NBD helper policy is not non-interactive"
 grep -qF "${WORK}/system-root/usr/local/libexec/asterism/asterism-nbd" "$policy" \
@@ -649,6 +654,7 @@ grep -qF "${WORK}/system-root/usr/local/libexec/asterism/asterism-nbd" "$policy"
 run_install ok -- --uninstall
 [ ! -e "${PREFIX}/bin/cloud-hypervisor" ] || fail "uninstall left Cloud Hypervisor behind"
 [ ! -e "${PREFIX}/share/asterism/linux-components.env" ] || fail "uninstall left component metadata behind"
+[ ! -e "${WORK}/system-root/run/lock/asterism-nbd.lock" ] || fail "uninstall left the NBD claim lock behind"
 [ ! -e "$policy" ] || fail "uninstall left the account's NBD sudo policy behind"
 set_host Darwin arm64
 ok "a Linux release installs NBD/module/least-privilege support and removes its account policy"

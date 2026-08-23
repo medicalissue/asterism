@@ -331,7 +331,7 @@ receipt_complete() {
 
 linux_system_files() {
 	uid="$(id -u)"
-	printf '%s' "${SYSTEM_ROOT}/etc/modules-load.d/asterism-nbd.conf ${SYSTEM_ROOT}/etc/modprobe.d/asterism-nbd.conf ${SYSTEM_ROOT}/usr/local/libexec/asterism/asterism-nbd ${SYSTEM_ROOT}/etc/sudoers.d/asterism-nbd-${uid}"
+	printf '%s' "${SYSTEM_ROOT}/etc/modules-load.d/asterism-nbd.conf ${SYSTEM_ROOT}/etc/modprobe.d/asterism-nbd.conf ${SYSTEM_ROOT}/run/lock/asterism-nbd.lock ${SYSTEM_ROOT}/usr/local/libexec/asterism/asterism-nbd ${SYSTEM_ROOT}/etc/sudoers.d/asterism-nbd-${uid}"
 }
 
 remove_receipt_files() {
@@ -405,7 +405,9 @@ drop_stale_linux_helpers() {
 		share/asterism/licenses/cloud-hypervisor-Apache-2.0.txt \
 		share/asterism/licenses/cloud-hypervisor-BSD-3-Clause.txt \
 		share/asterism/licenses/virtiofsd-Apache-2.0.txt \
-		share/asterism/licenses/virtiofsd-BSD-3-Clause.txt; do
+		share/asterism/licenses/virtiofsd-BSD-3-Clause.txt \
+		share/asterism/licenses/LICENSE-APACHE share/asterism/licenses/LICENSE-MIT \
+		share/asterism/licenses/NOTICE; do
 		receipt_lists "$rel" || continue
 		[ -e "${PREFIX}/${rel}" ] || continue
 		rm -f "${PREFIX}/${rel}"
@@ -566,7 +568,7 @@ install_release() {
 	if [ "$vz" = "1" ]; then
 		intent_files="bin/ast bin/astd bin/astd-vz"
 	elif [ "$linux_helpers" = "1" ]; then
-		intent_files="bin/ast bin/astd bin/cloud-hypervisor bin/virtiofsd share/asterism/linux-components.env share/asterism/asterism-nbd share/asterism/licenses/cloud-hypervisor-Apache-2.0.txt share/asterism/licenses/cloud-hypervisor-BSD-3-Clause.txt share/asterism/licenses/virtiofsd-Apache-2.0.txt share/asterism/licenses/virtiofsd-BSD-3-Clause.txt"
+		intent_files="bin/ast bin/astd bin/cloud-hypervisor bin/virtiofsd share/asterism/linux-components.env share/asterism/asterism-nbd share/asterism/licenses/cloud-hypervisor-Apache-2.0.txt share/asterism/licenses/cloud-hypervisor-BSD-3-Clause.txt share/asterism/licenses/virtiofsd-Apache-2.0.txt share/asterism/licenses/virtiofsd-BSD-3-Clause.txt share/asterism/licenses/LICENSE-APACHE share/asterism/licenses/LICENSE-MIT share/asterism/licenses/NOTICE"
 	else
 		intent_files="bin/ast bin/astd"
 	fi
@@ -616,7 +618,10 @@ install_release() {
 				share/asterism/licenses/cloud-hypervisor-Apache-2.0.txt \
 				share/asterism/licenses/cloud-hypervisor-BSD-3-Clause.txt \
 				share/asterism/licenses/virtiofsd-Apache-2.0.txt \
-				share/asterism/licenses/virtiofsd-BSD-3-Clause.txt
+				share/asterism/licenses/virtiofsd-BSD-3-Clause.txt \
+				share/asterism/licenses/LICENSE-APACHE \
+				share/asterism/licenses/LICENSE-MIT \
+				share/asterism/licenses/NOTICE
 		else
 			write_receipt "$version" "$target" release "$got" \
 				bin/ast bin/astd bin/cloud-hypervisor bin/virtiofsd \
@@ -625,7 +630,10 @@ install_release() {
 				share/asterism/licenses/cloud-hypervisor-Apache-2.0.txt \
 				share/asterism/licenses/cloud-hypervisor-BSD-3-Clause.txt \
 				share/asterism/licenses/virtiofsd-Apache-2.0.txt \
-				share/asterism/licenses/virtiofsd-BSD-3-Clause.txt
+				share/asterism/licenses/virtiofsd-BSD-3-Clause.txt \
+				share/asterism/licenses/LICENSE-APACHE \
+				share/asterism/licenses/LICENSE-MIT \
+				share/asterism/licenses/NOTICE
 		fi
 	else
 		drop_stale_linux_helpers
@@ -811,6 +819,12 @@ configure_chv_linux() {
 	run_root install -m 0644 "$modules_load" "${SYSTEM_ROOT}/etc/modules-load.d/asterism-nbd.conf"
 	run_root install -m 0644 "$modprobe_options" "${SYSTEM_ROOT}/etc/modprobe.d/asterism-nbd.conf"
 	run_root modprobe nbd nbds_max=64
+
+	# This root-owned, non-secret inode is the host-wide flock boundary for
+	# check/claim/attach/owner-capture. Its writable mode lets the unprivileged
+	# daemon open it, while the directory remains administrator-owned.
+	run_root install -d -m 0755 "${SYSTEM_ROOT}/run/lock"
+	run_root install -m 0666 /dev/null "${SYSTEM_ROOT}/run/lock/asterism-nbd.lock"
 
 	# The daemon never gets general nbd-client access. It may invoke only this
 	# root-owned argument-checking wrapper, and only without an environment-
