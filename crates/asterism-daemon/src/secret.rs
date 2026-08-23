@@ -234,6 +234,35 @@ impl SecretPlane {
             .clone()
     }
 
+    /// Put the platform store back in the state it had before a metadata
+    /// commit was attempted. Secret Service and Keychain are the durable side
+    /// of this transaction: a failed compensation must be returned to the
+    /// caller, never hidden behind the original catalog error.
+    fn restore_material(&self, id: &SecretId, previous: Option<&[u8]>) -> Result<()> {
+        match previous {
+            Some(bytes) => self
+                .store
+                .put(id, bytes)
+                .context("restoring the previous value in the platform secret store"),
+            None => self
+                .store
+                .remove(id)
+                .context("removing the uncommitted value from the platform secret store"),
+        }
+    }
+
+    fn compensation_error(
+        operation: &str,
+        commit: anyhow::Error,
+        restore: anyhow::Error,
+    ) -> anyhow::Error {
+        anyhow!(
+            "{operation} metadata did not commit: {commit:#}; compensation also failed: \
+             {restore:#}. The platform secret store may not match the catalog; retry the \
+             operation after repairing Secret Service/Keychain access"
+        )
+    }
+
     fn sync(&self, secret: Secret) -> Result<Secret> {
         let id = secret.id.clone();
         let mut catalog = self.catalog.lock().expect("secret catalog poisoned");
@@ -313,8 +342,10 @@ impl SecretPlane {
         catalog.secrets.sort_by(|a, b| a.name.cmp(&b.name));
         if let Err(e) = catalog.save() {
             catalog.secrets = snapshot;
-            let _ = self.store.remove(&local.id);
-            return Err(e);
+            if let Err(restore) = self.restore_material(&local.id, None) {
+                return Err(Self::compensation_error("creating secret", e, restore));
+            }
+            return Err(e.context("creating secret metadata"));
         }
         Ok(local)
     }
@@ -332,7 +363,11 @@ impl SecretPlane {
             .iter()
             .any(|source| source.device_id == self.device_id)
         {
-            self.store.get(id).ok()
+            Some(
+                self.store
+                    .get(id)
+                    .context("reading the value before removing its metadata")?,
+            )
         } else {
             None
         };
@@ -343,10 +378,12 @@ impl SecretPlane {
         let removed = catalog.secrets.remove(index);
         if let Err(e) = catalog.save() {
             catalog.secrets = snapshot;
-            if let Some(bytes) = previous_bytes {
-                let _ = self.store.put(id, &bytes);
+            if let Some(bytes) = previous_bytes.as_deref() {
+                if let Err(restore) = self.restore_material(id, Some(bytes)) {
+                    return Err(Self::compensation_error("removing secret", e, restore));
+                }
             }
-            return Err(e);
+            return Err(e.context("removing secret metadata"));
         }
         Ok(removed)
     }
@@ -399,7 +436,10 @@ impl SecretPlane {
                 secret.name
             );
         }
-        let previous_bytes = self.store.get(id).ok();
+        let previous_bytes = self
+            .store
+            .get(id)
+            .context("reading the current value before rotating it")?;
         let previous_secret = secret.clone();
         self.store.put(id, value.as_bytes())?;
         let changed = {
@@ -417,15 +457,10 @@ impl SecretPlane {
         };
         if let Err(e) = catalog.save() {
             catalog.secrets[index] = previous_secret;
-            match previous_bytes {
-                Some(bytes) => {
-                    let _ = self.store.put(id, &bytes);
-                }
-                None => {
-                    let _ = self.store.remove(id);
-                }
+            if let Err(restore) = self.restore_material(id, Some(&previous_bytes)) {
+                return Err(Self::compensation_error("rotating secret", e, restore));
             }
-            return Err(e);
+            return Err(e.context("rotating secret metadata"));
         }
         Ok(changed)
     }
@@ -1271,6 +1306,28 @@ mod tests {
         }
     }
 
+    struct RestoreFailStore {
+        inner: MemoryStore,
+        fail_put_value: Vec<u8>,
+    }
+
+    impl SecretStore for RestoreFailStore {
+        fn put(&self, id: &SecretId, value: &[u8]) -> Result<()> {
+            if value == self.fail_put_value {
+                bail!("injected durable restore failure");
+            }
+            self.inner.put(id, value)
+        }
+
+        fn get(&self, id: &SecretId) -> Result<Vec<u8>> {
+            self.inner.get(id)
+        }
+
+        fn remove(&self, id: &SecretId) -> Result<()> {
+            self.inner.remove(id)
+        }
+    }
+
     fn id() -> SecretId {
         SecretId::from_name("api").unwrap()
     }
@@ -1565,6 +1622,51 @@ mod tests {
             "Secret Service/store mutation must roll back when metadata does not commit"
         );
         assert_eq!(plane.list()[0].version, 1);
+    }
+
+    #[test]
+    fn a_failed_platform_restore_is_reported_and_metadata_is_repaired_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.json");
+        let store = MemoryStore::default();
+        let plane = SecretPlane::new(
+            "laptop".into(),
+            path.clone(),
+            Box::new(RestoreFailStore {
+                inner: store.clone(),
+                fail_put_value: b"v1".to_vec(),
+            }),
+        )
+        .unwrap();
+        let lineage = ValueRevision::mint();
+        plane
+            .put(
+                secret(1, vec![source("laptop", 1, &lineage)]),
+                &value(b"v1-initial"),
+            )
+            .unwrap();
+        // Make the previous value the one the store will refuse only during
+        // compensation, after the forward write has succeeded.
+        store.put(&id(), b"v1").unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let err = plane
+            .rotate(&id(), 2, 2, &ValueRevision::mint(), &value(b"v2"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("compensation also failed"), "{err}");
+        assert!(
+            err.contains("repairing Secret Service/Keychain access"),
+            "{err}"
+        );
+        assert_eq!(
+            plane.list()[0].version,
+            1,
+            "catalog ownership was not repaired"
+        );
+        assert_eq!(store.get(&id()).unwrap(), b"v2");
     }
 
     #[test]

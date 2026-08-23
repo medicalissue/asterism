@@ -184,7 +184,9 @@ updater, the NBD privilege wrapper, component lock file, and licenses.
 Installation needs neither a Rust toolchain nor a separately installed VMM.
 The installer grants the bundled VMM only `CAP_NET_ADMIN`, loads `nbd`
 with 64 devices, and installs a least-privilege sudoers rule for the
-argument-checking NBD helper. `ast service install` writes the systemd
+argument-checking NBD helper plus the exact `setcap cap_net_admin+ep`
+invocation the transactional updater needs for that one installed VMM path.
+`ast service install` writes the systemd
 user unit; lingering (`loginctl enable-linger`) is what keeps that unit
 alive after logout. `ast doctor` executes the pinned helpers, NBD wrapper,
 and Secret Service rather than checking that files exist.
