@@ -140,7 +140,11 @@ pub fn probe_helper_within(path: &Path, timeout: Duration) -> Result<HostReady> 
         )
     })?;
     match reply.into_result()? {
-        Reply::Ready { host } => Ok(host),
+        Reply::Ready { host } => {
+            host.ensure_supported()
+                .context("helper Probe returned incompatible Ready metadata")?;
+            Ok(host)
+        }
         other => bail!("helper Probe replied {other:?}, not Ready"),
     }
 }
@@ -384,7 +388,10 @@ pub struct HostReady {
 }
 
 impl HostReady {
-    pub fn require_supported(&self) -> Result<()> {
+    /// Validate every compatibility and host-readiness field carried by a
+    /// `Ready` reply. Callers must not treat successful JSON decoding as a
+    /// successful Probe.
+    pub fn ensure_supported(&self) -> Result<()> {
         if self.protocol != PROTOCOL_VERSION {
             bail!(
                 "astd-hyperv speaks protocol {}, but astd expects {}",
@@ -429,6 +436,11 @@ impl HostReady {
             );
         }
         Ok(())
+    }
+
+    /// Compatibility spelling used by the native backend candidate.
+    pub fn require_supported(&self) -> Result<()> {
+        self.ensure_supported()
     }
 }
 
@@ -685,22 +697,44 @@ mod tests {
     fn doctor_probe_requires_the_helper_protocol_not_a_file() {
         let dir = tempfile::tempdir().unwrap();
         let helper = dir.path().join("astd-hyperv");
-        let script = r#"#!/bin/sh
-read _line
-printf '%s\n' '{"result":"ready","host":{"protocol":1,"build":"fixture","windows":"11.0.26100","edition":"Windows 11 Pro","elevated":true,"hcs_running":true,"hcn_running":true}}'
-"#;
-        std::fs::write(&helper, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perm = std::fs::metadata(&helper).unwrap().permissions();
-            perm.set_mode(0o755);
-            std::fs::set_permissions(&helper, perm).unwrap();
-        }
+        let write_reply = |host: HostReady| {
+            let reply = serde_json::to_string(&Reply::Ready { host }).unwrap();
+            let script = format!("#!/bin/sh\nread _line\nprintf '%s\\n' '{reply}'\n");
+            std::fs::write(&helper, script).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perm = std::fs::metadata(&helper).unwrap().permissions();
+                perm.set_mode(0o755);
+                std::fs::set_permissions(&helper, perm).unwrap();
+            }
+        };
+        let compatible = HostReady {
+            protocol: PROTOCOL_VERSION,
+            build: build_id(),
+            windows: "11.0.26100".into(),
+            edition: "Windows 11 Pro".into(),
+            elevated: true,
+            hcs_running: true,
+            hcn_running: true,
+        };
+        write_reply(compatible.clone());
         let host = probe_helper(&helper).expect("fixture helper must speak Probe");
         assert_eq!(host.protocol, PROTOCOL_VERSION);
-        assert_eq!(host.build, "fixture");
+        assert_eq!(host.build, build_id());
         assert!(host.edition.contains("Pro"));
         assert!(host.hcs_running && host.hcn_running);
+
+        let mut incompatible = compatible.clone();
+        incompatible.protocol = PROTOCOL_VERSION + 1;
+        write_reply(incompatible);
+        let error = probe_helper(&helper).unwrap_err().to_string();
+        assert!(error.contains("incompatible Ready metadata"), "{error}");
+
+        let mut incompatible = compatible;
+        incompatible.build = "0.0.2+another-build".into();
+        write_reply(incompatible);
+        let error = probe_helper(&helper).unwrap_err().to_string();
+        assert!(error.contains("incompatible Ready metadata"), "{error}");
     }
 }

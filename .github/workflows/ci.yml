@@ -226,6 +226,15 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
+      - name: Initialize Windows evidence
+        shell: pwsh
+        run: |
+          @(
+            "commit=$env:GITHUB_SHA"
+            "runner=$env:RUNNER_OS/$env:RUNNER_ARCH"
+            "powershell=$($PSVersionTable.PSVersion)"
+          ) | Set-Content -Path (Join-Path $env:RUNNER_TEMP 'windows-host-evidence.txt') -Encoding utf8
+
       - name: Static host-integration gate
         shell: bash
         run: bash scripts/check-windows-host.sh
@@ -247,9 +256,17 @@ jobs:
             }
           }
 
-      - name: Privilege, rollback, stop, helper probe and firewall fixtures
+      - name: Updater install, channel, concurrency, probe and privilege fixtures
         shell: pwsh
-        run: pwsh -NoProfile -File scripts/windows-host-fixtures.ps1
+        run: |
+          $evidence = Join-Path $env:RUNNER_TEMP 'windows-host-evidence.txt'
+          @(
+            "commit=$env:GITHUB_SHA"
+            "runner=$env:RUNNER_OS/$env:RUNNER_ARCH"
+            "powershell=$($PSVersionTable.PSVersion)"
+          ) | Set-Content -Path $evidence -Encoding utf8
+          pwsh -NoProfile -File scripts/windows-host-fixtures.ps1 2>&1 | Tee-Object -FilePath $evidence -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Authenticode-ready signing recipe is present
         shell: bash
@@ -259,3 +276,11 @@ jobs:
           grep -q 'ASTERISM_AUTHENTICODE_THUMBPRINT' packaging/install.sh
           grep -q 'astd-hyperv.exe' packaging/install.ps1
           grep -q 'sc.exe' crates/asterism-core/src/windows_host.rs
+
+      - name: Preserve remote Windows host evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2 commit
+        with:
+          name: windows-host-evidence-${{ github.sha }}
+          path: ${{ runner.temp }}/windows-host-evidence.txt
+          if-no-files-found: error

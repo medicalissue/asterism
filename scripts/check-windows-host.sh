@@ -1,10 +1,9 @@
 #!/bin/sh
 # Static gate for Windows host integration (as-lvf.10).
 #
-# The Hyper-V VM lifecycle stays in as-lvf.8 (daemon/backend/hyperv.rs and
-# asterism-hyperv/src/windows.rs). This script refuses those files if they
-# appear in *this* change set's host-integration tree, and proves the
-# portable 510d330 helper contract is present.
+# The Hyper-V VM lifecycle stays in its native backend. This gate composes
+# with that candidate when its files are present: it checks the boundary
+# rather than rejecting the existence of a valid backend.
 set -eu
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -15,14 +14,41 @@ fail() {
 	exit 1
 }
 
-# Backend implementation files are owned by as-lvf.8. Host integration must
-# not grow a second copy.
-if [ -f crates/asterism-daemon/src/backend/hyperv.rs ]; then
-	fail "daemon Hyper-V backend leaked into this tree; as-lvf.10 owns host seams only"
+check_native_source() {
+	file=$1
+	[ -f "$file" ] || return 0
+	# A protocol assertion may name a forbidden backend to prove its generated
+	# document omits it. Product control code may not select or launch one.
+	if grep -ni 'whpx' "$file" | grep -Ev 'assert!\(!.*contains\("whpx"\)\)' >/dev/null 2>&1; then
+		fail "$file introduces WHPX control into the native Windows path"
+	fi
+	if grep -ni 'qemu' "$file" | grep -Ev 'assert!\(!.*contains\("qemu"\)\)' >/dev/null 2>&1; then
+		fail "$file introduces QEMU control into the native Windows path"
+	fi
+	if grep -nEi 'Command::new.*(powershell|pwsh)|powershell\.exe|pwsh\.exe' "$file" >/dev/null 2>&1; then
+		fail "$file introduces ad-hoc PowerShell control into the native Windows path"
+	fi
+}
+
+# Small entry point used by exact failure fixtures and by the native backend
+# candidate's own gate. It tests file contents, not forbidden filenames.
+if [ "${1:-}" = "--native-only" ]; then
+	shift
+	[ "$#" -gt 0 ] || fail "--native-only needs at least one source file"
+	for file in "$@"; do check_native_source "$file"; done
+	echo "Windows native backend boundary: clean"
+	exit 0
 fi
-if [ -f crates/asterism-hyperv/src/windows.rs ]; then
-	fail "asterism-hyperv windows.rs leaked into this tree; as-lvf.10 owns host seams only"
-fi
+
+for file in \
+	crates/asterism-core/src/hyperv.rs \
+	crates/asterism-core/src/windows_host.rs \
+	crates/asterism-daemon/src/backend/hyperv.rs \
+	crates/asterism-hyperv/src/lib.rs \
+	crates/asterism-hyperv/src/windows.rs
+do
+	check_native_source "$file"
+done
 
 grep -q 'pub const HELPER_BIN: &str = "astd-hyperv"' crates/asterism-core/src/hyperv.rs \
 	|| fail "helper contract is missing HELPER_BIN"
@@ -57,10 +83,20 @@ grep -q 'user-writable prefix' crates/asterism-core/src/windows_host.rs \
 	|| fail "LocalSystem + user-writable prefix is not refused"
 grep -q 'fn probe_helper' crates/asterism-core/src/hyperv.rs \
 	|| fail "doctor has no real helper Probe"
+grep -q 'host.ensure_supported()' crates/asterism-core/src/hyperv.rs \
+	|| fail "helper Probe does not validate Ready compatibility metadata"
 grep -q 'wait_service_stop' crates/asterism-daemon/src/main.rs \
 	|| fail "SCM stop latch is not wired into the daemon accept loop"
 grep -q 'another updater process owns the activation transaction' packaging/update.ps1 \
 	|| fail "Windows updater is not transactional"
+grep -q "'status', 'check', 'apply', 'recover', 'channel'" packaging/update.ps1 \
+	|| fail "Windows updater does not accept channel semantics"
+grep -Fq 'if is_powershell { "-Yes" } else { "--yes" }' crates/asterism-cli/src/main.rs \
+	|| fail "ast update apply does not use PowerShell parameter semantics"
+grep -q "'asterism-update.ps1', 'install.ps1'" packaging/update.ps1 \
+	|| fail "Windows updater does not protect the packaged installer pair"
+grep -Fq "'libexec\asterism\install.ps1'" packaging/install.ps1 \
+	|| fail "native Windows installer does not place install.ps1 beside the updater"
 grep -q 'asterism-update.ps1' crates/asterism-core/src/windows_host.rs \
 	|| fail "ast update cannot reach asterism-update.ps1"
 grep -q 'name={ASTERISM_FIREWALL_RULE}' crates/asterism-core/src/windows_host.rs \
@@ -90,10 +126,4 @@ grep -q 'pub mod windows_host' crates/asterism-core/src/lib.rs \
 grep -q 'pub mod hyperv' crates/asterism-core/src/lib.rs \
 	|| fail "hyperv contract is not in the asterism-core module graph"
 
-# Product code must not offer WHPX as a fallback. The helper-protocol test
-# that asserts HCS documents do not contain the word is the allowed mention.
-if grep -n -i 'whpx' crates/asterism-core/src/windows_host.rs packaging/install.ps1; then
-	fail "Windows host integration names WHPX, which ADR 0002 excluded"
-fi
-
-echo "Windows host integration: 510d330 helper contract present; backend files absent; seven Sol blockers closed in source"
+echo "Windows host integration: helper contract and optional native backend compose without WHPX/QEMU/PowerShell control"
