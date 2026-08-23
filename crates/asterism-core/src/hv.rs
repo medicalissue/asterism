@@ -698,6 +698,17 @@ pub trait Hypervisor: Send + Sync {
     /// Immediate termination — for `ast down --force` and crash cleanup.
     fn kill(&self, h: &Handle) -> Result<()>;
 
+    /// Release backend-owned host resources before a stopped instance's
+    /// directory and authority row are removed.
+    ///
+    /// Most backends finish cleanup while stopping and need no extra work.
+    /// Persistent host services such as HCS/HCN outlive both the guest and
+    /// daemon, so their backend overrides this seam instead of leaking a
+    /// host-specific branch into instance removal.
+    fn remove_instance_resources(&self, _inst: &Instance) -> Result<()> {
+        Ok(())
+    }
+
     /// Liveness for a handle reloaded from the registry after an astd
     /// restart. Never assumes the handle is still valid.
     fn state(&self, h: &Handle) -> Result<RunState>;

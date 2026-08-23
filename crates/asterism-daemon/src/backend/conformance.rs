@@ -19,7 +19,9 @@ use asterism_core::hv::{
 use asterism_core::instance::{Instance, Shape};
 use asterism_core::power::{Change, SleepGuard};
 
-use super::{backends, by_id, hyperv, qemu, vz};
+use super::{backends, by_id, hyperv};
+#[cfg(unix)]
+use super::{qemu, vz};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ControlKind {
@@ -52,9 +54,11 @@ impl ControlKind {
 /// panic and cannot merge until its handles join the contract.
 fn control_kind(id: &str) -> ControlKind {
     match id {
+        #[cfg(unix)]
         qemu::ID => ControlKind::Qmp,
+        #[cfg(unix)]
         vz::ID => ControlKind::Rpc,
-        hyperv::ID => ControlKind::Helper,
+        id if id == hyperv::ID => ControlKind::Helper,
         other => panic!("registered backend {other:?} has no conformance profile"),
     }
 }

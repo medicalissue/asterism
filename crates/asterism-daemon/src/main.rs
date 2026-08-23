@@ -311,13 +311,14 @@ fn print_early_exit() -> bool {
 /// that is not is a question somebody has to answer later.
 fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
     file.write_all(bytes)
 }
 
@@ -411,22 +412,32 @@ fn sweep_interrupted_commits() {
 /// its handler does is not a shutdown — it is the default disposition, which
 /// is death, and a daemon killed that way leaves both files behind.
 struct Stop {
+    #[cfg(unix)]
     term: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
     int: Option<tokio::signal::unix::Signal>,
 }
 
 impl Stop {
     fn listen() -> Stop {
-        use tokio::signal::unix::{signal, SignalKind};
-        Stop {
-            term: signal(SignalKind::terminate()).ok(),
-            int: signal(SignalKind::interrupt()).ok(),
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            Stop {
+                term: signal(SignalKind::terminate()).ok(),
+                int: signal(SignalKind::interrupt()).ok(),
+            }
+        }
+        #[cfg(windows)]
+        {
+            Stop {}
         }
     }
 
     /// Wait for either. A signal this process could not register for never
     /// arrives here, which is correct: it was never ours to catch.
     async fn next(&mut self) {
+        #[cfg(unix)]
         match (&mut self.term, &mut self.int) {
             (Some(term), Some(int)) => {
                 tokio::select! {
@@ -438,6 +449,10 @@ impl Stop {
                 one.recv().await;
             }
             (None, None) => std::future::pending().await,
+        }
+        #[cfg(windows)]
+        {
+            let _ = tokio::signal::ctrl_c().await;
         }
     }
 }

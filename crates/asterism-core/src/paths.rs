@@ -6,7 +6,9 @@ pub fn home_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("ASTERISM_HOME") {
         return PathBuf::from(dir);
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".into());
     PathBuf::from(home).join(".asterism")
 }
 

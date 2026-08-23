@@ -8,7 +8,7 @@
 # scripts/check-hyperv-boundary.ps1.
 set -eu
 
-ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$ROOT"
 
 if [ "${1:-}" != "" ]; then
@@ -48,6 +48,7 @@ required = [
     "HcsSaveComputeSystem",
     "HcnCreateNetwork",
     "HcnCreateEndpoint",
+    "HcnDeleteNetwork",
     "CreateVirtualDisk",
     "AttachVirtualDisk",
     "AF_HYPERV",
@@ -67,6 +68,9 @@ hits = [
 if hits:
     errors.append("native Hyper-V helper contains a forbidden wrapper/runtime path")
     errors.extend(hits)
+
+if re.search(r"asterism_vz", daemon_text):
+    errors.append("daemon Hyper-V backend imports asterism_vz Unix APIs")
 
 leak = re.compile(
     r"windows_sys|Hcs[A-Z]|Hcn[A-Z]|CreateVirtualDisk|AF_HYPERV|SOCKADDR_HV"

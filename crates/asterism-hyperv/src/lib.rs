@@ -240,6 +240,8 @@ pub enum Request {
         system_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         endpoint_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        network_id: Option<String>,
     },
     Save {
         system_id: String,
@@ -362,6 +364,30 @@ pub fn serve_once(
     Ok(())
 }
 
+/// A stable, locally-administered MAC for an instance.
+///
+/// Same FNV-1a derivation the VZ backend uses, kept here so the Hyper-V
+/// daemon path never imports `asterism_vz`. `02:15:5d` is Microsoft's
+/// locally-administered Hyper-V OUI.
+pub fn mac_for(instance: &str) -> String {
+    let h = fnv1a(instance);
+    format!(
+        "02:15:5d:{:02x}:{:02x}:{:02x}",
+        (h >> 16) as u8,
+        (h >> 8) as u8,
+        h as u8
+    )
+}
+
+fn fnv1a(s: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 pub fn parse_guid(text: &str) -> Result<[u8; 16]> {
     let compact: String = text.chars().filter(|c| *c != '-').collect();
     if compact.len() != 32 || !compact.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -414,6 +440,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn macs_are_stable_local_and_per_instance() {
+        let mac = mac_for("dev");
+        assert_eq!(mac, mac_for("dev"));
+        assert_ne!(mac, mac_for("other"));
+        assert!(mac.starts_with("02:15:5d:"), "{mac}");
+        let first = u8::from_str_radix(&mac[..2], 16).unwrap();
+        assert_eq!(first & 0b10, 0b10);
+        assert_eq!(first & 1, 0);
+    }
+
+    #[test]
     fn protocol_round_trip_and_mutation_gate_are_explicit() {
         let request = Request::State {
             system_id: "6fce7c98-d05d-43c8-8207-141c56ccca18".into(),
@@ -421,11 +458,14 @@ mod tests {
         assert!(!request.mutates());
         let wire = serde_json::to_vec(&request).unwrap();
         assert_eq!(request, serde_json::from_slice(&wire).unwrap());
-        assert!(Request::Terminate {
+        let terminate = Request::Terminate {
             system_id: "6fce7c98-d05d-43c8-8207-141c56ccca18".into(),
-            endpoint_id: None,
-        }
-        .mutates());
+            endpoint_id: Some("83f8639b-3c23-4b07-b229-144314489fd0".into()),
+            network_id: Some("0a9d2db3-51ef-489f-bcac-85e410f769c9".into()),
+        };
+        assert!(terminate.mutates());
+        let wire = serde_json::to_vec(&terminate).unwrap();
+        assert_eq!(terminate, serde_json::from_slice(&wire).unwrap());
     }
 
     #[test]
@@ -458,7 +498,10 @@ mod tests {
             hcn_running: true,
         };
         let error = host.require_supported().unwrap_err().to_string();
-        assert!(error.contains("reinstall the complete Windows artifact"), "{error}");
+        assert!(
+            error.contains("reinstall the complete Windows artifact"),
+            "{error}"
+        );
     }
 
     #[test]

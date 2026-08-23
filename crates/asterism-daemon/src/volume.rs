@@ -1072,6 +1072,7 @@ fn stop_revoked_exports(revoked: &[(String, volume::Lease)]) -> Result<()> {
 /// current one, gets a refusal rather than a pipe. Nothing about the reply
 /// tells a stale consumer what the new epoch is; it has to go and ask for a
 /// lease, which is the code path that decides whether it may have one.
+#[cfg(unix)]
 pub async fn open_export(
     volume: &str,
     holder: &str,
@@ -1091,6 +1092,27 @@ pub async fn open_export(
     .await
 }
 
+#[cfg(windows)]
+pub async fn open_export(
+    volume: &str,
+    holder: &str,
+    holder_id: &str,
+    epoch: u64,
+    requester_device: &str,
+    requester_device_id: &str,
+) -> Result<tokio::net::TcpStream> {
+    let _ = (
+        volume,
+        holder,
+        holder_id,
+        epoch,
+        requester_device,
+        requester_device_id,
+    );
+    bail!("NBD unix-socket volume exports are not available on Windows")
+}
+
+#[cfg(unix)]
 async fn open_export_for(
     volume: &str,
     holder: &str,
@@ -2183,6 +2205,7 @@ pub async fn compensate_boot_leases(instance: &Instance, boot_intent_id: &str) -
 /// One accept loop per volume, one mesh stream per connection — the same
 /// shape `ast ssh` uses, and for the same reason: past the first frame this
 /// is a pipe, and neither daemon reads what goes through it.
+#[cfg(unix)]
 async fn bridge(
     instance: &str,
     instance_id: &str,
@@ -2236,7 +2259,20 @@ async fn bridge(
     Ok(Splice::new(task, Some(socket_path)))
 }
 
+#[cfg(windows)]
+async fn bridge(
+    instance: &str,
+    instance_id: &str,
+    vol: &Volume,
+    epoch: u64,
+    socket: &Path,
+) -> Result<Splice> {
+    let _ = (instance, instance_id, vol, epoch, socket);
+    bail!("volume NBD bridges are not available on Windows")
+}
+
 /// One QEMU connection, carried to the provider's export.
+#[cfg(unix)]
 async fn splice_one(
     device: &str,
     volume: &str,

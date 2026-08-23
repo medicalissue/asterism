@@ -8,8 +8,10 @@
 #   $env:ASTERISM_HYPERV_REAL_HOST = "1"
 #   ./scripts/hyperv-real-host-harness.ps1
 #
-# Operations, in order, once the pre-mutation gates pass:
-#   probe, create, boot, control, snapshot, stop, restart, adoption, stop.
+# Daemon disk snapshots copy a closed VHDX. The sequence therefore stops the
+# guest before snapshot, then proves restart, adoption across an astd
+# restart, and a final stop. Helper build identity and leftover HCS/HCN
+# objects are recorded independently of `ast`.
 param(
     [switch]$ExplainOnly,
     [string]$Instance = "asterism-hyperv-harness",
@@ -30,13 +32,15 @@ $GithubHostedGaps = @(
     "vmcompute/hns may exist as services without a usable HCS v2.1 VM partition",
     "VirtDisk VHDX create/attach against a real compute system cannot be proven",
     "AF_HYPERV/AF_VSOCK guest-agent readiness cannot be proven",
-    "create/boot/control/snapshot/restart/adoption/stop of a Linux guest cannot be proven",
-    "live guest survival across astd restart cannot be proven"
+    "create/boot/control/stop/snapshot/restart/adoption/final-stop of a Linux guest cannot be proven",
+    "live guest survival across astd restart cannot be proven",
+    "independent HCS compute-system and HCN network cleanup cannot be proven"
 )
 
 if ($ExplainOnly) {
     Write-Gap "Hyper-V real-host harness: EXPLAIN ONLY"
     Write-Gap "Opt-in: set ASTERISM_HYPERV_REAL_HOST=1 on an elevated Windows 11 Pro/Enterprise host with Hyper-V enabled."
+    Write-Gap "Lifecycle once opted in: probe, create, boot, control, stop, snapshot, restart, adoption, final-stop, independent HCS/HCN cleanup."
     Write-Gap "GitHub hosted runner gaps (impossible here):"
     foreach ($gap in $GithubHostedGaps) {
         Write-Gap "  - $gap"
@@ -93,6 +97,43 @@ function Record([string]$Step, [string]$Result) {
     Write-Output $line
 }
 
+function Invoke-Helper([string]$Json) {
+    $helperPath = $helper.Source
+    $reply = $Json | & $helperPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "astd-hyperv failed with $LASTEXITCODE"
+    }
+    return $reply
+}
+
+function Get-HcsSystems {
+    $hcsdiag = Get-Command hcsdiag -ErrorAction SilentlyContinue
+    if (-not $hcsdiag) {
+        throw "hcsdiag is required for independent HCS cleanup evidence"
+    }
+    return (& $hcsdiag.Source list 2>$null | Out-String)
+}
+
+function Get-HcnNetworks {
+    try {
+        $nets = Get-HnsNetwork -ErrorAction Stop | ConvertTo-Json -Depth 6
+        if ($nets) { return $nets }
+        return "[]"
+    } catch {
+        throw "Get-HnsNetwork is required for independent HCN cleanup evidence: $($_.Exception.Message)"
+    }
+}
+
+function Get-HcnEndpoints {
+    try {
+        $eps = Get-HnsEndpoint -ErrorAction Stop | ConvertTo-Json -Depth 6
+        if ($eps) { return $eps }
+        return "[]"
+    } catch {
+        throw "Get-HnsEndpoint is required for independent HCN cleanup evidence: $($_.Exception.Message)"
+    }
+}
+
 Record "host" "$product build $build elevated=true vmcompute=running hns=running"
 
 if (-not $ast -or -not $helper) {
@@ -100,12 +141,27 @@ if (-not $ast -or -not $helper) {
     throw "astd-hyperv and ast must be on PATH; real lifecycle remains unverified"
 }
 
-function Invoke-Ast([string[]]$Args) {
-    & $ast.Source @Args
+$probeJson = Invoke-Helper '{"op":"probe"}'
+Record "helper-build" $probeJson
+$probe = $probeJson | ConvertFrom-Json
+if (-not $probe.host.build) {
+    throw "astd-hyperv probe did not return host.build"
+}
+Record "helper-build-id" $probe.host.build
+
+function Invoke-Ast([string[]]$CommandArgs) {
+    & $ast.Source @CommandArgs
     if ($LASTEXITCODE -ne 0) {
-        throw "ast $($Args -join ' ') failed with $LASTEXITCODE"
+        throw "ast $($CommandArgs -join ' ') failed with $LASTEXITCODE"
     }
 }
+
+$home = if ($env:ASTERISM_HOME) { $env:ASTERISM_HOME } elseif ($env:USERPROFILE) { Join-Path $env:USERPROFILE ".asterism" } else { Join-Path $env:HOME ".asterism" }
+$configPath = Join-Path $home "instances\$Instance\hyperv.json"
+$daemonPidPath = Join-Path $home "astd.pid"
+$systemId = $null
+$networkId = $null
+$endpointId = $null
 
 Record "probe" "pre-mutation gates passed; mutating $Instance"
 try {
@@ -115,13 +171,34 @@ try {
     Record "boot" "ok"
     Invoke-Ast @("status", $Instance)
     Record "control" "ok"
-    Invoke-Ast @("snapshot", $Instance, "harness")
-    Record "snapshot" "ok"
+
+    if (Test-Path -LiteralPath $configPath) {
+        $cfg = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+        $systemId = $cfg.system_id
+        $networkId = $cfg.network_id
+        $endpointId = $cfg.endpoint_id
+        Record "handle" "system_id=$systemId network_id=$networkId endpoint_id=$endpointId"
+    } else {
+        throw "expected durable helper config at $configPath"
+    }
+
     Invoke-Ast @("down", $Instance)
-    Record "stop" "ok"
+    Record "stop-before-snapshot" "ok"
+    Invoke-Ast @("snapshot", $Instance, "harness")
+    Record "snapshot" "ok (guest was stopped)"
     Invoke-Ast @("up", $Instance)
     Record "restart" "ok"
-    Get-Process astd -ErrorAction SilentlyContinue | Stop-Process -Force
+    if (-not (Test-Path -LiteralPath $daemonPidPath)) {
+        throw "expected astd pid evidence at $daemonPidPath"
+    }
+    $daemonPidText = (Get-Content -LiteralPath $daemonPidPath -Raw).Trim()
+    $daemonPid = [int]$daemonPidText
+    $daemon = Get-Process -Id $daemonPid -ErrorAction Stop
+    if ($daemon.ProcessName -ne "astd") {
+        throw "$daemonPidPath names $($daemon.ProcessName), not astd"
+    }
+    Stop-Process -Id $daemonPid -Force
+    Record "daemon-stop" "pid=$daemonPid"
     Start-Sleep -Seconds 2
     Invoke-Ast @("status", $Instance)
     Record "adoption" "ok (guest still visible after astd restart)"
@@ -129,7 +206,39 @@ try {
     Record "stop-final" "ok"
 }
 finally {
-    try { Invoke-Ast @("rm", $Instance) } catch { Record "cleanup" $_.Exception.Message }
+    $cleanupError = $null
+    try { Invoke-Ast @("rm", $Instance) } catch {
+        $cleanupError = $_.Exception.Message
+        Record "cleanup-ast" $cleanupError
+    }
+    Start-Sleep -Seconds 2
+    $hcs = Get-HcsSystems
+    Set-Content -LiteralPath (Join-Path $EvidenceDir "hcsdiag-list.txt") -Value $hcs
+    $hcnNets = Get-HcnNetworks
+    Set-Content -LiteralPath (Join-Path $EvidenceDir "hcn-networks.json") -Value $hcnNets
+    $hcnEps = Get-HcnEndpoints
+    Set-Content -LiteralPath (Join-Path $EvidenceDir "hcn-endpoints.json") -Value $hcnEps
+
+    $leftover = @()
+    if ($cleanupError) {
+        $leftover += "ast rm failed: $cleanupError"
+    }
+    if ($systemId -and $hcs -match [regex]::Escape($systemId)) {
+        $leftover += "HCS compute system $systemId still listed"
+    }
+    if ($networkId -and $hcnNets -match [regex]::Escape($networkId)) {
+        $leftover += "HCN network $networkId still present"
+    }
+    if ($endpointId -and $hcnEps -match [regex]::Escape($endpointId)) {
+        $leftover += "HCN endpoint $endpointId still present"
+    }
+    if ($leftover.Count -gt 0) {
+        $msg = $leftover -join "; "
+        Record "cleanup-independent" "FAILED $msg"
+        throw "independent HCS/HCN cleanup failed: $msg"
+    }
+    Record "cleanup-independent" "ok (no leftover HCS system or HCN endpoint/network for this instance)"
 }
 
 Write-Output "evidence: $log"
+Write-Output "helper-build-id: $($probe.host.build)"

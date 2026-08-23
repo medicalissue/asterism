@@ -21,13 +21,18 @@
 //! which means there is no way for a new command to accidentally opt out.
 
 use std::io;
-use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(windows)]
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+#[cfg(unix)]
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{UnixListener, UnixStream};
+#[cfg(windows)]
+use tokio::net::{TcpListener as LocalListener, TcpStream as LocalStream};
+#[cfg(unix)]
+use tokio::net::{UnixListener as LocalListener, UnixStream as LocalStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{timeout, timeout_at, Instant};
 
@@ -36,7 +41,7 @@ use asterism_core::protocol::Response;
 
 /// The bound socket, the election that proves it is ours, and the slots.
 pub(crate) struct Door {
-    listener: UnixListener,
+    listener: LocalListener,
     slots: Arc<Semaphore>,
     sock: std::path::PathBuf,
     /// The `flock(2)` that makes this the only daemon on this home. Never
@@ -51,7 +56,7 @@ impl Door {
         listener
             .set_nonblocking(true)
             .context("putting the astd socket in non-blocking mode")?;
-        let listener = UnixListener::from_std(listener)
+        let listener = LocalListener::from_std(listener)
             .with_context(|| format!("serving {}", sock.display()))?;
         Ok(Door {
             listener,
@@ -68,7 +73,7 @@ impl Door {
     /// draining the kernel's backlog — which is a way for one slow peer to
     /// keep every other one out. The examination is [`admit`], on the task
     /// that will serve the connection.
-    pub(crate) async fn accept(&self) -> io::Result<UnixStream> {
+    pub(crate) async fn accept(&self) -> io::Result<LocalStream> {
         self.listener.accept().await.map(|(stream, _)| stream)
     }
 
@@ -100,8 +105,8 @@ pub(crate) struct Admitted {
 /// is the one place a user can be told *why* `ast` got nothing, and a socket
 /// closed in silence is the failure mode that produces bug reports rather
 /// than fixes.
-pub(crate) async fn admit(stream: UnixStream, slots: Arc<Semaphore>) -> Result<Option<Admitted>> {
-    let peer = ipc::same_user(stream.as_raw_fd());
+pub(crate) async fn admit(stream: LocalStream, slots: Arc<Semaphore>) -> Result<Option<Admitted>> {
+    let peer = ipc::admit_peer(&stream);
     let (read, write) = stream.into_split();
     let mut write = Writer { inner: write };
 
@@ -288,10 +293,11 @@ impl Writer {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::time::Duration;
+    use tokio::net::UnixStream;
 
     /// A connected pair, one end wrapped as the daemon would wrap it.
     async fn pair() -> (UnixStream, Frames) {
