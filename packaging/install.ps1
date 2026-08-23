@@ -213,9 +213,9 @@ function Install-Release {
         $unpack = Join-Path $work 'unpack'
         New-Item -ItemType Directory -Path $unpack | Out-Null
         tar -xzf $tarball -C $unpack
-        foreach ($bin in @('ast.exe', 'astd.exe', 'astd-hyperv.exe')) {
-            if (-not (Test-Path (Join-Path $unpack $bin))) {
-                Die "$artifact has no $bin. Refusing to install a partial Windows release."
+        foreach ($required in @('ast.exe', 'astd.exe', 'astd-hyperv.exe', 'asterism-update.ps1', 'install.ps1')) {
+            if (-not (Test-Path (Join-Path $unpack $required))) {
+                Die "$artifact has no $required. Refusing to install a partial Windows release."
             }
         }
         $binDir = Join-Path $Prefix 'bin'
@@ -228,10 +228,10 @@ function Install-Release {
         Place-File (Join-Path $unpack 'astd.exe') 'bin\astd.exe'
         Place-File (Join-Path $unpack 'astd-hyperv.exe') 'bin\astd-hyperv.exe'
         $files = @('bin\ast.exe', 'bin\astd.exe', 'bin\astd-hyperv.exe')
-        if (Test-Path (Join-Path $unpack 'asterism-update.ps1')) {
-            Place-File (Join-Path $unpack 'asterism-update.ps1') 'libexec\asterism\asterism-update.ps1'
-            $files += 'libexec\asterism\asterism-update.ps1'
-        }
+        Place-File (Join-Path $unpack 'asterism-update.ps1') 'libexec\asterism\asterism-update.ps1'
+        Place-File (Join-Path $unpack 'install.ps1') 'libexec\asterism\install.ps1'
+        $files += 'libexec\asterism\asterism-update.ps1'
+        $files += 'libexec\asterism\install.ps1'
         if (Test-Path (Join-Path $unpack 'asterism-update')) {
             Place-File (Join-Path $unpack 'asterism-update') 'libexec\asterism\asterism-update'
             $files += 'libexec\asterism\asterism-update'
