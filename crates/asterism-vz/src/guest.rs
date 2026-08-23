@@ -2249,7 +2249,7 @@ mod tests {
             client.write_all(&[i]).unwrap();
             let deadline = std::time::Instant::now() + Duration::from_secs(3);
             loop {
-                if collected.lock().unwrap().len() >= (i as usize) + 1 {
+                if collected.lock().unwrap().len() > i as usize {
                     break;
                 }
                 assert!(

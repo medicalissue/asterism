@@ -362,7 +362,7 @@ define_class!(
                 }
                 done.store(true, Ordering::Relaxed);
             });
-            true.into()
+            true
         }
     }
 );
