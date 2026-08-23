@@ -428,65 +428,81 @@ pub fn start(prepared: &Prepared) -> Result<Handle> {
             Some(Duration::from_secs(1)),
         ) {
             Ok((ControlResponse::Ready { host_pid }, peer_pid)) if host_pid == peer_pid => {
-                break host_pid
+                break Ok(host_pid)
             }
-            Ok((ControlResponse::Ready { host_pid }, peer_pid)) => bail!(
+            Ok((ControlResponse::Ready { host_pid }, peer_pid)) => break Err(anyhow::anyhow!(
                 "container control claimed pid {host_pid}, but the connected Unix peer is pid {peer_pid}"
-            ),
-            Ok((ControlResponse::Error { message }, _)) => bail!(message),
+            )),
+            Ok((ControlResponse::Error { message }, _)) => break Err(anyhow::anyhow!(message)),
             _ if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
-            _ => bail!(
+            _ => break Err(anyhow::anyhow!(
                 "container helper did not establish its control socket at {}",
                 spec.control.display()
-            ),
+            )),
         }
     };
-    let proc = ProcId::capture(host_pid).context("capturing the namespace holder identity")?;
+    let host_pid = match host_pid {
+        Ok(host_pid) => host_pid,
+        Err(error) => {
+            abort_start(&spec);
+            return Err(error);
+        }
+    };
+    let proc = match ProcId::capture(host_pid).context("capturing the namespace holder identity") {
+        Ok(proc) => proc,
+        Err(error) => {
+            abort_start(&spec);
+            return Err(error);
+        }
+    };
     // The wrapper merely waits for the namespace holder. Capture both during
     // launch, but persist and signal only the process that owns the socket.
     let _ = wrapper;
-    if !cgroup_populated(&spec.cgroup)? {
-        bail!(
-            "container control answered, but delegated cgroup {} contains no process",
-            spec.cgroup.display()
-        );
-    }
-    if let Err(error) = start_slirp(host_pid, &spec.network) {
-        // No caller may receive a failed launch while the namespace holder is
-        // still alive: it would leave a cgroup and control socket that look
-        // like a boot the registry must fence forever.
-        let _ = startup_call(
-            &spec.control,
-            &ControlRequest::Stop,
-            Some(Duration::from_secs(2)),
-        );
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while cgroup_populated(&spec.cgroup).unwrap_or(true) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(25));
+    match cgroup_populated(&spec.cgroup) {
+        Ok(true) => {}
+        Ok(false) => {
+            abort_start(&spec);
+            bail!(
+                "container control answered, but delegated cgroup {} contains no process",
+                spec.cgroup.display()
+            );
         }
-        if !cgroup_populated(&spec.cgroup).unwrap_or(true) {
-            let _ = fs::remove_dir(&spec.cgroup);
+        Err(error) => {
+            abort_start(&spec);
+            return Err(error).context("validating the launched container cgroup");
         }
-        return Err(error).context("configuring rootless container networking");
     }
     let ns = |kind: &str| PathBuf::from(format!("/proc/{host_pid}/ns/{kind}"));
     let user_namespace = ns("user");
     let mount_namespace = ns("mnt");
     let pid_namespace = ns("pid");
     let network_namespace = ns("net");
-    if !cgroup_contains(&spec.cgroup, host_pid)? {
-        bail!(
-            "container control peer pid {host_pid} is not a member of delegated cgroup {}",
-            spec.cgroup.display()
-        );
+    let identity = (|| -> Result<ContainerRuntimeIdentity> {
+        if !cgroup_contains(&spec.cgroup, host_pid)? {
+            bail!(
+                "container control peer pid {host_pid} is not a member of delegated cgroup {}",
+                spec.cgroup.display()
+            );
+        }
+        runtime_identity(
+            &user_namespace,
+            &mount_namespace,
+            &pid_namespace,
+            &network_namespace,
+            &spec.cgroup,
+        )
+    })();
+    let identity = match identity {
+        Ok(identity) => identity,
+        Err(error) => {
+            abort_start(&spec);
+            return Err(error).context("capturing the native-container runtime identity");
+        }
+    };
+    if let Err(error) = start_slirp(host_pid, &spec.network) {
+        abort_start(&spec);
+        return Err(error).context("configuring rootless container networking");
     }
-    let identity = runtime_identity(
-        &user_namespace,
-        &mount_namespace,
-        &pid_namespace,
-        &network_namespace,
-        &spec.cgroup,
-    )?;
     Ok(Handle {
         backend: LINUX_ID.into(),
         pid: Some(host_pid),
@@ -506,6 +522,21 @@ pub fn start(prepared: &Prepared) -> Result<Handle> {
         }),
         started_at: asterism_core::instance::now_unix(),
     })
+}
+
+/// No failed launch may return while its namespace holder is still alive.
+/// Otherwise a caller sees an error while durable-looking cgroup/socket state
+/// remains for reconciliation to fence forever.
+fn abort_start(spec: &Spec) {
+    let _ = startup_call(&spec.control, &ControlRequest::Stop, Some(CONTROL_DEADLINE));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while cgroup_populated(&spec.cgroup).unwrap_or(true) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    if !cgroup_populated(&spec.cgroup).unwrap_or(true) {
+        let _ = fs::remove_file(&spec.control);
+        let _ = fs::remove_dir(&spec.cgroup);
+    }
 }
 
 /// Start slirp after the namespace holder exists, then ask its control API to
