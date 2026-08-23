@@ -29,14 +29,14 @@ docker: true
 
 repos:
   - url: https://github.com/medicalissue/asterism.git
-    hash: "07d3b5648dc57674ed31934afd19c03624668c70"
+    hash: "f0d35132b4ced8a7e757fa3ffaf2f19b2e2c373f"
     path: /dstack/run
 
 working_dir: /dstack/run
 
 env:
   - ASTERISM_SOURCE_ONLY=0
-  - ASTERISM_PINNED_SHA=07d3b5648dc57674ed31934afd19c03624668c70
+  - ASTERISM_PINNED_SHA=f0d35132b4ced8a7e757fa3ffaf2f19b2e2c373f
   - ASTERISM_NVIDIA_E2E_RUNNER=/dstack/run/scripts/lib/nvidia-e2e-runner.sh
   - CARGO_HOME=/dstack/cargo
   - RUSTUP_HOME=/dstack/rustup
