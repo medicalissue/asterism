@@ -287,7 +287,7 @@ fn write_frame(writer: &Mutex<UnixStream>, typ: u8, payload: &[u8]) -> io::Resul
     Ok(())
 }
 
-fn read_frame(reader: &mut impl Read) -> io::Result<Option<(u8, Vec<u8>)>> {
+pub(crate) fn read_frame(reader: &mut impl Read) -> io::Result<Option<(u8, Vec<u8>)>> {
     let mut hdr = [0u8; 5];
     match reader.read_exact(&mut hdr) {
         Ok(()) => {}

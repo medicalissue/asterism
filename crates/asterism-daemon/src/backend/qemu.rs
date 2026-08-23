@@ -1879,6 +1879,33 @@ mod tests {
         assert!(caps.disk_formats.contains(&DiskFormat::Qcow2));
     }
 
+    /// QEMU user-net does not need an in-guest agent, so OCI still has a
+    /// guest-only door. VZ is the backend that has to strip the route.
+    #[test]
+    fn qemu_oci_keeps_loopback_gateway_egress() {
+        let hv = Qemu::new();
+        let mut inst = Instance::new(
+            "oci-web",
+            "dev",
+            "alpine:latest",
+            Shape::default(),
+            asterism_core::hv::Machine {
+                backend: ID.into(),
+                machine_type: "microvm".into(),
+                cpu: "host".into(),
+                hv_version: "test".into(),
+            },
+        );
+        inst.image_kind = ImageKind::OciRootfs;
+        assert!(
+            matches!(
+                hv.caps_for(&inst).guest_egress,
+                Some(GuestEgress::LoopbackGateway { .. })
+            ),
+            "QEMU OCI still reaches 10.0.2.2"
+        );
+    }
+
     /// The trait's default impls must stay reachable for what this backend
     /// does not offer, and must name the backend when they refuse.
     #[test]

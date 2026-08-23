@@ -393,14 +393,28 @@ impl Hypervisor for Vz {
             // helper already holds, not a TCP listener on the shared NAT.
             // The guest agent binds loopback inside the guest and carries
             // CONNECT streams over vsock; astd binds a unix socket the
-            // helper splices onto. Caps is truthful only because that
-            // whole path exists in this build.
+            // helper splices onto. This is the cloud-image offer; OCI and
+            // other direct-kernel boots have no agent, so [`Hypervisor::caps_for`]
+            // strips the route for those instances rather than advertising
+            // a path they cannot use.
             guest_egress: Some(GuestEgress::GuestLoopback {
                 bind: asterism_vz::egress::GUEST_PROXY_BIND,
                 port: asterism_vz::egress::GUEST_PROXY_PORT,
             }),
             disk_formats: &[DiskFormat::Raw],
         }
+    }
+
+    fn caps_for(&self, inst: &Instance) -> Caps {
+        let mut caps = self.caps();
+        if inst.image_kind == ImageKind::OciRootfs {
+            // GuestLoopback needs the in-guest agent the seed installs.
+            // Direct-kernel/OCI boots have no agent, no key, no vsock
+            // proxy. Advertising the route here would let bind mutate an
+            // instance that can never be served.
+            caps.guest_egress = None;
+        }
+        caps
     }
 
     /// The console fix every vz guest needs, plus the agent that answers on
@@ -507,6 +521,19 @@ impl Hypervisor for Vz {
             .is_none()
             .then(|| paths::guest_agent_key_path(&inst.name))
             .filter(|path| path.exists());
+        // Direct-kernel/OCI has no agent, so a bound secret would write a
+        // proxy URL into generated init that nothing in the guest honours.
+        // Refuse here too: seed_config already gates on caps_for, but a
+        // BootReq built by hand must fail closed the same way.
+        if !req.egress.is_empty() && agent_key.is_none() {
+            bail!(
+                "the vz backend cannot carry secrets on {:?}: this image has no \
+                 guest agent to carry GuestLoopback (direct-kernel/OCI boots do \
+                 not install one), so there is no authenticated vsock path for \
+                 this instance",
+                inst.name
+            );
+        }
         let config = Config {
             instance: inst.name.clone(),
             root: prep.root_path()?.to_owned(),
@@ -1426,6 +1453,36 @@ mod tests {
         assert!(caps.nbd_disks);
         assert!(caps.direct_kernel, "VZLinuxBootLoader is wired through");
         assert_eq!(caps.disk_formats, &[DiskFormat::Raw], "no qcow2, ever");
+        assert!(
+            matches!(caps.guest_egress, Some(GuestEgress::GuestLoopback { .. })),
+            "cloud images get the vsock GuestLoopback route"
+        );
+    }
+
+    /// Caps is per prepared instance: OCI/direct-kernel has no guest agent,
+    /// so GuestLoopback must not be advertised for it even though the
+    /// backend offers the route for cloud images.
+    #[test]
+    fn caps_are_truthful_per_prepared_instance() {
+        let hv = Vz::new();
+        let mut inst = Instance::new(
+            "cloud",
+            "dev",
+            "ubuntu:24.04",
+            Shape::default(),
+            asterism_core::hv::Machine {
+                backend: ID.into(),
+                machine_type: "generic".into(),
+                cpu: "host".into(),
+                hv_version: "test".into(),
+            },
+        );
+        assert!(hv.caps_for(&inst).guest_egress.is_some());
+        inst.image_kind = ImageKind::OciRootfs;
+        assert!(
+            hv.caps_for(&inst).guest_egress.is_none(),
+            "direct-kernel/OCI has no guest agent, so Caps must not advertise egress"
+        );
     }
 
     #[test]
