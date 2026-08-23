@@ -1,13 +1,10 @@
 //! OCI/Docker images as an instance image source.
 //!
-//! MODEL.md is the decision this file implements: *"OCI/Docker images are an
-//! image SOURCE, booted as microVMs (OCI rootfs + guest kernel), so users get
-//! the container ecosystem with VM isolation. No instance ever shares a host
-//! kernel."* There is no container runtime here and there never will be. A
-//! reference like `nginx` is pulled from a registry, its layers are unpacked,
-//! and the result is turned into an ext4 disk that an ordinary microVM boots.
-//! From `prepare()` onwards it is a raw disk like any other: it clones,
-//! snapshots and takes volumes exactly as a cloud image does.
+//! OCI/Docker is an image format, independent of the instance runtime. A
+//! reference like `nginx` is pulled, verified, unpacked, and represented as
+//! an ext4 filesystem image. `runtime=vm` boots that filesystem with a guest
+//! kernel; `runtime=container` extracts the same verified bytes into a
+//! rootless native namespace. Runtime selection never changes image identity.
 //!
 //! Three things a container image does not come with, and where each comes
 //! from:
