@@ -552,13 +552,10 @@ rollback_incomplete_install() {
 
 # Does the receipt name this file among the ones this script wrote?
 receipt_lists() {
-	files="$(receipt_field files || true)"
-	for rel in $files; do
-		if [ "$rel" = "$1" ]; then
-			return 0
-		fi
-	done
-	return 1
+	# Keep this predicate free of shell variables. POSIX sh has no portable
+	# function-local variables, and callers use it from deletion loops whose
+	# `rel` iterator must not be overwritten while deciding what to adopt.
+	receipt_field files 2>/dev/null | tr ' ' '\n' | grep -Fqx -- "$1"
 }
 
 # A move to a build with no helper must take the old helper with it: `astd`
