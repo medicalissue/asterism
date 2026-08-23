@@ -3365,6 +3365,7 @@ async fn serve_stream(
                 };
                 let bytes = asterism_core::remote_gpu_path::encode_frame(
                     &asterism_core::remote_gpu_path::GpuMeshFrame::Refused {
+                        id: None,
                         code: asterism_core::remote_gpu::ControlErrorCode::InvalidRequest,
                         message,
                     },

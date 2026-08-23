@@ -39,6 +39,7 @@ const ENOSYS: i32 = 38;
 const ENOTTY: i32 = 25;
 const EIO: i32 = 5;
 const EAGAIN: i32 = 11;
+const FUSE_NOTIFY_POLL: i32 = 1;
 
 /// Encode a CUSE_INIT userspace reply. Tests assert the layout without
 /// opening `/dev/cuse`.
@@ -250,6 +251,10 @@ fn serve_cuse(
     accept_tx: SyncSender<UnixStream>,
     stop: Arc<AtomicBool>,
 ) -> io::Result<()> {
+    // Notifications and ordinary replies share the CUSE descriptor. Keep
+    // their writes framed even when a poll watcher wakes concurrently with
+    // the main request loop.
+    let replies = Arc::new(Mutex::new(dev.try_clone()?));
     let mut fhs: HashMap<u64, UnixStream> = HashMap::new();
     let mut next_fh = 1u64;
     while !stop.load(Ordering::SeqCst) {
@@ -308,7 +313,7 @@ fn serve_cuse(
                     match fhs.get_mut(&fh) {
                         Some(stream) if data.is_some() => {
                             let data = data.expect("checked");
-                            cuse_write_reply(stream, unique, data)
+                            cuse_write_reply(stream, &wake, &stop, unique, data)
                         }
                         None => encode_fuse_error(unique, EIO),
                         Some(_) => encode_fuse_error(unique, EIO),
@@ -322,7 +327,7 @@ fn serve_cuse(
                     let fh = u64::from_le_bytes(rest[0..8].try_into().unwrap());
                     let size = u32::from_le_bytes(rest[16..20].try_into().unwrap()) as usize;
                     match fhs.get_mut(&fh) {
-                        Some(stream) => cuse_read_reply(stream, unique, size),
+                        Some(stream) => cuse_read_reply(stream, &wake, &stop, unique, size),
                         None => encode_fuse_error(unique, EIO),
                     }
                 }
@@ -363,16 +368,23 @@ fn serve_cuse(
                     encode_fuse_error(unique, EIO)
                 } else {
                     let fh = u64::from_le_bytes(rest[0..8].try_into().unwrap());
+                    let kh = u64::from_le_bytes(rest[8..16].try_into().unwrap());
                     let requested = u32::from_le_bytes(rest[20..24].try_into().unwrap());
                     match fhs.get(&fh) {
-                        Some(stream) => cuse_poll_reply(stream, unique, requested),
+                        Some(stream) => {
+                            cuse_poll_reply(stream, &wake, &stop, &replies, unique, kh, requested)
+                        }
                         None => encode_fuse_error(unique, EIO),
                     }
                 }
             }
             _ => encode_fuse_error(unique, ENOSYS),
         };
-        if dev.write_all(&reply).is_err() {
+        let written = replies
+            .lock()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "CUSE reply lock poisoned"))?
+            .write_all(&reply);
+        if written.is_err() {
             break;
         }
     }
@@ -410,8 +422,14 @@ fn wait_for_cuse_or_stop(cuse_fd: RawFd, wake_fd: RawFd) -> io::Result<bool> {
     }
 }
 
-fn cuse_write_reply(stream: &mut UnixStream, unique: u64, data: &[u8]) -> Vec<u8> {
-    if stream.write_all(data).is_err() {
+fn cuse_write_reply(
+    stream: &mut UnixStream,
+    wake: &UnixStream,
+    stop: &AtomicBool,
+    unique: u64,
+    data: &[u8],
+) -> Vec<u8> {
+    if write_all_wakeable(stream, wake, stop, data).is_err() {
         return encode_fuse_error(unique, EIO);
     }
     let mut payload = Vec::new();
@@ -420,23 +438,43 @@ fn cuse_write_reply(stream: &mut UnixStream, unique: u64, data: &[u8]) -> Vec<u8
     encode_fuse_ok(unique, &payload)
 }
 
-fn cuse_read_reply(stream: &mut UnixStream, unique: u64, size: usize) -> Vec<u8> {
+fn cuse_read_reply(
+    stream: &mut UnixStream,
+    wake: &UnixStream,
+    stop: &AtomicBool,
+    unique: u64,
+    size: usize,
+) -> Vec<u8> {
     let mut buf = vec![0u8; size.min(4 * 1024 * 1024)];
-    match stream.read(&mut buf) {
-        Ok(n) => {
-            buf.truncate(n);
-            encode_fuse_ok(unique, &buf)
+    loop {
+        match stream.read(&mut buf) {
+            Ok(n) => {
+                buf.truncate(n);
+                return encode_fuse_ok(unique, &buf);
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                if wait_stream_or_stop(stream.as_raw_fd(), wake.as_raw_fd(), libc::POLLIN, stop)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                return encode_fuse_error(unique, EIO);
+            }
+            Err(_) => return encode_fuse_error(unique, EIO),
         }
-        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-            // A successful zero-byte read is EOF. No reply is available yet,
-            // so preserve the stream and tell the caller to retry.
-            encode_fuse_error(unique, EAGAIN)
-        }
-        Err(_) => encode_fuse_error(unique, EIO),
     }
 }
 
-fn cuse_poll_reply(stream: &UnixStream, unique: u64, requested: u32) -> Vec<u8> {
+fn cuse_poll_reply(
+    stream: &UnixStream,
+    wake: &UnixStream,
+    stop: &Arc<AtomicBool>,
+    replies: &Arc<Mutex<File>>,
+    unique: u64,
+    kh: u64,
+    requested: u32,
+) -> Vec<u8> {
     let mut fd = libc::pollfd {
         fd: stream.as_raw_fd(),
         events: (requested & u16::MAX as u32) as i16,
@@ -445,10 +483,114 @@ fn cuse_poll_reply(stream: &UnixStream, unique: u64, requested: u32) -> Vec<u8> 
     if unsafe { libc::poll(&mut fd, 1, 0) } < 0 {
         return encode_fuse_error(unique, EIO);
     }
+    if fd.revents == 0 && kh != 0 {
+        let watched = match stream.try_clone() {
+            Ok(stream) => stream,
+            Err(_) => return encode_fuse_error(unique, EIO),
+        };
+        let watcher_wake = match wake.try_clone() {
+            Ok(wake) => wake,
+            Err(_) => return encode_fuse_error(unique, EIO),
+        };
+        let stop = stop.clone();
+        let replies = replies.clone();
+        let events = (requested & u16::MAX as u32) as i16;
+        let _ = thread::Builder::new()
+            .name("asterism-cuse-poll".into())
+            .spawn(move || {
+                if wait_stream_or_stop(watched.as_raw_fd(), watcher_wake.as_raw_fd(), events, &stop)
+                    .unwrap_or(false)
+                {
+                    let notify = encode_fuse_poll_notify(kh);
+                    if let Ok(mut dev) = replies.lock() {
+                        let _ = dev.write_all(&notify);
+                    }
+                }
+            });
+    }
     let mut payload = Vec::with_capacity(8);
     payload.extend_from_slice(&(fd.revents as u16 as u32).to_le_bytes());
     payload.extend_from_slice(&0u32.to_le_bytes());
     encode_fuse_ok(unique, &payload)
+}
+
+fn encode_fuse_poll_notify(kh: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(FUSE_OUT_HEADER_LEN + 8);
+    out.extend_from_slice(&((FUSE_OUT_HEADER_LEN + 8) as u32).to_le_bytes());
+    out.extend_from_slice(&FUSE_NOTIFY_POLL.to_le_bytes());
+    out.extend_from_slice(&0u64.to_le_bytes());
+    out.extend_from_slice(&kh.to_le_bytes());
+    out
+}
+
+fn wait_stream_or_stop(
+    stream_fd: RawFd,
+    wake_fd: RawFd,
+    events: i16,
+    stop: &AtomicBool,
+) -> io::Result<bool> {
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        let mut fds = [
+            libc::pollfd {
+                fd: stream_fd,
+                events,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: wake_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) };
+        if ready < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if fds[1].revents & libc::POLLIN != 0 || stop.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        if fds[0].revents & (events | libc::POLLERR | libc::POLLHUP) != 0 {
+            return Ok(true);
+        }
+    }
+}
+
+fn write_all_wakeable(
+    stream: &mut UnixStream,
+    wake: &UnixStream,
+    stop: &AtomicBool,
+    mut data: &[u8],
+) -> io::Result<()> {
+    while !data.is_empty() {
+        match stream.write(data) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "GPU stream closed",
+                ))
+            }
+            Ok(n) => data = &data[n..],
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                if !wait_stream_or_stop(stream.as_raw_fd(), wake.as_raw_fd(), libc::POLLOUT, stop)?
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "CUSE service stopping",
+                    ));
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 /// Expose the CUSE fd so tests can prove we opened `/dev/cuse`, not a marker.
@@ -511,25 +653,141 @@ mod tests {
     fn cuse_stream_preserves_eagain_poll_read_and_write_semantics() {
         let (mut service, mut client) = UnixStream::pair().unwrap();
         service.set_nonblocking(true).unwrap();
-
-        let empty = cuse_read_reply(&mut service, 7, 128);
-        assert_eq!(i32::from_le_bytes(empty[4..8].try_into().unwrap()), -EAGAIN);
+        let (_wake_tx, wake) = UnixStream::pair().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let replies = Arc::new(Mutex::new(tempfile::tempfile().unwrap()));
 
         client.write_all(b"reply").unwrap();
-        let poll = cuse_poll_reply(&service, 8, libc::POLLIN as u32);
+        let poll = cuse_poll_reply(&service, &wake, &stop, &replies, 8, 0, libc::POLLIN as u32);
         assert_eq!(i32::from_le_bytes(poll[4..8].try_into().unwrap()), 0);
         let readiness = u32::from_le_bytes(poll[16..20].try_into().unwrap());
         assert_ne!(readiness & libc::POLLIN as u32, 0);
 
-        let read = cuse_read_reply(&mut service, 9, 128);
+        let read = cuse_read_reply(&mut service, &wake, &stop, 9, 128);
         assert_eq!(&read[FUSE_OUT_HEADER_LEN..], b"reply");
 
-        let write = cuse_write_reply(&mut service, 10, b"call");
+        let write = cuse_write_reply(&mut service, &wake, &stop, 10, b"call");
         assert_eq!(i32::from_le_bytes(write[4..8].try_into().unwrap()), 0);
         assert_eq!(u32::from_le_bytes(write[16..20].try_into().unwrap()), 4);
         let mut received = [0u8; 4];
         client.read_exact(&mut received).unwrap();
         assert_eq!(&received, b"call");
+    }
+
+    #[test]
+    fn blocked_cuse_read_is_woken_by_data_instead_of_returning_eagain() {
+        let (mut service, mut client) = UnixStream::pair().unwrap();
+        service.set_nonblocking(true).unwrap();
+        let (_wake_tx, wake) = UnixStream::pair().unwrap();
+        let stop = AtomicBool::new(false);
+        thread::scope(|scope| {
+            let reader = scope.spawn(|| cuse_read_reply(&mut service, &wake, &stop, 17, 128));
+            thread::sleep(Duration::from_millis(10));
+            client.write_all(b"late reply").unwrap();
+            let reply = reader.join().unwrap();
+            assert_eq!(i32::from_le_bytes(reply[4..8].try_into().unwrap()), 0);
+            assert_eq!(&reply[FUSE_OUT_HEADER_LEN..], b"late reply");
+        });
+    }
+
+    #[test]
+    fn nonblocking_cuse_write_resumes_after_partial_io_without_replaying_prefix() {
+        let (mut service, mut client) = UnixStream::pair().unwrap();
+        service.set_nonblocking(true).unwrap();
+        let send_buffer = 4096i32;
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    service.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&send_buffer as *const i32).cast(),
+                    std::mem::size_of_val(&send_buffer) as _,
+                )
+            },
+            0
+        );
+        let (_wake_tx, wake) = UnixStream::pair().unwrap();
+        let stop = AtomicBool::new(false);
+        let data = (0..512 * 1024)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        thread::scope(|scope| {
+            let expected = data.clone();
+            let drain = scope.spawn(move || {
+                thread::sleep(Duration::from_millis(10));
+                let mut received = vec![0u8; expected.len()];
+                client.read_exact(&mut received).unwrap();
+                assert_eq!(received, expected);
+            });
+            let reply = cuse_write_reply(&mut service, &wake, &stop, 18, &data);
+            assert_eq!(i32::from_le_bytes(reply[4..8].try_into().unwrap()), 0);
+            assert_eq!(
+                u32::from_le_bytes(reply[16..20].try_into().unwrap()) as usize,
+                data.len()
+            );
+            drain.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn deferred_poll_handle_is_notified_when_reply_becomes_readable() {
+        use std::io::{Seek, SeekFrom};
+
+        let (service, mut client) = UnixStream::pair().unwrap();
+        service.set_nonblocking(true).unwrap();
+        let (_wake_tx, wake) = UnixStream::pair().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let replies = Arc::new(Mutex::new(tempfile::tempfile().unwrap()));
+        let kh = 0x7788u64;
+        let reply = cuse_poll_reply(
+            &service,
+            &wake,
+            &stop,
+            &replies,
+            19,
+            kh,
+            libc::POLLIN as u32,
+        );
+        assert_eq!(u32::from_le_bytes(reply[16..20].try_into().unwrap()), 0);
+        client.write_all(b"ready").unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let len = replies.lock().unwrap().metadata().unwrap().len();
+            if len == (FUSE_OUT_HEADER_LEN + 8) as u64 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "poll notify did not arrive"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let mut notify = vec![0u8; FUSE_OUT_HEADER_LEN + 8];
+        let mut file = replies.lock().unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_exact(&mut notify).unwrap();
+        assert_eq!(
+            i32::from_le_bytes(notify[4..8].try_into().unwrap()),
+            FUSE_NOTIFY_POLL
+        );
+        assert_eq!(u64::from_le_bytes(notify[16..24].try_into().unwrap()), kh);
+    }
+
+    #[test]
+    fn poll_notify_has_kernel_handle_and_notify_opcode() {
+        let notify = encode_fuse_poll_notify(0x1020_3040_5060_7080);
+        assert_eq!(notify.len(), FUSE_OUT_HEADER_LEN + 8);
+        assert_eq!(
+            i32::from_le_bytes(notify[4..8].try_into().unwrap()),
+            FUSE_NOTIFY_POLL
+        );
+        assert_eq!(u64::from_le_bytes(notify[8..16].try_into().unwrap()), 0);
+        assert_eq!(
+            u64::from_le_bytes(notify[16..24].try_into().unwrap()),
+            0x1020_3040_5060_7080
+        );
     }
 
     #[test]

@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, bail, Result};
 use uuid::Uuid;
 
-use asterism_core::instance::now_unix;
+use asterism_core::instance::{now_unix, Instance};
 use asterism_core::protocol::{Request, Response};
 use asterism_core::remote_gpu::{
     AbiRange, AuthenticatedPeer, ControlErrorCode, Executor, GpuAttachment, ProductionProvider,
@@ -49,7 +49,13 @@ impl Manager {
     /// Register providers admitted from live `nvidia-smi` inventory. Missing
     /// tooling or zero devices means zero providers; the reference executor
     /// is test-only and can never enter this registry.
-    pub async fn register_hardware(&self, device_name: &str, device_id: &str) -> Result<usize> {
+    pub async fn register_hardware(
+        &self,
+        device_name: &str,
+        device_id: &str,
+        instances: &[Instance],
+        device_ids: &HashMap<String, String>,
+    ) -> Result<usize> {
         let Some(inventory) = live_nvidia_inventory().await? else {
             return Ok(0);
         };
@@ -61,11 +67,131 @@ impl Manager {
             .map_err(|_| anyhow!("GPU provider registry lock poisoned"))?;
         for gpu in admitted {
             let uuid = gpu.device.uuid.clone();
-            let provider = production_for(&gpu, device_name, device_id, 1)
+            let durable = instances
+                .iter()
+                .filter_map(|instance| {
+                    instance.gpu.as_ref().and_then(|attachment| {
+                        (attachment.provider_device == device_name
+                            && attachment.provider_gpu_uuid == uuid)
+                            .then_some((instance, attachment))
+                    })
+                })
+                .collect::<Vec<_>>();
+            let generation = durable
+                .iter()
+                .map(|(_, attachment)| attachment.provider_generation)
+                .max()
+                .unwrap_or(1);
+            if durable
+                .iter()
+                .any(|(_, attachment)| attachment.provider_generation != generation)
+            {
+                bail!("durable GPU attachments for {uuid} disagree on provider generation");
+            }
+            let mut provider = production_for(&gpu, device_name, device_id, generation, 8)
                 .map_err(|err| anyhow!(err.message))?;
+            for (instance, attachment) in durable {
+                let consumer_device_id = device_ids.get(&instance.cpu_device).ok_or_else(|| {
+                    anyhow!(
+                        "durable GPU attachment for instance {:?} names unknown CPU device {:?}",
+                        instance.name,
+                        instance.cpu_device
+                    )
+                })?;
+                let peer = AuthenticatedPeer::from_mesh_identity(consumer_device_id.clone())
+                    .map_err(|error| anyhow!(error.message))?;
+                provider
+                    .ensure_attached(&peer, &instance.id, attachment.memory_bytes, now_unix())
+                    .map_err(|error| anyhow!(error.message))?;
+            }
             providers.insert(uuid, provider);
         }
         Ok(count)
+    }
+
+    /// Keep provider-side authority aligned with durable attachment rows.
+    /// Session close never calls this; the daemon renews independently of
+    /// whether a guest currently has an ABI connection open.
+    pub fn renew_durable_leases(&self, now: u64) -> Result<u32> {
+        let mut providers = self
+            .providers
+            .lock()
+            .map_err(|_| anyhow!("GPU provider registry lock poisoned"))?;
+        let mut renewed = 0u32;
+        for provider in providers.values_mut() {
+            renewed = renewed.saturating_add(
+                provider
+                    .authority_mut()
+                    .renew_durable(now)
+                    .map_err(|error| anyhow!(error.message))?,
+            );
+        }
+        Ok(renewed)
+    }
+
+    /// Rebuild provider authority from the orbit-wide token-free attachment
+    /// catalog. This runs off the startup path because assembling that view
+    /// may contact sleeping peers; until it completes, missing leases fail
+    /// closed instead of silently falling back to a reference executor.
+    pub fn reconcile_durable_attachments(
+        &self,
+        instances: &[Instance],
+        device_ids: &HashMap<String, String>,
+    ) -> Result<u32> {
+        let mut providers = self
+            .providers
+            .lock()
+            .map_err(|_| anyhow!("GPU provider registry lock poisoned"))?;
+        let mut restored = 0u32;
+        for (uuid, provider) in providers.iter_mut() {
+            let provider_device = provider.authority().provider_device().to_owned();
+            let durable = instances
+                .iter()
+                .filter_map(|instance| {
+                    instance.gpu.as_ref().and_then(|attachment| {
+                        (attachment.provider_device == provider_device
+                            && attachment.provider_gpu_uuid == *uuid)
+                            .then_some((instance, attachment))
+                    })
+                })
+                .collect::<Vec<_>>();
+            let Some(generation) = durable
+                .iter()
+                .map(|(_, attachment)| attachment.provider_generation)
+                .max()
+            else {
+                continue;
+            };
+            if durable
+                .iter()
+                .any(|(_, attachment)| attachment.provider_generation != generation)
+            {
+                bail!("durable GPU attachments for {uuid} disagree on provider generation");
+            }
+            provider
+                .authority_mut()
+                .reconcile_generation(generation)
+                .map_err(|error| anyhow!(error.message))?;
+            for (instance, attachment) in durable {
+                let consumer_device_id = device_ids.get(&instance.cpu_device).ok_or_else(|| {
+                    anyhow!(
+                        "durable GPU attachment for instance {:?} names unknown CPU device {:?}",
+                        instance.name,
+                        instance.cpu_device
+                    )
+                })?;
+                let peer = AuthenticatedPeer::from_mesh_identity(consumer_device_id.clone())
+                    .map_err(|error| anyhow!(error.message))?;
+                let existed = provider.authority().has_instance(&instance.id);
+                provider
+                    .ensure_attached(&peer, &instance.id, attachment.memory_bytes, now_unix())
+                    .map_err(|error| anyhow!(error.message))?;
+                if !existed {
+                    restored = restored.saturating_add(1);
+                }
+            }
+        }
+        Ok(restored)
     }
 
     fn take(&self, gpu_uuid: &str) -> Option<(String, ProductionProvider)> {
@@ -457,6 +583,7 @@ pub(crate) async fn serve_mesh(
             write_gpu_frame(
                 &mut stream.send,
                 &GpuMeshFrame::Refused {
+                    id: None,
                     code: ControlErrorCode::InvalidRequest,
                     message: err.message,
                 },
@@ -482,6 +609,7 @@ pub(crate) async fn serve_mesh(
             write_gpu_frame(
                 &mut stream.send,
                 &GpuMeshFrame::Refused {
+                    id: None,
                     code: ControlErrorCode::Unauthorized,
                     message: err.message,
                 },
@@ -500,6 +628,7 @@ pub(crate) async fn serve_mesh(
         write_gpu_frame(
             &mut stream.send,
             &GpuMeshFrame::Refused {
+                id: None,
                 code: err.code,
                 message: err.message,
             },
@@ -709,6 +838,7 @@ pub(crate) async fn bridge_client<'a, 'b>(
                             Ok(request) => {
                                 if credits == 0 || pending.contains_key(&id) {
                                     io.send(&Response::GpuGuestReply { reply: GuestReply::Refused {
+                                        id: Some(id),
                                         code: "backpressure".into(),
                                         message: "GPU mesh credit window is empty or call id is already in flight".into(),
                                     }}).await?;
@@ -754,14 +884,25 @@ pub(crate) async fn bridge_client<'a, 'b>(
                         credits = credits.saturating_add(1).min(DEFAULT_CREDIT_WINDOW);
                         io.send(&Response::GpuGuestReply { reply: GuestReply::Cancelled { id } }).await?;
                     }
-                    GpuMeshFrame::Refused { message, .. } => {
-                        let id = pending_cancels.pop_front();
+                    GpuMeshFrame::Refused { id, message, .. } => {
+                        let cancellation = id.is_some_and(|id| {
+                            pending_cancels.iter().position(|pending| *pending == id).is_some_and(|at| {
+                                pending_cancels.remove(at);
+                                true
+                            })
+                        });
+                        if let Some(id) = id {
+                            if pending.remove(&id).is_some() {
+                                credits = credits.saturating_add(1).min(DEFAULT_CREDIT_WINDOW);
+                            }
+                        }
                         io.send(&Response::GpuGuestReply { reply: GuestReply::Refused {
-                            code: if id.is_some() { "cancel" } else { "mesh" }.into(),
+                            id,
+                            code: if cancellation { "cancel" } else { "mesh" }.into(),
                             message,
                         }}).await?;
                     }
-                    GpuMeshFrame::Close => break,
+                    GpuMeshFrame::Close => bail!("GPU provider closed the mesh session"),
                     other => bail!("unexpected GPU provider frame: {other:?}"),
                 }
             }
@@ -927,11 +1068,13 @@ async fn handle_local_request(
                     }
                     GuestReply::Cancelled { id }
                 }
-                GpuMeshFrame::Refused { message, .. } => GuestReply::Refused {
+                GpuMeshFrame::Refused { id, message, .. } => GuestReply::Refused {
+                    id,
                     code: "cancel".into(),
                     message,
                 },
                 other => GuestReply::Refused {
+                    id: Some(id),
                     code: "cancel".into(),
                     message: format!("{other:?}"),
                 },
@@ -963,9 +1106,14 @@ async fn handle_local_request(
                         *sequence = next_sequence;
                         pending.push_back((id, call));
                     }
-                    GpuMeshFrame::Refused { message, .. } => {
+                    GpuMeshFrame::Refused {
+                        id: refused_id,
+                        message,
+                        ..
+                    } => {
                         io.send(&Response::GpuGuestReply {
                             reply: GuestReply::Refused {
+                                id: refused_id.or(Some(id)),
                                 code: "backpressure".into(),
                                 message,
                             },
@@ -975,6 +1123,7 @@ async fn handle_local_request(
                     other => {
                         io.send(&Response::GpuGuestReply {
                             reply: GuestReply::Refused {
+                                id: Some(id),
                                 code: "mesh".into(),
                                 message: format!("{other:?}"),
                             },
@@ -1007,9 +1156,35 @@ async fn apply_local_next(
                 result: guest::cuda_result_for(&call, reply),
             }
         }
+        GpuMeshFrame::Refused {
+            id: Some(id),
+            message,
+            ..
+        } => {
+            let Some(at) = pending.iter().position(|(pending, _)| *pending == id) else {
+                bail!("local GPU provider refused unknown call id {id}");
+            };
+            pending.remove(at);
+            GuestReply::Refused {
+                id: Some(id),
+                code: "mesh".into(),
+                message,
+            }
+        }
+        GpuMeshFrame::DeviceLost { reason } => bail!("GPU provider lost: {reason}"),
+        GpuMeshFrame::Revoked { instance_id } => {
+            bail!("GPU lease revoked for instance {instance_id}")
+        }
+        GpuMeshFrame::Skew {
+            expected_generation,
+            observed,
+        } => bail!(
+            "GPU provider generation skew: attachment {expected_generation}, provider {observed}"
+        ),
         other => {
             let id = pending.pop_front().map(|(id, _)| id);
             GuestReply::Refused {
+                id,
                 code: "mesh".into(),
                 message: match id {
                     Some(id) => format!("GPU call {id} failed: {other:?}"),
@@ -1079,9 +1254,32 @@ mod tests {
         .unwrap();
         let admitted = admit_cuda_inventory(&inventory).unwrap().remove(0);
         let manager = Manager::default();
+        let identity = asterism_core::remote_gpu_cuda::CudaDeviceIdentity {
+            ordinal: admitted.device.index,
+            uuid: admitted.device.uuid.clone(),
+            name: admitted.device.name.clone(),
+            driver_version: admitted.driver_version.clone(),
+            cuda_version: admitted.cuda_runtime_version.clone(),
+            compute_capability: admitted.device.compute_capability,
+            memory_bytes: admitted.device.memory_bytes,
+        };
+        let engine = asterism_core::remote_gpu_cuda::CudaEngine::simulated(identity, 1).unwrap();
+        let authority = asterism_core::remote_gpu::LeaseAuthority::new(
+            "desktop",
+            "a".repeat(64),
+            admitted.device.uuid.clone(),
+            1,
+            asterism_core::remote_gpu::LeaseLimits {
+                total_memory_bytes: admitted.device.memory_bytes,
+                max_memory_per_lease: admitted.device.memory_bytes,
+                max_leases: 1,
+                lease_ttl_secs: 600,
+            },
+        )
+        .unwrap();
         manager.providers.lock().unwrap().insert(
             admitted.device.uuid.clone(),
-            production_for(&admitted, "desktop", &"a".repeat(64), 1).unwrap(),
+            ProductionProvider::connect(authority, engine).unwrap(),
         );
 
         let attachment = manager
@@ -1099,6 +1297,23 @@ mod tests {
                 1024,
             )
             .is_err());
+        let renewed_at = now_unix().saturating_add(1_000);
+        assert_eq!(manager.renew_durable_leases(renewed_at).unwrap(), 1);
+        let peer = AuthenticatedPeer::from_mesh_identity("b".repeat(64)).unwrap();
+        assert!(manager
+            .providers
+            .lock()
+            .unwrap()
+            .get(&attachment.provider_gpu_uuid)
+            .unwrap()
+            .authority()
+            .authorize_instance(
+                &peer,
+                "instance-id",
+                attachment.provider_generation,
+                renewed_at + 1,
+            )
+            .is_ok());
         assert!(manager.revoke(&attachment.provider_gpu_uuid, "instance-id"));
         assert_eq!(manager.advertisements()[0].active_leases, 0);
     }
