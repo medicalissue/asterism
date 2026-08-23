@@ -331,7 +331,7 @@ receipt_complete() {
 
 linux_system_files() {
 	uid="$(id -u)"
-	printf '%s' "${SYSTEM_ROOT}/etc/modules-load.d/asterism-nbd.conf ${SYSTEM_ROOT}/etc/modprobe.d/asterism-nbd.conf ${SYSTEM_ROOT}/run/lock/asterism-nbd.lock ${SYSTEM_ROOT}/usr/local/libexec/asterism/asterism-nbd ${SYSTEM_ROOT}/etc/sudoers.d/asterism-nbd-${uid}"
+	printf '%s' "${SYSTEM_ROOT}/etc/modules-load.d/asterism-nbd.conf ${SYSTEM_ROOT}/etc/modprobe.d/asterism-nbd.conf ${SYSTEM_ROOT}/run/lock/asterism-nbd.lock ${SYSTEM_ROOT}/run/asterism-nbd ${SYSTEM_ROOT}/usr/local/libexec/asterism/asterism-nbd ${SYSTEM_ROOT}/etc/sudoers.d/asterism-nbd-${uid}"
 }
 
 remove_receipt_files() {
@@ -356,7 +356,13 @@ remove_receipt_system_files() {
 		system_files="$(linux_system_files)"
 	fi
 	for f in $system_files; do
-		run_root rm -f "$f" || return 1
+		if [ -d "$f" ]; then
+			# This is the exact root-owned state directory created by the
+			# installer; remove only its claims, never a caller-selected path.
+			run_root rm -rf "$f" || return 1
+		else
+			run_root rm -f "$f" || return 1
+		fi
 		say "removed ${f}"
 	done
 }
@@ -820,11 +826,16 @@ configure_chv_linux() {
 	run_root install -m 0644 "$modprobe_options" "${SYSTEM_ROOT}/etc/modprobe.d/asterism-nbd.conf"
 	run_root modprobe nbd nbds_max=64
 
-	# This root-owned, non-secret inode is the host-wide flock boundary for
-	# check/claim/attach/owner-capture. Its writable mode lets the unprivileged
-	# daemon open it, while the directory remains administrator-owned.
+	# The root-only helper owns the host-wide flock boundary for
+	# check/claim/attach/owner-capture. The daemon must not be able to write or
+	# replace either the lock or the ownership claims.
 	run_root install -d -m 0755 "${SYSTEM_ROOT}/run/lock"
-	run_root install -m 0666 /dev/null "${SYSTEM_ROOT}/run/lock/asterism-nbd.lock"
+	# Preserve the lock inode across upgrades; replacing it would let an
+	# in-flight helper and the next helper believe they hold different locks.
+	run_root touch "${SYSTEM_ROOT}/run/lock/asterism-nbd.lock"
+	run_root chown root:root "${SYSTEM_ROOT}/run/lock/asterism-nbd.lock"
+	run_root chmod 0600 "${SYSTEM_ROOT}/run/lock/asterism-nbd.lock"
+	run_root install -d -m 0700 "${SYSTEM_ROOT}/run/asterism-nbd"
 
 	# The daemon never gets general nbd-client access. It may invoke only this
 	# root-owned argument-checking wrapper, and only without an environment-

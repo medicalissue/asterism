@@ -79,4 +79,9 @@ tar -czf "$DIST/asterism-${VERSION}-${TARGET}.tar.gz" \
   -C "$WORK/root/bin" ast astd cloud-hypervisor virtiofsd \
   -C "$WORK/root" share LICENSE-APACHE LICENSE-MIT NOTICE
 sha256sum "$DIST/asterism-${VERSION}-${TARGET}.tar.gz" \
-  >"$DIST/SHA256SUMS.${TARGET}"
+  >"$DIST/SHA256SUMS"
+# The per-architecture name is consumed when the publish job folds both
+# native archives into the release-wide checksum set. Keep the conventional
+# SHA256SUMS name too so the exact single-architecture artifact can exercise
+# the installer on its own.
+cp "$DIST/SHA256SUMS" "$DIST/SHA256SUMS.${TARGET}"
