@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
+use asterism_core::guest;
 use asterism_core::hv::{
     BootReq, Caps, ControlChannel, DiskFormat, DiskSpec, GuestEndpoint, Handle, Hypervisor,
     Prepared, Ready, RunState, SnapshotId,
@@ -24,7 +25,6 @@ use asterism_hyperv::{
     DiskAttachment, HostReady, Reply, Request, VmConfig, VmState, HELPER_BIN, OWNER,
     PROTOCOL_VERSION,
 };
-use asterism_vz::guest;
 
 pub const ID: &str = "hyperv";
 const NETWORK_ID: &str = "a57e1210-1e64-4a83-b48f-95dbe093e18a";
@@ -113,7 +113,7 @@ impl HyperV {
             network_id: NETWORK_ID.into(),
             guest_ip: guest_ip(&endpoint_id)?,
             endpoint_id,
-            mac: asterism_vz::mac_for(&req.instance.name),
+            mac: asterism_hyperv::mac_for(&req.instance.name),
             agent_key: paths::guest_agent_key_path(&req.instance.name),
             restore_state: None,
         };
@@ -280,9 +280,32 @@ impl Hypervisor for HyperV {
         match self.request(&Request::Terminate {
             system_id: config.system_id,
             endpoint_id: Some(config.endpoint_id),
+            network_id: None,
         })? {
             Reply::Stopped => Ok(()),
             other => bail!("{HELPER_BIN} answered terminate with {other:?}"),
+        }
+    }
+
+    fn remove_instance_resources(&self, inst: &Instance) -> Result<()> {
+        let path = config_path(&paths::instance_dir(&inst.name));
+        let config = match VmConfig::read(&path) {
+            Ok(config) => config,
+            Err(_) if !path.exists() => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let network_id = if network_in_use_elsewhere(&inst.name, &config.network_id)? {
+            None
+        } else {
+            Some(config.network_id.clone())
+        };
+        match self.request(&Request::Terminate {
+            system_id: config.system_id,
+            endpoint_id: Some(config.endpoint_id),
+            network_id,
+        })? {
+            Reply::Stopped => Ok(()),
+            other => bail!("{HELPER_BIN} answered cleanup with {other:?}"),
         }
     }
 
@@ -376,6 +399,30 @@ fn helper_path() -> Result<PathBuf> {
 
 fn config_path(dir: &Path) -> PathBuf {
     dir.join("hyperv.json")
+}
+
+fn network_in_use_elsewhere(instance: &str, network_id: &str) -> Result<bool> {
+    let root = paths::home_dir().join("instances");
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", root.display())),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy() == instance {
+            continue;
+        }
+        let candidate = entry.path().join("hyperv.json");
+        if !candidate.is_file() {
+            continue;
+        }
+        let other = VmConfig::read(&candidate)?;
+        if other.network_id == network_id {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn console_pipe(system_id: &str) -> String {

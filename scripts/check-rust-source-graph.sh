@@ -12,7 +12,15 @@ crates/asterism-vz/src/helper/ctl.rs
 crates/asterism-vz/src/helper/net.rs
 crates/asterism-vz/src/helper/vm.rs'
 
-WINDOWS_ONLY_HELPER_MODULES='crates/asterism-hyperv/src/windows.rs'
+UNIX_ONLY_MODULES='crates/asterism-core/src/ipc_unix.rs
+crates/asterism-daemon/src/device_shell_unix.rs
+crates/asterism-daemon/src/backend/qemu.rs
+crates/asterism-daemon/src/backend/qmp.rs
+crates/asterism-daemon/src/backend/vz.rs'
+
+WINDOWS_ONLY_MODULES='crates/asterism-hyperv/src/windows.rs
+crates/asterism-core/src/ipc_windows.rs
+crates/asterism-daemon/src/device_shell_windows.rs'
 
 target_os() {
   local rustc_bin="${RUSTC:-rustc}"
@@ -20,42 +28,54 @@ target_os() {
 }
 
 # Keep the exception tied to the source-level reason these files are absent
-# from non-macOS dep-info. If a declaration loses or changes its cfg, fail
-# instead of silently turning this list into a dead-source allowlist.
-verify_macos_only_helper_modules() {
+# from other platforms' dep-info. If a declaration loses or changes its cfg,
+# fail instead of silently turning this list into a dead-source allowlist.
+verify_cfg_modules() {
+  local cfg="$1" parent="$2"
+  shift 2
   local path module
-  while IFS= read -r path; do
+  for path in "$@"; do
+    [ -n "$path" ] || continue
     module="${path##*/}"
     module="${module%.rs}"
-    awk -v declaration="mod ${module};" '
-      previous == "#[cfg(target_os = \"macos\")]" && $0 == declaration {
+    awk -v module="$module" -v cfg="$cfg" '
+      previous == cfg && $0 ~ ("^(pub )?mod " module ";") {
         found = 1
       }
       { previous = $0 }
       END { exit !found }
-    ' crates/asterism-vz/src/helper/main.rs || {
-      echo "$path is not declared as an immediately cfg-gated macOS module" >&2
+    ' "$parent" || {
+      echo "$path is not declared as an immediately cfg-gated module in $parent" >&2
       return 1
     }
+  done
+}
+
+verify_macos_only_helper_modules() {
+  local path
+  while IFS= read -r path; do
+    verify_cfg_modules '#[cfg(target_os = "macos")]' crates/asterism-vz/src/helper/main.rs "$path"
   done <<<"$MACOS_ONLY_HELPER_MODULES"
 }
 
-verify_windows_only_helper_modules() {
-  local path module
-  while IFS= read -r path; do
-    module="${path##*/}"
-    module="${module%.rs}"
-    awk -v declaration="mod ${module};" '
-      previous == "#[cfg(target_os = \"windows\")]" && $0 == declaration {
-        found = 1
-      }
-      { previous = $0 }
-      END { exit !found }
-    ' crates/asterism-hyperv/src/main.rs || {
-      echo "$path is not declared as an immediately cfg-gated Windows module" >&2
-      return 1
-    }
-  done <<<"$WINDOWS_ONLY_HELPER_MODULES"
+verify_unix_only_modules() {
+  verify_cfg_modules '#[cfg(unix)]' crates/asterism-core/src/ipc.rs \
+    crates/asterism-core/src/ipc_unix.rs
+  verify_cfg_modules '#[cfg(unix)]' crates/asterism-daemon/src/device_shell.rs \
+    crates/asterism-daemon/src/device_shell_unix.rs
+  verify_cfg_modules '#[cfg(unix)]' crates/asterism-daemon/src/backend/mod.rs \
+    crates/asterism-daemon/src/backend/qemu.rs \
+    crates/asterism-daemon/src/backend/qmp.rs \
+    crates/asterism-daemon/src/backend/vz.rs
+}
+
+verify_windows_only_modules() {
+  verify_cfg_modules '#[cfg(target_os = "windows")]' crates/asterism-hyperv/src/main.rs \
+    crates/asterism-hyperv/src/windows.rs
+  verify_cfg_modules '#[cfg(windows)]' crates/asterism-core/src/ipc.rs \
+    crates/asterism-core/src/ipc_windows.rs
+  verify_cfg_modules '#[cfg(windows)]' crates/asterism-daemon/src/device_shell.rs \
+    crates/asterism-daemon/src/device_shell_windows.rs
 }
 
 write_audited_sources() {
@@ -65,8 +85,11 @@ write_audited_sources() {
   if [ "$platform" != macos ]; then
     printf '%s\n' "$MACOS_ONLY_HELPER_MODULES" >>"$exclude"
   fi
+  if [ "$platform" != linux ] && [ "$platform" != macos ]; then
+    printf '%s\n' "$UNIX_ONLY_MODULES" >>"$exclude"
+  fi
   if [ "$platform" != windows ]; then
-    printf '%s\n' "$WINDOWS_ONLY_HELPER_MODULES" >>"$exclude"
+    printf '%s\n' "$WINDOWS_ONLY_MODULES" >>"$exclude"
   fi
   if [ ! -s "$exclude" ]; then
     cp "$tracked" "$audited"
@@ -83,14 +106,18 @@ self_test() (
   audited="$scratch/audited"
   expected="$scratch/expected"
 
-  printf '%s\n%s\n%s\n%s\n' \
+  printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
     "$MACOS_ONLY_HELPER_MODULES" \
-    "$WINDOWS_ONLY_HELPER_MODULES" \
+    "$UNIX_ONLY_MODULES" \
+    "$WINDOWS_ONLY_MODULES" \
     'crates/asterism-vz/src/helper/main.rs' \
-    'crates/asterism-hyperv/src/main.rs' | sort -u >"$tracked"
+    'crates/asterism-hyperv/src/main.rs' \
+    'crates/asterism-core/src/ipc.rs' | sort -u >"$tracked"
 
   write_audited_sources linux "$tracked" "$audited"
   printf '%s\n' \
+    "$UNIX_ONLY_MODULES" \
+    'crates/asterism-core/src/ipc.rs' \
     'crates/asterism-hyperv/src/main.rs' \
     'crates/asterism-vz/src/helper/main.rs' | sort >"$expected"
   cmp "$expected" "$audited"
@@ -98,19 +125,23 @@ self_test() (
   write_audited_sources macos "$tracked" "$audited"
   printf '%s\n' \
     "$MACOS_ONLY_HELPER_MODULES" \
+    "$UNIX_ONLY_MODULES" \
+    'crates/asterism-core/src/ipc.rs' \
     'crates/asterism-hyperv/src/main.rs' \
     'crates/asterism-vz/src/helper/main.rs' | sort >"$expected"
   cmp "$expected" "$audited"
 
   write_audited_sources windows "$tracked" "$audited"
   printf '%s\n' \
-    "$WINDOWS_ONLY_HELPER_MODULES" \
+    "$WINDOWS_ONLY_MODULES" \
+    'crates/asterism-core/src/ipc.rs' \
     'crates/asterism-hyperv/src/main.rs' \
     'crates/asterism-vz/src/helper/main.rs' | sort >"$expected"
   cmp "$expected" "$audited"
 
   verify_macos_only_helper_modules
-  verify_windows_only_helper_modules
+  verify_unix_only_modules
+  verify_windows_only_modules
 )
 
 if [ "${1:-}" = --self-test ]; then
@@ -149,7 +180,8 @@ find "$TARGET_DIR" -name '*.d' -type f -exec \
 
 find crates -type f -name '*.rs' -print | sort -u >"$TRACKED"
 verify_macos_only_helper_modules
-verify_windows_only_helper_modules
+verify_unix_only_modules
+verify_windows_only_modules
 
 TARGET_OS="$(target_os)"
 if [ -z "$TARGET_OS" ]; then
@@ -157,9 +189,10 @@ if [ -z "$TARGET_OS" ]; then
   exit 1
 fi
 
-# The VZ helper's implementation modules are declared only on macOS and the
-# Hyper-V helper's Windows adapters only on Windows. Stubs still compile on
-# other hosts, and every other Rust source remains required in rustc dep-info.
+# The VZ helper's implementation modules are declared only on macOS, the
+# Hyper-V helper's Windows adapters only on Windows, and Unix-only daemon
+# backends only on Unix. Stubs still compile on other hosts, and every other
+# Rust source remains required in rustc dep-info.
 write_audited_sources "$TARGET_OS" "$TRACKED" "$AUDITED"
 
 comm -23 "$AUDITED" "$REACHABLE" >"$MISSING"

@@ -19,7 +19,9 @@ use asterism_core::hv::{
 use asterism_core::instance::{Instance, Shape};
 use asterism_core::power::{Change, SleepGuard};
 
-use super::{backends, by_id, chv, hyperv, qemu, vz};
+use super::{backends, by_id, hyperv};
+#[cfg(unix)]
+use super::{chv, qemu, vz};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ControlKind {
@@ -55,10 +57,13 @@ impl ControlKind {
 /// panic and cannot merge until its handles join the contract.
 fn control_kind(id: &str) -> ControlKind {
     match id {
+        #[cfg(unix)]
         qemu::ID => ControlKind::Qmp,
+        #[cfg(unix)]
         vz::ID => ControlKind::Rpc,
+        #[cfg(unix)]
         chv::ID => ControlKind::HttpApi,
-        hyperv::ID => ControlKind::Helper,
+        id if id == hyperv::ID => ControlKind::Helper,
         other => panic!("registered backend {other:?} has no conformance profile"),
     }
 }
@@ -148,9 +153,11 @@ impl Fixture {
             ctl: kind.channel(self.control.clone()),
             endpoint: match kind {
                 ControlKind::Qmp => GuestEndpoint::HostForward { ssh_port: 22022 },
-                ControlKind::Rpc | ControlKind::HttpApi | ControlKind::Helper => GuestEndpoint::GuestAddr {
-                    addr: "192.0.2.1".parse().unwrap(),
-                },
+                ControlKind::Rpc | ControlKind::HttpApi | ControlKind::Helper => {
+                    GuestEndpoint::GuestAddr {
+                        addr: "192.0.2.1".parse().unwrap(),
+                    }
+                }
             },
             started_at: 1,
         }

@@ -30,6 +30,7 @@ $required = @(
     "HcsSaveComputeSystem",
     "HcnCreateNetwork",
     "HcnCreateEndpoint",
+    "HcnDeleteNetwork",
     "CreateVirtualDisk",
     "AttachVirtualDisk",
     "AF_HYPERV",
@@ -54,6 +55,10 @@ foreach ($line in ($helperText -split "`n")) {
         }
         $Errors.Add("${Helper}:${n}: $($line.TrimEnd())") | Out-Null
     }
+}
+
+if ($daemonText -match 'asterism_vz') {
+    $Errors.Add("daemon Hyper-V backend imports asterism_vz Unix APIs") | Out-Null
 }
 
 $leak = [regex]::new('windows_sys|Hcs[A-Z]|Hcn[A-Z]|CreateVirtualDisk|AF_HYPERV|SOCKADDR_HV')
