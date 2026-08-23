@@ -6,6 +6,7 @@ members = [
     "crates/asterism-cli",
     "crates/asterism-mesh",
     "crates/asterism-coordinator",
+    "crates/asterism-hyperv",
     "crates/asterism-vz",
 ]
 
@@ -18,6 +19,7 @@ repository = "https://github.com/medicalissue/asterism"
 [workspace.dependencies]
 asterism-core = { path = "crates/asterism-core", version = "0.0.2" }
 asterism-mesh = { path = "crates/asterism-mesh", version = "0.0.2" }
+asterism-hyperv = { path = "crates/asterism-hyperv", version = "0.0.2" }
 asterism-vz = { path = "crates/asterism-vz", version = "0.0.2" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
