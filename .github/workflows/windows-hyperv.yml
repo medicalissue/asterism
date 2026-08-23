@@ -40,6 +40,11 @@ jobs:
       - name: Cross-check the Windows helper from Linux
         run: cargo check --locked --package asterism-hyperv --target x86_64-pc-windows-gnu --all-targets
 
+      - name: Install the Windows GNU C toolchain for transitive build scripts
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes gcc-mingw-w64-x86-64
+
       - name: Cross-check the product astd graph from Linux
         env:
           ASTERISM_BUILD_ID: ${{ github.sha }}
