@@ -20,6 +20,7 @@ use crate::backup::{ExportReport, RestoreReport};
 use crate::device_shell::{
     ShellData, ShellExit, ShellOpen, ShellOutput, ShellPolicyAction, ShellPolicyStatus,
 };
+use crate::remote_gpu_guest::{GuestFrame, GuestReply};
 use crate::hv::GuestHealth;
 use crate::image::{ImagePullResult, ImageRow};
 use crate::instance::{Instance, PortForward, Restart, Shape};
@@ -311,6 +312,19 @@ pub enum Request {
         signal: i32,
     },
     DeviceShellClose,
+    /// Open the guest NVIDIA projection for one instance. The hypervisor
+    /// helper (or a source fixture) carries framed CUDA-semantic calls from
+    /// the projected `/dev/nvidia0` onto this unix socket. It is
+    /// instance-bound and never a LAN listener.
+    GpuGuestOpen {
+        name: String,
+    },
+    /// Frames sent after [`Request::GpuGuestOpen`] on the same local
+    /// connection. Invalid as standalone RPC.
+    GpuGuestFrame {
+        frame: GuestFrame,
+    },
+    GpuGuestClose,
 
     // ---- the mesh ----------------------------------------------------------
     //
@@ -677,6 +691,7 @@ impl Request {
             | Request::SnapshotRestore { name, .. }
             | Request::SnapshotRemove { name, .. }
             | Request::Logs { name, .. }
+            | Request::GpuGuestOpen { name }
             // Binding a secret is an instance command: `ast attach dev
             // --secret anthropic` resolves `dev` across the orbit like every
             // other, and the binding is written on whichever device holds it.
@@ -709,7 +724,9 @@ impl Request {
             | Request::DeviceShellEof
             | Request::DeviceShellResize { .. }
             | Request::DeviceShellSignal { .. }
-            | Request::DeviceShellClose => None,
+            | Request::DeviceShellClose
+            | Request::GpuGuestFrame { .. }
+            | Request::GpuGuestClose => None,
 
             // About devices, not instances. `ast device wake desktop` names a
             // device on purpose — it is the one command whose subject really
@@ -797,6 +814,9 @@ impl Request {
             | Request::VolumeRelease { .. } => 7,
             Request::DeviceShellStatus => 5,
             Request::ImageList | Request::ImagePull { .. } => 6,
+            Request::GpuGuestOpen { .. }
+            | Request::GpuGuestFrame { .. }
+            | Request::GpuGuestClose => 8,
             Request::DeviceShellPolicy { .. }
             | Request::DeviceShellOpen { .. }
             | Request::DeviceShellInput { .. }
@@ -838,6 +858,9 @@ impl Request {
             | Request::DeviceShellClose => Some("device shell"),
             Request::ImageList => Some("image_list"),
             Request::ImagePull { .. } => Some("image_pull"),
+            Request::GpuGuestOpen { .. }
+            | Request::GpuGuestFrame { .. }
+            | Request::GpuGuestClose => Some("gpu_guest"),
             _ => None,
         }
     }
@@ -1004,6 +1027,17 @@ pub enum Response {
     /// Exactly one terminal result for an accepted session.
     DeviceShellExit {
         exit: ShellExit,
+    },
+    GpuGuestAccepted {
+        session_id: String,
+        projection_kind: String,
+    },
+    GpuGuestRefused {
+        code: String,
+        message: String,
+    },
+    GpuGuestReply {
+        reply: GuestReply,
     },
 
     // ---- the mesh ----------------------------------------------------------
@@ -1202,6 +1236,9 @@ impl Response {
             | Response::DeviceShellRefused { .. }
             | Response::DeviceShellOutput { .. }
             | Response::DeviceShellExit { .. } => 4,
+            Response::GpuGuestAccepted { .. }
+            | Response::GpuGuestRefused { .. }
+            | Response::GpuGuestReply { .. } => 8,
             _ => crate::compat::FIRST_PROTOCOL,
         }
     }
@@ -1245,6 +1282,7 @@ pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
             .since(),
         ),
         ("device_shell_status", Request::DeviceShellStatus.since()),
+        ("gpu_guest", Request::GpuGuestOpen { name: String::new() }.since()),
         ("image_list", Request::ImageList.since()),
         (
             "image_pull",

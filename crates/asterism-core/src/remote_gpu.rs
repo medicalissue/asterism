@@ -269,7 +269,7 @@ pub enum Request {
 }
 
 impl Request {
-    fn session_and_sequence(&self) -> Option<(&str, u64)> {
+    pub(crate) fn session_and_sequence(&self) -> Option<(&str, u64)> {
         match self {
             Request::Hello { .. } => None,
             Request::Allocate {
@@ -718,6 +718,12 @@ impl GpuAttachment {
     pub fn guest_path(&self) -> &'static str {
         GUEST_DEVICE_PATH
     }
+
+    /// How `/dev/nvidia0` is materialized. Status still prints the path, but
+    /// the path is a projected local endpoint, not this record itself.
+    pub fn projection_kind(&self) -> &'static str {
+        crate::remote_gpu_guest::PROJECTION_KIND
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -924,6 +930,38 @@ impl LeaseAuthority {
             ));
         }
         Ok(lease)
+    }
+
+    /// Authorize by the instance identity that crossed the mesh, never by a
+    /// bearer capability in the opening frame. The live token stays in this
+    /// process's memory.
+    pub fn authorize_instance(
+        &self,
+        peer: &AuthenticatedPeer,
+        instance_id: &str,
+        generation: u64,
+        now: u64,
+    ) -> Result<&GpuLease, ControlError> {
+        if generation != self.generation {
+            return Err(ControlError::new(
+                ControlErrorCode::StaleGeneration,
+                format!(
+                    "GPU attachment named provider generation {generation}; provider is at {}",
+                    self.generation
+                ),
+            ));
+        }
+        let capability = self.instances.get(instance_id).ok_or_else(|| {
+            ControlError::new(
+                ControlErrorCode::InvalidLease,
+                "instance has no live GPU lease on this provider",
+            )
+        })?;
+        self.authorize(peer, capability, now)
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn renew(
@@ -1172,6 +1210,43 @@ impl ProductionProvider {
             self.sessions.remove(&session);
         }
         Ok(reply)
+    }
+
+    /// Open an ABI session from an instance-bound mesh stream. The opening
+    /// frame names the instance and generation; the bearer never leaves this
+    /// provider process.
+    pub fn open_session_for_instance(
+        &mut self,
+        peer: &AuthenticatedPeer,
+        instance_id: &str,
+        generation: u64,
+        versions: AbiRange,
+        now: u64,
+    ) -> Result<Response, ControlError> {
+        let capability = self
+            .authority
+            .authorize_instance(peer, instance_id, generation, now)?
+            .capability()
+            .to_owned();
+        self.open_session(peer, &capability, versions, now)
+    }
+
+    /// Apply one ABI request authorized by instance identity rather than a
+    /// capability that arrived on the wire.
+    pub fn handle_for_instance(
+        &mut self,
+        peer: &AuthenticatedPeer,
+        instance_id: &str,
+        generation: u64,
+        request: Request,
+        now: u64,
+    ) -> Result<Reply, ControlError> {
+        let capability = self
+            .authority
+            .authorize_instance(peer, instance_id, generation, now)?
+            .capability()
+            .to_owned();
+        self.handle(peer, &capability, request, now)
     }
 
     pub fn revoke_instance(&mut self, instance_id: &str) -> bool {
