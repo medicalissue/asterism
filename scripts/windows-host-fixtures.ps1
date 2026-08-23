@@ -106,34 +106,50 @@ if (Test-Path (Join-Path $state 'update-transaction.claim')) {
 Ok 'installed updater locates packaged install.ps1 and applies the beta channel'
 
 # Hold the transaction file exactly as a live updater does. A second process
-# must fail without restoring backup bytes or deleting the first claim.
-$backup = Join-Path $state 'update-backup'
-New-Item -ItemType Directory -Force -Path $backup | Out-Null
-Set-Content -Path (Join-Path $backup 'ast.exe') -Value 'recovered-old-ast' -Encoding ascii
-$claimPath = Join-Path $state 'update-transaction.claim'
-$claimStream = [System.IO.File]::Open(
-    $claimPath,
-    [System.IO.FileMode]::CreateNew,
-    [System.IO.FileAccess]::ReadWrite,
-    [System.IO.FileShare]::Read
-)
-$claimBytes = [Text.Encoding]::ASCII.GetBytes("owner=$PID`nid=live-fixture`nphase=activating`n")
-$claimStream.Write($claimBytes, 0, $claimBytes.Length)
-$claimStream.Flush($true)
-$concurrent = Invoke-UpdateChild $updater 'recover'
-if ($concurrent.ExitCode -eq 0) { Fail 'recovery stole a live transaction claim' }
-if (-not (Test-Path $claimPath)) { Fail 'recovery deleted another live transaction claim' }
-if ((Get-Content -Raw (Join-Path $bin 'ast.exe')).Trim() -ne 'new-ast.exe') {
-    Fail 'recovery restored over another live transaction'
-}
-$claimStream.Dispose()
-& $updater recover
-if (Test-Path $claimPath) { Fail 'stale recovery left its claimed transaction file' }
-if ((Get-Content -Raw (Join-Path $bin 'ast.exe')).Trim() -ne 'recovered-old-ast') {
-    Fail 'stale recovery did not restore the backup after the live owner released it'
+# must fail without restoring backup bytes or deleting the first claim. This
+# is a Windows kernel contract: Unix implementations of FileStream do not
+# enforce FileShare as a mandatory cross-process deny mode. The Windows CI
+# lane exercises it for real; non-Windows packaging lanes verify that the
+# updater still asks for the exact ownership mode and fail-closed path.
+$onWindows = [System.Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+if ($onWindows) {
+    $backup = Join-Path $state 'update-backup'
+    New-Item -ItemType Directory -Force -Path $backup | Out-Null
+    Set-Content -Path (Join-Path $backup 'ast.exe') -Value 'recovered-old-ast' -Encoding ascii
+    $claimPath = Join-Path $state 'update-transaction.claim'
+    $claimStream = [System.IO.File]::Open(
+        $claimPath,
+        [System.IO.FileMode]::CreateNew,
+        [System.IO.FileAccess]::ReadWrite,
+        [System.IO.FileShare]::Read
+    )
+    $claimBytes = [Text.Encoding]::ASCII.GetBytes("owner=$PID`nid=live-fixture`nphase=activating`n")
+    $claimStream.Write($claimBytes, 0, $claimBytes.Length)
+    $claimStream.Flush($true)
+    $concurrent = Invoke-UpdateChild $updater 'recover'
+    if ($concurrent.ExitCode -eq 0) { Fail 'recovery stole a live transaction claim' }
+    if (-not (Test-Path $claimPath)) { Fail 'recovery deleted another live transaction claim' }
+    if ((Get-Content -Raw (Join-Path $bin 'ast.exe')).Trim() -ne 'new-ast.exe') {
+        Fail 'recovery restored over another live transaction'
+    }
+    $claimStream.Dispose()
+    & $updater recover
+    if (Test-Path $claimPath) { Fail 'stale recovery left its claimed transaction file' }
+    if ((Get-Content -Raw (Join-Path $bin 'ast.exe')).Trim() -ne 'recovered-old-ast') {
+        Fail 'stale recovery did not restore the backup after the live owner released it'
+    }
+    Ok 'recovery refuses a live owner and restores only after exclusive stale-claim ownership'
+} else {
+    $updateSource = Get-Content -Raw $updater
+    if ($updateSource -notmatch '\[System\.IO\.FileShare\]::Read') {
+        Fail 'updater no longer holds the claim with a read-only share mode'
+    }
+    if ($updateSource -notmatch 'another updater process owns the activation transaction; refusing recovery') {
+        Fail 'recovery no longer fails closed when exclusive claim ownership is denied'
+    }
+    Ok 'non-Windows packaging preserves the Windows-only exclusive recovery contract'
 }
 Remove-Item -Recurse -Force $work
-Ok 'recovery refuses a live owner and restores only after exclusive stale-claim ownership'
 
 # A partial artifact with only the updater is an exact failure: apply must not
 # create a transaction or mutate binaries when packaged install.ps1 is absent.
