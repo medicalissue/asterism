@@ -365,6 +365,9 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
     }
 }
 
+// Mirrors the two versioned create frames field-for-field; grouping these
+// arguments would introduce a third protocol-shaped type with no new invariant.
+#[allow(clippy::too_many_arguments)]
 fn create_instance(
     reg: &mut Shard,
     cpu_device: &str,

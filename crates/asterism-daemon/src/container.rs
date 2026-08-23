@@ -31,7 +31,9 @@ use asterism_core::proc::{Ownership, ProcId, Signal};
 use asterism_core::{paths, tools};
 
 pub const LINUX_ID: &str = "linux-rootless";
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const MACOS_ID: &str = "macos-vz-container-utility-vm";
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub const WINDOWS_ID: &str = "windows-hyperv-container-utility-vm";
 #[cfg(target_os = "linux")]
 const MAX_EXEC_OUTPUT: usize = 1024 * 1024;
@@ -43,8 +45,11 @@ trait Adapter: Send + Sync {
     fn probe(&self) -> Result<Machine>;
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 struct LinuxRootless;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct MacosVzUtilityVm;
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 struct WindowsHyperVUtilityVm;
 
 impl Adapter for LinuxRootless {
