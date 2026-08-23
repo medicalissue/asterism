@@ -195,16 +195,9 @@ pub const SUPPORTED_DEVICE_ATTRIBUTES: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum GuestFrame {
-    Open {
-        versions: AbiRange,
-    },
-    Cuda {
-        id: u64,
-        call: CudaCall,
-    },
-    Cancel {
-        id: u64,
-    },
+    Open { versions: AbiRange },
+    Cuda { id: u64, call: CudaCall },
+    Cancel { id: u64 },
     Close,
 }
 
@@ -413,10 +406,7 @@ pub struct GuestShim {
 impl GuestShim {
     pub fn connect(device: &Path) -> io::Result<Self> {
         let stream = UnixStream::connect(device)?;
-        Ok(Self {
-            stream,
-            next_id: 0,
-        })
+        Ok(Self { stream, next_id: 0 })
     }
 
     pub fn open(&mut self) -> Result<GuestReply, GuestError> {
@@ -471,7 +461,9 @@ impl GuestShim {
             });
         }
         let call = call.ok_or_else(|| {
-            GuestError::new(format!("{symbol} is supported but was dispatched without arguments"))
+            GuestError::new(format!(
+                "{symbol} is supported but was dispatched without arguments"
+            ))
         })?;
         self.call(call)
     }
@@ -540,16 +532,15 @@ pub fn write_frame(writer: &mut impl Write, value: &impl Serialize) -> Result<()
             body.len()
         )));
     }
-    let len = u32::try_from(body.len()).map_err(|_| GuestError::new("guest GPU frame too large"))?;
+    let len =
+        u32::try_from(body.len()).map_err(|_| GuestError::new("guest GPU frame too large"))?;
     writer.write_all(&len.to_be_bytes())?;
     writer.write_all(&body)?;
     writer.flush()?;
     Ok(())
 }
 
-pub fn read_frame<T: for<'de> Deserialize<'de>>(
-    reader: &mut impl Read,
-) -> Result<T, GuestError> {
+pub fn read_frame<T: for<'de> Deserialize<'de>>(reader: &mut impl Read) -> Result<T, GuestError> {
     let mut len = [0u8; 4];
     reader.read_exact(&mut len)?;
     let len = u32::from_be_bytes(len) as usize;
@@ -665,34 +656,50 @@ pub fn abi_request_for(
 
 pub fn cuda_result_for(call: &CudaCall, reply: Reply) -> CudaResult {
     match (call, reply) {
-        (CudaCall::MemAlloc { .. }, Reply::Ok { response: Response::Allocated { allocation, .. } }) => {
-            CudaResult::Alloc { allocation }
-        }
-        (CudaCall::MemcpyHtoD { .. }, Reply::Ok { response: Response::Written { bytes, .. } }) => {
-            CudaResult::Copied { bytes }
-        }
-        (CudaCall::MemcpyDtoH { .. }, Reply::Ok { response: Response::Data { data, .. } }) => {
-            CudaResult::Data { data }
-        }
+        (
+            CudaCall::MemAlloc { .. },
+            Reply::Ok {
+                response: Response::Allocated { allocation, .. },
+            },
+        ) => CudaResult::Alloc { allocation },
+        (
+            CudaCall::MemcpyHtoD { .. },
+            Reply::Ok {
+                response: Response::Written { bytes, .. },
+            },
+        ) => CudaResult::Copied { bytes },
+        (
+            CudaCall::MemcpyDtoH { .. },
+            Reply::Ok {
+                response: Response::Data { data, .. },
+            },
+        ) => CudaResult::Data { data },
         (
             CudaCall::ModuleLoadData { .. },
             Reply::Ok {
                 response: Response::WorkloadLoaded { content_blake3, .. },
             },
-        ) => CudaResult::Module { pin: content_blake3 },
+        ) => CudaResult::Module {
+            pin: content_blake3,
+        },
         (
             CudaCall::LaunchVectorAdd { .. },
             Reply::Ok {
-                response: Response::Launched {
-                    provider_elapsed_ns, ..
-                },
+                response:
+                    Response::Launched {
+                        provider_elapsed_ns,
+                        ..
+                    },
             },
         ) => CudaResult::Launched {
             provider_elapsed_ns,
         },
-        (CudaCall::MemFree { .. }, Reply::Ok { response: Response::Freed { .. } }) => {
-            CudaResult::Freed
-        }
+        (
+            CudaCall::MemFree { .. },
+            Reply::Ok {
+                response: Response::Freed { .. },
+            },
+        ) => CudaResult::Freed,
         (_, Reply::Error { error }) => CudaResult::Error {
             cuda: match error.code {
                 ErrorCode::LimitExceeded | ErrorCode::OutOfBounds => CUDA_ERROR_INVALID_VALUE,

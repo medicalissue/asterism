@@ -7,6 +7,11 @@ nvidia_gate_is_oid() {
   [[ "$value" =~ ^[0-9a-f]{40}$ ]]
 }
 
+nvidia_gate_is_sha256() {
+  local value="$1"
+  [[ "$value" =~ ^sha256:[0-9a-f]{64}$ ]]
+}
+
 nvidia_gate_require_kv() {
   local file="$1" key="$2"
   local value
@@ -27,23 +32,69 @@ nvidia_gate_require_true() {
   fi
 }
 
+nvidia_gate_require_false() {
+  local file="$1" key="$2" value
+  value="$(nvidia_gate_require_kv "$file" "$key")" || return 1
+  if [ "$value" != "false" ]; then
+    echo "NVIDIA GATE FAIL: $key=$value (require false)" >&2
+    return 1
+  fi
+}
+
+nvidia_gate_require_pid_change() {
+  local file="$1" label="$2" before after
+  before="$(nvidia_gate_require_kv "$file" "${label}_pid_before")" || return 1
+  after="$(nvidia_gate_require_kv "$file" "${label}_pid_after")" || return 1
+  case "$before,$after" in
+    *[!0-9,]*|0,*|*,0) echo "NVIDIA GATE FAIL: invalid $label pids" >&2; return 1 ;;
+  esac
+  if [ "$before" = "$after" ]; then
+    echo "NVIDIA GATE FAIL: $label pid did not change ($before)" >&2
+    return 1
+  fi
+}
+
+# Runner output is a closed schema. It cannot shadow git, inventory, or runner
+# digest fields observed by the wrapper.
+nvidia_gate_validate_runner_evidence() {
+  local file="$1" line key seen=" " required
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -z "$line" ] && continue
+    case "$line" in \#*) continue ;; esac
+    case "$line" in
+      *=*) key="${line%%=*}" ;;
+      *) echo "NVIDIA GATE FAIL: runner line is not key=value" >&2; return 1 ;;
+    esac
+    case "$key" in
+      guest_image_digest|provider_image_digest|guest_container_id|guest_device_name|provider_device_name|guest_device_id|provider_device_id|path|direct_path|relay_path|guest_path|libcuda_path|executor|provider_helper_kind|guest_output|provider_astd_pid_before|provider_astd_pid_after|provider_helper_pid_before|provider_helper_pid_after|guest_pid_before|guest_pid_after|provider_astd_restarted|provider_helper_restarted|guest_restarted|revoke|contention|loss|version_skew_fresh_session|version_skew_error|mesh_open_bearer|hardware_cuda_executed) ;;
+      *) echo "NVIDIA GATE FAIL: forbidden runner evidence key $key" >&2; return 1 ;;
+    esac
+    case "$seen" in *" $key "*) echo "NVIDIA GATE FAIL: duplicate runner key $key" >&2; return 1 ;; esac
+    seen="$seen$key "
+  done <"$file"
+
+  for required in guest_image_digest provider_image_digest guest_container_id guest_device_name provider_device_name guest_device_id provider_device_id path direct_path relay_path guest_path libcuda_path executor provider_helper_kind guest_output provider_astd_pid_before provider_astd_pid_after provider_helper_pid_before provider_helper_pid_after guest_pid_before guest_pid_after provider_astd_restarted provider_helper_restarted guest_restarted revoke contention loss version_skew_fresh_session version_skew_error mesh_open_bearer hardware_cuda_executed; do
+    nvidia_gate_require_kv "$file" "$required" >/dev/null || return 1
+  done
+}
+
 # Judge a key=value evidence file. Exit 0 only for the exact guest →
 # projected /dev/nvidia0/libcuda → two named mesh devices → real NVIDIA
 # helper path. Reference, mock, and local-direct records fail closed.
 nvidia_gate_judge() {
   local file="$1"
   local path executor helper guest_path libcuda guest_name provider_name
-  local sha tree guest_digest provider_digest first_uuid second_uuid
+  local sha tree runner_digest guest_digest provider_digest first_uuid second_uuid
 
   path="$(nvidia_gate_require_kv "$file" path)" || return 1
   case "$path" in
-    direct|relay) ;;
+    guest-mesh-provider) ;;
     local-direct|reference-loopback|mock)
       echo "NVIDIA GATE FAIL: path=$path cannot hardware-PASS" >&2
       return 1
       ;;
     *)
-      echo "NVIDIA GATE FAIL: unknown path $path" >&2
+      echo "NVIDIA GATE FAIL: path=$path is not guest-mesh-provider" >&2
       return 1
       ;;
   esac
@@ -89,15 +140,15 @@ nvidia_gate_judge() {
 
   sha="$(nvidia_gate_require_kv "$file" candidate_sha)" || return 1
   tree="$(nvidia_gate_require_kv "$file" tree_digest)" || return 1
+  runner_digest="$(nvidia_gate_require_kv "$file" runner_digest)" || return 1
   nvidia_gate_is_oid "$sha" || { echo "NVIDIA GATE FAIL: candidate_sha is not a git oid" >&2; return 1; }
   nvidia_gate_is_oid "$tree" || { echo "NVIDIA GATE FAIL: tree_digest is not a git oid" >&2; return 1; }
+  nvidia_gate_is_sha256 "$runner_digest" || { echo "NVIDIA GATE FAIL: runner_digest is not sha256" >&2; return 1; }
 
   guest_digest="$(nvidia_gate_require_kv "$file" guest_image_digest)" || return 1
   provider_digest="$(nvidia_gate_require_kv "$file" provider_image_digest)" || return 1
-  [ -n "$guest_digest" ] && [ -n "$provider_digest" ] || {
-    echo "NVIDIA GATE FAIL: image digests required" >&2
-    return 1
-  }
+  nvidia_gate_is_sha256 "$guest_digest" || { echo "NVIDIA GATE FAIL: guest image digest" >&2; return 1; }
+  nvidia_gate_is_sha256 "$provider_digest" || { echo "NVIDIA GATE FAIL: provider image digest" >&2; return 1; }
 
   first_uuid="$(nvidia_gate_require_kv "$file" first_gpu_uuid)" || return 1
   second_uuid="$(nvidia_gate_require_kv "$file" second_gpu_uuid)" || return 1
@@ -108,11 +159,24 @@ nvidia_gate_judge() {
     return 1
   fi
 
-  nvidia_gate_require_kv "$file" guest_device_id >/dev/null || return 1
-  nvidia_gate_require_kv "$file" provider_device_id >/dev/null || return 1
+  local guest_id provider_id container skew_error guest_output
+  guest_id="$(nvidia_gate_require_kv "$file" guest_device_id)" || return 1
+  provider_id="$(nvidia_gate_require_kv "$file" provider_device_id)" || return 1
+  [[ "$guest_id" =~ ^[0-9a-f]{16,}$ ]] || { echo "NVIDIA GATE FAIL: guest_device_id" >&2; return 1; }
+  [[ "$provider_id" =~ ^[0-9a-f]{16,}$ ]] || { echo "NVIDIA GATE FAIL: provider_device_id" >&2; return 1; }
+  [ "$guest_id" != "$provider_id" ] || { echo "NVIDIA GATE FAIL: mesh device IDs must differ" >&2; return 1; }
+  container="$(nvidia_gate_require_kv "$file" guest_container_id)" || return 1
+  case "$container" in ''|mock|local|host) echo "NVIDIA GATE FAIL: guest_container_id" >&2; return 1 ;; esac
   nvidia_gate_require_kv "$file" driver_version >/dev/null || return 1
   nvidia_gate_require_kv "$file" cuda_runtime_version >/dev/null || return 1
-  nvidia_gate_require_kv "$file" guest_output >/dev/null || return 1
+  guest_output="$(nvidia_gate_require_kv "$file" guest_output)" || return 1
+  [ "$guest_output" = "6.0,2.0,6.0" ] || { echo "NVIDIA GATE FAIL: unexpected guest output" >&2; return 1; }
+  skew_error="$(nvidia_gate_require_kv "$file" version_skew_error)" || return 1
+  [ "$skew_error" = "unsupported_version" ] || { echo "NVIDIA GATE FAIL: skew was not UnsupportedVersion" >&2; return 1; }
+  nvidia_gate_require_false "$file" mesh_open_bearer || return 1
+  nvidia_gate_require_pid_change "$file" provider_astd || return 1
+  nvidia_gate_require_pid_change "$file" provider_helper || return 1
+  nvidia_gate_require_pid_change "$file" guest || return 1
 
   nvidia_gate_require_true "$file" direct_path || return 1
   nvidia_gate_require_true "$file" relay_path || return 1
