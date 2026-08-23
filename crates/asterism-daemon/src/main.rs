@@ -64,6 +64,7 @@ mod gpu;
 mod images;
 mod instance;
 mod mesh;
+mod nbd;
 mod orbit;
 mod persist;
 mod secret;

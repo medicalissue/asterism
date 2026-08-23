@@ -334,10 +334,12 @@ impl std::fmt::Display for Sharing {
     }
 }
 
-/// The program that serves a block volume's NBD export. Named here because
-/// it is what a lease's recorded process must turn out to be running before
-/// this daemon will believe the lease.
-pub const EXPORT_BIN: &str = "qemu-storage-daemon";
+/// The retired exporter binary, used only to adopt and safely stop leases
+/// written by older builds. New exports are native threads inside `astd`.
+pub const LEGACY_EXPORT_BIN: &str = "qemu-storage-daemon";
+/// Backward-compatible name for [`LEGACY_EXPORT_BIN`].
+#[deprecated(note = "new volume exports are native to astd")]
+pub const EXPORT_BIN: &str = LEGACY_EXPORT_BIN;
 
 /// Who holds a volume's single writer slot, and at what epoch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -366,29 +368,29 @@ pub struct Lease {
     pub granted_at: u64,
     /// NBD export name this grant is being served under: `<volume>-e<epoch>`.
     pub export: String,
-    /// The `qemu-storage-daemon` serving it, when one is running. Kept for
-    /// what reads it and cannot act on it; nothing signals it — see
-    /// [`Lease::proc`].
+    /// The process containing the exporter: `astd` for native exports, or a
+    /// legacy qemu-storage-daemon while an old lease is being migrated. Kept
+    /// for readers which cannot act on a number; signalling authority is only
+    /// ever [`Lease::proc`] plus the exporter runtime or legacy pidfile.
     #[serde(default)]
     pub pid: Option<u32>,
     /// Proof of *which* process that pid is.
     ///
-    /// Tracked the way a guest's helper is tracked, and for the same reason:
-    /// it is a process this daemon started, is responsible for stopping, and
-    /// will meet again only after writing it down — which means only after
-    /// its pid has stopped being evidence of anything. Absent on leases
-    /// written before identities existed; the daemon adopts those at startup
-    /// where it safely can, and treats the rest as an export that is simply
-    /// not running (which is recoverable: the export is restarted at the
-    /// same epoch).
+    /// For a native export this identifies the daemon whose in-memory runtime
+    /// owns the exact volume epoch; it is a crash fence, never permission to
+    /// signal the daemon. Legacy child exporters retain their own identity so
+    /// migration cleanup can stop only the process the old daemon launched.
+    /// Absent on leases written before identities existed; those remain
+    /// conservatively fenced unless legacy pidfile evidence permits adoption.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proc: Option<ProcId>,
-    /// Whether an export process may have accepted a writer for this lease.
+    /// Whether an export server may have accepted a writer for this lease.
     ///
-    /// New grants persist `false` before launch and flip it to `true` only
-    /// with the captured process identity. Legacy rows default to `true`, the
-    /// conservative answer: absence of a modern identity must never be
-    /// mistaken for proof that an old writer cannot exist.
+    /// New grants persist `false` before launch and flip it to `true` with the
+    /// containing daemon's identity before its prepared listener can accept.
+    /// Legacy rows default to `true`, the conservative answer: absence of a
+    /// modern identity must never be mistaken for proof that an old writer
+    /// cannot exist.
     #[serde(default = "export_may_be_running")]
     pub export_started: bool,
 }
@@ -678,10 +680,10 @@ impl Store {
     /// can be proven to be its export.
     ///
     /// The volume half of the startup migration
-    /// (`asterism_core::proc::ProcId::adopt`). Failing is cheap here in a way
-    /// it is not for a guest: an export that cannot be proven is treated as
-    /// not running and started again at the *same* epoch, which is the same
-    /// recovery a provider that restarted already gets.
+    /// (`asterism_core::proc::ProcId::adopt`). Failure leaves the conservative
+    /// writer fence intact: a pre-identity child cannot be confused with the
+    /// native exporter recovery path, whose durable row always identifies the
+    /// containing daemon.
     pub fn adopt_export(&mut self, name: &str) -> std::result::Result<Option<ProcId>, String> {
         let vol = self.volumes.get_mut(name).ok_or_else(|| no_such(name))?;
         let Some(lease) = vol.lease.as_mut() else {
@@ -704,7 +706,7 @@ impl Store {
             pid,
             lease.granted_at,
             &ProcEvidence {
-                exec: &[EXPORT_BIN],
+                exec: &[LEGACY_EXPORT_BIN],
                 names: &[&pidfile, &socket],
             },
         )?;
