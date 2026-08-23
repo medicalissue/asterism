@@ -767,7 +767,7 @@ impl Shard {
 /// the instance, not a claim by the device.
 pub fn taken(existing: &Instance) -> String {
     format!(
-        "instance {:?} already exists in this orbit (cpu/ram on {})",
+        "instance {:?} already exists in this orbit (compute on {})",
         existing.name, existing.cpu_device
     )
 }
@@ -776,7 +776,7 @@ pub fn taken(existing: &Instance) -> String {
 pub fn conflicted(inst: &Instance, conflict: &Conflict) -> String {
     format!(
         "instance {:?} shares its name with another instance in this orbit \
-         (cpu/ram on {}) — rename this one first: ast rename {} <new-name>",
+         (compute on {}) — rename this one first: ast rename {} <new-name>",
         inst.name, conflict.other_cpu_device, inst.name
     )
 }
@@ -1067,8 +1067,9 @@ mod tests {
             .to_string();
         assert_eq!(
             err,
-            "instance \"dev\" already exists in this orbit (cpu/ram on laptop)"
+            "instance \"dev\" already exists in this orbit (compute on laptop)"
         );
+        assert!(!err.contains("cpu/ram"), "{err}");
         assert!(shard
             .create("has space", "laptop", "u", Shape::default(), machine())
             .is_err());
@@ -1167,7 +1168,8 @@ mod tests {
             text.contains("shares its name with another instance in this orbit"),
             "{text}"
         );
-        assert!(text.contains("cpu/ram on desktop"), "{text}");
+        assert!(text.contains("compute on desktop"), "{text}");
+        assert!(!text.contains("cpu/ram"), "{text}");
         assert!(text.contains("ast rename dev <new-name>"), "{text}");
     }
 
