@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end for swapping an instance's cpu part onto another device — the
+# End-to-end for moving an instance's compute onto another device — the
 # offline migration of docs/ROADMAP.md Phase 6.
 #
 # Two daemons on one host, each with its own ASTERISM_HOME, paired over
@@ -322,6 +322,12 @@ ASTERISM_HOME="$A" "$AST" move "$INST" "$B_NAME" >"$MOVE_OUT" 2>&1 \
   || fail "ast move failed:"$'\n'"$(cat "$MOVE_OUT")"
 cat "$MOVE_OUT"
 
+grep -qF "$INST: compute now sourced from $B_NAME" "$MOVE_OUT" \
+  || fail "the move did not name compute as the placement:"$'\n'"$(cat "$MOVE_OUT")"
+if grep -qE 'cpu/ram|ram placement' "$MOVE_OUT"; then
+  fail "the move output leaked a non-canonical placement name:"$'\n'"$(cat "$MOVE_OUT")"
+fi
+
 # The base image is fetched from the orbit peer that has it, not the internet.
 grep -qF "fetching base image $IMAGE" "$MOVE_OUT" \
   || fail "B did not fetch the base image at all:"$'\n'"$(cat "$MOVE_OUT")"
@@ -384,10 +390,10 @@ echo "ok: B's disk is $B_SIZE bytes long and occupies $B_BLOCKS — still a spar
 
 LS="$(ASTERISM_HOME="$A" "$AST" ls 2>&1)" || fail "ast ls failed:"$'\n'"$LS"
 grep -qE "^$INST +stopped .*$B_NAME" <<<"$LS" \
-  || fail "ast ls does not show $INST with its cpu on B:"$'\n'"$LS"
+  || fail "ast ls does not show $INST with its compute on B:"$'\n'"$LS"
 [ "$(grep -c "^$INST " <<<"$LS")" = "1" ] \
   || fail "$INST appears more than once — a move left two rows:"$'\n'"$LS"
-echo "ok: ast ls shows one row for $INST, cpu on $B_NAME"
+echo "ok: ast ls shows one row for $INST, compute on $B_NAME"
 
 [ ! -d "$A/instances/$INST" ] \
   || fail "A still has $A/instances/$INST — the source did not drop its copy"
@@ -409,7 +415,7 @@ expect "the row carries a move epoch" "moves:   1" \
 # dropped: the row still says what the user asked for.
 STATUS="$(ASTERISM_HOME="$A" "$AST" status "$INST" 2>&1)"
 grep -qF "$VOL" <<<"$STATUS" || fail "the volume row was dropped by the move:"$'\n'"$STATUS"
-grep -qF "stranded by the cpu move" <<<"$STATUS" \
+grep -qF "stranded by the compute move" <<<"$STATUS" \
   || fail "the stranded volume is not flagged:"$'\n'"$STATUS"
 echo "ok: the 9p volume survived as a row and is flagged in status"
 
@@ -423,7 +429,7 @@ expect "status names the device whose key opens the guest" "seed:    built on $A
 
 expect "up through the orbit boots it on B" "$INST  running" \
   env ASTERISM_HOME="$A" "$AST" up "$INST"
-# Typed on A, about a guest whose cpu is on B, reached over the ssh splice.
+# Typed on A, about a guest whose compute is on B, reached over the ssh splice.
 expect "the marker survived the move" "$MARKER" \
   env ASTERISM_HOME="$A" "$AST" ssh "$INST" -- "cat /var/lib/asterism-marker"
 echo "ok: the guest that booted on B is the guest that was written to on A"
@@ -465,7 +471,7 @@ refute "moving to a device nobody has heard of is refused" "no device named" \
   env ASTERISM_HOME="$A" "$AST" move "$FAIL" nowhere
 refute "moving something that is not in the orbit is refused" "no instance named" \
   env ASTERISM_HOME="$A" "$AST" move ghost "$B_NAME"
-refute "there is only one part to set today" "there is no \"gpu\" part to set" \
+refute "there is only one placement part to set today" "there is no \"gpu\" placement part" \
   env ASTERISM_HOME="$A" "$AST" set "$FAIL" gpu "$B_NAME"
 
 # A running instance is refused without --down, because offline is the only
@@ -576,9 +582,9 @@ stop_daemon "$B" -KILL
 wait "$MOVE_PID" || true
 [ "$(cat "$RUN/kill.rc")" = "refused" ] \
   || fail "the move reported success although its target was killed:"$'\n'"$(cat "$KILL_OUT")"
-grep -qF "still supplies $KILL's cpu" "$KILL_OUT" \
+grep -qF "still supplies $KILL's compute" "$KILL_OUT" \
   || fail "the failed move did not say who still has it:"$'\n'"$(cat "$KILL_OUT")"
-echo "ok: the interrupted move failed and named A as the instance's cpu source"
+echo "ok: the interrupted move failed and named A as the instance's compute source"
 
 # B has no bootable copy: no instance directory, no row.
 [ ! -d "$B/instances/$KILL" ] \

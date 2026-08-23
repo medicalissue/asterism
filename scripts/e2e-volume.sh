@@ -61,7 +61,7 @@ else
   SHORT_TMP=/tmp
 fi
 RUN="$SHORT_TMP/ast-vol-$$"
-A="$RUN/a"            # supplies cpu/ram: the guest runs here
+A="$RUN/a"            # supplies compute: the guest runs here
 B="$RUN/b"            # supplies the bytes: the volume lives here
 A_NAME="vol-a-$$"
 B_NAME="vol-b-$$"
@@ -410,7 +410,7 @@ grep -qF "the guest gets a plain disk" <<<"$ATTACH" \
 echo "ok: attach records a disk after $ATTEMPT measured attempt(s) and says the guest must format it"
 
 # The lease is on B, taken at attach time, and it names the instance and the
-# device supplying that instance's cpu.
+# device supplying that instance's compute.
 [ "$(holder_now)" = "$INST" ] || fail "B does not think $INST holds the lease"
 E1="$(epoch_now)"
 [ "$E1" = "1" ] || fail "the first lease should be epoch 1, got $E1"
@@ -614,7 +614,7 @@ expect "a second instance exists" "$OTHER  defined" \
 refute "a second instance cannot take a held volume" \
   "volume \"$VOL\" is held by instance \"$INST\"" \
   env ASTERISM_HOME="$A" "$AST" attach "$OTHER" --volume "$VOL"
-refute "and the refusal says which device is writing to it" "cpu/ram on $A_NAME" \
+refute "and the refusal says which device is writing to it" "compute on $A_NAME" \
   env ASTERISM_HOME="$A" "$AST" attach "$OTHER" --volume "$VOL"
 refute "and how to end it" "ast detach $INST --volume $VOL" \
   env ASTERISM_HOME="$A" "$AST" attach "$OTHER" --volume "$VOL"
@@ -706,20 +706,20 @@ expect "detach from the second instance" "$VOL detached" \
 expect "and back to the first" "a disk in the guest" \
   env ASTERISM_HOME="$A" "$AST" attach "$INST" --volume "$B_NAME:$VOL"
 
-# ---- 7b. cpu placement moves while storage ownership does not ---------------
+# ---- 7b. compute placement moves while storage ownership does not -----------
 #
 # The instance is stopped and both device endpoints still carry their paired
-# paths. Move cpu/ram onto the storage owner and back; each boot renews the
-# lease for the new cpu device while the part's owner never changes.
+# paths. Move compute onto the storage owner and back; each boot renews the
+# lease for the new compute device while the part's owner never changes.
 
 ASTERISM_HOME="$A" "$AST" move "$INST" "$B_NAME" >"$RUN/move-to-provider.out" 2>&1 \
   || fail "moving cpu to the storage provider failed:"$'\n'"$(cat "$RUN/move-to-provider.out")"
 expect "the moved instance boots with provider-local storage" "$INST  running" \
   env ASTERISM_HOME="$A" "$AST" up "$INST"
 [ "$(holder_device_now)" = "$B_NAME" ] \
-  || fail "the renewed lease did not follow cpu placement to $B_NAME"
+  || fail "the renewed lease did not follow compute placement to $B_NAME"
 VOLUME_DEV="$(find_volume_device)"
-expect "the volume bytes survive cpu placement on their owner" "$MARKER" \
+expect "the volume bytes survive compute placement on their owner" "$MARKER" \
   in_guest "sudo mkdir -p /data && sudo mount $VOLUME_DEV /data && cat /data/marker"
 
 expect "stop before moving cpu back" "$INST  stopped" \
@@ -729,7 +729,7 @@ ASTERISM_HOME="$A" "$AST" move "$INST" "$A_NAME" >"$RUN/move-back.out" 2>&1 \
 expect "the instance boots after storage becomes remote again" "$INST  running" \
   env ASTERISM_HOME="$A" "$AST" up "$INST"
 [ "$(holder_device_now)" = "$A_NAME" ] \
-  || fail "the renewed lease did not follow cpu placement back to $A_NAME"
+  || fail "the renewed lease did not follow compute placement back to $A_NAME"
 VOLUME_DEV="$(find_volume_device)"
 expect "the guest still sees one local disk contract after both moves" "$MARKER" \
   in_guest "sudo mkdir -p /data && sudo mount $VOLUME_DEV /data && cat /data/marker"

@@ -64,7 +64,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Define a new instance, sourcing its cpu and ram from this device.
+    /// Define a new instance, sourcing its compute from this device.
     ///
     /// The name is claimed across the whole orbit, so it means one instance
     /// everywhere.
@@ -112,9 +112,9 @@ enum Command {
     },
     /// Boot an instance.
     ///
-    /// Where its cpu and ram come from is the instance's business, not the
+    /// Where its compute comes from is the instance's business, not the
     /// command's: the name resolves across the orbit and the boot happens on
-    /// whichever device supplies them.
+    /// whichever device supplies it.
     Up {
         /// The instance to boot.
         name: String,
@@ -160,7 +160,7 @@ enum Command {
     /// device that did not answer is still listed, with its status
     /// `unknown` — the instance is real, its state is merely stale.
     Ls {
-        /// Only the instances this device supplies cpu for (debugging).
+        /// Only the instances this device supplies compute for (debugging).
         #[arg(long)]
         local: bool,
     },
@@ -300,7 +300,7 @@ enum Command {
     /// A DIRECTORY (`--volume /tank/media`) is shared with the guest and
     /// mounted at a path. Three things have to be true, and each of them is
     /// refused in words rather than discovered later: the directory is on
-    /// the same device as the instance's cpu and ram (directory sharing has
+    /// the same device as the instance's compute (directory sharing has
     /// no network transport), the backend offers a share transport (9p on
     /// qemu or virtiofs on vz), and the guest kernel supports that transport.
     /// Cloud images receive a mount unit in their seed; OCI images receive
@@ -3927,9 +3927,9 @@ fn uname_line() -> String {
 
 /// `ast ls`: one table, one namespace.
 ///
-/// The CPU column says which device is supplying each instance's cpu and ram.
+/// The COMPUTE column says which device is supplying each instance's compute.
 /// It is a column and not a grouping on purpose — the rows are one flat list
-/// because the namespace is one flat namespace, and where the cpu comes from
+/// because the namespace is one flat namespace, and where compute comes from
 /// is a property of the instance, like its shape or its age.
 fn print_table(rows: &[OrbitRow]) {
     if rows.is_empty() {
@@ -3938,7 +3938,7 @@ fn print_table(rows: &[OrbitRow]) {
     }
     println!(
         "{:<14} {:<9} {:<14} {:<16} {:<12} {:<6} SSH",
-        "NAME", "STATUS", "IMAGE", "SHAPE", "CPU", "AGE"
+        "NAME", "STATUS", "IMAGE", "SHAPE", "COMPUTE", "AGE"
     );
     let mut stale = false;
     let mut conflicts = Vec::new();
@@ -3980,7 +3980,7 @@ fn print_table(rows: &[OrbitRow]) {
         );
     }
     if stale {
-        println!("\nunknown: the device supplying that instance's cpu is out of touch");
+        println!("\nunknown: the device supplying that instance's compute is out of touch");
     }
     for name in conflicts {
         println!("\nconflict: {name} shares its name — rename it: ast rename {name} <new-name>");
@@ -4028,7 +4028,7 @@ fn print_detail(inst: &Instance, guest_health: Option<&GuestHealth>) {
     if let Some(conflict) = &inst.conflict {
         println!(
             "conflict: another instance in this orbit is also called {:?} \
-             (cpu/ram on {}) — rename this one: ast rename {} <new-name>",
+             (compute on {}) — rename this one: ast rename {} <new-name>",
             inst.name, conflict.other_cpu_device, inst.name
         );
     }
@@ -4036,7 +4036,7 @@ fn print_detail(inst: &Instance, guest_health: Option<&GuestHealth>) {
     // its cpu part swapped is the ordinary case and does not need telling.
     if inst.move_epoch > 0 {
         println!(
-            "moves:   {} (cpu/ram has been re-sourced that many times)",
+            "moves:   {} (compute has been re-sourced that many times)",
             inst.move_epoch
         );
     }

@@ -684,7 +684,7 @@ impl Instance {
     pub fn parts(&self) -> Vec<Part> {
         let mut parts = vec![
             Part {
-                kind: "cpu/ram".into(),
+                kind: "compute".into(),
                 source: self.cpu_device.clone(),
                 detail: format!("{} cores · {} MiB", self.shape.cpus, self.shape.mem_mib),
                 note: self.moving.as_ref().map(|m| {
@@ -705,8 +705,10 @@ impl Instance {
                 note: Some(match self.image_kind {
                     // Where the image came from changes what the machine is,
                     // so it is a fact about the disk and it is said out loud.
-                    ImageKind::OciRootfs => "follows cpu · oci rootfs, direct kernel boot".into(),
-                    ImageKind::Disk => "follows cpu".to_owned(),
+                    ImageKind::OciRootfs => {
+                        "follows compute · oci rootfs, direct kernel boot".into()
+                    }
+                    ImageKind::Disk => "follows compute".to_owned(),
                 }),
             },
         ];
@@ -722,7 +724,7 @@ impl Instance {
                     format!("{} -> {}", v.path, v.guest_path()),
                     if self.stranded.iter().any(|p| *p == v.guest_path()) {
                         Some(format!(
-                            "stranded by the cpu move — a directory on {}, and \
+                            "stranded by the compute move — a directory on {}, and \
                              directory shares are same-device only",
                             v.host
                         ))
@@ -786,7 +788,7 @@ impl Instance {
                 true => "user-mode NAT".to_owned(),
                 false => format!("user-mode NAT · {}", published.join(", ")),
             },
-            note: Some("exit default: same as cpu".into()),
+            note: Some("exit default: same as compute".into()),
         });
         parts.push(Part {
             kind: "gpu".into(),
@@ -806,7 +808,7 @@ impl Instance {
 /// it came to be sourced there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Part {
-    /// `cpu/ram`, `disk`, `volume`, `network`, `gpu`.
+    /// `compute`, `disk`, `volume`, `network`, `gpu`.
     pub kind: String,
     /// The device supplying it, or `-` when nothing does.
     pub source: String,
@@ -931,25 +933,38 @@ mod tests {
     }
 
     #[test]
-    fn every_part_names_the_device_that_supplies_it() {
+    fn status_parts_render_compute_without_cpu_ram_placement() {
         let mut inst = Instance::new("dev", "desktop", "debian:13", Shape::default(), machine());
         inst.volumes.push(vol("/tank/media", "nas"));
         let parts = inst.parts();
 
         let find = |kind: &str| parts.iter().find(|p| p.kind == kind).expect(kind).clone();
-        // cpu and ram come as a pair from one device.
-        assert_eq!(find("cpu/ram").source, "desktop");
-        assert_eq!(find("cpu/ram").detail, "2 cores · 2048 MiB");
+        // Compute (CPU and physical RAM) comes from one device.
+        assert_eq!(find("compute").source, "desktop");
+        assert_eq!(find("compute").detail, "2 cores · 2048 MiB");
         // Disk and egress default to that same device, and say so.
         assert_eq!(find("disk").source, "desktop");
-        assert_eq!(find("disk").note.as_deref(), Some("follows cpu"));
+        assert_eq!(find("disk").note.as_deref(), Some("follows compute"));
         assert_eq!(find("network").source, "desktop");
+        assert_eq!(
+            find("network").note.as_deref(),
+            Some("exit default: same as compute")
+        );
         // A volume is sourced wherever its bytes are, which need not be there.
         assert_eq!(find("volume").source, "nas");
         assert_eq!(find("volume").detail, "/tank/media -> /mnt/ast/media");
         // Nothing in the pool is supplying a gpu.
         assert_eq!(find("gpu").source, "-");
         assert_eq!(find("gpu").detail, "none");
+
+        let rendered = parts
+            .iter()
+            .flat_map(|part| [part.kind.as_str(), part.note.as_deref().unwrap_or_default()])
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("compute"), "{rendered}");
+        assert!(!rendered.contains("cpu/ram"), "{rendered}");
+        assert!(!rendered.contains("ram placement"), "{rendered}");
     }
 
     /// An instance built from a container image is a machine like any other,
@@ -977,7 +992,7 @@ mod tests {
             .contains("docker.io/library/nginx:latest"));
         assert_eq!(
             find("disk").note.as_deref(),
-            Some("follows cpu · oci rootfs, direct kernel boot")
+            Some("follows compute · oci rootfs, direct kernel boot")
         );
         assert_eq!(
             find("network").detail,

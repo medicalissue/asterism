@@ -944,7 +944,7 @@ pub fn moved_note(name: &str) -> Option<String> {
         return None;
     }
     Some(format!(
-        "instance {name:?} moved to {} — its cpu is sourced there now, and \
+        "instance {name:?} moved to {} — its compute is sourced there now, and \
          `ast status {name}` from anywhere in this orbit will find it",
         note.to_device
     ))
@@ -952,7 +952,7 @@ pub fn moved_note(name: &str) -> Option<String> {
 
 // ---- the orchestrator ------------------------------------------------------
 
-/// `ast set <instance> cpu <device>`, driven from the daemon in front of the
+/// `ast set <instance> compute <device>`, driven from the daemon in front of the
 /// user.
 ///
 /// This daemon is neither end of the transfer unless it happens to be: the
@@ -977,7 +977,7 @@ pub async fn run(
     let here = node.device_name().await;
     let source = locate(name, node, mesh).await?;
     if source == device {
-        bail!("instance {name:?} already sources its cpu and ram from {device}");
+        bail!("instance {name:?} already sources its compute from {device}");
     }
     // Refuse a device nobody has heard of, and one that is not answering,
     // before anything has been fenced. A device does not list itself among
@@ -989,7 +989,7 @@ pub async fn run(
         if !mesh.online(device).await {
             bail!(
                 "device {device} is not answering, so it cannot take {name:?} — the move \
-                 has not started and {source} still supplies its cpu"
+                 has not started and {source} still supplies its compute"
             );
         }
     }
@@ -998,7 +998,7 @@ pub async fn run(
     if manifest.instance.status == Status::Running {
         if !down {
             bail!(
-                "instance {name:?} is running on {source}. Moving cpu/ram is an offline \
+                "instance {name:?} is running on {source}. Moving compute is an offline \
                  operation on every backend Asterism has — pass --down to shut the guest \
                  down first"
             );
@@ -1118,7 +1118,7 @@ pub async fn run(
         )
         .await;
         io.send(&line(format!(
-            "the move did not happen — {source} still supplies {name}'s cpu"
+            "the move did not happen — {source} still supplies {name}'s compute"
         )))
         .await?;
         return Err(e);
@@ -1126,7 +1126,7 @@ pub async fn run(
 
     io.send(&Response::Move {
         text: format!(
-            "{name}: cpu/ram now sourced from {device} (move epoch {epoch}) — \
+            "{name}: compute now sourced from {device} (move epoch {epoch}) — \
              `ast up {name}` boots it there"
         ),
         done: true,
