@@ -261,8 +261,9 @@ CUDA-semantic ABI and runnable reference proof are in
 [docs/remote-gpu-abi.md](docs/remote-gpu-abi.md); production placement,
 identity-bound leases, quotas, revocation and restart fencing are in
 [docs/remote-gpu-production.md](docs/remote-gpu-production.md). The real CUDA
-executor and Linux guest adapter remain explicit hardware gates, not claims
-inferred from the portable reference executor.
+two-device gate (fail-closed driver/CUDA matrix, harness, and no-cost dstack
+plan) is in [docs/remote-gpu-nvidia-gate.md](docs/remote-gpu-nvidia-gate.md).
+The portable reference executor is not NVIDIA hardware evidence.
 
 ## Build from source
 
