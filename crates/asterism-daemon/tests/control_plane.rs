@@ -381,7 +381,8 @@ fn informational_flags_exit_before_creating_or_binding_the_daemon() {
              Usage: astd\n\n\
              Options:\n\
                --help     Print help\n\
-               --version  Print version\n"
+               --version  Print version\n\
+               --service  Windows Service dispatcher (SCM ImagePath)\n"
                 .to_owned(),
         ),
     ] {
