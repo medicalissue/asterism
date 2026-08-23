@@ -360,6 +360,10 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 peeled commit
+      - name: Install virtiofsd build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libcap-ng-dev libseccomp-dev
       - name: Build Linux CLI and daemon
         env:
           ASTERISM_BUILD_ID: ${{ github.sha }}
@@ -399,6 +403,7 @@ jobs:
           version="${{ steps.version.outputs.version }}"
           archive="dist/${version}/asterism-${version}-${{ matrix.target }}.tar.gz"
           [ -f "$archive" ]
+          (cd "dist/${version}" && sha256sum --check "SHA256SUMS.${{ matrix.target }}")
           for member in ast astd cloud-hypervisor virtiofsd asterism-update \
             share/asterism/asterism-nbd share/asterism/linux-components.env \
             share/asterism/licenses/LICENSE-APACHE \
@@ -431,8 +436,11 @@ jobs:
           [ -x "$prefix/bin/cloud-hypervisor" ]
           [ -x "$prefix/bin/virtiofsd" ]
           [ -x "$prefix/libexec/asterism/asterism-update" ]
-          "$prefix/bin/cloud-hypervisor" --version | grep -F 'v53.0'
+          . packaging/linux-components.env
           "$prefix/bin/ast" --version
+          "$prefix/bin/astd" --version
+          "$prefix/bin/cloud-hypervisor" --version | grep -F "$CLOUD_HYPERVISOR_VERSION"
+          "$prefix/bin/virtiofsd" --version | grep -F "${VIRTIOFSD_VERSION#v}"
           sh packaging/install.sh --uninstall
           [ ! -e "$prefix/bin/ast" ]
 
