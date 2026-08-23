@@ -352,7 +352,8 @@ fn safe_file_target(rootfs: &Path, guest: &Path) -> Result<PathBuf> {
 
 #[cfg(target_os = "linux")]
 fn delegated_cgroup(id: &str, cpus: u32, mem_mib: u32) -> Result<PathBuf> {
-    let relative = fs::read_to_string("/proc/self/cgroup")?
+    let membership = fs::read_to_string("/proc/self/cgroup")?;
+    let relative = membership
         .lines()
         .find_map(|line| line.strip_prefix("0::"))
         .context("this host is not using the unified cgroup-v2 hierarchy")?;
