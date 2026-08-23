@@ -280,7 +280,7 @@ switch ($Command) {
             Save-Channel $Channel
             Say "channel is now $Channel"
         } else {
-            Write-Host (Read-Channel)
+            Write-Output (Read-Channel)
         }
     }
     'apply' {
