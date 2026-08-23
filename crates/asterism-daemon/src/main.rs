@@ -805,6 +805,13 @@ pub(crate) async fn handle(req: Request, node: &Node) -> Response {
     if images::is_plane_request(&req) {
         return images::serve(req).await;
     }
+    // Exec is the one instance command whose useful work may be unbounded.
+    // Clone its immutable authority while holding the shard, then release the
+    // global mutex before touching the runtime.  Down/remove/reconcile can
+    // consequently proceed even when the command or its control peer stalls.
+    if matches!(&req, Request::ContainerExec { .. }) {
+        return container_exec(node, req).await;
+    }
 
     // Catalog fan-out can wait on every peer. Resolve it before taking the
     // shard lock so one partitioned storage device cannot stall unrelated
@@ -865,6 +872,69 @@ pub(crate) async fn handle(req: Request, node: &Node) -> Response {
         return snapshot::serve(req, &reg);
     }
     instance::serve(req, &mut reg, &cpu_device).await
+}
+
+async fn container_exec(node: &Node, request: Request) -> Response {
+    let handle = {
+        let reg = node.shard.lock().await;
+        if let Some(refusal) = instance::refusal(&request, &reg) {
+            return refusal;
+        }
+        let Request::ContainerExec { name, .. } = &request else {
+            return Response::Error {
+                message: "non-container request reached container exec dispatcher".into(),
+            };
+        };
+        let inst = match reg.get(&name) {
+            Ok(inst) => inst,
+            Err(error) => {
+                return Response::Error {
+                    message: format!("{error:#}"),
+                }
+            }
+        };
+        if inst.runtime != asterism_core::instance::RuntimeKind::Container {
+            return Response::Error {
+                message: format!("instance {name:?} uses runtime=vm; use `ast ssh {name}`"),
+            };
+        }
+        match inst.handle.clone() {
+            Some(handle) => handle,
+            None => {
+                return Response::Error {
+                    message: "container is not running".into(),
+                }
+            }
+        }
+    };
+    let Request::ContainerExec { command, .. } = request else {
+        unreachable!("request was checked while selecting the container handle")
+    };
+
+    let task = tokio::task::spawn_blocking(move || {
+        container::exec(&handle, command, container::EXEC_DEADLINE)
+    });
+    let result = tokio::time::timeout(
+        container::EXEC_DEADLINE + std::time::Duration::from_secs(3),
+        task,
+    )
+    .await;
+    match result {
+        Ok(Ok(Ok((status, stdout, stderr)))) => Response::ContainerExec {
+            status,
+            stdout,
+            stderr,
+        },
+        Ok(Ok(Err(error))) => Response::Error {
+            message: format!("{error:#}"),
+        },
+        Ok(Err(error)) => Response::Error {
+            message: format!("container exec worker failed: {error}"),
+        },
+        Err(_) => Response::Error {
+            message: "container exec exceeded its daemon deadline".into(),
+        },
+    }
 }
 
 #[cfg(test)]

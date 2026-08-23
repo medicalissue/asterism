@@ -238,6 +238,32 @@ pub struct ContainerControlEndpoint {
     pub pid_namespace: PathBuf,
     pub network_namespace: PathBuf,
     pub cgroup: PathBuf,
+    /// Kernel identities captured with the namespace holder.
+    ///
+    /// Paths under `/proc/<pid>` and cgroup names are reusable.  Persisting
+    /// their device/inode pairs makes a later control connection prove it is
+    /// still attached to the exact namespaces and cgroup created at boot.
+    /// Old handles deserialize without this field and deliberately fail
+    /// closed in the native-container adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<ContainerRuntimeIdentity>,
+}
+
+/// A kernel object's stable identity for the lifetime of that object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KernelObjectIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
+/// Identity of every kernel boundary a native-container control socket owns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerRuntimeIdentity {
+    pub user_namespace: KernelObjectIdentity,
+    pub mount_namespace: KernelObjectIdentity,
+    pub pid_namespace: KernelObjectIdentity,
+    pub network_namespace: KernelObjectIdentity,
+    pub cgroup: KernelObjectIdentity,
 }
 
 impl GuestEndpoint {
