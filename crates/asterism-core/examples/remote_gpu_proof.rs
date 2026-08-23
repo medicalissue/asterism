@@ -306,10 +306,7 @@ fn guest(args: &[String]) -> Result<()> {
     println!("transparent_raw_syscalls=no");
     println!("transparent_raw_nvidia_ioctls=no");
     println!("transparent_driver_mmap_and_events=no");
-    println!(
-        "hardware_cuda_executed={}",
-        capabilities.executor == gpu::Executor::Cuda
-    );
+    println!("hardware_cuda_executed=false");
     println!("production_transport=authenticated_encrypted_orbit_mesh_required");
     Ok(())
 }

@@ -188,9 +188,10 @@ impl Capabilities {
         }
     }
 
-    /// CPU reference is portable ABI evidence. It is never a hardware PASS.
+    /// Capabilities cannot claim hardware. A simulated `Executor::Cuda` is
+    /// never eligible; only a live-driver kernel launch is.
     pub fn hardware_pass_eligible(&self) -> bool {
-        self.executor == Executor::Cuda
+        false
     }
 }
 
@@ -368,6 +369,31 @@ impl Reply {
             Reply::Error { error } => Err(error),
         }
     }
+}
+
+/// First frame a GPU helper client writes on the 0600 unix socket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum HelperHello {
+    Open {
+        peer_device_id: String,
+        capability: String,
+    },
+}
+
+/// Helper reply to [`HelperHello::Open`]. ABI Request/Reply frames follow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum HelperReady {
+    Ok {
+        gpu_uuid: String,
+        generation: u64,
+        executor: String,
+        hardware_cuda_executed: bool,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1163,13 +1189,13 @@ impl ProductionProvider {
         self.abi.capabilities.executor
     }
 
-    /// True only when the connected executor loaded the real NVIDIA driver.
-    /// Simulated CUDA and the CPU reference are never a hardware PASS.
+    /// True only after a successful live NVIDIA kernel launch. Simulated
+    /// CUDA and the CPU reference are never a hardware PASS.
     pub fn hardware_cuda_executed(&self) -> bool {
         self.abi
             .cuda
             .as_ref()
-            .map(CudaEngine::is_live_nvidia)
+            .map(CudaEngine::hardware_cuda_executed)
             .unwrap_or(false)
     }
 
@@ -1316,12 +1342,14 @@ impl ProductionProvider {
     /// Helper-process restart: zeroize live device memory while the old
     /// context still exists, fence every lease, rebuild an empty CUDA
     /// context, and recover at the new generation. Old capabilities cannot
-    /// authorize the restarted helper.
+    /// authorize the restarted helper. A wipe failure fails closed: leases
+    /// and accounting stay, generation does not advance.
     pub fn restart_helper(&mut self) -> Result<u64, ControlError> {
-        self.provider_lost("GPU helper process restart");
         if let Some(engine) = self.abi.cuda.as_mut() {
             engine.restart()?;
         }
+        self.abi.disarm_device_pointers();
+        self.provider_lost("GPU helper process restart");
         self.authority.recover()?;
         Ok(self.authority.generation())
     }
@@ -1402,6 +1430,11 @@ impl ProductionProvider {
     /// Bytes currently reserved by ABI allocations. Control-plane leases are
     /// a separate budget; this is the data-plane remainder a restart must
     /// return.
+    #[cfg(test)]
+    fn fail_next_zeroize(&mut self) {
+        self.abi.fail_next_zeroize();
+    }
+
     pub fn live_abi_bytes(&self) -> u64 {
         self.abi.committed_bytes
     }
@@ -1511,11 +1544,28 @@ impl Provider {
         &self.capabilities
     }
 
+    #[cfg(test)]
+    fn fail_next_zeroize(&mut self) {
+        if let Some(engine) = self.cuda.as_mut() {
+            engine.fail_next_zeroize();
+        }
+    }
+
     pub fn session_allocated_bytes(&self, session_id: &str) -> u64 {
         self.sessions
             .get(session_id)
             .map(|session| session.allocated_bytes)
             .unwrap_or(0)
+    }
+
+    /// After a successful engine restart the device pointers are dead. Clear
+    /// them so later host-side release does not retry CUDA wipe.
+    fn disarm_device_pointers(&mut self) {
+        for session in self.sessions.values_mut() {
+            for allocation in session.allocations.values_mut() {
+                allocation.device_ptr = None;
+            }
+        }
     }
 
     /// Administrative close used by the authenticated production adapter.
@@ -1534,25 +1584,30 @@ impl Provider {
         for (_, session) in sessions {
             self.release_session(session);
         }
-        self.committed_bytes = 0;
         count
     }
 
     fn release_session(&mut self, session: Session) {
-        self.committed_bytes = self.committed_bytes.saturating_sub(session.allocated_bytes);
+        let mut released = 0u64;
         for (_, allocation) in session.allocations {
-            self.release_allocation(allocation);
-        }
-    }
-
-    fn release_allocation(&mut self, mut allocation: Allocation) {
-        let bytes = allocation.bytes();
-        allocation.host.zeroize();
-        if let Some(ptr) = allocation.device_ptr {
-            if let Some(engine) = self.cuda.as_mut() {
-                engine.zeroize_and_free(ptr, bytes);
+            match self.release_allocation(allocation) {
+                Ok(bytes) => released = released.saturating_add(bytes),
+                Err(_) => {}
             }
         }
+        self.committed_bytes = self.committed_bytes.saturating_sub(released);
+    }
+
+    fn release_allocation(&mut self, mut allocation: Allocation) -> Result<u64, GpuError> {
+        let bytes = allocation.bytes();
+        if let Some(ptr) = allocation.device_ptr {
+            if let Some(engine) = self.cuda.as_mut() {
+                engine.zeroize_and_free(ptr, bytes)?;
+            }
+            allocation.device_ptr = None;
+        }
+        allocation.host.zeroize();
+        Ok(bytes)
     }
 
     /// Apply one decoded frame. A valid session consumes its sequence number
@@ -1840,15 +1895,21 @@ impl Provider {
                     ));
                 }
                 if self.cuda.is_some() {
+                    let _ = allocation_slice(session, &lhs, sequence)?;
+                    let _ = allocation_slice(session, &rhs, sequence)?;
+                    let _ = allocation_slice(session, &output, sequence)?;
                     let lhs_ptr = device_ptr(session, &lhs, sequence)?;
                     let rhs_ptr = device_ptr(session, &rhs, sequence)?;
                     let output_ptr = device_ptr(session, &output, sequence)?;
                     let (elapsed, result) = {
                         let engine = self.cuda.as_mut().expect("cuda");
                         let elapsed = engine.launch_vector_add(
-                            lhs_ptr.saturating_add(lhs.offset),
-                            rhs_ptr.saturating_add(rhs.offset),
-                            output_ptr.saturating_add(output.offset),
+                            lhs_ptr,
+                            lhs.offset,
+                            rhs_ptr,
+                            rhs.offset,
+                            output_ptr,
+                            output.offset,
                             elements as u32,
                             sequence,
                         )?;
@@ -1939,31 +2000,71 @@ impl Provider {
                 }
             }
             Request::Free { allocation, .. } => {
-                let mut memory = session.allocations.remove(&allocation).ok_or_else(|| {
-                    GpuError::new(
-                        ErrorCode::UnknownAllocation,
-                        Some(sequence),
-                        "allocation is not owned by this session",
-                    )
-                })?;
-                let released = memory.bytes();
-                memory.host.zeroize();
-                if let Some(ptr) = memory.device_ptr {
-                    if let Some(engine) = self.cuda.as_mut() {
-                        engine.zeroize_and_free(ptr, released);
+                let (released, device_ptr) = {
+                    let memory = session.allocations.get(&allocation).ok_or_else(|| {
+                        GpuError::new(
+                            ErrorCode::UnknownAllocation,
+                            Some(sequence),
+                            "allocation is not owned by this session",
+                        )
+                    })?;
+                    (memory.bytes(), memory.device_ptr)
+                };
+                if let Some(ptr) = device_ptr {
+                    self.cuda
+                        .as_mut()
+                        .ok_or_else(|| {
+                            GpuError::new(
+                                ErrorCode::InvalidRequest,
+                                Some(sequence),
+                                "CUDA allocation has no executor",
+                            )
+                        })?
+                        .zeroize_and_free(ptr, released)?;
+                    if let Some(memory) = session.allocations.get_mut(&allocation) {
+                        memory.device_ptr = None;
                     }
                 }
+                let mut memory = session
+                    .allocations
+                    .remove(&allocation)
+                    .expect("allocation was present");
+                memory.host.zeroize();
                 session.allocated_bytes = session.allocated_bytes.saturating_sub(released);
                 self.committed_bytes = self.committed_bytes.saturating_sub(released);
                 Ok(Response::Freed { sequence })
             }
             Request::Close { .. } => {
+                let to_wipe: Vec<(String, u64, u64)> = session
+                    .allocations
+                    .iter()
+                    .filter_map(|(id, allocation)| {
+                        allocation
+                            .device_ptr
+                            .map(|ptr| (id.clone(), ptr, allocation.bytes()))
+                    })
+                    .collect();
+                for (id, ptr, bytes) in to_wipe {
+                    self.cuda
+                        .as_mut()
+                        .ok_or_else(|| {
+                            GpuError::new(
+                                ErrorCode::InvalidRequest,
+                                Some(sequence),
+                                "CUDA allocation has no executor",
+                            )
+                        })?
+                        .zeroize_and_free(ptr, bytes)?;
+                    if let Some(memory) = session.allocations.get_mut(&id) {
+                        memory.device_ptr = None;
+                    }
+                }
                 let released = session.allocated_bytes;
                 let allocations = std::mem::take(&mut session.allocations);
                 self.sessions.remove(&session_id);
                 self.committed_bytes = self.committed_bytes.saturating_sub(released);
-                for (_, allocation) in allocations {
-                    self.release_allocation(allocation);
+                for (_, mut allocation) in allocations {
+                    allocation.host.zeroize();
                 }
                 Ok(Response::SessionClosed { sequence })
             }
@@ -3135,5 +3236,179 @@ mod tests {
             .into_result()
             .unwrap();
         assert!(matches!(allocated, Response::Allocated { bytes: 8, .. }));
+    }
+
+    #[test]
+    fn cuda_free_fails_closed_when_zeroize_fails() {
+        let mut production = cuda_production(LeaseLimits {
+            total_memory_bytes: 32,
+            max_memory_per_lease: 16,
+            max_leases: 1,
+            lease_ttl_secs: 30,
+        });
+        let owner = peer('b');
+        let (capability, session) = open_lease(&mut production, &owner, "instance-a", 16, 100);
+        let allocated = production
+            .handle(
+                &owner,
+                &capability,
+                Request::Allocate {
+                    session: session.clone(),
+                    sequence: 1,
+                    bytes: 8,
+                },
+                101,
+            )
+            .unwrap()
+            .into_result()
+            .unwrap();
+        let Response::Allocated { allocation, .. } = allocated else {
+            panic!("allocate")
+        };
+        production.fail_next_zeroize();
+        let error = production
+            .handle(
+                &owner,
+                &capability,
+                Request::Free {
+                    session: session.clone(),
+                    sequence: 2,
+                    allocation: allocation.clone(),
+                },
+                102,
+            )
+            .unwrap()
+            .into_result()
+            .unwrap_err();
+        assert!(error.message.contains("failed closed"));
+        assert_eq!(production.live_abi_bytes(), 8);
+        production
+            .handle(
+                &owner,
+                &capability,
+                Request::Free {
+                    session,
+                    sequence: 3,
+                    allocation,
+                },
+                103,
+            )
+            .unwrap()
+            .into_result()
+            .unwrap();
+        assert_eq!(production.live_abi_bytes(), 0);
+    }
+
+    #[test]
+    fn simulated_cuda_launch_never_sets_hardware_flag() {
+        let mut production = cuda_production(LeaseLimits {
+            total_memory_bytes: 256 * 1024,
+            max_memory_per_lease: 256 * 1024,
+            max_leases: 1,
+            lease_ttl_secs: 30,
+        });
+        let owner = peer('b');
+        let (capability, session) =
+            open_lease(&mut production, &owner, "instance-a", 256 * 1024, 100);
+        assert!(!production.hardware_cuda_executed());
+        let lhs = allocate(&mut production, &owner, &capability, &session, 1, 8, 101);
+        let rhs = allocate(&mut production, &owner, &capability, &session, 2, 8, 102);
+        let output = allocate(&mut production, &owner, &capability, &session, 3, 8, 103);
+        production
+            .handle(
+                &owner,
+                &capability,
+                Request::Write {
+                    session: session.clone(),
+                    sequence: 4,
+                    destination: range(&lhs, 0, 8),
+                    data: vec![0; 8],
+                },
+                104,
+            )
+            .unwrap()
+            .into_result()
+            .unwrap();
+        production
+            .handle(
+                &owner,
+                &capability,
+                Request::Write {
+                    session: session.clone(),
+                    sequence: 5,
+                    destination: range(&rhs, 0, 8),
+                    data: vec![0; 8],
+                },
+                105,
+            )
+            .unwrap()
+            .into_result()
+            .unwrap();
+        let descriptor = vector_add_workload();
+        let pin = descriptor.content_blake3.clone();
+        production
+            .handle(
+                &owner,
+                &capability,
+                Request::LoadWorkload {
+                    session: session.clone(),
+                    sequence: 6,
+                    descriptor,
+                    image: VECTOR_ADD_PTX.as_bytes().to_vec(),
+                },
+                106,
+            )
+            .unwrap()
+            .into_result()
+            .unwrap();
+        production
+            .handle(
+                &owner,
+                &capability,
+                Request::LaunchVectorAdd {
+                    session,
+                    sequence: 7,
+                    workload_pin: pin,
+                    lhs: range(&lhs, 0, 8),
+                    rhs: range(&rhs, 0, 8),
+                    output: range(&output, 0, 8),
+                    elements: 2,
+                },
+                107,
+            )
+            .unwrap()
+            .into_result()
+            .unwrap();
+        assert!(!production.hardware_cuda_executed());
+        assert!(!Capabilities::cuda("gpu", Limits::default()).hardware_pass_eligible());
+    }
+
+    fn allocate(
+        production: &mut ProductionProvider,
+        owner: &AuthenticatedPeer,
+        capability: &str,
+        session: &str,
+        sequence: u64,
+        bytes: u64,
+        now: u64,
+    ) -> String {
+        let allocated = production
+            .handle(
+                owner,
+                capability,
+                Request::Allocate {
+                    session: session.to_owned(),
+                    sequence,
+                    bytes,
+                },
+                now,
+            )
+            .unwrap()
+            .into_result()
+            .unwrap();
+        let Response::Allocated { allocation, .. } = allocated else {
+            panic!("allocate")
+        };
+        allocation
     }
 }

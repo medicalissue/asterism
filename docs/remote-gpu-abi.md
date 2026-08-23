@@ -102,8 +102,9 @@ semantics on CPU so every development and CI machine can run it. Its output
 therefore says `hardware_cuda_executed=false`. The production CUDA executor
 loads the NVIDIA driver API, advertises `executor=cuda`, and sets
 `hardware_cuda_executed=true` only when that live driver launched the pinned
-work. The CPU reference is never registered as a production helper and cannot
-satisfy a hardware PASS.
+work. A simulated `Executor::Cuda` is never hardware-pass eligible. The CPU
+reference is never registered as a production helper and cannot satisfy a
+hardware PASS.
 
 Measurements include end-to-end p50/p95 time for two writes, a launch, and a
 read; provider-only launch p50; and payload MiB/s. They include JSON/base64 and

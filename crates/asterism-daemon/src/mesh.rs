@@ -1522,6 +1522,39 @@ impl Mesh {
         Ok((stream, observation))
     }
 
+    /// Open an authenticated GPU ABI session on a provider device.
+    ///
+    /// The far side proxies through its 0600 unix helper; this side never
+    /// opens a public listener. Local routing uses
+    /// [`crate::gpu::open_local_helper`].
+    #[allow(dead_code)]
+    pub async fn open_gpu_abi(
+        self: &Arc<Self>,
+        device: &str,
+        capability: &str,
+    ) -> Result<asterism_mesh::MeshStream> {
+        let peer = self.device(device).await?;
+        let connection = self
+            .live_connection(&peer)
+            .await
+            .with_context(|| format!("GPU provider {device} is unreachable"))?;
+        let request = MeshRequest::GpuAbi {
+            capability: capability.to_owned(),
+        };
+        self.require_peer_version(&connection, &request, &peer.name)
+            .await?;
+        let mut stream = connection.open_stream().await?;
+        open_stream_with(&mut stream.send, &request).await?;
+        match read_frame::<MeshReply>(&mut stream.recv).await? {
+            MeshReply::GpuReady { .. } => Ok(stream),
+            MeshReply::Rpc {
+                response: Response::Error { message },
+            } => bail!(message),
+            MeshReply::Incompatible { message, .. } => bail!(message),
+            other => bail!("device {device:?} would not serve a GPU ABI session: {other:?}"),
+        }
+    }
+
     // ---- moving an instance's cpu part --------------------------------------
 
     /// Is `name` a device this orbit has heard of?

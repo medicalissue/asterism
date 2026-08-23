@@ -11,15 +11,18 @@ driver, CUDA toolkit version and compute capability against the fail-closed
 matrix, and executes the versioned remote ABI. `Executor::Reference` remains
 the portable semantic proof and is test-only: it is never registered in
 daemon/mesh routing and can never satisfy a hardware PASS.
-`hardware_cuda_executed` is true only when the live NVIDIA driver launched
-work.
+`hardware_cuda_executed` is true only after a successful live-driver kernel
+launch. Simulated `Executor::Cuda` is never eligible.
 
 Each `GpuLease.memory_bytes` and the aggregate of live device reservations
 are enforced on every allocation, import and copy *before* generic provider
 limits. Concurrent sessions share that aggregate. Helper-process restart
 zeroizes device memory, fences the old generation, and refuses the previous
 capability. The helper binds a unix socket in `ASTERISM_HOME` (mode 0600),
-never a public TCP listener, and never persists the bearer token.
+accepts ABI clients, and never opens a public TCP listener or persists the
+bearer token. Inbound and outbound mesh `GpuAbi` streams are proxied through
+that accept/client protocol rather than an idle listener or an in-process
+duplicate.
 
 ## Admission and placement
 
