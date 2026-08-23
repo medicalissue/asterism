@@ -484,11 +484,13 @@ async fn discovery_endpoint(
     infra: &MeshInfra,
 ) -> anyhow::Result<Endpoint> {
     if infra.is_n0() {
-        return Ok(Endpoint::builder(presets::N0)
+        let mut builder = Endpoint::builder(presets::N0)
             .secret_key(identity.secret_key().clone())
-            .alpns(vec![ALPN.to_vec()])
-            .bind()
-            .await?);
+            .alpns(vec![ALPN.to_vec()]);
+        if hide_direct_addrs() {
+            builder = builder.clear_ip_transports();
+        }
+        return Ok(builder.bind().await?);
     }
 
     let mut builder = Endpoint::builder(presets::Minimal)
@@ -523,6 +525,9 @@ async fn discovery_endpoint(
             );
         }
         builder = builder.relay_mode(RelayMode::custom(urls));
+    }
+    if hide_direct_addrs() {
+        builder = builder.clear_ip_transports();
     }
 
     Ok(builder.bind().await?)

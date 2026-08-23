@@ -51,9 +51,16 @@ impl Manager {
     /// Load the real NVIDIA driver and put that exact executor behind the
     /// token-free, instance-bound mesh path. A host without admitted hardware
     /// remains unavailable; it never falls back to the reference executor.
-    pub fn install_live(&self, device_name: String, device_id: String) -> Result<()> {
-        let engine = CudaEngine::open_live(None).map_err(|error| anyhow!(error))?;
+    pub fn install_live(
+        &self,
+        device_name: String,
+        device_id: String,
+        gpu_uuid: Option<&str>,
+        bootstrap: Option<(&str, &str, u64)>,
+    ) -> Result<()> {
+        let engine = CudaEngine::open_live(gpu_uuid).map_err(|error| anyhow!(error))?;
         let identity = engine.identity().clone();
+        let lease_ttl_secs = if bootstrap.is_some() { 300 } else { 30 };
         let authority = LeaseAuthority::new(
             device_name,
             device_id,
@@ -63,12 +70,20 @@ impl Manager {
                 total_memory_bytes: identity.memory_bytes,
                 max_memory_per_lease: identity.memory_bytes,
                 max_leases: 8,
-                lease_ttl_secs: 30,
+                lease_ttl_secs,
             },
         )
         .map_err(|error| anyhow!(error))?;
-        let provider =
+        let mut provider =
             ProductionProvider::connect(authority, engine).map_err(|error| anyhow!(error))?;
+        if let Some((consumer_device_id, instance_id, memory_bytes)) = bootstrap {
+            let peer = AuthenticatedPeer::from_mesh_identity(consumer_device_id)
+                .map_err(|error| anyhow!(error))?;
+            provider
+                .authority_mut()
+                .attach(&peer, instance_id, memory_bytes, now_unix())
+                .map_err(|error| anyhow!(error))?;
+        }
         self.insert(identity.uuid, provider);
         Ok(())
     }

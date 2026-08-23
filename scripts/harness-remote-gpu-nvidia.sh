@@ -89,34 +89,42 @@ esac
 RUNNER_DIGEST="$(shasum -a 256 "$RUNNER" | awk '{print "sha256:"$1}')"
 echo "runner_digest=$RUNNER_DIGEST"
 
+VERIFIER_IMAGE="${ASTERISM_NVIDIA_VERIFIER_IMAGE:-}"
+VERIFIER_DIGEST="${ASTERISM_NVIDIA_VERIFIER_DIGEST:-}"
+case "$VERIFIER_IMAGE" in *@sha256:[0-9a-f][0-9a-f]*) ;; *) fail "external verifier image must be digest-pinned" ;; esac
+nvidia_gate_is_sha256 "$VERIFIER_DIGEST" || fail "ASTERISM_NVIDIA_VERIFIER_DIGEST must be sha256"
+[ "${VERIFIER_IMAGE##*@}" = "$VERIFIER_DIGEST" ] || fail "external verifier image/digest mismatch"
+
 RUN="$(mktemp -d "${TMPDIR:-/tmp}/asterism-nvidia-release.XXXXXX")"
 trap 'rm -rf "$RUN"' EXIT
-RUNNER_EVIDENCE="$RUN/runner.evidence"
-RUNNER_BUNDLE="$RUN/runner.bundle.json"
-RUNNER_VERIFIER="$RUN/runner.evidence.verifier"
+RAW="$RUN/raw"
 EVIDENCE="$RUN/release.evidence"
+mkdir -p "$RAW"
 
 # Runner contract: run a CUDA application inside the Asterism guest/container,
 # across two named authenticated mesh devices, on the live provider. It must
 # restart provider astd/helper and the guest, and prove direct, relay, revoke,
 # contention, loss, and fresh-session skew. The wrapper supplies no defaults.
-"$RUNNER" \
-  --evidence "$RUNNER_EVIDENCE" \
-  --guest-device-name "${ASTERISM_GPU_GUEST_DEVICE_NAME:-guest-gpu}" \
-  --provider-device-name "${ASTERISM_GPU_PROVIDER_DEVICE_NAME:-provider-gpu}" \
-  --first-gpu-uuid "${UUIDS[0]}" \
-  --second-gpu-uuid "${UUIDS[1]}"
-[ -s "$RUNNER_EVIDENCE" ] || fail "runner produced no evidence"
-[ -s "$RUNNER_BUNDLE" ] || fail "runner produced no authenticated transcript bundle"
-[ -x "$RUNNER_VERIFIER" ] || fail "runner produced no transcript verifier"
-nvidia_gate_validate_runner_evidence "$RUNNER_EVIDENCE" \
-  || fail "runner evidence is incomplete or contains forbidden keys"
-DRIVER_DIGEST="$(nvidia_gate_require_kv "$RUNNER_EVIDENCE" driver_digest)"
-VERIFIER_DIGEST="$(shasum -a 256 "$RUNNER_VERIFIER" | awk '{print "sha256:"$1}')"
-[ "$DRIVER_DIGEST" = "$VERIFIER_DIGEST" ] \
-  || fail "transcript verifier does not match the pinned driver digest"
-"$RUNNER_VERIFIER" verify --bundle "$RUNNER_BUNDLE" \
-  || fail "authenticated transcript verification failed"
+export ASTERISM_NVIDIA_FIRST_GPU_UUID="${UUIDS[0]}"
+export ASTERISM_NVIDIA_SECOND_GPU_UUID="${UUIDS[1]}"
+"$RUNNER" --output-dir "$RAW"
+for raw in direct-success active-loss relay-success active-revoke; do
+  [ -s "$RAW/$raw.json" ] || fail "runner omitted raw observation $raw"
+done
+
+# The candidate can produce observations but cannot accept them. The image is
+# supplied and digest-pinned by the independent reviewer, runs read-only and
+# offline, and is the only component allowed to emit normalized PASS evidence.
+docker run --rm --network none --read-only \
+  --mount "type=bind,src=$RAW,dst=/evidence,readonly" \
+  "$VERIFIER_IMAGE" /verify \
+    --evidence /evidence \
+    --candidate-sha "$CANDIDATE_SHA" \
+    --tree-digest "$TREE_DIGEST" \
+    --runner-digest "$RUNNER_DIGEST" >"$EVIDENCE"
+[ -s "$EVIDENCE" ] || fail "external verifier emitted no acceptance record"
+nvidia_gate_validate_runner_evidence "$EVIDENCE" \
+  || fail "external verifier evidence is incomplete or contains forbidden keys"
 
 {
   echo "candidate_sha=$CANDIDATE_SHA"
@@ -126,9 +134,10 @@ VERIFIER_DIGEST="$(shasum -a 256 "$RUNNER_VERIFIER" | awk '{print "sha256:"$1}')
   echo "second_gpu_uuid=${UUIDS[1]}"
   echo "driver_version=$DRIVER"
   echo "cuda_runtime_version=$CUDA"
-  echo "provenance_verified=true"
-  sed -n '/^[a-z_][a-z_]*=/p' "$RUNNER_EVIDENCE"
-} >"$EVIDENCE"
+  echo "verifier_image_digest=$VERIFIER_DIGEST"
+  sed -n '/^[a-z_][a-z_]*=/p' "$EVIDENCE"
+} >"$RUN/release.combined"
+mv "$RUN/release.combined" "$EVIDENCE"
 
 nvidia_gate_judge "$EVIDENCE" || fail "judge refused the real-hardware record"
 cat "$EVIDENCE"

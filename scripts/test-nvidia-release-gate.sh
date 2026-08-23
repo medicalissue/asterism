@@ -56,6 +56,7 @@ libcuda_digest=sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
 guest_binary_digest=sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd
 guest_launcher_digest=sha256:5656565656565656565656565656565656565656565656565656565656565656
 transcript_root=blake3:1212121212121212121212121212121212121212121212121212121212121212
+verifier_image_digest=sha256:7878787878787878787878787878787878787878787878787878787878787878
 EOF
 
 nvidia_gate_judge "$VALID" >/dev/null
@@ -79,10 +80,18 @@ must_refuse guest_container_id aaaaaaaaaaaa,aaaaaaaaaaaa
 must_refuse mesh_open_bearer true
 must_refuse provenance_verified false
 must_refuse transcript_root caller-authored
+must_refuse verifier_image_digest candidate-authored
+
+RAW="$TMP/raw.json"
+printf '%s\n' '{"schema":"asterism.nvidia.raw-observation/2","hardware_cuda_executed":true}' >"$RAW"
+if nvidia_gate_judge "$RAW" >/dev/null 2>&1; then
+  echo "candidate raw observation was allowed to accept itself" >&2
+  exit 1
+fi
 
 RUNNER="$TMP/runner"
 sed -n '/^guest_image_digest=/,$p' "$VALID" \
-  | sed '/^candidate_sha=/d;/^tree_digest=/d;/^runner_digest=/d;/^first_gpu_uuid=/d;/^second_gpu_uuid=/d;/^driver_version=/d;/^cuda_runtime_version=/d;/^provenance_verified=/d' \
+  | sed '/^candidate_sha=/d;/^tree_digest=/d;/^runner_digest=/d;/^first_gpu_uuid=/d;/^second_gpu_uuid=/d;/^driver_version=/d;/^cuda_runtime_version=/d;/^provenance_verified=/d;/^verifier_image_digest=/d' \
   >"$RUNNER"
 nvidia_gate_validate_runner_evidence "$RUNNER"
 printf 'candidate_sha=%040d\n' 0 >>"$RUNNER"

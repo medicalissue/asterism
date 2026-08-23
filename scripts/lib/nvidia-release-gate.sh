@@ -151,19 +151,21 @@ nvidia_gate_judge() {
   nvidia_gate_is_sha256 "$guest_digest" || { echo "NVIDIA GATE FAIL: guest image digest" >&2; return 1; }
   nvidia_gate_is_sha256 "$provider_digest" || { echo "NVIDIA GATE FAIL: provider image digest" >&2; return 1; }
 
-  local driver_artifact astd_artifact libcuda_artifact guest_artifact launcher_artifact transcript_root
+  local driver_artifact astd_artifact libcuda_artifact guest_artifact launcher_artifact transcript_root verifier_image
   driver_artifact="$(nvidia_gate_require_kv "$file" driver_digest)" || return 1
   astd_artifact="$(nvidia_gate_require_kv "$file" astd_digest)" || return 1
   libcuda_artifact="$(nvidia_gate_require_kv "$file" libcuda_digest)" || return 1
   guest_artifact="$(nvidia_gate_require_kv "$file" guest_binary_digest)" || return 1
   launcher_artifact="$(nvidia_gate_require_kv "$file" guest_launcher_digest)" || return 1
   transcript_root="$(nvidia_gate_require_kv "$file" transcript_root)" || return 1
+  verifier_image="$(nvidia_gate_require_kv "$file" verifier_image_digest)" || return 1
   nvidia_gate_is_sha256 "$driver_artifact" || { echo "NVIDIA GATE FAIL: driver artifact digest" >&2; return 1; }
   nvidia_gate_is_sha256 "$astd_artifact" || { echo "NVIDIA GATE FAIL: astd artifact digest" >&2; return 1; }
   nvidia_gate_is_sha256 "$libcuda_artifact" || { echo "NVIDIA GATE FAIL: libcuda artifact digest" >&2; return 1; }
   nvidia_gate_is_sha256 "$guest_artifact" || { echo "NVIDIA GATE FAIL: guest artifact digest" >&2; return 1; }
   nvidia_gate_is_sha256 "$launcher_artifact" || { echo "NVIDIA GATE FAIL: guest launcher digest" >&2; return 1; }
   nvidia_gate_is_blake3 "$transcript_root" || { echo "NVIDIA GATE FAIL: transcript root" >&2; return 1; }
+  nvidia_gate_is_sha256 "$verifier_image" || { echo "NVIDIA GATE FAIL: verifier image digest" >&2; return 1; }
   [ "$libcuda" = "$libcuda_artifact" ] || { echo "NVIDIA GATE FAIL: libcuda digest binding" >&2; return 1; }
 
   first_uuid="$(nvidia_gate_require_kv "$file" first_gpu_uuid)" || return 1
@@ -221,7 +223,7 @@ nvidia_gate_judge() {
 # The provider image and repos.hash are immutable digest/OID pins.
 nvidia_gate_validate_dstack() {
   local yml="$1"
-  local hash image
+  local image
   grep -q '^type: task$' "$yml" || { echo "dstack: type must be task" >&2; return 1; }
   grep -q '^name: asterism-remote-gpu-nvidia-gate$' "$yml" || {
     echo "dstack: name must be asterism-remote-gpu-nvidia-gate" >&2
@@ -241,23 +243,27 @@ nvidia_gate_validate_dstack() {
     echo "dstack: commands must run the release gate" >&2
     return 1
   }
-  grep -q 'url: https://github.com/medicalissue/asterism.git' "$yml" || {
-    echo "dstack: repos.url must pin the asterism repo" >&2
+  grep -q 'local_path: ../..' "$yml" || {
+    echo "dstack: exact detached candidate checkout must be uploaded" >&2
     return 1
   }
-  hash="$(awk '/^[[:space:]]*hash:/{gsub(/["'\'']/, "", $2); print $2; exit}' "$yml")"
-  nvidia_gate_is_oid "$hash" || {
-    echo "dstack: repos.hash must be a 40-character git oid (got ${hash:-empty})" >&2
+  grep -q '^[[:space:]]*- ASTERISM_PINNED_SHA$' "$yml" || {
+    echo "dstack: reviewer must supply the exact candidate SHA" >&2
     return 1
   }
-  grep -q "ASTERISM_PINNED_SHA=$hash" "$yml" || {
-    echo "dstack: ASTERISM_PINNED_SHA must equal repos.hash" >&2
-    return 1
+  grep -q 'test "$(git rev-parse HEAD)" = "$ASTERISM_PINNED_SHA"' "$yml" || {
+    echo "dstack: runtime must reject a non-exact checkout" >&2; return 1;
+  }
+  grep -q '^[[:space:]]*- ASTERISM_NVIDIA_VERIFIER_IMAGE$' "$yml" || {
+    echo "dstack: independent verifier image is required" >&2; return 1;
+  }
+  grep -q '^[[:space:]]*- ASTERISM_NVIDIA_VERIFIER_DIGEST$' "$yml" || {
+    echo "dstack: independent verifier digest is required" >&2; return 1;
   }
   grep -q 'ASTERISM_NVIDIA_E2E_RUNNER=/dstack/run/scripts/lib/nvidia-e2e-runner.sh' "$yml" || {
     echo "dstack: exact pinned-tree E2E runner must be selected" >&2
     return 1
   }
   echo "dstack_schema=valid"
-  echo "dstack_pinned_sha=$hash"
+  echo "dstack_exact_sha=reviewer-supplied"
 }
