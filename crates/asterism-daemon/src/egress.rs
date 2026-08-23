@@ -82,7 +82,7 @@ use tokio_rustls::TlsAcceptor;
 use zeroize::Zeroizing;
 
 use asterism_core::hv::GuestEgress;
-use asterism_core::instance::Instance;
+use asterism_core::instance::{Instance, RuntimeKind};
 use asterism_core::protocol::{EgressRequest, EgressResponse, Response};
 use asterism_core::rewrite::{
     self, Allowlist, Decision, Refusal, MAX_BODY_BYTES, MAX_HEADERS, MAX_RESPONSE_BYTES,
@@ -253,6 +253,12 @@ pub(crate) fn orbit() -> Result<(Node, Option<Arc<Mesh>>)> {
 /// is the same fact — and writing it down a second time would mean comparing
 /// an orbit name against a hostname, which are not the same string.
 pub(crate) fn check_can_bind(inst: &Instance) -> Result<()> {
+    // slirp4netns gives a rootless namespace the same private host gateway as
+    // QEMU's user-mode network. The proxy still binds only on host loopback;
+    // the namespace cannot reach arbitrary LAN listeners through this path.
+    if inst.runtime == RuntimeKind::Container {
+        return Ok(());
+    }
     let hv = backend::for_instance(inst)?;
     // Only a backend we could actually ask is allowed to refuse: on a device
     // where the hypervisor is not installed yet, `caps()` knows nothing, and
@@ -274,6 +280,9 @@ pub(crate) fn check_can_bind(inst: &Instance) -> Result<()> {
 
 /// Where the guest reaches this device, according to its backend.
 fn gateway(inst: &Instance) -> Result<&'static str> {
+    if inst.runtime == RuntimeKind::Container {
+        return Ok("10.0.2.2");
+    }
     let hv = backend::for_instance(inst)?;
     match hv.caps().guest_egress {
         Some(GuestEgress::LoopbackGateway { gateway }) => Ok(gateway),
@@ -1505,6 +1514,25 @@ mod tests {
             crate::mesh::MAX_FRAME,
             "the egress body caps are derived from a number that has moved"
         );
+    }
+
+    #[test]
+    fn a_rootless_container_uses_the_private_slirp_gateway_for_secret_egress() {
+        let mut instance = Instance::new(
+            "dev",
+            "laptop",
+            "oci",
+            asterism_core::instance::Shape::default(),
+            asterism_core::hv::Machine {
+                backend: crate::container::LINUX_ID.into(),
+                machine_type: "linux-userns-cgroup-v2".into(),
+                cpu: "x86_64".into(),
+                hv_version: "native".into(),
+            },
+        );
+        instance.runtime = RuntimeKind::Container;
+        assert!(check_can_bind(&instance).is_ok());
+        assert_eq!(gateway(&instance).unwrap(), "10.0.2.2");
     }
 
     /// The proxy is on loopback, and that is the whole of why it is safe.
