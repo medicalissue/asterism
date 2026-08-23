@@ -68,7 +68,6 @@ cd "$ROOT"
 #   net    — talks to a public relay, so it needs working internet
 #   helper — needs a signed, entitled `astd-vz` from the installed artifact,
 #            with the same build id as ast. Absence or mismatch is red.
-#   gui    — the desktop app has to have been built
 SUITES="
 identity   any    180   rc_suite_identity
 install    any    900   bash scripts/install-test.sh
@@ -84,7 +83,6 @@ move       vm     2400  bash scripts/e2e-move.sh
 mesh       vm     2400  bash scripts/e2e-mesh.sh
 discovery  net    900   bash scripts/e2e-discovery.sh
 wake       net    900   bash scripts/e2e-wake.sh
-gui        gui    1200  bash gui/proof.sh
 "
 
 # What runs with no suite named: everything that needs nothing. This is the
@@ -385,27 +383,7 @@ rc_suite_identity() {
   helper_build="$(harness_assert_vz_helper "$AST_BIN" "$helper")" || return 1
   echo "ok: the installed astd-vz is signed, entitled, and build $helper_build"
 
-  # 6. The app, when there is one. It is a separate download, so its absence
-  #    is not a failure — but a mismatched one is exactly the failure this
-  #    whole suite exists to catch.
-  local app="/Applications/Asterism.app/Contents/MacOS/asterism-gui"
-  if [ -x "$app" ]; then
-    local app_build
-    app_build="$(ASTERISM_HOME="$home" "$app" --dump-main settings 2>/dev/null |
-      sed -n 's/^app build //p' | head -n 1)"
-    if [ -z "$app_build" ]; then
-      echo "note: the installed app is too old to report a build id"
-    elif [ "$app_build" != "$ast_build" ]; then
-      echo "the installed app is build $app_build, but ast is $ast_build" >&2
-      return 1
-    else
-      echo "ok: the installed app is the same build"
-    fi
-  else
-    echo "note: no desktop app installed, so nothing to compare it to"
-  fi
-
-  # 7. The bug report runs, and says which build it is about. A report that
+  # 6. The bug report runs, and says which build it is about. A report that
   #    cannot name the build is a report nobody can act on.
   local report
   report="$(ASTERISM_HOME="$home" "$AST_BIN" bugreport 2>&1)" \
@@ -424,18 +402,6 @@ rc_suite_unit() {
   cargo test --workspace || return 1
   cargo clippy --workspace --all-targets -- -D warnings || return 1
 
-  # The desktop app is a separate cargo workspace, and its crate cannot even
-  # be compiled without its built frontend: `tauri::generate_context!` reads
-  # `gui/ui/dist` at macro-expansion time and panics when it is not there. So
-  # this half runs when the frontend has been built and says so when it has
-  # not — a checkout with no `npm run build` in it is an ordinary state of
-  # the tree, not a failing one.
-  if [ -d "$ROOT/gui/ui/dist" ]; then
-    ( cd "$ROOT/gui" && cargo test ) || return 1
-  else
-    echo "note: gui/ui/dist is not built, so the desktop app's tests did not run"
-    echo "      (npm --prefix gui/ui ci && npm --prefix gui/ui run build)"
-  fi
   return 0
 }
 
@@ -468,9 +434,6 @@ can_run() {
     # from another build, or unsigned. Nothing here falls back to the tree.
     helper) have_vm ;;
     net) have_net ;;
-    # The desktop app is built by the tauri CLI rather than by this run, so
-    # its absence is an ordinary state of the tree and not a failure.
-    gui) [ -x "${GUI_BIN:-$ROOT/gui/target/debug/asterism-gui}" ] ;;
     *) return 0 ;;
   esac
 }

@@ -1,29 +1,18 @@
 # Packaging
 
-Two things ship from this repository and they ship separately:
+The CLI ships from this repository:
 
 | | what it is | how it is installed |
 |---|---|---|
 | **CLI** | `ast`, the `astd` daemon, and the code-signed `astd-vz` helper | `install.sh`, or Homebrew |
-| **Desktop app** | the menu bar app in `gui/` | a signed `.dmg`, dragged to Applications |
-
-They are deliberately not one artifact. The CLI is a pair of binaries that
-belong on `PATH` and get upgraded from a shell; the app is a bundle macOS
-wants to notarize and quarantine. Bundling the CLI inside the app would put
-the daemon somewhere `brew upgrade` could not reach. The app tarball is
-reserved for the authenticated updater; the DMG supplies the notarized,
-stapled container and familiar Applications shortcut expected for a manual
-install. The installer never touches the DMG and the DMG never writes to
-`~/.local/bin`.
-
-After installation they do, however, upgrade as one compatible unit. Both the
-desktop app's Updates controls and `ast update` invoke the same updater and the
-same signed manifest. The updater verifies exact build identities for `ast`,
-`astd`, `astd-vz`, and the app before replacing anything; it then activates
-them with same-filesystem renames. Any partial replacement or daemon restart
-failure restores the entire previous unit. Running guests are left alive for
-the restarted daemon to re-adopt, and a signed channel is never allowed to
-downgrade an installed release.
+The CLI binaries belong on `PATH` and get upgraded from a shell. Desktop is
+released privately and is not built or packaged from this source tree. The
+updater deliberately retains its authenticated Desktop-manifest boundary: a
+private manifest can provide matching app metadata, which the updater verifies
+and activates with the CLI unit using same-filesystem renames. Any partial
+replacement or daemon restart failure restores the entire previous unit.
+Running guests are left alive for the restarted daemon to re-adopt, and a
+signed channel is never allowed to downgrade an installed release.
 
 ```console
 $ ast update status
@@ -88,14 +77,12 @@ v0.1.0/
   asterism-v0.1.0-darwin-arm64.tar.gz   # ast, astd, astd-vz, asterism-update — flat
   asterism-v0.1.0-linux-x86_64.tar.gz   # ast, astd, cloud-hypervisor, virtiofsd, asterism-update, share/
   asterism-v0.1.0-linux-arm64.tar.gz    # same layout, aarch64 Cloud Hypervisor pin
-  Asterism-v0.1.0-darwin-arm64.app.tar.gz # signed app payload used by the updater
-  Asterism-v0.1.0-darwin-arm64.dmg      # signed manual installer; drag to Applications
   RELEASE.json                          # exact build, URLs, digests, minimum updater
   RELEASE.json.sig                      # mandatory detached update signature
   asterism.rb                           # the Homebrew formula for this tag
   asterism-v0.1.0-sbom.cdx.json         # deterministic CycloneDX dependency SBOM
   asterism-v0.1.0-licenses.json         # deterministic third-party license manifest
-  SHA256SUMS                            # hashes payloads, metadata, DMG, and formula
+  SHA256SUMS                            # hashes payloads, metadata, and formula
   SHA256SUMS.sig                        # when a signing key exists
 ```
 
@@ -106,25 +93,21 @@ half a release.
 ### Supply-chain metadata
 
 Every release also publishes a CycloneDX 1.5 SBOM and a compact third-party
-license manifest. Both are generated only from the committed CLI/daemon and GUI
-Rust lockfiles plus the GUI npm lockfile, sorted by package URL, and
-intentionally contain neither a timestamp nor a generated UUID. Re-running
+license manifest. Both are generated only from the committed Rust lockfile,
+sorted by package URL, and intentionally contain neither a timestamp nor a
+generated UUID. Re-running
 `node scripts/generate-supply-chain-metadata.mjs --out DIR --version vX.Y.Z`
-against the same locks produces byte-identical files. `SHA256SUMS` covers both
-metadata files alongside the shipped binaries and app artifacts.
+against the same lockfile produces byte-identical files. `SHA256SUMS` covers
+both metadata files alongside the shipped binaries.
 
 The CI supply-chain job audits those exact lockfiles, scans all reachable Git
 history and the checked-out tree locally for secrets, and tests the generator
 twice for deterministic output. Its exception policy is documented in
 [`docs/supply-chain-exceptions.md`](../docs/supply-chain-exceptions.md).
 
-The app tarball remains the signed update channel's payload; it is not the
-manual installer. For a first desktop install, open the DMG and drag
-`Asterism.app` to its Applications shortcut. Both app artifacts are made from
-the same signed bundle. With Developer ID and notary credentials the workflow
-notarizes and staples both the app and its DMG container; a credential-free dry
-run uses an ad-hoc signature and still mounts the DMG and runs the bundled app's
-version and immutable build-id checks.
+Desktop artifacts and their signed manifest are published by the private
+Desktop release process. The public updater consumes that authenticated
+manifest boundary without rebuilding or redistributing Desktop source.
 
 ### The vz helper
 
@@ -218,12 +201,13 @@ trusted.
 
 In-app updates are stricter than the bootstrap installer: `RELEASE.json.sig`
 and an embedded minisign/signify public key are mandatory. The release workflow
-renders the flat manifest only after both archives have been assembled and
-hashed, signs it with the base64-encoded `UPDATE_MINISIGN_SECRET_KEY`, and compiles
-`ASTERISM_UPDATE_PUBKEY` into both CLI and app-facing builds. A missing key or
-signature is a refusal, as are a digest mismatch, wrong target, build-identity
-mismatch, unsupported minimum updater, or downgrade. Tagged publishing fails
-closed when the signing secret is absent.
+renders the flat manifest only after the CLI archive has been assembled and
+hashed, signs it with the base64-encoded `UPDATE_MINISIGN_SECRET_KEY`, and
+compiles `ASTERISM_UPDATE_PUBKEY` into the CLI. The private Desktop release
+uses the same authenticated manifest contract. A missing key or signature is a
+refusal, as are a digest mismatch, wrong target, build-identity mismatch,
+unsupported minimum updater, or downgrade. Tagged publishing fails closed when
+the signing secret is absent.
 Verification uses `minisign` (or the compatible `signify` command); its
 absence is a fail-closed refusal. The Homebrew formula installs `minisign` as
 a runtime dependency, while other installation lanes must provide one of the
