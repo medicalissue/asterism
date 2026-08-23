@@ -76,7 +76,7 @@ pub fn connect(sock: &Path) -> io::Result<Stream> {
     UnixStream::connect(sock)
 }
 
-pub fn admit_peer(stream: &Stream) -> Result<u32> {
+pub fn admit_peer(stream: &impl AsRawFd) -> Result<u32> {
     same_user(stream.as_raw_fd())
 }
 
