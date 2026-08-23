@@ -500,7 +500,7 @@ pub struct ControlError {
 }
 
 impl ControlError {
-    fn new(code: ControlErrorCode, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: ControlErrorCode, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
@@ -1203,6 +1203,25 @@ impl ProductionProvider {
         self.sessions.clear();
         self.abi.revoke_all_sessions();
         revoked
+    }
+
+    /// A guest process restart drops the in-memory ABI session while the
+    /// durable, token-free attachment and live lease remain. The restarted
+    /// guest may open a new session on the same capability; an old session
+    /// ID cannot be reused and cannot keep provider memory reserved.
+    pub fn guest_lost(&mut self, instance_id: &str) -> bool {
+        let Some(capability) = self.authority.instances.get(instance_id).cloned() else {
+            return false;
+        };
+        self.revoke_abi_capability(&capability);
+        true
+    }
+
+    /// Bytes currently reserved by ABI allocations. Control-plane leases are
+    /// a separate budget; this is the data-plane remainder a restart must
+    /// return.
+    pub fn live_abi_bytes(&self) -> u64 {
+        self.abi.committed_bytes
     }
 
     fn revoke_abi_capability(&mut self, capability: &str) {
@@ -2359,5 +2378,85 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(refused.code, ControlErrorCode::InvalidLease);
+    }
+
+    #[test]
+    fn guest_restart_closes_the_abi_session_and_keeps_the_lease() {
+        let authority = authority(LeaseLimits {
+            total_memory_bytes: 32,
+            max_memory_per_lease: 32,
+            max_leases: 1,
+            lease_ttl_secs: 30,
+        });
+        let mut production =
+            ProductionProvider::new(authority, Provider::reference("reference-test"));
+        let owner = peer('b');
+        let (lease, attachment) = production
+            .authority_mut()
+            .attach(&owner, "instance-a", 32, 100)
+            .unwrap();
+        let Response::SessionOpened { session, .. } = production
+            .open_session(&owner, lease.capability(), AbiRange::ours(), 100)
+            .unwrap()
+        else {
+            panic!("session should open")
+        };
+        production
+            .handle(
+                &owner,
+                lease.capability(),
+                Request::Allocate {
+                    session: session.clone(),
+                    sequence: 1,
+                    bytes: 8,
+                },
+                101,
+            )
+            .unwrap()
+            .into_result()
+            .unwrap();
+        assert_eq!(production.live_abi_bytes(), 8);
+        assert_eq!(attachment.guest_path(), GUEST_DEVICE_PATH);
+
+        assert!(production.guest_lost("instance-a"));
+        assert_eq!(production.live_abi_bytes(), 0);
+        let stale = production
+            .handle(
+                &owner,
+                lease.capability(),
+                Request::Read {
+                    session,
+                    sequence: 2,
+                    source: range("irrelevant", 0, 1),
+                },
+                102,
+            )
+            .unwrap_err();
+        assert_eq!(stale.code, ControlErrorCode::InvalidLease);
+
+        let Response::SessionOpened {
+            session: restarted, ..
+        } = production
+            .open_session(&owner, lease.capability(), AbiRange::ours(), 103)
+            .unwrap()
+        else {
+            panic!("restarted guest reopens on the live lease")
+        };
+        let allocated = production
+            .handle(
+                &owner,
+                lease.capability(),
+                Request::Allocate {
+                    session: restarted,
+                    sequence: 1,
+                    bytes: 8,
+                },
+                104,
+            )
+            .unwrap()
+            .into_result()
+            .unwrap();
+        assert!(matches!(allocated, Response::Allocated { bytes: 8, .. }));
+        assert_eq!(production.authority().diagnostics().active_leases, 1);
     }
 }
