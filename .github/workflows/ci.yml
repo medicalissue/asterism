@@ -30,7 +30,8 @@ jobs:
       # cargo-deny-action v2.0.10 embeds cargo-deny 0.18.0, whose advisory
       # parser predates RustSec's CVSS 4.0 records. Keep that pinned action for
       # license/source policy and use a current, version-pinned cargo-audit for
-      # the two vulnerability checks.
+      # the single remaining Cargo.lock vulnerability audit after GUI/npm
+      # removal.
       - name: Install the RustSec vulnerability scanner
         uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5 peeled commit
         with:
