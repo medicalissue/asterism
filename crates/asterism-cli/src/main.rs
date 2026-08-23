@@ -41,7 +41,7 @@ use asterism_core::ipc;
 use asterism_core::proc::{ProcId, Signal};
 use asterism_core::protocol::{self, Request, Response};
 use asterism_core::registry::OrbitRow;
-use asterism_core::{cow, image, oci, paths, service, snapshot, verify, VERSION};
+use asterism_core::{cow, image, oci, paths, service, snapshot, verify, windows_host, VERSION};
 
 #[derive(Parser)]
 #[command(
@@ -505,6 +505,12 @@ enum Command {
     /// where this device keeps its state and what is running. Nothing here
     /// contacts another device and nothing here prints a secret.
     Bugreport,
+    /// Read-only host capability report: service, sleep, secrets, helper,
+    /// and on Windows the Hyper-V/firewall gate.
+    ///
+    /// Refuses nothing and changes nothing. A machine that cannot run
+    /// Asterism still gets a report saying exactly which check failed.
+    Doctor,
 }
 
 /// `ast snapshot ...` — taking one, and deleting one.
@@ -1030,6 +1036,10 @@ fn main() -> Result<()> {
         Command::Bugreport => {
             local_only("bugreport", device.as_deref())?;
             return print_bugreport();
+        }
+        Command::Doctor => {
+            local_only("doctor", device.as_deref())?;
+            return print_doctor();
         }
     };
 
@@ -3677,13 +3687,20 @@ fn spawn_daemon() -> Result<()> {
 
 /// astd normally sits next to the ast binary; fall back to PATH.
 fn daemon_path() -> Result<std::path::PathBuf> {
+    let names: &[&str] = if cfg!(windows) {
+        &["astd.exe", "astd"]
+    } else {
+        &["astd", "astd.exe"]
+    };
     if let Ok(me) = std::env::current_exe() {
-        let sibling = me.with_file_name("astd");
-        if sibling.exists() {
-            return Ok(sibling);
+        for name in names {
+            let sibling = me.with_file_name(name);
+            if sibling.exists() {
+                return Ok(sibling);
+            }
         }
     }
-    Ok(std::path::PathBuf::from("astd"))
+    Ok(std::path::PathBuf::from(names[0]))
 }
 
 fn exec_daemon() -> anyhow::Error {
@@ -3805,7 +3822,16 @@ fn send_to_running(request: &Request) -> Option<Response> {
 /// macOS app bundle has one place; a report that guessed at several would
 /// have to explain which one it found.
 fn gui_binary() -> std::path::PathBuf {
-    std::path::PathBuf::from("/Applications/Asterism.app/Contents/MacOS/asterism-gui")
+    if cfg!(windows) {
+        let mut path = std::env::var_os("LOCALAPPDATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Program Files"));
+        path.push("Asterism");
+        path.push("Asterism.exe");
+        path
+    } else {
+        std::path::PathBuf::from("/Applications/Asterism.app/Contents/MacOS/asterism-gui")
+    }
 }
 
 /// `ast bugreport`: everything worth pasting, and nothing that needs the
@@ -3879,6 +3905,18 @@ fn print_bugreport() -> Result<()> {
             Err(e) => println!("{}  could not be read: {e:#}", manager.mechanism()),
         },
         Err(e) => println!("no service manager on this device: {e:#}"),
+    }
+    println!();
+
+    println!("[helper]");
+    match asterism_core::hyperv::discover_helper() {
+        Ok(path) => println!("astd-hyperv    {}", path.display()),
+        Err(e) => println!("astd-hyperv    not found ({e:#})"),
+    }
+    println!();
+
+    for line in windows_host::doctor().lines() {
+        println!("{line}");
     }
     println!();
 
@@ -4443,6 +4481,19 @@ fn sync_update_entry(path: &Path, recursive: bool) -> Result<()> {
         .with_context(|| format!("opening updater path {}", path.display()))?
         .sync_all()
         .with_context(|| format!("syncing updater path {}", path.display()))
+}
+
+fn print_doctor() -> Result<()> {
+    let report = windows_host::doctor();
+    for line in report.lines() {
+        println!("{line}");
+    }
+    println!();
+    println!("{}", report.summary());
+    if !report.supported {
+        bail!("{}", report.summary());
+    }
+    Ok(())
 }
 
 // ---- service ---------------------------------------------------------------

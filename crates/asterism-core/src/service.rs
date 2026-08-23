@@ -12,7 +12,7 @@
 //! |---|---|---|
 //! | macOS | launchd user agent | `~/Library/LaunchAgents/com.asterism.astd.plist` |
 //! | Linux | systemd user unit | `~/.config/systemd/user/astd.service` |
-//! | Windows | not implemented — the decided row is a Windows Service |
+//! | Windows | Windows Service (`sc.exe` / SCM), auto-start, `astd.exe --service` |
 //!
 //! **The binary path is baked in.** Both unit formats name an absolute
 //! path to `astd`, recorded at install time. Replacing the binary in place
@@ -110,21 +110,34 @@ impl Spec {
 /// Where `astd` is, given that the caller is usually `ast` sitting next to
 /// it. Absolute, because both unit formats demand it.
 pub fn daemon_program() -> Result<PathBuf> {
+    let names = daemon_names();
     if let Ok(me) = std::env::current_exe() {
-        let sibling = me.with_file_name("astd");
-        if sibling.exists() {
-            return Ok(sibling);
+        for name in names {
+            let sibling = me.with_file_name(name);
+            if sibling.exists() {
+                return Ok(sibling);
+            }
         }
     }
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
-            let candidate = dir.join("astd");
-            if candidate.is_file() {
-                return Ok(candidate);
+            for name in names {
+                let candidate = dir.join(name);
+                if candidate.is_file() {
+                    return Ok(candidate);
+                }
             }
         }
     }
     bail!("cannot find the astd binary next to ast or on PATH")
+}
+
+fn daemon_names() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["astd.exe", "astd"]
+    } else {
+        &["astd", "astd.exe"]
+    }
 }
 
 /// What an install or uninstall did, in the order it did it. Printed by
@@ -206,8 +219,11 @@ pub fn manager() -> Result<Box<dyn Manager>> {
 
 fn home() -> Result<PathBuf> {
     std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
-        .context("no HOME in the environment, so there is no place to put a user service")
+        .context(
+            "no HOME/USERPROFILE in the environment, so there is no place to put a user service",
+        )
 }
 
 /// Run a command, returning stdout+stderr and whether it succeeded. Service
@@ -737,9 +753,135 @@ mod imp {
     }
 }
 
-// ---- Windows: undecided ----------------------------------------------------
+// ---- Windows: SCM ----------------------------------------------------------
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(windows)]
+mod imp {
+    use std::path::PathBuf;
+
+    use anyhow::{bail, Result};
+
+    use super::{run, test_label, Manager, Report, Spec, State};
+    use crate::windows_host::{
+        parse_sc_query, sc_create_args, sc_delete_args, sc_query_args, sc_start_args, sc_stop_args,
+        SERVICE_NAME,
+    };
+
+    pub fn manager() -> Result<Box<dyn Manager>> {
+        Ok(Box::new(Scm {
+            name: test_label()?.unwrap_or_else(|| SERVICE_NAME.to_owned()),
+        }))
+    }
+
+    struct Scm {
+        name: String,
+    }
+
+    impl Scm {
+        fn unit(&self) -> PathBuf {
+            // SCM has no unit file. The ImagePath lives in the service
+            // database; this path is what `ast service status` prints so a
+            // human can name the thing they would `sc.exe query`.
+            PathBuf::from(r"HKLM\SYSTEM\CurrentControlSet\Services").join(&self.name)
+        }
+    }
+
+    impl Manager for Scm {
+        fn mechanism(&self) -> &'static str {
+            "windows-service"
+        }
+
+        fn unit_path(&self) -> PathBuf {
+            self.unit()
+        }
+
+        fn install(&self, spec: &Spec) -> Result<Report> {
+            let unit = self.unit();
+            let mut report = Report {
+                unit: unit.clone(),
+                ..Report::default()
+            };
+            // Replace an existing service: stop+delete first, or create
+            // refuses with "already exists".
+            let _ = run(std::process::Command::new("sc.exe").args(sc_stop_args(&self.name)));
+            let (deleted, _) =
+                run(std::process::Command::new("sc.exe").args(sc_delete_args(&self.name)))?;
+            if deleted {
+                report.step(format!("removed the previous {}", self.name));
+            }
+            let args = sc_create_args(spec, &self.name);
+            let (ok, out) = run(std::process::Command::new("sc.exe").args(&args))?;
+            if !ok {
+                bail!("sc.exe would not create {}: {}", self.name, out.trim());
+            }
+            report.step(format!("sc.exe {}", args.join(" ")));
+            let (started, start_out) =
+                run(std::process::Command::new("sc.exe").args(sc_start_args(&self.name)))?;
+            if started {
+                report.step(format!("sc.exe start {}", self.name));
+            } else {
+                report.step(format!(
+                    "created but not yet running ({})",
+                    start_out.trim()
+                ));
+            }
+            report.step(format!("astd runs from {}", spec.program.display()));
+            report.step(format!("its log is {}", spec.log.display()));
+            Ok(report)
+        }
+
+        fn uninstall(&self) -> Result<Report> {
+            let unit = self.unit();
+            let mut report = Report {
+                unit: unit.clone(),
+                ..Report::default()
+            };
+            let (stopped, stop_out) =
+                run(std::process::Command::new("sc.exe").args(sc_stop_args(&self.name)))?;
+            if stopped {
+                report.step(format!("sc.exe stop {}", self.name));
+            } else {
+                report.step(format!("SCM had nothing running ({})", stop_out.trim()));
+            }
+            let (ok, out) =
+                run(std::process::Command::new("sc.exe").args(sc_delete_args(&self.name)))?;
+            if ok {
+                report.step(format!("sc.exe delete {}", self.name));
+            } else {
+                report.step(format!("{} was not installed ({})", self.name, out.trim()));
+            }
+            Ok(report)
+        }
+
+        fn status(&self) -> Result<State> {
+            let unit = self.unit();
+            let (ok, out) =
+                run(std::process::Command::new("sc.exe").args(sc_query_args(&self.name)))?;
+            if !ok {
+                return Ok(State::missing(unit));
+            }
+            let (running, pid) = parse_sc_query(&out);
+            let mut state = State {
+                unit,
+                installed: true,
+                loaded: true,
+                pid,
+                program: None,
+                notes: Vec::new(),
+            };
+            if running {
+                if pid.is_none() {
+                    state.notes.push("SCM reports RUNNING but no pid".into());
+                }
+            } else {
+                state.notes.push("SCM state: not running".into());
+            }
+            Ok(state)
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 mod imp {
     use anyhow::{bail, Result};
 
@@ -748,8 +890,7 @@ mod imp {
     pub fn manager() -> Result<Box<dyn Manager>> {
         bail!(
             "installing astd as a service is not built for this OS yet — the \
-             Windows row of docs/PLATFORM.md (a Windows Service via \
-             `windows-service`) is still to do. Until then, start astd yourself."
+             decided rows are launchd, systemd (user), and a Windows Service."
         )
     }
 }

@@ -2,7 +2,8 @@
 //!
 //! Secret values never enter `$ASTERISM_HOME`.  The JSON file here is only an
 //! orbit metadata catalog; material is held by [`SecretStore`] (the login
-//! Keychain on macOS, explicitly unavailable elsewhere).  Public operations
+//! Keychain on macOS, Credential Manager on Windows, explicitly unavailable
+//! elsewhere).  Public operations
 //! fan out to independent source devices through the existing authenticated
 //! mesh.
 //!
@@ -81,13 +82,43 @@ impl SecretStore for PlatformSecretStore {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+struct PlatformSecretStore {
+    namespace: String,
+}
+
+#[cfg(windows)]
+impl PlatformSecretStore {
+    fn target(&self, id: &SecretId) -> String {
+        asterism_core::windows_host::cred_target(&self.namespace, id.as_str())
+    }
+}
+
+#[cfg(windows)]
+impl SecretStore for PlatformSecretStore {
+    fn put(&self, id: &SecretId, value: &[u8]) -> Result<()> {
+        asterism_core::windows_host::cred::put(&self.target(id), value)
+            .context("storing secret in Windows Credential Manager")
+    }
+
+    fn get(&self, id: &SecretId) -> Result<Vec<u8>> {
+        asterism_core::windows_host::cred::get(&self.target(id))
+            .context("reading secret from Windows Credential Manager")
+    }
+
+    fn remove(&self, id: &SecretId) -> Result<()> {
+        asterism_core::windows_host::cred::delete(&self.target(id))
+            .context("removing secret from Windows Credential Manager")
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 struct PlatformSecretStore {
     #[allow(dead_code)]
     namespace: String,
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 impl SecretStore for PlatformSecretStore {
     fn put(&self, _: &SecretId, _: &[u8]) -> Result<()> {
         bail!("secret storage is unavailable on this platform; no plaintext fallback is used")
