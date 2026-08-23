@@ -621,7 +621,15 @@ pub fn nvidia_ioctl_is_refused(request: u64) -> bool {
 /// the Unix-endpoint fixture; production Linux guests require CUSE.
 #[cfg(unix)]
 pub fn linux_cuse_available() -> bool {
-    Path::new("/dev/cuse").exists()
+    // A device node can be mounted into a CI container without granting the
+    // process permission to register a CUSE service. Treating mere presence
+    // as capability makes projection fail instead of taking the explicit
+    // Unix-endpoint fallback used by non-privileged development hosts.
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/cuse")
+        .is_ok()
 }
 
 /// Bind a real local endpoint at `<guest-root>/dev/nvidia0`.

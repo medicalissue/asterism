@@ -179,12 +179,21 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
                         "instance removal refused until every block-volume lease is released",
                     ));
                 }
-                if let Err(e) =
-                    backend::for_instance(&inst).and_then(|hv| hv.remove_instance_resources(&inst))
-                {
-                    return attach_response(
-                        Err(e).context("instance removal refused until backend cleanup completes"),
-                    );
+                // Native containers have no hypervisor-owned resources. Their
+                // cgroup, namespaces, slirp process and control socket are
+                // retired by `container::down`; asking the VM backend selector
+                // to clean them up turns a successful container shutdown into
+                // a spurious "no backend" refusal at `ast rm`.
+                if inst.runtime == RuntimeKind::Vm {
+                    if let Err(e) = backend::for_instance(&inst)
+                        .and_then(|hv| hv.remove_instance_resources(&inst))
+                    {
+                        return attach_response(
+                            Err(e).context(
+                                "instance removal refused until backend cleanup completes",
+                            ),
+                        );
+                    }
                 }
                 // The instance directory goes below, and this instance's CA
                 // private key is in it.

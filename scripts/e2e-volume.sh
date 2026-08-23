@@ -124,8 +124,13 @@ kill_pid() {
 # kill_pidfile <path>: whatever a pidfile names, and then the file.
 kill_pidfile() {
   local f="$1"
+  local pid
   [ -f "$f" ] || return 0
-  kill_pid "$(cat "$f" 2>/dev/null || true)"
+  # A native exporter may retire a legacy pidfile between glob expansion and
+  # this read. Cleanup is idempotent; that race is already-clean state.
+  if pid="$(cat "$f" 2>/dev/null)"; then
+    kill_pid "$pid"
+  fi
   rm -f "$f"
 }
 

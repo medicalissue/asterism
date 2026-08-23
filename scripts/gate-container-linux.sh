@@ -299,6 +299,7 @@ done
 grep -qx "$CONTAINER_PID" "$CGROUP/cgroup.procs" \
   || record_failure "recorded namespace holder is absent from delegated cgroup"
 assert_eq "memory.max enforcement" "$(cat "$CGROUP/memory.max")" "536870912"
+assert_eq "memory.swap.max enforcement" "$(cat "$CGROUP/memory.swap.max")" "0"
 assert_eq "cpu.max enforcement" "$(cat "$CGROUP/cpu.max")" "100000 100000"
 assert_eq "pids.max enforcement" "$(cat "$CGROUP/pids.max")" "512"
 
@@ -355,10 +356,16 @@ else
 fi
 
 STAGE="memory-enforcement"
+exec_cgroup="$("$AST" shell "$INSTANCE" -- cat /proc/self/cgroup 2>&1)" \
+  || record_failure "exec cgroup identity could not be read: $exec_cgroup"
+assert_contains "exec inherits the instance cgroup" "$exec_cgroup" "$(basename "$CGROUP")"
 oom_before="$(awk '$1 == "oom_kill" {print $2}' "$CGROUP/memory.events")"
-# shellcheck disable=SC2016 # Perl, not this observer shell, expands $x.
+# Allocate independent, dirtied 1 MiB chunks. A repeated scalar may be
+# represented or reclaimed surprisingly by a language runtime; this shape
+# must retain every page until the kernel enforces the cgroup boundary.
+# shellcheck disable=SC2016 # Perl, not this observer shell, expands @pages.
 if "$AST" shell "$INSTANCE" -- perl -e \
-  '$x = "x" x (768 * 1024 * 1024); sleep 5' \
+  'my @pages; for (1..768) { push @pages, "x" x (1024 * 1024) } sleep 5' \
   >"$ARTIFACTS/memory-pressure.log" 2>&1; then
   record_failure "768 MiB allocation survived a 512 MiB cgroup limit"
 else
@@ -428,7 +435,7 @@ handle_shape="$("$AST" shell "$INSTANCE" -- sh -c \
 assert_contains "opaque secret injection" "$handle_shape" "opaque-handle"
 # shellcheck disable=SC2016 # The quoted program expands inside the container.
 egress_digest="$("$AST" shell "$INSTANCE" -- sh -c \
-  'curl -fsS --max-time 25 https://httpbin.org/bearer -H "Authorization: Bearer $ASTERISM_GATE_SECRET" | jq -r .token | sha256sum | awk "{print \\$1}"' \
+  'curl -fsS --max-time 25 https://httpbin.org/bearer -H "Authorization: Bearer $ASTERISM_GATE_SECRET" | jq -r .token | sha256sum | cut -d " " -f1' \
   2>&1)" || record_failure "bound egress request failed: $egress_digest"
 assert_contains "secret substitution in flight" "$egress_digest" "$SECRET_DIGEST"
 # shellcheck disable=SC2016 # The quoted program expands inside the container.
@@ -449,24 +456,19 @@ assert_contains "unbound public egress allowed" "$unbound_report" "unbound-publi
 STAGE="secret-non-leak"
 leak_report="$ARTIFACTS/secret-leaks.txt"
 : >"$leak_report"
-while IFS= read -r -d '' file; do
-  grep -a -l -F -- "$SECRET_VALUE" "$file" >>"$leak_report" 2>/dev/null || true
-done < <(find "$ASTERISM_HOME" "$HOME" "$ARTIFACTS" -type f -size -256M -print0)
-while IFS= read -r -d '' image; do
-  if "$SOURCE/scripts/sparse-contains.py" "$image" "$SECRET_VALUE"; then
-    printf '%s\n' "$image" >>"$leak_report"
-  else
-    sparse_status=$?
-    [ "$sparse_status" -eq 1 ] \
-      || record_failure "sparse secret scan failed for $image with $sparse_status"
-  fi
-done < <(find "$ASTERISM_HOME" -type f -name '*.raw' -print0)
-while read -r member; do
-  [ -n "$member" ] || continue
-  if tr '\0' '\n' <"/proc/$member/environ" 2>/dev/null | grep -qF -- "$SECRET_VALUE"; then
-    printf '/proc/%s/environ\n' "$member" >>"$leak_report"
-  fi
-done <"$CGROUP/cgroup.procs"
+set +e
+# shellcheck disable=SC2024 # sudo is for reads; this user-owned evidence redirect is deliberate.
+printf %s "$SECRET_VALUE" | sudo -n python3 "$SOURCE/scripts/secret-nonleak-scan.py" \
+  --proc-pids "$CGROUP/cgroup.procs" \
+  "$ASTERISM_HOME" "$HOME" "$ARTIFACTS" >"$leak_report" \
+  2>"$ARTIFACTS/secret-scan.err"
+scan_status=$?
+set -e
+if [ "$scan_status" -eq 2 ]; then
+  record_failure "raw-secret scan was incomplete: $(cat "$ARTIFACTS/secret-scan.err")"
+elif [ "$scan_status" -ne 0 ] && [ "$scan_status" -ne 1 ]; then
+  record_failure "raw-secret scan exited with unexpected status $scan_status"
+fi
 if [ -s "$leak_report" ]; then
   record_failure "raw secret appeared in persisted files or container process environments"
 else
@@ -490,7 +492,7 @@ assert_eq "container survived daemon restart" "$after_container" "$before_contai
   || record_failure "container control did not survive daemon restart"
 # shellcheck disable=SC2016 # The quoted program expands inside the container.
 restart_egress="$("$AST" shell "$INSTANCE" -- sh -c \
-  'curl -fsS --max-time 15 https://httpbin.org/bearer -H "Authorization: Bearer $ASTERISM_GATE_SECRET" | jq -r .token | sha256sum | awk "{print \\$1}"' \
+  'curl -fsS --max-time 15 https://httpbin.org/bearer -H "Authorization: Bearer $ASTERISM_GATE_SECRET" | jq -r .token | sha256sum | cut -d " " -f1' \
   2>&1)" || record_failure "secret egress did not survive daemon restart: $restart_egress"
 assert_contains "secret egress survived daemon restart" "$restart_egress" "$SECRET_DIGEST"
 qemu_absent

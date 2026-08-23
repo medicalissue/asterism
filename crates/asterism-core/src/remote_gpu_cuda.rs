@@ -22,6 +22,14 @@ use crate::remote_gpu_nvidia::{
     admit_cuda_inventory, CudaInventory, NvidiaDevice, MIN_COMPUTE_MAJOR, MIN_COMPUTE_MINOR,
 };
 
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn LoadLibraryA(name: *const u8) -> *mut c_void;
+    fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+    fn FreeLibrary(module: *mut c_void) -> i32;
+}
+
 /// Device facts the executor verified before creating a context.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CudaDeviceIdentity {
@@ -785,7 +793,7 @@ impl Drop for LiveCuda {
             let _ = unsafe { (self.fns.cu_ctx_destroy)(self.context) };
         }
         if !self.handle.is_null() {
-            unsafe { libc::dlclose(self.handle) };
+            unsafe { close_library(self.handle) };
         }
     }
 }
@@ -896,24 +904,25 @@ fn format_driver_from_cuda(driver_version: c_int) -> String {
 }
 
 fn load_libcuda() -> Result<(*mut c_void, CudaFns), ControlError> {
+    #[cfg(unix)]
     let names = ["libcuda.so.1", "libcuda.so", "libcuda.dylib"];
+    #[cfg(windows)]
+    let names = ["nvcuda.dll"];
     let mut last = "libcuda was not found".to_owned();
     for name in names {
         let cname = CString::new(name).expect("lib name");
-        let handle = unsafe { libc::dlopen(cname.as_ptr(), libc::RTLD_NOW) };
+        let handle = unsafe { open_library(&cname) };
         if handle.is_null() {
-            last = unsafe {
-                let err = libc::dlerror();
-                if err.is_null() {
-                    format!("{name} could not be loaded")
-                } else {
-                    CStr::from_ptr(err).to_string_lossy().into_owned()
-                }
-            };
+            last = library_error(name);
             continue;
         }
-        let fns = unsafe { load_fns(handle) }?;
-        return Ok((handle, fns));
+        match unsafe { load_fns(handle) } {
+            Ok(fns) => return Ok((handle, fns)),
+            Err(error) => {
+                unsafe { close_library(handle) };
+                return Err(error);
+            }
+        }
     }
     Err(ControlError::new(
         ControlErrorCode::Unavailable,
@@ -924,10 +933,9 @@ fn load_libcuda() -> Result<(*mut c_void, CudaFns), ControlError> {
 unsafe fn load_fns(handle: *mut c_void) -> Result<CudaFns, ControlError> {
     unsafe fn sym<T>(handle: *mut c_void, name: &str) -> Result<T, ControlError> {
         let cname = CString::new(name).expect("symbol");
-        libc::dlerror();
-        let ptr = libc::dlsym(handle, cname.as_ptr());
-        let err = libc::dlerror();
-        if ptr.is_null() || !err.is_null() {
+        clear_library_error();
+        let ptr = library_symbol(handle, &cname);
+        if ptr.is_null() {
             return Err(ControlError::new(
                 ControlErrorCode::Unavailable,
                 format!("NVIDIA CUDA driver is missing {name}"),
@@ -986,6 +994,64 @@ unsafe fn load_fns(handle: *mut c_void) -> Result<CudaFns, ControlError> {
         cu_launch_kernel: sym(handle, "cuLaunchKernel")?,
         cu_get_error_string: sym(handle, "cuGetErrorString").ok(),
     })
+}
+
+#[cfg(unix)]
+unsafe fn open_library(name: &CStr) -> *mut c_void {
+    libc::dlopen(name.as_ptr(), libc::RTLD_NOW)
+}
+
+#[cfg(windows)]
+unsafe fn open_library(name: &CStr) -> *mut c_void {
+    LoadLibraryA(name.as_ptr().cast())
+}
+
+#[cfg(unix)]
+unsafe fn close_library(handle: *mut c_void) {
+    libc::dlclose(handle);
+}
+
+#[cfg(windows)]
+unsafe fn close_library(handle: *mut c_void) {
+    FreeLibrary(handle);
+}
+
+#[cfg(unix)]
+unsafe fn library_symbol(handle: *mut c_void, name: &CStr) -> *mut c_void {
+    libc::dlsym(handle, name.as_ptr())
+}
+
+#[cfg(windows)]
+unsafe fn library_symbol(handle: *mut c_void, name: &CStr) -> *mut c_void {
+    GetProcAddress(handle, name.as_ptr().cast())
+}
+
+#[cfg(unix)]
+unsafe fn clear_library_error() {
+    libc::dlerror();
+}
+
+#[cfg(windows)]
+unsafe fn clear_library_error() {}
+
+#[cfg(unix)]
+fn library_error(name: &str) -> String {
+    unsafe {
+        let error = libc::dlerror();
+        if error.is_null() {
+            format!("{name} could not be loaded")
+        } else {
+            CStr::from_ptr(error).to_string_lossy().into_owned()
+        }
+    }
+}
+
+#[cfg(windows)]
+fn library_error(name: &str) -> String {
+    format!(
+        "{name} could not be loaded: {}",
+        std::io::Error::last_os_error()
+    )
 }
 
 fn check_ctrl(status: CuResult, op: &str, fns: &CudaFns) -> Result<(), ControlError> {

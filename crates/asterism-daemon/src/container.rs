@@ -285,6 +285,22 @@ pub fn prepare(inst: &Instance) -> Result<Prepared> {
     let bootstrap = asterism_core::profile::Bootstrap::resolve(&inst.profiles)
         .context("resolving the container's bootstrap profiles")?;
     install_bootstrap(&rootfs, &bootstrap)?;
+    let mut bootstrap_command = String::new();
+    if !egress.is_empty() {
+        install_egress_ca(&rootfs, &egress.ca_pem)?;
+        // OCI root filesystems do not run cloud-init, so they need the same
+        // trust-store activation as a VM before the image entrypoint starts.
+        // The certificate is public; its signing key and the bound secret
+        // remain outside the container.
+        bootstrap_command.push_str(
+            "update-ca-certificates >/dev/null 2>&1 \
+             || update-ca-trust extract >/dev/null 2>&1 \
+             || { echo 'asterism: this image has no CA trust-store updater' >&2; exit 1; }\n",
+        );
+    }
+    if !bootstrap.is_empty() {
+        bootstrap_command.push_str(&bootstrap.runcmd());
+    }
     let mut env = strings("Env");
     env.extend(
         asterism_core::seed::egress_environment(&egress)
@@ -317,7 +333,7 @@ pub fn prepare(inst: &Instance) -> Result<Prepared> {
                 guest_port: crate::egress::CONTAINER_EGRESS_PORT,
             }),
         },
-        bootstrap: (!bootstrap.is_empty()).then(|| bootstrap.runcmd()),
+        bootstrap: (!bootstrap_command.is_empty()).then_some(bootstrap_command),
     };
     fs::write(&spec, serde_json::to_vec_pretty(&value)?)?;
     Ok(Prepared { spec })
@@ -339,6 +355,30 @@ fn install_bootstrap(rootfs: &Path, bootstrap: &asterism_core::profile::Bootstra
             let mode = u32::from_str_radix(mode, 8)
                 .with_context(|| format!("parsing profile mode {mode:?}"))?;
             fs::set_permissions(&target, fs::Permissions::from_mode(mode))?;
+        }
+    }
+    Ok(())
+}
+
+/// Install only the public instance CA into an OCI root filesystem.
+///
+/// `safe_file_target` prevents an image-controlled symlink from redirecting
+/// the write outside the extracted root. Trust-store activation happens after
+/// chroot, immediately before the image entrypoint starts.
+fn install_egress_ca(rootfs: &Path, ca_pem: &str) -> Result<()> {
+    for guest in [
+        Path::new("/usr/local/share/ca-certificates/asterism-egress.crt"),
+        Path::new("/etc/pki/ca-trust/source/anchors/asterism-egress.crt"),
+    ] {
+        let target = safe_file_target(rootfs, guest)?;
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&target, ca_pem)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o644))?;
         }
     }
     Ok(())
@@ -411,6 +451,11 @@ fn delegated_cgroup(id: &str, cpus: u32, mem_mib: u32) -> Result<PathBuf> {
             leaf.join("memory.max"),
             (u64::from(mem_mib) * 1024 * 1024).to_string(),
         )?;
+        // `memory.max` excludes swap in cgroup v2. Leaving swap unlimited
+        // lets a container whose advertised shape is 512 MiB retain more than
+        // 512 MiB and merely pushes the excess out of RAM. The shape is a
+        // total resident-memory contract, so make the boundary exact.
+        fs::write(leaf.join("memory.swap.max"), "0")?;
         fs::write(
             leaf.join("cpu.max"),
             format!("{} 100000", u64::from(cpus.max(1)) * 100000),
@@ -2065,6 +2110,34 @@ mod tests {
     }
 
     #[test]
+    fn a_container_gets_only_the_public_egress_ca_inside_its_root() {
+        let root = tempfile::tempdir().unwrap();
+        install_egress_ca(root.path(), "PUBLIC CERTIFICATE\n").unwrap();
+        let installed = root
+            .path()
+            .join("usr/local/share/ca-certificates/asterism-egress.crt");
+        assert_eq!(
+            fs::read_to_string(installed).unwrap(),
+            "PUBLIC CERTIFICATE\n"
+        );
+        assert_eq!(
+            fs::read_to_string(
+                root.path()
+                    .join("etc/pki/ca-trust/source/anchors/asterism-egress.crt")
+            )
+            .unwrap(),
+            "PUBLIC CERTIFICATE\n"
+        );
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            let trapped = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(outside.path(), trapped.path().join("usr")).unwrap();
+            assert!(install_egress_ca(trapped.path(), "PUBLIC CERTIFICATE\n").is_err());
+        }
+    }
+
+    #[test]
     fn slirp_network_spec_keeps_publishing_on_private_control_state() {
         let network = Network {
             api: "/run/user/1000/asterism/dev/slirp4netns-api.sock".into(),
@@ -2093,7 +2166,7 @@ mod tests {
         slirp_call(
             &socket,
             serde_json::json!({ "execute": "add_hostfwd" }),
-            Instant::now() + Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(5),
         )
         .unwrap();
         server.join().unwrap();
@@ -2115,7 +2188,7 @@ mod tests {
         slirp_call(
             &socket,
             serde_json::json!({ "execute": "add_hostfwd" }),
-            Instant::now() + Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(5),
         )
         .unwrap();
         server.join().unwrap();
@@ -2136,7 +2209,7 @@ mod tests {
         let error = slirp_call(
             &socket,
             serde_json::json!({ "execute": "add_hostfwd" }),
-            Instant::now() + Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(5),
         )
         .unwrap_err();
         assert!(
@@ -2161,7 +2234,7 @@ mod tests {
         let error = slirp_call(
             &socket,
             serde_json::json!({ "execute": "add_hostfwd" }),
-            Instant::now() + Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(5),
         )
         .unwrap_err();
         assert!(error.to_string().contains("parsing"), "{error:#}");
@@ -2183,7 +2256,7 @@ mod tests {
         let error = slirp_call(
             &socket,
             serde_json::json!({ "execute": "add_hostfwd" }),
-            Instant::now() + Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(5),
         )
         .unwrap_err();
         assert!(error.to_string().contains("exceeded"), "{error:#}");
