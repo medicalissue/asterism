@@ -340,22 +340,9 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
                 },
             }
         }
-        Request::ContainerExec { name, command } => {
-            return match reg.get(&name).and_then(|inst| {
-                if inst.runtime != RuntimeKind::Container {
-                    anyhow::bail!("instance {name:?} uses runtime=vm; use `ast ssh {name}`")
-                }
-                let handle = inst.handle.as_ref().context("container is not running")?;
-                crate::container::exec(handle, command)
-            }) {
-                Ok((status, stdout, stderr)) => Response::ContainerExec {
-                    status,
-                    stdout,
-                    stderr,
-                },
-                Err(error) => Response::Error {
-                    message: format!("{error:#}"),
-                },
+        Request::ContainerExec { .. } => {
+            return Response::Error {
+                message: "container exec reached the shard-locked dispatcher".into(),
             };
         }
         _ => return not_a_shard_request(),
