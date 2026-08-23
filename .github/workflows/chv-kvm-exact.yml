@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - "polecat/feral/as-sx46+mt5yeaez"
+  workflow_dispatch:
 
 permissions:
   contents: read
