@@ -1,9 +1,8 @@
 # Exact real-NVIDIA release gate. Provider-side dstack task.
 #
 # DO NOT apply this configuration from a polecat session.
-# Never run `dstack apply` here. The local dstack server is currently
-# unhealthy (HTTP 500 on /). That is an external execution blocker for Sol,
-# not a reason to weaken the fail-closed gate in-tree.
+# Never run `dstack apply` here. The 0.21.2 control plane is at
+# http://127.0.0.1:3001, project main. Port 3000 is Dagster and is not dstack.
 #
 # Schema: official task reference
 # https://dstack.ai/docs/reference/dstack.yml/task.md
@@ -11,13 +10,14 @@
 #   resources.gpu.vendor/count/memory/compute_capability, spot_policy,
 #   max_price, max_duration, idle_duration, retry.
 #
-# Sol cost-input: after the server is healthy, preview only:
-#   echo n | dstack apply -f deploy/dstack/remote-gpu-nvidia.dstack.yml
+# Sol cost-input, preview only:
+#   echo n | dstack apply --project main -f deploy/dstack/remote-gpu-nvidia.dstack.yml
 # Apply only when the plan shows 2x NVIDIA, CC 7.5+, under max_price 2.50.
 # Expected spend about 1–3 USD if the gate finishes in under an hour.
 #
 # Hardware PASS is recorded only when the paid host checks out repos.hash
-# (this pin), ASTERISM_PINNED_SHA matches that oid, and
+# (the integrated 13.2 + 13.3 + 13.4 candidate), ASTERISM_PINNED_SHA matches,
+# ASTERISM_NVIDIA_E2E_RUNNER names an executable from that checkout, and
 # scripts/harness-remote-gpu-nvidia.sh judges the guest→mesh→provider path.
 # CPU reference and host-direct CUDA cannot PASS.
 
@@ -29,21 +29,18 @@ nvcc: true
 
 repos:
   - url: https://github.com/medicalissue/asterism.git
-    hash: "f656f017de3a0b34ce710350ee5e55fb2cb2e593"
+    hash: "950db9aed40c04df529e590498159824a9feaf88"
     path: /dstack/run
 
 working_dir: /dstack/run
 
 env:
-  - ASTERISM_NVIDIA_ALLOW_CARGO=1
   - ASTERISM_SOURCE_ONLY=0
-  - ASTERISM_PINNED_SHA=f656f017de3a0b34ce710350ee5e55fb2cb2e593
+  - ASTERISM_PINNED_SHA=950db9aed40c04df529e590498159824a9feaf88
+  - ASTERISM_NVIDIA_E2E_RUNNER=/dstack/run/scripts/lib/nvidia-e2e-runner.sh
 
 commands:
   - test "$(git rev-parse HEAD)" = "$ASTERISM_PINNED_SHA"
-  - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
-  - . "$HOME/.cargo/env"
-  - rustc --version
   - git rev-parse HEAD
   - git rev-parse HEAD^{tree}
   - nvidia-smi
