@@ -2,3 +2,8 @@ Asterism is distributed by medicalissue.
 
 Linux release archives include the Asterism license texts and the license
 notices for the pinned Cloud Hypervisor and virtiofsd runtime components.
+
+Cloud Hypervisor v53.0 is distributed under Apache-2.0 and BSD-3-Clause terms;
+the corresponding upstream license texts are included in each Linux archive
+under share/asterism/licenses. The pinned source and binary identities are
+recorded in packaging/linux-components.env.

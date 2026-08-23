@@ -391,7 +391,7 @@ jobs:
         run: echo "version=${{ inputs.version || github.ref_name }}" >>"$GITHUB_OUTPUT"
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: release-${{ matrix.target == 'linux-arm64' && 'linux-arm64' || 'linux-x86_64' }}
+          name: release-linux-${{ matrix.target }}
           path: dist
       - name: Verify Linux archive layout and notices
         run: |
@@ -415,6 +415,25 @@ jobs:
           fi
           sh -n packaging/install.sh packaging/asterism-nbd
           bash -n scripts/package-linux.sh
+
+      - name: Install and execute the exact Linux release artifact
+        run: |
+          set -eu
+          version="${{ steps.version.outputs.version }}"
+          prefix="${RUNNER_TEMP}/asterism-linux-prefix"
+          export ASTERISM_BASE_URL="file://${PWD}/dist"
+          export ASTERISM_VERSION="$version"
+          export ASTERISM_PREFIX="$prefix"
+          export ASTERISM_YES=1
+          sh packaging/install.sh
+          [ -x "$prefix/bin/ast" ]
+          [ -x "$prefix/bin/astd" ]
+          [ -x "$prefix/bin/cloud-hypervisor" ]
+          [ -x "$prefix/bin/virtiofsd" ]
+          "$prefix/bin/cloud-hypervisor" --version | grep -F 'v53.0'
+          "$prefix/bin/ast" --version
+          sh packaging/install.sh --uninstall
+          [ ! -e "$prefix/bin/ast" ]
 
   # Install what was just built, with the script users run, on a clean
   # runner. The artifacts are served over file:// from the download

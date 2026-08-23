@@ -908,7 +908,7 @@ fn catalog_row(reference: &str, depth: Depth) -> Result<ImageRow> {
     let pulled = path.exists();
     let verified = resolved.path.exists()
         && verify::check_recorded(&resolved.path, &resolved.record, depth).is_ok()
-        && resolved.pin_satisfied().is_ok();
+        && resolved.pin_satisfied(&path).is_ok();
     let bytes = if pulled { file_len(&path)? } else { 0 };
     let digest = if resolved.path.exists() {
         verify::provenance(&resolved.path).map(|record| {

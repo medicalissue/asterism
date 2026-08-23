@@ -4,9 +4,7 @@
 //! [`Hypervisor`] contract, an HTTP control channel and capability data it
 //! already uses for every other backend.
 
-use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::os::fd::AsRawFd;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -44,7 +42,6 @@ const VIRTIOFS_RESOURCE_SUFFIX: &str = ".resource.json";
 const NBD_RECORD_PREFIX: &str = "chv-nbd-";
 const NBD_RECORD_SUFFIX: &str = ".device";
 const NBD_HELPER: &str = "/usr/local/libexec/asterism/asterism-nbd";
-const NBD_LOCK: &str = "/run/lock/asterism-nbd.lock";
 const BOOT_TIMEOUT: Duration = Duration::from_secs(240);
 const API_TIMEOUT: Duration = Duration::from_secs(10);
 const API_START_TIMEOUT: Duration = Duration::from_secs(60);
@@ -86,7 +83,7 @@ impl Chv {
             .with_context(|| format!("making {}'s Cloud Hypervisor disk", req.instance.name))?;
         let resize = match req.base.format {
             DiskFormat::Raw => grow(path, u64::from(req.instance.shape.disk_gib)),
-            DiskFormat::Qcow2 => grow_qcow2(path, u64::from(req.instance.shape.disk_gib)),
+            DiskFormat::Qcow2 => check_qcow2_shape(path, u64::from(req.instance.shape.disk_gib)),
             DiskFormat::Asif => bail!("the chv backend cannot read an asif disk"),
         };
         if let Err(error) = resize {
@@ -265,31 +262,24 @@ impl Chv {
     }
 }
 
-/// Resize a retained qcow2 image without invoking a converter at runtime.
-///
-/// The qcow2 header stores the virtual disk size as a big-endian u64 at byte
-/// 24. Changing that field is the format-native equivalent of growing a raw
-/// sparse file; the allocated cluster table and backing data remain intact.
-/// Shrinking is never safe, so a too-small requested shape is refused before
-/// the clone can be exposed to Cloud Hypervisor.
-fn grow_qcow2(path: &Path, disk_gib: u64) -> Result<()> {
-    const HEADER_LEN: u64 = 72;
-    const QCOW_MAGIC: [u8; 4] = *b"QFI\xfb";
+/// Validate a qcow2 image without changing its metadata. Cloud Hypervisor can
+/// consume qcow2 directly, but growing it requires a format-aware metadata
+/// rewrite; the no-runtime-converter path therefore accepts only an image
+/// whose virtual size already equals the requested shape.
+fn check_qcow2_shape(path: &Path, disk_gib: u64) -> Result<()> {
     let want = disk_gib
         .checked_mul(1 << 30)
         .context("the requested qcow2 disk size overflows the host size type")?;
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
+    let mut file = std::fs::File::open(path)
         .with_context(|| format!("opening qcow2 image {}", path.display()))?;
-    if file.metadata()?.len() < HEADER_LEN {
-        bail!("qcow2 image {} has a truncated header", path.display());
-    }
-    let mut header = [0u8; HEADER_LEN as usize];
-    file.read_exact(&mut header)?;
-    if header[..4] != QCOW_MAGIC {
-        bail!("{} is not a qcow2 image", path.display());
+    let mut header = [0u8; 32];
+    file.read_exact(&mut header)
+        .with_context(|| format!("reading qcow2 header from {}", path.display()))?;
+    if header[..4] != *b"QFI\xfb" {
+        bail!(
+            "{} is not a qcow2 image; refusing to prepare it as qcow2",
+            path.display()
+        );
     }
     let version = u32::from_be_bytes(header[4..8].try_into().unwrap());
     if version != 2 && version != 3 {
@@ -298,26 +288,14 @@ fn grow_qcow2(path: &Path, disk_gib: u64) -> Result<()> {
             path.display()
         );
     }
-    let cluster_bits = u32::from_be_bytes(header[20..24].try_into().unwrap());
-    if !(9..=21).contains(&cluster_bits) {
-        bail!(
-            "qcow2 image {} has invalid cluster size bits {cluster_bits}",
-            path.display()
-        );
-    }
     let have = u64::from_be_bytes(header[24..32].try_into().unwrap());
-    if have > want {
+    if have != want {
         bail!(
-            "this image is {:.1} GiB, so it does not fit a {disk_gib} GiB disk — create the instance with a larger --disk",
+            "qcow2 image {} has a {:.1} GiB virtual size, but the instance requests {disk_gib} GiB; refusing an unsafe metadata growth or shrink",
+            path.display(),
             have as f64 / (1u64 << 30) as f64
         );
     }
-    if have == want {
-        return Ok(());
-    }
-    file.seek(SeekFrom::Start(24))?;
-    file.write_all(&want.to_be_bytes())?;
-    file.sync_data()?;
     Ok(())
 }
 
@@ -413,6 +391,7 @@ impl Hypervisor for Chv {
                 readonly: false,
             }
         } else if qcow.exists() {
+            check_qcow2_shape(&qcow, u64::from(req.instance.shape.disk_gib))?;
             DiskSpec::File {
                 path: qcow,
                 format: DiskFormat::Qcow2,
@@ -1655,57 +1634,6 @@ fn remote_disk_identity(disk: &DiskSpec) -> Result<String> {
     Ok(blake3::hash(&serialized).to_hex().to_string())
 }
 
-/// One host-wide claim serializes the check/claim/attach/owner-capture
-/// sequence. Per-instance JSON records survive crashes, but they cannot stop
-/// two daemon processes from choosing the same currently-free `/dev/nbdN` in
-/// the gap before either process reaches `nbd-client`.
-struct NbdClaim(File);
-
-impl Drop for NbdClaim {
-    fn drop(&mut self) {
-        // The descriptor is closed immediately afterwards as well; explicit
-        // unlock makes the ownership boundary obvious and testable.
-        unsafe {
-            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
-        }
-    }
-}
-
-fn acquire_nbd_claim() -> Result<NbdClaim> {
-    let path = std::env::var_os("ASTERISM_NBD_LOCK")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            #[cfg(test)]
-            {
-                return std::env::temp_dir().join("asterism-nbd-test.lock");
-            }
-            #[cfg(not(test))]
-            {
-                PathBuf::from(NBD_LOCK)
-            }
-        });
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(&path)
-        .with_context(|| {
-            format!(
-                "opening the system-wide NBD claim {}; re-run the Linux installer",
-                path.display()
-            )
-        })?;
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    if result != 0 {
-        bail!(
-            "claiming the system-wide NBD lock {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        );
-    }
-    Ok(NbdClaim(file))
-}
-
 fn attach_nbd(
     dir: &Path,
     index: usize,
@@ -1714,7 +1642,6 @@ fn attach_nbd(
     source: &str,
     args_for: impl FnOnce(&Path) -> Result<Vec<String>>,
 ) -> Result<PathBuf> {
-    let _claim = acquire_nbd_claim()?;
     let device = match desired {
         Some(device) => {
             if !device.exists() {
@@ -1733,7 +1660,7 @@ fn attach_nbd(
         }
         None => free_nbd_device_from(preferred_nbd_index(dir, index))?,
     };
-    attach_nbd_at_locked(
+    attach_nbd_at(
         dir,
         index,
         readonly,
@@ -1745,29 +1672,12 @@ fn attach_nbd(
     )
 }
 
+/// Claiming and owner capture happen inside the root-only helper. The durable
+/// record here is the daemon's recovery journal, not an authority to detach a
+/// device from a different caller. `nbd-client` can report failure after the
+/// kernel accepted an attach, so the pre-attach intent makes that ambiguous
+/// side effect retryable during cleanup.
 fn attach_nbd_at(
-    dir: &Path,
-    index: usize,
-    readonly: bool,
-    device: PathBuf,
-    source: &str,
-    args_for: impl FnOnce(&Path) -> Result<Vec<String>>,
-    run: impl FnOnce(&[String]) -> Result<()>,
-    kernel_pid: impl Fn(&Path) -> Option<String>,
-) -> Result<PathBuf> {
-    let _claim = acquire_nbd_claim()?;
-    attach_nbd_at_locked(
-        dir, index, readonly, device, source, args_for, run, kernel_pid,
-    )
-}
-
-/// Claim an NBD device durably before crossing the privileged attach boundary.
-///
-/// `nbd-client` can report failure after the kernel accepted an attach, and a
-/// successful attach can be followed by ENOSPC while recording ownership.  A
-/// pre-attach intent makes both outcomes retryable: cleanup treats a claimed
-/// device with no recorded kernel pid as ours iff the device is now attached.
-fn attach_nbd_at_locked(
     dir: &Path,
     index: usize,
     readonly: bool,
@@ -2306,11 +2216,6 @@ fn detach_nbd(device: &Path) -> Result<()> {
 }
 
 fn cleanup_remote_blocks(dir: &Path) -> bool {
-    let Ok(_claim) = acquire_nbd_claim() else {
-        // Without the host-wide claim, cleanup cannot prove that a device
-        // observed free belongs to this record rather than a racing attach.
-        return false;
-    };
     cleanup_remote_blocks_with(dir, nbd_kernel_pid, detach_nbd);
     !has_nbd_records(dir)
 }
@@ -2554,7 +2459,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_qcow2_grows_in_place_and_refuses_to_shrink() {
+    fn qcow2_shape_mismatch_is_refused_without_mutating_its_header() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("disk.qcow2");
         let mut header = vec![0u8; 72];
@@ -2564,15 +2469,10 @@ mod tests {
         header[24..32].copy_from_slice(&(1u64 << 30).to_be_bytes());
         std::fs::write(&path, header).unwrap();
 
-        grow_qcow2(&path, 2).unwrap();
-        let bytes = std::fs::read(&path).unwrap();
-        assert_eq!(
-            u64::from_be_bytes(bytes[24..32].try_into().unwrap()),
-            2u64 << 30
-        );
-
-        let error = grow_qcow2(&path, 1).unwrap_err().to_string();
-        assert!(error.contains("does not fit"), "{error}");
+        let before = std::fs::read(&path).unwrap();
+        let error = check_qcow2_shape(&path, 2).unwrap_err().to_string();
+        assert!(error.contains("unsafe metadata"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     #[test]
