@@ -940,7 +940,13 @@ fn read_line_deadline(stream: &mut UnixStream, deadline: Instant) -> Result<Stri
             bail!("slirp4netns control exceeded the container launch deadline");
         }
         match stream.read(&mut chunk) {
-            Ok(0) => bail!("slirp4netns closed its control socket without a response"),
+            Ok(0) if bytes.is_empty() => {
+                bail!("slirp4netns closed its control socket without a response")
+            }
+            Ok(0) => {
+                return String::from_utf8(bytes)
+                    .context("slirp4netns control response is not UTF-8")
+            }
             Ok(read) => {
                 bytes.extend_from_slice(&chunk[..read]);
                 if bytes.len() > MAX_SLIRP_RESPONSE {
@@ -1963,6 +1969,94 @@ mod tests {
             Instant::now() + Duration::from_secs(1),
         )
         .unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    #[cfg(target_family = "unix")]
+    fn slirp_control_accepts_an_eof_terminated_json_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("slirp-eof.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            stream.read_to_string(&mut request).unwrap();
+            assert!(request.contains("add_hostfwd"));
+            stream.write_all(b"{\"return\":{}}").unwrap();
+        });
+        slirp_call(
+            &socket,
+            serde_json::json!({ "execute": "add_hostfwd" }),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    #[cfg(target_family = "unix")]
+    fn slirp_control_refuses_an_empty_eof_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("slirp-empty.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            stream.read_to_string(&mut request).unwrap();
+            assert!(request.contains("add_hostfwd"));
+        });
+        let error = slirp_call(
+            &socket,
+            serde_json::json!({ "execute": "add_hostfwd" }),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("without a response"), "{error:#}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    #[cfg(target_family = "unix")]
+    fn slirp_control_refuses_malformed_eof_terminated_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("slirp-malformed.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            stream.read_to_string(&mut request).unwrap();
+            stream.write_all(b"not-json").unwrap();
+        });
+        let error = slirp_call(
+            &socket,
+            serde_json::json!({ "execute": "add_hostfwd" }),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("parsing"), "{error:#}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    #[cfg(target_family = "unix")]
+    fn slirp_control_refuses_an_oversized_eof_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("slirp-oversized.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            stream.read_to_string(&mut request).unwrap();
+            stream.write_all(&vec![b'x'; 64 * 1024 + 1]).unwrap();
+        });
+        let error = slirp_call(
+            &socket,
+            serde_json::json!({ "execute": "add_hostfwd" }),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("exceeded"), "{error:#}");
         server.join().unwrap();
     }
 
