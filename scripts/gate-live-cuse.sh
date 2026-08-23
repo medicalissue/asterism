@@ -64,10 +64,7 @@ service_user=asterism-gpu
 service_group=asterism-gpu
 run_as_service_user() {
   sudo -n -u "$service_user" env \
-    HOME="$HOME" PATH="$PATH" \
-    CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
-    RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
-    CARGO_TARGET_DIR="${RUNNER_TEMP:-/tmp}/asterism-cuse-target" \
+    HOME=/nonexistent PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     "$@"
 }
 
@@ -88,6 +85,58 @@ if [ "$gate_rc" -eq 0 ]; then
     if [ "$install_rc" -ne 0 ]; then
       block "shipped source install path failed (see product-install.log)" || gate_rc=1
     fi
+  fi
+fi
+
+# Compilation is not part of the device privilege boundary. Build the exact
+# target's observer binaries as the ordinary runner before installing the
+# guest policy, then execute only those binaries as the fresh service account.
+# This avoids granting that account access to the runner's home/toolchain.
+CUSE_OBSERVER_TARGET="${RUNNER_TEMP:-/tmp}/asterism-cuse-observer-target"
+CUSE_TEST_BINARY=""
+CUSE_LIVE_BINARY=""
+if [ "$gate_rc" -eq 0 ]; then
+  command -v jq >/dev/null 2>&1 \
+    || { block "jq is required to resolve exact hosted observer binaries" || gate_rc=1; }
+fi
+if [ "$gate_rc" -eq 0 ]; then
+  rm -rf "$CUSE_OBSERVER_TARGET"
+  set +e
+  CARGO_TARGET_DIR="$CUSE_OBSERVER_TARGET" ASTERISM_BUILD_ID="$TARGET_COMMIT" \
+    cargo test -p asterism-core --lib --no-run --message-format=json \
+      >"$EVIDENCE/observer-test-build.jsonl" \
+      2>"$EVIDENCE/observer-test-build.log"
+  observer_test_build_rc=$?
+  set -e
+  record "observer_test_build_exit=$observer_test_build_rc"
+  if [ "$observer_test_build_rc" -ne 0 ]; then
+    block "exact CUSE test observer did not build" || gate_rc=1
+  else
+    CUSE_TEST_BINARY="$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "asterism_core" and .profile.test == true) | .executable // empty' "$EVIDENCE/observer-test-build.jsonl" | tail -n 1)"
+    [ -n "$CUSE_TEST_BINARY" ] && [ -x "$CUSE_TEST_BINARY" ] \
+      || { block "exact CUSE test observer binary was not resolved" || gate_rc=1; }
+  fi
+fi
+if [ "$gate_rc" -eq 0 ]; then
+  set +e
+  CARGO_TARGET_DIR="$CUSE_OBSERVER_TARGET" ASTERISM_BUILD_ID="$TARGET_COMMIT" \
+    cargo build -p asterism-core --example live_cuse_gate --message-format=json \
+      >"$EVIDENCE/observer-live-build.jsonl" \
+      2>"$EVIDENCE/observer-live-build.log"
+  observer_live_build_rc=$?
+  set -e
+  record "observer_live_build_exit=$observer_live_build_rc"
+  if [ "$observer_live_build_rc" -ne 0 ]; then
+    block "exact live CUSE observer did not build" || gate_rc=1
+  else
+    CUSE_LIVE_BINARY="$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "live_cuse_gate") | .executable // empty' "$EVIDENCE/observer-live-build.jsonl" | tail -n 1)"
+    [ -n "$CUSE_LIVE_BINARY" ] && [ -x "$CUSE_LIVE_BINARY" ] \
+      || { block "exact live CUSE observer binary was not resolved" || gate_rc=1; }
+  fi
+  if [ "$gate_rc" -eq 0 ]; then
+    record "observer_compile_identity=ordinary_runner"
+    record "observer_execute_identity=guest_service_asterism-gpu"
+    record "observer_service_toolchain_access=false"
   fi
 fi
 
@@ -161,8 +210,6 @@ if [ "$gate_rc" -eq 0 ]; then
     sudo -n udevadm control --reload-rules
     sudo -n udevadm trigger --action=add /sys/class/misc/cuse
     sudo -n udevadm settle
-    sudo -n install -d -o "$service_user" -g "$service_group" \
-      "${RUNNER_TEMP:-/tmp}/asterism-cuse-target"
   } >"$EVIDENCE/guest-boundary-install.log" 2>&1
   reload_rc=$?
   set -e
@@ -179,6 +226,9 @@ if [ "$gate_rc" -eq 0 ]; then
       block "/dev/cuse is not read/write for the freshly started guest service identity" || gate_rc=1
     elif [ -r /dev/cuse ] || [ -w /dev/cuse ]; then
       block "ordinary host account can access guest-service-only /dev/cuse" || gate_rc=1
+    elif ! run_as_service_user test -x "$CUSE_TEST_BINARY" ||
+      ! run_as_service_user test -x "$CUSE_LIVE_BINARY"; then
+      block "fresh guest service identity cannot execute the exact prebuilt observers" || gate_rc=1
     else
       record "least_privilege_preflight=pass"
     fi
@@ -190,8 +240,8 @@ run_exact_test() {
   local log_name="$2"
   set +e
   run_as_service_user env ASTERISM_BUILD_ID="$TARGET_COMMIT" \
-    cargo test -p asterism-core "$test_name" \
-    -- --exact --nocapture 2>&1 | tee "$EVIDENCE/$log_name"
+    "$CUSE_TEST_BINARY" "$test_name" --exact --nocapture \
+      2>&1 | tee "$EVIDENCE/$log_name"
   local test_rc=${PIPESTATUS[0]}
   set -e
   return "$test_rc"
@@ -218,7 +268,7 @@ fi
 if [ "$gate_rc" -eq 0 ]; then
   set +e
   run_as_service_user env ASTERISM_BUILD_ID="$TARGET_COMMIT" \
-    cargo run -p asterism-core --example live_cuse_gate 2>&1 \
+    "$CUSE_LIVE_BINARY" 2>&1 \
     | tee "$EVIDENCE/live-lifecycle.log"
   lifecycle_rc=${PIPESTATUS[0]}
   set -e
