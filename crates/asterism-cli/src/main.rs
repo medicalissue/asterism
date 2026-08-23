@@ -4409,7 +4409,7 @@ fn update_command(cmd: UpdateCommand) -> Result<()> {
         .or_else(|| {
             let prefix = ast.parent()?.parent()?;
             // Prefer asterism-update.ps1 on Windows, then .exe, then the POSIX updater.
-            windows_host::update::first_reachable_updater(&prefix)
+            windows_host::update::first_reachable_updater(prefix)
         })
         .or_else(|| {
             let prefix = ast.parent()?.parent()?;
