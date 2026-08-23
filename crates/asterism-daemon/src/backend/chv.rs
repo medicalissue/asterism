@@ -1267,9 +1267,10 @@ fn wait_for_guest(
         ctl: ControlChannel::HttpApi {
             path: instance_dir.join(API_NAME),
         },
-        endpoint: GuestEndpoint::GuestAddr {
+        endpoint: Some(GuestEndpoint::GuestAddr {
             addr: "192.0.2.1".parse().unwrap(),
-        },
+        }),
+        container_control: None,
         started_at: 0,
     };
     loop {
