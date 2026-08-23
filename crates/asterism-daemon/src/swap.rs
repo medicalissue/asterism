@@ -757,27 +757,22 @@ pub async fn reconcile_target_mesh(node: &Node, mesh: &Arc<Mesh>) {
                 )
                 .await
                 {
-                    Ok(response)
-                        if exact_source_phase(
-                            response,
-                            &txn.instance_id,
-                            txn.epoch,
-                            &txn.token,
-                        )
-                        .is_ok_and(|phase| phase == MoveSourcePhase::Committed) =>
-                    {
-                        Request::MoveCommitTarget {
-                            manifest: Box::new(txn.manifest.clone()),
-                            epoch: txn.epoch,
-                            token: txn.token.clone(),
+                    Ok(response) => {
+                        match exact_source_phase(response, &txn.instance_id, txn.epoch, &txn.token)
+                        {
+                            Ok(MoveSourcePhase::Committed) => Request::MoveCommitTarget {
+                                manifest: Box::new(txn.manifest.clone()),
+                                epoch: txn.epoch,
+                                token: txn.token.clone(),
+                            },
+                            _ => {
+                                eprintln!(
+                                "astd: reserved target {:?} epoch {} remains fenced; source did not replay the exact committed winner",
+                                txn.name, txn.epoch
+                            );
+                                continue;
+                            }
                         }
-                    }
-                    Ok(_) => {
-                        eprintln!(
-                            "astd: reserved target {:?} epoch {} remains fenced; source did not replay the exact committed winner",
-                            txn.name, txn.epoch
-                        );
-                        continue;
                     }
                     Err(e) => {
                         eprintln!(
@@ -3783,7 +3778,7 @@ fn finish_target_abort(txn: &mut AuthorityTxn) -> Result<()> {
         .remove(&(name.to_owned(), epoch))
         .or_else(|| txn.handle.clone())
         .or_else(|| {
-            std::fs::read(staging_dir(name, epoch).join(LIVE_HANDLE))
+            std::fs::read(staging_dir(&name, epoch).join(LIVE_HANDLE))
                 .ok()
                 .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         });
@@ -3793,7 +3788,7 @@ fn finish_target_abort(txn: &mut AuthorityTxn) -> Result<()> {
         }
     }
     if txn.live {
-        let staging = staging_dir(name, epoch);
+        let staging = staging_dir(&name, epoch);
         let cleanup = (|| -> Result<()> {
             let hv = backend::for_instance(&txn.manifest.instance)?;
             let req = backend::migration_req(&txn.manifest.instance, staging)?;
@@ -3810,7 +3805,7 @@ fn finish_target_abort(txn: &mut AuthorityTxn) -> Result<()> {
             }
         }
     }
-    let staging = staging_dir(name, epoch);
+    let staging = staging_dir(&name, epoch);
     let _ = std::fs::remove_file(paths::migration_socket_in(&staging));
     if let Err(e) = std::fs::remove_dir_all(&staging) {
         if e.kind() != std::io::ErrorKind::NotFound {
