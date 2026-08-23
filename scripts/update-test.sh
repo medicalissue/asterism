@@ -17,6 +17,9 @@ pass=0
 fail() { echo "UPDATE-TEST FAIL: $*" >&2; exit 1; }
 ok() { pass=$((pass + 1)); echo "ok: $*"; }
 sha() { shasum -a 256 "$1" | awk '{print $1}'; }
+mode_of() {
+  stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1"
+}
 
 VERIFIER="$WORK/verifier"
 cat >"$VERIFIER" <<'SH'
@@ -24,6 +27,15 @@ cat >"$VERIFIER" <<'SH'
 [ "$(cat "$2")" = valid ] && [ "$3" = test-public-key ]
 SH
 chmod +x "$VERIFIER"
+
+SETCAP="$WORK/setcap"
+cat >"$SETCAP" <<SH
+#!/bin/sh
+[ "\$1" = cap_net_admin+ep ] || exit 93
+chmod 0700 "\$2"
+printf '%s\n' "\$2" >>"$WORK/setcap-calls"
+SH
+chmod +x "$SETCAP"
 
 make_program() {
   local path="$1" name="$2" version="$3" build="$4"
@@ -320,6 +332,10 @@ install_linux_old() {
   printf '#!/bin/sh\necho "cloud-hypervisor v53.0 old"\n' >"$PREFIX/bin/cloud-hypervisor"
   printf '#!/bin/sh\necho "virtiofsd 1.14.0 old"\n' >"$PREFIX/bin/virtiofsd"
   chmod +x "$PREFIX/bin/cloud-hypervisor" "$PREFIX/bin/virtiofsd"
+  # A distinct executable mode is a portable fixture for inode metadata:
+  # replacing the file drops it, the capability restoration seam reapplies
+  # it, and rollback must recover the old inode with it intact.
+  chmod 0700 "$PREFIX/bin/cloud-hypervisor"
   make_updater "$PREFIX/libexec/asterism/asterism-update"
 }
 
@@ -332,6 +348,7 @@ run_linux_update() {
     ASTERISM_UPDATE_MANIFEST_URL="file://$MANIFEST" \
     ASTERISM_UPDATE_VERIFIER="$VERIFIER" \
     ASTERISM_UPDATE_PUBKEY=test-public-key \
+    ASTERISM_UPDATE_SETCAP="$SETCAP" \
     "$PREFIX/libexec/asterism/asterism-update" "$@"
 }
 
@@ -343,8 +360,24 @@ run_linux_update apply --yes >"$WORK/linux-applied"
 [ "$(build_of "$PREFIX/bin/astd")" = 0.0.2+new ] || fail "linux astd did not activate"
 [ -x "$PREFIX/bin/cloud-hypervisor" ] || fail "linux update dropped cloud-hypervisor"
 [ -x "$PREFIX/bin/virtiofsd" ] || fail "linux update dropped virtiofsd"
+[ "$(mode_of "$PREFIX/bin/cloud-hypervisor")" = 700 ] ||
+  fail "linux update did not restore cap_net_admin metadata on cloud-hypervisor"
+grep -qxF "$PREFIX/bin/cloud-hypervisor" "$WORK/setcap-calls" ||
+  fail "linux update did not cross the capability restoration seam"
 [ ! -e "$PREFIX/bin/astd-vz" ] || fail "linux update planted a vz helper"
 ok "Linux signed update activates ast, astd, CHV and virtiofsd as one unit"
+
+install_linux_old
+if ASTERISM_UPDATE_FAIL_AFTER=astd run_linux_update apply --yes >"$WORK/linux-cap-rollback" 2>&1; then
+  fail "linux update succeeded after the capability-stage activation fault"
+fi
+[ "$(build_of "$PREFIX/bin/astd")" = 0.0.1+old ] ||
+  fail "linux capability-stage failure did not roll back astd"
+"$PREFIX/bin/cloud-hypervisor" | grep -q 'v53.0 old' ||
+  fail "linux capability-stage failure did not restore the old CHV inode"
+[ "$(mode_of "$PREFIX/bin/cloud-hypervisor")" = 700 ] ||
+  fail "linux rollback did not restore cap_net_admin metadata"
+ok "Linux activation and rollback preserve Cloud Hypervisor capability metadata"
 
 install_linux_old
 mkdir -p "$PREFIX/share/asterism/artifact.lock"

@@ -313,6 +313,21 @@ durable_parent() {
 	"$AST" __sync-update-path --parent-only "$1"
 }
 
+restore_chv_capability() {
+	chv="$BIN/cloud-hypervisor"
+	[ -f "$chv" ] || return 1
+	if [ -n "${ASTERISM_UPDATE_SETCAP:-}" ]; then
+		"$ASTERISM_UPDATE_SETCAP" cap_net_admin+ep "$chv"
+	elif [ "$(id -u)" = 0 ]; then
+		setcap cap_net_admin+ep "$chv"
+	else
+		# install.sh grants this account exactly this fixed setcap invocation.
+		# `-n` keeps an unattended updater from hanging on a password prompt.
+		sudo -n setcap cap_net_admin+ep "$chv"
+	fi || return 1
+	durable_path "$chv"
+}
+
 atomic_record() {
 	path="$1" value="$2"
 	record_tmp="${path}.tmp.$$"
@@ -410,6 +425,9 @@ rollback_transaction() {
 			rm -rf "$dst"
 			mv "$backup" "$dst" || die "could not restore $name from interrupted update"
 			if [ -d "$dst" ]; then durable_tree "$dst"; else durable_path "$dst"; fi
+			if [ "$name" = cloud-hypervisor ]; then
+				restore_chv_capability || die "could not restore cap_net_admin on rolled-back Cloud Hypervisor"
+			fi
 		elif [ -e "${backup}.absent" ]; then
 			rm -rf "$dst"
 			durable_parent "$dst"
@@ -631,6 +649,7 @@ apply_update() {
 	if ! {
 		if [ "$linux_payload" = 1 ]; then
 			place_one cloud-hypervisor "$BIN/.cloud-hypervisor.update.$$" "$BIN/cloud-hypervisor" &&
+			restore_chv_capability &&
 			place_one virtiofsd "$BIN/.virtiofsd.update.$$" "$BIN/virtiofsd" &&
 			place_one astd "$BIN/.astd.update.$$" "$BIN/astd" &&
 			place_one asterism-update "$LIBEXEC/.asterism-update.update.$$" "$LIBEXEC/asterism-update" &&

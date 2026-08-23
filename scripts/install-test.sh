@@ -676,6 +676,8 @@ policy="${WORK}/system-root/etc/sudoers.d/asterism-nbd-$(id -u)"
 grep -qF 'NOPASSWD:' "$policy" || fail "the NBD helper policy is not non-interactive"
 grep -qF "${WORK}/system-root/usr/local/libexec/asterism/asterism-nbd" "$policy" \
 	|| fail "sudoers grants something other than the root-owned argument boundary"
+grep -qF "cap_net_admin+ep ${PREFIX}/bin/cloud-hypervisor" "$policy" \
+	|| fail "sudoers does not permit the updater's exact CHV capability restoration"
 [ -e "${WORK}/system-root/run/lock/asterism-nbd.lock" ] \
 	|| fail "the NBD flock inode was not created"
 
