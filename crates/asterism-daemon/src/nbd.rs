@@ -534,10 +534,10 @@ fn negotiate(
                 let allocation = if option == NBD_OPT_LIST_META_CONTEXT {
                     queries.is_empty()
                         || queries.iter().any(|query| {
-                            query == BASE_ALLOCATION || BASE_ALLOCATION.starts_with(query)
+                            *query == BASE_ALLOCATION || BASE_ALLOCATION.starts_with(query)
                         })
                 } else {
-                    queries.iter().any(|query| query == BASE_ALLOCATION)
+                    queries.iter().any(|query| *query == BASE_ALLOCATION)
                 };
                 if option == NBD_OPT_SET_META_CONTEXT {
                     negotiated.allocation = allocation;
