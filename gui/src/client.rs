@@ -59,7 +59,7 @@ const SPAWN_COOLDOWN: Duration = Duration::from_secs(15);
 
 static LAST_SPAWN: Mutex<Option<Instant>> = Mutex::new(None);
 
-/// This device's shard: the instances whose cpu and ram it supplies. What
+/// This device's shard: the instances whose compute it supplies. What
 /// the tray menu lists, and what the New Instance window checks a name
 /// against.
 pub fn list() -> Result<Vec<Instance>> {

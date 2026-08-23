@@ -2,7 +2,7 @@
 //!
 //! `ast ls` and this table are the same question — [`Request::ListOrbit`] —
 //! so a row here says what a row there says: the name, what it is doing, the
-//! device supplying its cpu and ram, the backend it was defined against and
+//! device supplying its compute, the backend it was defined against and
 //! the shape it was cut to.
 //!
 //! The gates live here too, and only here. `astd` refuses `Up` on a running
@@ -64,8 +64,8 @@ pub struct Row {
     /// is still worth showing — the alternative reads as "deleted" — but it
     /// must not claim to know what the instance is doing.
     pub live: bool,
-    /// The device supplying its cpu and ram.
-    pub cpu_device: String,
+    /// The device supplying its compute.
+    pub compute_device: String,
     /// The backend it was defined against. Creation records this before the
     /// instance enters the registry.
     pub backend: String,
@@ -102,7 +102,7 @@ impl Row {
             name: instance.name.clone(),
             status,
             live,
-            cpu_device: instance.cpu_device.clone(),
+            compute_device: instance.compute_device().to_owned(),
             backend: instance.machine.backend.clone(),
             shape: shape(&instance.shape),
             image: instance.image.clone().unwrap_or_else(|| "unknown".to_owned()),
@@ -201,10 +201,10 @@ impl Instances {
             Fleet::Rows { rows } => {
                 for row in rows {
                     out.push(format!(
-                        "instance {:<16} {:<8} cpu={:<14} backend={:<6} shape={}",
+                        "instance {:<16} {:<8} compute={:<14} backend={:<6} shape={}",
                         row.name,
                         row.status,
-                        row.cpu_device,
+                        row.compute_device,
                         if row.backend.is_empty() { "-" } else { &row.backend },
                         row.shape
                     ));
@@ -296,11 +296,11 @@ mod tests {
     }
 
     #[test]
-    fn a_row_names_the_device_supplying_its_cpu_and_the_backend_it_was_cut_against() {
+    fn a_row_names_its_compute_device_and_the_backend_it_was_cut_against() {
         let mut inst = instance("dev", Status::Stopped);
         inst.machine = machine("vz");
         let row = Row::of(&inst, true);
-        assert_eq!(row.cpu_device, "laptop");
+        assert_eq!(row.compute_device, "laptop");
         assert_eq!(row.backend, "vz");
 
         assert_eq!(Row::of(&instance("dev", Status::Stopped), true).backend, "qemu");
@@ -332,7 +332,8 @@ mod tests {
         ];
         let lines = Instances::of(&rows).lines().join("\n");
         assert!(lines.contains("instance dev              running "), "{lines}");
-        assert!(lines.contains("cpu=laptop"), "{lines}");
+        assert!(lines.contains("compute=laptop"), "{lines}");
+        assert!(!lines.contains("cpu_device"), "{lines}");
         assert!(lines.contains("shape=2 CPU · 2 GB · 20 GB"), "{lines}");
         assert!(
             lines.contains("actions up=disabled down=enabled terminal=enabled snapshots=disabled"),
@@ -347,7 +348,7 @@ mod tests {
     fn a_row_reaches_the_webview_under_the_names_it_reads() {
         let json = serde_json::to_value(Row::of(&instance("dev", Status::Running), true)).unwrap();
         for key in
-            ["name", "status", "live", "cpu_device", "backend", "shape", "can_start", "can_stop"]
+            ["name", "status", "live", "compute_device", "backend", "shape", "can_start", "can_stop"]
         {
             assert!(json.get(key).is_some(), "a row has no {key:?}: {json}");
         }

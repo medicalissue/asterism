@@ -182,7 +182,7 @@ function ImageStep({form, source, name, setName, nameProblem, image, setImage, o
 function ResourcesStep({cpus, setCpus, mem, setMem, disk, setDisk}: {cpus: number; setCpus: (value: number) => void; mem: number; setMem: (value: number) => void; disk: number; setDisk: (value: number) => void}) {
   return (
     <section className="create-stage resources-stage">
-      <div className="stage-copy"><h2>Size the instance</h2><p>These resources come from the device supplying CPU and RAM. You can inspect that source from Control Center.</p></div>
+      <div className="stage-copy"><h2>Size the instance</h2><p>These quotas apply to this device's compute placement. CPU and physical memory move together.</p></div>
       <div className="resource-options">
         <Resource label="CPU" description="Virtual processor cores" value={cpus} min={1} max={64} setValue={setCpus} />
         <Resource label="Memory" description="Guest working memory" value={mem} unit="GB" min={1} max={512} setValue={setMem} />

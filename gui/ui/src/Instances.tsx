@@ -76,7 +76,7 @@ export function Instances({
                 <strong>{row.name}</strong>
                 <small>{row.status}</small>
               </span>
-              <span className="row-source">{row.cpu_device}</span>
+              <span className="row-source">{row.compute_device}</span>
             </button>
           ))}
         </div>
@@ -135,7 +135,7 @@ function InstanceDetail({
             <span className={`status-dot ${statusClass(row.status)}`} />
             <span>{row.live ? row.status : 'last known state'}</span>
             <span className="separator-dot">·</span>
-            <span>{row.cpu_device}</span>
+            <span>{row.compute_device}</span>
           </div>
         </div>
         <Button label="Connect" size="sm" variant="secondary" icon={<LinkIcon />} onClick={onConnect} />
@@ -197,7 +197,7 @@ function InstanceDetail({
       {backupStatus ? <p className="operation-note">{backupStatus}</p> : null}
 
       <div className="facts-grid">
-        <Fact label="Source device" value={row.cpu_device} />
+        <Fact label="Compute" value={row.compute_device} />
         <Fact label="Backend" value={row.backend || 'not recorded'} mono />
         <Fact label="Resources" value={row.shape} />
         <Fact label="Image" value={row.image} mono />
@@ -340,7 +340,7 @@ function ConnectionSheet({
         <div className="connection-summary">
           <span className={`status-dot ${statusClass(row.status)}`} />
           <strong>{row.live ? row.status : 'unreachable'}</strong>
-          <span>{row.live ? `local daemon → ${row.cpu_device} → guest` : `last known on ${row.cpu_device}`}</span>
+          <span>{row.live ? `local daemon → ${row.compute_device} → guest` : `last known compute on ${row.compute_device}`}</span>
         </div>
 
         <section className="sheet-section">

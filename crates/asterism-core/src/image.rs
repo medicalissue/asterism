@@ -1617,7 +1617,7 @@ mod tests {
         assert!(text.contains("ast pull"), "{text}");
     }
 
-    /// What `ast move` leaves behind when it fetches a base image off an
+    /// What a compute move leaves behind when it fetches a base image off an
     /// orbit peer instead of the internet, and what the instance it moved
     /// needs in order to boot from it.
     ///

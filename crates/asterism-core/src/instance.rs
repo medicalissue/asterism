@@ -1,11 +1,11 @@
 //! What an instance is made of.
 //!
 //! The orbit is a pool of parts; an instance is a computer assembled from
-//! them. Every part records the device it is sourced from — cpu and ram come
-//! as a pair from whichever device runs the hypervisor, a volume comes from
-//! whichever device holds the bytes — and the rest default to the same device
-//! as cpu because that is the cheapest place to put them, not because that
-//! device has any claim on the instance.
+//! them. Compute is one placement unit: CPU, physical RAM, and VM/container
+//! execution state come from one orbit device. A volume comes from whichever
+//! device holds the bytes, while defaults may follow compute because that is
+//! the cheapest place to put them, not because that device has any claim on
+//! the instance.
 
 use serde::{Deserialize, Serialize};
 
@@ -93,7 +93,7 @@ pub struct Volume {
     /// Size of a block volume as its provider reported it, for `ast status`.
     #[serde(default)]
     pub size_bytes: Option<u64>,
-    /// What the daemon supplying cpu/ram most recently observed about this
+    /// What the daemon supplying compute most recently observed about this
     /// part while the guest was running.
     ///
     /// Runtime-only: registries never populate it, but a `status` reply may.
@@ -293,7 +293,7 @@ pub fn fnv1a(s: &str) -> u64 {
 ///
 /// The model has no network ingress: an instance is reached through the mesh,
 /// and nothing dials in from outside. This is not ingress — it is the loopback
-/// of the device supplying cpu/ram, the same place `ast ssh` already lands —
+/// of the device supplying compute, the same place `ast ssh` already lands —
 /// and it exists because an OCI image's whole point is the port it listens on.
 /// A cloud image gets there over ssh; a container image has no ssh to get
 /// there over.
@@ -430,16 +430,17 @@ impl Default for Shape {
 /// mean two things — is worse than a command that says what to do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Conflict {
-    /// The device supplying cpu/ram to the other instance of this name.
+    /// The device supplying compute to the other instance of this name.
+    #[serde(alias = "other_compute_device")]
     pub other_cpu_device: String,
     /// When the orbit noticed, Unix seconds.
     pub found_at: u64,
 }
 
-/// The fence a cpu-part swap puts on an instance while its bytes are in
+/// The fence a compute move puts on an instance while its bytes are in
 /// flight.
 ///
-/// Swapping the device that supplies cpu and ram means the instance's disk
+/// Moving compute to another device means the instance's disk
 /// has to move too — one copy, one writer — and for the length of that
 /// transfer there are two directories with the same instance's bytes in
 /// them. Exactly one of them may ever be booted, so the source records this
@@ -448,11 +449,11 @@ pub struct Conflict {
 /// The epoch is the tie-break of last resort. It is monotonic per instance,
 /// it is bumped by the move that lands, and it is written on both shards —
 /// so a device that was partitioned during a move and comes back believing
-/// it still supplies the cpu loses to the higher number, rather than the
+/// it still supplies compute loses to the higher number, rather than the
 /// two of them arguing from equally-plausible rows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Moving {
-    /// The device the cpu part is moving to.
+    /// The device compute is moving to.
     pub to_device: String,
     /// The epoch this move will land on: one past the current one.
     pub epoch: u64,
@@ -464,13 +465,13 @@ pub struct Moving {
 pub struct Instance {
     pub id: String,
     pub name: String,
-    /// The device sourcing this instance's cpu and ram. They come as a pair,
-    /// from wherever the hypervisor runs; it is a sourcing fact about two
-    /// parts, and every other part defaults to the same device.
+    /// The device sourcing this instance's compute. CPU, physical RAM, and
+    /// execution state move together; every other part may default to the
+    /// same device without being owned by it.
     ///
     /// Read from the `anchor` key too, so registries written when this was
     /// framed as an anchoring relationship still load.
-    #[serde(alias = "anchor")]
+    #[serde(alias = "anchor", alias = "compute_device")]
     pub cpu_device: String,
     pub status: Status,
     /// Unix seconds.
@@ -521,7 +522,7 @@ pub struct Instance {
     /// orbit. Every command on it refuses until `ast rename` clears it.
     #[serde(default)]
     pub conflict: Option<Conflict>,
-    /// How many times this instance's cpu part has been swapped onto a
+    /// How many times this instance's compute has been moved onto a
     /// different device. Monotonic, written on both shards by the swap that
     /// bumps it, and the fence that decides between two rows claiming the
     /// same instance: the higher epoch is the live one.
@@ -535,14 +536,14 @@ pub struct Instance {
     ///
     /// A cloud-init seed bakes in the ssh key of the device that *built* it,
     /// so the guest trusts that device's key and no other. Until instances
-    /// could move that was always the device supplying cpu/ram, because that
-    /// is where seeds get built — a cpu-part swap carries the seed rather
+    /// could move that was always the device supplying compute, because that
+    /// is where seeds get built — a compute move carries the seed rather
     /// than rebuilding it, and then the two are different devices. Recorded
     /// so `ast ssh` presents the key the guest will actually accept,
     /// whichever device the command was typed on.
     ///
     /// `None` on records written before instances could move, and on ones
-    /// whose seed has never been built; both fall back to the cpu device,
+    /// whose seed has never been built; both fall back to the compute device,
     /// which is what was true when they were written.
     #[serde(default)]
     pub seed_device: Option<String>,
@@ -553,7 +554,7 @@ pub struct Instance {
     /// request it rides, and the opaque handle this instance's guest was
     /// given instead of it. That is what makes it safe for this to live in a
     /// shard that is written to disk, printed by `ast status`, and carried
-    /// whole to another device by a cpu-part move.
+    /// whole to another device by a compute move.
     ///
     /// Defaulted, so every registry written before secrets had a data plane
     /// loads as an instance with none — which is what it was.
@@ -572,13 +573,13 @@ pub struct Instance {
     /// created without `--profile` still is.
     #[serde(default)]
     pub profiles: Vec<String>,
-    /// Guest paths of volumes the last cpu-part swap left behind.
+    /// Guest paths of volumes the last compute move left behind.
     ///
     /// A directory share is a same-device part: the hypervisor
-    /// shares a directory that is on its own disk. Move the cpu part to
+    /// shares a directory that is on its own disk. Move compute to
     /// another device and that share has nothing to attach to. The row is
     /// *kept* — it is still what the user asked for, and it becomes true
-    /// again the moment the cpu part comes back or the volume is re-sourced
+    /// again the moment compute comes back or the volume is re-sourced
     /// over the mesh — but it is flagged in `ast status` rather than
     /// silently dropped.
     #[serde(default)]
@@ -670,22 +671,27 @@ impl Instance {
 
     /// The device whose guest key this guest trusts. See [`Instance::seed_device`].
     pub fn seeded_by(&self) -> &str {
-        self.seed_device.as_deref().unwrap_or(&self.cpu_device)
+        self.seed_device.as_deref().unwrap_or(self.compute_device())
+    }
+
+    /// The orbit device supplying this instance's compute placement.
+    pub fn compute_device(&self) -> &str {
+        &self.cpu_device
     }
 
     /// The parts this instance is assembled from, in the order `ast status`
     /// prints them.
     ///
     /// Every row names the device the part comes from. Most of them name the
-    /// cpu device, and say so as a default rather than as a fact about
+    /// compute device, and say so as a default rather than as a fact about
     /// ownership: the disk is an overlay on that device's filesystem because
     /// that is where it is cheapest, and egress leaves through that device's
     /// uplink because nothing has been asked to route it elsewhere.
     pub fn parts(&self) -> Vec<Part> {
         let mut parts = vec![
             Part {
-                kind: "cpu/ram".into(),
-                source: self.cpu_device.clone(),
+                kind: "compute".into(),
+                source: self.compute_device().to_owned(),
                 detail: format!("{} cores · {} MiB", self.shape.cpus, self.shape.mem_mib),
                 note: self.moving.as_ref().map(|m| {
                     format!(
@@ -696,7 +702,7 @@ impl Instance {
             },
             Part {
                 kind: "disk".into(),
-                source: self.cpu_device.clone(),
+                source: self.compute_device().to_owned(),
                 detail: format!(
                     "{} GiB · {}",
                     self.shape.disk_gib,
@@ -705,15 +711,17 @@ impl Instance {
                 note: Some(match self.image_kind {
                     // Where the image came from changes what the machine is,
                     // so it is a fact about the disk and it is said out loud.
-                    ImageKind::OciRootfs => "follows cpu · oci rootfs, direct kernel boot".into(),
-                    ImageKind::Disk => "follows cpu".to_owned(),
+                    ImageKind::OciRootfs => {
+                        "follows compute · oci rootfs, direct kernel boot".into()
+                    }
+                    ImageKind::Disk => "follows compute".to_owned(),
                 }),
             },
         ];
         for v in &self.volumes {
             let (detail, note) = match v.kind {
                 // A directory share is same-device by construction, so a
-                // cpu-part swap leaves it pointing at a device that is no
+                // compute move leaves it pointing at a device that is no
                 // longer running the guest. That is the more specific fact
                 // and it goes first: it is what tells a user why something
                 // that used to work does not. The row is kept either way —
@@ -722,7 +730,7 @@ impl Instance {
                     format!("{} -> {}", v.path, v.guest_path()),
                     if self.stranded.iter().any(|p| *p == v.guest_path()) {
                         Some(format!(
-                            "stranded by the cpu move — a directory on {}, and \
+                            "stranded by the compute move — a directory on {}, and \
                              directory shares are same-device only",
                             v.host
                         ))
@@ -781,12 +789,12 @@ impl Instance {
         let published: Vec<String> = self.publish.iter().map(|p| p.to_string()).collect();
         parts.push(Part {
             kind: "network".into(),
-            source: self.cpu_device.clone(),
+            source: self.compute_device().to_owned(),
             detail: match published.is_empty() {
                 true => "user-mode NAT".to_owned(),
                 false => format!("user-mode NAT · {}", published.join(", ")),
             },
-            note: Some("exit default: same as cpu".into()),
+            note: Some("exit default: same as compute".into()),
         });
         parts.push(Part {
             kind: "gpu".into(),
@@ -806,7 +814,7 @@ impl Instance {
 /// it came to be sourced there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Part {
-    /// `cpu/ram`, `disk`, `volume`, `network`, `gpu`.
+    /// `compute`, `disk`, `volume`, `network`, `gpu`.
     pub kind: String,
     /// The device supplying it, or `-` when nothing does.
     pub source: String,
@@ -814,6 +822,14 @@ pub struct Part {
     pub detail: String,
     /// Why it comes from where it does, when that is not obvious.
     pub note: Option<String>,
+}
+
+/// Names that select an instance's whole compute placement on the CLI.
+///
+/// CPU and physical RAM are supplied together. `cpu` remains an alias for
+/// compatibility, but neither resource can be placed independently.
+pub fn is_compute_part(part: &str) -> bool {
+    matches!(part, "compute" | "cpu")
 }
 
 pub fn now_unix() -> u64 {
@@ -861,14 +877,14 @@ mod tests {
         assert_ne!(a.mount_tag(), vol("/tank/media", "laptop").mount_tag());
     }
 
-    /// A guest trusts the key that is in its seed, and a cpu-part swap
+    /// A guest trusts the key that is in its seed, and a compute move
     /// carries the seed rather than rebuilding it — so after a move the
     /// device that opens the guest is not the device running it.
     #[test]
-    fn the_key_that_opens_a_guest_follows_the_seed_not_the_cpu() {
+    fn the_key_that_opens_a_guest_follows_the_seed_not_compute() {
         let mut inst = Instance::new("dev", "laptop", "debian:13", Shape::default(), machine());
         // Nothing recorded: the invariant that held before instances could
-        // move, which is that the cpu device seeded it.
+        // move, which is that the compute device seeded it.
         assert_eq!(inst.seeded_by(), "laptop");
 
         inst.seed_device = Some("laptop".into());
@@ -876,7 +892,7 @@ mod tests {
         assert_eq!(
             inst.seeded_by(),
             "laptop",
-            "the seed did not move with the cpu"
+            "the seed did not move with compute"
         );
     }
 
@@ -894,46 +910,76 @@ mod tests {
         assert_eq!(v.guest_path(), "/srv/media");
     }
 
-    /// The field was called `anchor` when the model still had one. Registries
-    /// written then must load, or an upgrade loses every instance on the
-    /// device.
+    /// Legacy placement keys must load, or an upgrade loses every instance on
+    /// the device. They remain serialization details and are never rendered.
     #[test]
-    fn a_registry_that_says_anchor_still_names_the_cpu_device() {
+    fn legacy_registry_keys_migrate_without_becoming_product_labels() {
         let inst: Instance = serde_json::from_str(
             r#"{"id":"6f1c","name":"dev","anchor":"desktop","status":"stopped",
                 "created_at":1700000000,"volumes":[],"image":"debian:13",
                 "machine":{"backend":"qemu","machine_type":"virt","cpu":"host","hv_version":"test"}}"#,
         )
         .unwrap();
-        assert_eq!(inst.cpu_device, "desktop");
+        assert_eq!(inst.compute_device(), "desktop");
         assert!(inst.conflict.is_none(), "an old record is not in conflict");
 
-        // ...and it is written back in the parts vocabulary.
+        // ...and it is written back under the compatibility wire key only.
         let raw: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&inst).unwrap()).unwrap();
         assert_eq!(raw["cpu_device"], "desktop");
+        assert!(raw.get("anchor").is_none(), "{raw}");
+        assert!(raw.get("compute_device").is_none(), "{raw}");
+
+        let migrated: Instance = serde_json::from_str(
+            r#"{"id":"6f1c","name":"dev","compute_device":"desktop","status":"stopped",
+                "created_at":1700000000,"volumes":[],"image":"debian:13",
+                "machine":{"backend":"qemu","machine_type":"virt","cpu":"host","hv_version":"test"}}"#,
+        )
+        .unwrap();
+        assert_eq!(migrated.compute_device(), "desktop");
     }
 
     #[test]
-    fn every_part_names_the_device_that_supplies_it() {
+    fn compute_is_canonical_and_ram_is_not_a_placement_part() {
+        assert!(is_compute_part("compute"));
+        assert!(is_compute_part("cpu"));
+        assert!(!is_compute_part("ram"));
+        assert!(!is_compute_part("cpu/ram"));
+    }
+
+    #[test]
+    fn status_parts_render_compute_without_cpu_ram_placement() {
         let mut inst = Instance::new("dev", "desktop", "debian:13", Shape::default(), machine());
         inst.volumes.push(vol("/tank/media", "nas"));
         let parts = inst.parts();
 
         let find = |kind: &str| parts.iter().find(|p| p.kind == kind).expect(kind).clone();
-        // cpu and ram come as a pair from one device.
-        assert_eq!(find("cpu/ram").source, "desktop");
-        assert_eq!(find("cpu/ram").detail, "2 cores · 2048 MiB");
+        // Compute (CPU and physical RAM) comes from one device.
+        assert_eq!(find("compute").source, "desktop");
+        assert_eq!(find("compute").detail, "2 cores · 2048 MiB");
         // Disk and egress default to that same device, and say so.
         assert_eq!(find("disk").source, "desktop");
-        assert_eq!(find("disk").note.as_deref(), Some("follows cpu"));
+        assert_eq!(find("disk").note.as_deref(), Some("follows compute"));
         assert_eq!(find("network").source, "desktop");
+        assert_eq!(
+            find("network").note.as_deref(),
+            Some("exit default: same as compute")
+        );
         // A volume is sourced wherever its bytes are, which need not be there.
         assert_eq!(find("volume").source, "nas");
         assert_eq!(find("volume").detail, "/tank/media -> /mnt/ast/media");
         // Nothing in the pool is supplying a gpu.
         assert_eq!(find("gpu").source, "-");
         assert_eq!(find("gpu").detail, "none");
+
+        let rendered = parts
+            .iter()
+            .flat_map(|part| [part.kind.as_str(), part.note.as_deref().unwrap_or_default()])
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("compute"), "{rendered}");
+        assert!(!rendered.contains("cpu/ram"), "{rendered}");
+        assert!(!rendered.contains("ram placement"), "{rendered}");
     }
 
     /// An instance built from a container image is a machine like any other,
@@ -961,7 +1007,7 @@ mod tests {
             .contains("docker.io/library/nginx:latest"));
         assert_eq!(
             find("disk").note.as_deref(),
-            Some("follows cpu · oci rootfs, direct kernel boot")
+            Some("follows compute · oci rootfs, direct kernel boot")
         );
         assert_eq!(
             find("network").detail,

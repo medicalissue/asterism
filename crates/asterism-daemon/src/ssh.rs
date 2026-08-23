@@ -28,7 +28,7 @@ use crate::{instance, Node};
 /// Where `ssh` should be pointed to reach `name`'s guest, and whatever has to
 /// stay alive for that address to keep working.
 ///
-/// When this device supplies the guest's cpu the address is the hypervisor's
+/// When this device supplies the guest's compute the address is the hypervisor's
 /// own forwarded port and nothing needs holding open. When another device
 /// does, the mesh puts a listener here and splices it there, and the returned
 /// [`Splice`] is what the caller must keep to keep it.
@@ -111,7 +111,7 @@ pub(crate) async fn endpoint(
 
 /// The key file that opens a guest, from this device.
 ///
-/// Usually this device's own: the guest was seeded here. After a cpu-part
+/// Usually this device's own: the guest was seeded here. After a compute
 /// swap it is the *seeding* device's, because the seed travelled with the
 /// instance and a guest trusts the key that is in its seed — which is a
 /// property of the instance, not of whoever is running it today.
@@ -119,7 +119,7 @@ async fn guest_identity(inst: &Instance, node: &Node, mesh: Option<&Arc<Mesh>>) 
     // Reached only for a row this device holds, so an instance with nothing
     // recorded was seeded here — that was the invariant before instances
     // could move. Falling back to *this device* rather than to the recorded
-    // cpu device also survives a device rename, which leaves old rows naming
+    // compute device also survives a device rename, which leaves old rows naming
     // a device by a name it no longer answers to.
     let here = node.device_name().await;
     let seeder = inst.seed_device.as_deref().unwrap_or(&here);

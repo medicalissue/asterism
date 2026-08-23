@@ -246,7 +246,7 @@ expect "status proxied from A to B" "name:    $INST" \
 LOCAL_LS="$(ASTERISM_HOME="$A" "$AST" ls --local 2>&1)"
 grep -qF "no instances" <<<"$LOCAL_LS" \
   || fail "A supplies instances of its own, so the proxy assertions prove nothing:"$'\n'"$LOCAL_LS"
-echo "ok: B supplies the instance's cpu and A supplies none"
+echo "ok: B supplies the instance's compute and A supplies none"
 
 # A name that is in nobody's orbit is a local error, with a way out in it.
 refute "an unknown device name is refused locally" "no device named" \
@@ -336,7 +336,7 @@ echo "ok: ast ping — $PING"
 #
 # The only section that boots anything, and the only one that can prove the
 # ssh splice: `ast ssh` on A has to end up talking to a real sshd on a guest
-# whose cpu and ram are being supplied by B. A's daemon binds a loopback port,
+# whose compute is being supplied by B. A's daemon binds a loopback port,
 # pipes it over a mesh stream to B's daemon, and B's daemon connects that to
 # the guest's forwarded ssh port. Neither `ast` nor the user names a device.
 

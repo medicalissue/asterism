@@ -10,7 +10,7 @@ pub fn home_dir() -> PathBuf {
     PathBuf::from(home).join(".asterism")
 }
 
-/// This device's shard of the orbit registry: the instances whose cpu and ram
+/// This device's shard of the orbit registry: the instances whose compute
 /// it supplies.
 pub fn state_path() -> PathBuf {
     home_dir().join("state.json")
@@ -22,7 +22,7 @@ pub fn state_path() -> PathBuf {
 /// a device that is asleep would otherwise take its instances out of `ast ls`
 /// entirely — which would read as "deleted" rather than "out of touch". This
 /// file is what lets those rows still be listed, marked `unknown`, with the
-/// device supplying their cpu named. It is a cache and nothing depends on it
+/// device supplying their compute named. It is a cache and nothing depends on it
 /// being present or fresh.
 pub fn shard_cache_path() -> PathBuf {
     home_dir().join("orbit-shards.json")

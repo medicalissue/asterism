@@ -387,7 +387,7 @@ fn guest_health(handle: &asterism_core::hv::Handle) -> Option<GuestHealth> {
 /// What a request that no area of this daemon claims is told.
 ///
 /// Four families end up here, and each of them was already answered
-/// somewhere else: `ssh` and `set cpu` on the connection that asked, because
+/// somewhere else: `ssh` and `set compute` on the connection that asked, because
 /// they report as they go; the orbit views and the pairing frames in
 /// [`crate::dispatch`], because they are about the orbit rather than about a
 /// shard; the wake frames in [`crate::wake`] and `mesh::serve_stream`,
@@ -658,7 +658,7 @@ pub(crate) fn up(reg: &mut Shard, name: &str, restart: Option<Restart>) -> Resul
     // Normally that is settled at the first boot and never moves again; it
     // moves when the seed is rebuilt, which is why the stamp is compared
     // rather than assumed. `up` only ever runs on the device holding the row,
-    // so that device is this instance's own cpu device.
+    // so that device is this instance's own compute device.
     let stamp = paths::instance_dir(name).join("seed.stamp");
     let before = std::fs::read(&stamp).ok();
     let raised = match tokio::task::block_in_place(|| -> Result<_> {
