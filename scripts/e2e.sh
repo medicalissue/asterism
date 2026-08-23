@@ -19,14 +19,19 @@ cd "$ROOT"
 harness_begin lifecycle
 harness_binaries "$ROOT"
 
-# Fresh, SHORT home: unix socket paths are capped near 104 bytes. macOS has
-# /private/tmp; Linux's equivalent is /tmp.
-if [ -d /private/tmp ] && [ -w /private/tmp ]; then
+# Fresh, SHORT home: unix socket paths are capped near 104 bytes. A hosted
+# exact-artifact gate may name its owned home explicitly so the pull, create
+# and boot all consume one target-bound store. macOS has /private/tmp;
+# Linux's equivalent is /tmp.
+if [ -n "${E2E_HOME:-}" ]; then
+  export ASTERISM_HOME="$E2E_HOME"
+elif [ -d /private/tmp ] && [ -w /private/tmp ]; then
   SHORT_TMP=/private/tmp
+  export ASTERISM_HOME="$SHORT_TMP/ast-e2e-$$"
 else
   SHORT_TMP=/tmp
+  export ASTERISM_HOME="$SHORT_TMP/ast-e2e-$$"
 fi
-export ASTERISM_HOME="$SHORT_TMP/ast-e2e-$$"
 harness_own_home "$ASTERISM_HOME"
 
 # A single-device test has no orbit, so it has no business publishing a
@@ -106,6 +111,36 @@ if [ "$BACKEND" = chv ]; then
   done
 fi
 "$AST" pull "$IMAGE" >/dev/null 2>&1 || fail "pull $IMAGE"
+if [ "$BACKEND" = chv ] && [ -n "${ASTERISM_TEST_ARTIFACTS:-}" ] \
+  && [ -n "${E2E_BOOT_IMAGE_BASENAME:-}" ]; then
+  case "$E2E_BOOT_IMAGE_BASENAME" in
+    *[!A-Za-z0-9._-]* | *..*) fail "invalid boot image basename" ;;
+  esac
+  IMAGE_PATH=
+  for candidate in "$ASTERISM_HOME/images/$E2E_BOOT_IMAGE_BASENAME.raw" \
+    "$ASTERISM_HOME/images/$E2E_BOOT_IMAGE_BASENAME.qcow2"; do
+    [ -f "$candidate" ] || continue
+    [ -z "$IMAGE_PATH" ] \
+      || fail "pull $IMAGE left more than one active catalog artifact"
+    IMAGE_PATH="$candidate"
+  done
+  [ -n "$IMAGE_PATH" ] || fail "pull $IMAGE left no active catalog artifact"
+  IMAGE_PROVENANCE="$IMAGE_PATH.provenance"
+  [ -f "$IMAGE_PROVENANCE" ] \
+    || fail "pull $IMAGE left no provenance for $IMAGE_PATH"
+  {
+    printf 'boot_image=%s\n' "$IMAGE"
+    printf 'boot_image_file=%s\n' "$(basename "$IMAGE_PATH")"
+    printf 'boot_image_provenance_sha256=%s\n' \
+      "$(sha256sum "$IMAGE_PROVENANCE" | awk '{print $1}')"
+    sed -n \
+      -e 's/^content /boot_image_content=/' \
+      -e 's/^size /boot_image_size=/' \
+      -e 's/^source /boot_image_source=/' \
+      -e 's/^derived-from /boot_image_derived_from=/' \
+      "$IMAGE_PROVENANCE"
+  } >>"$ASTERISM_TEST_ARTIFACTS/summary.txt"
+fi
 
 # The backend is named, not left to the daemon.
 #

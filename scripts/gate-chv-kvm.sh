@@ -79,9 +79,26 @@ export AST_BIN="$AST" ASTD_BIN="$ASTD"
 export ASTERISM_CLOUD_HYPERVISOR="$CHV" ASTERISM_VIRTIOFSD="$VIRTIOFSD"
 export ASTERISM_TEST_ARTIFACTS="$ARTIFACTS"
 
+# This gate must not inherit or seed from a login home. Bind both the reusable
+# pull cache and the lifecycle home to the exact product revision, then let
+# e2e.sh perform the visible `ast pull debian:13` in that same owned home
+# before create/up. Product verification gates every copied cache artifact at
+# pull and again at boot; e2e.sh records the active image provenance and the
+# direct-boot payload digests in the exact-run summary.
+GATE_RUN_ROOT="${RUNNER_TEMP:-/tmp}/chv-${EXPECTED_SHA:0:12}"
+export ASTERISM_TEST_CACHE="$GATE_RUN_ROOT/cache"
+export E2E_HOME="$GATE_RUN_ROOT/home"
+mkdir -p "$ASTERISM_TEST_CACHE" "$E2E_HOME"
+{
+  printf 'gate_run_root=%s\n' "$GATE_RUN_ROOT"
+  printf 'gate_cache=%s\n' "$ASTERISM_TEST_CACHE"
+  printf 'gate_home=%s\n' "$E2E_HOME"
+} >>"$ARTIFACTS/summary.txt"
+
 # create/up/vsock-ready/SSH, installed-helper identity, virtiofs, disk
 # snapshot/restore, down/rm. E2E_BACKEND is explicit: fallback cannot pass.
-E2E_BACKEND=chv E2E_DISK_GIB=3 \
+E2E_BACKEND=chv E2E_IMAGE=debian:13 E2E_BOOT_IMAGE_BASENAME=debian-13 \
+E2E_DISK_GIB=3 \
   bash "$ROOT/scripts/e2e.sh" 2>&1 | tee "$ARTIFACTS/lifecycle.log"
 
 # The same exact binaries now operate a local directory and a remote block
