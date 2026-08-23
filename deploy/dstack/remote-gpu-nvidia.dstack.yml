@@ -1,0 +1,52 @@
+# Provider-side real NVIDIA gate for the production remote GPU part.
+#
+# DO NOT apply this configuration from a polecat session.
+# Never run `dstack apply` here. The local dstack server is currently
+# unhealthy (HTTP 500 on / and on the offers path; historically 405 on
+# offers). That is an external execution blocker for Sol, not a reason to
+# weaken the fail-closed harness in-tree.
+#
+# Sol cost-input: show a plan with `echo n | dstack apply -f deploy/dstack/remote-gpu-nvidia.dstack.yml`
+# only after the server is healthy, then apply with an explicit budget.
+# Expected: one on-demand 2x NVIDIA GPU host, CC 7.5+, 16 GB+ each, driver
+# 550+, CUDA 12.4–13.x, max_price 2.50 USD/hour, max_duration 1h, typical
+# spend about 1–3 USD if the gate finishes in under an hour.
+
+type: task
+name: asterism-remote-gpu-nvidia-gate
+
+python: "3.12"
+nvcc: true
+
+repos:
+  - local_path: ../..
+    path: /dstack/run
+
+working_dir: /dstack/run
+
+env:
+  - ASTERISM_NVIDIA_ALLOW_CARGO=1
+  - ASTERISM_SOURCE_ONLY=0
+
+commands:
+  - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+  - . "$HOME/.cargo/env"
+  - rustc --version
+  - nvidia-smi
+  - bash scripts/harness-remote-gpu-nvidia.sh
+
+resources:
+  cpu: 8
+  memory: 32GB
+  disk: 100GB
+  gpu:
+    vendor: nvidia
+    count: 2
+    memory: 16GB..
+    compute_capability: 7.5
+
+spot_policy: on-demand
+max_price: 2.50
+max_duration: 1h
+idle_duration: 5m
+retry: false
