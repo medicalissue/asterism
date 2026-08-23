@@ -14,17 +14,16 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  TARGET_SHA: 6e043bef5f58dfd14d4c53876f4dca5ccf76408b
-  TARGET_TREE: b258de950e54f033eb6b2d8a009eab5509d18fc4
+  PARENT_SHA: 6e043bef5f58dfd14d4c53876f4dca5ccf76408b
+  PARENT_TREE: b258de950e54f033eb6b2d8a009eab5509d18fc4
+  TARGET_SHA: 02ed071c71136fd0f0d2d092513137b4f9133875
+  TARGET_TREE: f2ba30be0f9afa8e523508fccdd5d878919c1aba
   CARGO_TERM_COLOR: always
 
 jobs:
   exact-kvm-lifecycle:
     name: exact v53.0 lifecycle on real KVM
-    # Ubuntu 24.04's current hosted-runner kernel (6.17.0-1022-azure) rejects
-    # the unprivileged mount namespace used by the shipped virtiofsd sandbox.
-    # Keep the product sandbox enabled and use GitHub's supported 22.04 image.
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
       # This checkout supplies only the observer workflow and harness. Product
@@ -59,12 +58,16 @@ jobs:
           git worktree add --detach "$exact" "$TARGET_SHA"
           test "$(git -C "$exact" rev-parse HEAD)" = "$TARGET_SHA"
           test "$(git -C "$exact" rev-parse 'HEAD^{tree}')" = "$TARGET_TREE"
+          test "$(git -C "$exact" rev-parse HEAD^)" = "$PARENT_SHA"
+          test "$(git -C "$exact" rev-parse 'HEAD^^{tree}')" = "$PARENT_TREE"
           evidence="${RUNNER_TEMP}/chv-kvm-evidence"
           mkdir -p "$evidence"
           {
             echo "result=pending"
             echo "source_sha=$TARGET_SHA"
             echo "source_tree=$TARGET_TREE"
+            echo "immutable_parent_sha=$PARENT_SHA"
+            echo "immutable_parent_tree=$PARENT_TREE"
             echo "observer_sha=$GITHUB_SHA"
             echo "host=$(uname -srmo) $(stat -c '%A %U:%G %t:%T' /dev/kvm)"
           } >"$evidence/summary.txt"
@@ -101,6 +104,8 @@ jobs:
           ASTERISM_GATE_SOURCE_DIR: ${{ env.EXACT_SOURCE }}
           ASTERISM_GATE_EXPECTED_SHA: ${{ env.TARGET_SHA }}
           ASTERISM_GATE_EXPECTED_TREE: ${{ env.TARGET_TREE }}
+          ASTERISM_GATE_PARENT_SHA: ${{ env.PARENT_SHA }}
+          ASTERISM_GATE_PARENT_TREE: ${{ env.PARENT_TREE }}
           ASTERISM_GATE_OBSERVER_SHA: ${{ github.sha }}
           AST_BIN: ${{ env.GATE_PREFIX }}/bin/ast
           ASTD_BIN: ${{ env.GATE_PREFIX }}/bin/astd

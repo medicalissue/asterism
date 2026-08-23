@@ -8,6 +8,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SOURCE="${ASTERISM_GATE_SOURCE_DIR:?set ASTERISM_GATE_SOURCE_DIR}"
 EXPECTED_SHA="${ASTERISM_GATE_EXPECTED_SHA:?set ASTERISM_GATE_EXPECTED_SHA}"
 EXPECTED_TREE="${ASTERISM_GATE_EXPECTED_TREE:?set ASTERISM_GATE_EXPECTED_TREE}"
+PARENT_SHA="${ASTERISM_GATE_PARENT_SHA:?set ASTERISM_GATE_PARENT_SHA}"
+PARENT_TREE="${ASTERISM_GATE_PARENT_TREE:?set ASTERISM_GATE_PARENT_TREE}"
 OBSERVER_SHA="${ASTERISM_GATE_OBSERVER_SHA:-$(git -C "$ROOT" rev-parse HEAD)}"
 AST="${AST_BIN:?set AST_BIN to the installed exact-release ast}"
 ASTD="${ASTD_BIN:?set ASTD_BIN to the installed exact-release astd}"
@@ -25,10 +27,16 @@ done
 
 actual_sha="$(git -C "$SOURCE" rev-parse HEAD)"
 actual_tree="$(git -C "$SOURCE" rev-parse 'HEAD^{tree}')"
+actual_parent="$(git -C "$SOURCE" rev-parse 'HEAD^')"
+actual_parent_tree="$(git -C "$SOURCE" rev-parse 'HEAD^^{tree}')"
 [ "$actual_sha" = "$EXPECTED_SHA" ] \
   || fail "source HEAD is $actual_sha, expected $EXPECTED_SHA"
 [ "$actual_tree" = "$EXPECTED_TREE" ] \
   || fail "source tree is $actual_tree, expected $EXPECTED_TREE"
+[ "$actual_parent" = "$PARENT_SHA" ] \
+  || fail "source parent is $actual_parent, expected immutable $PARENT_SHA"
+[ "$actual_parent_tree" = "$PARENT_TREE" ] \
+  || fail "source parent tree is $actual_parent_tree, expected immutable $PARENT_TREE"
 [ -c /dev/kvm ] || fail "/dev/kvm is absent or is not a character device"
 [ -r /dev/kvm ] && [ -w /dev/kvm ] || fail "/dev/kvm is not open read-write"
 
@@ -59,6 +67,8 @@ fi
   printf 'result=pending\n'
   printf 'source_sha=%s\nsource_tree=%s\nobserver_sha=%s\n' \
     "$actual_sha" "$actual_tree" "$OBSERVER_SHA"
+  printf 'immutable_parent_sha=%s\nimmutable_parent_tree=%s\n' \
+    "$actual_parent" "$actual_parent_tree"
   printf 'host=%s %s\n' "$(uname -srmo)" "$(stat -c '%A %U:%G %t:%T' /dev/kvm)"
   printf 'cloud_hypervisor_version=%s\ncloud_hypervisor_sha256=%s\n' \
     "$CLOUD_HYPERVISOR_VERSION" "$actual_chv_digest"

@@ -85,6 +85,16 @@ expect() {
 if [ "$BACKEND" = chv ]; then
   harness_cache_image "$AST" "${E2E_KERNEL_IMAGE:-busybox:musl}" \
     || fail "could not cache the pinned CHV guest kernel payload"
+  KERNEL_DIR="$ASTERISM_HOME/images/kernel"
+  for payload in "$KERNEL_DIR"/*-vmlinuz "$KERNEL_DIR"/*-initrd \
+    "$KERNEL_DIR"/*-virtiofs.ko; do
+    [ -f "$payload" ] || fail "pinned CHV boot payload is missing: $payload"
+    if [ -n "${ASTERISM_TEST_ARTIFACTS:-}" ]; then
+      printf 'boot_payload_sha256[%s]=%s\n' "$(basename "$payload")" \
+        "$(sha256sum "$payload" | awk '{print $1}')" \
+        >>"$ASTERISM_TEST_ARTIFACTS/summary.txt"
+    fi
+  done
 fi
 
 # The image comes from the harness cache, filled once by the binary under
@@ -127,6 +137,18 @@ if [ "$BACKEND" = chv ]; then
     fail "a qemu-system process exists during the CHV lifecycle"
   fi
   echo "ok: CHV pid $VMM_PID is the shipped helper; virtiofsd ownership is durable; no qemu-system exists"
+  GUEST_KERNEL="$($AST ssh "$INST" -- "uname -r")" \
+    || fail "could not read the direct-boot guest kernel release"
+  GUEST_VIRTIOFS="$($AST ssh "$INST" -- \
+    "grep -qw virtiofs /proc/filesystems && echo loaded")" \
+    || fail "the pinned virtiofs module is not loaded in the guest"
+  [ "$GUEST_VIRTIOFS" = loaded ] \
+    || fail "unexpected guest virtiofs state: $GUEST_VIRTIOFS"
+  if [ -n "${ASTERISM_TEST_ARTIFACTS:-}" ]; then
+    printf 'guest_kernel_release=%s\nguest_virtiofs_module=%s\n' \
+      "$GUEST_KERNEL" "$GUEST_VIRTIOFS" \
+      >>"$ASTERISM_TEST_ARTIFACTS/summary.txt"
+  fi
 fi
 
 # First boot: sshd can come up before cloud-init has mounted the volumes,
