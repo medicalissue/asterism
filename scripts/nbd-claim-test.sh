@@ -72,8 +72,10 @@ run_helper "$HELPER" -unix /tmp/fixture.sock /dev/nbd0 -N fixture >/dev/null 2>&
 }
 
 # An interrupted legacy mkdir-to-owner publication is recoverable when no
-# attachment exists; it must not block a later owner forever.
+# attachment exists; an owner without the helper identity is incomplete and
+# must not block a later owner forever.
 mkdir "$STATE/nbd0"
+printf '1000:1000\n' >"$STATE/nbd0/owner"
 run_helper "$HELPER" -unix /tmp/fixture.sock /dev/nbd0 -N fixture >/dev/null 2>&1 || true
 [ ! -e "$STATE/nbd0" ] || {
 	echo "nbd-claim-test: ownerless detached claim was not reclaimed" >&2
