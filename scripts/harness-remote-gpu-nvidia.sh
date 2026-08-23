@@ -20,7 +20,7 @@ CANDIDATE_SHA="$(git rev-parse HEAD)"
 TREE_DIGEST="$(git rev-parse 'HEAD^{tree}')"
 echo "candidate_sha=$CANDIDATE_SHA"
 echo "tree_digest=$TREE_DIGEST"
-echo "base_sha=f656f017de3a0b34ce710350ee5e55fb2cb2e593"
+echo "base_sha=c964b8c6bbcc44bfea02cb1f7e46bf6dd861ed18"
 
 if [ "${ASTERISM_SOURCE_ONLY:-0}" = 1 ]; then
   echo "hardware_cuda_executed=false"
