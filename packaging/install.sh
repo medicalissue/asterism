@@ -285,7 +285,10 @@ receipt_complete() {
 	files="$(receipt_field files || true)"
 	[ -n "$files" ] || return 1
 	for rel in $files; do
-		[ -x "${PREFIX}/${rel}" ] || return 1
+		case "$rel" in
+		*.ps1) [ -f "${PREFIX}/${rel}" ] || return 1 ;;
+		*) [ -x "${PREFIX}/${rel}" ] || return 1 ;;
+		esac
 	done
 	return 0
 }
