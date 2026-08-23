@@ -14,8 +14,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  TARGET_SHA: 9d283c00364d0609a17dd5948a556f6f5b739e07
-  TARGET_TREE: 8d72b2ce1a69fce70362582141800727530a87a6
+  TARGET_SHA: c295bf3948f31971d3f9acbe43c52acad1fc6b43
+  TARGET_TREE: 783bec3f7a6774ff574dc8c013d0af34f814fd69
   CARGO_TERM_COLOR: always
 
 jobs:
