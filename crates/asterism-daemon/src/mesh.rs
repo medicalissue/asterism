@@ -2949,6 +2949,7 @@ pub(crate) async fn abort_live_disk_pump(name: &str, epoch: u64) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_live_splice(
     mut stream: asterism_mesh::MeshStream,
     instance_id: &str,
@@ -3019,6 +3020,7 @@ async fn serve_live_splice(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_disk_splice(
     mut stream: asterism_mesh::MeshStream,
     instance_id: &str,
