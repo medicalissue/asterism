@@ -8,6 +8,7 @@ members = [
     "crates/asterism-coordinator",
     "crates/asterism-vz",
     "crates/asterism-libcuda",
+    "crates/asterism-nvidia-e2e-driver",
 ]
 
 [workspace.package]

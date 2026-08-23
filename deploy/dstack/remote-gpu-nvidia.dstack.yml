@@ -6,7 +6,7 @@
 #
 # Schema: official task reference
 # https://dstack.ai/docs/reference/dstack.yml/task.md
-#   type, name, python, nvcc (mutually exclusive with image), repos.url+hash,
+#   type, name, digest-pinned image, repos.url+hash,
 #   resources.gpu.vendor/count/memory/compute_capability, spot_policy,
 #   max_price, max_duration, idle_duration, retry.
 #
@@ -24,8 +24,8 @@
 type: task
 name: asterism-remote-gpu-nvidia-gate
 
-python: "3.12"
-nvcc: true
+image: docker.io/nvidia/cuda:13.0.0-devel-ubuntu24.04@sha256:435220c0fef35cbf712e11999f8670a83835ef3cdd18564e5e8122f83078c88c
+docker: true
 
 repos:
   - url: https://github.com/medicalissue/asterism.git
@@ -38,11 +38,19 @@ env:
   - ASTERISM_SOURCE_ONLY=0
   - ASTERISM_PINNED_SHA=950db9aed40c04df529e590498159824a9feaf88
   - ASTERISM_NVIDIA_E2E_RUNNER=/dstack/run/scripts/lib/nvidia-e2e-runner.sh
+  - CARGO_HOME=/dstack/cargo
+  - RUSTUP_HOME=/dstack/rustup
+  - PATH=/dstack/cargo/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 commands:
   - test "$(git rev-parse HEAD)" = "$ASTERISM_PINNED_SHA"
   - git rev-parse HEAD
   - git rev-parse HEAD^{tree}
+  - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/asterism-rustup-init.sh
+  - sh /tmp/asterism-rustup-init.sh -y --no-modify-path --profile minimal
+  - cargo --version
+  - cc --version
+  - docker version
   - nvidia-smi
   - bash scripts/harness-remote-gpu-nvidia.sh
 

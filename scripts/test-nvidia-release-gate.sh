@@ -18,6 +18,7 @@ first_gpu_uuid=GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa
 second_gpu_uuid=GPU-bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb
 driver_version=550.54.15
 cuda_runtime_version=12.4
+provenance_verified=true
 guest_image_digest=sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
 provider_image_digest=sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 guest_container_id=asterism-guest-1234
@@ -29,7 +30,7 @@ path=guest-mesh-provider
 direct_path=true
 relay_path=true
 guest_path=/dev/nvidia0
-libcuda_path=/usr/lib/asterism/libcuda.so.1
+libcuda_path=sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
 executor=cuda
 provider_helper_kind=process
 guest_output=6.0,2.0,6.0
@@ -49,6 +50,10 @@ version_skew_fresh_session=true
 version_skew_error=unsupported_version
 mesh_open_bearer=false
 hardware_cuda_executed=true
+driver_digest=sha256:abababababababababababababababababababababababababababababababab
+libcuda_digest=sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+guest_binary_digest=sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd
+transcript_root=blake3:1212121212121212121212121212121212121212121212121212121212121212
 EOF
 
 nvidia_gate_judge "$VALID" >/dev/null
@@ -69,10 +74,12 @@ must_refuse hardware_cuda_executed false
 must_refuse version_skew_error conflict
 must_refuse provider_helper_pid_after 201
 must_refuse mesh_open_bearer true
+must_refuse provenance_verified false
+must_refuse transcript_root caller-authored
 
 RUNNER="$TMP/runner"
 sed -n '/^guest_image_digest=/,$p' "$VALID" \
-  | sed '/^candidate_sha=/d;/^tree_digest=/d;/^runner_digest=/d;/^first_gpu_uuid=/d;/^second_gpu_uuid=/d;/^driver_version=/d;/^cuda_runtime_version=/d' \
+  | sed '/^candidate_sha=/d;/^tree_digest=/d;/^runner_digest=/d;/^first_gpu_uuid=/d;/^second_gpu_uuid=/d;/^driver_version=/d;/^cuda_runtime_version=/d;/^provenance_verified=/d' \
   >"$RUNNER"
 nvidia_gate_validate_runner_evidence "$RUNNER"
 printf 'candidate_sha=%040d\n' 0 >>"$RUNNER"
