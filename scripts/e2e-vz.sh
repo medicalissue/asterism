@@ -469,6 +469,12 @@ expect "rm"     "$INST  removed"  "$AST" rm "$INST"
 
 # ---- an OCI rootfs through VZ's native Linux boot loader ------------------
 
+# Refresh both halves of the OCI boot before cloning them into this run's
+# home. The nginx layers may already be current while the shared kernel input
+# is from an older harness run and lacks a module the VZ lane now requires.
+harness_cache_image "$AST" nginx || fail "could not cache nginx OCI boot inputs"
+harness_seed_images "$ASTERISM_HOME"
+
 # No ssh and no cloud-init are smuggled into this image. Its generated pid 1
 # runs DHCP, the helper resolves that exact lease from the pinned MAC/name,
 # and stdout reaches the same hvc0 console as a cloud-image guest.
