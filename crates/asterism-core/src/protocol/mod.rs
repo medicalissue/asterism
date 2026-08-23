@@ -1243,9 +1243,10 @@ pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
         ("exit_grant", 8),
         ("exit_activate", 8),
         ("exit_revoke", 8),
+        ("exit_discard_pending", 8),
         ("exit_probe", 8),
-        ("exit_tcp", 7),
-        ("exit_udp", 7),
+        ("exit_tcp", 8),
+        ("exit_udp", 8),
     ]
     .into_iter()
     .map(|(name, version)| (name.to_owned(), version))
@@ -1482,11 +1483,12 @@ mod tests {
             "exit_grant",
             "exit_activate",
             "exit_revoke",
+            "exit_discard_pending",
             "exit_probe",
             "exit_tcp",
             "exit_udp",
         ] {
-            assert_eq!(table.get(frame), Some(&7));
+            assert_eq!(table.get(frame), Some(&8));
         }
         for (name, version) in &table {
             assert!(

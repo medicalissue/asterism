@@ -57,12 +57,13 @@
 //!    a note so that asking it directly gets "moved to desktop" rather than
 //!    "no such instance".
 //!
-//! Any failure before step 3's ack is an abort: the target's staging
-//! directory goes, the source's fence comes off, and the source's row — which
-//! never stopped being the authoritative one — is authoritative again. The
-//! epoch is what settles the case nothing else can: two rows for one instance
-//! id, from two devices that could not see each other, are decided by the
-//! higher number.
+//! A failure before target publication is an abort: target staging goes and
+//! the source fence may come off.  A failure after publication is different:
+//! the target remains authoritative and the source stays fenced until its
+//! idempotent revoke/removal is retried.  The target transition record makes
+//! an uncertain publication rollback-safe across a restart.  The epoch still
+//! settles the case nothing else can: two rows for one instance id, from two
+//! devices that could not see each other, are decided by the higher number.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -189,6 +190,39 @@ pub struct Receipt {
     pub bytes: u64,
     /// Per file, relative path to bytes written.
     pub files: BTreeMap<String, u64>,
+}
+
+/// A target-side commit that has published the directory but has not yet
+/// completed every authority hand-off.  It lives *inside* the directory so
+/// the staging-to-live rename carries it atomically.  Keeping it until the
+/// registry save and grant activation succeed gives a later abort/retry all
+/// of the state it needs to revoke an adopted grant before reopening source
+/// authority.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TargetTransition {
+    epoch: u64,
+    instance_id: String,
+    #[serde(default)]
+    exit_point: Option<asterism_core::network::ExitPoint>,
+}
+
+impl TargetTransition {
+    fn path(dir: &Path) -> PathBuf {
+        dir.join(".move-target-transition.json")
+    }
+
+    fn save(&self, dir: &Path) -> Result<()> {
+        durable::commit_json_private(&Self::path(dir), self)
+            .context("recording target-side move transition")
+    }
+
+    fn load(dir: &Path) -> Result<Option<Self>> {
+        match std::fs::read(Self::path(dir)) {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).context("reading target-side move transition"),
+        }
+    }
 }
 
 impl Receipt {
@@ -420,7 +454,7 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
         }
         Request::MoveCommitSource { name, epoch } => commit_source(reg, &name, epoch).await,
         Request::MoveAbortSource { name, epoch } => abort_source(reg, &name, epoch),
-        Request::MoveAbortTarget { name, epoch } => abort_target(&name, epoch),
+        Request::MoveAbortTarget { name, epoch } => abort_target(reg, &name, epoch).await,
         other => Response::Error {
             message: format!("{other:?} is not a step of a move"),
         },
@@ -526,6 +560,7 @@ pub async fn commit_source(reg: &mut Shard, name: &str, epoch: u64) -> Response 
     // its own identity; revoke the source identity before deleting this row
     // so a crash leaves a retryable fenced source rather than an orphaned
     // authority.
+    crate::exit_point::test_pause("move_before_source_revoke").await;
     if let Err(e) = crate::exit_point::revoke(&inst).await {
         return error(e.context("revoking source-bound exit grants before CPU move commit"));
     }
@@ -803,6 +838,17 @@ pub async fn commit_target(
             return error(anyhow!("{e}"));
         }
     }
+    // This marker crosses the publish rename with the directory.  Do not
+    // remove it until the row and any replacement exit grants are active:
+    // an error after `publish_dir` is no longer a pre-publish abort.
+    let mut transition = TargetTransition {
+        epoch,
+        instance_id: manifest.instance.id.clone(),
+        exit_point: None,
+    };
+    if let Err(e) = transition.save(&staging) {
+        return error(e);
+    }
     // The rename first, then the receipt: a rename that fails leaves the
     // staging directory exactly as it was, receipt included, so the move can
     // be aborted or retried against something that still adds up.
@@ -817,6 +863,7 @@ pub async fn commit_target(
             staging.display()
         ));
     }
+    crate::exit_point::test_pause("move_after_live_publish").await;
     let _ = std::fs::remove_file(Receipt::path(&live));
 
     let mut adopted = manifest.instance.clone();
@@ -838,7 +885,16 @@ pub async fn commit_target(
         // source grant here would either fail every flow or authorize the
         // wrong immutable consumer after a move.
         match crate::exit_point::regrant_for_cpu_move(&adopted, exit).await {
-            Ok(exit) => adopted.exit_point = Some(exit),
+            Ok(exit) => {
+                transition.exit_point = Some(exit.clone());
+                if let Err(e) = transition.save(&live) {
+                    return error(e.context(
+                        "recording replacement exit grants before target registry adoption",
+                    ));
+                }
+                adopted.exit_point = Some(exit);
+                crate::exit_point::test_pause("move_after_regrant").await;
+            }
             Err(e) => return error(e.context("granting exit policy to the moved CPU device")),
         }
     }
@@ -850,10 +906,15 @@ pub async fn commit_target(
             // The registry is durable before activation, matching ordinary
             // attachment recovery. A restart can therefore retry a pending
             // activation without ever reviving the source-bound generation.
+            crate::exit_point::test_pause("move_after_target_adoption").await;
             if let Err(e) = crate::exit_point::activate(&instance).await {
                 return error(e.context("activating exit grants for moved CPU device"));
             }
+            crate::exit_point::test_pause("move_after_target_activation").await;
             crate::exit_point::update(&instance.name, instance.exit_point.clone());
+            if let Err(e) = std::fs::remove_file(TargetTransition::path(&live)) {
+                return error(anyhow!(e).context("clearing completed target-side move transition"));
+            }
             Response::Instance {
                 instance,
                 guest_health: None,
@@ -912,11 +973,75 @@ fn verify(staging: &Path, manifest: &MoveManifest, epoch: u64) -> Result<()> {
     Ok(())
 }
 
-/// Delete a staging directory. What an abort owes the target.
-pub fn abort_target(name: &str, epoch: u64) -> Response {
+/// Undo every target-side artifact of a move that did not reach source
+/// commit.  It deliberately handles both staging and a published live
+/// directory: after the rename, merely deleting staging and unfencing the
+/// source would create two possible CPU authorities.
+pub async fn abort_target(reg: &mut Shard, name: &str, epoch: u64) -> Response {
     let staging = staging_dir(name, epoch);
+    let live = paths::instance_dir(name);
+    let transition = match TargetTransition::load(&live) {
+        Ok(transition) => transition,
+        Err(error) => return error(error),
+    };
+    if let Some(transition) = transition {
+        if transition.epoch != epoch {
+            return error(anyhow!(
+                "target directory for {name:?} belongs to move epoch {}, not {epoch}",
+                transition.epoch
+            ));
+        }
+        let staged_exit =
+            match crate::exit_point::abort_staged_move_transition(name, &transition.instance_id)
+                .await
+            {
+                Ok(staged) => staged,
+                Err(error) => {
+                    return error(
+                        error.context("rolling back target exit transition during move rollback"),
+                    )
+                }
+            };
+        // A grant may have been obtained before a registry save or activation
+        // failure.  Reconstruct only its target-bound authority from the
+        // marker and revoke it before removing the durable evidence.
+        if !staged_exit {
+            if let Some(exit_point) = transition.exit_point {
+                if let Err(error) =
+                    crate::exit_point::revoke_staged(&transition.instance_id, &exit_point).await
+                {
+                    return error(
+                        error.context("revoking target exit grants during move rollback"),
+                    );
+                }
+            }
+        }
+        if reg.holds(name) {
+            let adopted = match reg.get(name).cloned() {
+                Ok(instance) if instance.move_epoch == epoch => instance,
+                Ok(instance) => {
+                    return error(anyhow!(
+                        "target row for {name:?} is at move epoch {}, not {epoch}",
+                        instance.move_epoch
+                    ))
+                }
+                Err(error) => return error(error),
+            };
+            if let Err(error) = reg.remove(name).and_then(|_| reg.save()) {
+                return error(
+                    error.context("removing target registry authority during move rollback"),
+                );
+            }
+            crate::exit_point::update(&adopted.name, None);
+        }
+        if let Err(error) = std::fs::remove_dir_all(&live) {
+            return error(error.into());
+        }
+    }
     match std::fs::remove_dir_all(&staging) {
-        Ok(()) | Err(_) => Response::Ok,
+        Ok(()) => Response::Ok,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Response::Ok,
+        Err(error) => error(error.into()),
     }
 }
 
@@ -1021,6 +1146,46 @@ pub async fn run(
     }
 
     let mut manifest = offer_of(name, &source, node, mesh).await?;
+    // A previous coordinator can die after the target has published its
+    // directory or replacement grants.  Finish its durable rollback before
+    // choosing a new epoch; opening the source fence first would turn that
+    // interrupted target into a second authority.
+    if let Some(moving) = manifest.instance.moving.clone() {
+        expect_ok(
+            ask(
+                &moving.to_device,
+                Request::MoveAbortTarget {
+                    name: name.to_owned(),
+                    epoch: moving.epoch,
+                },
+                node,
+                mesh,
+            )
+            .await?,
+        )
+        .with_context(|| {
+            format!(
+                "cannot recover interrupted move of {name:?}: target {} still has durable move state; source remains fenced",
+                moving.to_device
+            )
+        })?;
+        expect_ok(
+            ask(
+                &source,
+                Request::MoveAbortSource {
+                    name: name.to_owned(),
+                    epoch: moving.epoch,
+                },
+                node,
+                mesh,
+            )
+            .await?,
+        )
+        .with_context(|| {
+            format!("target rollback completed but could not reopen {source}'s fence")
+        })?;
+        manifest = offer_of(name, &source, node, mesh).await?;
+    }
     if manifest.instance.status == Status::Running {
         if !down {
             bail!(
@@ -1121,9 +1286,13 @@ pub async fn run(
 
     let outcome = transfer_and_commit(&manifest, &source, device, epoch, node, mesh, io).await;
     if let Err(e) = outcome {
-        // Nothing the target staged is bootable and nothing has been written
-        // to its shard, so this is a tidy-up rather than a rollback.
-        let _ = ask(
+        // A target error is ambiguous to the coordinator: it may have
+        // happened before publish, after the live rename, after row adoption,
+        // or after a grant activation.  Its durable transition record makes
+        // this abort idempotent across all of those phases.  Never lift the
+        // source fence unless that cleanup confirms every target authority is
+        // gone.
+        let target_cleanup = ask(
             device,
             Request::MoveAbortTarget {
                 name: name.to_owned(),
@@ -1132,8 +1301,14 @@ pub async fn run(
             node,
             mesh,
         )
-        .await;
-        let _ = ask(
+        .await
+        .and_then(expect_ok);
+        if let Err(cleanup) = target_cleanup {
+            return Err(e.context(format!(
+                "target cleanup failed after an uncertain publish: {cleanup:#}; {source} remains fenced so no second authority is opened"
+            )));
+        }
+        let source_cleanup = ask(
             &source,
             Request::MoveAbortSource {
                 name: name.to_owned(),
@@ -1142,13 +1317,43 @@ pub async fn run(
             node,
             mesh,
         )
-        .await;
+        .await
+        .and_then(expect_ok);
+        if let Err(cleanup) = source_cleanup {
+            return Err(e.context(format!(
+                "target cleanup completed, but {source}'s fence could not be reopened: {cleanup:#}"
+            )));
+        }
         io.send(&line(format!(
             "the move did not happen — {source} still supplies {name}'s cpu"
         )))
         .await?;
         return Err(e);
     }
+
+    // Once the target has acknowledged a durable row and activated its
+    // target-bound grants, it is the authority.  A failed source revoke must
+    // not roll it back or reopen the old source: the source remains fenced
+    // and this exact, idempotent commit can be retried after restart.
+    expect_ok(
+        ask(
+            &source,
+            Request::MoveCommitSource {
+                name: name.to_owned(),
+                epoch,
+            },
+            node,
+            mesh,
+        )
+        .await?,
+    )
+    .with_context(|| {
+        format!(
+            "{device} now authoritatively holds {name:?} at epoch {epoch}; {source} remains fenced until its source-grant revocation and cleanup retry succeeds"
+        )
+    })?;
+    io.send(&line(format!("{source} has dropped its copy")))
+        .await?;
 
     io.send(&Response::Move {
         text: format!(
@@ -1160,7 +1365,9 @@ pub async fn run(
     .await
 }
 
-/// Phases two and three: the bytes, then the two commits in order.
+/// Phases two and three through target publication.  Source cleanup is a
+/// separate phase in [`run`], because a failure there must preserve, rather
+/// than roll back, the newly published target authority.
 #[allow(clippy::too_many_arguments)]
 async fn transfer_and_commit(
     manifest: &MoveManifest,
@@ -1196,29 +1403,6 @@ async fn transfer_and_commit(
     )))
     .await?;
 
-    // Past this point the move has happened. A source that will not answer
-    // now leaves a stale copy rather than losing one, and the epoch on the
-    // target's row is what settles which is which.
-    expect_ok(
-        ask(
-            source,
-            Request::MoveCommitSource {
-                name: name.clone(),
-                epoch,
-            },
-            node,
-            mesh,
-        )
-        .await?,
-    )
-    .with_context(|| {
-        format!(
-            "{device} has {name:?} at epoch {epoch} and {source} would not let go of \
-             its copy — the higher epoch is the live one, and {source}'s copy is stale"
-        )
-    })?;
-    io.send(&line(format!("{source} has dropped its copy")))
-        .await?;
     Ok(())
 }
 
@@ -1323,6 +1507,31 @@ mod tests {
         assert_ne!(staged, paths::instance_dir("dev"));
         // Same parent, so the commit is a rename rather than a copy.
         assert_eq!(staged.parent(), paths::instance_dir("dev").parent());
+    }
+
+    /// The rollback state must survive the one-way staging-to-live rename.
+    /// These are the failure-injection boundaries after publication: regrant,
+    /// target-row adoption, grant activation, and source revoke all need a
+    /// durable target record before the coordinator may ever reopen source.
+    #[test]
+    fn published_target_keeps_a_durable_rollback_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("dev.moving-9");
+        let live = dir.path().join("dev");
+        std::fs::create_dir(&staging).unwrap();
+        let transition = TargetTransition {
+            epoch: 9,
+            instance_id: "instance-id".into(),
+            exit_point: None,
+        };
+        transition.save(&staging).unwrap();
+        std::fs::rename(&staging, &live).unwrap();
+
+        let recovered = TargetTransition::load(&live).unwrap().unwrap();
+        assert_eq!(recovered.epoch, 9);
+        assert_eq!(recovered.instance_id, "instance-id");
+        assert!(recovered.exit_point.is_none());
+        assert!(TargetTransition::path(&live).exists());
     }
 
     /// The manifest carries bare hex, because that is what [`digest_of`]

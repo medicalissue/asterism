@@ -432,6 +432,64 @@ pub(crate) async fn revoke(inst: &Instance) -> Result<()> {
     Ok(())
 }
 
+/// Revoke a target-side grant set that was durably staged before the target
+/// could safely publish its registry row.  CPU-move rollback has only the
+/// transition record at that point, not necessarily an [`Instance`] in the
+/// shard, but the provider authorizes by immutable instance id and grant
+/// generation, which are both recorded there.
+pub(crate) async fn revoke_staged(instance_id: &str, exit: &ExitPoint) -> Result<()> {
+    revoke_staged_grants(instance_id, &exit.grants).await
+}
+
+async fn revoke_staged_grants(
+    instance_id: &str,
+    grants: &BTreeMap<String, ExitGrant>,
+) -> Result<()> {
+    for (provider, grant) in grants {
+        let mesh = MESH
+            .get()
+            .and_then(Option::as_ref)
+            .context("remote exit revocation requires the authenticated mesh")?;
+        mesh.revoke_exit_grant(provider, instance_id, grant.generation)
+            .await
+            .with_context(|| format!("revoking staged exit grant from {provider:?}"))?;
+    }
+    Ok(())
+}
+
+/// Undo the exit transition which [`regrant_for_cpu_move`] stages in the
+/// target's just-published directory.  The target transition marker is
+/// written before a grant is requested, so this closes the narrow crash
+/// window after a provider minted a grant but before that marker could be
+/// updated with its generation.
+pub(crate) async fn abort_staged_move_transition(name: &str, instance_id: &str) -> Result<bool> {
+    let path = asterism_core::paths::instance_dir(name).join("exit-transition.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("reading staged target exit transition"),
+    };
+    let transition: ExitTransition =
+        serde_json::from_slice(&bytes).context("decoding staged target exit transition")?;
+    if !transition.pending_scopes.is_empty() {
+        let mesh = MESH
+            .get()
+            .and_then(Option::as_ref)
+            .context("target move cleanup requires the authenticated mesh")?;
+        for provider in &transition.pending_scopes {
+            mesh.discard_pending_exit_grants(provider, instance_id)
+                .await
+                .with_context(|| format!("discarding target pending grants on {provider:?}"))?;
+        }
+    }
+    revoke_staged_grants(instance_id, &transition.pending).await?;
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error).context("clearing rolled-back target exit transition"),
+    }
+}
+
 /// Raise the stable guest edge before the hypervisor starts.
 ///
 /// The listener is loopback-only and the backend receives only its endpoint
