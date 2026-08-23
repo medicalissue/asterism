@@ -376,6 +376,9 @@ impl Hypervisor for Chv {
         &self,
         inst: &asterism_core::instance::Instance,
     ) -> Result<Option<String>> {
+        // TAP + static address, no DHCP. The seed builder writes this as
+        // NoCloud `network-config` so cloud-init applies it before its
+        // Network Stage. Reached through the trait, not by matching on id.
         Ok(Some(network_config(&Network::for_instance(&inst.name))))
     }
 

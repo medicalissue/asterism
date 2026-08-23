@@ -402,16 +402,25 @@ pub fn boot_req<'a>(inst: &'a Instance, hv: &dyn Hypervisor) -> Result<BootReq<'
 
     // The backend gets to add what its own devices need — for vz, the
     // `/dev/hvc0` console no stock cloud image knows about, and the agent
-    // that answers on the guest's virtio socket.
+    // that answers on the guest's virtio socket. A TAP backend that does
+    // not run DHCP also supplies a NoCloud network-config document here,
+    // through the same trait, so orchestration never branches on id().
     let guest_config = hv
         .guest_config(inst)
         .with_context(|| format!("preparing what the {} backend puts in a guest", hv.id()))?;
+    let network_config = hv.guest_network_config(inst).with_context(|| {
+        format!(
+            "preparing the network-config the {} backend puts in a guest",
+            hv.id()
+        )
+    })?;
     seed::ensure(
         &inst.name,
         &req.seed,
         &shares,
         share_kind,
         &guest_config,
+        network_config.as_deref(),
         &egress,
         &bootstrap,
     )
@@ -663,7 +672,8 @@ pub(crate) fn observed_running(h: &Handle) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
     use std::process::{Child, Command};
     use std::time::Duration;
 
@@ -1597,5 +1607,159 @@ mod tests {
             .expect("xen is not available")
             .to_string();
         assert!(error.contains("created for the xen backend"), "{error}");
+    }
+
+    fn cloud_instance(name: &str, backend: &str) -> Instance {
+        Instance::new(
+            name,
+            "laptop",
+            "debian:13",
+            asterism_core::instance::Shape {
+                cpus: 2,
+                mem_mib: 2048,
+                disk_gib: 20,
+            },
+            Machine {
+                backend: backend.into(),
+                machine_type: "t".into(),
+                cpu: "host".into(),
+                hv_version: "1".into(),
+            },
+        )
+    }
+
+    /// Orchestration reaches network-config through the trait. QEMU and VZ
+    /// keep the default (DHCP); CHV supplies a NoCloud document. Branching
+    /// on `id()` here would be the ad hoc seam this method exists to avoid.
+    #[test]
+    fn guest_network_config_is_reached_through_the_trait() {
+        let inst = cloud_instance("agent-one", chv::ID);
+        assert_eq!(
+            by_id(qemu::ID)
+                .unwrap()
+                .guest_network_config(&inst)
+                .unwrap(),
+            None,
+            "user-mode net already runs DHCP"
+        );
+        assert_eq!(
+            by_id(vz::ID).unwrap().guest_network_config(&inst).unwrap(),
+            None
+        );
+        let doc = by_id(chv::ID)
+            .unwrap()
+            .guest_network_config(&inst)
+            .unwrap()
+            .expect("CHV TAP guests need a NoCloud network-config");
+        assert!(doc.starts_with("version: 2\n"), "{doc}");
+        assert!(doc.contains("eth0:"), "{doc}");
+        assert!(doc.contains("macaddress:"), "{doc}");
+    }
+
+    #[test]
+    fn every_backend_source_file_is_registered_in_mod() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/backend");
+        let mod_rs = std::fs::read_to_string(dir.join("mod.rs")).expect("backend/mod.rs");
+        let mut unregistered = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("backend/") {
+            let name = entry.expect("backend entry").file_name();
+            let name = name.to_string_lossy();
+            if !name.ends_with(".rs") || name == "mod.rs" {
+                continue;
+            }
+            let stem = name.trim_end_matches(".rs");
+            let registered = mod_rs.lines().any(|line| {
+                let line = line.trim();
+                line == format!("mod {stem};")
+                    || line == format!("pub mod {stem};")
+                    || line == format!("pub(crate) mod {stem};")
+            });
+            if !registered {
+                unregistered.push(stem.to_string());
+            }
+        }
+        assert!(
+            unregistered.is_empty(),
+            "backend source files compile only when mod.rs names them; \
+             unregistered files hide Hypervisor trait drift: {unregistered:?}"
+        );
+    }
+
+    #[test]
+    fn hypervisor_impls_in_backend_sources_are_trait_coherent() {
+        let trait_src =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../asterism-core/src/hv.rs");
+        let trait_src = std::fs::read_to_string(&trait_src).expect("hv.rs");
+        let trait_fns = fn_names_in_item(
+            trait_src
+                .split("pub trait Hypervisor")
+                .nth(1)
+                .expect("Hypervisor trait"),
+        );
+        assert!(
+            trait_fns.contains("guest_network_config"),
+            "the boot network-config seam has to live on the trait: {trait_fns:?}"
+        );
+
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/backend");
+        let mut drift = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("backend/") {
+            let path = entry.expect("backend entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("backend source");
+            let file = path.file_name().unwrap().to_string_lossy();
+            for name in impl_hypervisor_fns(&src) {
+                if !trait_fns.contains(name.as_str()) {
+                    drift.push(format!("{file}::{name}"));
+                }
+            }
+        }
+        assert!(
+            drift.is_empty(),
+            "Hypervisor impl methods missing from the trait (E0407 once the \
+             file is compiled; this source test catches it even when the file \
+             is not registered): {drift:?}"
+        );
+    }
+
+    fn impl_hypervisor_fns(src: &str) -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+        let mut from = 0usize;
+        for line in src.lines() {
+            if line.trim_start().starts_with("impl Hypervisor for") {
+                names.extend(fn_names_in_item(&src[from..]));
+            }
+            from += line.len() + 1;
+        }
+        names
+    }
+
+    fn fn_names_in_item(src: &str) -> BTreeSet<String> {
+        let Some(open) = src.find('{') else {
+            return BTreeSet::new();
+        };
+        let mut names = BTreeSet::new();
+        let mut depth = 0usize;
+        for line in src[open..].lines() {
+            if depth == 1 {
+                let trimmed = line.trim_start();
+                if let Some(rest) = trimmed.strip_prefix("fn ") {
+                    if let Some(name) = rest.split('(').next() {
+                        let name = name.trim();
+                        if !name.is_empty() {
+                            names.insert(name.to_string());
+                        }
+                    }
+                }
+            }
+            depth += line.chars().filter(|&c| c == '{').count();
+            depth = depth.saturating_sub(line.chars().filter(|&c| c == '}').count());
+            if depth == 0 {
+                break;
+            }
+        }
+        names
     }
 }

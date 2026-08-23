@@ -127,6 +127,12 @@ pub fn shares(inst: &Instance) -> Vec<Share> {
 /// [`crate::hv::Hypervisor::guest_config`]. It is appended verbatim, so it
 /// arrives in the guest exactly as the backend wrote it.
 ///
+/// `network` is a NoCloud `network-config` document the *backend* needs
+/// in the guest — see [`crate::hv::Hypervisor::guest_network_config`]. It
+/// is written as a sibling of `user-data`, not merged into cloud-config,
+/// because cloud-init applies it before its Network Stage. `None` or empty
+/// writes no file and does not move the fingerprint.
+///
 /// `bootstrap` is the instance's profiles ([`crate::profile`]), and it rides
 /// the same mechanism for the same reason: bump a profile's version and the
 /// fingerprint moves, so a guest that has been up for a month applies the
@@ -138,6 +144,7 @@ pub fn ensure(
     shares: &[Share],
     share_kind: Option<ShareKind>,
     extra: &str,
+    network: Option<&str>,
     egress: &Egress,
     bootstrap: &Bootstrap,
 ) -> Result<()> {
@@ -145,12 +152,14 @@ pub fn ensure(
         bail!("cannot build mount units without a directory-share transport");
     }
     let stamp_path = seed.with_file_name("seed.stamp");
-    let stamp = fingerprint(name, shares, share_kind, extra, egress, bootstrap);
+    let stamp = fingerprint(name, shares, share_kind, extra, network, egress, bootstrap);
     let current = std::fs::read_to_string(&stamp_path).unwrap_or_default();
     if seed.exists() && current.trim() == stamp {
         return Ok(());
     }
-    build(name, seed, shares, share_kind, extra, egress, bootstrap)?;
+    build(
+        name, seed, shares, share_kind, extra, network, egress, bootstrap,
+    )?;
     std::fs::write(&stamp_path, &stamp)?;
     Ok(())
 }
@@ -164,11 +173,13 @@ pub fn ensure(
 /// line, so adding backend cloud-config to this module does not reissue the
 /// seed of every instance that does not use any — a reissued seed carries a
 /// new `instance-id`, which makes a guest run its first-boot work again.
+/// A missing or empty `network` is folded the same way, for the same reason.
 fn fingerprint(
     name: &str,
     shares: &[Share],
     share_kind: Option<ShareKind>,
     extra: &str,
+    network: Option<&str>,
     egress: &Egress,
     bootstrap: &Bootstrap,
 ) -> String {
@@ -188,6 +199,9 @@ fn fingerprint(
     }
     if !extra.is_empty() {
         material.push_str(extra);
+    }
+    if let Some(network) = nocloud_network_config(network) {
+        material.push_str(network);
     }
     // Folded in whole, and the port with it: a proxy that comes back on a
     // different port is a guest that has to be told, and the only way to tell
@@ -228,10 +242,11 @@ fn build(
     shares: &[Share],
     share_kind: Option<ShareKind>,
     extra: &str,
+    network: Option<&str>,
     egress: &Egress,
     bootstrap: &Bootstrap,
 ) -> Result<()> {
-    let stamp = fingerprint(name, shares, share_kind, extra, egress, bootstrap);
+    let stamp = fingerprint(name, shares, share_kind, extra, network, egress, bootstrap);
     let mut keys = vec![ensure_asterism_key()?];
     if let Ok(home) = std::env::var("HOME") {
         if let Ok(entries) = std::fs::read_dir(PathBuf::from(home).join(".ssh")) {
@@ -274,8 +289,7 @@ fn build(
     let stage = seed.parent().unwrap().join("seed-files");
     let _ = std::fs::remove_dir_all(&stage);
     std::fs::create_dir_all(&stage)?;
-    std::fs::write(stage.join("user-data"), user_data)?;
-    std::fs::write(stage.join("meta-data"), meta_data)?;
+    write_nocloud_files(&stage, &user_data, &meta_data, network)?;
 
     let _ = std::fs::remove_file(seed);
     if cfg!(target_os = "macos") {
@@ -303,6 +317,27 @@ fn build(
         run(&mut cmd)?;
     }
     let _ = std::fs::remove_dir_all(&stage);
+    Ok(())
+}
+
+/// A NoCloud `network-config` document the seed should carry, or nothing.
+/// Empty is nothing: adding this slot must not reissue seeds that do not
+/// use it.
+fn nocloud_network_config(network: Option<&str>) -> Option<&str> {
+    network.filter(|body| !body.is_empty())
+}
+
+fn write_nocloud_files(
+    stage: &Path,
+    user_data: &str,
+    meta_data: &str,
+    network: Option<&str>,
+) -> Result<()> {
+    std::fs::write(stage.join("user-data"), user_data)?;
+    std::fs::write(stage.join("meta-data"), meta_data)?;
+    if let Some(network) = nocloud_network_config(network) {
+        std::fs::write(stage.join("network-config"), network)?;
+    }
     Ok(())
 }
 
@@ -917,6 +952,19 @@ mod tests {
             &local_host(),
             Some(guest_path.into()),
         ))
+    }
+
+    /// Tests that do not speak network-config keep the pre-seam fingerprint
+    /// helper: a missing document must not move existing seeds.
+    fn fingerprint(
+        name: &str,
+        shares: &[Share],
+        share_kind: Option<ShareKind>,
+        extra: &str,
+        egress: &Egress,
+        bootstrap: &Bootstrap,
+    ) -> String {
+        super::fingerprint(name, shares, share_kind, extra, None, egress, bootstrap)
     }
 
     /// The shape a backend's `Hypervisor::guest_config` has: keys of its
@@ -1551,6 +1599,77 @@ mod tests {
                 &bare,
                 &Bootstrap::default()
             )
+        );
+    }
+
+    #[test]
+    fn nocloud_network_config_is_absent_when_the_backend_has_none() {
+        assert_eq!(nocloud_network_config(None), None);
+        assert_eq!(nocloud_network_config(Some("")), None);
+        assert_eq!(
+            nocloud_network_config(Some("version: 2\n")),
+            Some("version: 2\n")
+        );
+    }
+
+    #[test]
+    fn a_network_config_reissues_the_seed_and_an_empty_one_does_not() {
+        let none = super::fingerprint(
+            "dev",
+            &[],
+            None,
+            "",
+            None,
+            &Egress::default(),
+            &Bootstrap::default(),
+        );
+        assert_eq!(
+            none,
+            super::fingerprint(
+                "dev",
+                &[],
+                None,
+                "",
+                Some(""),
+                &Egress::default(),
+                &Bootstrap::default(),
+            )
+        );
+        assert_ne!(
+            none,
+            super::fingerprint(
+                "dev",
+                &[],
+                None,
+                "",
+                Some("version: 2\n"),
+                &Egress::default(),
+                &Bootstrap::default(),
+            )
+        );
+    }
+
+    #[test]
+    fn the_seed_stage_writes_network_config_only_when_the_backend_supplies_one() {
+        let dir = tempfile::tempdir().unwrap();
+        write_nocloud_files(dir.path(), "#cloud-config\n", "instance-id: x\n", None).unwrap();
+        assert!(dir.path().join("user-data").is_file());
+        assert!(dir.path().join("meta-data").is_file());
+        assert!(
+            !dir.path().join("network-config").exists(),
+            "DHCP backends must not grow a network-config file"
+        );
+
+        write_nocloud_files(
+            dir.path(),
+            "#cloud-config\n",
+            "instance-id: x\n",
+            Some("version: 2\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("network-config")).unwrap(),
+            "version: 2\n"
         );
     }
 
