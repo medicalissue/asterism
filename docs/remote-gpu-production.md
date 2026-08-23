@@ -8,10 +8,21 @@ generated `libcuda.so.1`), not a provider hostname, relay URL, or mesh
 session. The durable `GpuAttachment` record is still token-free metadata;
 the executable projection lives in [`remote-gpu-guest.md`](remote-gpu-guest.md).
 
-`Executor::Reference` remains the portable semantic executor. A provider may
-advertise `Executor::Cuda` only when its executor actually launches the
-pinned work on NVIDIA hardware. This document does not claim that hardware
-path.
+Production providers connect [`ProductionProvider::connect`] to a CUDA
+executor that loads the NVIDIA driver API (`libcuda`), verifies GPU UUID,
+driver, CUDA toolkit version and compute capability against the fail-closed
+matrix, and executes the versioned remote ABI. `Executor::Reference` remains
+the portable semantic proof and is test-only: it is never registered in
+daemon/mesh routing and can never satisfy a hardware PASS.
+`hardware_cuda_executed` is true only when the live NVIDIA driver launched
+work.
+
+Each `GpuLease.memory_bytes` and the aggregate of live device reservations
+are enforced on every allocation, import and copy *before* generic provider
+limits. Concurrent sessions share that aggregate. Helper-process restart
+zeroizes device memory, fences the old generation, and refuses the previous
+capability. The helper binds a unix socket in `ASTERISM_HOME` (mode 0600),
+never a public TCP listener, and never persists the bearer token.
 
 ## Admission and placement
 

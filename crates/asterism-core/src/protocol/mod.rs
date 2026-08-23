@@ -422,6 +422,10 @@ pub enum Request {
     DeviceFacts,
     /// This device's wake readiness, honestly reported: `ast device check`.
     DeviceCheck,
+    /// This device's CUDA GPU helper. Token-free: availability, UUID,
+    /// generation and whether a live NVIDIA driver executed work. A CPU
+    /// reference executor is never reported as a production helper.
+    GpuProviderStatus,
 
     // ---- device-local images -----------------------------------------------
     /// Read this device's structured cloud/OCI image catalog.
@@ -736,6 +740,7 @@ impl Request {
             | Request::WakeBroadcast { .. }
             | Request::DeviceFacts
             | Request::DeviceCheck
+            | Request::GpuProviderStatus
             | Request::ImageList
             | Request::ImagePull { .. } => None,
 
@@ -816,7 +821,8 @@ impl Request {
             Request::ImageList | Request::ImagePull { .. } => 6,
             Request::GpuGuestOpen { .. }
             | Request::GpuGuestFrame { .. }
-            | Request::GpuGuestClose => 8,
+            | Request::GpuGuestClose
+            | Request::GpuProviderStatus => 8,
             Request::DeviceShellPolicy { .. }
             | Request::DeviceShellOpen { .. }
             | Request::DeviceShellInput { .. }
@@ -861,6 +867,7 @@ impl Request {
             Request::GpuGuestOpen { .. }
             | Request::GpuGuestFrame { .. }
             | Request::GpuGuestClose => Some("gpu_guest"),
+            Request::GpuProviderStatus => Some("gpu_provider_status"),
             _ => None,
         }
     }
@@ -1095,6 +1102,15 @@ pub enum Response {
         device: String,
         rows: Vec<CheckRow>,
     },
+    /// Reply to [`Request::GpuProviderStatus`]. Token-free.
+    GpuProvider {
+        available: bool,
+        executor: String,
+        gpu_uuid: String,
+        generation: u64,
+        hardware_cuda_executed: bool,
+        helper_socket: String,
+    },
 
     // ---- block volumes ------------------------------------------------------
     /// Reply to [`Request::VolumeList`], [`Request::VolumeCreate`] and
@@ -1231,6 +1247,7 @@ impl Response {
             Response::BackupExported { .. } | Response::BackupRestored { .. } => 3,
             Response::Images { .. } | Response::ImagePulled { .. } => 6,
             Response::VolumeCatalog { .. } | Response::VolumeLease { .. } => 7,
+            Response::GpuProvider { .. } => 8,
             Response::DeviceShellStatus { .. }
             | Response::DeviceShellAccepted { .. }
             | Response::DeviceShellRefused { .. }
@@ -1336,6 +1353,7 @@ pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
             }
             .since(),
         ),
+        ("gpu_provider_status", Request::GpuProviderStatus.since()),
     ]
     .into_iter()
     .map(|(name, version)| (name.to_owned(), version))
@@ -1871,6 +1889,7 @@ mod tests {
             None
         );
         assert_eq!(Request::DeviceFacts.subject(), None);
+        assert_eq!(Request::GpuProviderStatus.subject(), None);
         assert_eq!(Request::DeviceCheck.subject(), None);
     }
 

@@ -220,7 +220,6 @@ enum MeshRequest {
         /// The epoch that lease was granted at.
         epoch: u64,
     },
-
     // ---- moving an instance's cpu part --------------------------------------
     //
     // Three streams, and none of them is a request/reply. A move is bulk, so
@@ -388,7 +387,7 @@ enum MoveFrame {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-enum MeshReply {
+pub(crate) enum MeshReply {
     Rpc {
         response: Response,
     },
@@ -3492,6 +3491,9 @@ async fn serve_stream(
                     device: node.device_name().await,
                     rows: crate::wake::check(),
                 },
+                Request::GpuProviderStatus => {
+                    crate::gpu::serve(Request::GpuProviderStatus, &node)
+                }
                 Request::DeviceShellStatus => Response::DeviceShellStatus {
                     status: node.shell.status(true),
                     revoked: 0,
@@ -3762,7 +3764,7 @@ fn addr_strings(addr: &EndpointAddr) -> (Vec<String>, Vec<String>) {
     )
 }
 
-async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Result<()> {
+pub(crate) async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Result<()> {
     let bytes = serde_json::to_vec(value)?;
     send.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
     send.write_all(&bytes).await?;

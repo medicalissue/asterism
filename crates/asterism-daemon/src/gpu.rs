@@ -14,7 +14,11 @@ use uuid::Uuid;
 
 use asterism_core::instance::now_unix;
 use asterism_core::protocol::{Request, Response};
-use asterism_core::remote_gpu::{AuthenticatedPeer, ControlErrorCode, ProductionProvider};
+use asterism_core::remote_gpu::{
+    AuthenticatedPeer, ControlErrorCode, Executor, LeaseAuthority, LeaseLimits,
+    ProductionProvider,
+};
+use asterism_core::remote_gpu_cuda::CudaEngine;
 use asterism_core::remote_gpu_guest::{
     self as guest, GuestFrame, GuestReply, DEFAULT_CREDIT_WINDOW, PROJECTION_KIND,
 };
@@ -27,9 +31,8 @@ use asterism_mesh::{DeviceId, MeshStream};
 use crate::mesh::{ClientIo, Mesh};
 use crate::Node;
 
-/// In-memory provider GPU services on this device. The real CUDA executor
-/// is a later part; this registry is how the mesh path finds a
-/// [`ProductionProvider`] without a public listener.
+/// In-memory provider GPU services on this device. Only the live CUDA
+/// constructor is installed in production; reference providers are fixtures.
 #[derive(Default)]
 pub struct Manager {
     providers: Mutex<HashMap<String, ProductionProvider>>,
@@ -45,6 +48,58 @@ impl Manager {
             .lock()
             .expect("GPU provider registry")
             .insert(gpu_uuid.into(), provider);
+    }
+
+    /// Load the real NVIDIA driver and put that exact executor behind the
+    /// token-free, instance-bound mesh path. A host without admitted hardware
+    /// remains unavailable; it never falls back to the reference executor.
+    pub fn install_live(&self, device_name: String, device_id: String) -> Result<()> {
+        let engine = CudaEngine::open_live(None).map_err(|error| anyhow!(error))?;
+        let identity = engine.identity().clone();
+        let authority = LeaseAuthority::new(
+            device_name,
+            device_id,
+            identity.uuid.clone(),
+            1,
+            LeaseLimits {
+                total_memory_bytes: identity.memory_bytes,
+                max_memory_per_lease: identity.memory_bytes,
+                max_leases: 8,
+                lease_ttl_secs: 30,
+            },
+        )
+        .map_err(|error| anyhow!(error))?;
+        let provider =
+            ProductionProvider::connect(authority, engine).map_err(|error| anyhow!(error))?;
+        self.insert(identity.uuid, provider);
+        Ok(())
+    }
+
+    fn status(&self) -> Response {
+        let providers = self.providers.lock().expect("GPU provider registry");
+        match providers.values().next() {
+            Some(provider) => Response::GpuProvider {
+                available: true,
+                executor: match provider.executor() {
+                    Executor::Cuda => "cuda".into(),
+                    Executor::Reference => "reference".into(),
+                },
+                gpu_uuid: provider.authority().gpu_uuid().to_owned(),
+                generation: provider.authority().generation(),
+                hardware_cuda_executed: provider.hardware_cuda_executed(),
+                helper_socket: asterism_core::paths::socket_path()
+                    .display()
+                    .to_string(),
+            },
+            None => Response::GpuProvider {
+                available: false,
+                executor: "none".into(),
+                gpu_uuid: String::new(),
+                generation: 0,
+                hardware_cuda_executed: false,
+                helper_socket: String::new(),
+            },
+        }
     }
 
     fn take(&self) -> Option<(String, ProductionProvider)> {
@@ -65,6 +120,19 @@ pub(crate) fn local_only_request(request: &Request) -> bool {
         request,
         Request::GpuGuestOpen { .. } | Request::GpuGuestFrame { .. } | Request::GpuGuestClose
     )
+}
+
+pub(crate) fn claims(request: &Request) -> bool {
+    matches!(request, Request::GpuProviderStatus)
+}
+
+pub(crate) fn serve(request: Request, node: &Node) -> Response {
+    match request {
+        Request::GpuProviderStatus => node.gpu.status(),
+        _ => Response::Error {
+            message: "not a GPU provider request".into(),
+        },
+    }
 }
 
 /// Serve one authenticated GPU mesh stream on the provider device.
