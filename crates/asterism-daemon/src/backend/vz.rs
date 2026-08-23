@@ -1856,7 +1856,32 @@ mod tests {
         let hv = Vz::new();
 
         let mut sleeper = Command::new("sleep").arg("30").spawn().unwrap();
-        let real = ProcId::capture(sleeper.id()).unwrap();
+        // `spawn` may return before the child has replaced this test binary.
+        // Capture only the fixture's settled identity; otherwise the later
+        // exec to `sleep` looks exactly like the PID replacement under test.
+        let pid = sleeper.id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let real = loop {
+            if let Ok(candidate) = ProcId::capture(pid) {
+                let is_sleep = candidate
+                    .exec
+                    .as_deref()
+                    .and_then(Path::file_name)
+                    .is_some_and(|name| name == "sleep");
+                if is_sleep && candidate.check().is_ours() {
+                    break candidate;
+                }
+            }
+            assert!(
+                sleeper.try_wait().unwrap().is_none(),
+                "sleep fixture exited before readiness"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "sleep fixture did not exec within five seconds"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
         let stale = ProcId {
             started_us: real.started_us - 1,
             ..real.clone()
