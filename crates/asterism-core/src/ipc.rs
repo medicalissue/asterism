@@ -60,12 +60,14 @@
 //! supported configuration — do honour it.
 
 #[cfg(unix)]
+#[path = "ipc_unix.rs"]
 mod ipc_unix;
 
 #[cfg(unix)]
 pub use ipc_unix::*;
 
 #[cfg(windows)]
+#[path = "ipc_windows.rs"]
 mod ipc_windows;
 
 #[cfg(windows)]

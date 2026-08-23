@@ -39,13 +39,15 @@ verify_cfg_modules() {
     module="${path##*/}"
     module="${module%.rs}"
     awk -v module="$module" -v cfg="$cfg" '
-      previous == cfg && $0 ~ ("^(pub )?mod " module ";") {
+      $0 == cfg { gated = 1; next }
+      gated && $0 ~ /^#\[path = "[^"]+"\]$/ { next }
+      gated && $0 ~ ("^(pub )?mod " module ";") {
         found = 1
       }
-      { previous = $0 }
+      { gated = 0 }
       END { exit !found }
     ' "$parent" || {
-      echo "$path is not declared as an immediately cfg-gated module in $parent" >&2
+      echo "$path is not declared as a cfg-gated module in $parent" >&2
       return 1
     }
   done

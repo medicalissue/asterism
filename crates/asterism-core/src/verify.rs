@@ -378,9 +378,19 @@ pub fn provenance(artifact: &Path) -> Option<Provenance> {
     read(&path).or_else(|| read(&durable::backup_path(&path)))
 }
 
+#[cfg(unix)]
 fn mtime_of(meta: &std::fs::Metadata) -> i64 {
     use std::os::unix::fs::MetadataExt;
     meta.mtime()
+}
+
+#[cfg(windows)]
+fn mtime_of(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or_default()
 }
 
 /// A source Asterism fetches from, and the digest the publisher says it will
