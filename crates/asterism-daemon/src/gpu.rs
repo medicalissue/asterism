@@ -7,17 +7,24 @@
 //! here; a missing NVIDIA driver means this plane stays unavailable.
 //!
 //! Inbound and outbound [`crate::mesh::MeshRequest::GpuAbi`] frames are
-//! proxied through a helper accept/client protocol on that socket. The
-//! listener is not left idle and ABI dispatch is not duplicated in-process.
+//! proxied through a helper accept/client protocol on that socket. Each
+//! accepted unix client is served on a bounded worker so a persistent local
+//! session cannot starve later local or inbound-mesh clients. The listener is
+//! not left idle and ABI dispatch is not duplicated in-process.
 
 use std::io::{Read, Write};
+use std::net::Shutdown;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+/// Concurrent unix ABI clients the helper will serve at once. Extra accepts
+/// are refused so the accept thread cannot grow an unbounded worker set.
+const MAX_HELPER_WORKERS: usize = 8;
 
 use anyhow::{bail, Context, Result};
 
@@ -46,9 +53,10 @@ pub struct GpuService {
 /// CUDA helper bound to `gpu.sock` (mode 0600).
 ///
 /// A helper-process restart is [`CudaProviderHelper::restart`]: live device
-/// memory is zeroized, the provider generation advances, and old capabilities
-/// cannot authorize the new helper. ABI clients connect to the unix socket;
-/// tokens never land next to it.
+/// memory is zeroized, the public generation advances only after a successful
+/// wipe/restart, and old capabilities cannot authorize the new helper. A wipe
+/// failure rolls the public generation back and keeps accounting. ABI clients
+/// connect to the unix socket; tokens never land next to it.
 pub struct CudaProviderHelper {
     pub production: Arc<Mutex<ProductionProvider>>,
     socket_path: PathBuf,
@@ -102,22 +110,35 @@ impl CudaProviderHelper {
             message: format!("GPU helper socket: {error}"),
         })?;
         let production = Arc::new(Mutex::new(ProductionProvider::connect(authority, engine)?));
+        let process_generation = production
+            .lock()
+            .expect("GPU helper")
+            .authority()
+            .generation();
         let shutdown = Arc::new(AtomicBool::new(false));
         let server = spawn_accept_loop(listener, Arc::clone(&production), Arc::clone(&shutdown));
         Ok(Self {
             production,
             socket_path,
-            process_generation: 1,
+            process_generation,
             shutdown,
             server: Some(server),
         })
     }
 
     pub fn restart(&mut self) -> Result<u64, ControlError> {
-        self.process_generation = self.process_generation.saturating_add(1);
+        let previous = self.process_generation;
         let mut production = self.production.lock().expect("GPU helper");
-        let generation = production.restart_helper()?;
-        Ok(generation)
+        match production.restart_helper() {
+            Ok(generation) => {
+                self.process_generation = generation;
+                Ok(generation)
+            }
+            Err(error) => {
+                self.process_generation = previous;
+                Err(error)
+            }
+        }
     }
 
     pub fn process_generation(&self) -> u64 {
@@ -269,9 +290,35 @@ fn spawn_accept_loop(
     shutdown: Arc<AtomicBool>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
+        let active_workers = Arc::new(AtomicUsize::new(0));
+        let mut workers = Vec::with_capacity(MAX_HELPER_WORKERS);
         while !shutdown.load(Ordering::Relaxed) {
+            reap_helper_workers(&mut workers);
             match listener.accept() {
-                Ok((stream, _)) => serve_helper_connection(stream, &production),
+                Ok((stream, _)) => {
+                    if shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let Some(permit) = HelperWorkerPermit::try_acquire(Arc::clone(&active_workers))
+                    else {
+                        let _ = stream.shutdown(Shutdown::Both);
+                        continue;
+                    };
+                    let control = match stream.try_clone() {
+                        Ok(control) => control,
+                        Err(_) => continue,
+                    };
+                    let production = Arc::clone(&production);
+                    if let Ok(handle) = thread::Builder::new()
+                        .name("asterism-gpu-helper".into())
+                        .spawn(move || {
+                            let _permit = permit;
+                            serve_helper_connection(stream, &production);
+                        })
+                    {
+                        workers.push(HelperWorker { control, handle });
+                    }
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(20));
                 }
@@ -283,7 +330,51 @@ fn spawn_accept_loop(
                 }
             }
         }
+        for worker in &workers {
+            let _ = worker.control.shutdown(Shutdown::Both);
+        }
+        for worker in workers {
+            let _ = worker.handle.join();
+        }
     })
+}
+
+struct HelperWorker {
+    control: UnixStream,
+    handle: JoinHandle<()>,
+}
+
+struct HelperWorkerPermit {
+    active: Arc<AtomicUsize>,
+}
+
+impl HelperWorkerPermit {
+    fn try_acquire(active: Arc<AtomicUsize>) -> Option<Self> {
+        active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < MAX_HELPER_WORKERS).then_some(current + 1)
+            })
+            .ok()?;
+        Some(Self { active })
+    }
+}
+
+impl Drop for HelperWorkerPermit {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::Release);
+    }
+}
+
+fn reap_helper_workers(workers: &mut Vec<HelperWorker>) {
+    let mut index = 0;
+    while index < workers.len() {
+        if workers[index].handle.is_finished() {
+            let worker = workers.swap_remove(index);
+            let _ = worker.handle.join();
+        } else {
+            index += 1;
+        }
+    }
 }
 
 fn serve_helper_connection(mut stream: UnixStream, production: &Mutex<ProductionProvider>) {
@@ -610,6 +701,9 @@ mod tests {
         AbiRange, AuthenticatedPeer, LeaseAuthority, LeaseLimits, Request, Response,
     };
     use asterism_core::remote_gpu_cuda::CudaDeviceIdentity;
+    use std::sync::mpsc;
+
+    static TEST_HOME_LOCK: Mutex<()> = Mutex::new(());
 
     fn identity_hex() -> String {
         "ab".repeat(32)
@@ -627,6 +721,7 @@ mod tests {
 
     #[test]
     fn helper_connects_to_cuda_executor_and_never_persists_tokens() {
+        let _home = TEST_HOME_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("ASTERISM_HOME", tmp.path());
         let identity = CudaDeviceIdentity::simulated_l4();
@@ -685,6 +780,7 @@ mod tests {
 
     #[test]
     fn helper_unix_client_routes_abi_not_an_idle_listener() {
+        let _home = TEST_HOME_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("ASTERISM_HOME", tmp.path());
         let identity = CudaDeviceIdentity::simulated_l4();
@@ -742,6 +838,160 @@ mod tests {
             .unwrap();
         assert!(matches!(allocated, Response::Allocated { bytes: 8, .. }));
         assert!(!helper.hardware_cuda_executed());
+        std::env::remove_var("ASTERISM_HOME");
+    }
+
+    #[test]
+    fn persistent_helper_client_does_not_starve_later_clients_or_shutdown() {
+        let _home = TEST_HOME_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("ASTERISM_HOME", tmp.path());
+        let identity = CudaDeviceIdentity::simulated_l4();
+        let engine = CudaEngine::simulated(identity.clone(), 1).unwrap();
+        let authority = LeaseAuthority::new(
+            "desktop",
+            identity_hex(),
+            identity.uuid.clone(),
+            1,
+            LeaseLimits {
+                total_memory_bytes: 64,
+                max_memory_per_lease: 32,
+                max_leases: 2,
+                lease_ttl_secs: 30,
+            },
+        )
+        .unwrap();
+        let helper = CudaProviderHelper::connect(engine, authority).unwrap();
+        wait_for_socket(helper.socket_path());
+
+        let peer = AuthenticatedPeer::from_mesh_identity(identity_hex()).unwrap();
+        let (lease, _) = helper
+            .production
+            .lock()
+            .unwrap()
+            .authority_mut()
+            .attach(&peer, "instance-a", 16, asterism_core::instance::now_unix())
+            .unwrap();
+        let first =
+            GpuHelperClient::connect(helper.socket_path(), &identity_hex(), lease.capability())
+                .unwrap();
+
+        let socket_path = helper.socket_path().to_owned();
+        let capability = lease.capability().to_owned();
+        let peer_id = identity_hex();
+        let (connected_tx, connected_rx) = mpsc::channel();
+        let connect_thread = thread::spawn(move || {
+            let result = GpuHelperClient::connect(&socket_path, &peer_id, &capability);
+            let _ = connected_tx.send(result);
+        });
+        let second = match connected_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(result) => result.expect("later helper client should connect"),
+            Err(error) => {
+                drop(first);
+                let _ = connect_thread.join();
+                panic!("persistent helper client starved a later client: {error}");
+            }
+        };
+        connect_thread.join().unwrap();
+
+        let (stopped_tx, stopped_rx) = mpsc::channel();
+        let stop_thread = thread::spawn(move || {
+            drop(helper);
+            let _ = stopped_tx.send(());
+        });
+        if let Err(error) = stopped_rx.recv_timeout(Duration::from_secs(2)) {
+            drop(first);
+            drop(second);
+            let _ = stop_thread.join();
+            panic!("helper shutdown did not join persistent workers: {error}");
+        }
+        stop_thread.join().unwrap();
+        drop(first);
+        drop(second);
+        std::env::remove_var("ASTERISM_HOME");
+    }
+
+    #[test]
+    fn helper_worker_admission_is_bounded() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let mut permits = (0..MAX_HELPER_WORKERS)
+            .map(|_| HelperWorkerPermit::try_acquire(Arc::clone(&active)).unwrap())
+            .collect::<Vec<_>>();
+        assert!(HelperWorkerPermit::try_acquire(Arc::clone(&active)).is_none());
+        permits.pop();
+        assert!(HelperWorkerPermit::try_acquire(active).is_some());
+    }
+
+    #[test]
+    fn helper_restart_rolls_back_public_generation_when_wipe_fails() {
+        let _home = TEST_HOME_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("ASTERISM_HOME", tmp.path());
+        let identity = CudaDeviceIdentity::simulated_l4();
+        let engine = CudaEngine::simulated(identity.clone(), 1).unwrap();
+        let authority = LeaseAuthority::new(
+            "desktop",
+            identity_hex(),
+            identity.uuid,
+            1,
+            LeaseLimits {
+                total_memory_bytes: 32,
+                max_memory_per_lease: 16,
+                max_leases: 1,
+                lease_ttl_secs: 30,
+            },
+        )
+        .unwrap();
+        let mut helper = CudaProviderHelper::connect(engine, authority).unwrap();
+        let peer = AuthenticatedPeer::from_mesh_identity(identity_hex()).unwrap();
+        let now = asterism_core::instance::now_unix();
+        let (lease, _) = helper
+            .production
+            .lock()
+            .unwrap()
+            .authority_mut()
+            .attach(&peer, "instance-a", 16, now)
+            .unwrap();
+        let Response::SessionOpened { session, .. } = helper
+            .production
+            .lock()
+            .unwrap()
+            .open_session(&peer, lease.capability(), AbiRange::ours(), now)
+            .unwrap()
+        else {
+            panic!("session should open")
+        };
+        helper
+            .production
+            .lock()
+            .unwrap()
+            .handle(
+                &peer,
+                lease.capability(),
+                Request::Allocate {
+                    session,
+                    sequence: 1,
+                    bytes: 8,
+                },
+                now,
+            )
+            .unwrap()
+            .into_result()
+            .unwrap();
+        let before = helper.process_generation();
+        helper.production.lock().unwrap().fail_next_zeroize();
+
+        let blocked = helper.restart().unwrap_err();
+        assert_eq!(blocked.code, ControlErrorCode::Unavailable);
+        assert_eq!(helper.process_generation(), before);
+        let production = helper.production.lock().unwrap();
+        assert_eq!(production.authority().generation(), before);
+        assert_eq!(production.live_abi_bytes(), 8);
+        drop(production);
+
+        assert_eq!(helper.restart().unwrap(), before + 1);
+        assert_eq!(helper.process_generation(), before + 1);
+        assert_eq!(helper.production.lock().unwrap().live_abi_bytes(), 0);
         std::env::remove_var("ASTERISM_HOME");
     }
 

@@ -133,7 +133,9 @@ impl CudaEngine {
         }
     }
 
-    #[cfg(test)]
+    /// Source-test injection: the next wipe/free fails closed. Live drivers
+    /// ignore this; simulated accounting stays reserved until a later wipe
+    /// succeeds.
     pub fn fail_next_zeroize(&mut self) {
         match &mut self.inner {
             EngineKind::Live(_) => {}

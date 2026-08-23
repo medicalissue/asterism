@@ -1427,14 +1427,15 @@ impl ProductionProvider {
         true
     }
 
-    /// Bytes currently reserved by ABI allocations. Control-plane leases are
-    /// a separate budget; this is the data-plane remainder a restart must
-    /// return.
-    #[cfg(test)]
-    fn fail_next_zeroize(&mut self) {
+    /// Source-test injection: the next wipe/free fails closed without
+    /// advancing generation or releasing accounting.
+    pub fn fail_next_zeroize(&mut self) {
         self.abi.fail_next_zeroize();
     }
 
+    /// Bytes currently reserved by ABI allocations. Control-plane leases are
+    /// a separate budget; this is the data-plane remainder a restart must
+    /// return.
     pub fn live_abi_bytes(&self) -> u64 {
         self.abi.committed_bytes
     }
@@ -1544,7 +1545,6 @@ impl Provider {
         &self.capabilities
     }
 
-    #[cfg(test)]
     fn fail_next_zeroize(&mut self) {
         if let Some(engine) = self.cuda.as_mut() {
             engine.fail_next_zeroize();
@@ -3236,6 +3236,45 @@ mod tests {
             .into_result()
             .unwrap();
         assert!(matches!(allocated, Response::Allocated { bytes: 8, .. }));
+    }
+
+    #[test]
+    fn helper_restart_keeps_generation_when_wipe_fails() {
+        let mut production = cuda_production(LeaseLimits {
+            total_memory_bytes: 32,
+            max_memory_per_lease: 16,
+            max_leases: 1,
+            lease_ttl_secs: 30,
+        });
+        let owner = peer('b');
+        let (capability, session) = open_lease(&mut production, &owner, "instance-a", 16, 100);
+        production
+            .handle(
+                &owner,
+                &capability,
+                Request::Allocate {
+                    session: session.clone(),
+                    sequence: 1,
+                    bytes: 8,
+                },
+                101,
+            )
+            .unwrap()
+            .into_result()
+            .unwrap();
+        let before = production.authority().generation();
+        assert_eq!(production.live_abi_bytes(), 8);
+        production.fail_next_zeroize();
+        let blocked = production.restart_helper().unwrap_err();
+        assert_eq!(blocked.code, ControlErrorCode::Unavailable);
+        assert_eq!(production.authority().generation(), before);
+        assert_eq!(production.live_abi_bytes(), 8);
+        let generation = production.restart_helper().unwrap();
+        assert_eq!(generation, before + 1);
+        assert_eq!(production.live_abi_bytes(), 0);
+        assert!(production
+            .open_session(&owner, &capability, AbiRange::ours(), 110)
+            .is_err());
     }
 
     #[test]
