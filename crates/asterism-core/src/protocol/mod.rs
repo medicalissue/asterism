@@ -20,12 +20,12 @@ use crate::backup::{ExportReport, RestoreReport};
 use crate::device_shell::{
     ShellData, ShellExit, ShellOpen, ShellOutput, ShellPolicyAction, ShellPolicyStatus,
 };
-use crate::remote_gpu_guest::{GuestFrame, GuestReply};
 use crate::hv::GuestHealth;
 use crate::image::{ImagePullResult, ImageRow};
 use crate::instance::{Instance, PortForward, Restart, Shape};
 use crate::orbit::{Device, DeviceStatus, WakeFacts};
 use crate::registry::OrbitRow;
+use crate::remote_gpu_guest::{GuestFrame, GuestReply};
 use crate::secret::Secret;
 use crate::snapshot::Snapshot;
 
@@ -1299,7 +1299,13 @@ pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
             .since(),
         ),
         ("device_shell_status", Request::DeviceShellStatus.since()),
-        ("gpu_guest", Request::GpuGuestOpen { name: String::new() }.since()),
+        (
+            "gpu_guest",
+            Request::GpuGuestOpen {
+                name: String::new(),
+            }
+            .since(),
+        ),
         ("image_list", Request::ImageList.since()),
         (
             "image_pull",

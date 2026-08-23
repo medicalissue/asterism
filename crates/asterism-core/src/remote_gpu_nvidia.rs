@@ -562,15 +562,13 @@ fn prove_version_skew(admitted: &AdmittedNvidiaDevice) -> Result<bool, ControlEr
             "ABI version skew opened a session instead of failing closed",
         ));
     }
-    Ok(
-        refused(&skew, &[ControlErrorCode::UnsupportedVersion])
-            && skew
-                .as_ref()
-                .err()
-                .map(|error| error.message.contains("no remote GPU ABI is common"))
-                .unwrap_or(false)
-            && provider.authority().diagnostics().active_leases == 1,
-    )
+    Ok(refused(&skew, &[ControlErrorCode::UnsupportedVersion])
+        && skew
+            .as_ref()
+            .err()
+            .map(|error| error.message.contains("no remote GPU ABI is common"))
+            .unwrap_or(false)
+        && provider.authority().diagnostics().active_leases == 1)
 }
 
 fn refused<T>(result: &Result<T, ControlError>, codes: &[ControlErrorCode]) -> bool {

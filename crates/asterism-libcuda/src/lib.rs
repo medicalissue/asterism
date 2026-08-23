@@ -82,18 +82,22 @@ pub extern "C" fn cuMemAlloc(dev_ptr: *mut u64, bytes: usize) -> i32 {
     if dev_ptr.is_null() || bytes == 0 {
         return guest::CUDA_ERROR_INVALID_VALUE;
     }
-    with_shim(|shim| match shim.call(CudaCall::MemAlloc { bytes: bytes as u64 }) {
-        Ok(CudaResult::Alloc { allocation }) => {
-            let mut handle = [0u8; 8];
-            let bytes = allocation.as_bytes();
-            let n = bytes.len().min(8);
-            handle[..n].copy_from_slice(&bytes[..n]);
-            unsafe {
-                *dev_ptr = u64::from_le_bytes(handle);
+    with_shim(|shim| {
+        match shim.call(CudaCall::MemAlloc {
+            bytes: bytes as u64,
+        }) {
+            Ok(CudaResult::Alloc { allocation }) => {
+                let mut handle = [0u8; 8];
+                let bytes = allocation.as_bytes();
+                let n = bytes.len().min(8);
+                handle[..n].copy_from_slice(&bytes[..n]);
+                unsafe {
+                    *dev_ptr = u64::from_le_bytes(handle);
+                }
+                CUDA_SUCCESS
             }
-            CUDA_SUCCESS
+            other => result_code(other),
         }
-        other => result_code(other),
     })
 }
 
