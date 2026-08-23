@@ -271,13 +271,7 @@ pub fn prepare(inst: &Instance) -> Result<Prepared> {
     let bootstrap = asterism_core::profile::Bootstrap::resolve(&inst.profiles)
         .context("resolving the container's bootstrap profiles")?;
     install_bootstrap(&rootfs, &bootstrap)?;
-    let mut env = strings("Env");
-    env.extend(
-        asterism_core::seed::egress_environment(&egress)
-            .into_iter()
-            .map(|(name, value)| format!("{name}={value}")),
-    );
-    env.extend(install_egress_trust(&rootfs, &egress)?);
+    let env = runtime_environment(&rootfs, strings("Env"), &egress)?;
     let spec = dir.join("container.json");
     let binds = asterism_core::seed::shares(inst)
         .into_iter()
@@ -384,6 +378,24 @@ pub(crate) fn install_egress_trust(
     .into_iter()
     .map(|(name, value)| format!("{name}={value}"))
     .collect())
+}
+
+/// Compose the OCI image environment with Asterism's protected runtime
+/// values. Appending is intentional: [`spawn`] applies assignments in order,
+/// so neither an image-provided secret handle nor an image-provided TLS path
+/// can override the per-instance values prepared by Asterism.
+pub(crate) fn runtime_environment(
+    rootfs: &Path,
+    mut image: Vec<String>,
+    egress: &asterism_core::seed::Egress,
+) -> Result<Vec<String>> {
+    image.extend(
+        asterism_core::seed::egress_environment(egress)
+            .into_iter()
+            .map(|(name, value)| format!("{name}={value}")),
+    );
+    image.extend(install_egress_trust(rootfs, egress)?);
+    Ok(image)
 }
 
 /// Place generated profile files in the extracted OCI root without ever
@@ -1697,9 +1709,172 @@ fn host_pid() -> Result<u32> {
         .context("parsing the namespace holder's host pid")
 }
 
+/// A hosted-Linux composition fixture that enters the same
+/// user/mount/pid/UTS/IPC/network namespaces and the same [`helper_main`]
+/// chroot/spawn path as [`start`]. The cgroup and slirp control planes have
+/// independent lifecycle tests; this fixture keeps them inert so its only
+/// variable is whether a process in the real container runtime consumes the
+/// trust and environment assembled by [`runtime_environment`].
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) struct NativeRuntimeFixture {
+    child: std::process::Child,
+    state: tempfile::TempDir,
+    control: PathBuf,
+    console: PathBuf,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl NativeRuntimeFixture {
+    pub(crate) fn spawn(
+        rootfs: &Path,
+        env: Vec<String>,
+        argv: Vec<String>,
+        egress_source: &Path,
+    ) -> Result<Self> {
+        let state = tempfile::tempdir().context("creating native-runtime proof state")?;
+        let cgroup = state.path().join("cgroup");
+        fs::create_dir(&cgroup)?;
+        // helper_main writes its membership before entering the rootfs. A
+        // regular fixture file is sufficient here because cgroup membership,
+        // identity and failed-start draining are proved separately.
+        fs::write(cgroup.join("cgroup.procs"), b"")?;
+        let control = state.path().join("container-control.sock");
+        let console = state.path().join("console.log");
+        let spec_path = state.path().join("container.json");
+        let spec = Spec {
+            rootfs: rootfs.to_path_buf(),
+            control: control.clone(),
+            cgroup,
+            console: console.clone(),
+            argv,
+            env,
+            workdir: Some("/".into()),
+            binds: Vec::new(),
+            network: Network {
+                api: state.path().join("unused-slirp.sock"),
+                publish: Vec::new(),
+                egress: Some(EgressBridge {
+                    source: egress_source.to_path_buf(),
+                    target: PathBuf::from("/run/asterism-egress"),
+                    guest_port: crate::egress::CONTAINER_EGRESS_PORT,
+                }),
+            },
+            bootstrap: None,
+        };
+        fs::write(&spec_path, serde_json::to_vec_pretty(&spec)?)?;
+
+        let child = Command::new(tools::tool("unshare")?)
+            .args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--propagation",
+                "private",
+                "--pid",
+                "--fork",
+                "--uts",
+                "--ipc",
+                "--net",
+            ])
+            .arg(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "container::tests::native_runtime_fixture_child",
+                "--nocapture",
+            ])
+            .env("ASTERISM_NATIVE_RUNTIME_PROOF_SPEC", &spec_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .context("starting the native-runtime TLS proof")?;
+
+        Ok(Self {
+            child,
+            state,
+            control,
+            console,
+        })
+    }
+
+    pub(crate) fn runtime_pid(&self) -> Result<u32> {
+        let (response, peer_pid) = startup_call(
+            &self.control,
+            &ControlRequest::Hello,
+            Some(Duration::from_millis(250)),
+        )?;
+        match response {
+            ControlResponse::Ready { host_pid } if host_pid == peer_pid => Ok(host_pid),
+            ControlResponse::Ready { host_pid } => bail!(
+                "native-runtime fixture claimed pid {host_pid}, but its Unix peer is {peer_pid}"
+            ),
+            other => bail!("native-runtime fixture was not ready: {other:?}"),
+        }
+    }
+
+    pub(crate) fn console(&self) -> String {
+        fs::read_to_string(&self.console).unwrap_or_default()
+    }
+
+    pub(crate) fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>> {
+        Ok(self.child.try_wait()?)
+    }
+
+    /// Wake helper_main after its entrypoint has exited. Its accept loop
+    /// observes the child status before reading this request and retires the
+    /// namespace holder cleanly.
+    pub(crate) fn finish(&mut self) -> Result<std::process::ExitStatus> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                return Ok(status);
+            }
+            // A Hello while the entrypoint is still completing is harmless;
+            // the next one reaches the accept loop after try_wait observes
+            // exit and makes the namespace wrapper return.
+            let _ = startup_call(
+                &self.control,
+                &ControlRequest::Hello,
+                Some(Duration::from_millis(100)),
+            );
+            if Instant::now() >= deadline {
+                bail!("native-runtime fixture did not retire its namespace holder");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    pub(crate) fn state_path(&self) -> &Path {
+        self.state.path()
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for NativeRuntimeFixture {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Re-entry point used only by [`NativeRuntimeFixture`]. `unshare` starts
+    /// this exact unit-test process inside fresh namespaces; the test then
+    /// invokes the production helper, which performs its mounts, chroot and
+    /// entrypoint spawn exactly as it does for a launched container.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn native_runtime_fixture_child() {
+        let Ok(spec) = std::env::var("ASTERISM_NATIVE_RUNTIME_PROOF_SPEC") else {
+            return;
+        };
+        helper_main(Path::new(&spec)).expect("the native container helper lifecycle");
+    }
 
     #[cfg(target_os = "linux")]
     fn control_fixture(dir: &Path, pid: u32) -> ContainerControlEndpoint {

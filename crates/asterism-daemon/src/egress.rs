@@ -770,9 +770,19 @@ async fn vet(authority: &str) -> Result<Vec<SocketAddr>, Refusal> {
         Some((_, port)) if port.parse::<u16>().is_ok() => authority.to_owned(),
         _ => format!("{authority}:443"),
     };
-    let resolved = tokio::net::lookup_host(&target)
+    #[cfg(test)]
+    let resolved = match tests::extra_resolution(&target) {
+        Some(addr) => vec![addr],
+        None => tokio::net::lookup_host(&target)
+            .await
+            .map_err(|_| Refusal::Upstream("that name does not resolve".into()))?
+            .collect(),
+    };
+    #[cfg(not(test))]
+    let resolved: Vec<_> = tokio::net::lookup_host(&target)
         .await
-        .map_err(|_| Refusal::Upstream("that name does not resolve".into()))?;
+        .map_err(|_| Refusal::Upstream("that name does not resolve".into()))?
+        .collect();
     let mut vetted = Vec::new();
     for addr in resolved {
         // Every answer, not just the one that will be used: a name that
@@ -1145,6 +1155,7 @@ mod tests {
 
     static ALLOW_LOOPBACK: AtomicBool = AtomicBool::new(false);
     static EXTRA_ROOT: StdMutex<Option<String>> = StdMutex::new(None);
+    static EXTRA_RESOLUTION: StdMutex<Option<(String, SocketAddr)>> = StdMutex::new(None);
 
     /// Both hooks above are process-global, and `cargo test` runs these in
     /// parallel — so a test that moves one takes this first. Without it, the
@@ -1161,6 +1172,15 @@ mod tests {
 
     pub(super) fn extra_root() -> Option<String> {
         EXTRA_ROOT.lock().expect("test root poisoned").clone()
+    }
+
+    pub(super) fn extra_resolution(authority: &str) -> Option<SocketAddr> {
+        EXTRA_RESOLUTION
+            .lock()
+            .expect("test resolution poisoned")
+            .as_ref()
+            .filter(|(expected, _)| expected == authority)
+            .map(|(_, addr)| *addr)
     }
 
     fn provider() {
@@ -1242,14 +1262,18 @@ mod tests {
     }
 
     async fn upstream() -> Upstream {
+        upstream_for("localhost").await
+    }
+
+    async fn upstream_for(host: &str) -> Upstream {
         provider();
         // Its own CA and leaf, minted by the same code the proxy uses — so
         // the test's fake service is a real TLS server, not a stub.
         let dir = tempfile::tempdir().expect("a temp dir").keep();
         let authority = Authority::load_or_create(&dir, "upstream").expect("an upstream CA");
         let acceptor = authority
-            .acceptor("localhost")
-            .expect("a leaf for localhost");
+            .acceptor(host)
+            .expect("a leaf for the fixture authority");
         let ca_pem = authority.ca_pem.clone();
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("a port");
@@ -1321,18 +1345,55 @@ mod tests {
             .expect("a guest client")
     }
 
-    /// A native-container client loads the CA from the rootfs path installed
-    /// by the runtime lifecycle, rather than receiving authority bytes out of
-    /// band from the test.
     #[cfg(target_os = "linux")]
-    fn container_guest(proxy_port: u16, ca_path: &std::path::Path) -> reqwest::Client {
-        let ca_pem = std::fs::read(ca_path).expect("the runtime-installed container CA");
-        reqwest::Client::builder()
-            .add_root_certificate(reqwest::Certificate::from_pem(&ca_pem).unwrap())
-            .proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{proxy_port}")).unwrap())
-            .timeout(Duration::from_secs(20))
-            .build()
-            .expect("a container client")
+    fn copy_runtime_program(rootfs: &std::path::Path, program: &std::path::Path) {
+        fn copy_one(rootfs: &std::path::Path, source: &std::path::Path) {
+            let target = rootfs.join(source.strip_prefix("/").expect("an absolute program path"));
+            std::fs::create_dir_all(target.parent().expect("a program parent")).unwrap();
+            std::fs::copy(source, target).unwrap();
+        }
+
+        copy_one(rootfs, program);
+        let output = std::process::Command::new("ldd")
+            .arg(program)
+            .output()
+            .expect("ldd is available on the hosted Linux runner");
+        assert!(
+            output.status.success(),
+            "ldd rejected {}: {}",
+            program.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for line in String::from_utf8(output.stdout).unwrap().lines() {
+            if let Some(path) = line.split_whitespace().find(|field| field.starts_with('/')) {
+                copy_one(rootfs, std::path::Path::new(path));
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn tree_contains(root: &std::path::Path, needle: &str) -> bool {
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(path) = pending.pop() {
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.is_dir() {
+                pending.extend(
+                    std::fs::read_dir(path)
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .map(|entry| entry.path()),
+                );
+            } else if metadata.is_file()
+                && String::from_utf8_lossy(&std::fs::read(path).unwrap_or_default())
+                    .contains(needle)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// The end-to-end proof, and the reason the rest of this module exists.
@@ -1611,27 +1672,35 @@ mod tests {
         drop(listener);
     }
 
-    /// The container path carries a real CONNECT over only the mounted Unix
-    /// endpoint. The TCP listener here stands in for the helper's loopback
-    /// listener inside the isolated network namespace.
+    /// The complete native-container trust path: the production environment
+    /// composer installs and selects the combined bundle; the production
+    /// helper enters fresh namespaces, bind-mounts only this instance's Unix
+    /// transport, chroots, and spawns a real curl from the rootfs. curl gets
+    /// neither `--cacert` nor certificate bytes from this test. Success means
+    /// its ordinary runtime environment found the CA prepared for it.
     #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn container_unix_transport_carries_bound_egress() {
-        use tokio::io::copy_bidirectional;
-        use tokio::net::UnixStream;
-
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn actual_container_runtime_consumes_prepared_trust_for_bound_https() {
         let _exclusive = exclusive().await;
         ALLOW_LOOPBACK.store(true, Ordering::Relaxed);
-        let up = upstream().await;
+        const HOST: &str = "container-proof.test";
+        let up = upstream_for(HOST).await;
         *EXTRA_ROOT.lock().unwrap() = Some(up.ca_pem.clone());
-        let bound = binding(&format!("localhost:{}", up.port));
+        *EXTRA_RESOLUTION.lock().unwrap() = Some((
+            format!("{HOST}:{}", up.port),
+            SocketAddr::from(([127, 0, 0, 1], up.port)),
+        ));
+        let bound = binding(&format!("{HOST}:{}", up.port));
         let handle_text = bound.guest_handle.as_str().to_owned();
         let seen = Arc::new(StdMutex::new(Vec::new()));
 
-        let dir = tempfile::tempdir().unwrap();
-        let authority = Authority::load_or_create(dir.path(), "container").unwrap();
+        let instance = tempfile::tempdir().unwrap();
+        let authority_dir = instance.path().join("egress");
+        let transport = authority_dir.join("container-transport");
+        std::fs::create_dir_all(&transport).unwrap();
+        let authority = Authority::load_or_create(&authority_dir, "container").unwrap();
         let ca_pem = authority.ca_pem.clone();
-        let socket = dir.path().join("proxy.sock");
+        let socket = transport.join("proxy.sock");
         let unix = UnixListener::bind(&socket).unwrap();
         let ctx = Arc::new(ProxyCtx {
             instance: "container".into(),
@@ -1642,39 +1711,138 @@ mod tests {
         });
         let proxy_task = tokio::spawn(accept_unix_loop(unix, ctx));
 
-        let bridge = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let port = bridge.local_addr().unwrap().port();
         let rootfs = tempfile::tempdir().unwrap();
+        let system_bundle = rootfs.path().join("etc/ssl/certs/ca-certificates.crt");
+        std::fs::create_dir_all(system_bundle.parent().unwrap()).unwrap();
+        std::fs::copy("/etc/ssl/certs/ca-certificates.crt", &system_bundle)
+            .expect("the hosted Linux image has its system CA bundle");
+        copy_runtime_program(rootfs.path(), std::path::Path::new("/bin/sh"));
+        copy_runtime_program(rootfs.path(), std::path::Path::new("/usr/bin/curl"));
+        for directory in ["dev", "proc", "run/asterism-egress"] {
+            std::fs::create_dir_all(rootfs.path().join(directory)).unwrap();
+        }
+
         let runtime_egress = asterism_core::seed::Egress {
-            proxy: format!("http://127.0.0.1:{port}"),
+            proxy: format!("http://127.0.0.1:{CONTAINER_EGRESS_PORT}"),
             ca_pem,
-            authorities: vec![format!("localhost:{}", up.port)],
+            authorities: vec![format!("{HOST}:{}", up.port)],
             handles: vec![("ANTHROPIC_API_KEY".into(), handle_text.clone())],
         };
-        let trust_env = crate::container::install_egress_trust(rootfs.path(), &runtime_egress)
-            .expect("the container runtime installs its egress trust");
-        assert!(trust_env
-            .iter()
-            .any(|entry| entry == "SSL_CERT_FILE=/.asterism/ca-bundle.pem"));
-        let bridge_socket = socket.clone();
-        let bridge_task = tokio::spawn(async move {
-            let (mut guest, _) = bridge.accept().await.unwrap();
-            let mut host = UnixStream::connect(bridge_socket).await.unwrap();
-            copy_bidirectional(&mut guest, &mut host).await.unwrap();
-        });
+        let env = crate::container::runtime_environment(
+            rootfs.path(),
+            vec![
+                "ANTHROPIC_API_KEY=image-controlled-value".into(),
+                "HTTPS_PROXY=http://image.invalid:9".into(),
+                "SSL_CERT_FILE=/image-controlled.pem".into(),
+                "CURL_CA_BUNDLE=/image-controlled.pem".into(),
+            ],
+            &runtime_egress,
+        )
+        .expect("prepare composes the protected container environment");
+        let value = |name: &str| {
+            env.iter()
+                .rev()
+                .find_map(|entry| entry.split_once('=').filter(|(key, _)| *key == name))
+                .map(|(_, value)| value)
+                .unwrap()
+        };
+        assert_eq!(value("ANTHROPIC_API_KEY"), handle_text);
+        assert_eq!(value("HTTPS_PROXY"), runtime_egress.proxy);
+        assert_eq!(value("SSL_CERT_FILE"), "/.asterism/ca-bundle.pem");
+        assert_eq!(value("CURL_CA_BUNDLE"), "/.asterism/ca-bundle.pem");
 
-        let response = container_guest(port, &rootfs.path().join(".asterism/egress-ca.pem"))
-            .post(format!("https://localhost:{}/v1/messages", up.port))
-            .header("x-api-key", handle_text)
-            .body("{}")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 200);
+        let command = format!(
+            "set -eu; \
+             test \"$SSL_CERT_FILE\" = /.asterism/ca-bundle.pem; \
+             test \"$CURL_CA_BUNDLE\" = /.asterism/ca-bundle.pem; \
+             test \"$ANTHROPIC_API_KEY\" = {handle_text}; \
+             /usr/bin/curl --fail --silent --show-error --max-time 15 \
+               -X POST -H \"x-api-key: $ANTHROPIC_API_KEY\" -d '{{}}' \
+               https://{HOST}:{}/v1/messages; \
+             printf '\\nASTERISM_RUNTIME_TLS_OK\\n'",
+            up.port
+        );
+        let mut runtime = crate::container::NativeRuntimeFixture::spawn(
+            rootfs.path(),
+            env,
+            vec!["/bin/sh".into(), "-c".into(), command],
+            &transport,
+        )
+        .expect("launching the actual native-container runtime proof");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let runtime_pid = loop {
+            match runtime.runtime_pid() {
+                Ok(pid) => break pid,
+                Err(error) if tokio::time::Instant::now() < deadline => {
+                    if let Some(status) = runtime.try_wait().unwrap() {
+                        panic!(
+                            "native runtime exited before ready ({status}): {error:#}\n{}",
+                            runtime.console()
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => panic!("native runtime never became ready: {error:#}"),
+            }
+        };
+        for namespace in ["user", "mnt", "pid", "uts", "ipc", "net"] {
+            let ours = std::fs::read_link(format!("/proc/self/ns/{namespace}")).unwrap();
+            let theirs = std::fs::read_link(format!("/proc/{runtime_pid}/ns/{namespace}")).unwrap();
+            assert_ne!(
+                ours, theirs,
+                "container reused the host {namespace} namespace"
+            );
+        }
+
+        loop {
+            let console = runtime.console();
+            if console.contains("ASTERISM_RUNTIME_TLS_OK") {
+                assert!(console.contains("{\"upstream\":\"ok\"}"), "{console}");
+                assert!(
+                    !console.contains(REAL_VALUE),
+                    "secret leaked to the console"
+                );
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "real curl did not complete through runtime trust:\n{console}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let status = runtime.finish().expect("retiring the namespace lifecycle");
+        assert!(status.success(), "native runtime wrapper failed: {status}");
         assert_eq!(seen.lock().unwrap().len(), 1);
+        let upstream_headers = up.seen.lock().unwrap().clone();
+        assert!(upstream_headers
+            .iter()
+            .any(|(name, value)| name == "x-api-key" && value == REAL_VALUE));
+        assert!(!upstream_headers
+            .iter()
+            .any(|(_, value)| value.contains(&handle_text)));
 
-        bridge_task.abort();
+        let private_key = std::fs::read_to_string(authority_dir.join("ca.key"))
+            .expect("the source device retains its egress signing key");
+        assert!(!tree_contains(rootfs.path(), &private_key));
+        assert!(!tree_contains(rootfs.path(), REAL_VALUE));
+        assert!(!tree_contains(&transport, &private_key));
+        assert!(!tree_contains(&transport, REAL_VALUE));
+        assert!(authority_dir.join("ca.key").exists());
+
+        let rootfs_path = rootfs.path().to_path_buf();
+        let state_path = runtime.state_path().to_path_buf();
+        drop(runtime);
+        drop(rootfs);
+        assert!(!rootfs_path.exists(), "container rootfs was not cleaned up");
+        assert!(
+            !state_path.exists(),
+            "container runtime state was not cleaned up"
+        );
+
         proxy_task.abort();
+        *EXTRA_RESOLUTION.lock().unwrap() = None;
         *EXTRA_ROOT.lock().unwrap() = None;
         ALLOW_LOOPBACK.store(false, Ordering::Relaxed);
     }
