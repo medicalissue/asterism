@@ -4162,6 +4162,29 @@ async fn serve_stream(
                     status: node.shell.status(true),
                     revoked: 0,
                 },
+                Request::MoveFinalizeTarget {
+                    instance_id,
+                    name,
+                    epoch,
+                    token,
+                    files,
+                } => {
+                    let device = node.device_name().await;
+                    let reg = node.shard.lock().await;
+                    tokio::task::block_in_place(|| {
+                        crate::swap::finalize_target_authenticated(
+                            &reg,
+                            &instance_id,
+                            &name,
+                            epoch,
+                            &token,
+                            &files,
+                            &requester_device,
+                            &requester_device_id,
+                            &device,
+                        )
+                    })
+                }
                 request if crate::volume::is_plane_request(&request) => {
                     crate::volume::serve_authenticated(
                         request,

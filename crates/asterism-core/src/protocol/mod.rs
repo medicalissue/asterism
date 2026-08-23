@@ -34,7 +34,7 @@ mod wake;
 
 use crate::instance::MoveSourcePhase;
 pub use egress::{EgressRequest, EgressResponse, MESH_FRAME_LIMIT};
-pub use swap::{BaseImage, MoveAuthorityPhase, MoveFile, MoveManifest};
+pub use swap::{BaseImage, MoveAuthorityPhase, MoveFile, MoveFinalFile, MoveManifest};
 pub use wake::{CheckRow, Verdict};
 
 /// One request per line of JSON over the daemon's unix socket;
@@ -642,6 +642,18 @@ pub enum Request {
         token: String,
         from_lane: u64,
     },
+    /// Persist the final identity of a live move after the authenticated
+    /// source has fenced writes and observed the target's mirror EOF.
+    ///
+    /// Accepted only on the mesh connection whose device name and immutable
+    /// id match the source recorded in the target authority WAL.
+    MoveFinalizeTarget {
+        instance_id: String,
+        name: String,
+        epoch: u64,
+        token: String,
+        files: Vec<MoveFinalFile>,
+    },
     /// The bytes are all here and verified: adopt them. The staging
     /// directory becomes the instance directory and the row is written with
     /// this device supplying cpu, at `epoch`.
@@ -828,6 +840,7 @@ impl Request {
             | Request::MoveLivePrepareTarget { .. }
             | Request::MoveReserveTarget { .. }
             | Request::MoveRecoverTarget { .. }
+            | Request::MoveFinalizeTarget { .. }
             | Request::MoveCommitTarget { .. }
             | Request::MoveTargetStatus { .. }
             | Request::MoveSourceStatus { .. }
@@ -884,6 +897,7 @@ impl Request {
             {
                 7
             }
+            Request::MoveFinalizeTarget { .. } => 8,
             Request::MoveBeginTarget { .. }
             | Request::MoveLivePrepareDisk { .. }
             | Request::MoveLiveDiskReady { .. }
@@ -930,6 +944,7 @@ impl Request {
             | Request::MoveLivePrepareTarget { .. }
             | Request::MoveReserveTarget { .. }
             | Request::MoveRecoverTarget { .. }
+            | Request::MoveFinalizeTarget { .. }
             | Request::MoveCommitTarget { .. }
             | Request::MoveTargetStatus { .. }
             | Request::MoveSourceStatus { .. }
@@ -1266,6 +1281,10 @@ pub enum Response {
         disk_eof: bool,
         #[serde(default)]
         ram_eof: bool,
+        /// Canonical digest of the authenticated final per-file proof.
+        /// Empty means the target has not durably accepted one.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        final_digest: String,
         phase: MoveAuthorityPhase,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         instance: Option<Box<Instance>>,
@@ -1420,6 +1439,17 @@ pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
                 source_device: "source".into(),
                 source_device_id: "01".into(),
                 token: "attempt".into(),
+            }
+            .since(),
+        ),
+        (
+            "live-migration-final-digest",
+            Request::MoveFinalizeTarget {
+                instance_id: "instance".into(),
+                name: "compat".into(),
+                epoch: 1,
+                token: "attempt".into(),
+                files: Vec::new(),
             }
             .since(),
         ),

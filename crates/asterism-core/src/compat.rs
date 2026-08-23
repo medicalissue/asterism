@@ -111,7 +111,8 @@ use crate::VERSION;
 /// * **6** — storage-part leases, reconnect/release, catalog and attach frames,
 ///   plus the device-local structured image catalog and pull results.
 /// * **7** — token-fenced live migration with independent disk and RAM lanes.
-pub const PROTOCOL_VERSION: u32 = 7;
+/// * **8** — authenticated, post-convergence live-migration file digests.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// The wire as it was before it carried a version.
 ///
@@ -124,7 +125,7 @@ pub const FIRST_PROTOCOL: u32 = 1;
 
 /// How many versions back this build still serves. Keep the unnumbered first
 /// wire usable while newer device-shell capabilities negotiate independently.
-pub const SUPPORTED_BACK: u32 = 6;
+pub const SUPPORTED_BACK: u32 = 7;
 
 /// Format version of the home stamp document itself.
 pub const STAMP_VERSION: u32 = 1;

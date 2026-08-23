@@ -118,6 +118,23 @@ pub struct MoveFile {
     pub digest: String,
 }
 
+/// One file in the source-authenticated final identity of a live move.
+///
+/// [`MoveFile`] belongs to the pre-copy manifest and keeps sparse-transfer
+/// accounting. A running guest may legitimately change its root disk after
+/// that manifest was made, so those early hashes are not commit authority.
+/// This proof is captured only after source writes are fenced and the dirty
+/// disk lane has reached durable EOF.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MoveFinalFile {
+    /// Path relative to the instance directory, `/`-separated.
+    pub path: String,
+    /// Final logical length.
+    pub len: u64,
+    /// BLAKE3 content address of the final, quiesced bytes.
+    pub digest: String,
+}
+
 /// Everything a cpu-part swap will carry, computed on the source device
 /// before any of it moves.
 ///

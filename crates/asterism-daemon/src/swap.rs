@@ -78,7 +78,7 @@ use asterism_core::hv::{ControlChannel, Handle, MigrationDiskExport, MigrationSo
 use asterism_core::instance::{now_unix, Instance, MoveSourcePhase, Moving, Status, VolumeKind};
 use asterism_core::paths;
 use asterism_core::protocol::{
-    BaseImage, MoveAuthorityPhase, MoveFile, MoveManifest, Request, Response,
+    BaseImage, MoveAuthorityPhase, MoveFile, MoveFinalFile, MoveManifest, Request, Response,
 };
 use asterism_core::registry::Shard;
 use asterism_core::verify::Digest;
@@ -98,6 +98,7 @@ const LIVE_HANDLE: &str = ".live-migration-handle.json";
 const LIVE_AUTHORITY: &str = ".move-authority.json";
 const AUTHORITY_DIR: &str = "move-authority";
 const SOURCE_COMPLETION_DIR: &str = "move-source-completion";
+const SOURCE_FINAL_PROOF_DIR: &str = "move-source-final-proof";
 
 /// How long a device remembers that an instance left it.
 ///
@@ -985,6 +986,9 @@ struct AuthorityTxn {
     lane: u64,
     #[serde(default = "default_true")]
     lane_ready: bool,
+    /// Source-authenticated identity captured after disk convergence.
+    #[serde(default)]
+    final_files: Option<Vec<MoveFinalFile>>,
 }
 
 fn initial_lane() -> u64 {
@@ -1103,7 +1107,7 @@ fn published_for(txn: &AuthorityTxn) -> bool {
 /// closed before any success `Response::Instance`.
 fn prove_tree_files(
     root: &Path,
-    files: &[MoveFile],
+    files: &[MoveFinalFile],
     instance_id: &str,
     epoch: u64,
     tree: &str,
@@ -1155,6 +1159,89 @@ fn prove_tree_files(
     Ok(())
 }
 
+fn manifest_final_files(files: &[MoveFile]) -> Vec<MoveFinalFile> {
+    files
+        .iter()
+        .map(|file| MoveFinalFile {
+            path: file.path.clone(),
+            len: file.len,
+            digest: file.digest.clone(),
+        })
+        .collect()
+}
+
+fn validate_final_files(txn: &AuthorityTxn, files: &[MoveFinalFile]) -> Result<()> {
+    if files.len() != txn.manifest.files.len() {
+        bail!(
+            "final proof has {} files; the transfer manifest has {}",
+            files.len(),
+            txn.manifest.files.len()
+        );
+    }
+    let mut previous: Option<&str> = None;
+    for (expected, final_file) in txn.manifest.files.iter().zip(files) {
+        if previous.is_some_and(|path| path >= final_file.path.as_str()) {
+            bail!("final proof paths are not unique and canonically ordered");
+        }
+        previous = Some(&final_file.path);
+        if final_file.path != expected.path || final_file.len != expected.len {
+            bail!(
+                "final proof for {:?} does not match manifest path/length {:?}/{}",
+                final_file.path,
+                expected.path,
+                expected.len
+            );
+        }
+        let digest = Digest::parse(&final_file.digest).with_context(|| {
+            format!(
+                "final proof for {:?} has an unusable digest",
+                final_file.path
+            )
+        })?;
+        if digest.algo() != verify::OWN_ALGO {
+            bail!(
+                "final proof for {:?} uses {}, not {}",
+                final_file.path,
+                digest.algo(),
+                verify::OWN_ALGO
+            );
+        }
+    }
+    Ok(())
+}
+
+fn final_proof_digest(
+    instance_id: &str,
+    epoch: u64,
+    token: &str,
+    files: &[MoveFinalFile],
+) -> Result<String> {
+    let encoded = serde_json::to_vec(&(instance_id, epoch, token, files))?;
+    Ok(Digest::of_bytes(verify::OWN_ALGO, &encoded).to_string())
+}
+
+fn txn_final_digest(txn: &AuthorityTxn) -> String {
+    txn.final_files
+        .as_deref()
+        .and_then(|files| final_proof_digest(&txn.instance_id, txn.epoch, &txn.token, files).ok())
+        .unwrap_or_default()
+}
+
+fn authoritative_files(txn: &AuthorityTxn) -> Result<Vec<MoveFinalFile>> {
+    if txn.live {
+        let files = txn
+            .final_files
+            .clone()
+            .context("live target has no source-authenticated final file proof")?;
+        validate_final_files(txn, &files)?;
+        Ok(files)
+    } else {
+        let files = manifest_final_files(&txn.manifest.files);
+        validate_final_files(txn, &files)?;
+        Ok(files)
+    }
+}
+
 /// Prove a WAL that already says `Committed` still names the published target.
 ///
 /// Commit consumes the in-tree marker on purpose: the durable WAL is then
@@ -1196,9 +1283,10 @@ fn prove_committed_published(reg: &Shard, txn: &AuthorityTxn, device: &str) -> R
             txn.epoch
         ),
     }
+    let files = authoritative_files(txn)?;
     prove_tree_files(
         &live,
-        &txn.manifest.files,
+        &files,
         &txn.instance_id,
         txn.epoch,
         "committed live tree",
@@ -1249,6 +1337,7 @@ fn authority_response(txn: &AuthorityTxn, reg: &Shard) -> Response {
         lane: txn.lane,
         disk_eof: txn.disk_eof,
         ram_eof: txn.ram_eof,
+        final_digest: txn_final_digest(txn),
         phase: txn.phase,
         instance,
     }
@@ -1262,6 +1351,7 @@ fn authority_phase_response(txn: &AuthorityTxn) -> Response {
         lane: txn.lane,
         disk_eof: txn.disk_eof,
         ram_eof: txn.ram_eof,
+        final_digest: txn_final_digest(txn),
         phase: txn.phase,
         instance: None,
     }
@@ -1501,6 +1591,7 @@ pub(crate) fn is_step(req: &Request) -> bool {
             | Request::MoveLivePrepareTarget { .. }
             | Request::MoveReserveTarget { .. }
             | Request::MoveRecoverTarget { .. }
+            | Request::MoveFinalizeTarget { .. }
             | Request::MoveCommitTarget { .. }
             | Request::MoveTargetStatus { .. }
             | Request::MoveSourceStatus { .. }
@@ -1619,6 +1710,11 @@ pub(crate) fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Response
                 recover_target(reg, &instance_id, &name, epoch, &token, from_lane)
             })
         }),
+        Request::MoveFinalizeTarget { .. } => Response::Error {
+            message:
+                "final move digests are accepted only from the authenticated source mesh connection"
+                    .into(),
+        },
         Request::MoveCommitTarget {
             manifest,
             epoch,
@@ -1850,12 +1946,13 @@ pub fn source_status(
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct TargetProof {
     phase: MoveAuthorityPhase,
     lane: u64,
     disk_eof: bool,
     ram_eof: bool,
+    final_digest: String,
 }
 
 fn exact_source_phase(
@@ -1920,6 +2017,7 @@ fn exact_target_authority(
             lane,
             disk_eof,
             ram_eof,
+            final_digest,
             ..
         } if winner_id == instance_id && winner_epoch == epoch && winner_token == token => {
             Ok(TargetProof {
@@ -1927,6 +2025,7 @@ fn exact_target_authority(
                 lane,
                 disk_eof,
                 ram_eof,
+                final_digest,
             })
         }
         Response::MoveAuthority { .. } => {
@@ -1935,6 +2034,73 @@ fn exact_target_authority(
         Response::Error { message } => bail!(message),
         other => bail!("unexpected target authority reply: {other:?}"),
     }
+}
+
+fn capture_final_files(name: &str) -> Result<Vec<MoveFinalFile>> {
+    let root = paths::instance_dir(name);
+    let mut files = Vec::new();
+    collect(&root, &root, &mut files)?;
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(manifest_final_files(&files))
+}
+
+async fn ensure_target_final_proof(
+    target: &Arc<Mesh>,
+    moving: &Moving,
+    instance_id: &str,
+    name: &str,
+    epoch: u64,
+    token: &str,
+) -> Result<SourceFinalProof> {
+    let proof = match load_source_final_proof(instance_id, name, &moving.to_device, epoch, token)? {
+        Some(proof) => proof,
+        None => {
+            let files = capture_final_files(name)
+                .context("hashing the quiesced source after dirty-disk EOF")?;
+            SourceFinalProof {
+                version: 1,
+                instance_id: instance_id.to_owned(),
+                name: name.to_owned(),
+                to_device: moving.to_device.clone(),
+                epoch,
+                token: token.to_owned(),
+                digest: final_proof_digest(instance_id, epoch, token, &files)?,
+                files,
+            }
+        }
+    };
+    let response = target
+        .proxy(
+            &moving.to_device,
+            Request::MoveFinalizeTarget {
+                instance_id: instance_id.to_owned(),
+                name: name.to_owned(),
+                epoch,
+                token: token.to_owned(),
+                files: proof.files.clone(),
+            },
+        )
+        .await
+        .context("persisting final digest proof at the target")?;
+    let target_proof = exact_target_authority(response, instance_id, epoch, token)?;
+    if !matches!(
+        target_proof.phase,
+        MoveAuthorityPhase::Reserved
+            | MoveAuthorityPhase::Committing
+            | MoveAuthorityPhase::Committed
+    ) || !target_proof.disk_eof
+        || target_proof.final_digest != proof.digest
+    {
+        bail!(
+            "target did not durably acknowledge the exact final digest proof (phase={:?}, disk_eof={}, expected={}, got={})",
+            target_proof.phase,
+            target_proof.disk_eof,
+            proof.digest,
+            target_proof.final_digest
+        );
+    }
+    save_source_final_proof(&proof)?;
+    Ok(proof)
 }
 
 fn exact_target_commit(
@@ -2011,16 +2177,67 @@ pub async fn decide_source(
         )
         .await
         {
-            Ok(TargetProof {
+            Ok(target_proof @ TargetProof {
                 phase: MoveAuthorityPhase::Committing | MoveAuthorityPhase::Committed,
                 ..
             }) => {
+                let final_proof = match ensure_target_final_proof(
+                    &target,
+                    &moving,
+                    instance_id,
+                    name,
+                    epoch,
+                    token,
+                )
+                .await
+                {
+                    Ok(proof) => proof,
+                    Err(e) => return error(e),
+                };
+                if target_proof.final_digest != final_proof.digest {
+                    return error(anyhow!(
+                        "committing target names a different final digest; source remains fenced"
+                    ));
+                }
                 return Response::MoveSource {
                     instance_id: instance_id.to_owned(),
                     epoch,
                     token: token.to_owned(),
                     phase: MoveSourcePhase::Committed,
                 }
+            }
+            Ok(target_proof @ TargetProof {
+                phase: MoveAuthorityPhase::Reserved,
+                disk_eof: true,
+                ram_eof: true,
+                ..
+            }) => {
+                let final_proof = match ensure_target_final_proof(
+                    &target,
+                    &moving,
+                    instance_id,
+                    name,
+                    epoch,
+                    token,
+                )
+                .await
+                {
+                    Ok(proof) => proof,
+                    Err(e) => return error(e),
+                };
+                if !target_proof.final_digest.is_empty()
+                    && target_proof.final_digest != final_proof.digest
+                {
+                    return error(anyhow!(
+                        "reserved target names a different final digest; source remains fenced"
+                    ));
+                }
+                return Response::MoveSource {
+                    instance_id: instance_id.to_owned(),
+                    epoch,
+                    token: token.to_owned(),
+                    phase: MoveSourcePhase::Committed,
+                };
             }
             Ok(proof) => {
                 return error(anyhow!(
@@ -2141,6 +2358,24 @@ pub async fn decide_source(
         proof.phase,
         MoveAuthorityPhase::Committing | MoveAuthorityPhase::Committed
     ) {
+        let final_proof = match ensure_target_final_proof(
+            &target,
+            &moving,
+            instance_id,
+            name,
+            epoch,
+            token,
+        )
+        .await
+        {
+            Ok(proof) => proof,
+            Err(e) => return error(e),
+        };
+        if proof.final_digest != final_proof.digest {
+            return error(anyhow!(
+                "committing target names a different final digest; source remains fenced"
+            ));
+        }
         return Response::MoveSource {
             instance_id: instance_id.to_owned(),
             epoch,
@@ -2177,6 +2412,7 @@ pub async fn decide_source(
                 lane,
                 disk_eof,
                 ram_eof,
+                final_digest,
                 ..
             }) if winner_id == instance_id && winner_epoch == epoch && winner_token == token => {
                 TargetProof {
@@ -2184,6 +2420,7 @@ pub async fn decide_source(
                     lane,
                     disk_eof,
                     ram_eof,
+                    final_digest,
                 }
             }
             Ok(Response::Error { message }) => return error(anyhow!(message)),
@@ -2270,6 +2507,11 @@ pub async fn decide_source(
             proof.disk_eof,
             proof.ram_eof
         ));
+    }
+    if let Err(e) =
+        ensure_target_final_proof(&target, &moving, instance_id, name, epoch, token).await
+    {
+        return error(e.context("finalizing the converged live disk identity"));
     }
     Response::MoveSource {
         instance_id: instance_id.to_owned(),
@@ -2378,6 +2620,11 @@ fn validate_live_publish_state(
     if !txn.disk_eof || !txn.ram_eof {
         bail!("live target has not durably observed both disk and RAM stream EOF");
     }
+    let files = txn
+        .final_files
+        .as_deref()
+        .context("live target has no source-authenticated final digest")?;
+    validate_final_files(txn, files)?;
     if !target_complete {
         bail!("incoming backend has not completed migration");
     }
@@ -2432,6 +2679,16 @@ pub async fn commit_source_checked(
         ));
     }
     if moving.live {
+        let source_proof =
+            match load_source_final_proof(&inst.id, name, &moving.to_device, epoch, token) {
+                Ok(Some(proof)) => proof,
+                Ok(None) => {
+                    return error(anyhow!(
+                        "source has no durable final digest acknowledged by the target"
+                    ))
+                }
+                Err(e) => return error(e),
+            };
         let mesh = match mesh() {
             Ok(mesh) => mesh,
             Err(e) => return error(e),
@@ -2439,8 +2696,17 @@ pub async fn commit_source_checked(
         match target_proof(&mesh, &moving.to_device, &inst.id, name, epoch, token).await {
             Ok(TargetProof {
                 phase: MoveAuthorityPhase::Committed,
+                final_digest,
                 ..
-            }) => {}
+            }) if final_digest == source_proof.digest => {}
+            Ok(TargetProof {
+                phase: MoveAuthorityPhase::Committed,
+                ..
+            }) => {
+                return error(anyhow!(
+                    "target committed a different final digest; source remains fenced"
+                ))
+            }
             Ok(proof) => {
                 return error(anyhow!(
                     "target authority is {:?}, not durably committed; source remains fenced",
@@ -2510,6 +2776,16 @@ fn commit_source_after_proof(
         ));
     }
 
+    let final_digest = if moving.live {
+        match load_source_final_proof(&inst.id, name, &moving.to_device, epoch, token) {
+            Ok(Some(proof)) => proof.digest,
+            Ok(None) => return error(anyhow!("source cleanup has no durable final digest proof")),
+            Err(e) => return error(e),
+        }
+    } else {
+        String::new()
+    };
+
     if let Some(handle) = &inst.handle.filter(backend::alive) {
         if let Err(e) = backend::for_handle(&handle.backend).and_then(|hv| hv.kill(handle)) {
             return error(e.context("the migrated source guest could not be fenced off"));
@@ -2525,6 +2801,8 @@ fn commit_source_after_proof(
         to_device: moving.to_device.clone(),
         epoch,
         token: token.to_owned(),
+        live: moving.live,
+        final_digest,
     };
     match load_source_completion(instance_id, name, epoch, token) {
         Ok(Some(existing)) if existing == completion => {}
@@ -2917,6 +3195,7 @@ fn begin_target(
         ram_eof: false,
         lane: initial_lane(),
         lane_ready: true,
+        final_files: None,
     };
     match load_authority(&txn.instance_id, epoch) {
         Ok(Some(existing)) => {
@@ -3118,6 +3397,7 @@ fn live_prepare_target(
         ram_eof: false,
         lane: initial_lane(),
         lane_ready: true,
+        final_files: None,
     };
     match load_authority(&txn.instance_id, epoch) {
         Ok(Some(existing)) => {
@@ -3245,6 +3525,85 @@ fn reserve_target(reg: &Shard, instance_id: &str, name: &str, epoch: u64, token:
             txn.phase
         )),
     }
+}
+
+/// Accept the post-convergence proof only from the exact source identity
+/// recorded before either bulk lane opened.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finalize_target_authenticated(
+    reg: &Shard,
+    instance_id: &str,
+    name: &str,
+    epoch: u64,
+    token: &str,
+    files: &[MoveFinalFile],
+    requester_device: &str,
+    requester_device_id: &str,
+    device: &str,
+) -> Response {
+    with_authority_txn(|| {
+        let mut txn = match load_authority(instance_id, epoch) {
+            Ok(Some(txn))
+                if txn.live
+                    && txn.name == name
+                    && txn.token == token
+                    && txn.source_device == requester_device
+                    && txn.source_device_id == requester_device_id =>
+            {
+                txn
+            }
+            Ok(Some(_)) => {
+                return error(anyhow!(
+                    "final digest sender does not match the durable source/id/epoch/token"
+                ))
+            }
+            Ok(None) => return error(anyhow!("target authority transaction is absent")),
+            Err(e) => return error(e),
+        };
+
+        if let Some(existing) = txn.final_files.as_ref() {
+            if existing != files {
+                return error(anyhow!(
+                    "a different final digest proof already won this target transaction"
+                ));
+            }
+            if txn.phase == MoveAuthorityPhase::Committed {
+                if let Err(e) = prove_committed_published(reg, &txn, device) {
+                    return error(e.context("replaying the final digest acknowledgement"));
+                }
+            }
+            return authority_response(&txn, reg);
+        }
+        if txn.phase != MoveAuthorityPhase::Reserved || !txn.disk_eof || !txn.ram_eof {
+            return error(anyhow!(
+                "target is {:?} with disk_eof={} ram_eof={}; final digest requires Reserved plus durable disk and RAM EOF",
+                txn.phase,
+                txn.disk_eof,
+                txn.ram_eof
+            ));
+        }
+        if let Err(e) = validate_final_files(&txn, files) {
+            return error(e);
+        }
+        let staging = match staging_for(&txn) {
+            Ok(staging) => staging,
+            Err(e) => return error(e),
+        };
+        if let Err(e) = prove_tree_files(
+            &staging,
+            files,
+            &txn.instance_id,
+            txn.epoch,
+            "converged staged tree",
+        ) {
+            return error(e.context("target bytes do not match the source final proof"));
+        }
+        txn.final_files = Some(files.to_vec());
+        match save_authority(&txn) {
+            Ok(()) => authority_response(&txn, reg),
+            Err(e) => error(e.context("persisting the final digest before publication")),
+        }
+    })
 }
 
 fn record_completed_incoming(txn: &mut AuthorityTxn) -> Result<bool> {
@@ -3542,6 +3901,7 @@ pub fn commit_target(
                 ram_eof: false,
                 lane: initial_lane(),
                 lane_ready: true,
+                final_files: None,
             };
             if let Err(e) = save_authority(&txn) {
                 return error(e.context("recording target intent before adoption"));
@@ -3689,6 +4049,14 @@ fn finish_target_commit(reg: &mut Shard, txn: &mut AuthorityTxn, device: &str) -
             );
         }
         verify(&staging, &txn.manifest, txn.epoch, &txn.token)?;
+        let files = authoritative_files(txn)?;
+        prove_tree_files(
+            &staging,
+            &files,
+            &txn.instance_id,
+            txn.epoch,
+            "staged tree at publication",
+        )?;
         save_authority_marker(&staging, txn)?;
         if let Some(parent) = live.parent() {
             std::fs::create_dir_all(parent)?;
@@ -3715,9 +4083,10 @@ fn finish_target_commit(reg: &mut Shard, txn: &mut AuthorityTxn, device: &str) -
     // substitution after verify, or a Committing restart of a substituted
     // live tree, must not become Instance.
     if txn.phase != MoveAuthorityPhase::Committed {
+        let files = authoritative_files(txn)?;
         prove_tree_files(
             &live,
-            &txn.manifest.files,
+            &files,
             &txn.instance_id,
             txn.epoch,
             "published live tree",
@@ -3836,13 +4205,6 @@ fn verify(staging: &Path, manifest: &MoveManifest, epoch: u64, token: &str) -> R
             None => bail!("{} is not in the record of what arrived", file.path),
         }
     }
-    prove_tree_files(
-        staging,
-        &manifest.files,
-        &manifest.instance.id,
-        epoch,
-        "staged tree",
-    )?;
     let expected = manifest.allocated();
     if receipt.bytes != expected {
         bail!(
@@ -4151,6 +4513,26 @@ struct SourceCompletion {
     to_device: String,
     epoch: u64,
     token: String,
+    #[serde(default)]
+    live: bool,
+    #[serde(default)]
+    final_digest: String,
+}
+
+/// Source copy of the exact proof acknowledged by the target WAL.
+///
+/// This survives a lost reply and lets source cleanup compare the target's
+/// committed answer with the same bytes the quiesced source authenticated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SourceFinalProof {
+    version: u32,
+    instance_id: String,
+    name: String,
+    to_device: String,
+    epoch: u64,
+    token: String,
+    files: Vec<MoveFinalFile>,
+    digest: String,
 }
 
 fn hex_key(value: &str) -> String {
@@ -4168,6 +4550,59 @@ fn source_completion_path(instance_id: &str, epoch: u64, token: &str) -> PathBuf
         hex_key(instance_id),
         hex_key(token)
     ))
+}
+
+fn source_final_proof_path(instance_id: &str, epoch: u64, token: &str) -> PathBuf {
+    paths::home_dir().join(SOURCE_FINAL_PROOF_DIR).join(format!(
+        "{}-{epoch}-{}.json",
+        hex_key(instance_id),
+        hex_key(token)
+    ))
+}
+
+fn load_source_final_proof(
+    instance_id: &str,
+    name: &str,
+    to_device: &str,
+    epoch: u64,
+    token: &str,
+) -> Result<Option<SourceFinalProof>> {
+    let path = source_final_proof_path(instance_id, epoch, token);
+    let Some(loaded) = durable::load_json::<SourceFinalProof>(&path, "a source final move proof")?
+    else {
+        return Ok(None);
+    };
+    let proof = loaded.value;
+    if proof.instance_id != instance_id
+        || proof.name != name
+        || proof.to_device != to_device
+        || proof.epoch != epoch
+        || proof.token != token
+        || proof.digest != final_proof_digest(instance_id, epoch, token, &proof.files)?
+    {
+        bail!("source final proof does not match id/name/target/epoch/token/content");
+    }
+    Ok(Some(proof))
+}
+
+fn save_source_final_proof(proof: &SourceFinalProof) -> Result<()> {
+    if let Some(existing) = load_source_final_proof(
+        &proof.instance_id,
+        &proof.name,
+        &proof.to_device,
+        proof.epoch,
+        &proof.token,
+    )? {
+        if existing == *proof {
+            return Ok(());
+        }
+        bail!("another final source proof already won this id/epoch/token");
+    }
+    durable::commit_json(
+        &source_final_proof_path(&proof.instance_id, proof.epoch, &proof.token),
+        proof,
+    )
+    .context("committing the source final move proof")
 }
 
 fn load_source_completion(
@@ -4188,6 +4623,13 @@ fn load_source_completion(
         || completion.token != token
     {
         bail!("source completion WAL does not match id/name/epoch/token");
+    }
+    if completion.live {
+        let digest = Digest::parse(&completion.final_digest)
+            .context("live source completion has no usable final digest")?;
+        if digest.algo() != verify::OWN_ALGO {
+            bail!("live source completion final digest is not BLAKE3");
+        }
     }
     Ok(Some(completion))
 }
@@ -5275,23 +5717,54 @@ mod tests {
         wrong_identity.token = "token".into();
         wrong_identity.save(&staging).unwrap();
 
-        // Completeness includes content: an empty digest is not authority,
-        // and a same-length substitution is not the file that was promised.
+        // The receipt proves transfer accounting, not live identity. A guest
+        // may write after the pre-copy manifest, so this boundary must not
+        // compare the staged disk with that stale hash.
         let mut no_digest = manifest.clone();
         no_digest.files[0].digest.clear();
-        let err = verify(&staging, &no_digest, 1, "token")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("no digest authority"), "{err}");
+        verify(&staging, &no_digest, 1, "token").unwrap();
         let forged = vec![1u8; 4096];
         assert_eq!(forged.len(), honest.len());
         std::fs::write(staging.join("disk.raw"), &forged).unwrap();
-        let err = verify(&staging, &manifest, 1, "token")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("does not match its digest"), "{err}");
-        std::fs::write(staging.join("disk.raw"), &honest).unwrap();
         verify(&staging, &manifest, 1, "token").unwrap();
+
+        // The post-convergence proof is the identity boundary. The initial
+        // hash rejects the legitimate live write, while a final digest of
+        // those quiesced bytes accepts it and rejects a same-length swap.
+        let err = prove_tree_files(
+            &staging,
+            &manifest_final_files(&manifest.files),
+            &manifest.instance.id,
+            1,
+            "staged tree",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("does not match its digest"), "{err}");
+        let final_files = vec![MoveFinalFile {
+            path: "disk.raw".into(),
+            len: forged.len() as u64,
+            digest: Digest::of_bytes(verify::OWN_ALGO, &forged).to_string(),
+        }];
+        prove_tree_files(
+            &staging,
+            &final_files,
+            &manifest.instance.id,
+            1,
+            "staged tree",
+        )
+        .unwrap();
+        std::fs::write(staging.join("disk.raw"), &honest).unwrap();
+        let err = prove_tree_files(
+            &staging,
+            &final_files,
+            &manifest.instance.id,
+            1,
+            "staged tree",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("does not match its digest"), "{err}");
 
         // A file that arrived the wrong length is refused even though the
         // byte count adds up — sparse means those are different questions.
@@ -5384,6 +5857,7 @@ mod tests {
                 ram_eof: false,
                 lane: initial_lane(),
                 lane_ready: true,
+                final_files: Some(manifest_final_files(&manifest.files)),
             }
         }
 
@@ -6225,6 +6699,8 @@ mod tests {
                 to_device: "desktop".into(),
                 epoch,
                 token: token.clone(),
+                live: false,
+                final_digest: String::new(),
             })
             .unwrap();
             let armed = faults::arm_once(
@@ -6769,6 +7245,8 @@ mod tests {
             to_device: "desktop".into(),
             epoch: 41,
             token: "stranded-token".into(),
+            live: false,
+            final_digest: String::new(),
         };
         save_source_completion(&stranded).unwrap();
         let stranded_dir = paths::instance_dir(&stranded.name);
@@ -6915,6 +7393,147 @@ mod tests {
             ),
             "{restored:?}"
         );
+
+        // A live write after the pre-copy manifest is legitimate. Only the
+        // exact authenticated source may replace that stale identity, and
+        // the target first proves its converged staging bytes before making
+        // the final proof durable.
+        let before_write = b"before-write";
+        let after_write = b"after--write";
+        assert_eq!(before_write.len(), after_write.len());
+        let mut live_digest_manifest = manifest_of(vec![MoveFile {
+            path: "disk.raw".into(),
+            len: before_write.len() as u64,
+            allocated: before_write.len() as u64,
+            mode: 0o600,
+            digest: Digest::of_bytes(verify::OWN_ALGO, before_write).to_string(),
+        }]);
+        live_digest_manifest.instance.name = "live-final-digest".into();
+        live_digest_manifest.instance.id = "live-final-digest-id".into();
+        let live_digest_epoch = 64;
+        let live_digest_staging = staging_dir(
+            &live_digest_manifest.instance.name,
+            &live_digest_manifest.instance.id,
+            live_digest_epoch,
+            "token",
+        );
+        std::fs::create_dir_all(&live_digest_staging).unwrap();
+        std::fs::write(live_digest_staging.join("disk.raw"), after_write).unwrap();
+        let mut live_digest_txn = txn(
+            &live_digest_manifest,
+            live_digest_epoch,
+            MoveAuthorityPhase::Reserved,
+        );
+        live_digest_txn.live = true;
+        live_digest_txn.disk_eof = true;
+        live_digest_txn.final_files = None;
+        save_authority(&live_digest_txn).unwrap();
+        let final_files = vec![MoveFinalFile {
+            path: "disk.raw".into(),
+            len: after_write.len() as u64,
+            digest: Digest::of_bytes(verify::OWN_ALGO, after_write).to_string(),
+        }];
+        // Mirror EOF alone is not a quiescence proof: the RAM/device lane
+        // must also have crossed its durable EOF before the source's final
+        // identity can win target authority.
+        assert!(matches!(
+            finalize_target_authenticated(
+                &restarted,
+                &live_digest_manifest.instance.id,
+                &live_digest_manifest.instance.name,
+                live_digest_epoch,
+                "token",
+                &final_files,
+                "laptop",
+                "source-id",
+                "desktop",
+            ),
+            Response::Error { .. }
+        ));
+        live_digest_txn.ram_eof = true;
+        save_authority(&live_digest_txn).unwrap();
+        assert!(matches!(
+            finalize_target_authenticated(
+                &restarted,
+                &live_digest_manifest.instance.id,
+                &live_digest_manifest.instance.name,
+                live_digest_epoch,
+                "token",
+                &final_files,
+                "impostor",
+                "source-id",
+                "desktop",
+            ),
+            Response::Error { .. }
+        ));
+        let same_len_substitution = b"forged-write";
+        assert_eq!(same_len_substitution.len(), after_write.len());
+        std::fs::write(live_digest_staging.join("disk.raw"), same_len_substitution).unwrap();
+        assert!(matches!(
+            finalize_target_authenticated(
+                &restarted,
+                &live_digest_manifest.instance.id,
+                &live_digest_manifest.instance.name,
+                live_digest_epoch,
+                "token",
+                &final_files,
+                "laptop",
+                "source-id",
+                "desktop",
+            ),
+            Response::Error { .. }
+        ));
+        std::fs::write(live_digest_staging.join("disk.raw"), after_write).unwrap();
+        let finalized = finalize_target_authenticated(
+            &restarted,
+            &live_digest_manifest.instance.id,
+            &live_digest_manifest.instance.name,
+            live_digest_epoch,
+            "token",
+            &final_files,
+            "laptop",
+            "source-id",
+            "desktop",
+        );
+        let expected_final_digest = final_proof_digest(
+            &live_digest_manifest.instance.id,
+            live_digest_epoch,
+            "token",
+            &final_files,
+        )
+        .unwrap();
+        assert!(matches!(
+            finalized,
+            Response::MoveAuthority {
+                phase: MoveAuthorityPhase::Reserved,
+                final_digest,
+                ..
+            } if final_digest == expected_final_digest
+        ));
+        assert_eq!(
+            load_authority(&live_digest_manifest.instance.id, live_digest_epoch)
+                .unwrap()
+                .unwrap()
+                .final_files,
+            Some(final_files.clone())
+        );
+        let mut conflicting_final = final_files.clone();
+        conflicting_final[0].digest =
+            Digest::of_bytes(verify::OWN_ALGO, same_len_substitution).to_string();
+        assert!(matches!(
+            finalize_target_authenticated(
+                &restarted,
+                &live_digest_manifest.instance.id,
+                &live_digest_manifest.instance.name,
+                live_digest_epoch,
+                "token",
+                &conflicting_final,
+                "laptop",
+                "source-id",
+                "desktop",
+            ),
+            Response::Error { .. }
+        ));
 
         // Treat the successful Instance above as a lost reply. Live tree
         // digest is part of its replay identity: a truncated published file
@@ -7134,6 +7753,33 @@ mod tests {
         let source_dir = paths::instance_dir(&source.name);
         std::fs::create_dir_all(&source_dir).unwrap();
         std::fs::write(source_dir.join("disk.raw"), b"source bytes").unwrap();
+        assert!(matches!(
+            commit_source_after_proof(
+                &mut restarted,
+                &source.id,
+                &source.name,
+                source_epoch,
+                source_token,
+            ),
+            Response::Error { .. }
+        ));
+        assert!(
+            source_dir.exists(),
+            "ambiguous digest proof must retain source bytes"
+        );
+        let source_files = Vec::new();
+        save_source_final_proof(&SourceFinalProof {
+            version: 1,
+            instance_id: source.id.clone(),
+            name: source.name.clone(),
+            to_device: "desktop".into(),
+            epoch: source_epoch,
+            token: source_token.into(),
+            digest: final_proof_digest(&source.id, source_epoch, source_token, &source_files)
+                .unwrap(),
+            files: source_files,
+        })
+        .unwrap();
         let mut restarted = Shard::load(&state).unwrap();
         let proof_after_restart = commit_target(
             &mut restarted,
