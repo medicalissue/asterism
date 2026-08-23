@@ -19,13 +19,14 @@ fi
 helper=crates/asterism-hyperv/src/windows.rs
 daemon=crates/asterism-daemon/src/backend/hyperv.rs
 protocol=crates/asterism-hyperv/src/lib.rs
+ipc_harness=scripts/windows-local-system-ipc.ps1
 
-python3 - "$helper" "$daemon" "$protocol" <<'PY'
+python3 - "$helper" "$daemon" "$protocol" "$ipc_harness" <<'PY'
 import pathlib
 import re
 import sys
 
-helper, daemon, protocol = (pathlib.Path(p) for p in sys.argv[1:4])
+helper, daemon, protocol, ipc_harness = (pathlib.Path(p) for p in sys.argv[1:5])
 errors = []
 
 def read(path: pathlib.Path) -> str:
@@ -38,6 +39,7 @@ def read(path: pathlib.Path) -> str:
 helper_text = read(helper)
 daemon_text = read(daemon)
 protocol_text = read(protocol)
+ipc_harness_text = read(ipc_harness)
 
 required = [
     "HcsCreateComputeSystem",
@@ -86,6 +88,9 @@ if leaks:
 
 if not re.search(r"ShouldTerminateOnLastHandleClosed.*false", protocol_text):
     errors.append("durable HCS ownership flag is not pinned in the protocol document")
+
+if re.search(r"\$home\b", ipc_harness_text, re.I):
+    errors.append("LocalSystem IPC harness repurposes PowerShell's reserved HOME variable")
 
 if errors:
     sys.stderr.write("\n".join(errors) + "\n")

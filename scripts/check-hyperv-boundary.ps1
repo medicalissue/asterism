@@ -7,6 +7,7 @@ Set-Location (Split-Path -Parent $PSScriptRoot)
 $Helper = "crates/asterism-hyperv/src/windows.rs"
 $Daemon = "crates/asterism-daemon/src/backend/hyperv.rs"
 $Protocol = "crates/asterism-hyperv/src/lib.rs"
+$IpcHarness = "scripts/windows-local-system-ipc.ps1"
 $Errors = New-Object System.Collections.Generic.List[string]
 
 function Read-Required([string]$Path) {
@@ -20,6 +21,7 @@ function Read-Required([string]$Path) {
 $helperText = Read-Required $Helper
 $daemonText = Read-Required $Daemon
 $protocolText = Read-Required $Protocol
+$ipcHarnessText = Read-Required $IpcHarness
 
 $required = @(
     "HcsCreateComputeSystem",
@@ -77,6 +79,10 @@ foreach ($line in ($daemonText -split "`n")) {
 
 if ($protocolText -notmatch 'ShouldTerminateOnLastHandleClosed.*false') {
     $Errors.Add("durable HCS ownership flag is not pinned in the protocol document") | Out-Null
+}
+
+if ([regex]::IsMatch($ipcHarnessText, '\$home\b', 'IgnoreCase')) {
+    $Errors.Add("LocalSystem IPC harness repurposes PowerShell's reserved HOME variable") | Out-Null
 }
 
 if ($Errors.Count -gt 0) {
