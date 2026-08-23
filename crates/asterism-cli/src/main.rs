@@ -3980,6 +3980,7 @@ fn print_bugreport() -> Result<()> {
 }
 
 /// `ast doctor` — pass/fail host integration, not a bug report.
+#[cfg(not(windows))]
 fn print_doctor() -> Result<()> {
     let checks = doctor::run();
     for check in &checks {
@@ -4557,6 +4558,7 @@ fn sync_update_entry(path: &Path, recursive: bool) -> Result<()> {
         .with_context(|| format!("syncing updater path {}", path.display()))
 }
 
+#[cfg(windows)]
 fn print_doctor() -> Result<()> {
     let report = windows_host::doctor();
     for line in report.lines() {
