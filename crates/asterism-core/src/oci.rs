@@ -188,12 +188,6 @@ const KERNEL_MODULE_NAMES: &[&str] = &[
     "vmw_vsock_virtio_transport",
 ];
 
-const VSOCK_MODULE_NAMES: &[&str] = &[
-    "vsock",
-    "vmw_vsock_virtio_transport_common",
-    "vmw_vsock_virtio_transport",
-];
-
 /// One verified loadable module paired with [`kernel`].
 pub struct KernelModule {
     /// Linux module name, without the `.ko` suffix.
@@ -1843,12 +1837,15 @@ fn virtiofs_module() -> Result<Vec<u8>> {
     std::fs::read(&module).with_context(|| format!("reading {}", module.display()))
 }
 
-/// Verified virtio-vsock modules paired with the direct-boot kernel.
+/// Verified loadable modules paired with the direct-boot kernel.
 ///
-/// Returned in dependency order: core socket support, the common virtio
-/// transport, then the concrete transport Cloud Hypervisor exposes.
-pub fn vsock_modules() -> Result<Vec<KernelModule>> {
-    VSOCK_MODULE_NAMES
+/// Returned in load order: virtiofs first, then core socket support, the
+/// common virtio transport, and finally the concrete transport Cloud
+/// Hypervisor exposes. Direct boot cannot fall back to the root disk's module
+/// tree: that disk may be Debian while the running kernel is Ubuntu's pinned
+/// cloud kernel.
+pub fn direct_boot_modules() -> Result<Vec<KernelModule>> {
+    KERNEL_MODULE_NAMES
         .iter()
         .map(|&name| {
             let path = kernel_module_path(name);

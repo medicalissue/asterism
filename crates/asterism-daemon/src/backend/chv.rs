@@ -267,7 +267,7 @@ impl Chv {
 /// when the root disk is Debian, so loading from the root's `/lib/modules`
 /// would mix kernel releases. These bytes came from the package pinned next
 /// to that kernel and are folded into the seed fingerprint verbatim.
-fn vsock_module_config(modules: &[oci::KernelModule]) -> String {
+fn direct_boot_module_config(modules: &[oci::KernelModule]) -> String {
     let mut out = String::from(
         "bootcmd:\n - |\n   # Asterism: load modules paired with the direct-boot kernel.\n   (\n   set -e\n   umask 077\n",
     );
@@ -294,7 +294,7 @@ fn vsock_module_config(modules: &[oci::KernelModule]) -> String {
             module.name
         ));
     }
-    out.push_str("   rm -f /run/asterism-*.ko\n   ) || echo 'asterism: the direct-boot vsock modules could not be loaded' >&2\n");
+    out.push_str("   rm -f /run/asterism-*.ko\n   ) || echo 'asterism: the direct-boot kernel modules could not be loaded' >&2\n");
     out
 }
 
@@ -405,8 +405,8 @@ impl Hypervisor for Chv {
 
     fn guest_config(&self, inst: &asterism_core::instance::Instance) -> Result<String> {
         let key = Key::ensure(&paths::guest_agent_key_path(&inst.name))?;
-        let modules = oci::vsock_modules()?;
-        let mut config = vsock_module_config(&modules);
+        let modules = oci::direct_boot_modules()?;
+        let mut config = direct_boot_module_config(&modules);
         let agent = guest::cloud_config(&key);
         config.push_str(
             agent
@@ -2480,8 +2480,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn direct_boot_vsock_modules_load_in_dependency_order_before_the_agent() {
+    fn direct_boot_modules_include_virtiofs_and_load_before_the_agent() {
         let modules = [
+            oci::KernelModule {
+                name: "virtiofs",
+                bytes: b"filesystem".to_vec(),
+            },
             oci::KernelModule {
                 name: "vsock",
                 bytes: b"core".to_vec(),
@@ -2495,10 +2499,11 @@ mod tests {
                 bytes: b"transport".to_vec(),
             },
         ];
-        let mut config = vsock_module_config(&modules);
+        let mut config = direct_boot_module_config(&modules);
         config.push_str(" - |\n   echo agent-ready\n");
         asterism_core::seed::mergeable(&config).expect("the seed can carry module payloads");
 
+        let virtiofs = config.find("insmod /run/asterism-virtiofs.ko").unwrap();
         let core = config.find("insmod /run/asterism-vsock.ko").unwrap();
         let common = config
             .find("insmod /run/asterism-vmw_vsock_virtio_transport_common.ko")
@@ -2507,7 +2512,7 @@ mod tests {
             .find("insmod /run/asterism-vmw_vsock_virtio_transport.ko")
             .unwrap();
         let agent = config.find("agent-ready").unwrap();
-        assert!(core < common && common < transport && transport < agent);
+        assert!(virtiofs < core && core < common && common < transport && transport < agent);
         assert_eq!(config.matches("bootcmd:").count(), 1);
     }
 
