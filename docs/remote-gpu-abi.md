@@ -99,10 +99,11 @@ property.
 
 The proof's `Reference` executor evaluates the pinned PTX workload's vector-add
 semantics on CPU so every development and CI machine can run it. Its output
-therefore says `hardware_cuda_executed=false`. A CUDA executor must produce the
-same ABI replies while honestly advertising `executor=cuda`; until that exists,
-the proof establishes the distributed ABI, validation, and fake-local path—not
-hardware CUDA performance or application-wide CUDA compatibility.
+therefore says `hardware_cuda_executed=false`. The production CUDA executor
+loads the NVIDIA driver API, advertises `executor=cuda`, and sets
+`hardware_cuda_executed=true` only when that live driver launched the pinned
+work. The CPU reference is never registered as a production helper and cannot
+satisfy a hardware PASS.
 
 Measurements include end-to-end p50/p95 time for two writes, a launch, and a
 read; provider-only launch p50; and payload MiB/s. They include JSON/base64 and

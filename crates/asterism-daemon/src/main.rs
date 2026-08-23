@@ -58,6 +58,7 @@ use transport::{Admitted, Framing};
 mod backend;
 mod device_shell;
 mod egress;
+mod gpu;
 mod images;
 mod instance;
 mod mesh;
@@ -212,6 +213,17 @@ async fn main() -> Result<()> {
     // ambiguously recorded disk to a hypervisor.
     instance::reconcile_pending_storage(&node).await;
 
+    // CUDA GPU helper. Missing NVIDIA driver leaves the plane unavailable
+    // rather than advertising the CPU reference executor as production.
+    let gpu_name = node.device_name().await;
+    let gpu_id = mesh
+        .as_ref()
+        .map(|mesh| mesh.device_id().to_string())
+        .unwrap_or_else(|| "0".repeat(64));
+    if let Err(e) = gpu::init(gpu_name, gpu_id) {
+        eprintln!("astd: GPU provider unavailable: {e:#}");
+    }
+
     // The egress plane, for the same reason and in the same shape: a bound
     // guest's proxy is put up by the boot that builds its seed, and the
     // source half of a bound request arrives from a mesh stream.
@@ -295,9 +307,17 @@ fn print_early_exit() -> bool {
                 "astd — the Asterism device daemon\n\n\
                  Usage: astd\n\n\
                  Options:\n\
-                   --help     Print help\n\
-                   --version  Print version"
+                   --help        Print help\n\
+                   --version     Print version\n\
+                   --gpu-helper  Run the CUDA GPU helper (unix socket, no public listener)"
             );
+            true
+        }
+        Some("--gpu-helper") => {
+            if let Err(error) = gpu::run_helper() {
+                eprintln!("astd gpu-helper: {error:#}");
+                std::process::exit(1);
+            }
             true
         }
         _ => false,
@@ -791,6 +811,9 @@ pub(crate) async fn handle(req: Request, node: &Node) -> Response {
     // a lease and wait forever on its own lock.
     if volume::is_plane_request(&req) {
         return volume::serve(req).await;
+    }
+    if gpu::claims(&req) {
+        return gpu::serve(req);
     }
     if images::is_plane_request(&req) {
         return images::serve(req).await;

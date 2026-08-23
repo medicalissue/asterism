@@ -213,6 +213,10 @@ enum MeshRequest {
         /// The epoch that lease was granted at.
         epoch: u64,
     },
+    /// Authenticated GPU ABI session on the CUDA helper. The opening frame
+    /// carries the live lease capability; subsequent frames are versioned
+    /// remote-GPU requests. Never a public listener.
+    GpuAbi { capability: String },
 
     // ---- moving an instance's cpu part --------------------------------------
     //
@@ -261,6 +265,7 @@ impl MeshRequest {
             // and epoch are the provider-side writer fence, so an older peer
             // must refuse it rather than treating it as an ordinary splice.
             MeshRequest::VolumeSplice { .. } => 7,
+            MeshRequest::GpuAbi { .. } => 8,
             _ => compat::FIRST_PROTOCOL,
         }
     }
@@ -306,6 +311,7 @@ impl MeshRequest {
             MeshRequest::SshSplice { .. } => "an ssh connection",
             MeshRequest::DeviceShell { .. } => "a device shell",
             MeshRequest::VolumeSplice { .. } => "a volume connection",
+            MeshRequest::GpuAbi { .. } => "a GPU ABI session",
             MeshRequest::MoveExport { .. } => "an instance export",
             MeshRequest::MoveBase { .. } => "a base image",
             MeshRequest::MoveImport { .. } => "an instance import",
@@ -379,7 +385,7 @@ enum MoveFrame {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-enum MeshReply {
+pub(crate) enum MeshReply {
     Rpc {
         response: Response,
     },
@@ -402,6 +408,12 @@ enum MeshReply {
     /// The last framed message on a stream that is becoming a pipe — an ssh
     /// session, or a volume's NBD connection.
     SpliceReady,
+    /// GPU helper accepted the authenticated lease. ABI frames follow.
+    GpuReady {
+        gpu_uuid: String,
+        generation: u64,
+        executor: String,
+    },
     /// The private half of this device's guest key, in OpenSSH format.
     GuestKey {
         key: String,
@@ -3382,6 +3394,9 @@ async fn serve_stream(
             )
             .await
         }
+        MeshRequest::GpuAbi { capability } => {
+            return crate::gpu::serve_mesh(stream, &capability, &requester_device_id).await
+        }
         // Bulk, not request/reply: each of these stops being a framed RPC
         // after this line and becomes a stream of `MoveFrame`s.
         MeshRequest::MoveExport { name, epoch } => {
@@ -3437,6 +3452,7 @@ async fn serve_stream(
                     device: node.device_name().await,
                     rows: crate::wake::check(),
                 },
+                Request::GpuProviderStatus => crate::gpu::serve(Request::GpuProviderStatus),
                 Request::DeviceShellStatus => Response::DeviceShellStatus {
                     status: node.shell.status(true),
                     revoked: 0,
@@ -3707,7 +3723,7 @@ fn addr_strings(addr: &EndpointAddr) -> (Vec<String>, Vec<String>) {
     )
 }
 
-async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Result<()> {
+pub(crate) async fn write_frame<T: Serialize>(send: &mut SendStream, value: &T) -> Result<()> {
     let bytes = serde_json::to_vec(value)?;
     send.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
     send.write_all(&bytes).await?;

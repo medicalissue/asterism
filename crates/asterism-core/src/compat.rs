@@ -110,7 +110,8 @@ use crate::VERSION;
 /// * **5** — mesh-safe, read-only device-shell policy status.
 /// * **6** — device-local structured image catalog and pull results.
 /// * **7** — orbit storage catalog, placement, leases, and fenced NBD splices.
-pub const PROTOCOL_VERSION: u32 = 7;
+/// * **8** — CUDA GPU helper status and authenticated mesh GPU ABI.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// The wire as it was before it carried a version.
 ///

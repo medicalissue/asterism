@@ -13,7 +13,9 @@ filed as NVIDIA hardware evidence.
 
 | Path | Role |
 | --- | --- |
-| `crates/asterism-core/src/remote_gpu.rs` | ABI v1 + production control plane (`ProductionProvider`, leases, placement, generation fencing, guest-local `/dev/nvidia0` metadata) |
+| `crates/asterism-core/src/remote_gpu.rs` | ABI v1 + production control plane (`ProductionProvider`, leases, placement, generation fencing, guest-local `/dev/nvidia0` metadata, per-lease and aggregate quotas) |
+| `crates/asterism-core/src/remote_gpu_cuda.rs` | NVIDIA CUDA driver executor (`libcuda` via dlopen). Simulated driver for source tests; live driver is the only hardware-PASS path. |
+| `crates/asterism-daemon/src/gpu.rs` | Daemon/mesh routing into the CUDA helper. Unix helper socket, no public listener, no token persistence. |
 | `crates/asterism-core/src/remote_gpu_nvidia.rs` | Fail-closed driver/CUDA/CC matrix and deterministic two-device harness |
 | `crates/asterism-core/examples/remote_gpu_nvidia_harness.rs` | Source runner for the contract; always prints `hardware_cuda_executed=false` |
 | `scripts/harness-remote-gpu-nvidia.sh` | Hardware wrapper: inventory, matrix, `nvcc` kernel on two devices, contract runner |

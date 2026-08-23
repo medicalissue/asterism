@@ -12,9 +12,10 @@
 //! [`protocol`] is the CLI <-> daemon wire, [`ipc`] is the door that
 //! wire arrives through, and [`compat`] is which version of it two vintages
 //! settle on. [`remote_gpu`] is the transport-independent CUDA-semantic ABI
-//! behind a projected guest GPU device. [`remote_gpu_nvidia`] is the
-//! fail-closed NVIDIA inventory/matrix and two-device harness around that
-//! ABI. [`verify`] is the gate every boot input passes through on its way
+//! behind a projected guest GPU device. [`remote_gpu_cuda`] is the production
+//! NVIDIA driver executor for that ABI. [`remote_gpu_nvidia`] is the
+//! fail-closed inventory/matrix and two-device harness around it. [`verify`]
+//! is the gate every boot input passes through on its way
 //! into the store and out of it again, and [`profile`] is what a guest is
 //! asked to become once it has booted.
 
@@ -37,6 +38,7 @@ pub mod profile;
 pub mod protocol;
 pub mod registry;
 pub mod remote_gpu;
+pub mod remote_gpu_cuda;
 pub mod remote_gpu_nvidia;
 pub mod rewrite;
 pub mod secret;

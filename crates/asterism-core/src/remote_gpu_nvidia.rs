@@ -9,10 +9,12 @@
 //! against two admitted GPU identities.
 //!
 //! Execution inside this harness uses the portable [`Executor::Reference`]
-//! state machine. That is deliberate. Advertising `Executor::Cuda` and
-//! setting `hardware_cuda_executed=true` is reserved for a provider that
-//! actually launched the pinned work on NVIDIA hardware. A CPU reference
-//! run is never NVIDIA evidence.
+//! state machine. That is deliberate: this file is the *contract* runner, not
+//! the production executor. Production daemons connect
+//! [`crate::remote_gpu::ProductionProvider`] to [`crate::remote_gpu_cuda`].
+//! Advertising `Executor::Cuda` with `hardware_cuda_executed=true` is reserved
+//! for a provider that actually launched the pinned work through the NVIDIA
+//! driver API. A CPU reference run is never NVIDIA evidence.
 
 use std::collections::HashSet;
 
