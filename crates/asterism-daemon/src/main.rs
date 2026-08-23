@@ -47,6 +47,7 @@ use anyhow::{Context, Result};
 use tokio::sync::Mutex;
 
 use asterism_core::compat;
+use asterism_core::instance::now_unix;
 use asterism_core::ipc;
 use asterism_core::orbit::Orbit;
 use asterism_core::protocol::{Request, Response};
@@ -190,13 +191,82 @@ async fn main() -> Result<()> {
                 mesh.self_name().await
             );
             let name = node.device_name().await;
+            let instances = node.shard.lock().await.list();
+            let mut device_ids =
+                std::collections::HashMap::from([(name.clone(), mesh.device_id().to_string())]);
+            {
+                let orbit = node.orbit.lock().await;
+                device_ids.extend(
+                    orbit
+                        .devices()
+                        .iter()
+                        .map(|device| (device.name.clone(), device.device_id.clone())),
+                );
+            }
             match node
                 .gpu
-                .register_hardware(&name, &mesh.device_id().to_string())
+                .register_hardware(
+                    &name,
+                    &mesh.device_id().to_string(),
+                    &instances,
+                    &device_ids,
+                )
                 .await
             {
                 Ok(0) => {}
-                Ok(count) => eprintln!("astd: registered {count} NVIDIA GPU provider(s)"),
+                Ok(count) => {
+                    eprintln!("astd: registered {count} NVIDIA GPU provider(s)");
+                    let gpu = node.gpu.clone();
+                    let reconciliation_node = node.clone();
+                    let reconciliation_mesh = mesh.clone();
+                    tokio::spawn(async move {
+                        let mut durable_catalog = Vec::new();
+                        match reconciliation_mesh
+                            .orbit_registry(&reconciliation_node)
+                            .await
+                        {
+                            Ok(Response::Orbit { rows }) => {
+                                let instances = rows
+                                    .into_iter()
+                                    .map(|row| row.instance)
+                                    .collect::<Vec<_>>();
+                                match gpu.reconcile_durable_attachments(&instances, &device_ids) {
+                                    Ok(restored) if restored > 0 => eprintln!(
+                                        "astd: reconciled {restored} durable remote GPU attachment(s)"
+                                    ),
+                                    Ok(_) => {}
+                                    Err(error) => eprintln!(
+                                        "astd: durable GPU attachment reconciliation failed: {error:#}"
+                                    ),
+                                }
+                                durable_catalog = instances;
+                            }
+                            Ok(other) => eprintln!(
+                                "astd: orbit GPU reconciliation received unexpected reply: {other:?}"
+                            ),
+                            Err(error) => eprintln!(
+                                "astd: orbit GPU attachment catalog is unavailable: {error:#}"
+                            ),
+                        }
+                        let mut interval =
+                            tokio::time::interval(std::time::Duration::from_secs(60));
+                        loop {
+                            interval.tick().await;
+                            if !durable_catalog.is_empty() {
+                                if let Err(error) =
+                                    gpu.reconcile_durable_attachments(&durable_catalog, &device_ids)
+                                {
+                                    eprintln!(
+                                        "astd: durable GPU attachment reconciliation failed: {error:#}"
+                                    );
+                                }
+                            }
+                            if let Err(error) = gpu.renew_durable_leases(now_unix()) {
+                                eprintln!("astd: durable GPU lease renewal failed: {error:#}");
+                            }
+                        }
+                    });
+                }
                 Err(err) => eprintln!("astd: NVIDIA GPU inventory refused: {err:#}"),
             }
             Some(mesh)
@@ -585,6 +655,10 @@ async fn serve(conn: Admitted, node: Node, mesh: Option<Arc<Mesh>>) -> Result<()
                     message: format!("{e:#}"),
                 })
                 .await?;
+                // This unix connection is the local counterpart of one GPU
+                // data path. Once the remote side is gone, retaining it in
+                // the ordinary RPC loop leaves the guest/CUSE pump blocked.
+                break;
             }
             continue;
         }

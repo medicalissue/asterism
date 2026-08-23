@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use asterism_core::remote_gpu_guest::{
     self as guest, CudaCall, CudaResult, GuestShim, CUDA_DRIVER_VERSION, CUDA_ERROR_INVALID_VALUE,
@@ -50,7 +50,11 @@ pub const EXPORTED_CUDA_DRIVER_SYMBOLS: &[&str] = &[
 ];
 
 struct State {
-    shim: GuestShim,
+    shim: Arc<GuestShim>,
+    mutable: Mutex<MutableState>,
+}
+
+struct MutableState {
     ptrs: HashMap<u64, String>,
     next_ptr: u64,
     modules: HashMap<u64, String>,
@@ -60,7 +64,7 @@ struct State {
     last_pin: Option<String>,
 }
 
-static STATE: Mutex<Option<State>> = Mutex::new(None);
+static STATE: Mutex<Option<Arc<State>>> = Mutex::new(None);
 
 fn device_path() -> &'static Path {
     Path::new(GUEST_DEVICE_PATH)
@@ -68,14 +72,16 @@ fn device_path() -> &'static Path {
 
 fn with_state<F>(body: F) -> i32
 where
-    F: FnOnce(&mut State) -> i32,
+    F: FnOnce(&State) -> i32,
 {
-    let mut guard = match STATE.lock() {
+    let state = match STATE.lock() {
         Ok(guard) => guard,
         Err(_) => return CUDA_ERROR_NOT_INITIALIZED,
-    };
-    match guard.as_mut() {
-        Some(state) => body(state),
+    }
+    .as_ref()
+    .cloned();
+    match state {
+        Some(state) => body(&state),
         None => CUDA_ERROR_NOT_INITIALIZED,
     }
 }
@@ -88,7 +94,7 @@ fn result_code(result: Result<CudaResult, guest::GuestError>) -> i32 {
     }
 }
 
-fn intern_ptr(state: &mut State, allocation: String) -> u64 {
+fn intern_ptr(state: &mut MutableState, allocation: String) -> u64 {
     let ptr = state.next_ptr.max(1);
     state.next_ptr = ptr.saturating_add(16);
     state.ptrs.insert(ptr, allocation);
@@ -105,16 +111,18 @@ pub extern "C" fn cuInit(_flags: c_uint) -> i32 {
         Ok(mut shim) => match shim.open() {
             Ok(_) => match shim.call(CudaCall::Init) {
                 Ok(_) => {
-                    *guard = Some(State {
-                        shim,
-                        ptrs: HashMap::new(),
-                        next_ptr: 0x1000,
-                        modules: HashMap::new(),
-                        next_module: 1,
-                        functions: HashMap::new(),
-                        next_function: 1,
-                        last_pin: None,
-                    });
+                    *guard = Some(Arc::new(State {
+                        shim: Arc::new(shim),
+                        mutable: Mutex::new(MutableState {
+                            ptrs: HashMap::new(),
+                            next_ptr: 0x1000,
+                            modules: HashMap::new(),
+                            next_module: 1,
+                            functions: HashMap::new(),
+                            next_function: 1,
+                            last_pin: None,
+                        }),
+                    }));
                     CUDA_SUCCESS
                 }
                 Err(_) => CUDA_ERROR_NOT_SUPPORTED,
@@ -310,7 +318,11 @@ pub extern "C" fn cuMemAlloc(dev_ptr: *mut u64, bytes: usize) -> i32 {
             bytes: bytes as u64,
         }) {
             Ok(CudaResult::Alloc { allocation }) => {
-                let ptr = intern_ptr(state, allocation);
+                let mut mutable = match state.mutable.lock() {
+                    Ok(mutable) => mutable,
+                    Err(_) => return CUDA_ERROR_NOT_INITIALIZED,
+                };
+                let ptr = intern_ptr(&mut mutable, allocation);
                 unsafe {
                     *dev_ptr = ptr;
                 }
@@ -324,10 +336,20 @@ pub extern "C" fn cuMemAlloc(dev_ptr: *mut u64, bytes: usize) -> i32 {
 #[no_mangle]
 pub extern "C" fn cuMemFree(dev_ptr: u64) -> i32 {
     with_state(|state| {
-        let Some(allocation) = state.ptrs.remove(&dev_ptr) else {
+        let allocation = match state.mutable.lock() {
+            Ok(mutable) => mutable.ptrs.get(&dev_ptr).cloned(),
+            Err(_) => return CUDA_ERROR_NOT_INITIALIZED,
+        };
+        let Some(allocation) = allocation else {
             return CUDA_ERROR_INVALID_VALUE;
         };
-        result_code(state.shim.call(CudaCall::MemFree { allocation }))
+        let result = state.shim.call(CudaCall::MemFree { allocation });
+        if result.is_ok() {
+            if let Ok(mut mutable) = state.mutable.lock() {
+                mutable.ptrs.remove(&dev_ptr);
+            }
+        }
+        result_code(result)
     })
 }
 
@@ -337,7 +359,11 @@ pub extern "C" fn cuMemcpyHtoD(dst: u64, src: *const c_void, bytes: usize) -> i3
         return CUDA_ERROR_INVALID_VALUE;
     }
     with_state(|state| {
-        let Some(allocation) = state.ptrs.get(&dst).cloned() else {
+        let allocation = match state.mutable.lock() {
+            Ok(mutable) => mutable.ptrs.get(&dst).cloned(),
+            Err(_) => return CUDA_ERROR_NOT_INITIALIZED,
+        };
+        let Some(allocation) = allocation else {
             return CUDA_ERROR_INVALID_VALUE;
         };
         let data = unsafe { std::slice::from_raw_parts(src as *const u8, bytes) }.to_vec();
@@ -355,7 +381,11 @@ pub extern "C" fn cuMemcpyDtoH(dst: *mut c_void, src: u64, bytes: usize) -> i32 
         return CUDA_ERROR_INVALID_VALUE;
     }
     with_state(|state| {
-        let Some(allocation) = state.ptrs.get(&src).cloned() else {
+        let allocation = match state.mutable.lock() {
+            Ok(mutable) => mutable.ptrs.get(&src).cloned(),
+            Err(_) => return CUDA_ERROR_NOT_INITIALIZED,
+        };
+        let Some(allocation) = allocation else {
             return CUDA_ERROR_INVALID_VALUE;
         };
         match state.shim.call(CudaCall::MemcpyDtoH {
@@ -383,22 +413,29 @@ pub extern "C" fn cuModuleLoadData(module: *mut u64, image: *const c_void) -> i3
     // Validate caller bytes before attempting to open transport state. An
     // unavailable guest endpoint must not hide that an unsupported module
     // would otherwise be substituted or accepted on a later retry.
-    let bytes = unsafe { CStr::from_ptr(image as *const c_char) }
-        .to_bytes()
-        .to_vec();
-    if bytes != asterism_core::remote_gpu::VECTOR_ADD_PTX.as_bytes() {
+    let expected = asterism_core::remote_gpu::VECTOR_ADD_PTX.as_bytes();
+    // CUDA specifies a NUL-terminated image, but scanning for that NUL makes
+    // an attacker-controlled pointer an unbounded read. ABI 1 accepts one
+    // pinned PTX image, so inspect exactly that bounded length plus its NUL.
+    let candidate = unsafe { std::slice::from_raw_parts(image as *const u8, expected.len() + 1) };
+    if candidate[..expected.len()] != *expected || candidate[expected.len()] != 0 {
         return CUDA_ERROR_NOT_SUPPORTED;
     }
+    let bytes = expected.to_vec();
     with_state(|state| {
         // ABI 1 accepts exactly the audited, content-pinned PTX program.
         // Never replace caller bytes with a built-in payload: that turns an
         // unsupported module into a different successful program.
         match state.shim.call(CudaCall::ModuleLoadData { image: bytes }) {
             Ok(CudaResult::Module { pin }) => {
-                let handle = state.next_module;
-                state.next_module = handle.saturating_add(1);
-                state.modules.insert(handle, pin.clone());
-                state.last_pin = Some(pin);
+                let mut mutable = match state.mutable.lock() {
+                    Ok(mutable) => mutable,
+                    Err(_) => return CUDA_ERROR_NOT_INITIALIZED,
+                };
+                let handle = mutable.next_module;
+                mutable.next_module = handle.saturating_add(1);
+                mutable.modules.insert(handle, pin.clone());
+                mutable.last_pin = Some(pin);
                 unsafe {
                     *module = handle;
                 }
@@ -412,10 +449,20 @@ pub extern "C" fn cuModuleLoadData(module: *mut u64, image: *const c_void) -> i3
 #[no_mangle]
 pub extern "C" fn cuModuleUnload(module: u64) -> i32 {
     with_state(|state| {
-        let Some(pin) = state.modules.remove(&module) else {
+        let pin = match state.mutable.lock() {
+            Ok(mutable) => mutable.modules.get(&module).cloned(),
+            Err(_) => return CUDA_ERROR_NOT_INITIALIZED,
+        };
+        let Some(pin) = pin else {
             return CUDA_ERROR_INVALID_VALUE;
         };
-        result_code(state.shim.call(CudaCall::ModuleUnload { module: pin }))
+        let result = state.shim.call(CudaCall::ModuleUnload { module: pin });
+        if result.is_ok() {
+            if let Ok(mut mutable) = state.mutable.lock() {
+                mutable.modules.remove(&module);
+            }
+        }
+        result_code(result)
     })
 }
 
@@ -429,7 +476,11 @@ pub extern "C" fn cuModuleGetFunction(func: *mut u64, module: u64, name: *const 
         .unwrap_or("")
         .to_owned();
     with_state(|state| {
-        let Some(pin) = state.modules.get(&module).cloned() else {
+        let pin = match state.mutable.lock() {
+            Ok(mutable) => mutable.modules.get(&module).cloned(),
+            Err(_) => return CUDA_ERROR_NOT_INITIALIZED,
+        };
+        let Some(pin) = pin else {
             return CUDA_ERROR_INVALID_VALUE;
         };
         match state.shim.call(CudaCall::ModuleGetFunction {
@@ -437,9 +488,13 @@ pub extern "C" fn cuModuleGetFunction(func: *mut u64, module: u64, name: *const 
             name: name.clone(),
         }) {
             Ok(CudaResult::Function { function }) => {
-                let handle = state.next_function;
-                state.next_function = handle.saturating_add(1);
-                state.functions.insert(handle, function);
+                let mut mutable = match state.mutable.lock() {
+                    Ok(mutable) => mutable,
+                    Err(_) => return CUDA_ERROR_NOT_INITIALIZED,
+                };
+                let handle = mutable.next_function;
+                mutable.next_function = handle.saturating_add(1);
+                mutable.functions.insert(handle, function);
                 unsafe {
                     *func = handle;
                 }
@@ -468,9 +523,6 @@ pub extern "C" fn cuLaunchKernel(
         return CUDA_ERROR_NOT_SUPPORTED;
     }
     with_state(|state| {
-        let Some(function) = state.functions.get(&func).cloned() else {
-            return CUDA_ERROR_INVALID_VALUE;
-        };
         let params = unsafe { std::slice::from_raw_parts(kernel_params, 4) };
         if params.iter().any(|p| p.is_null()) {
             return CUDA_ERROR_INVALID_VALUE;
@@ -479,19 +531,23 @@ pub extern "C" fn cuLaunchKernel(
         let rhs_ptr = unsafe { *(params[1] as *const u64) };
         let out_ptr = unsafe { *(params[2] as *const u64) };
         let elements = unsafe { *(params[3] as *const u32) } as u64;
-        let Some(lhs) = state.ptrs.get(&lhs_ptr).cloned() else {
-            return CUDA_ERROR_INVALID_VALUE;
+        let handles = match state.mutable.lock() {
+            Ok(mutable) => (
+                mutable.functions.get(&func).cloned(),
+                mutable.ptrs.get(&lhs_ptr).cloned(),
+                mutable.ptrs.get(&rhs_ptr).cloned(),
+                mutable.ptrs.get(&out_ptr).cloned(),
+                mutable.last_pin.clone(),
+            ),
+            Err(_) => return CUDA_ERROR_NOT_INITIALIZED,
         };
-        let Some(rhs) = state.ptrs.get(&rhs_ptr).cloned() else {
-            return CUDA_ERROR_INVALID_VALUE;
-        };
-        let Some(output) = state.ptrs.get(&out_ptr).cloned() else {
+        let (Some(function), Some(lhs), Some(rhs), Some(output), pin) = handles else {
             return CUDA_ERROR_INVALID_VALUE;
         };
         if function != "vector_add_f32" || shared_mem != 0 {
             return CUDA_ERROR_NOT_SUPPORTED;
         }
-        let pin = state.last_pin.clone().unwrap_or_default();
+        let pin = pin.unwrap_or_default();
         let _ = (grid_x, grid_y, grid_z, block_x, block_y, block_z);
         result_code(state.shim.call(CudaCall::LaunchVectorAdd {
             workload_pin: pin,
@@ -597,6 +653,20 @@ mod tests {
     #[test]
     fn unsupported_module_bytes_are_never_replaced_by_the_pinned_ptx() {
         let image = std::ffi::CString::new(".version 99.0\n.not_the_audited_program").unwrap();
+        let mut module = 0u64;
+        assert_eq!(
+            cuModuleLoadData(&mut module, image.as_ptr().cast()),
+            CUDA_ERROR_NOT_SUPPORTED
+        );
+        assert_eq!(module, 0);
+    }
+
+    #[test]
+    fn module_validation_is_bounded_and_requires_nul_at_the_exact_pin_length() {
+        let mut image = asterism_core::remote_gpu::VECTOR_ADD_PTX
+            .as_bytes()
+            .to_vec();
+        image.push(b'x');
         let mut module = 0u64;
         assert_eq!(
             cuModuleLoadData(&mut module, image.as_ptr().cast()),

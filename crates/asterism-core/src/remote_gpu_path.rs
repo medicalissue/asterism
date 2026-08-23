@@ -78,6 +78,8 @@ pub enum GpuMeshFrame {
         session: String,
     },
     Refused {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<u64>,
         code: ControlErrorCode,
         message: String,
     },
@@ -342,6 +344,12 @@ impl ProviderHop {
     /// time would let an expired lease keep serving.
     pub fn set_now(&mut self, now: u64) {
         self.now = now;
+        if let Some(instance_id) = &self.instance_id {
+            let _ = self
+                .production
+                .authority_mut()
+                .renew_durable_instance(instance_id, now);
+        }
         self.production.authority_mut().reap_expired(now);
     }
 
@@ -399,6 +407,7 @@ impl ProviderHop {
                 reason: err.message,
             }),
             Err(err) => Ok(GpuMeshFrame::Refused {
+                id: None,
                 code: err.code,
                 message: err.message,
             }),
@@ -417,12 +426,14 @@ impl ProviderHop {
             GpuMeshFrame::Call { id, request } => {
                 if self.queued.len() as u32 >= DEFAULT_CREDIT_WINDOW {
                     return Ok(GpuMeshFrame::Refused {
+                        id: Some(id),
                         code: ControlErrorCode::LimitExceeded,
                         message: "GPU mesh credit window is exhausted".into(),
                     });
                 }
                 if self.queued.iter().any(|(qid, _)| *qid == id) {
                     return Ok(GpuMeshFrame::Refused {
+                        id: Some(id),
                         code: ControlErrorCode::InvalidRequest,
                         message: "GPU call id is already queued".into(),
                     });
@@ -438,6 +449,7 @@ impl ProviderHop {
                     Ok(GpuMeshFrame::Cancelled { id })
                 } else {
                     Ok(GpuMeshFrame::Refused {
+                        id: Some(id),
                         code: ControlErrorCode::InvalidRequest,
                         message: "GPU call already executed or unknown".into(),
                     })
@@ -448,6 +460,7 @@ impl ProviderHop {
                 Ok(GpuMeshFrame::Close)
             }
             other => Ok(GpuMeshFrame::Refused {
+                id: None,
                 code: ControlErrorCode::InvalidRequest,
                 message: format!("provider rejected unexpected mesh frame {other:?}"),
             }),
@@ -490,6 +503,7 @@ impl ProviderHop {
                     reason: err.message,
                 },
                 Err(err) => GpuMeshFrame::Refused {
+                    id: Some(id),
                     code: err.code,
                     message: err.message,
                 },
@@ -640,9 +654,11 @@ impl ProviderHop {
         }
     }
 
-    /// Close the ABI session, revoke the instance, and reap expired leases.
-    /// `lost` also marks the provider unavailable.
-    pub fn shutdown(&mut self, reason: &str, lost: bool) {
+    /// Close this transient ABI session while preserving the durable GPU
+    /// attachment and its lease. A socket EOF says the guest process or one
+    /// route disappeared; it is not evidence that the NVIDIA provider died
+    /// and must never silently turn an ordinary close into `ast gpu detach`.
+    pub fn shutdown(&mut self, _reason: &str, _lost: bool) {
         self.queued.clear();
         if let (Some(session), Some(instance_id), Some(generation)) = (
             self.abi_session.take(),
@@ -658,12 +674,8 @@ impl ProviderHop {
                 self.now,
             );
             self.production.guest_lost(&instance_id);
-            self.production.revoke_instance(&instance_id);
         }
         self.production.authority_mut().reap_expired(self.now);
-        if lost {
-            self.production.provider_lost(reason);
-        }
         self.instance_id = None;
         self.generation = None;
         self.current_context = None;
@@ -765,7 +777,8 @@ impl GuestMeshPath {
                 self.consumer.apply_mesh(reply.clone())?;
                 match reply {
                     GpuMeshFrame::Cancelled { id } => Ok(GuestReply::Cancelled { id }),
-                    GpuMeshFrame::Refused { message, .. } => Ok(GuestReply::Refused {
+                    GpuMeshFrame::Refused { id, message, .. } => Ok(GuestReply::Refused {
+                        id,
                         code: "cancel".into(),
                         message,
                     }),
@@ -1059,7 +1072,7 @@ mod tests {
             .unwrap();
         production.authority_mut().provider_lost("restart");
         production.authority_mut().recover().unwrap();
-        let mut consumer = ConsumerHop::new("inst-skew", attachment.provider_generation).unwrap();
+        let consumer = ConsumerHop::new("inst-skew", attachment.provider_generation).unwrap();
         let mut provider = ProviderHop::new(peer, production, 1_000);
         let open: GpuMeshOpen = decode_frame(&consumer.open_bytes().unwrap()).unwrap();
         let reply = provider.accept_open(open).unwrap();
@@ -1101,6 +1114,37 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_session_shutdown_preserves_durable_lease_for_reconnect() {
+        let peer = peer(4);
+        let mut production = production("desktop");
+        let (_, attachment) = production
+            .authority_mut()
+            .attach(&peer, "durable", 64 * 1024 * 1024, 1_000)
+            .unwrap();
+        let mut hop = ProviderHop::new(peer.clone(), production, 1_001);
+        assert!(matches!(
+            hop.accept_open(GpuMeshOpen::new("durable", attachment.provider_generation).unwrap())
+                .unwrap(),
+            GpuMeshFrame::Accepted { .. }
+        ));
+        hop.shutdown("ordinary close", false);
+        let mut production = hop.into_production();
+        assert!(production.authority().has_instance("durable"));
+        assert!(matches!(
+            production
+                .open_session_for_instance(
+                    &peer,
+                    "durable",
+                    attachment.provider_generation,
+                    AbiRange::ours(),
+                    1_002,
+                )
+                .unwrap(),
+            Response::SessionOpened { .. }
+        ));
+    }
+
+    #[test]
     fn mesh_open_json_is_only_instance_and_generation() {
         let open = GpuMeshOpen::new("inst-1", 7).unwrap();
         let bytes = encode_frame(&open).unwrap();
@@ -1138,27 +1182,22 @@ mod tests {
     }
 
     #[test]
-    fn close_revokes_and_expiry_is_re_evaluated() {
+    fn close_ends_only_the_session_and_active_paths_renew_the_durable_lease() {
         let (mut path, _, _) = mesh_path();
         path.cuda(CudaCall::Init).unwrap();
         path.apply_guest(GuestFrame::Close).unwrap();
         let err = path.cuda(CudaCall::DeviceCount).unwrap_err();
         assert!(
-            err.message.contains("not accepted")
-                || err.message.contains("revoked")
-                || err.message.contains("no live GPU lease"),
+            err.message.contains("not accepted") || err.message.contains("session"),
             "{err}"
         );
 
         let (mut path, _, _) = mesh_path();
         path.cuda(CudaCall::Init).unwrap();
         path.set_now(1_000 + 10_000);
-        let err = path.cuda(CudaCall::DeviceCount).unwrap_err();
-        assert!(
-            err.message.contains("expired")
-                || err.message.contains("revoked")
-                || err.message.contains("no live GPU lease"),
-            "{err}"
+        assert_eq!(
+            path.cuda(CudaCall::DeviceCount).unwrap(),
+            CudaResult::DeviceCount { count: 1 }
         );
     }
 

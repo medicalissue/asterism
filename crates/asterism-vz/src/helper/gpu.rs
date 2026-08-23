@@ -123,11 +123,13 @@ fn session(fd: RawFd, key: [u8; 32], instance: &str) -> Result<()> {
                             write_frame(
                                 &mut writer,
                                 &GuestReply::Refused {
+                                    id: None,
                                     code: "astd".into(),
                                     message,
                                 },
                             )
                             .map_err(|err| anyhow!(err.message))?;
+                            break;
                         }
                         other => anyhow::bail!("unexpected astd GPU reply: {other:?}"),
                     }

@@ -24,11 +24,17 @@
 //! root. The host adapter talks to local `astd` over the existing unix
 //! socket. `astd` carries the work over the authenticated orbit mesh.
 
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, BufRead, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 
 use data_encoding::BASE64;
 use serde::{Deserialize, Serialize};
@@ -448,6 +454,8 @@ pub enum GuestReply {
         credit: u32,
     },
     Refused {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<u64>,
         code: String,
         message: String,
     },
@@ -629,20 +637,70 @@ enum ShimTransport {
     Char(File),
 }
 
+impl ShimTransport {
+    fn try_clone(&self) -> io::Result<Self> {
+        match self {
+            Self::Unix(stream) => stream.try_clone().map(Self::Unix),
+            Self::Char(file) => file.try_clone().map(Self::Char),
+        }
+    }
+
+    fn raw_fd(&self) -> i32 {
+        match self {
+            Self::Unix(stream) => stream.as_raw_fd(),
+            Self::Char(file) => file.as_raw_fd(),
+        }
+    }
+
+    fn wait(&self, events: i16) -> io::Result<()> {
+        loop {
+            let mut fd = libc::pollfd {
+                fd: self.raw_fd(),
+                events,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut fd, 1, -1) };
+            if ready > 0 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+}
+
 impl Read for ShimTransport {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            Self::Unix(stream) => stream.read(buf),
-            Self::Char(file) => file.read(buf),
+        loop {
+            let result = match self {
+                Self::Unix(stream) => stream.read(buf),
+                Self::Char(file) => file.read(buf),
+            };
+            match result {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.wait(libc::POLLIN)?;
+                }
+                other => return other,
+            }
         }
     }
 }
 
 impl Write for ShimTransport {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            Self::Unix(stream) => stream.write(buf),
-            Self::Char(file) => file.write(buf),
+        loop {
+            let result = match self {
+                Self::Unix(stream) => stream.write(buf),
+                Self::Char(file) => file.write(buf),
+            };
+            match result {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.wait(libc::POLLOUT)?;
+                }
+                other => return other,
+            }
         }
     }
 
@@ -657,8 +715,25 @@ impl Write for ShimTransport {
 /// Generated libcuda client: connects to the projected endpoint and issues
 /// CUDA Driver calls as framed [`GuestFrame`]s.
 pub struct GuestShim {
-    stream: ShimTransport,
-    next_id: u64,
+    writer: Arc<Mutex<ShimTransport>>,
+    reader: Option<ShimTransport>,
+    next_id: AtomicU64,
+    pending: Arc<Mutex<PendingReplies>>,
+    flow: Arc<(Mutex<FlowControl>, Condvar)>,
+    control_rx: Mutex<Receiver<GuestReply>>,
+    control_tx: Option<SyncSender<GuestReply>>,
+}
+
+#[derive(Default)]
+struct PendingReplies {
+    by_id: HashMap<u64, SyncSender<GuestReply>>,
+    order: VecDeque<u64>,
+}
+
+#[derive(Default)]
+struct FlowControl {
+    available: u32,
+    closed: bool,
 }
 
 impl GuestShim {
@@ -669,33 +744,94 @@ impl GuestShim {
         } else {
             ShimTransport::Char(File::options().read(true).write(true).open(device)?)
         };
-        Ok(Self { stream, next_id: 0 })
+        let reader = stream.try_clone()?;
+        let (control_tx, control_rx) = mpsc::sync_channel(4);
+        Ok(Self {
+            writer: Arc::new(Mutex::new(stream)),
+            reader: Some(reader),
+            next_id: AtomicU64::new(0),
+            pending: Arc::new(Mutex::new(PendingReplies::default())),
+            flow: Arc::new((Mutex::new(FlowControl::default()), Condvar::new())),
+            control_rx: Mutex::new(control_rx),
+            control_tx: Some(control_tx),
+        })
     }
 
     pub fn open(&mut self) -> Result<GuestReply, GuestError> {
-        write_frame(
-            &mut self.stream,
-            &GuestFrame::Open {
-                versions: AbiRange::ours(),
-            },
-        )?;
-        read_frame(&mut self.stream)
+        {
+            let mut writer = self
+                .writer
+                .lock()
+                .map_err(|_| GuestError::new("guest GPU writer lock poisoned"))?;
+            write_frame(
+                &mut *writer,
+                &GuestFrame::Open {
+                    versions: AbiRange::ours(),
+                },
+            )?;
+        }
+        let reader = self
+            .reader
+            .as_mut()
+            .ok_or_else(|| GuestError::new("guest GPU shim was already opened"))?;
+        let reply = read_frame(reader)?;
+        let GuestReply::Accepted { credit, .. } = reply else {
+            return Ok(reply);
+        };
+        {
+            let (flow, _) = &*self.flow;
+            flow.lock()
+                .map_err(|_| GuestError::new("guest GPU flow lock poisoned"))?
+                .available = credit;
+        }
+        let reader = self.reader.take().expect("reader checked above");
+        let pending = self.pending.clone();
+        let flow = self.flow.clone();
+        let control = self.control_tx.take().expect("dispatcher starts once");
+        thread::Builder::new()
+            .name("asterism-libcuda-replies".into())
+            .spawn(move || dispatch_replies(reader, pending, flow, control))
+            .map_err(|error| GuestError::new(format!("starting GPU reply dispatcher: {error}")))?;
+        Ok(reply)
     }
 
-    pub fn call(&mut self, call: CudaCall) -> Result<CudaResult, GuestError> {
-        self.next_id = self
+    pub fn call(&self, call: CudaCall) -> Result<CudaResult, GuestError> {
+        take_credit(&self.flow)?;
+        let id = self
             .next_id
-            .checked_add(1)
-            .ok_or_else(|| GuestError::new("guest CUDA call id space exhausted"))?;
-        write_frame(
-            &mut self.stream,
-            &GuestFrame::Cuda {
-                id: self.next_id,
-                call,
-            },
-        )?;
-        match read_frame::<GuestReply>(&mut self.stream)? {
-            GuestReply::Cuda { result, .. } => Ok(result),
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
+            .map(|previous| previous + 1)
+            .map_err(|_| GuestError::new("guest CUDA call id space exhausted"))?;
+        let (tx, rx) = mpsc::sync_channel(1);
+        {
+            let mut pending = self
+                .pending
+                .lock()
+                .map_err(|_| GuestError::new("guest GPU pending-call lock poisoned"))?;
+            pending.by_id.insert(id, tx);
+            pending.order.push_back(id);
+        }
+        let written = self
+            .writer
+            .lock()
+            .map_err(|_| GuestError::new("guest GPU writer lock poisoned"))
+            .and_then(|mut writer| write_frame(&mut *writer, &GuestFrame::Cuda { id, call }));
+        if let Err(error) = written {
+            remove_pending(&self.pending, id);
+            return_credit(&self.flow);
+            return Err(error);
+        }
+        match rx
+            .recv()
+            .map_err(|_| GuestError::new("guest GPU reply dispatcher stopped"))?
+        {
+            GuestReply::Cuda {
+                id: reply_id,
+                result,
+            } if reply_id == id => Ok(result),
+            GuestReply::Cancelled { id: cancelled } if cancelled == id => Err(GuestError::new(
+                format!("guest CUDA call {id} was cancelled"),
+            )),
             GuestReply::Refused { message, .. } => Err(GuestError::new(message)),
             other => Err(GuestError::new(format!(
                 "unexpected guest reply while calling CUDA: {other:?}"
@@ -704,21 +840,46 @@ impl GuestShim {
     }
 
     pub fn last_id(&self) -> u64 {
-        self.next_id
+        self.next_id.load(Ordering::SeqCst)
     }
 
-    pub fn cancel(&mut self, id: u64) -> Result<GuestReply, GuestError> {
-        write_frame(&mut self.stream, &GuestFrame::Cancel { id })?;
-        read_frame(&mut self.stream)
+    /// Cancel an in-flight call from another application thread. The waiting
+    /// call receives the provider's actual `Cancelled` reply; this method
+    /// only confirms that the cancellation frame reached the local device.
+    pub fn cancel(&self, id: u64) -> Result<GuestReply, GuestError> {
+        if !self
+            .pending
+            .lock()
+            .map_err(|_| GuestError::new("guest GPU pending-call lock poisoned"))?
+            .by_id
+            .contains_key(&id)
+        {
+            return Err(GuestError::new("cancel names a call that is not in flight"));
+        }
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| GuestError::new("guest GPU writer lock poisoned"))?;
+        write_frame(&mut *writer, &GuestFrame::Cancel { id })?;
+        Ok(GuestReply::Cancelled { id })
     }
 
-    pub fn close(&mut self) -> Result<GuestReply, GuestError> {
-        write_frame(&mut self.stream, &GuestFrame::Close)?;
-        read_frame(&mut self.stream)
+    pub fn close(&self) -> Result<GuestReply, GuestError> {
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| GuestError::new("guest GPU writer lock poisoned"))?;
+        write_frame(&mut *writer, &GuestFrame::Close)?;
+        drop(writer);
+        self.control_rx
+            .lock()
+            .map_err(|_| GuestError::new("guest GPU control lock poisoned"))?
+            .recv()
+            .map_err(|_| GuestError::new("guest GPU reply dispatcher stopped"))
     }
 
     pub fn dispatch_symbol(
-        &mut self,
+        &self,
         symbol: &str,
         call: Option<CudaCall>,
     ) -> Result<CudaResult, GuestError> {
@@ -729,6 +890,95 @@ impl GuestShim {
         }
         let call = call.unwrap_or_else(|| cuda_call_for_symbol(symbol));
         self.call(call)
+    }
+}
+
+fn take_credit(flow: &Arc<(Mutex<FlowControl>, Condvar)>) -> Result<(), GuestError> {
+    let (state, ready) = &**flow;
+    let mut state = state
+        .lock()
+        .map_err(|_| GuestError::new("guest GPU flow lock poisoned"))?;
+    while state.available == 0 && !state.closed {
+        state = ready
+            .wait(state)
+            .map_err(|_| GuestError::new("guest GPU flow lock poisoned"))?;
+    }
+    if state.closed {
+        return Err(GuestError::new("guest GPU session is closed"));
+    }
+    state.available -= 1;
+    Ok(())
+}
+
+fn return_credit(flow: &Arc<(Mutex<FlowControl>, Condvar)>) {
+    let (state, ready) = &**flow;
+    if let Ok(mut state) = state.lock() {
+        state.available = state.available.saturating_add(1);
+        ready.notify_one();
+    }
+}
+
+fn remove_pending(pending: &Arc<Mutex<PendingReplies>>, id: u64) {
+    if let Ok(mut pending) = pending.lock() {
+        pending.by_id.remove(&id);
+        if let Some(at) = pending.order.iter().position(|queued| *queued == id) {
+            pending.order.remove(at);
+        }
+    }
+}
+
+fn dispatch_replies(
+    mut reader: ShimTransport,
+    pending: Arc<Mutex<PendingReplies>>,
+    flow: Arc<(Mutex<FlowControl>, Condvar)>,
+    control: SyncSender<GuestReply>,
+) {
+    while let Ok(reply) = read_frame::<GuestReply>(&mut reader) {
+        let id = match &reply {
+            GuestReply::Cuda { id, .. } | GuestReply::Cancelled { id } => Some(*id),
+            GuestReply::Refused { id, .. } => id.or_else(|| {
+                pending
+                    .lock()
+                    .ok()
+                    .and_then(|pending| pending.order.front().copied())
+            }),
+            GuestReply::Closed | GuestReply::Accepted { .. } => {
+                let closed = matches!(reply, GuestReply::Closed);
+                let _ = control.send(reply);
+                if closed {
+                    break;
+                }
+                continue;
+            }
+        };
+        if let Some(id) = id {
+            let sender = pending.lock().ok().and_then(|mut pending| {
+                if let Some(at) = pending.order.iter().position(|queued| *queued == id) {
+                    pending.order.remove(at);
+                }
+                pending.by_id.remove(&id)
+            });
+            return_credit(&flow);
+            if let Some(sender) = sender {
+                let _ = sender.send(reply);
+            }
+        }
+    }
+    let (state, ready) = &*flow;
+    if let Ok(mut state) = state.lock() {
+        state.closed = true;
+        ready.notify_all();
+    }
+    let stranded = pending
+        .lock()
+        .map(|mut pending| std::mem::take(&mut pending.by_id))
+        .unwrap_or_default();
+    for (id, sender) in stranded {
+        let _ = sender.send(GuestReply::Refused {
+            id: Some(id),
+            code: "closed".into(),
+            message: format!("guest GPU session closed with call {id} in flight"),
+        });
     }
 }
 
@@ -1542,5 +1792,196 @@ mod tests {
         });
         drop(client);
         assert!(device.path().exists());
+    }
+
+    #[test]
+    fn guest_shim_pipelines_and_routes_out_of_order_replies_by_id() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("nvidia0");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(matches!(
+                read_frame::<GuestFrame>(&mut stream).unwrap(),
+                GuestFrame::Open { .. }
+            ));
+            write_frame(
+                &mut stream,
+                &GuestReply::Accepted {
+                    abi: gpu::ABI_VERSION,
+                    projection_kind: PROJECTION_KIND.into(),
+                    device_kind: GuestDeviceKind::UnixEndpoint,
+                    executor: gpu::Executor::Cuda,
+                    credit: 2,
+                },
+            )
+            .unwrap();
+            let first = read_frame::<GuestFrame>(&mut stream).unwrap();
+            let second = read_frame::<GuestFrame>(&mut stream).unwrap();
+            let reply_for = |frame: GuestFrame| match frame {
+                GuestFrame::Cuda {
+                    id,
+                    call: CudaCall::DeviceCount,
+                } => GuestReply::Cuda {
+                    id,
+                    result: CudaResult::DeviceCount { count: 7 },
+                },
+                GuestFrame::Cuda {
+                    id,
+                    call: CudaCall::DriverGetVersion,
+                } => GuestReply::Cuda {
+                    id,
+                    result: CudaResult::DriverVersion { version: 12_345 },
+                },
+                other => panic!("unexpected call: {other:?}"),
+            };
+            write_frame(&mut stream, &reply_for(second)).unwrap();
+            write_frame(&mut stream, &reply_for(first)).unwrap();
+        });
+
+        let mut shim = GuestShim::connect(&path).unwrap();
+        assert!(matches!(shim.open().unwrap(), GuestReply::Accepted { .. }));
+        let shim = Arc::new(shim);
+        thread::scope(|scope| {
+            let count_shim = shim.clone();
+            let count = scope.spawn(move || count_shim.call(CudaCall::DeviceCount).unwrap());
+            let version_shim = shim.clone();
+            let version =
+                scope.spawn(move || version_shim.call(CudaCall::DriverGetVersion).unwrap());
+            assert_eq!(count.join().unwrap(), CudaResult::DeviceCount { count: 7 });
+            assert_eq!(
+                version.join().unwrap(),
+                CudaResult::DriverVersion { version: 12_345 }
+            );
+        });
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn guest_shim_cancel_is_reachable_while_call_waits() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("nvidia0");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (id_tx, id_rx) = mpsc::sync_channel(1);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_frame::<GuestFrame>(&mut stream).unwrap();
+            write_frame(
+                &mut stream,
+                &GuestReply::Accepted {
+                    abi: gpu::ABI_VERSION,
+                    projection_kind: PROJECTION_KIND.into(),
+                    device_kind: GuestDeviceKind::UnixEndpoint,
+                    executor: gpu::Executor::Cuda,
+                    credit: 1,
+                },
+            )
+            .unwrap();
+            let GuestFrame::Cuda { id, .. } = read_frame::<GuestFrame>(&mut stream).unwrap() else {
+                panic!("expected CUDA call")
+            };
+            id_tx.send(id).unwrap();
+            assert_eq!(
+                read_frame::<GuestFrame>(&mut stream).unwrap(),
+                GuestFrame::Cancel { id }
+            );
+            write_frame(&mut stream, &GuestReply::Cancelled { id }).unwrap();
+        });
+
+        let mut shim = GuestShim::connect(&path).unwrap();
+        let _ = shim.open().unwrap();
+        let shim = Arc::new(shim);
+        thread::scope(|scope| {
+            let caller = shim.clone();
+            let call = scope.spawn(move || caller.call(CudaCall::DeviceCount));
+            let id = id_rx.recv().unwrap();
+            assert_eq!(shim.cancel(id).unwrap(), GuestReply::Cancelled { id });
+            assert!(call
+                .join()
+                .unwrap()
+                .unwrap_err()
+                .message
+                .contains("cancelled"));
+        });
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn pipelined_refusal_is_delivered_to_its_exact_call_id() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("nvidia0");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_frame::<GuestFrame>(&mut stream).unwrap();
+            write_frame(
+                &mut stream,
+                &GuestReply::Accepted {
+                    abi: gpu::ABI_VERSION,
+                    projection_kind: PROJECTION_KIND.into(),
+                    device_kind: GuestDeviceKind::UnixEndpoint,
+                    executor: gpu::Executor::Cuda,
+                    credit: 2,
+                },
+            )
+            .unwrap();
+            let calls = [
+                read_frame::<GuestFrame>(&mut stream).unwrap(),
+                read_frame::<GuestFrame>(&mut stream).unwrap(),
+            ];
+            let id_for = |wanted: fn(&CudaCall) -> bool| {
+                calls
+                    .iter()
+                    .find_map(|frame| match frame {
+                        GuestFrame::Cuda { id, call } if wanted(call) => Some(*id),
+                        _ => None,
+                    })
+                    .unwrap()
+            };
+            let version_id = id_for(|call| matches!(call, CudaCall::DriverGetVersion));
+            let count_id = id_for(|call| matches!(call, CudaCall::DeviceCount));
+            write_frame(
+                &mut stream,
+                &GuestReply::Refused {
+                    id: Some(version_id),
+                    code: "refused".into(),
+                    message: "version refused".into(),
+                },
+            )
+            .unwrap();
+            write_frame(
+                &mut stream,
+                &GuestReply::Cuda {
+                    id: count_id,
+                    result: CudaResult::DeviceCount { count: 1 },
+                },
+            )
+            .unwrap();
+        });
+
+        let mut shim = GuestShim::connect(&path).unwrap();
+        let _ = shim.open().unwrap();
+        let shim = Arc::new(shim);
+        thread::scope(|scope| {
+            let count = {
+                let shim = shim.clone();
+                scope.spawn(move || shim.call(CudaCall::DeviceCount))
+            };
+            let version = {
+                let shim = shim.clone();
+                scope.spawn(move || shim.call(CudaCall::DriverGetVersion))
+            };
+            assert_eq!(
+                count.join().unwrap().unwrap(),
+                CudaResult::DeviceCount { count: 1 }
+            );
+            assert!(version
+                .join()
+                .unwrap()
+                .unwrap_err()
+                .message
+                .contains("version refused"));
+        });
+        server.join().unwrap();
     }
 }

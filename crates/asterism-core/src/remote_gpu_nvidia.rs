@@ -22,6 +22,7 @@ use crate::remote_gpu::{
     ProviderAdvertisement, ProviderHealth, ProviderRoute, Request, Response, ABI_VERSION,
     GUEST_DEVICE_PATH, VECTOR_ADD_PTX,
 };
+use crate::remote_gpu_cuda::CudaEngine;
 
 /// NVIDIA driver floor for the paid gate. Older branches are refused rather
 /// than probed.
@@ -402,13 +403,14 @@ pub fn production_for(
     admitted: &AdmittedNvidiaDevice,
     provider_device: &str,
     provider_device_id: &str,
+    generation: u64,
     max_leases: u32,
 ) -> Result<ProductionProvider, ControlError> {
     let authority = LeaseAuthority::new(
         provider_device,
         provider_device_id,
         admitted.device.uuid.clone(),
-        1,
+        generation,
         LeaseLimits {
             total_memory_bytes: admitted.device.memory_bytes,
             max_memory_per_lease: admitted.device.memory_bytes,
@@ -416,13 +418,8 @@ pub fn production_for(
             lease_ttl_secs: 600,
         },
     )?;
-    Ok(ProductionProvider::new(
-        authority,
-        Provider::nvidia(
-            admitted.device.name.clone(),
-            crate::remote_gpu::Limits::default(),
-        ),
-    ))
+    let engine = CudaEngine::open_live(Some(&admitted.device.uuid))?;
+    ProductionProvider::connect(authority, engine)
 }
 
 /// Deterministic source fixture. It is deliberately private and keeps the
@@ -576,8 +573,13 @@ fn prove_version_skew(
             "ABI version skew opened a session instead of failing closed",
         ));
     }
-    Ok(refused(&skew, &[ControlErrorCode::Unavailable])
-        && provider.authority().diagnostics().active_leases == 1)
+    Ok(refused(
+        &skew,
+        &[
+            ControlErrorCode::Unavailable,
+            ControlErrorCode::UnsupportedVersion,
+        ],
+    ) && provider.authority().diagnostics().active_leases == 1)
 }
 
 fn refused<T>(result: &Result<T, ControlError>, codes: &[ControlErrorCode]) -> bool {
@@ -1130,7 +1132,7 @@ gpu index=0 uuid=GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa memory_bytes=257698037
         let error = production
             .open_session(&peer, &capability, AbiRange { min: 2, max: 2 }, 2)
             .unwrap_err();
-        assert_eq!(error.code, ControlErrorCode::Unavailable);
+        assert_eq!(error.code, ControlErrorCode::UnsupportedVersion);
         assert!(
             error.message.contains("no remote GPU ABI is common") || error.message.contains("ABI")
         );
