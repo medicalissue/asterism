@@ -2,18 +2,19 @@
 //! and the bridge that carries them to a guest on another device.
 //!
 //! One device is the **provider** — the bytes are on its disk. It runs
-//! `qemu-storage-daemon`, which exports the volume as NBD **on a unix socket**
-//! under the volume's own directory. Never a TCP port: nothing about a volume
-//! is reachable from the LAN, at either end, ever.
+//! a native fixed-newstyle NBD exporter **on a unix socket** under the
+//! volume's own directory. Never a TCP port: nothing about a volume is
+//! reachable from the LAN, at either end, ever.
 //!
 //! Another device is the **consumer** — its hypervisor is running the guest.
 //! Its `astd` binds a *local* unix socket next to the instance and splices
 //! every connection on it over an authenticated QUIC stream to the provider's
-//! export socket. QEMU is pointed at the local socket with
-//! `-blockdev nbd,server.type=unix,...`, and the guest sees `/dev/vdb`:
+//! export socket. VZ consumes that socket directly; Cloud Hypervisor
+//! materializes it as a host NBD block device behind its backend seam; QEMU
+//! remains an optional compatible consumer. The guest sees a local disk:
 //!
 //! ```text
-//! QEMU ─unix─ astd(consumer) ═QUIC/mesh═ astd(provider) ─unix─ qemu-storage-daemon ─ disk
+//! hypervisor ─unix─ astd(consumer) ═QUIC/mesh═ astd(provider/NBD) ─ disk
 //! ```
 //!
 //! It is the same splice `ast ssh` uses, aimed at a different socket, which is
@@ -23,11 +24,11 @@
 //!
 //! The lease lives on the provider ([`asterism_core::volume`]). Attaching
 //! takes it; booting renews it; both bump a monotonic epoch. Every bump
-//! renames the export (`tank-e7`), stops the previous `qemu-storage-daemon`
-//! and unlinks the socket it was on — so a consumer that was partitioned and
-//! comes back holding epoch 6 has nothing to reconnect to. The refusal a
-//! second instance gets names the holder and the device its cpu comes from,
-//! because "busy" is not something anybody can act on.
+//! renames the export (`tank-e7`), stops the previous listener and every
+//! accepted session, and unlinks its socket — so a consumer that was
+//! partitioned and comes back holding epoch 6 has nothing to reconnect to.
+//! The refusal a second instance gets names the holder and the device its cpu
+//! comes from, because "busy" is not something anybody can act on.
 //!
 //! # The plane
 //!
@@ -43,17 +44,19 @@
 //! process: the local socket is one it binds, the accept loop is one it
 //! runs. The guest is not — it is its own process, and an `astd` restart
 //! does not touch it. So a restart takes the disk away from a guest that
-//! never went anywhere, and QEMU sits retrying the socket for
+//! never went anywhere, and the backend's NBD client sits retrying the socket for
 //! `RECONNECT_DELAY_SECS` before it starts failing the guest's I/O.
 //!
 //! [`reattach`] is what closes that: at startup, every running instance
 //! whose guest is still alive gets its bridges raised again, at the epoch it
-//! already holds. Not a fresh lease — the running QEMU was handed one export
-//! name on its command line, and a bump would rename that door out from
-//! under a guest doing nothing wrong. See [`Request::VolumeReconnect`].
+//! already holds. Not a fresh lease — the running backend was handed one
+//! export name in its boot configuration, and a bump would rename that door
+//! out from under a guest doing nothing wrong. See
+//! [`Request::VolumeReconnect`].
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -65,25 +68,20 @@ use asterism_core::hv::{DiskSpec, Hypervisor};
 use asterism_core::instance::{Instance, PartRuntime, Status, Volume};
 use asterism_core::orbit::{Device, Orbit};
 use asterism_core::paths;
-use asterism_core::proc::{ProcId, Signal};
+use asterism_core::proc::{Ownership, ProcId, Signal};
 use asterism_core::protocol::{Request, Response};
-use asterism_core::tools::{run, tool};
 use asterism_core::volume::{
     self, BlockVolume, Catalog, CatalogVolume, Locality, PlacementPolicy, Store, UnreachableStorage,
 };
 use asterism_mesh::PathKind;
 
 use crate::mesh::{self, Mesh, Splice, TransferStats};
+use crate::nbd;
 use crate::Node;
-
-/// How long to wait for a freshly started export to put its socket on disk.
-/// `qemu-storage-daemon --daemonize` returns once startup is complete, so
-/// this is a guard against a slow filesystem, not a poll for readiness.
-const EXPORT_READY: Duration = Duration::from_secs(5);
 
 /// What a consumer is told when the provider's daemon is not answering.
 /// Named because the e2e asserts on it: an honest failure is a feature here,
-/// and a wall of QEMU errors is not one.
+/// and a wall of backend errors is not one.
 pub const UNREACHABLE: &str = "could not reach the device holding it";
 
 /// The launch admission bound for a remote block device.
@@ -820,44 +818,11 @@ async fn grant(
     *store = next;
 
     let socket = paths::volume_export_socket(name, lease.epoch);
-    if !export_alive(lease.proc.as_ref(), &socket) {
-        if lease.export_started && lease.proc.is_none() {
-            bail!(
-                "volume {name:?}'s epoch {} may still have an untracked export; refusing to \
-                 start a second writer",
-                lease.epoch
-            );
-        }
+    let pidfile = paths::volume_export_pid(name, lease.epoch);
+    if !export_alive(lease.proc.as_ref(), &socket, &pidfile) {
+        retire_unhealthy_export(&mut store, name, &lease)?;
         let (lease, launch) = prepare_export_start(&mut store, &vol)?;
-        let proc = start_export(&vol, lease.epoch, &lease.export, &launch)?;
-        let mut recorded = store.clone();
-        recorded.set_export_proc(name, Some(proc.clone()))?;
-        if let Err(error) = recorded.save_confirmed() {
-            let unrecorded = volume::Lease {
-                proc: Some(proc.clone()),
-                pid: Some(proc.pid),
-                export_started: true,
-                ..lease.clone()
-            };
-            let stop_error = stop_export(name, &unrecorded).err();
-            store.reload().with_context(|| {
-                format!("reloading the volume store after export commit failed: {error:#}")
-            })?;
-            return match stop_error {
-                Some(stop) => Err(error).context(format!(
-                    "committing the provider export identity; refusing to hide an unproven \
-                     writer shutdown: {stop:#}"
-                )),
-                None => match clear_export_start(&mut store, name) {
-                    Ok(()) => Err(error).context("committing the provider export identity"),
-                    Err(clear) => Err(error).context(format!(
-                        "committing the provider export identity; the process is dead but its \
-                         conservative launch fence could not be cleared: {clear:#}"
-                    )),
-                },
-            };
-        }
-        *store = recorded;
+        start_export(&mut store, name, &lease, launch)?;
     }
 
     let vol = store.get(name)?.clone();
@@ -896,44 +861,11 @@ async fn resume(
     authorize_lease_device(name, &lease, requester)?;
 
     let socket = paths::volume_export_socket(name, lease.epoch);
-    if !export_alive(lease.proc.as_ref(), &socket) {
-        if lease.export_started && lease.proc.is_none() {
-            bail!(
-                "volume {name:?}'s epoch {} may still have an untracked export; refusing to \
-                 start a second writer",
-                lease.epoch
-            );
-        }
+    let pidfile = paths::volume_export_pid(name, lease.epoch);
+    if !export_alive(lease.proc.as_ref(), &socket, &pidfile) {
+        retire_unhealthy_export(&mut store, name, &lease)?;
         let (lease, launch) = prepare_export_start(&mut store, &vol)?;
-        let proc = start_export(&vol, lease.epoch, &lease.export, &launch)?;
-        let mut recorded = store.clone();
-        recorded.set_export_proc(name, Some(proc.clone()))?;
-        if let Err(error) = recorded.save_confirmed() {
-            let unrecorded = volume::Lease {
-                proc: Some(proc.clone()),
-                pid: Some(proc.pid),
-                export_started: true,
-                ..lease.clone()
-            };
-            let stop_error = stop_export(name, &unrecorded).err();
-            store.reload().with_context(|| {
-                format!("reloading the volume store after reconnect commit failed: {error:#}")
-            })?;
-            return match stop_error {
-                Some(stop) => Err(error).context(format!(
-                    "committing the resumed provider export identity; its shutdown is not \
-                     proven: {stop:#}"
-                )),
-                None => match clear_export_start(&mut store, name) {
-                    Ok(()) => Err(error).context("committing the resumed provider export identity"),
-                    Err(clear) => Err(error).context(format!(
-                        "committing the resumed provider export identity; the process is dead \
-                         but its conservative launch fence could not be cleared: {clear:#}"
-                    )),
-                },
-            };
-        }
-        *store = recorded;
+        start_export(&mut store, name, &lease, launch)?;
     }
     Ok(Response::VolumeLease {
         volume: vol.name.clone(),
@@ -1141,46 +1073,15 @@ async fn open_export_for(
     }
 
     // The export may be gone even though the lease is not: the provider's
-    // daemon may have restarted, or its storage daemon may have been killed.
+    // daemon may have restarted, taking its in-process exporter with it.
     // Restarting it at the *same* epoch is safe, because the epoch is what
     // decides who may write and it has not moved.
     let socket = paths::volume_export_socket(volume, lease.epoch);
-    if !export_alive(lease.proc.as_ref(), &socket) {
-        if lease.export_started && lease.proc.is_none() {
-            bail!(
-                "volume {volume:?}'s epoch {} may still have an untracked export; refusing to \
-                 start a second writer",
-                lease.epoch
-            );
-        }
+    let pidfile = paths::volume_export_pid(volume, lease.epoch);
+    if !export_alive(lease.proc.as_ref(), &socket, &pidfile) {
+        retire_unhealthy_export(&mut store, volume, &lease)?;
         let (lease, launch) = prepare_export_start(&mut store, &vol)?;
-        let proc = start_export(&vol, lease.epoch, &lease.export, &launch)?;
-        let mut recorded = store.clone();
-        recorded.set_export_proc(volume, Some(proc.clone()))?;
-        if let Err(error) = recorded.save_confirmed() {
-            let unrecorded = volume::Lease {
-                proc: Some(proc.clone()),
-                pid: Some(proc.pid),
-                export_started: true,
-                ..lease.clone()
-            };
-            let stop_error = stop_export(volume, &unrecorded).err();
-            store.reload()?;
-            return match stop_error {
-                Some(stop) => Err(error).context(format!(
-                    "committing the restarted export identity; its shutdown is not proven: \
-                     {stop:#}"
-                )),
-                None => match clear_export_start(&mut store, volume) {
-                    Ok(()) => Err(error).context("committing the restarted export identity"),
-                    Err(clear) => Err(error).context(format!(
-                        "committing the restarted export identity; the process is dead but its \
-                         conservative launch fence could not be cleared: {clear:#}"
-                    )),
-                },
-            };
-        }
-        *store = recorded;
+        start_export(&mut store, volume, &lease, launch)?;
     }
     drop(store);
 
@@ -1191,15 +1092,20 @@ async fn open_export_for(
     connected
 }
 
-/// Confirm the fail-closed marker before a storage process is spawned.
+/// Durably bind a prospective in-process server to this exact daemon before
+/// its listener can accept. Unlike a child process, a native export cannot
+/// outlive this identity; a crash between this commit and thread start is
+/// therefore safely recoverable once the recorded daemon is proven gone.
 fn arm_export_start(store: &mut Store, name: &str) -> Result<volume::Lease> {
     let mut starting = store.clone();
-    starting.mark_export_starting(name)?;
+    let process = ProcId::capture(std::process::id())
+        .context("capturing the daemon identity for a native NBD launch fence")?;
+    starting.set_export_proc(name, Some(process))?;
     if let Err(error) = starting.save_confirmed() {
         store.reload().with_context(|| {
             format!("reloading the volume store after export launch-fence failure: {error:#}")
         })?;
-        return Err(error).context("committing the export launch fence");
+        return Err(error).context("committing the native export launch fence");
     }
     *store = starting;
     Ok(store
@@ -1211,43 +1117,54 @@ fn arm_export_start(store: &mut Store, name: &str) -> Result<volume::Lease> {
 
 #[derive(Debug)]
 struct ExportStart {
-    qsd: PathBuf,
-    image: PathBuf,
+    prepared: nbd::Prepared,
 }
 
 /// Resolve every definitely pre-spawn dependency before publishing the
-/// conservative process-may-run marker. A missing tool or image cannot leave
-/// a false unknown-writer fence behind because no launch is armed yet.
+/// conservative server-may-run marker. Opening the image and binding the
+/// socket happen before the marker; the prepared listener accepts nothing
+/// until after the marker is durable.
 fn prepare_export_start(
     store: &mut Store,
     vol: &BlockVolume,
 ) -> Result<(volume::Lease, ExportStart)> {
-    prepare_export_start_with(store, vol, &paths::volume_image_path(&vol.name), tool)
+    prepare_export_start_with(
+        store,
+        vol,
+        &paths::volume_image_path(&vol.name),
+        &paths::volume_export_socket(
+            &vol.name,
+            vol.lease
+                .as_ref()
+                .expect("an exported volume has a lease")
+                .epoch,
+        ),
+        &paths::volume_export_pid(
+            &vol.name,
+            vol.lease
+                .as_ref()
+                .expect("an exported volume has a lease")
+                .epoch,
+        ),
+    )
 }
 
 fn prepare_export_start_with(
     store: &mut Store,
     vol: &BlockVolume,
     image: &Path,
-    find_tool: impl FnOnce(&str) -> Result<PathBuf>,
+    socket: &Path,
+    pidfile: &Path,
 ) -> Result<(volume::Lease, ExportStart)> {
-    let qsd = find_tool("qemu-storage-daemon").context(
-        "qemu-storage-daemon is what serves a block volume, and it is not installed \
-         on this device (it ships with qemu)",
-    )?;
-    if !image.exists() {
-        bail!(
-            "volume {:?} has lost its image at {}",
-            vol.name,
-            image.display()
-        );
-    }
-    let launch = ExportStart {
-        qsd,
-        image: image.to_owned(),
-    };
+    let lease = vol.lease.as_ref().expect("an exported volume has a lease");
+    let prepared = nbd::prepare(image, socket, &lease.export, vol.size_bytes)?;
+    std::fs::remove_file(pidfile).or_else(|error| {
+        (error.kind() == std::io::ErrorKind::NotFound)
+            .then_some(())
+            .ok_or(error)
+    })?;
     let lease = arm_export_start(store, &vol.name)?;
-    Ok((lease, launch))
+    Ok((lease, ExportStart { prepared }))
 }
 
 /// Clear a launch fence only after `stop_export` proved process death.
@@ -1262,6 +1179,19 @@ fn clear_export_start(store: &mut Store, name: &str) -> Result<()> {
     }
     *store = cleared;
     Ok(())
+}
+
+/// Retire every trace of an exporter which failed the combined runtime,
+/// process-identity, socket, and legacy-pidfile liveness check. A missing
+/// socket is not permission to start beside a still-live server: this path
+/// first shuts that server down (or refuses when death is not provable), then
+/// durably clears its identity before another listener is prepared.
+fn retire_unhealthy_export(store: &mut Store, name: &str, lease: &volume::Lease) -> Result<()> {
+    if !lease.export_started {
+        return Ok(());
+    }
+    stop_export(name, lease)?;
+    clear_export_start(store, name)
 }
 
 /// Give every pre-identity lease on this device an identity, once.
@@ -1304,72 +1234,40 @@ pub async fn adopt_export_identities() {
     }
 }
 
-// ---- qemu-storage-daemon ---------------------------------------------------
+// ---- native NBD exporter ---------------------------------------------------
 
-/// Start the storage daemon for one epoch's export.
-///
-/// Tracked exactly the way the vz helper is: an identity captured from the
-/// pidfile it writes at startup, and a socket that answers. Neither alone is
-/// enough — a socket file outlives the process that bound it, and a pid on
-/// its own proves nothing at all once this daemon has restarted — so
-/// liveness is both.
+/// Start the in-process server behind an already-durable daemon identity.
+/// Thread-start failure is known not to have published a runtime, so it may
+/// clear that marker immediately. Once start succeeds, the exact runtime is
+/// the second half of every later liveness and revocation decision.
 fn start_export(
-    vol: &BlockVolume,
-    epoch: u64,
-    export: &str,
-    launch: &ExportStart,
-) -> Result<ProcId> {
-    let socket = paths::volume_export_socket(&vol.name, epoch);
-    let pidfile = paths::volume_export_pid(&vol.name, epoch);
-    // A socket file left by a killed daemon blocks the bind.
-    let _ = std::fs::remove_file(&socket);
-    let _ = std::fs::remove_file(&pidfile);
-
-    run(Command::new(&launch.qsd)
-        .arg("--daemonize")
-        .arg("--pidfile")
-        .arg(&pidfile)
-        .arg("--blockdev")
-        .arg(format!(
-            "driver=file,node-name=vol,filename={}",
-            launch.image.display()
-        ))
-        .arg("--nbd-server")
-        .arg(format!("addr.type=unix,addr.path={}", socket.display()))
-        .arg("--export")
-        .arg(format!(
-            "type=nbd,id=exp,node-name=vol,name={export},writable=on"
-        )))
-    .with_context(|| format!("exporting volume {:?} as {export}", vol.name))?;
-
-    let deadline = std::time::Instant::now() + EXPORT_READY;
-    loop {
-        if socket.exists() && pidfile.exists() {
-            break;
+    store: &mut Store,
+    name: &str,
+    armed: &volume::Lease,
+    launch: ExportStart,
+) -> Result<()> {
+    let process = match nbd::start(launch.prepared) {
+        Ok(process) => process,
+        Err(error) => {
+            return match clear_export_start(store, name) {
+                Ok(()) => Err(error).context("starting the native NBD exporter"),
+                Err(clear) => Err(error).context(format!(
+                    "starting the native NBD exporter; no server was published but its durable \
+                     launch fence could not be cleared: {clear:#}"
+                )),
+            };
         }
-        if std::time::Instant::now() >= deadline {
-            bail!(
-                "qemu-storage-daemon did not put an export socket at {}",
-                socket.display()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(20));
+    };
+    if armed.proc.as_ref() != Some(&process) {
+        let socket = paths::volume_export_socket(name, armed.epoch);
+        let stop = nbd::stop(&socket, Some(&process));
+        let clear = clear_export_start(store, name);
+        bail!(
+            "native NBD runtime identity differed from its durable launch fence \
+             (stop={stop:?}, clear={clear:?})"
+        );
     }
-    let pid: u32 = std::fs::read_to_string(&pidfile)
-        .context("qemu-storage-daemon did not write its pidfile")?
-        .trim()
-        .parse()
-        .context("unparseable qemu-storage-daemon pidfile")?;
-    // Captured while the process is still known to be the one just started.
-    // Everything later done to this export — including the SIGKILL that ends
-    // a revoked lease — is authorised by this and nothing else.
-    ProcId::capture(pid).with_context(|| {
-        format!(
-            "qemu-storage-daemon wrote pid {pid} for volume {:?} and was gone before it \
-             could be recorded",
-            vol.name
-        )
-    })
+    Ok(())
 }
 
 /// Stop an export and take its socket with it.
@@ -1393,7 +1291,29 @@ fn stop_export(name: &str, lease: &volume::Lease) -> Result<()> {
 }
 
 fn stop_export_at(name: &str, lease: &volume::Lease, socket: &Path, pidfile: &Path) -> Result<()> {
+    let stopped_native = nbd::stop(socket, lease.proc.as_ref())?;
     match lease.proc.as_ref() {
+        Some(_) if stopped_native => {}
+        // Native exports deliberately have no pidfile: the process identity
+        // is a crash fence, never permission to signal a whole daemon. Only
+        // kernel proof that the recorded daemon is gone permits cleanup when
+        // its in-memory runtime is unavailable.
+        Some(proc) if !pidfile.exists() => match proc.check() {
+            Ownership::Gone | Ownership::Foreign(_) => {}
+            Ownership::Ours => bail!(
+                "volume {name:?}'s native export runtime is missing inside its recorded daemon; \
+                 refusing to unlink or advance the writer fence"
+            ),
+            Ownership::Unknown(why) => bail!(
+                "volume {name:?}'s native export process identity cannot prove whether its \
+                 daemon ended ({why}); \
+                 refusing to unlink or advance the writer fence"
+            ),
+        },
+        Some(proc) if !is_legacy_export_process(proc) => bail!(
+            "volume {name:?}'s legacy pidfile names {proc}, which is not a \
+             qemu-storage-daemon; refusing to signal or advance the writer fence"
+        ),
         Some(proc) => {
             if proc.signal(Signal::Term)? && !proc.wait_gone(Duration::from_secs(5)) {
                 proc.signal(Signal::Kill)?;
@@ -1435,8 +1355,19 @@ fn stop_export_at(name: &str, lease: &volume::Lease, socket: &Path, pidfile: &Pa
 ///
 /// Both halves, and neither is redundant: a socket file outlives whoever
 /// bound it, and a recorded process may since have become somebody else's.
-fn export_alive(proc: Option<&ProcId>, socket: &Path) -> bool {
-    proc.is_some_and(|p| p.alive()) && socket.exists()
+fn export_alive(proc: Option<&ProcId>, socket: &Path, legacy_pidfile: &Path) -> bool {
+    nbd::alive(proc, socket)
+        || legacy_pidfile.exists()
+            && proc.is_some_and(|process| is_legacy_export_process(process) && process.alive())
+            && socket.exists()
+}
+
+fn is_legacy_export_process(process: &ProcId) -> bool {
+    process
+        .exec
+        .as_deref()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == std::ffi::OsStr::new(volume::LEGACY_EXPORT_BIN))
 }
 
 // ---- the consumer's half ---------------------------------------------------
@@ -1640,16 +1571,16 @@ pub async fn take_down(instance: &str) {
 ///
 /// A bridge is a unix socket this process binds and an accept loop this
 /// process runs, so it dies with the process — and the guest does not. Its
-/// QEMU is told to keep retrying a dropped volume for
+/// backend NBD client is told to keep retrying a dropped volume for
 /// `RECONNECT_DELAY_SECS` before it starts failing the guest's I/O, so the
 /// window this has to land in is a real one but it is not generous:
 /// re-establishing here, before the accept loop opens, is what turns an
 /// astd restart into a pause rather than a disk that goes away.
 ///
 /// Deliberately *not* a boot. Nothing is leased at a new epoch, because
-/// nothing was lost: the running QEMU has one export name on its command
-/// line and asking the provider for a fresh one would fence the guest that
-/// is doing nothing wrong. See [`confirm_lease`].
+/// nothing was lost: the running backend has one export name in its boot
+/// configuration and asking the provider for a fresh one would fence the
+/// guest that is doing nothing wrong. See [`confirm_lease`].
 ///
 /// Per-volume failures are reported and the rest go up: one unreachable
 /// provider must not cost the guest the disks whose providers are awake.
@@ -1881,7 +1812,7 @@ pub async fn take_lease(
 /// holds it at, and get the export behind it running again if it is not.
 ///
 /// What a restarted consumer asks, rather than [`take_lease`]: the guest is
-/// still up and its QEMU will ask for the export name it was booted with.
+/// still up and its backend will ask for the export name it was booted with.
 pub(crate) async fn confirm_lease(
     volume: &str,
     device: &str,
@@ -2085,14 +2016,13 @@ async fn ask_authority(
 }
 
 /// The backend has to be able to consume an NBD disk. Gated on the
-/// capability, never on which backend it is — except that today exactly one
-/// says yes, and the refusal should say so plainly rather than in the
-/// abstract.
+/// capability, never on which backend it is. VZ and Cloud Hypervisor both
+/// implement this seam; QEMU remains an optional compatibility consumer.
 pub fn check_backend(hv: &dyn Hypervisor) -> Result<()> {
     if hv.probe().is_ok() && !hv.caps().nbd_disks {
         bail!(
-            "the {} backend cannot attach a block volume — remote volumes ride the \
-             qemu backend today",
+            "the {} backend cannot attach a block volume because it has no Unix NBD disk \
+             capability",
             hv.id()
         );
     }
@@ -2177,7 +2107,7 @@ pub async fn compensate_boot_leases(instance: &Instance, boot_intent_id: &str) -
     Ok(())
 }
 
-/// Bind the local socket QEMU will connect to, and splice every connection on
+/// Bind the local socket the selected backend will connect to, and splice every connection on
 /// it to the provider's export.
 ///
 /// One accept loop per volume, one mesh stream per connection — the same
@@ -2236,7 +2166,7 @@ async fn bridge(
     Ok(Splice::new(task, Some(socket_path)))
 }
 
-/// One QEMU connection, carried to the provider's export.
+/// One backend NBD connection, carried to the provider's export.
 async fn splice_one(
     device: &str,
     volume: &str,
@@ -2287,7 +2217,7 @@ async fn splice_one(
                 holder,
                 &vol,
                 "provider_loss",
-                "the remote NBD session ended; QEMU is retrying the local bridge".into(),
+                "the remote NBD session ended; the backend is retrying the local bridge".into(),
                 Some(stats),
                 Some(session),
             )
@@ -2420,16 +2350,12 @@ mod tests {
         }
     }
 
-    /// vz has `VZNetworkBlockDeviceStorageDeviceAttachment` and this backend
-    /// does not drive it, so `Caps::nbd_disks` is false and the refusal has
-    /// to be a sentence rather than a hypervisor error.
+    /// A backend without the NBD capability is refused before boot in a
+    /// sentence rather than through a backend-specific failure.
     #[test]
     fn a_backend_without_an_nbd_client_refuses_in_words() {
         let err = check_backend(&Fake(false)).unwrap_err().to_string();
-        assert!(
-            err.contains("remote volumes ride the qemu backend today"),
-            "{err}"
-        );
+        assert!(err.contains("has no Unix NBD disk capability"), "{err}");
         assert!(err.contains("vz"), "{err}");
         assert!(check_backend(&Fake(true)).is_ok());
     }
@@ -2841,34 +2767,44 @@ mod tests {
     /// A dead export leaves its socket file behind, so liveness is never the
     /// file on its own.
     #[test]
-    fn an_export_is_alive_only_when_both_halves_are() {
+    fn export_liveness_requires_an_exact_runtime_or_legacy_executable_evidence() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("nbd-e1.sock");
+        let pidfile = dir.path().join("nbd-e1.pid");
         let me = ProcId::capture(std::process::id()).unwrap();
 
         assert!(
-            !export_alive(None, &socket),
+            !export_alive(None, &socket, &pidfile),
             "nothing recorded, nothing running"
         );
         std::fs::write(&socket, b"").unwrap();
-        // Our own process is certainly alive, and the file is there.
-        assert!(export_alive(Some(&me), &socket));
+        assert!(
+            !export_alive(Some(&me), &socket, &pidfile),
+            "a native export needs its exact in-process runtime"
+        );
+        std::fs::write(&pidfile, me.pid.to_string()).unwrap();
+        assert!(
+            !export_alive(Some(&me), &socket, &pidfile),
+            "a forged legacy pidfile must not turn astd into its own exporter child"
+        );
         std::fs::remove_file(&socket).unwrap();
         assert!(
-            !export_alive(Some(&me), &socket),
+            !export_alive(Some(&me), &socket, &pidfile),
             "a live process with no socket is not an export"
         );
     }
 
-    /// Tool and image discovery happen before the durable process-may-run
-    /// transition. Their definite failure therefore leaves no imaginary
-    /// writer, and fixing the dependency reaches the launch boundary on the
-    /// next attempt without manual lease repair.
+    /// Image admission and socket binding happen before the durable
+    /// server-may-run transition. Their definite failure therefore leaves no
+    /// imaginary writer, and fixing the image reaches the launch boundary on
+    /// the next attempt without manual lease repair.
     #[test]
     fn missing_export_dependencies_are_retryable_before_the_launch_fence() {
         let dir = tempfile::tempdir().unwrap();
         let store_path = dir.path().join("volumes.json");
         let image = dir.path().join("disk.raw");
+        let socket = dir.path().join("nbd-e1.sock");
+        let pidfile = dir.path().join("nbd-e1.pid");
         let mut store = Store::load(&store_path).unwrap();
         store.create("tank", 1 << 30).unwrap();
         store
@@ -2877,22 +2813,13 @@ mod tests {
         store.save_confirmed().unwrap();
         let vol = store.get("tank").unwrap().clone();
 
-        let missing_tool = prepare_export_start_with(&mut store, &vol, &image, |_| {
-            Err(anyhow::anyhow!("injected missing qemu-storage-daemon"))
-        })
-        .unwrap_err()
-        .to_string();
-        assert!(missing_tool.contains("not installed"), "{missing_tool}");
-        let lease = store.get("tank").unwrap().lease.as_ref().unwrap();
-        assert!(!lease.export_started, "a pre-spawn error armed a writer");
-        assert!(lease.proc.is_none(), "a pre-spawn error invented a process");
-
-        let fake_qsd = dir.path().join("qemu-storage-daemon");
-        let missing_image =
-            prepare_export_start_with(&mut store, &vol, &image, |_| Ok(fake_qsd.clone()))
-                .unwrap_err()
-                .to_string();
-        assert!(missing_image.contains("lost its image"), "{missing_image}");
+        let missing_image = prepare_export_start_with(&mut store, &vol, &image, &socket, &pidfile)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing_image.contains("opening volume image"),
+            "{missing_image}"
+        );
         assert!(
             !store
                 .get("tank")
@@ -2904,19 +2831,36 @@ mod tests {
         );
 
         std::fs::write(&image, b"").unwrap();
+        let short_image = prepare_export_start_with(&mut store, &vol, &image, &socket, &pidfile)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            short_image.contains("shorter than its advertised"),
+            "{short_image}"
+        );
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&image)
+            .unwrap()
+            .set_len(1 << 30)
+            .unwrap();
         let (armed, launch) =
-            prepare_export_start_with(&mut store, &vol, &image, |_| Ok(fake_qsd.clone())).unwrap();
+            prepare_export_start_with(&mut store, &vol, &image, &socket, &pidfile).unwrap();
         assert!(armed.export_started, "retry did not reach launch admission");
         assert!(
-            armed.proc.is_none(),
-            "no process has been spawned in this test"
+            armed
+                .proc
+                .as_ref()
+                .is_some_and(|process| process.pid == std::process::id()),
+            "the native launch was not fenced to this exact daemon"
         );
-        assert_eq!(launch.qsd, fake_qsd);
-        assert_eq!(launch.image, image);
+        assert!(socket.exists(), "the admitted listener was not bound");
 
         // This test deliberately stops at the launch boundary. Since no
         // process was invoked, clearing the marker is proven-safe and shows
         // the retry does not leave a permanent fence behind either.
+        drop(launch);
         clear_export_start(&mut store, "tank").unwrap();
         assert!(
             !store
@@ -3009,6 +2953,7 @@ mod tests {
     fn a_recycled_export_pid_is_neither_believed_nor_signalled() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("nbd-e1.sock");
+        let pidfile = dir.path().join("nbd-e1.pid");
         std::fs::write(&socket, b"").unwrap();
 
         let mut sleeper = sleeper();
@@ -3021,7 +2966,7 @@ mod tests {
         }
 
         assert!(
-            !export_alive(Some(&stale), &socket),
+            !export_alive(Some(&stale), &socket, &pidfile),
             "not our export any more"
         );
         let stale_pid = stale.pid;
@@ -3038,7 +2983,6 @@ mod tests {
             proc: Some(stale),
             export_started: true,
         };
-        let pidfile = dir.path().join("nbd-e1.pid");
         std::fs::write(&pidfile, stale_pid.to_string()).unwrap();
         let error = stop_export_at("tank", &lease, &socket, &pidfile)
             .unwrap_err()
@@ -3068,9 +3012,9 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("nbd-e1.sock");
-        std::fs::write(&socket, b"").unwrap();
-        assert!(!export_alive(lease.proc.as_ref(), &socket));
         let pidfile = dir.path().join("nbd-e1.pid");
+        std::fs::write(&socket, b"").unwrap();
+        assert!(!export_alive(lease.proc.as_ref(), &socket, &pidfile));
         std::fs::write(&pidfile, lease.pid.unwrap().to_string()).unwrap();
         assert!(stop_export_at("tank", &lease, &socket, &pidfile).is_err());
         assert!(
@@ -3100,7 +3044,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("nbd-e7.sock");
         let pidfile = dir.path().join("nbd-e7.pid");
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        let legacy_exporter = dir.path().join(volume::LEGACY_EXPORT_BIN);
+        std::fs::copy(std::env::current_exe().unwrap(), &legacy_exporter).unwrap();
+        let mut child = std::process::Command::new(&legacy_exporter)
             .arg("--exact")
             .arg("volume::tests::export_process_fixture")
             .arg("--nocapture")
