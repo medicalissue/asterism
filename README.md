@@ -242,6 +242,9 @@ Desktop-manifest boundary: when a private Desktop release supplies matching
 app metadata, it verifies the app, CLI, daemon, and helper before atomically
 activating them. Public Asterism releases contain only the CLI, daemon, and VZ
 helper; Homebrew installations remain owned by Homebrew.
+Desktop downloads are distributed separately through
+[`asterism.run/download`](https://asterism.run/download) and are not artifacts
+of this repository's GitHub releases.
 
 ```console
 $ ast update status
