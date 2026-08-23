@@ -885,7 +885,7 @@ async fn container_exec(node: &Node, request: Request) -> Response {
                 message: "non-container request reached container exec dispatcher".into(),
             };
         };
-        let inst = match reg.get(&name) {
+        let inst = match reg.get(name) {
             Ok(inst) => inst,
             Err(error) => {
                 return Response::Error {
