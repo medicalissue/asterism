@@ -9,7 +9,7 @@ $ErrorActionPreference = 'Stop'
 $suffix = [Guid]::NewGuid().ToString('N').Substring(0, 12)
 $service = "com.asterism.astd.test.localsystem-$suffix"
 $installRoot = Join-Path $env:ProgramData "Asterism\ci-$suffix"
-$home = Join-Path $env:RUNNER_TEMP "asterism-home-$suffix"
+$testHome = Join-Path $env:RUNNER_TEMP "asterism-home-$suffix"
 $probeRoot = Join-Path $installRoot 'probe'
 $task = "AsterismPipeRefusal-$suffix"
 $installedAst = Join-Path $installRoot 'ast.exe'
@@ -38,7 +38,7 @@ function Wait-ServiceState([string]$Name, [string]$State, [int]$Seconds = 30) {
 }
 
 $beforePipes = Get-AsterismPipes
-New-Item -ItemType Directory -Path $installRoot, $home, $probeRoot -Force | Out-Null
+New-Item -ItemType Directory -Path $installRoot, $testHome, $probeRoot -Force | Out-Null
 Copy-Item -LiteralPath $Ast -Destination $installedAst
 Copy-Item -LiteralPath $Astd -Destination $installedAstd
 
@@ -48,18 +48,18 @@ Copy-Item -LiteralPath $Astd -Destination $installedAstd
 # LocalService can traverse the home and read its owner SID, but cannot write
 # it. Its probe therefore reaches the pipe DACL instead of failing on a parent
 # directory lookup, and cannot win the daemon election as a fallback.
-& icacls.exe $home '/setowner' "*$interactiveSid" '/Q' | Out-Null
+& icacls.exe $testHome '/setowner' "*$interactiveSid" '/Q' | Out-Null
 if ($LASTEXITCODE -ne 0) {
     throw "could not assign ASTERISM_HOME to interactive SID $interactiveSid"
 }
-& icacls.exe $home '/inheritance:r' '/grant:r' `
+& icacls.exe $testHome '/inheritance:r' '/grant:r' `
     "*${interactiveSid}:(OI)(CI)(F)" '*S-1-5-18:(OI)(CI)(F)' '*S-1-5-19:(OI)(CI)(RX)' '/Q' | Out-Null
 if ($LASTEXITCODE -ne 0) {
     throw 'could not protect the user-owned ASTERISM_HOME'
 }
 & icacls.exe $probeRoot '/grant:r' '*S-1-5-19:(OI)(CI)(M)' | Out-Null
 
-$env:ASTERISM_HOME = $home
+$env:ASTERISM_HOME = $testHome
 $env:ASTERISM_TEST_SERVICE_LABEL = $service
 
 try {
@@ -107,7 +107,7 @@ $env:ASTERISM_HOME = $HomePath
 Set-Content -LiteralPath $ResultPath -Value $LASTEXITCODE -Encoding ascii
 '@ | Set-Content -LiteralPath $probeScript -Encoding utf8
 
-    $action = "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$probeScript`" -HomePath `"$home`" -AstPath `"$installedAst`" -ResultPath `"$probeResult`" -LogPath `"$probeLog`""
+    $action = "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$probeScript`" -HomePath `"$testHome`" -AstPath `"$installedAst`" -ResultPath `"$probeResult`" -LogPath `"$probeLog`""
     & schtasks.exe /Create /TN $task /SC ONCE /ST 23:59 /RU 'NT AUTHORITY\LOCAL SERVICE' /RL LIMITED /TR $action /F | Out-Null
     & schtasks.exe /Run /TN $task | Out-Null
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
