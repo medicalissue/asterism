@@ -525,6 +525,19 @@ fn mount_units(shares: &[Share], share_kind: Option<ShareKind>) -> String {
     for module in kind.modules() {
         out.push_str(&format!("\x20     {module}\n"));
     }
+    out.push_str(&format!(
+        "\x20 - path: /etc/systemd/system/asterism-{kind}-modules.service\n\
+         \x20   content: |\n\
+         \x20     [Unit]\n\
+         \x20     Description=Load Asterism {kind} share modules\n\
+         \x20     After=systemd-modules-load.service\n\
+         \x20     [Service]\n\
+         \x20     Type=oneshot\n\
+         \x20     RemainAfterExit=yes\n"
+    ));
+    for module in kind.modules() {
+        out.push_str(&format!("\x20     ExecStart=/sbin/modprobe {module}\n"));
+    }
     for share in shares {
         let options = match kind.mount_options() {
             "" => String::new(),
@@ -535,6 +548,8 @@ fn mount_units(shares: &[Share], share_kind: Option<ShareKind>) -> String {
              \x20   content: |\n\
              \x20     [Unit]\n\
              \x20     Description=Asterism volume {label}\n\
+             \x20     Requires=asterism-{kind}-modules.service\n\
+             \x20     After=asterism-{kind}-modules.service\n\
              \x20     [Mount]\n\
              \x20     What={tag}\n\
              \x20     Where={where_}\n\
@@ -1049,6 +1064,9 @@ mod tests {
         assert!(config.contains("Where=/srv/code"));
         assert!(config.contains(&format!("What={}", shares[0].tag)));
         assert!(config.contains("Type=9p"));
+        assert!(config.contains("asterism-9p-modules.service"));
+        assert!(config.contains("Requires=asterism-9p-modules.service"));
+        assert!(config.contains("After=asterism-9p-modules.service"));
         assert!(config.contains("for unit in 'mnt-ast-media.mount' 'srv-code.mount'; do"));
         assert!(config.contains("systemctl enable --now \"$unit\""));
 
@@ -1089,6 +1107,14 @@ mod tests {
         assert!(config.contains("Type=virtiofs"), "{config}");
         assert!(config.contains("modprobe virtiofs"), "{config}");
         assert!(config.contains("asterism-virtiofs.conf"), "{config}");
+        assert!(
+            config.contains("Requires=asterism-virtiofs-modules.service"),
+            "{config}"
+        );
+        assert!(
+            config.contains("After=asterism-virtiofs-modules.service"),
+            "{config}"
+        );
         assert!(
             config.contains(&format!("What={}", shares[0].tag)),
             "{config}"

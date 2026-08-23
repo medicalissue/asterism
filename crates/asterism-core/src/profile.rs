@@ -1039,7 +1039,11 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        // The driver is intentionally detached and asynchronous. A saturated
+        // CI host may not schedule that child within one second even though
+        // the launch path is correct, so give process scheduling a bounded
+        // but non-flaky window.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !direct.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
