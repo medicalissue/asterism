@@ -109,8 +109,8 @@ use crate::VERSION;
 /// * **4** — the opt-in, framed device-shell policy and session wire.
 /// * **5** — mesh-safe, read-only device-shell policy status.
 /// * **6** — device-local structured image catalog and pull results.
-/// * **6** — orbit storage catalog and catalog-driven attachment.
-pub const PROTOCOL_VERSION: u32 = 6;
+/// * **7** — orbit storage catalog, placement, leases, and fenced NBD splices.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// The wire as it was before it carried a version.
 ///

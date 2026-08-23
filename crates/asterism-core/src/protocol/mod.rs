@@ -794,7 +794,7 @@ impl Request {
             | Request::VolumeCatalog
             | Request::VolumeLease { .. }
             | Request::VolumeReconnect { .. }
-            | Request::VolumeRelease { .. } => 6,
+            | Request::VolumeRelease { .. } => 7,
             Request::DeviceShellStatus => 5,
             Request::ImageList | Request::ImagePull { .. } => 6,
             Request::DeviceShellPolicy { .. }
@@ -1195,9 +1195,8 @@ impl Response {
         match self {
             Response::Compat { .. } => 2,
             Response::BackupExported { .. } | Response::BackupRestored { .. } => 3,
-            Response::Images { .. }
-            | Response::ImagePulled { .. }
-            | Response::VolumeCatalog { .. } => 6,
+            Response::Images { .. } | Response::ImagePulled { .. } => 6,
+            Response::VolumeCatalog { .. } | Response::VolumeLease { .. } => 7,
             Response::DeviceShellStatus { .. }
             | Response::DeviceShellAccepted { .. }
             | Response::DeviceShellRefused { .. }
@@ -1446,7 +1445,22 @@ mod tests {
         assert!(Request::Compat.speakable_at(2));
         assert!(Request::List.speakable_at(1));
         assert_eq!(Request::DeviceShellStatus.since(), 5);
-        assert_eq!(Request::VolumeCatalog.since(), 6);
+        assert_eq!(Request::VolumeCatalog.since(), 7);
+        assert!(
+            !Request::VolumeCatalog.speakable_at(6),
+            "a protocol-6 peer cannot parse the orbit storage catalog"
+        );
+        assert!(Request::VolumeCatalog.speakable_at(7));
+        let lease = Response::VolumeLease {
+            volume: "tank".into(),
+            epoch: 7,
+            export: "lease-7".into(),
+            socket: "/run/asterism/tank.sock".into(),
+            size_bytes: 1,
+        };
+        assert_eq!(lease.since(), 7);
+        assert!(!lease.speakable_at(6));
+        assert!(lease.speakable_at(7));
         assert_eq!(
             serde_json::to_string(&Request::DeviceShellStatus).unwrap(),
             r#"{"cmd":"device_shell_status"}"#
@@ -1522,11 +1536,11 @@ mod tests {
         assert_eq!(table.get("compat"), Some(&Request::Compat.since()));
         assert_eq!(table.get("backup_export"), Some(&3));
         assert_eq!(table.get("backup_import"), Some(&3));
-        assert_eq!(table.get("volume_catalog"), Some(&6));
-        assert_eq!(table.get("attach_storage"), Some(&6));
-        assert_eq!(table.get("volume_lease"), Some(&6));
-        assert_eq!(table.get("volume_reconnect"), Some(&6));
-        assert_eq!(table.get("volume_release"), Some(&6));
+        assert_eq!(table.get("volume_catalog"), Some(&7));
+        assert_eq!(table.get("attach_storage"), Some(&7));
+        assert_eq!(table.get("volume_lease"), Some(&7));
+        assert_eq!(table.get("volume_reconnect"), Some(&7));
+        assert_eq!(table.get("volume_release"), Some(&7));
         assert_eq!(
             table.get("device-shell"),
             Some(&4),

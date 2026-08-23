@@ -1228,10 +1228,11 @@ pub(crate) async fn reconcile_pending_attaches(node: &Node) {
         }
     };
     for intent in intents.list() {
-        // Startup has not begun accepting requests yet, but still never hold
-        // the shard mutex over a peer dial: a dead provider must not pin the
-        // registry lock or turn its network timeout into a daemon-wide stall.
-        let mut reg = node.shard.lock().await.clone();
+        // Mesh streams may already be arriving while startup reconciles.
+        // Keep the live shard locked across this bounded recovery operation:
+        // saving a detached clone and assigning it back later could otherwise
+        // erase a mesh-originated mutation that landed in between.
+        let mut reg = node.shard.lock().await;
         match tokio::time::timeout(
             STORAGE_RECOVERY_DEADLINE,
             reconcile_one_attach(&mut reg, &mut intents, &intent),
@@ -1254,7 +1255,6 @@ pub(crate) async fn reconcile_pending_attaches(node: &Node) {
                 STORAGE_RECOVERY_DEADLINE.as_secs()
             ),
         }
-        *node.shard.lock().await = reg;
     }
 }
 
@@ -1560,7 +1560,9 @@ pub(crate) async fn reconcile_pending_releases(node: &Node) {
         }
     };
     for intent in intents.list() {
-        let mut reg = node.shard.lock().await.clone();
+        // See attach recovery above: this must mutate the live locked shard,
+        // never write a startup clone over concurrent mesh-originated work.
+        let mut reg = node.shard.lock().await;
         match tokio::time::timeout(
             STORAGE_RECOVERY_DEADLINE,
             reconcile_one_release(&mut reg, &mut intents, &intent),
@@ -1583,7 +1585,6 @@ pub(crate) async fn reconcile_pending_releases(node: &Node) {
                 STORAGE_RECOVERY_DEADLINE.as_secs()
             ),
         }
-        *node.shard.lock().await = reg;
     }
 }
 
