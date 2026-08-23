@@ -86,7 +86,7 @@ $ sh install.sh --uninstall
 ```
 v0.1.0/
   asterism-v0.1.0-darwin-arm64.tar.gz   # ast, astd, astd-vz, asterism-update — flat
-  asterism-v0.1.0-linux-x86_64.tar.gz   # ast, astd, cloud-hypervisor, virtiofsd, asterism-update, share/
+  asterism-v0.1.0-linux-x86_64.tar.gz   # ast, astd, guest-gpu/, cloud-hypervisor, virtiofsd, updater, share/
   asterism-v0.1.0-linux-arm64.tar.gz    # same layout, aarch64 Cloud Hypervisor pin
   Asterism-v0.1.0-darwin-arm64.app.tar.gz # signed app payload used by the updater
   Asterism-v0.1.0-darwin-arm64.dmg      # signed manual installer; drag to Applications

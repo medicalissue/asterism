@@ -9,6 +9,8 @@ cd "$ROOT"
 TARGET_COMMIT="${ASTERISM_CUSE_TARGET_COMMIT:?ASTERISM_CUSE_TARGET_COMMIT is required}"
 TARGET_TREE="${ASTERISM_CUSE_TARGET_TREE:?ASTERISM_CUSE_TARGET_TREE is required}"
 EVIDENCE="${ASTERISM_CUSE_EVIDENCE_DIR:-$ROOT/cuse-live-evidence}"
+INSTALL_REF="${ASTERISM_CUSE_INSTALL_REF:-${GITHUB_REF_NAME:-}}"
+INSTALL_PREFIX="${ASTERISM_CUSE_INSTALL_PREFIX:-${RUNNER_TEMP:-/tmp}/asterism-cuse-install}"
 mkdir -p "$EVIDENCE"
 SUMMARY="$EVIDENCE/summary.txt"
 : >"$SUMMARY"
@@ -19,6 +21,7 @@ block() { record "verdict=BLOCKED"; record "blocker=$*"; return 1; }
 record "target_commit=$TARGET_COMMIT"
 record "target_tree=$TARGET_TREE"
 record "observer_commit=$(git rev-parse HEAD)"
+record "install_ref=${INSTALL_REF:-missing}"
 record "run_url=${GITHUB_SERVER_URL:-local}/${GITHUB_REPOSITORY:-local}/actions/runs/${GITHUB_RUN_ID:-local}"
 date -u '+observed_at=%Y-%m-%dT%H:%M:%SZ' | tee -a "$SUMMARY"
 
@@ -57,27 +60,87 @@ if [ "$gate_rc" -eq 0 ]; then
   fi
 fi
 
+service_user=asterism-gpu
+service_group=asterism-gpu
+run_as_service_user() {
+  sudo -n -u "$service_user" env \
+    HOME="$HOME" PATH="$PATH" \
+    CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+    RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
+    CARGO_TARGET_DIR="${RUNNER_TEMP:-/tmp}/asterism-cuse-target" \
+    "$@"
+}
+
 if [ "$gate_rc" -eq 0 ]; then
-  set +e
-  modprobe_output="$(sudo -n modprobe cuse 2>&1)"
-  modprobe_rc=$?
-  set -e
-  printf '%s\n' "$modprobe_output" >"$EVIDENCE/modprobe.log"
-  record "modprobe_cuse_exit=$modprobe_rc"
-  if [ "$modprobe_rc" -ne 0 ]; then
-    block "sudo -n modprobe cuse failed (exit $modprobe_rc; see modprobe.log)" || gate_rc=1
-  elif [ ! -d /sys/module/cuse ]; then
-    block "cuse module is not present at /sys/module/cuse after modprobe" || gate_rc=1
-  elif [ ! -c /dev/cuse ]; then
-    block "/dev/cuse is missing or is not a character device after modprobe" || gate_rc=1
-  elif [ ! -r /dev/cuse ] || [ ! -w /dev/cuse ]; then
-    stat -Lc 'cuse_mode=%A cuse_owner=%U cuse_group=%G cuse_major_minor=%t:%T' /dev/cuse \
-      | tee -a "$SUMMARY" || true
-    block "/dev/cuse is not readable and writable by the runner user" || gate_rc=1
+  if [ -z "$INSTALL_REF" ]; then
+    block "no immutable checkout branch was supplied to the product installer" || gate_rc=1
   else
-    stat -Lc 'cuse_mode=%A cuse_owner=%U cuse_group=%G cuse_major_minor=%t:%T' /dev/cuse \
+    rm -rf "$INSTALL_PREFIX"
+    set +e
+    ASTERISM_METHOD=source \
+      ASTERISM_REF="$INSTALL_REF" \
+      ASTERISM_PREFIX="$INSTALL_PREFIX" \
+      ASTERISM_YES=1 \
+      sh packaging/install.sh 2>&1 | tee "$EVIDENCE/product-install.log"
+    install_rc=${PIPESTATUS[0]}
+    set -e
+    record "product_install_exit=$install_rc"
+    if [ "$install_rc" -ne 0 ]; then
+      block "shipped source install path failed (see product-install.log)" || gate_rc=1
+    fi
+  fi
+fi
+
+if [ "$gate_rc" -eq 0 ]; then
+  [ -x "$INSTALL_PREFIX/bin/guest-gpu/bin/asterism-gpu-guest" ] \
+    || { block "product install did not ship the guest CUSE opener beside astd" || gate_rc=1; }
+  [ -f "$INSTALL_PREFIX/bin/guest-gpu/lib/libcuda.so.1.0.0" ] \
+    || { block "product install did not ship the matching guest libcuda" || gate_rc=1; }
+  grep -q 'project_guest_device(Path::new("/"))' crates/asterism-gpu-guest/src/main.rs \
+    || { block "shipped guest service is not the process that mounts guest /dev/cuse" || gate_rc=1; }
+  grep -q 'User=asterism-gpu' crates/asterism-core/src/remote_gpu_guest.rs \
+    || { block "guest service unit does not drop to the dedicated identity" || gate_rc=1; }
+  record "cuse_opener=guest:asterism-gpu-guest"
+  record "host_astd_opens_cuse=false"
+  record "udev_placement=guest:/etc/udev/rules.d/70-asterism-cuse.rules"
+  record "credential_refresh=system_service_start_no_relogin"
+fi
+
+if [ "$gate_rc" -eq 0 ]; then
+  rule=/etc/udev/rules.d/70-asterism-cuse.rules
+  modules=/etc/modules-load.d/asterism-cuse.conf
+  set +e
+  {
+    sudo -n groupadd --system "$service_group"
+    sudo -n useradd --system --gid "$service_group" --no-create-home \
+      --home-dir /nonexistent --shell /usr/sbin/nologin "$service_user"
+    printf 'cuse\n' | sudo -n tee "$modules" >/dev/null
+    sudo -n install -m 0644 crates/asterism-core/assets/70-asterism-cuse.rules "$rule"
+    sudo -n modprobe cuse
+    sudo -n udevadm control --reload-rules
+    sudo -n udevadm trigger --action=add /sys/class/misc/cuse
+    sudo -n udevadm settle
+    sudo -n install -d -o "$service_user" -g "$service_group" \
+      "${RUNNER_TEMP:-/tmp}/asterism-cuse-target"
+  } >"$EVIDENCE/guest-boundary-install.log" 2>&1
+  reload_rc=$?
+  set -e
+  record "guest_boundary_install_exit=$reload_rc"
+  if [ "$reload_rc" -ne 0 ]; then
+    block "guest CUSE least-privilege boundary did not install" || gate_rc=1
+  elif [ ! -d /sys/module/cuse ] || [ ! -c /dev/cuse ]; then
+    block "real /dev/cuse did not appear for the guest service boundary" || gate_rc=1
+  else
+    stat -Lc 'cuse_mode=%A cuse_mode_octal=%a cuse_owner=%U cuse_group=%G cuse_major_minor=%t:%T' /dev/cuse \
       | tee -a "$SUMMARY"
-    record "preflight=pass"
+    run_as_service_user id | tee "$EVIDENCE/guest-service-id.log"
+    if ! run_as_service_user test -r /dev/cuse || ! run_as_service_user test -w /dev/cuse; then
+      block "/dev/cuse is not read/write for the freshly started guest service identity" || gate_rc=1
+    elif [ -r /dev/cuse ] || [ -w /dev/cuse ]; then
+      block "ordinary host account can access guest-service-only /dev/cuse" || gate_rc=1
+    else
+      record "least_privilege_preflight=pass"
+    fi
   fi
 fi
 
@@ -85,7 +148,8 @@ run_exact_test() {
   local test_name="$1"
   local log_name="$2"
   set +e
-  ASTERISM_BUILD_ID="$TARGET_COMMIT" cargo test -p asterism-core "$test_name" \
+  run_as_service_user env ASTERISM_BUILD_ID="$TARGET_COMMIT" \
+    cargo test -p asterism-core "$test_name" \
     -- --exact --nocapture 2>&1 | tee "$EVIDENCE/$log_name"
   local test_rc=${PIPESTATUS[0]}
   set -e
@@ -112,13 +176,60 @@ if [ "$gate_rc" -eq 0 ]; then
 fi
 if [ "$gate_rc" -eq 0 ]; then
   set +e
-  ASTERISM_BUILD_ID="$TARGET_COMMIT" \
+  run_as_service_user env ASTERISM_BUILD_ID="$TARGET_COMMIT" \
     cargo run -p asterism-core --example live_cuse_gate 2>&1 \
     | tee "$EVIDENCE/live-lifecycle.log"
   lifecycle_rc=${PIPESTATUS[0]}
   set -e
   if [ "$lifecycle_rc" -ne 0 ]; then
     block "live mount/open/read/write/poll/cancel/interrupt/teardown failed" || gate_rc=1
+  fi
+fi
+
+if [ -f "$INSTALL_PREFIX/share/asterism/install-receipt.env" ]; then
+  set +e
+  ASTERISM_PREFIX="$INSTALL_PREFIX" ASTERISM_YES=1 \
+    sh packaging/install.sh --uninstall 2>&1 | tee "$EVIDENCE/product-uninstall.log"
+  uninstall_rc=${PIPESTATUS[0]}
+  set -e
+  record "product_uninstall_exit=$uninstall_rc"
+  if [ "$uninstall_rc" -ne 0 ]; then
+    block "product uninstall did not remove the packaged guest GPU unit" || gate_rc=1
+  fi
+  if [ -e "$INSTALL_PREFIX/bin/guest-gpu" ]; then
+    block "product uninstall left packaged guest GPU artifacts behind" || gate_rc=1
+  fi
+fi
+
+if [ -e /etc/udev/rules.d/70-asterism-cuse.rules ] ||
+  id "$service_user" >/dev/null 2>&1 || getent group "$service_group" >/dev/null 2>&1; then
+  set +e
+  {
+    sudo -n rm -f /etc/udev/rules.d/70-asterism-cuse.rules \
+      /etc/modules-load.d/asterism-cuse.conf
+    id "$service_user" >/dev/null 2>&1 && sudo -n userdel "$service_user"
+    getent group "$service_group" >/dev/null 2>&1 && sudo -n groupdel "$service_group"
+    sudo -n modprobe -r cuse
+    sudo -n modprobe cuse
+    sudo -n udevadm control --reload-rules
+    sudo -n udevadm trigger --action=add /sys/class/misc/cuse
+    sudo -n udevadm settle
+  } >"$EVIDENCE/post-uninstall-reload.log" 2>&1
+  post_reload_rc=$?
+  set -e
+  if [ "$post_reload_rc" -ne 0 ]; then
+    block "could not verify guest-boundary teardown" || gate_rc=1
+  elif [ -e /etc/udev/rules.d/70-asterism-cuse.rules ] ||
+    [ -e /etc/modules-load.d/asterism-cuse.conf ]; then
+    block "uninstall left persistent CUSE policy behind" || gate_rc=1
+  elif [ -r /dev/cuse ] || [ -w /dev/cuse ]; then
+    stat -Lc 'post_uninstall_mode=%A post_uninstall_owner=%U post_uninstall_group=%G' /dev/cuse \
+      | tee -a "$SUMMARY" || true
+    block "guest-boundary teardown left the ordinary host account able to access /dev/cuse" || gate_rc=1
+  else
+    stat -Lc 'post_uninstall_mode=%A post_uninstall_owner=%U post_uninstall_group=%G' /dev/cuse \
+      | tee -a "$SUMMARY"
+    record "guest_boundary_teardown=pass"
   fi
 fi
 

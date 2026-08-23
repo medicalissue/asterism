@@ -302,8 +302,14 @@ make_linux_release() {
   printf '#!/bin/sh\necho "cloud-hypervisor v53.0"\n' >"$stage/cloud-hypervisor"
   printf '#!/bin/sh\necho "virtiofsd 1.14.0"\n' >"$stage/virtiofsd"
   chmod +x "$stage/cloud-hypervisor" "$stage/virtiofsd"
+  mkdir -p "$stage/guest-gpu/bin" "$stage/guest-gpu/lib"
+  printf '#!/bin/sh\necho guest-gpu-%s\n' "$build" >"$stage/guest-gpu/bin/asterism-gpu-guest"
+  printf 'libcuda-%s\n' "$build" >"$stage/guest-gpu/lib/libcuda.so.1.0.0"
+  ln -s libcuda.so.1.0.0 "$stage/guest-gpu/lib/libcuda.so.1"
+  ln -s libcuda.so.1 "$stage/guest-gpu/lib/libcuda.so"
+  chmod +x "$stage/guest-gpu/bin/asterism-gpu-guest"
   make_updater "$stage/asterism-update"
-  tar -czf "$dir/unit.tar.gz" -C "$stage" ast astd cloud-hypervisor virtiofsd asterism-update
+  tar -czf "$dir/unit.tar.gz" -C "$stage" ast astd cloud-hypervisor virtiofsd guest-gpu asterism-update
   "$RENDER" stable "$version" "$build" linux-x86_64 \
     "file://$dir/unit.tar.gz" "$(sha "$dir/unit.tar.gz")" \
     "" "" >"$dir/RELEASE.json"
@@ -320,6 +326,10 @@ install_linux_old() {
   printf '#!/bin/sh\necho "cloud-hypervisor v53.0 old"\n' >"$PREFIX/bin/cloud-hypervisor"
   printf '#!/bin/sh\necho "virtiofsd 1.14.0 old"\n' >"$PREFIX/bin/virtiofsd"
   chmod +x "$PREFIX/bin/cloud-hypervisor" "$PREFIX/bin/virtiofsd"
+  mkdir -p "$PREFIX/bin/guest-gpu/bin" "$PREFIX/bin/guest-gpu/lib"
+  printf '#!/bin/sh\necho guest-gpu-old\n' >"$PREFIX/bin/guest-gpu/bin/asterism-gpu-guest"
+  printf 'libcuda-old\n' >"$PREFIX/bin/guest-gpu/lib/libcuda.so.1.0.0"
+  chmod +x "$PREFIX/bin/guest-gpu/bin/asterism-gpu-guest"
   make_updater "$PREFIX/libexec/asterism/asterism-update"
 }
 
@@ -343,8 +353,21 @@ run_linux_update apply --yes >"$WORK/linux-applied"
 [ "$(build_of "$PREFIX/bin/astd")" = 0.0.2+new ] || fail "linux astd did not activate"
 [ -x "$PREFIX/bin/cloud-hypervisor" ] || fail "linux update dropped cloud-hypervisor"
 [ -x "$PREFIX/bin/virtiofsd" ] || fail "linux update dropped virtiofsd"
+[ "$(cat "$PREFIX/bin/guest-gpu/lib/libcuda.so.1.0.0")" = 'libcuda-0.0.2+new' ] \
+  || fail "linux update did not activate the matching guest GPU unit"
 [ ! -e "$PREFIX/bin/astd-vz" ] || fail "linux update planted a vz helper"
 ok "Linux signed update activates ast, astd, CHV and virtiofsd as one unit"
+
+install_linux_old
+if ASTERISM_UPDATE_FAIL_AFTER=cloud-hypervisor \
+  run_linux_update apply --yes >"$WORK/linux-guest-rollback" 2>&1; then
+  fail "injected Linux activation failure unexpectedly succeeded"
+fi
+[ "$(cat "$PREFIX/bin/guest-gpu/lib/libcuda.so.1.0.0")" = 'libcuda-old' ] \
+  || fail "Linux rollback left the new guest GPU unit beside the old daemon"
+[ "$(build_of "$PREFIX/bin/astd")" = 0.0.1+old ] \
+  || fail "Linux rollback did not restore the old daemon with its guest unit"
+ok "Linux update rollback restores guest GPU artifacts with the matching daemon"
 
 install_linux_old
 mkdir -p "$PREFIX/share/asterism/artifact.lock"

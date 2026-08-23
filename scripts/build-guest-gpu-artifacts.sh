@@ -1,13 +1,28 @@
 #!/bin/sh
 set -eu
 
-target=${ASTERISM_GPU_GUEST_TARGET:-x86_64-unknown-linux-gnu}
-destination=${1:-target/asterism-gpu-guest/$target}
+root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$root"
 
-cargo build --release --target "$target" -p asterism-gpu-guest -p asterism-libcuda
+if [ -n "${ASTERISM_GPU_GUEST_TARGET:-}" ]; then
+	target=$ASTERISM_GPU_GUEST_TARGET
+else
+	target=$(rustc -vV | sed -n 's/^host: //p')
+fi
+[ -n "$target" ] || { echo "could not resolve the native Rust target" >&2; exit 1; }
+cargo_target_dir=${CARGO_TARGET_DIR:-target}
+case "$cargo_target_dir" in
+	/*) ;;
+	*) cargo_target_dir="$root/$cargo_target_dir" ;;
+esac
+destination=${1:-$root/target/asterism-gpu-guest/$target}
+
+CARGO_TARGET_DIR="$cargo_target_dir" \
+	cargo build --release --locked --target "$target" \
+		-p asterism-gpu-guest -p asterism-libcuda
 mkdir -p "$destination/bin" "$destination/lib"
-cp "target/$target/release/asterism-gpu-guest" "$destination/bin/asterism-gpu-guest"
-cp "target/$target/release/libcuda.so" "$destination/lib/libcuda.so.1.0.0"
+cp "$cargo_target_dir/$target/release/asterism-gpu-guest" "$destination/bin/asterism-gpu-guest"
+cp "$cargo_target_dir/$target/release/libcuda.so" "$destination/lib/libcuda.so.1.0.0"
 ln -sfn libcuda.so.1.0.0 "$destination/lib/libcuda.so.1"
 ln -sfn libcuda.so.1 "$destination/lib/libcuda.so"
 

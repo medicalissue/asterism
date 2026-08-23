@@ -400,6 +400,9 @@ jobs:
           archive="dist/${version}/asterism-${version}-${{ matrix.target }}.tar.gz"
           [ -f "$archive" ]
           for member in ast astd cloud-hypervisor virtiofsd asterism-update \
+            guest-gpu/bin/asterism-gpu-guest \
+            guest-gpu/lib/libcuda.so.1.0.0 guest-gpu/lib/libcuda.so.1 \
+            guest-gpu/lib/libcuda.so \
             share/asterism/asterism-nbd share/asterism/linux-components.env \
             share/asterism/licenses/LICENSE-APACHE \
             share/asterism/licenses/LICENSE-MIT share/asterism/licenses/NOTICE \

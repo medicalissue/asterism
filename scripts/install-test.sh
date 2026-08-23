@@ -72,6 +72,12 @@ EOF
 		mkdir -p "${stage}/share/asterism/licenses"
 		cp "${ROOT}/packaging/linux-components.env" "${stage}/share/asterism/"
 		cp "${ROOT}/packaging/asterism-nbd" "${stage}/share/asterism/"
+		mkdir -p "${stage}/guest-gpu/bin" "${stage}/guest-gpu/lib"
+		printf '#!/bin/sh\nexit 1\n' >"${stage}/guest-gpu/bin/asterism-gpu-guest"
+		printf 'ELF guest libcuda\n' >"${stage}/guest-gpu/lib/libcuda.so.1.0.0"
+		ln -s libcuda.so.1.0.0 "${stage}/guest-gpu/lib/libcuda.so.1"
+		ln -s libcuda.so.1 "${stage}/guest-gpu/lib/libcuda.so"
+		chmod +x "${stage}/guest-gpu/bin/asterism-gpu-guest"
 		for license in cloud-hypervisor-Apache-2.0 cloud-hypervisor-BSD-3-Clause \
 			virtiofsd-Apache-2.0 virtiofsd-BSD-3-Clause; do
 			printf 'test license\n' >"${stage}/share/asterism/licenses/${license}.txt"
@@ -83,7 +89,7 @@ EOF
 		else
 			printf 'NOTICE\n' >"${stage}/share/asterism/licenses/NOTICE"
 		fi
-		members=(ast astd cloud-hypervisor virtiofsd share)
+		members=(ast astd cloud-hypervisor virtiofsd guest-gpu share)
 	fi
 	# The first release predates self-update; current releases ship the updater
 	# that `ast update` keeps alive while replacing ast itself.
@@ -664,6 +670,12 @@ says "loginctl enable-linger"
 [ -x "${PREFIX}/bin/virtiofsd" ] || fail "virtiofsd was not installed"
 [ -f "${PREFIX}/share/asterism/linux-components.env" ] || fail "component lock was not installed"
 [ -x "${PREFIX}/libexec/asterism/asterism-update" ] || fail "the Linux updater was not installed"
+[ -x "${PREFIX}/bin/guest-gpu/bin/asterism-gpu-guest" ] \
+	|| fail "the Linux guest GPU service was not installed beside astd"
+[ -f "${PREFIX}/bin/guest-gpu/lib/libcuda.so.1.0.0" ] \
+	|| fail "the generated guest libcuda was not installed beside astd"
+grep -q 'bin/guest-gpu/bin/asterism-gpu-guest' <<<"$(receipt)" \
+	|| fail "the receipt does not own the shipped guest GPU unit"
 [ -x "${WORK}/system-root/usr/local/libexec/asterism/asterism-nbd" ] \
 	|| fail "the root-owned NBD argument boundary was not installed"
 grep -qxF 'nbd' "${WORK}/system-root/etc/modules-load.d/asterism-nbd.conf" \
@@ -691,9 +703,22 @@ says "cleanup authority were kept"
 [ -e "$policy" ] || fail "uninstall removed sudoers cleanup authority while a live claim existed"
 [ -x "${PREFIX}/bin/cloud-hypervisor" ] || fail "refused uninstall still removed prefix files"
 rm -rf "${WORK}/system-root/run/asterism-nbd/nbd0"
+# A signed updater predating receipt migration can add guest-gpu to an older
+# Linux install. Cloud Hypervisor is the unambiguous ownership marker that
+# lets uninstall adopt and remove that exact internal unit.
+sed -E \
+	-e 's# bin/guest-gpu/bin/asterism-gpu-guest##' \
+	-e 's# bin/guest-gpu/lib/libcuda.so\.1\.0\.0##' \
+	-e 's# bin/guest-gpu/lib/libcuda\.so\.1##' \
+	-e 's# bin/guest-gpu/lib/libcuda\.so##' \
+	"${PREFIX}/share/asterism/install-receipt.env" \
+	>"${PREFIX}/share/asterism/install-receipt.env.new"
+mv "${PREFIX}/share/asterism/install-receipt.env.new" \
+	"${PREFIX}/share/asterism/install-receipt.env"
 run_install ok -- --uninstall
 [ ! -e "${PREFIX}/bin/cloud-hypervisor" ] || fail "uninstall left Cloud Hypervisor behind"
 [ ! -e "${PREFIX}/share/asterism/linux-components.env" ] || fail "uninstall left component metadata behind"
+[ ! -e "${PREFIX}/bin/guest-gpu" ] || fail "uninstall left guest GPU artifacts behind"
 [ ! -e "$policy" ] || fail "uninstall left the account's NBD sudo policy behind"
 
 # The shared artifact lock is exclusive across install/update/uninstall.

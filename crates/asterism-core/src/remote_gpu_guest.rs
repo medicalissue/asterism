@@ -55,6 +55,11 @@ pub const GUEST_GPU_VSOCK_PORT: u32 = 1022;
 /// HMAC transcript prefix. The `gpu` label keeps these proofs from standing
 /// in for [`crate`] guest-agent proofs on port 1023.
 pub const GUEST_GPU_PROOF_LABEL: &str = "asterism-guest-gpu";
+/// Guest-local identity that alone may open `/dev/cuse` and read the GPU key.
+/// It is created inside an attached guest, never on the Asterism host.
+pub const GUEST_GPU_SERVICE_USER: &str = "asterism-gpu";
+pub const GUEST_GPU_SERVICE_GROUP: &str = "asterism-gpu";
+pub const GUEST_CUSE_UDEV_RULE: &str = include_str!("../assets/70-asterism-cuse.rules");
 /// NVIDIA's historical ioctl magic (`'F'`). Every request with this magic is
 /// refused: we do not forward host-pointer driver commands.
 pub const NVIDIA_IOCTL_MAGIC: u8 = b'F';
@@ -112,6 +117,7 @@ impl GuestProjectionArtifacts {
     pub fn cloud_config(&self) -> String {
         let service = BASE64.encode(&self.service);
         let libcuda = BASE64.encode(&self.libcuda);
+        let udev_rule = GUEST_CUSE_UDEV_RULE.trim();
         format!(
             "write_files:\n\
              \x20- path: /usr/local/sbin/asterism-gpu-guest\n\
@@ -124,6 +130,16 @@ impl GuestProjectionArtifacts {
              \x20  permissions: '0755'\n\
              \x20  encoding: b64\n\
              \x20  content: {libcuda}\n\
+             \x20- path: /etc/modules-load.d/asterism-cuse.conf\n\
+             \x20  owner: root:root\n\
+             \x20  permissions: '0644'\n\
+             \x20  content: |\n\
+             \x20    cuse\n\
+             \x20- path: /etc/udev/rules.d/70-asterism-cuse.rules\n\
+             \x20  owner: root:root\n\
+             \x20  permissions: '0644'\n\
+             \x20  content: |\n\
+             \x20    {udev_rule}\n\
              \x20- path: /etc/systemd/system/asterism-gpu-guest.service\n\
              \x20  owner: root:root\n\
              \x20  permissions: '0644'\n\
@@ -132,21 +148,43 @@ impl GuestProjectionArtifacts {
              \x20    Description=Asterism guest GPU projection\n\
              \x20    After=systemd-modules-load.service\n\
              \x20    [Service]\n\
-             \x20    ExecStartPre=/sbin/modprobe cuse\n\
+             \x20    User={service_user}\n\
+             \x20    Group={service_group}\n\
              \x20    ExecStart=/usr/local/sbin/asterism-gpu-guest\n\
              \x20    Restart=on-failure\n\
              \x20    RestartSec=1\n\
+             \x20    NoNewPrivileges=true\n\
+             \x20    PrivateTmp=true\n\
+             \x20    ProtectHome=true\n\
+             \x20    ProtectSystem=strict\n\
+             \x20    ProtectKernelModules=true\n\
+             \x20    DevicePolicy=closed\n\
+             \x20    DeviceAllow=/dev/cuse rw\n\
+             \x20    CapabilityBoundingSet=\n\
+             \x20    RestrictAddressFamilies=AF_UNIX AF_VSOCK\n\
              \x20    [Install]\n\
              \x20    WantedBy=multi-user.target\n\
              runcmd:\n\
              \x20- |\n\
+             \x20  getent group {service_group} >/dev/null || groupadd --system {service_group}\n\
+             \x20  id -u {service_user} >/dev/null 2>&1 || useradd --system --gid {service_group} --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin {service_user}\n\
+             \x20  chown root:{service_group} /etc/asterism/agent.key\n\
+             \x20  chmod 0640 /etc/asterism/agent.key\n\
+             \x20  modprobe cuse\n\
+             \x20  udevadm control --reload-rules\n\
+             \x20  udevadm trigger --action=add /sys/class/misc/cuse\n\
+             \x20  udevadm settle\n\
+             \x20  test -c /dev/cuse\n\
+             \x20  test \"$(stat -c '%U:%G:%a' /dev/cuse)\" = \"root:{service_group}:660\"\n\
              \x20  install -d -m 0755 /usr/local/lib/asterism\n\
              \x20  ln -sfn libcuda.so.1.0.0 /usr/local/lib/asterism/libcuda.so.1\n\
              \x20  ln -sfn libcuda.so.1 /usr/local/lib/asterism/libcuda.so\n\
              \x20  printf '%s\\n' /usr/local/lib/asterism > /etc/ld.so.conf.d/asterism-gpu.conf\n\
              \x20  ldconfig\n\
              \x20  systemctl daemon-reload\n\
-             \x20  systemctl enable --now asterism-gpu-guest.service\n"
+             \x20  systemctl enable --now asterism-gpu-guest.service\n",
+            service_user = GUEST_GPU_SERVICE_USER,
+            service_group = GUEST_GPU_SERVICE_GROUP,
         )
     }
 
@@ -155,9 +193,19 @@ impl GuestProjectionArtifacts {
     /// starts the service before the image entrypoint.
     pub fn oci_boot_script(&self, key_hex: &str) -> String {
         format!(
-            "$BB mkdir -p /etc/asterism /usr/local/sbin /usr/local/lib/asterism\n\
+            "$BB mkdir -p /etc/asterism /usr/local/sbin /usr/local/lib/asterism /var/log\n\
+             if $BB grep -q '^[^:]*:[^:]*:65532:' /etc/group 2>/dev/null; then\n\
+             \x20 $BB grep -qx '{service_group}:x:65532:' /etc/group || exit 1\n\
+             else printf '%s\\n' '{service_group}:x:65532:' >> /etc/group; fi\n\
+             if $BB grep -q '^[^:]*:[^:]*:65532:' /etc/passwd 2>/dev/null; then\n\
+             \x20 $BB grep -qx '{service_user}:x:65532:65532:Asterism GPU service:/nonexistent:/bin/false' /etc/passwd || exit 1\n\
+             else printf '%s\\n' '{service_user}:x:65532:65532:Asterism GPU service:/nonexistent:/bin/false' >> /etc/passwd; fi\n\
              printf '%s\\n' '{}' > /etc/asterism/agent.key\n\
-             chmod 0600 /etc/asterism/agent.key\n\
+             $BB chown 0:65532 /etc/asterism/agent.key\n\
+             chmod 0640 /etc/asterism/agent.key\n\
+             [ -c /dev/cuse ] || {{ echo 'asterism: guest CUSE device is missing' >&2; exit 1; }}\n\
+             $BB chown 0:65532 /dev/cuse\n\
+             chmod 0660 /dev/cuse\n\
              printf '%s' '{}' | $BB base64 -d > /usr/local/sbin/asterism-gpu-guest\n\
              chmod 0755 /usr/local/sbin/asterism-gpu-guest\n\
              printf '%s' '{}' | $BB base64 -d > /usr/local/lib/asterism/libcuda.so.1.0.0\n\
@@ -165,10 +213,12 @@ impl GuestProjectionArtifacts {
              $BB ln -sfn libcuda.so.1.0.0 /usr/local/lib/asterism/libcuda.so.1\n\
              $BB ln -sfn libcuda.so.1 /usr/local/lib/asterism/libcuda.so\n\
              export LD_LIBRARY_PATH=/usr/local/lib/asterism${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}\n\
-             /usr/local/sbin/asterism-gpu-guest >/var/log/asterism-gpu.log 2>&1 &\n",
+             $BB setuidgid {service_user} /usr/local/sbin/asterism-gpu-guest >/var/log/asterism-gpu.log 2>&1 &\n",
             key_hex,
             BASE64.encode(&self.service),
             BASE64.encode(&self.libcuda),
+            service_user = GUEST_GPU_SERVICE_USER,
+            service_group = GUEST_GPU_SERVICE_GROUP,
         )
     }
 }
@@ -1759,11 +1809,18 @@ mod tests {
         let cloud = artifacts.cloud_config();
         assert!(cloud.contains("asterism-gpu-guest.service"));
         assert!(cloud.contains("libcuda.so.1.0.0"));
+        assert!(cloud.contains("User=asterism-gpu"));
+        assert!(cloud.contains("Group=asterism-gpu"));
+        assert!(cloud.contains(GUEST_CUSE_UDEV_RULE.trim()));
+        assert!(cloud.contains("DeviceAllow=/dev/cuse rw"));
+        assert!(cloud.contains("CapabilityBoundingSet="));
+        assert!(!cloud.contains("MODE=\"0666\""));
         assert!(cloud.contains("enable --now asterism-gpu-guest.service"));
         let oci = artifacts.oci_boot_script("0011");
         assert!(oci.contains("/etc/asterism/agent.key"));
         assert!(oci.contains("export LD_LIBRARY_PATH="));
-        assert!(oci.contains("asterism-gpu-guest >/var/log/asterism-gpu.log"));
+        assert!(oci.contains("setuidgid asterism-gpu /usr/local/sbin/asterism-gpu-guest"));
+        assert!(oci.contains("chmod 0660 /dev/cuse"));
     }
 
     #[test]

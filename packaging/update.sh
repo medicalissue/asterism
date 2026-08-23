@@ -53,6 +53,7 @@ cleanup() {
 	# A failed copy or activation may leave verified staging bytes beside an
 	# install destination. They are never active, but do not accumulate them.
 	for name in ast astd astd-vz cloud-hypervisor virtiofsd; do rm -f "$BIN/.${name}.update.$$"; done
+	rm -rf "$BIN/.guest-gpu.update.$$"
 	rm -f "$LIBEXEC/.asterism-update.update.$$"
 	[ -z "$app_staged" ] || rm -rf "$app_staged"
 }
@@ -365,6 +366,7 @@ release_transaction() {
 component_destination() {
 	case "$1" in
 	ast | astd | astd-vz | cloud-hypervisor | virtiofsd) printf '%s/%s' "$BIN" "$1" ;;
+	guest-gpu) printf '%s' "$BIN/guest-gpu" ;;
 	asterism-update) printf '%s' "$LIBEXEC/asterism-update" ;;
 	Asterism.app) [ -n "$transaction_app_path" ] && printf '%s' "$transaction_app_path" ;;
 	*) return 1 ;;
@@ -375,6 +377,7 @@ cleanup_transaction_staging() {
 	owner=$(sed -n '1p' "$TRANSACTION_DIR/owner-pid" 2>/dev/null || true)
 	case "$owner" in *[!0-9]* | '') return ;; esac
 	for name in ast astd astd-vz cloud-hypervisor virtiofsd; do rm -f "$BIN/.${name}.update.${owner}"; done
+	rm -rf "$BIN/.guest-gpu.update.${owner}"
 	rm -f "$LIBEXEC/.asterism-update.update.${owner}"
 	[ -z "$transaction_app_path" ] || rm -rf "$(dirname "$transaction_app_path")/.Asterism.app.update.${owner}"
 	durable_parent "$BIN/.ast.update.${owner}"
@@ -390,7 +393,7 @@ last_build=${last_build}"
 }
 
 discard_transaction_backups() {
-	for name in astd-vz astd asterism-update ast Asterism.app cloud-hypervisor virtiofsd; do
+	for name in astd-vz astd asterism-update ast Asterism.app cloud-hypervisor virtiofsd guest-gpu; do
 		[ -f "$TRANSACTION_DIR/component-$name" ] || continue
 		dst=$(component_destination "$name") || continue
 		rm -rf "${dst}.previous.update" "${dst}.previous.update.absent"
@@ -402,7 +405,7 @@ rollback_transaction() {
 	err "recovering an interrupted update; restoring the previous compatible unit"
 	# Reverse activation order. A marker is durable before the first rename.
 	# If no backup exists, the destination was never moved and is left alone.
-	for name in Asterism.app ast asterism-update astd astd-vz cloud-hypervisor virtiofsd; do
+	for name in Asterism.app ast asterism-update astd astd-vz cloud-hypervisor virtiofsd guest-gpu; do
 		[ -f "$TRANSACTION_DIR/component-$name" ] || continue
 		dst=$(component_destination "$name") || continue
 		backup="${dst}.previous.update"
@@ -577,6 +580,8 @@ apply_update() {
 	if [ "$linux_payload" = 1 ]; then
 		[ -x "$tmp/stage/cloud-hypervisor" ] || die "the Linux update archive has no executable cloud-hypervisor"
 		[ -x "$tmp/stage/virtiofsd" ] || die "the Linux update archive has no executable virtiofsd"
+		[ -x "$tmp/stage/guest-gpu/bin/asterism-gpu-guest" ] || die "the Linux update archive has no guest GPU service"
+		[ -f "$tmp/stage/guest-gpu/lib/libcuda.so.1.0.0" ] || die "the Linux update archive has no guest libcuda"
 	else
 		verify_binary astd-vz "$tmp/stage/astd-vz"
 	fi
@@ -618,6 +623,10 @@ apply_update() {
 		chmod 755 "$BIN/.${name}.update.$$"
 		durable_path "$BIN/.${name}.update.$$"
 	done
+	if [ "$linux_payload" = 1 ]; then
+		cp -R "$tmp/stage/guest-gpu" "$BIN/.guest-gpu.update.$$"
+		durable_tree "$BIN/.guest-gpu.update.$$"
+	fi
 	cp "$tmp/stage/asterism-update" "$LIBEXEC/.asterism-update.update.$$"
 	chmod 755 "$LIBEXEC/.asterism-update.update.$$"
 	durable_path "$LIBEXEC/.asterism-update.update.$$"
@@ -630,6 +639,7 @@ apply_update() {
 	fi
 	if ! {
 		if [ "$linux_payload" = 1 ]; then
+			place_one guest-gpu "$BIN/.guest-gpu.update.$$" "$BIN/guest-gpu" &&
 			place_one cloud-hypervisor "$BIN/.cloud-hypervisor.update.$$" "$BIN/cloud-hypervisor" &&
 			place_one virtiofsd "$BIN/.virtiofsd.update.$$" "$BIN/virtiofsd" &&
 			place_one astd "$BIN/.astd.update.$$" "$BIN/astd" &&
