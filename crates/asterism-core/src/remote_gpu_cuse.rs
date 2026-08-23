@@ -28,13 +28,20 @@ const FUSE_RELEASE: u32 = 18;
 const FUSE_FLUSH: u32 = 25;
 const FUSE_INTERRUPT: u32 = 36;
 const FUSE_IOCTL: u32 = 39;
-const FUSE_POLL: u32 = 22;
+const FUSE_POLL: u32 = 40;
 const CUSE_INIT: u32 = 4096;
 const CUSE_UNRESTRICTED_IOCTL: u32 = 1;
 const FUSE_KERNEL_VERSION: u32 = 7;
 const FUSE_KERNEL_MINOR_VERSION: u32 = 31;
 const FUSE_IN_HEADER_LEN: usize = 40;
 const FUSE_OUT_HEADER_LEN: usize = 16;
+const FUSE_WRITE_IN_LEN: usize = 40;
+const FUSE_IOCTL_IN_LEN: usize = 32;
+const CUSE_MAX_READ: usize = 4 * 1024 * 1024;
+const CUSE_MAX_WRITE: usize = 4 * 1024 * 1024;
+// A /dev/cuse read returns one complete record. Leave a page for the largest
+// fixed request body in addition to the negotiated payload limit.
+const CUSE_MAX_REQUEST_LEN: usize = CUSE_MAX_WRITE + 4096;
 const ENOSYS: i32 = 38;
 const ENOTTY: i32 = 25;
 const EIO: i32 = 5;
@@ -101,6 +108,106 @@ pub fn decode_fuse_in_header(bytes: &[u8]) -> io::Result<(u32, u32, u64)> {
     Ok((len, opcode, unique))
 }
 
+#[derive(Debug)]
+struct FuseRequest<'a> {
+    len: u32,
+    opcode: u32,
+    unique: u64,
+    body: &'a [u8],
+}
+
+fn parse_fuse_request_record(record: &[u8]) -> io::Result<FuseRequest<'_>> {
+    let (len, opcode, unique) = decode_fuse_in_header(record)?;
+    let len = len as usize;
+    if len < FUSE_IN_HEADER_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "CUSE request length is smaller than its header",
+        ));
+    }
+    if len > CUSE_MAX_REQUEST_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "CUSE request exceeds the negotiated record bound",
+        ));
+    }
+    if len > record.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "CUSE request record is truncated",
+        ));
+    }
+    if len < record.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "CUSE request record contains bytes beyond header.len",
+        ));
+    }
+    Ok(FuseRequest {
+        len: len as u32,
+        opcode,
+        unique,
+        body: &record[FUSE_IN_HEADER_LEN..],
+    })
+}
+
+fn read_fuse_request_record<'a, R: Read>(
+    reader: &mut R,
+    record: &'a mut [u8],
+) -> io::Result<FuseRequest<'a>> {
+    let read = loop {
+        match reader.read(record) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "CUSE request channel closed",
+                ))
+            }
+            Ok(read) => break read,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    };
+    parse_fuse_request_record(&record[..read])
+}
+
+fn request_body_is_valid(opcode: u32, body: &[u8]) -> bool {
+    match opcode {
+        CUSE_INIT => body.len() == 16,
+        FUSE_OPEN => body.len() == 8,
+        FUSE_READ => {
+            body.len() == 40
+                && u32::from_le_bytes(body[16..20].try_into().unwrap()) as usize <= CUSE_MAX_READ
+        }
+        FUSE_WRITE => {
+            if body.len() < FUSE_WRITE_IN_LEN {
+                return false;
+            }
+            let size = u32::from_le_bytes(body[16..20].try_into().unwrap()) as usize;
+            size <= CUSE_MAX_WRITE
+                && FUSE_WRITE_IN_LEN
+                    .checked_add(size)
+                    .is_some_and(|expected| body.len() == expected)
+        }
+        FUSE_RELEASE | FUSE_FLUSH | FUSE_POLL => body.len() == 24,
+        FUSE_INTERRUPT => body.len() == 8,
+        FUSE_IOCTL => {
+            if body.len() < FUSE_IOCTL_IN_LEN {
+                return false;
+            }
+            let in_size = u32::from_le_bytes(body[24..28].try_into().unwrap()) as usize;
+            let out_size = u32::from_le_bytes(body[28..32].try_into().unwrap()) as usize;
+            in_size <= CUSE_MAX_WRITE
+                && out_size <= CUSE_MAX_READ
+                && FUSE_IOCTL_IN_LEN
+                    .checked_add(in_size)
+                    .is_some_and(|expected| body.len() == expected)
+        }
+        // The dispatcher replies ENOSYS without interpreting an unknown body.
+        _ => true,
+    }
+}
+
 pub fn encode_fuse_error(unique: u64, errno: i32) -> Vec<u8> {
     let mut out = Vec::with_capacity(FUSE_OUT_HEADER_LEN);
     out.extend_from_slice(&(FUSE_OUT_HEADER_LEN as u32).to_le_bytes());
@@ -154,8 +261,8 @@ impl CuseService {
         let init = encode_cuse_init_out(
             unique,
             CUSE_UNRESTRICTED_IOCTL,
-            4 * 1024 * 1024,
-            4 * 1024 * 1024,
+            CUSE_MAX_READ as u32,
+            CUSE_MAX_WRITE as u32,
             &devname,
         );
         cuse.write_all(&init)?;
@@ -252,15 +359,15 @@ fn wait_for_node(path: &Path) -> io::Result<()> {
 }
 
 fn read_one_request(dev: &mut File) -> io::Result<(u32, u32, u64)> {
-    let mut header = [0u8; FUSE_IN_HEADER_LEN];
-    dev.read_exact(&mut header)?;
-    let (len, opcode, unique) = decode_fuse_in_header(&header)?;
-    let rest = (len as usize).saturating_sub(FUSE_IN_HEADER_LEN);
-    if rest > 0 {
-        let mut skip = vec![0u8; rest];
-        dev.read_exact(&mut skip)?;
+    let mut record = vec![0u8; CUSE_MAX_REQUEST_LEN];
+    let request = read_fuse_request_record(dev, &mut record)?;
+    if !request_body_is_valid(request.opcode, request.body) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "CUSE INIT request has an invalid body",
+        ));
     }
-    Ok((len, opcode, unique))
+    Ok((request.len, request.opcode, request.unique))
 }
 
 fn serve_cuse(
@@ -277,29 +384,37 @@ fn serve_cuse(
     let active_watchers = Arc::new(AtomicUsize::new(0));
     let mut fhs: HashMap<u64, CuseHandle> = HashMap::new();
     let mut next_fh = 1u64;
+    let mut record = vec![0u8; CUSE_MAX_REQUEST_LEN];
     while !stop.load(Ordering::SeqCst) {
         if !wait_for_cuse_or_stop(dev.as_raw_fd(), wake.as_raw_fd())? || stop.load(Ordering::SeqCst)
         {
             break;
         }
-        let mut header = [0u8; FUSE_IN_HEADER_LEN];
-        match dev.read_exact(&mut header) {
-            Ok(()) => {}
+        let request = match read_fuse_request_record(&mut dev, &mut record) {
+            Ok(request) => request,
             Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => break,
-        }
-        let (len, opcode, unique) = decode_fuse_in_header(&header)?;
-        let rest_len = (len as usize).saturating_sub(FUSE_IN_HEADER_LEN);
-        let mut rest = vec![0u8; rest_len];
-        if rest_len > 0 {
-            dev.read_exact(&mut rest)?;
+        };
+        let opcode = request.opcode;
+        let unique = request.unique;
+        let rest = request.body;
+        if !request_body_is_valid(opcode, rest) {
+            let malformed = encode_fuse_error(unique, EIO);
+            let written = replies
+                .lock()
+                .map_err(|_| io::Error::other("CUSE reply lock poisoned"))?
+                .write_all(&malformed);
+            if written.is_err() {
+                break;
+            }
+            continue;
         }
         let reply = match opcode {
             CUSE_INIT => encode_cuse_init_out(
                 unique,
                 CUSE_UNRESTRICTED_IOCTL,
-                4 * 1024 * 1024,
-                4 * 1024 * 1024,
+                CUSE_MAX_READ as u32,
+                CUSE_MAX_WRITE as u32,
                 "asterism-nvidia0",
             ),
             FUSE_OPEN => match UnixStream::pair() {
@@ -946,6 +1061,111 @@ mod tests {
     use super::*;
     use crate::remote_gpu_guest::ASTERISM_IOCTL_MAGIC;
 
+    fn fuse_request_bytes(opcode: u32, unique: u64, body: &[u8]) -> Vec<u8> {
+        let len = FUSE_IN_HEADER_LEN + body.len();
+        let mut record = vec![0u8; FUSE_IN_HEADER_LEN];
+        record[0..4].copy_from_slice(&(len as u32).to_le_bytes());
+        record[4..8].copy_from_slice(&opcode.to_le_bytes());
+        record[8..16].copy_from_slice(&unique.to_le_bytes());
+        record.extend_from_slice(body);
+        record
+    }
+
+    struct KernelRecordReader {
+        record: Vec<u8>,
+        reads: usize,
+    }
+
+    impl Read for KernelRecordReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            if self.reads != 1 {
+                return Err(io::Error::other(
+                    "a record-oriented CUSE request must not be read twice",
+                ));
+            }
+            if buffer.len() < self.record.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "kernel refuses a request buffer smaller than the record",
+                ));
+            }
+            buffer[..self.record.len()].copy_from_slice(&self.record);
+            Ok(self.record.len())
+        }
+    }
+
+    #[test]
+    fn kernel_record_is_received_by_one_sufficient_read() {
+        let body = [0x5au8; 16];
+        let mut kernel = KernelRecordReader {
+            record: fuse_request_bytes(CUSE_INIT, 0x1020, &body),
+            reads: 0,
+        };
+        let mut buffer = vec![0u8; CUSE_MAX_REQUEST_LEN];
+        let request = read_fuse_request_record(&mut kernel, &mut buffer).unwrap();
+        assert_eq!(request.len as usize, FUSE_IN_HEADER_LEN + body.len());
+        assert_eq!(request.opcode, CUSE_INIT);
+        assert_eq!(request.unique, 0x1020);
+        assert_eq!(request.body, body);
+        assert_eq!(kernel.reads, 1);
+    }
+
+    #[test]
+    fn record_parser_rejects_short_truncated_trailing_and_oversized_frames() {
+        let short = vec![0u8; FUSE_IN_HEADER_LEN - 1];
+        assert_eq!(
+            parse_fuse_request_record(&short).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+
+        let mut below_header = fuse_request_bytes(FUSE_OPEN, 1, &[0; 8]);
+        below_header[0..4].copy_from_slice(&((FUSE_IN_HEADER_LEN - 1) as u32).to_le_bytes());
+        assert_eq!(
+            parse_fuse_request_record(&below_header).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut truncated = fuse_request_bytes(FUSE_OPEN, 2, &[0; 8]);
+        let longer = truncated.len() as u32 + 1;
+        truncated[0..4].copy_from_slice(&longer.to_le_bytes());
+        assert_eq!(
+            parse_fuse_request_record(&truncated).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+
+        let mut trailing = fuse_request_bytes(FUSE_OPEN, 3, &[0; 8]);
+        let shorter = trailing.len() as u32 - 1;
+        trailing[0..4].copy_from_slice(&shorter.to_le_bytes());
+        assert_eq!(
+            parse_fuse_request_record(&trailing).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut oversized = vec![0u8; FUSE_IN_HEADER_LEN];
+        oversized[0..4].copy_from_slice(&((CUSE_MAX_REQUEST_LEN as u32) + 1).to_le_bytes());
+        assert_eq!(
+            parse_fuse_request_record(&oversized).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn known_request_bodies_are_bounded_before_field_parsing() {
+        let mut write = vec![0u8; FUSE_WRITE_IN_LEN];
+        write[16..20].copy_from_slice(&4u32.to_le_bytes());
+        assert!(!request_body_is_valid(FUSE_WRITE, &write));
+        write.extend_from_slice(b"data");
+        assert!(request_body_is_valid(FUSE_WRITE, &write));
+
+        let mut read = vec![0u8; 40];
+        read[16..20].copy_from_slice(&((CUSE_MAX_READ as u32) + 1).to_le_bytes());
+        assert!(!request_body_is_valid(FUSE_READ, &read));
+        assert!(!request_body_is_valid(FUSE_INTERRUPT, &[0; 7]));
+        assert!(!request_body_is_valid(FUSE_IOCTL, &[0; 31]));
+        assert!(request_body_is_valid(0xffff_fffe, &[0; 3]));
+    }
+
     #[test]
     fn cuse_init_out_carries_devname_and_unrestricted_ioctl() {
         let bytes = encode_cuse_init_out(99, CUSE_UNRESTRICTED_IOCTL, 4096, 4096, "nvidia0");
@@ -1225,5 +1445,94 @@ mod tests {
         assert_eq!(len, FUSE_IN_HEADER_LEN as u32 + 16);
         assert_eq!(opcode, CUSE_INIT);
         assert_eq!(unique, 7);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_cuse_mount_open_read_write_poll_and_cancel_when_available() {
+        use std::os::unix::fs::FileTypeExt;
+
+        unsafe extern "C" fn absorb_signal(_: libc::c_int) {}
+
+        let root = tempfile::tempdir().unwrap();
+        let dev_dir = root.path().join("dev");
+        fs::create_dir(&dev_dir).unwrap();
+        let guest = dev_dir.join("nvidia0");
+        let service = match CuseService::mount(&guest) {
+            Ok(service) => service,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                return
+            }
+            Err(err) => panic!("live /dev/cuse mount failed: {err}"),
+        };
+        assert!(fs::metadata(&guest).unwrap().file_type().is_char_device());
+
+        thread::scope(|scope| {
+            let accepted = scope.spawn(|| service.accept().unwrap());
+            let mut client = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&guest)
+                .unwrap();
+            let mut server = accepted.join().unwrap();
+
+            client.write_all(b"kernel-write").unwrap();
+            let mut written = [0u8; 12];
+            server.read_exact(&mut written).unwrap();
+            assert_eq!(&written, b"kernel-write");
+
+            server.write_all(b"poll-read").unwrap();
+            let mut pollfd = libc::pollfd {
+                fd: client.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 1000) }, 1);
+            assert_ne!(pollfd.revents & libc::POLLIN, 0);
+            let mut reply = [0u8; 9];
+            client.read_exact(&mut reply).unwrap();
+            assert_eq!(&reply, b"poll-read");
+
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            action.sa_sigaction = absorb_signal as *const () as usize;
+            action.sa_flags = 0;
+            unsafe { libc::sigemptyset(&mut action.sa_mask) };
+            let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::sigaction(libc::SIGUSR2, &action, &mut previous) },
+                0
+            );
+
+            let cancelled_client = client.try_clone().unwrap();
+            let (thread_tx, thread_rx) = mpsc::sync_channel(1);
+            let cancelled = scope.spawn(move || {
+                let thread_id = unsafe { libc::pthread_self() };
+                thread_tx.send(thread_id).unwrap();
+                let mut byte = 0u8;
+                let result = unsafe {
+                    libc::read(
+                        cancelled_client.as_raw_fd(),
+                        (&mut byte as *mut u8).cast(),
+                        1,
+                    )
+                };
+                (result, io::Error::last_os_error())
+            });
+            let thread_id = thread_rx.recv().unwrap();
+            thread::sleep(Duration::from_millis(25));
+            assert_eq!(unsafe { libc::pthread_kill(thread_id, libc::SIGUSR2) }, 0);
+            let (result, err) = cancelled.join().unwrap();
+            assert_eq!(result, -1);
+            assert_eq!(err.raw_os_error(), Some(libc::EINTR));
+            assert_eq!(
+                unsafe { libc::sigaction(libc::SIGUSR2, &previous, std::ptr::null_mut()) },
+                0
+            );
+        });
     }
 }
