@@ -596,10 +596,11 @@ fn start_macos(config_path: &Path, mailbox: &Path) -> Result<Handle> {
             "the VZ helper exited immediately; inspect {}",
             log_path.display()
         )
-    })?;
+    });
     std::thread::spawn(move || {
         let _ = child.wait();
     });
+    let proc = proc?;
 
     let started = Instant::now();
     let helper_deadline = started + HELPER_TIMEOUT;
