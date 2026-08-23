@@ -89,6 +89,13 @@ qemu_absent() {
   note "PASS no qemu-system process ($STAGE)"
 }
 
+capture_container_console() {
+  local source="$MAIN_HOME/instances/$INSTANCE/console.log"
+  if [ -f "$source" ]; then
+    redact <"$source" >"$ARTIFACTS/container-console.log"
+  fi
+}
+
 pid_is_exact_daemon() {
   local pid="$1" exe
   [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
@@ -136,9 +143,7 @@ cleanup() {
   trap - EXIT ERR INT TERM
   set +e
   STAGE=cleanup
-  if [ -f "$MAIN_HOME/instances/$INSTANCE/console.log" ]; then
-    redact <"$MAIN_HOME/instances/$INSTANCE/console.log" >"$ARTIFACTS/container-console.log"
-  fi
+  capture_container_console
   if [ -x "$AST" ]; then
     if [ -n "$INSTANCE_RUNNING" ]; then
       "$AST" down "$INSTANCE" >>"$ARTIFACTS/cleanup.log" 2>&1
@@ -280,7 +285,10 @@ assert_contains "runtime identity" "$status" "runtime: container"
 assert_contains "native adapter identity" "$status" "running: linux-rootless pid"
 CONTAINER_PID="$(sed -n 's/^running: linux-rootless pid \([0-9][0-9]*\),.*/\1/p' <<<"$status")"
 [ -n "$CONTAINER_PID" ] || fatal "status did not expose the native container pid"
-kill -0 "$CONTAINER_PID" 2>/dev/null || fatal "recorded container pid is not alive"
+if ! kill -0 "$CONTAINER_PID" 2>/dev/null; then
+  capture_container_console
+  fatal "recorded container pid is not alive"
+fi
 
 STAGE="namespace-cgroup"
 STATE="$ASTERISM_HOME/state.json"
@@ -497,6 +505,7 @@ assert_contains "secret egress survived daemon restart" "$restart_egress" "$SECR
 qemu_absent
 
 STAGE="down-rm"
+capture_container_console
 down_report="$("$AST" down "$INSTANCE" 2>&1)" || record_failure "final down failed: $down_report"
 INSTANCE_RUNNING=
 assert_contains "final down" "$down_report" "$INSTANCE  stopped"
