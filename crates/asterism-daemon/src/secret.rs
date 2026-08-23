@@ -360,11 +360,12 @@ impl SecretPlane {
         value: &SecretValue,
     ) -> Result<Secret> {
         let mut catalog = self.catalog.lock().expect("secret catalog poisoned");
-        let secret = catalog
+        let index = catalog
             .secrets
-            .iter_mut()
-            .find(|secret| &secret.id == id)
+            .iter()
+            .position(|secret| &secret.id == id)
             .ok_or_else(|| anyhow!("this device is not a source for secret {:?}", id.as_str()))?;
+        let secret = &catalog.secrets[index];
         if !secret
             .sources
             .iter()
@@ -401,18 +402,21 @@ impl SecretPlane {
         let previous_bytes = self.store.get(id).ok();
         let previous_secret = secret.clone();
         self.store.put(id, value.as_bytes())?;
-        secret.version = version;
-        secret.updated_at = updated_at;
-        for source in &mut secret.sources {
-            if source.device_id == self.device_id {
-                source.version = version;
-                source.updated_at = updated_at;
-                source.revision = revision.clone();
+        let changed = {
+            let secret = &mut catalog.secrets[index];
+            secret.version = version;
+            secret.updated_at = updated_at;
+            for source in &mut secret.sources {
+                if source.device_id == self.device_id {
+                    source.version = version;
+                    source.updated_at = updated_at;
+                    source.revision = revision.clone();
+                }
             }
-        }
-        let changed = secret.clone();
+            secret.clone()
+        };
         if let Err(e) = catalog.save() {
-            *secret = previous_secret;
+            catalog.secrets[index] = previous_secret;
             match previous_bytes {
                 Some(bytes) => {
                     let _ = self.store.put(id, &bytes);
