@@ -56,6 +56,7 @@ use asterism_core::{paths, VERSION};
 use transport::{Admitted, Framing};
 
 mod backend;
+mod container;
 mod device_shell;
 mod egress;
 mod images;
@@ -97,6 +98,15 @@ impl Node {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if matches!(
+        std::env::args().nth(1).as_deref(),
+        Some("__container-helper")
+    ) {
+        let spec = std::env::args_os()
+            .nth(2)
+            .context("container helper needs its spec path")?;
+        return container::helper_main(std::path::Path::new(&spec));
+    }
     // Release activation has to prove the staged daemon before it replaces a
     // running one. This path touches no state and binds no socket, so a
     // downgrade refusal remains a refusal before mutation.
@@ -795,6 +805,13 @@ pub(crate) async fn handle(req: Request, node: &Node) -> Response {
     if images::is_plane_request(&req) {
         return images::serve(req).await;
     }
+    // Exec is the one instance command whose useful work may be unbounded.
+    // Clone its immutable authority while holding the shard, then release the
+    // global mutex before touching the runtime.  Down/remove/reconcile can
+    // consequently proceed even when the command or its control peer stalls.
+    if matches!(&req, Request::ContainerExec { .. }) {
+        return container_exec(node, req).await;
+    }
 
     // Catalog fan-out can wait on every peer. Resolve it before taking the
     // shard lock so one partitioned storage device cannot stall unrelated
@@ -855,6 +872,69 @@ pub(crate) async fn handle(req: Request, node: &Node) -> Response {
         return snapshot::serve(req, &reg);
     }
     instance::serve(req, &mut reg, &cpu_device).await
+}
+
+async fn container_exec(node: &Node, request: Request) -> Response {
+    let handle = {
+        let reg = node.shard.lock().await;
+        if let Some(refusal) = instance::refusal(&request, &reg) {
+            return refusal;
+        }
+        let Request::ContainerExec { name, .. } = &request else {
+            return Response::Error {
+                message: "non-container request reached container exec dispatcher".into(),
+            };
+        };
+        let inst = match reg.get(name) {
+            Ok(inst) => inst,
+            Err(error) => {
+                return Response::Error {
+                    message: format!("{error:#}"),
+                }
+            }
+        };
+        if inst.runtime != asterism_core::instance::RuntimeKind::Container {
+            return Response::Error {
+                message: format!("instance {name:?} uses runtime=vm; use `ast ssh {name}`"),
+            };
+        }
+        match inst.handle.clone() {
+            Some(handle) => handle,
+            None => {
+                return Response::Error {
+                    message: "container is not running".into(),
+                }
+            }
+        }
+    };
+    let Request::ContainerExec { command, .. } = request else {
+        unreachable!("request was checked while selecting the container handle")
+    };
+
+    let task = tokio::task::spawn_blocking(move || {
+        container::exec(&handle, command, container::EXEC_DEADLINE)
+    });
+    let result = tokio::time::timeout(
+        container::EXEC_DEADLINE + std::time::Duration::from_secs(3),
+        task,
+    )
+    .await;
+    match result {
+        Ok(Ok(Ok((status, stdout, stderr)))) => Response::ContainerExec {
+            status,
+            stdout,
+            stderr,
+        },
+        Ok(Ok(Err(error))) => Response::Error {
+            message: format!("{error:#}"),
+        },
+        Ok(Err(error)) => Response::Error {
+            message: format!("container exec worker failed: {error}"),
+        },
+        Err(_) => Response::Error {
+            message: "container exec exceeded its daemon deadline".into(),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -932,5 +1012,136 @@ mod tests {
             node.shard.try_lock().is_ok(),
             "the handshake kept the registry after answering"
         );
+    }
+
+    /// A runtime exec may wait on arbitrary guest code, but it must release
+    /// the one shard mutex before it sends the control request.  This is the
+    /// race that keeps down/remove/reconcile live during a stuck exec.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(target_os = "linux")]
+    async fn container_exec_releases_the_registry_before_waiting() {
+        use std::io::{BufRead, Write};
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::net::UnixListener;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        use asterism_core::hv::{
+            ContainerControlEndpoint, ContainerRuntimeIdentity, ControlChannel, Handle,
+            KernelObjectIdentity, Machine,
+        };
+        use asterism_core::instance::{RuntimeKind, Shape};
+        use asterism_core::proc::ProcId;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let node = node_on(tmp.path());
+        let runtime = tmp.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        let cgroup = runtime.join("cgroup");
+        std::fs::create_dir(&cgroup).unwrap();
+        let proc = ProcId::capture(std::process::id()).unwrap();
+        std::fs::write(cgroup.join("cgroup.procs"), format!("{}\n", proc.pid)).unwrap();
+        std::fs::write(cgroup.join("cgroup.events"), "populated 1\n").unwrap();
+        let namespace = |name: &str| {
+            let path = runtime.join(name);
+            std::fs::write(&path, name).unwrap();
+            path
+        };
+        let user_namespace = namespace("user.ns");
+        let mount_namespace = namespace("mount.ns");
+        let pid_namespace = namespace("pid.ns");
+        let network_namespace = namespace("network.ns");
+        let kernel_id = |path: &std::path::Path| {
+            let metadata = std::fs::metadata(path).unwrap();
+            KernelObjectIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }
+        };
+        let socket = runtime.join("control.sock");
+        let control = ContainerControlEndpoint {
+            socket: socket.clone(),
+            user_namespace: user_namespace.clone(),
+            mount_namespace: mount_namespace.clone(),
+            pid_namespace: pid_namespace.clone(),
+            network_namespace: network_namespace.clone(),
+            cgroup: cgroup.clone(),
+            identity: Some(ContainerRuntimeIdentity {
+                user_namespace: kernel_id(&user_namespace),
+                mount_namespace: kernel_id(&mount_namespace),
+                pid_namespace: kernel_id(&pid_namespace),
+                network_namespace: kernel_id(&network_namespace),
+                cgroup: kernel_id(&cgroup),
+            }),
+        };
+        let handle = Handle {
+            backend: container::LINUX_ID.into(),
+            pid: Some(proc.pid),
+            proc: Some(proc),
+            ctl: ControlChannel::Rpc {
+                path: socket.clone(),
+            },
+            endpoint: None,
+            container_control: Some(control),
+            started_at: 1,
+        };
+        {
+            let mut reg = node.shard.lock().await;
+            reg.create_runtime(
+                "dev",
+                "cpu",
+                "image",
+                Shape::default(),
+                Machine {
+                    backend: container::LINUX_ID.into(),
+                    machine_type: "test".into(),
+                    cpu: "test".into(),
+                    hv_version: "test".into(),
+                },
+                RuntimeKind::Container,
+            )
+            .unwrap();
+            reg.set_running("dev", handle).unwrap();
+        }
+
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            std::io::BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            assert!(request.contains("exec"));
+            waiting_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            stream
+                .write_all(b"{\"result\":\"error\",\"message\":\"released\"}\n")
+                .unwrap();
+        });
+
+        let exec_node = node.clone();
+        let exec = tokio::spawn(async move {
+            container_exec(
+                &exec_node,
+                Request::ContainerExec {
+                    name: "dev".into(),
+                    command: vec!["true".into()],
+                },
+            )
+            .await
+        });
+        tokio::task::spawn_blocking(move || waiting_rx.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .expect("exec never reached its runtime control socket");
+        assert!(
+            node.shard.try_lock().is_ok(),
+            "container exec held the registry while waiting on guest code"
+        );
+        release_tx.send(()).unwrap();
+        assert!(matches!(exec.await.unwrap(), Response::Error { .. }));
+        server.join().unwrap();
     }
 }

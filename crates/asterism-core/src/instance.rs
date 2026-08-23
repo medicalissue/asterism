@@ -12,6 +12,24 @@ use serde::{Deserialize, Serialize};
 use crate::hv::{ControlChannel, GuestEndpoint, Handle, ImageKind, Machine};
 use crate::secret::Binding;
 
+/// The isolation contract of an instance, independent of its image format.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeKind {
+    #[default]
+    Vm,
+    Container,
+}
+
+impl std::fmt::Display for RuntimeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RuntimeKind::Vm => "vm",
+            RuntimeKind::Container => "container",
+        })
+    }
+}
+
 /// Lifecycle state of an instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -474,6 +492,9 @@ pub struct Instance {
     #[serde(alias = "anchor", alias = "compute_device")]
     pub cpu_device: String,
     pub status: Status,
+    /// VM or native-container isolation. Older registries are VMs.
+    #[serde(default)]
+    pub runtime: RuntimeKind,
     /// Unix seconds.
     pub created_at: u64,
     pub volumes: Vec<Volume>,
@@ -482,9 +503,9 @@ pub struct Instance {
     #[serde(default)]
     pub image: Option<String>,
     /// What that image turned out to be when the instance was created: a
-    /// bootable disk, or an OCI root filesystem the backend has to bring a
-    /// kernel for. `disk` on records written before container images were a
-    /// source, which is what they all were.
+    /// bootable disk, or an OCI root filesystem. Runtime decides whether that
+    /// filesystem receives a guest kernel or native namespaces. `disk` on
+    /// records written before OCI images were a source.
     #[serde(default)]
     pub image_kind: ImageKind,
     /// Guest ports published on this device's loopback (`ast create -p`).
@@ -605,6 +626,7 @@ impl Instance {
             name: name.to_owned(),
             cpu_device: cpu_device.to_owned(),
             status: Status::Defined,
+            runtime: RuntimeKind::Vm,
             created_at: now_unix(),
             volumes: Vec::new(),
             image: Some(image.to_owned()),
@@ -654,7 +676,8 @@ impl Instance {
             ctl: ControlChannel::Qmp {
                 path: crate::paths::qmp_socket_path(&self.name),
             },
-            endpoint: GuestEndpoint::HostForward { ssh_port },
+            endpoint: Some(GuestEndpoint::HostForward { ssh_port }),
+            container_control: None,
             started_at: self.created_at,
         });
     }
@@ -666,7 +689,7 @@ impl Instance {
 
     /// Where `ast ssh` should connect, while the instance is running.
     pub fn endpoint(&self) -> Option<&GuestEndpoint> {
-        self.handle.as_ref().map(|h| &h.endpoint)
+        self.handle.as_ref().and_then(|h| h.endpoint.as_ref())
     }
 
     /// The device whose guest key this guest trusts. See [`Instance::seed_device`].
@@ -708,13 +731,16 @@ impl Instance {
                     self.shape.disk_gib,
                     self.image.as_deref().unwrap_or("no image")
                 ),
-                note: Some(match self.image_kind {
+                note: Some(match (self.runtime, self.image_kind) {
                     // Where the image came from changes what the machine is,
                     // so it is a fact about the disk and it is said out loud.
-                    ImageKind::OciRootfs => {
+                    (RuntimeKind::Container, ImageKind::OciRootfs) => {
+                        "follows compute · oci rootfs, native namespace".into()
+                    }
+                    (_, ImageKind::OciRootfs) => {
                         "follows compute · oci rootfs, direct kernel boot".into()
                     }
-                    ImageKind::Disk => "follows compute".to_owned(),
+                    (_, ImageKind::Disk) => "follows compute".to_owned(),
                 }),
             },
         ];
@@ -790,11 +816,20 @@ impl Instance {
         parts.push(Part {
             kind: "network".into(),
             source: self.compute_device().to_owned(),
-            detail: match published.is_empty() {
-                true => "user-mode NAT".to_owned(),
-                false => format!("user-mode NAT · {}", published.join(", ")),
+            detail: match (self.runtime, published.is_empty()) {
+                (RuntimeKind::Container, true) => {
+                    "isolated network namespace · no uplink".to_owned()
+                }
+                (RuntimeKind::Container, false) => {
+                    format!("rootless network · {}", published.join(", "))
+                }
+                (RuntimeKind::Vm, true) => "user-mode NAT".to_owned(),
+                (RuntimeKind::Vm, false) => format!("user-mode NAT · {}", published.join(", ")),
             },
-            note: Some("exit default: same as compute".into()),
+            note: Some(match self.runtime {
+                RuntimeKind::Vm => "exit default: same as compute".into(),
+                RuntimeKind::Container => "native rootless adapter".into(),
+            }),
         });
         parts.push(Part {
             kind: "gpu".into(),
@@ -1162,5 +1197,24 @@ mod tests {
         let back: Volume = serde_json::from_str(&json).unwrap();
         assert_eq!(back, inst.volumes[0]);
         assert!(back.is_block());
+    }
+
+    #[test]
+    fn runtime_kind_is_explicit_and_old_rows_remain_vms() {
+        assert_eq!(
+            serde_json::to_string(&RuntimeKind::Container).unwrap(),
+            "\"container\""
+        );
+        let mut value = serde_json::to_value(Instance::new(
+            "dev",
+            "laptop",
+            "debian:13",
+            Shape::default(),
+            machine(),
+        ))
+        .unwrap();
+        value.as_object_mut().unwrap().remove("runtime");
+        let restored: Instance = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.runtime, RuntimeKind::Vm);
     }
 }

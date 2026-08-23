@@ -17,7 +17,7 @@ use std::sync::{Arc, OnceLock};
 use anyhow::{bail, Context, Result};
 
 use asterism_core::hv::{BootReq, DiskFormat, Handle, Hypervisor, ImageKind, ImageRef, Machine};
-use asterism_core::instance::{Instance, PortForward};
+use asterism_core::instance::{Instance, PortForward, RuntimeKind};
 use asterism_core::proc::{Evidence, Ownership, ProcId};
 use asterism_core::{image, paths, profile, seed};
 
@@ -338,10 +338,11 @@ pub fn disk_req(inst: &Instance) -> Result<BootReq<'_>> {
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("instance has no image — recreate it with --image"))?;
     let dir = paths::instance_dir(&inst.name);
-    let retain_qcow2 = for_instance(inst)?
-        .caps()
-        .disk_formats
-        .contains(&DiskFormat::Qcow2);
+    // A native container is not a hypervisor backend. Its root is always an
+    // OCI filesystem materialised as raw ext4, so asking the VM registry to
+    // resolve `linux-rootless` here is both meaningless and fatal. VM disks
+    // still consult their selected backend because CHV may retain qcow2.
+    let retain_qcow2 = retain_qcow2_for(inst)?;
     Ok(BootReq {
         instance: inst,
         base: materialised_image_ref(reference, retain_qcow2)?,
@@ -353,6 +354,16 @@ pub fn disk_req(inst: &Instance) -> Result<BootReq<'_>> {
         extra_disks: Vec::new(),
         dir,
     })
+}
+
+fn retain_qcow2_for(inst: &Instance) -> Result<bool> {
+    if inst.runtime == RuntimeKind::Container {
+        return Ok(false);
+    }
+    Ok(for_instance(inst)?
+        .caps()
+        .disk_formats
+        .contains(&DiskFormat::Qcow2))
 }
 
 /// Assemble a full boot request: resolve the image, work out the shares,
@@ -810,7 +821,8 @@ mod tests {
                     ctl: ControlChannel::Qmp {
                         path: "/tmp/x.sock".into(),
                     },
-                    endpoint: GuestEndpoint::HostForward { ssh_port: 22 },
+                    endpoint: Some(GuestEndpoint::HostForward { ssh_port: 22 }),
+                    container_control: None,
                     started_at: now_unix(),
                 },
             )
@@ -912,7 +924,8 @@ mod tests {
                 pid: Some(std::process::id()),
                 proc: None,
                 ctl: ControlChannel::Qmp { path: ctl.clone() },
-                endpoint: GuestEndpoint::HostForward { ssh_port: 22 },
+                endpoint: Some(GuestEndpoint::HostForward { ssh_port: 22 }),
+                container_control: None,
                 started_at: now_unix(),
             };
             assert!(
@@ -1051,7 +1064,8 @@ mod tests {
                     ctl: ControlChannel::Qmp {
                         path: paths::qmp_socket_path("dev"),
                     },
-                    endpoint: GuestEndpoint::HostForward { ssh_port: 22 },
+                    endpoint: Some(GuestEndpoint::HostForward { ssh_port: 22 }),
+                    container_control: None,
                     started_at: 0,
                 };
                 let inst = Instance::new(
@@ -1611,6 +1625,13 @@ mod tests {
             .expect("xen is not available")
             .to_string();
         assert!(error.contains("created for the xen backend"), "{error}");
+    }
+
+    #[test]
+    fn a_native_container_does_not_enter_the_hypervisor_registry() {
+        let mut inst = cloud_instance("box", crate::container::LINUX_ID);
+        inst.runtime = RuntimeKind::Container;
+        assert!(!retain_qcow2_for(&inst).unwrap());
     }
 
     fn cloud_instance(name: &str, backend: &str) -> Instance {

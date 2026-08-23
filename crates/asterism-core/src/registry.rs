@@ -36,7 +36,8 @@ use serde::{Deserialize, Serialize};
 use crate::durable::{self, Loaded};
 use crate::hv::{Handle, ImageKind, Machine};
 use crate::instance::{
-    self, now_unix, Conflict, Instance, Moving, Policy, PortForward, Restart, Shape, Status, Volume,
+    self, now_unix, Conflict, Instance, Moving, Policy, PortForward, Restart, RuntimeKind, Shape,
+    Status, Volume,
 };
 use crate::proc::ProcId;
 use crate::secret::Binding;
@@ -302,11 +303,25 @@ impl Shard {
         shape: Shape,
         machine: Machine,
     ) -> Result<Instance> {
+        self.create_runtime(name, cpu_device, image, shape, machine, RuntimeKind::Vm)
+    }
+
+    /// Define an instance with an explicit isolation contract.
+    pub fn create_runtime(
+        &mut self,
+        name: &str,
+        cpu_device: &str,
+        image: &str,
+        shape: Shape,
+        machine: Machine,
+        runtime: RuntimeKind,
+    ) -> Result<Instance> {
         check_name(name)?;
         if let Some(existing) = self.instances.get(name) {
             bail!("{}", taken(existing));
         }
-        let inst = Instance::new(name, cpu_device, image, shape, machine);
+        let mut inst = Instance::new(name, cpu_device, image, shape, machine);
+        inst.runtime = runtime;
         self.instances.insert(name.to_owned(), inst.clone());
         Ok(inst)
     }
@@ -810,7 +825,8 @@ mod tests {
             ctl: ControlChannel::Qmp {
                 path: "/tmp/qmp.sock".into(),
             },
-            endpoint: GuestEndpoint::HostForward { ssh_port },
+            endpoint: Some(GuestEndpoint::HostForward { ssh_port }),
+            container_control: None,
             started_at: 1_700_000_000,
         }
     }
@@ -1206,7 +1222,10 @@ mod tests {
             .expect("the running guest survived the upgrade");
         assert_eq!(h.backend, "qemu", "old entries were all QEMU");
         assert_eq!(h.pid, Some(4242));
-        assert_eq!(h.endpoint, GuestEndpoint::HostForward { ssh_port: 22022 });
+        assert_eq!(
+            h.endpoint,
+            Some(GuestEndpoint::HostForward { ssh_port: 22022 })
+        );
         // The control path is the one the old backend derived from the name.
         assert_eq!(
             h.ctl,
