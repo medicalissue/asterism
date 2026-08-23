@@ -809,7 +809,7 @@ mod imp {
             if deleted {
                 report.step(format!("removed the previous {}", self.name));
             }
-            let args = sc_create_args(spec, &self.name);
+            let args = sc_create_args(spec, &self.name)?;
             let (ok, out) = run(std::process::Command::new("sc.exe").args(&args))?;
             if !ok {
                 bail!("sc.exe would not create {}: {}", self.name, out.trim());

@@ -13,6 +13,8 @@
 use std::io::{BufReader, Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -91,6 +93,55 @@ fn helper_names() -> &'static [&'static str] {
         &["astd-hyperv.exe", HELPER_BIN]
     } else {
         &[HELPER_BIN, "astd-hyperv.exe"]
+    }
+}
+
+/// Run the helper's read-only Probe. A file on disk is not evidence the
+/// binary speaks this protocol or that Hyper-V is actually ready.
+pub fn probe_helper(path: &Path) -> Result<HostReady> {
+    probe_helper_within(path, Duration::from_secs(5))
+}
+
+pub fn probe_helper_within(path: &Path, timeout: Duration) -> Result<HostReady> {
+    let mut child = Command::new(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawning {}", path.display()))?;
+    {
+        let mut stdin = child.stdin.take().context("helper stdin")?;
+        serde_json::to_writer(&mut stdin, &Request::Probe).context("writing helper Probe")?;
+        stdin.write_all(b"\n")?;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let output = match rx.recv_timeout(timeout) {
+        Ok(Ok(output)) => output,
+        Ok(Err(err)) => return Err(err).context("waiting for helper Probe"),
+        Err(_) => {
+            bail!(
+                "{} did not answer Probe within {}s",
+                path.display(),
+                timeout.as_secs()
+            )
+        }
+    };
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        bail!("helper Probe exited {}: {}", output.status, err.trim());
+    }
+    let reply: Reply = serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "parsing helper Probe reply: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })?;
+    match reply.into_result()? {
+        Reply::Ready { host } => Ok(host),
+        other => bail!("helper Probe replied {other:?}, not Ready"),
     }
 }
 
@@ -628,5 +679,28 @@ mod tests {
         assert_eq!(PROTOCOL_VERSION, 1);
         assert_eq!(OWNER, "asterism");
         assert_eq!(GUEST_PORT, 1023);
+    }
+
+    #[test]
+    fn doctor_probe_requires_the_helper_protocol_not_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("astd-hyperv");
+        let script = r#"#!/bin/sh
+read _line
+printf '%s\n' '{"result":"ready","host":{"protocol":1,"build":"fixture","windows":"11.0.26100","edition":"Windows 11 Pro","elevated":true,"hcs_running":true,"hcn_running":true}}'
+"#;
+        std::fs::write(&helper, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = std::fs::metadata(&helper).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&helper, perm).unwrap();
+        }
+        let host = probe_helper(&helper).expect("fixture helper must speak Probe");
+        assert_eq!(host.protocol, PROTOCOL_VERSION);
+        assert_eq!(host.build, "fixture");
+        assert!(host.edition.contains("Pro"));
+        assert!(host.hcs_running && host.hcn_running);
     }
 }

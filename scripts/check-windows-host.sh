@@ -49,10 +49,51 @@ grep -q 'com.asterism.astd' packaging/install.ps1 \
 grep -q 'windows-host:' .github/workflows/ci.yml \
 	|| fail "GitHub Windows host workflow is missing"
 
+# Sol blockers: privilege, probe, stop, transactional update, firewall exactness,
+# thread-affine sleep, honest docs.
+grep -q 'obj={SERVICE_ACCOUNT_SYSTEM}' crates/asterism-core/src/windows_host.rs \
+	|| fail "SCM create does not pin obj=LocalSystem"
+grep -q 'user-writable prefix' crates/asterism-core/src/windows_host.rs \
+	|| fail "LocalSystem + user-writable prefix is not refused"
+grep -q 'fn probe_helper' crates/asterism-core/src/hyperv.rs \
+	|| fail "doctor has no real helper Probe"
+grep -q 'wait_service_stop' crates/asterism-daemon/src/main.rs \
+	|| fail "SCM stop latch is not wired into the daemon accept loop"
+grep -q 'another updater process owns the activation transaction' packaging/update.ps1 \
+	|| fail "Windows updater is not transactional"
+grep -q 'asterism-update.ps1' crates/asterism-core/src/windows_host.rs \
+	|| fail "ast update cannot reach asterism-update.ps1"
+grep -q 'name={ASTERISM_FIREWALL_RULE}' crates/asterism-core/src/windows_host.rs \
+	|| fail "firewall rule args do not use the exact Asterism rule name"
+grep -q 'Asterism device daemon' packaging/install.ps1 \
+	|| fail "installer does not create the exact firewall rule the doctor matches"
+grep -q 'ThreadAffineHold' crates/asterism-core/src/windows_host.rs \
+	|| fail "SetThreadExecutionState is not owned on a dedicated thread"
+grep -q 'unverified' docs/PLATFORM.md \
+	|| fail "PLATFORM.md still claims an unproven Windows guest lifecycle"
+grep -q 'source-and-script only' docs/PLATFORM.md \
+	|| fail "PLATFORM.md does not admit the Windows compile graph is not Cargo-proven"
+grep -q 'not invoke Cargo' .github/workflows/ci.yml \
+	|| fail "CI Windows lane is not honest about skipping Cargo"
+
+# Host modules are portable (always compiled). They must not be listed as
+# Windows-only exclusions in the source-graph gate.
+if grep -E 'WINDOWS_ONLY.*windows_host|windows_host\.rs' scripts/check-rust-source-graph.sh | grep -v '^#' >/dev/null 2>&1; then
+	if grep -q "WINDOWS_ONLY_HELPER_MODULES=.*windows_host" scripts/check-rust-source-graph.sh; then
+		fail "windows_host.rs must stay in the compile graph on every OS"
+	fi
+fi
+grep -q 'crates/asterism-core/src/windows_host.rs' crates/asterism-core/src/lib.rs \
+	|| true
+grep -q 'pub mod windows_host' crates/asterism-core/src/lib.rs \
+	|| fail "windows_host is not in the asterism-core module graph"
+grep -q 'pub mod hyperv' crates/asterism-core/src/lib.rs \
+	|| fail "hyperv contract is not in the asterism-core module graph"
+
 # Product code must not offer WHPX as a fallback. The helper-protocol test
 # that asserts HCS documents do not contain the word is the allowed mention.
 if grep -n -i 'whpx' crates/asterism-core/src/windows_host.rs packaging/install.ps1; then
 	fail "Windows host integration names WHPX, which ADR 0002 excluded"
 fi
 
-echo "Windows host integration: 510d330 helper contract present; backend files absent; installer/doctor/service seams in place"
+echo "Windows host integration: 510d330 helper contract present; backend files absent; seven Sol blockers closed in source"

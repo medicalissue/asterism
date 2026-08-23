@@ -171,10 +171,14 @@ stays exactly what it is today either way.
 
 ### Platforms
 
-Binaries are published for **macOS on Apple silicon** (`darwin-arm64`) and
-**Windows 11 Pro/Enterprise** (`windows-x86_64`, `windows-arm64`). Every
-other host is refused by name and pointed at the source build; there is no
-near-enough target, because a near-enough binary is one that does not run.
+Binaries are published for **macOS on Apple silicon** (`darwin-arm64`).
+Windows 11 Pro/Enterprise (`windows-x86_64`, `windows-arm64`) is a decided
+host-integration target: the installer, updater, SCM, doctor, firewall and
+helper Probe seams are in this tree. Guest lifecycle on a real Windows host
+is owned by the Hyper-V backend bead and is **not** claimed proven here.
+Every other host is refused by name and pointed at the source build; there
+is no near-enough target, because a near-enough binary is one that does
+not run.
 
 Windows installs with the native PowerShell installer or the POSIX script
 under Git Bash:
@@ -188,9 +192,11 @@ A Windows tarball is `ast.exe`, `astd.exe`, `astd-hyperv.exe`, and the
 updater. The helper is required: there is no WHPX/QEMU product fallback.
 SHA-256 is mandatory. Authenticode is checked when
 `ASTERISM_AUTHENTICODE_THUMBPRINT` is set or `ASTERISM_REQUIRE_SIGNATURE=1`.
-Persistence is a Windows Service (`ast service install`); `ast doctor`
-reports edition, elevation, Hyper-V services, firewall, helper, and
-Credential Manager before any guest is created.
+An elevated install lands in Program Files so SCM may use LocalSystem; a
+per-user prefix is refused as a service ImagePath. `ast doctor` Probes
+`astd-hyperv` and matches the inbound firewall rule named
+`Asterism device daemon` for `astd.exe`. The updater claims a transaction
+and rolls back on failure.
 
 ```console
 $ curl -fsSL https://asterism.run/install.sh | ASTERISM_METHOD=source sh

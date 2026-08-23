@@ -8,16 +8,21 @@
 //! does not churn the lockfile.
 
 use std::path::Path;
+use std::sync::{Condvar, Mutex};
+use std::thread::JoinHandle;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
-use crate::hyperv::{self, HELPER_BIN};
+use crate::hyperv;
 use crate::service::Spec;
 
 /// SCM service name. Dots are legal; this matches the launchd label so a
 /// bug report can name one thing on every OS.
 pub const SERVICE_NAME: &str = "com.asterism.astd";
 pub const SERVICE_DISPLAY: &str = "Asterism device daemon";
+/// Explicit SCM `obj=`. Omitting it defaults to LocalSystem — the combination
+/// this module refuses when the ImagePath is user-writable.
+pub const SERVICE_ACCOUNT_SYSTEM: &str = "LocalSystem";
 
 /// Credential Manager generic-credential namespace. Same string the macOS
 /// Keychain uses, so an orbit secret copied between devices keeps one name.
@@ -113,13 +118,26 @@ pub fn doctor() -> DoctorReport {
     let mut checks = Vec::new();
 
     match hyperv::discover_helper() {
-        Ok(path) => checks.push(Check::pass(
-            "helper",
-            format!("{} at {}", HELPER_BIN, path.display()),
-        )),
+        Ok(path) => match hyperv::probe_helper(&path) {
+            Ok(host) => checks.push(Check::pass(
+                "helper",
+                format!(
+                    "{} probed protocol {} build {}",
+                    path.display(),
+                    host.protocol,
+                    host.build
+                ),
+            )),
+            Err(err) => checks.push(Check::fail(
+                "helper",
+                format!("{} exists but Probe failed: {err:#}", path.display()),
+            )),
+        },
         Err(err) => {
             // A macOS/Linux build is not a Windows artifact; the helper is
-            // required only on the Windows host that would run Hyper-V.
+            // required only on the Windows host that would run Hyper-V. A
+            // helper on PATH/env still has to speak Probe — existence is not
+            // readiness.
             if cfg!(windows) {
                 checks.push(Check::fail("helper", format!("{err:#}")));
             } else {
@@ -176,21 +194,142 @@ fn service_bin_path_with_home(program: &Path, home: &Path) -> String {
     )
 }
 
+/// True when `program` lives under a Windows directory that non-admins
+/// cannot replace. LocalSystem may only execute an ImagePath from one of
+/// these roots; a user-writable prefix is a privilege-escalation path.
+pub fn prefix_is_protected(program: &Path) -> bool {
+    let n = normalize_windows_path(&program.to_string_lossy());
+    let rest = n.split_once(':').map(|(_, r)| r).unwrap_or(n.as_str());
+    let rest = rest.trim_start_matches('\\');
+    rest.starts_with("program files\\")
+        || rest.starts_with("program files (x86)\\")
+        || rest.starts_with("windows\\")
+        || rest.starts_with("programdata\\asterism\\")
+}
+
+pub fn normalize_windows_path(s: &str) -> String {
+    s.replace('/', "\\").to_ascii_lowercase()
+}
+
 /// Arguments for `sc.exe create`. Built as data so tests on a Unix host can
 /// assert the persistence promise without talking to SCM.
-pub fn sc_create_args(spec: &Spec, name: &str) -> Vec<String> {
+///
+/// Refuses LocalSystem when the ImagePath is user-writable. `obj=` is always
+/// explicit so an omitted account cannot silently default to SYSTEM.
+pub fn sc_create_args(spec: &Spec, name: &str) -> Result<Vec<String>> {
+    if !prefix_is_protected(&spec.program) {
+        bail!(
+            "refusing to install {name} as {SERVICE_ACCOUNT_SYSTEM} with ImagePath {} — \
+             a user-writable prefix would let a non-admin replace astd and run as SYSTEM. \
+             Install to Program Files (elevated) instead of a user-writable prefix",
+            spec.program.display()
+        );
+    }
     let bin = match &spec.home {
         Some(home) => service_bin_path_with_home(&spec.program, home),
         None => service_bin_path(&spec.program),
     };
-    vec![
+    Ok(vec![
         "create".into(),
         name.into(),
         format!("binPath={bin}"),
         "start=auto".into(),
         format!("DisplayName={SERVICE_DISPLAY}"),
         "type=own".into(),
+        format!("obj={SERVICE_ACCOUNT_SYSTEM}"),
+    ])
+}
+
+/// `netsh advfirewall firewall add rule` for the daemon inbound allow.
+/// Doctor matching uses this exact name and program, not a Hyper-V substring.
+pub fn netsh_add_asterism_rule_args(program: &Path) -> Vec<String> {
+    vec![
+        "advfirewall".into(),
+        "firewall".into(),
+        "add".into(),
+        "rule".into(),
+        format!("name={ASTERISM_FIREWALL_RULE}"),
+        "dir=in".into(),
+        "action=allow".into(),
+        format!("program={}", program.display()),
+        "enable=yes".into(),
+        "profile=any".into(),
     ]
+}
+
+/// One rule from `netsh advfirewall firewall show rule`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FirewallRule {
+    pub name: String,
+    pub enabled: bool,
+    pub direction: String,
+    pub action: String,
+    pub program: String,
+}
+
+/// Parse `netsh advfirewall firewall show rule` text. Matching is exact on
+/// the rule name; a Hyper-V group somewhere in the dump is not a pass.
+pub fn parse_netsh_firewall_rules(text: &str) -> Vec<FirewallRule> {
+    let mut rules = Vec::new();
+    let mut current: Option<FirewallRule> = None;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if let Some(name) = line
+            .strip_prefix("Rule Name:")
+            .or_else(|| line.strip_prefix("Rule Name :"))
+        {
+            if let Some(rule) = current.take() {
+                rules.push(rule);
+            }
+            current = Some(FirewallRule {
+                name: name.trim().to_owned(),
+                enabled: false,
+                direction: String::new(),
+                action: String::new(),
+                program: String::new(),
+            });
+            continue;
+        }
+        let Some(rule) = current.as_mut() else {
+            continue;
+        };
+        if let Some(v) = field_after(line, "Enabled") {
+            rule.enabled = v.eq_ignore_ascii_case("yes") || v.eq_ignore_ascii_case("true");
+        } else if let Some(v) = field_after(line, "Direction") {
+            rule.direction = v.to_owned();
+        } else if let Some(v) = field_after(line, "Action") {
+            rule.action = v.to_owned();
+        } else if let Some(v) = field_after(line, "Program") {
+            rule.program = v.to_owned();
+        }
+    }
+    if let Some(rule) = current {
+        rules.push(rule);
+    }
+    rules
+}
+
+fn field_after<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let rest = line.strip_prefix(key)?;
+    let rest = rest.trim_start_matches([' ', '\t', ':']);
+    if rest.is_empty() {
+        None
+    } else {
+        Some(rest.trim())
+    }
+}
+
+/// True only when a rule with `name` is enabled, inbound, allow, and names
+/// `program`. Substring hits on "Hyper-V" do not count.
+pub fn firewall_rule_allows_program(rules: &[FirewallRule], name: &str, program: &Path) -> bool {
+    let want = normalize_windows_path(&program.to_string_lossy());
+    rules.iter().any(|rule| {
+        rule.name == name
+            && rule.enabled
+            && rule.direction.eq_ignore_ascii_case("in")
+            && rule.action.eq_ignore_ascii_case("allow")
+            && normalize_windows_path(&rule.program) == want
+    })
 }
 
 /// `sc.exe query` / `delete` / `start` / `stop` argument lists.
@@ -296,12 +435,14 @@ fn windows_checks() -> Vec<Check> {
     checks.push(if info.firewall_ok {
         Check::pass(
             "firewall",
-            format!("Windows Firewall allows {HYPERV_FIREWALL_GROUP}"),
+            format!("Windows Firewall allows inbound {ASTERISM_FIREWALL_RULE}"),
         )
     } else {
         Check::fail(
             "firewall",
-            "Windows Firewall is blocking Hyper-V or the Asterism daemon inbound rule is missing",
+            format!(
+                "Windows Firewall has no enabled inbound Allow rule named {ASTERISM_FIREWALL_RULE} for astd.exe"
+            ),
         )
     });
     checks.push(if info.credman_ok {
@@ -584,7 +725,8 @@ fn service_running(name: &str) -> bool {
 fn firewall_allows_hyperv() -> bool {
     // netsh is the documented read-only view of the firewall policy and does
     // not require the INetFwPolicy2 COM apartment. The doctor must not
-    // create rules; the installer does that when asked.
+    // create rules; the installer does that when asked. Matching is the
+    // exact Asterism rule + program, never a Hyper-V group substring.
     let output = std::process::Command::new("netsh")
         .args(["advfirewall", "show", "currentprofile"])
         .output();
@@ -597,21 +739,35 @@ fn firewall_allows_hyperv() -> bool {
             {
                 return true;
             }
-            hyperv_firewall_group_present()
+            asterism_firewall_rule_present()
         }
         Err(_) => false,
     }
 }
 
 #[cfg(windows)]
-fn hyperv_firewall_group_present() -> bool {
+fn asterism_firewall_rule_present() -> bool {
+    let program = match crate::service::daemon_program() {
+        Ok(path) => path,
+        Err(_) => return false,
+    };
     let output = std::process::Command::new("netsh")
-        .args(["advfirewall", "firewall", "show", "rule", "name=all"])
+        .args([
+            "advfirewall",
+            "firewall",
+            "show",
+            "rule",
+            &format!("name={ASTERISM_FIREWALL_RULE}"),
+        ])
         .output();
     match output {
         Ok(out) => {
             let text = String::from_utf8_lossy(&out.stdout);
-            text.contains(HYPERV_FIREWALL_GROUP) || text.contains(ASTERISM_FIREWALL_RULE)
+            firewall_rule_allows_program(
+                &parse_netsh_firewall_rules(&text),
+                ASTERISM_FIREWALL_RULE,
+                &program,
+            )
         }
         Err(_) => false,
     }
@@ -643,10 +799,10 @@ fn sleep_probe() -> bool {
     }
 }
 
-/// A held `SetThreadExecutionState`. Restores `ES_CONTINUOUS` only (clearing
-/// `ES_SYSTEM_REQUIRED`) on drop, which is the documented way to let the
-/// machine sleep again.
-pub struct SleepHeld;
+/// A held `SetThreadExecutionState`. Acquire and release run on the same
+/// dedicated thread: the API is thread-affine, and dropping from a tokio
+/// worker would leak the execution state on the wrong thread.
+pub struct SleepHeld(#[allow(dead_code)] ThreadAffineHold);
 
 pub fn hold_sleep(_reason: &str) -> Result<SleepHeld> {
     #[cfg(windows)]
@@ -662,9 +818,69 @@ pub fn hold_sleep(_reason: &str) -> Result<SleepHeld> {
     }
 }
 
+/// Owns a resource that must be acquired and released on one OS thread.
+pub struct ThreadAffineHold {
+    join: Option<JoinHandle<()>>,
+    release: std::sync::Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl ThreadAffineHold {
+    pub fn spawn<F, G>(acquire: F, release_fn: G) -> Result<Self>
+    where
+        F: FnOnce() -> Result<()> + Send + 'static,
+        G: FnOnce() + Send + 'static,
+    {
+        let pair = std::sync::Arc::new((Mutex::new(false), Condvar::new()));
+        let waiter = pair.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let join = std::thread::Builder::new()
+            .name("asterism-power".into())
+            .spawn(move || {
+                match acquire() {
+                    Ok(()) => {
+                        let _ = tx.send(Ok(()));
+                    }
+                    Err(err) => {
+                        let _ = tx.send(Err(err.to_string()));
+                        return;
+                    }
+                }
+                let (lock, cv) = &*waiter;
+                let mut done = lock.lock().unwrap();
+                while !*done {
+                    done = cv.wait(done).unwrap();
+                }
+                release_fn();
+            })
+            .context("starting the thread-affine power thread")?;
+        match rx.recv().context("power thread did not start")? {
+            Ok(()) => Ok(Self {
+                join: Some(join),
+                release: pair,
+            }),
+            Err(err) => {
+                let _ = join.join();
+                bail!("{err}")
+            }
+        }
+    }
+}
+
+impl Drop for ThreadAffineHold {
+    fn drop(&mut self) {
+        if let Ok(mut done) = self.release.0.lock() {
+            *done = true;
+            self.release.1.notify_all();
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
 #[cfg(windows)]
 mod imp_sleep {
-    use super::{SleepHeld, ES_CONTINUOUS, SLEEP_STATE};
+    use super::{SleepHeld, ThreadAffineHold, ES_CONTINUOUS, SLEEP_STATE};
     use anyhow::{bail, Result};
 
     #[link(name = "kernel32")]
@@ -673,19 +889,18 @@ mod imp_sleep {
     }
 
     pub fn hold() -> Result<SleepHeld> {
-        let previous = unsafe { SetThreadExecutionState(SLEEP_STATE) };
-        if previous == 0 {
-            bail!("SetThreadExecutionState refused ES_CONTINUOUS|ES_SYSTEM_REQUIRED");
-        }
-        Ok(SleepHeld)
-    }
-
-    impl Drop for SleepHeld {
-        fn drop(&mut self) {
-            unsafe {
+        Ok(SleepHeld(ThreadAffineHold::spawn(
+            || {
+                let previous = unsafe { SetThreadExecutionState(SLEEP_STATE) };
+                if previous == 0 {
+                    bail!("SetThreadExecutionState refused ES_CONTINUOUS|ES_SYSTEM_REQUIRED");
+                }
+                Ok(())
+            },
+            || unsafe {
                 let _ = SetThreadExecutionState(ES_CONTINUOUS);
-            }
-        }
+            },
+        )?))
     }
 }
 
@@ -842,17 +1057,164 @@ pub mod cred {
     }
 }
 
-/// SCM STOP/SHUTDOWN latch. The daemon's accept loop waits on this on
-/// Windows so a service stop is a clean shutdown rather than TerminateProcess.
+/// SCM STOP/SHUTDOWN latch. The daemon's accept loop waits on this so a
+/// service stop is a clean shutdown rather than TerminateProcess. A flag
+/// that nobody waits on is not a shutdown path.
+struct StopLatch {
+    stop: Mutex<bool>,
+    cv: Condvar,
+}
+
+static SERVICE_STOP: StopLatch = StopLatch {
+    stop: Mutex::new(false),
+    cv: Condvar::new(),
+};
+
 pub fn service_stop_requested() -> bool {
-    SERVICE_STOP.load(std::sync::atomic::Ordering::SeqCst)
+    *SERVICE_STOP.stop.lock().unwrap()
 }
 
 pub fn request_service_stop() {
-    SERVICE_STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut stop = SERVICE_STOP.stop.lock().unwrap();
+    *stop = true;
+    SERVICE_STOP.cv.notify_all();
 }
 
-static SERVICE_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn wait_service_stop() {
+    let mut stop = SERVICE_STOP.stop.lock().unwrap();
+    while !*stop {
+        stop = SERVICE_STOP.cv.wait(stop).unwrap();
+    }
+}
+
+pub fn clear_service_stop() {
+    *SERVICE_STOP.stop.lock().unwrap() = false;
+}
+
+/// Layout and claim protocol for the Windows updater. PowerShell implements
+/// the same files so a rollback fixture does not need SCM.
+pub mod update {
+    use std::fs;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+
+    use anyhow::{bail, Context, Result};
+
+    pub const CLAIM_FILE: &str = "update-transaction.claim";
+    pub const BACKUP_DIR: &str = "update-backup";
+    pub const STAGE_DIR: &str = "update-stage";
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Claim {
+        pub owner: String,
+        pub id: String,
+        pub phase: String,
+    }
+
+    pub fn updater_paths(prefix: &Path) -> Vec<PathBuf> {
+        let libexec = prefix.join("libexec").join("asterism");
+        vec![
+            libexec.join("asterism-update.ps1"),
+            libexec.join("asterism-update.exe"),
+            libexec.join("asterism-update"),
+        ]
+    }
+
+    pub fn first_reachable_updater(prefix: &Path) -> Option<PathBuf> {
+        updater_paths(prefix)
+            .into_iter()
+            .find(|path| path.is_file())
+    }
+
+    pub fn format_claim(claim: &Claim) -> String {
+        format!(
+            "owner={}\nid={}\nphase={}\n",
+            claim.owner, claim.id, claim.phase
+        )
+    }
+
+    pub fn parse_claim(text: &str) -> Result<Claim> {
+        let mut owner = None;
+        let mut id = None;
+        let mut phase = None;
+        for line in text.lines() {
+            if let Some(v) = line.strip_prefix("owner=") {
+                owner = Some(v.trim().to_owned());
+            } else if let Some(v) = line.strip_prefix("id=") {
+                id = Some(v.trim().to_owned());
+            } else if let Some(v) = line.strip_prefix("phase=") {
+                phase = Some(v.trim().to_owned());
+            }
+        }
+        Ok(Claim {
+            owner: owner.context("claim has no owner")?,
+            id: id.context("claim has no id")?,
+            phase: phase.context("claim has no phase")?,
+        })
+    }
+
+    /// Exclusive create. A live claim is a concurrent updater, not a stale
+    /// file to clobber.
+    pub fn try_claim(dir: &Path, owner: &str, id: &str) -> Result<PathBuf> {
+        fs::create_dir_all(dir).context("creating updater state")?;
+        let path = dir.join(CLAIM_FILE);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                file.write_all(
+                    format_claim(&Claim {
+                        owner: owner.into(),
+                        id: id.into(),
+                        phase: "claimed".into(),
+                    })
+                    .as_bytes(),
+                )?;
+                Ok(path)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                bail!("another updater process owns the activation transaction")
+            }
+            Err(err) => Err(err).context("claiming the update transaction"),
+        }
+    }
+
+    pub fn write_phase(claim_path: &Path, phase: &str) -> Result<()> {
+        let mut claim = parse_claim(&fs::read_to_string(claim_path)?)?;
+        claim.phase = phase.to_owned();
+        fs::write(claim_path, format_claim(&claim))?;
+        Ok(())
+    }
+
+    /// Copy `names` from `backup` over `dest`, restoring the previous unit.
+    pub fn rollback(backup: &Path, dest: &Path, names: &[&str]) -> Result<()> {
+        for name in names {
+            let src = backup.join(name);
+            let dst = dest.join(name);
+            if src.is_file() {
+                if let Some(parent) = dst.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::copy(&src, &dst)
+                    .with_context(|| format!("rolling back {} from {}", name, src.display()))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn backup_files(src: &Path, backup: &Path, names: &[&str]) -> Result<()> {
+        fs::create_dir_all(backup)?;
+        for name in names {
+            let from = src.join(name);
+            if from.is_file() {
+                fs::copy(&from, backup.join(name))?;
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Enter the Windows Service dispatcher. Must be called from the process
 /// entry thread, not from inside a tokio worker: SCM requires
@@ -932,6 +1294,7 @@ mod scm {
     where
         F: FnOnce() -> Result<()> + Send + 'static,
     {
+        clear_service_stop();
         *WORKER.lock().unwrap() = Some(Box::new(worker));
         let name_w = wide(name);
         *NAME.lock().unwrap() = Some(name_w.clone());
@@ -1023,8 +1386,18 @@ mod scm {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     fn spec() -> Spec {
+        Spec {
+            program: PathBuf::from(r"C:\Program Files\Asterism\bin\astd.exe"),
+            home: Some(PathBuf::from(r"C:\Users\me\.asterism")),
+            path_env: r"C:\Windows\system32".into(),
+            log: PathBuf::from(r"C:\Users\me\.asterism\astd.log"),
+        }
+    }
+
+    fn user_spec() -> Spec {
         Spec {
             program: PathBuf::from(r"C:\Users\me\AppData\Local\Asterism\bin\astd.exe"),
             home: Some(PathBuf::from(r"C:\Users\me\.asterism")),
@@ -1035,7 +1408,7 @@ mod tests {
 
     #[test]
     fn sc_create_bakes_the_binary_home_and_auto_start() {
-        let args = sc_create_args(&spec(), SERVICE_NAME);
+        let args = sc_create_args(&spec(), SERVICE_NAME).unwrap();
         let joined = args.join(" ");
         assert!(joined.contains("create"));
         assert!(joined.contains(SERVICE_NAME));
@@ -1044,7 +1417,22 @@ mod tests {
         assert!(joined.contains(r"astd.exe"), "{joined}");
         assert!(joined.contains(r"--home"), "{joined}");
         assert!(joined.contains("type=own"), "{joined}");
+        assert!(
+            joined.contains(&format!("obj={SERVICE_ACCOUNT_SYSTEM}")),
+            "{joined}"
+        );
         assert!(!joined.to_ascii_lowercase().contains("qemu"));
+    }
+
+    #[test]
+    fn local_system_is_refused_for_a_user_writable_prefix() {
+        let err = sc_create_args(&user_spec(), SERVICE_NAME)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("user-writable"), "{err}");
+        assert!(err.contains(SERVICE_ACCOUNT_SYSTEM), "{err}");
+        assert!(prefix_is_protected(&spec().program));
+        assert!(!prefix_is_protected(&user_spec().program));
     }
 
     #[test]
@@ -1097,8 +1485,132 @@ mod tests {
     }
 
     #[test]
-    fn a_service_stop_is_an_explicit_latch() {
+    fn a_service_stop_wakes_the_waiter() {
+        let _guard = LATCH_TEST.lock().unwrap();
+        clear_service_stop();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            wait_service_stop();
+            tx.send(()).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            rx.try_recv().is_err(),
+            "stop waiter returned before SCM latch"
+        );
         request_service_stop();
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("SCM stop latch did not drive the waiter");
         assert!(service_stop_requested());
+        clear_service_stop();
+    }
+
+    static LATCH_TEST: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn hold_and_release_run_on_the_same_thread() {
+        let ids = std::sync::Arc::new(Mutex::new((None, None)));
+        let acquire_ids = ids.clone();
+        let release_ids = ids.clone();
+        let held = ThreadAffineHold::spawn(
+            move || {
+                acquire_ids.lock().unwrap().0 = Some(std::thread::current().id());
+                Ok(())
+            },
+            move || {
+                release_ids.lock().unwrap().1 = Some(std::thread::current().id());
+            },
+        )
+        .unwrap();
+        drop(held);
+        let pair = *ids.lock().unwrap();
+        assert_eq!(
+            pair.0, pair.1,
+            "SetThreadExecutionState owner thread must release"
+        );
+        assert!(pair.0.is_some());
+    }
+
+    #[test]
+    fn firewall_match_is_the_created_rule_not_a_hyperv_substring() {
+        let program = PathBuf::from(r"C:\Program Files\Asterism\bin\astd.exe");
+        let dump = "\
+Rule Name:                            Hyper-V\n\
+Enabled:                              Yes\n\
+Direction:                            In\n\
+Action:                               Allow\n\
+Program:                              C:\\Windows\\System32\\svchost.exe\n\
+Rule Name:                            Asterism device daemon\n\
+Enabled:                              Yes\n\
+Direction:                            In\n\
+Action:                               Allow\n\
+Program:                              C:\\Program Files\\Asterism\\bin\\astd.exe\n";
+        let rules = parse_netsh_firewall_rules(dump);
+        assert_eq!(rules.len(), 2);
+        assert!(firewall_rule_allows_program(
+            &rules,
+            ASTERISM_FIREWALL_RULE,
+            &program
+        ));
+        assert!(!firewall_rule_allows_program(
+            &rules[..1],
+            ASTERISM_FIREWALL_RULE,
+            &program
+        ));
+        assert_eq!(rules[0].name, HYPERV_FIREWALL_GROUP);
+        let fixture = include_str!("../../../scripts/fixtures/windows-host/firewall-show-rule.txt");
+        let from_file = parse_netsh_firewall_rules(fixture);
+        assert!(firewall_rule_allows_program(
+            &from_file,
+            ASTERISM_FIREWALL_RULE,
+            &program
+        ));
+        assert!(!firewall_rule_allows_program(
+            &from_file[..1],
+            ASTERISM_FIREWALL_RULE,
+            &program
+        ));
+        let args = netsh_add_asterism_rule_args(&program).join(" ");
+        assert!(args.contains(ASTERISM_FIREWALL_RULE));
+        assert!(args.contains("astd.exe"));
+        assert!(!args.to_ascii_lowercase().contains("hyper-v"));
+    }
+
+    #[test]
+    fn updater_claim_backup_and_rollback_are_transactional() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = dir.path();
+        let bin = prefix.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("ast.exe"), b"old-ast").unwrap();
+        std::fs::write(bin.join("astd.exe"), b"old-astd").unwrap();
+        let state = prefix.join("state");
+        let claim = update::try_claim(&state, "111", "tx-1").unwrap();
+        assert!(update::try_claim(&state, "222", "tx-2")
+            .unwrap_err()
+            .to_string()
+            .contains("another updater"));
+        let backup = state.join(update::BACKUP_DIR);
+        update::backup_files(&bin, &backup, &["ast.exe", "astd.exe"]).unwrap();
+        std::fs::write(bin.join("ast.exe"), b"new-ast").unwrap();
+        std::fs::write(bin.join("astd.exe"), b"broken").unwrap();
+        update::write_phase(&claim, "activating").unwrap();
+        update::rollback(&backup, &bin, &["ast.exe", "astd.exe"]).unwrap();
+        assert_eq!(std::fs::read(bin.join("ast.exe")).unwrap(), b"old-ast");
+        assert_eq!(std::fs::read(bin.join("astd.exe")).unwrap(), b"old-astd");
+        let parsed = update::parse_claim(&std::fs::read_to_string(&claim).unwrap()).unwrap();
+        assert_eq!(parsed.phase, "activating");
+        std::fs::remove_file(&claim).unwrap();
+        assert!(update::first_reachable_updater(prefix).is_none());
+        let libexec = prefix.join("libexec").join("asterism");
+        std::fs::create_dir_all(&libexec).unwrap();
+        std::fs::write(libexec.join("asterism-update.ps1"), b"# updater").unwrap();
+        assert_eq!(
+            update::first_reachable_updater(prefix)
+                .unwrap()
+                .file_name()
+                .unwrap(),
+            "asterism-update.ps1"
+        );
     }
 }

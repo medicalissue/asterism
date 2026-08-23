@@ -4357,11 +4357,21 @@ fn update_command(cmd: UpdateCommand) -> Result<()> {
         .map(std::path::PathBuf::from)
         .or_else(|| {
             let prefix = ast.parent()?.parent()?;
+            // Prefer asterism-update.ps1 on Windows, then .exe, then the POSIX updater.
+            windows_host::update::first_reachable_updater(&prefix)
+        })
+        .or_else(|| {
+            let prefix = ast.parent()?.parent()?;
             let path = prefix.join("libexec/asterism/asterism-update");
             path.is_file().then_some(path)
         })
         // A source checkout can exercise the same updater without installing
         // into the developer's prefix. Published binaries never need this.
+        .or_else(|| {
+            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../packaging/update.ps1");
+            path.is_file().then_some(path)
+        })
         .or_else(|| {
             let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../packaging/update.sh");
@@ -4373,7 +4383,21 @@ fn update_command(cmd: UpdateCommand) -> Result<()> {
             )
         })?;
 
-    let mut process = std::process::Command::new(&updater);
+    let mut process = if updater
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("ps1"))
+    {
+        let mut shell = std::process::Command::new(if cfg!(windows) {
+            "powershell.exe"
+        } else {
+            "pwsh"
+        });
+        shell.arg("-NoProfile").arg("-File").arg(&updater);
+        shell
+    } else {
+        std::process::Command::new(&updater)
+    };
     process.env("ASTERISM_UPDATE_AST_PATH", &ast);
     if std::env::var_os("ASTERISM_UPDATE_PUBKEY").is_none() {
         if let Some(pubkey) = option_env!("ASTERISM_UPDATE_PUBKEY") {

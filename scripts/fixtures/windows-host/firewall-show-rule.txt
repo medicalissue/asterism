@@ -1,0 +1,17 @@
+Rule Name:                            Hyper-V
+----------------------------------------------------------------------
+Enabled:                              Yes
+Direction:                            In
+Profiles:                             Domain,Private,Public
+Grouping:                             Hyper-V
+Action:                               Allow
+Program:                              C:\Windows\System32\svchost.exe
+
+Rule Name:                            Asterism device daemon
+----------------------------------------------------------------------
+Enabled:                              Yes
+Direction:                            In
+Profiles:                             Domain,Private,Public
+Grouping:
+Action:                               Allow
+Program:                              C:\Program Files\Asterism\bin\astd.exe
