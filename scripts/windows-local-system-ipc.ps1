@@ -112,14 +112,24 @@ try {
     $probeScript = Join-Path $probeRoot 'refuse.ps1'
     $probeResult = Join-Path $probeRoot 'result.txt'
     $probeLog = Join-Path $probeRoot 'output.txt'
+    $probeConfig = Join-Path $probeRoot 'probe.json'
+    @{
+        HomePath = $testHome
+        AstPath = $installedAst
+        ResultPath = $probeResult
+        LogPath = $probeLog
+    } | ConvertTo-Json | Set-Content -LiteralPath $probeConfig -Encoding utf8
     @'
-param([string]$HomePath, [string]$AstPath, [string]$ResultPath, [string]$LogPath)
-$env:ASTERISM_HOME = $HomePath
-& $AstPath ls --local *> $LogPath
-Set-Content -LiteralPath $ResultPath -Value $LASTEXITCODE -Encoding ascii
+$config = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'probe.json') -Raw | ConvertFrom-Json
+$env:ASTERISM_HOME = $config.HomePath
+& $config.AstPath ls --local *> $config.LogPath
+Set-Content -LiteralPath $config.ResultPath -Value $LASTEXITCODE -Encoding ascii
 '@ | Set-Content -LiteralPath $probeScript -Encoding utf8
 
-    $action = "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$probeScript`" -HomePath `"$testHome`" -AstPath `"$installedAst`" -ResultPath `"$probeResult`" -LogPath `"$probeLog`""
+    # schtasks.exe rejects a /TR command longer than 261 characters. Keep the
+    # action itself short and let the root-owned JSON beside the script carry
+    # the long GitHub-runner paths into the LocalService probe.
+    $action = "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$probeScript`""
     & schtasks.exe /Create /TN $task /SC ONCE /ST 23:59 /RU 'NT AUTHORITY\LOCAL SERVICE' /RL LIMITED /TR $action /F | Out-Null
     & schtasks.exe /Run /TN $task | Out-Null
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
