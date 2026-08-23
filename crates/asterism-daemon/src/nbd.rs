@@ -324,6 +324,15 @@ fn serve(
         reap_clients(&mut clients);
         match listener.accept() {
             Ok((stream, _)) => {
+                // Linux returns a blocking accepted socket from a nonblocking
+                // listener, while Darwin inherits O_NONBLOCK. Normalize the
+                // session before its framing reads so a momentarily empty
+                // socket is never mistaken for a malformed client.
+                if let Err(error) = stream.set_nonblocking(false) {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    eprintln!("astd: refusing NBD client whose socket mode failed: {error}");
+                    continue;
+                }
                 let id = shared.next_session.fetch_add(1, Ordering::Relaxed);
                 let mut sessions = shared.sessions.lock().expect("NBD sessions poisoned");
                 if sessions.len() >= MAX_SESSIONS {

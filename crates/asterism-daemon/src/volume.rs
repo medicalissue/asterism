@@ -2987,7 +2987,7 @@ mod tests {
         let error = stop_export_at("tank", &lease, &socket, &pidfile)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("refusing to send"), "{error}");
+        assert!(error.contains("refusing to signal"), "{error}");
         assert!(socket.exists(), "an unproven writer lost its socket name");
         assert!(pidfile.exists(), "an unproven writer lost its pid evidence");
         assert!(real.alive(), "nobody else was killed to close the door");
