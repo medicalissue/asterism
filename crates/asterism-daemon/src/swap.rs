@@ -1098,6 +1098,63 @@ fn published_for(txn: &AuthorityTxn) -> bool {
         .is_some_and(|loaded| loaded.value == AuthorityMarker::of(txn))
 }
 
+/// Rehash each file against the manifest digest. Length is not identity:
+/// a same-length substitution of staging or the published tree must fail
+/// closed before any success `Response::Instance`.
+fn prove_tree_files(
+    root: &Path,
+    files: &[MoveFile],
+    instance_id: &str,
+    epoch: u64,
+    tree: &str,
+) -> Result<()> {
+    for file in files {
+        let path = root.join(&file.path);
+        let meta = std::fs::metadata(&path).with_context(|| {
+            format!(
+                "{} is missing from the {tree} for id {instance_id:?} epoch {epoch}",
+                file.path
+            )
+        })?;
+        if meta.len() != file.len {
+            bail!(
+                "{} in the {tree} is {} bytes and should be {}",
+                file.path,
+                meta.len(),
+                file.len
+            );
+        }
+        if file.digest.is_empty() {
+            bail!(
+                "{} in the {tree} has no digest authority for id {instance_id:?} epoch {epoch}",
+                file.path
+            );
+        }
+        let expected = Digest::parse(&file.digest).with_context(|| {
+            format!(
+                "{} in the {tree} has an unusable digest for id {instance_id:?} epoch {epoch}",
+                file.path
+            )
+        })?;
+        if expected.algo() != verify::OWN_ALGO {
+            bail!(
+                "{} in the {tree} has a {} digest, not the authoritative {} move digest",
+                file.path,
+                expected.algo(),
+                verify::OWN_ALGO
+            );
+        }
+        expected.verify_file(
+            &path,
+            &format!(
+                "{} in the {tree} for id {instance_id:?} epoch {epoch}",
+                file.path
+            ),
+        )?;
+    }
+    Ok(())
+}
+
 /// Prove a WAL that already says `Committed` still names the published target.
 ///
 /// Commit consumes the in-tree marker on purpose: the durable WAL is then
@@ -1139,45 +1196,13 @@ fn prove_committed_published(reg: &Shard, txn: &AuthorityTxn, device: &str) -> R
             txn.epoch
         ),
     }
-    for file in &txn.manifest.files {
-        let path = live.join(&file.path);
-        let meta = std::fs::metadata(&path).with_context(|| {
-            format!(
-                "{} is missing from the committed live tree for id {:?} epoch {}",
-                file.path, txn.instance_id, txn.epoch
-            )
-        })?;
-        if meta.len() != file.len {
-            bail!(
-                "{} in the committed live tree is {} bytes and should be {}",
-                file.path,
-                meta.len(),
-                file.len
-            );
-        }
-        if file.digest.is_empty() {
-            bail!(
-                "{} in the committed live tree has no digest authority for id {:?} epoch {}",
-                file.path,
-                txn.instance_id,
-                txn.epoch
-            );
-        }
-        let expected = Digest::parse(&file.digest).with_context(|| {
-            format!(
-                "{} in the committed live tree has an unusable digest for id {:?} epoch {}",
-                file.path, txn.instance_id, txn.epoch
-            )
-        })?;
-        expected.verify_file(
-            &path,
-            &format!(
-                "{} in the committed live tree for id {:?} epoch {}",
-                file.path, txn.instance_id, txn.epoch
-            ),
-        )?;
-    }
-    Ok(())
+    prove_tree_files(
+        &live,
+        &txn.manifest.files,
+        &txn.instance_id,
+        txn.epoch,
+        "committed live tree",
+    )
 }
 
 fn validate_target_replay(
@@ -3537,7 +3562,7 @@ pub fn commit_target(
         ));
     }
     match txn.phase {
-        MoveAuthorityPhase::Committed => return committed_response(reg, &txn),
+        MoveAuthorityPhase::Committed => return committed_response(reg, &txn, device),
         MoveAuthorityPhase::Aborted => {
             return error(anyhow!("target authority transaction was durably aborted"))
         }
@@ -3616,7 +3641,13 @@ pub fn commit_target(
     }
 }
 
-fn committed_response(reg: &Shard, txn: &AuthorityTxn) -> Response {
+fn committed_response(reg: &Shard, txn: &AuthorityTxn, device: &str) -> Response {
+    // Reply-loss replay of MoveCommitTarget used to return Instance from the
+    // row alone. A same-length substitution of the live tree then reached
+    // source cleanup. Prove the published bytes first.
+    if let Err(e) = prove_committed_published(reg, txn, device) {
+        return error(e.context("committed target identity is not proven"));
+    }
     match reg.get(&txn.name).ok().filter(|i| {
         i.id == txn.instance_id && i.move_epoch == txn.epoch
     }) {
@@ -3677,6 +3708,20 @@ fn finish_target_commit(reg: &mut Shard, txn: &mut AuthorityTxn, device: &str) -
                 txn.epoch
             );
         }
+    }
+
+    // Staging was checked, or a prior publish left this tree. Rehash before
+    // the row/WAL success that source cleanup waits on: a same-length
+    // substitution after verify, or a Committing restart of a substituted
+    // live tree, must not become Instance.
+    if txn.phase != MoveAuthorityPhase::Committed {
+        prove_tree_files(
+            &live,
+            &txn.manifest.files,
+            &txn.instance_id,
+            txn.epoch,
+            "published live tree",
+        )?;
     }
 
     let existing = reg.get(&name).ok().cloned();
@@ -3742,6 +3787,7 @@ fn finish_target_commit(reg: &mut Shard, txn: &mut AuthorityTxn, device: &str) -
     let _ = std::fs::remove_file(live.join(LIVE_SOCKET));
     // Consumed: later Committed status must prove this tree without it.
     let _ = std::fs::remove_file(live.join(LIVE_AUTHORITY));
+    prove_committed_published(reg, txn, device)?;
     Ok(instance)
 }
 
@@ -3790,6 +3836,13 @@ fn verify(staging: &Path, manifest: &MoveManifest, epoch: u64, token: &str) -> R
             None => bail!("{} is not in the record of what arrived", file.path),
         }
     }
+    prove_tree_files(
+        staging,
+        &manifest.files,
+        &manifest.instance.id,
+        epoch,
+        "staged tree",
+    )?;
     let expected = manifest.allocated();
     if receipt.bytes != expected {
         bail!(
@@ -5158,14 +5211,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let staging = dir.path().join("dev.moving-1");
         std::fs::create_dir_all(&staging).unwrap();
-        std::fs::write(staging.join("disk.raw"), vec![0u8; 4096]).unwrap();
+        let honest = vec![0u8; 4096];
+        std::fs::write(staging.join("disk.raw"), &honest).unwrap();
+        let digest = verify::Digest::of_bytes(verify::OWN_ALGO, &honest).to_string();
 
         let manifest = manifest_of(vec![MoveFile {
             path: "disk.raw".into(),
             len: 4096,
             allocated: 4096,
             mode: 0o600,
-            digest: String::new(),
+            digest,
         }]);
 
         // No receipt at all: the transfer never finished.
@@ -5219,6 +5274,24 @@ mod tests {
         assert!(err.contains("move token"), "{err}");
         wrong_identity.token = "token".into();
         wrong_identity.save(&staging).unwrap();
+
+        // Completeness includes content: an empty digest is not authority,
+        // and a same-length substitution is not the file that was promised.
+        let mut no_digest = manifest.clone();
+        no_digest.files[0].digest.clear();
+        let err = verify(&staging, &no_digest, 1, "token")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no digest authority"), "{err}");
+        let forged = vec![1u8; 4096];
+        assert_eq!(forged.len(), honest.len());
+        std::fs::write(staging.join("disk.raw"), &forged).unwrap();
+        let err = verify(&staging, &manifest, 1, "token")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not match its digest"), "{err}");
+        std::fs::write(staging.join("disk.raw"), &honest).unwrap();
+        verify(&staging, &manifest, 1, "token").unwrap();
 
         // A file that arrived the wrong length is refused even though the
         // byte count adds up — sparse means those are different questions.
@@ -6843,8 +6916,9 @@ mod tests {
             "{restored:?}"
         );
 
-        // Live tree digest is part of that identity: a truncated published
-        // file is substitution, not a successful Committed replay. Same-length
+        // Treat the successful Instance above as a lost reply. Live tree
+        // digest is part of its replay identity: a truncated published file
+        // is substitution, not a successful Committed replay. Same-length
         // byte mutation is too — length is not content.
         let published_bytes = b"target bytes";
         let published_digest =
@@ -6879,13 +6953,50 @@ mod tests {
         }
         .save(&digest_staging)
         .unwrap();
-        let mut digest_txn = txn(
-            &digest_manifest,
-            digest_epoch,
-            MoveAuthorityPhase::Committing,
-        );
+        let digest_txn = txn(&digest_manifest, digest_epoch, MoveAuthorityPhase::Prepared);
         save_authority(&digest_txn).unwrap();
-        finish_target_commit(&mut restarted, &mut digest_txn, "desktop").unwrap();
+
+        // Normal MoveCommitTarget must rehash what it is about to publish,
+        // not trust a receipt whose byte counts still match. The failed
+        // attempt has crossed into Committing, so restoring the honest bytes
+        // must replay that same transaction rather than aborting it.
+        let staged_mutation = b"staged bytes";
+        assert_eq!(
+            staged_mutation.len(),
+            published_bytes.len(),
+            "the staging mutation must preserve length"
+        );
+        std::fs::write(digest_staging.join("disk.raw"), staged_mutation).unwrap();
+        assert!(matches!(
+            commit_target(
+                &mut restarted,
+                &digest_manifest,
+                digest_epoch,
+                "token",
+                "desktop",
+            ),
+            Response::Error { .. }
+        ));
+        assert!(restarted.get("committed-digest").is_err());
+        assert!(!paths::instance_dir("committed-digest").exists());
+        assert_eq!(
+            load_authority(&digest_manifest.instance.id, digest_epoch)
+                .unwrap()
+                .unwrap()
+                .phase,
+            MoveAuthorityPhase::Committing
+        );
+        std::fs::write(digest_staging.join("disk.raw"), published_bytes).unwrap();
+        assert!(matches!(
+            commit_target(
+                &mut restarted,
+                &digest_manifest,
+                digest_epoch,
+                "token",
+                "desktop",
+            ),
+            Response::Instance { .. }
+        ));
         let digest_live = paths::instance_dir("committed-digest");
         assert!(!digest_live.join(LIVE_AUTHORITY).exists());
         assert!(matches!(
@@ -6922,6 +7033,16 @@ mod tests {
         );
         std::fs::write(digest_live.join("disk.raw"), mutated).unwrap();
         assert!(matches!(
+            commit_target(
+                &mut restarted,
+                &digest_manifest,
+                digest_epoch,
+                "token",
+                "desktop",
+            ),
+            Response::Error { .. }
+        ));
+        assert!(matches!(
             target_status(
                 &mut restarted,
                 &digest_manifest.instance.id,
@@ -6933,6 +7054,16 @@ mod tests {
             Response::Error { .. }
         ));
         std::fs::write(digest_live.join("disk.raw"), published_bytes).unwrap();
+        assert!(matches!(
+            commit_target(
+                &mut restarted,
+                &digest_manifest,
+                digest_epoch,
+                "token",
+                "desktop",
+            ),
+            Response::Instance { .. }
+        ));
         assert!(matches!(
             target_status(
                 &mut restarted,
@@ -7004,22 +7135,15 @@ mod tests {
         std::fs::create_dir_all(&source_dir).unwrap();
         std::fs::write(source_dir.join("disk.raw"), b"source bytes").unwrap();
         let mut restarted = Shard::load(&state).unwrap();
-        let proof_after_restart = target_status(
+        let proof_after_restart = commit_target(
             &mut restarted,
-            &first.instance.id,
-            "dev",
-            first_epoch,
+            &digest_manifest,
+            digest_epoch,
             "token",
             "desktop",
         );
         assert!(
-            matches!(
-                proof_after_restart,
-                Response::MoveAuthority {
-                    phase: MoveAuthorityPhase::Committed,
-                    ..
-                }
-            ),
+            matches!(proof_after_restart, Response::Instance { .. }),
             "{proof_after_restart:?}"
         );
         let armed = faults::arm_once(
