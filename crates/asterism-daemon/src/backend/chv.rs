@@ -382,6 +382,14 @@ impl Hypervisor for Chv {
         Ok(Some(network_config(&Network::for_instance(&inst.name))))
     }
 
+    fn guest_virtiofs_module(&self, image_kind: ImageKind) -> Result<Option<Vec<u8>>> {
+        if image_kind == ImageKind::OciRootfs {
+            // OCI roots receive the same module in their generated pid 1.
+            return Ok(None);
+        }
+        oci::virtiofs_module().map(Some)
+    }
+
     fn prepare(&self, req: &BootReq) -> Result<Prepared> {
         self.probed()?;
         std::fs::create_dir_all(&req.dir)?;
@@ -1431,6 +1439,14 @@ fn record_helper(child: &mut Child, executable: &Path, record: &Path) -> Result<
 /// Asterism first.
 fn spawn_fs_helpers(probe: &Probe, req: &BootReq) -> Result<Vec<(String, PathBuf)>> {
     let mut helpers = Vec::new();
+    // virtiofsd's namespace sandbox needs the invoking account to appear as
+    // root inside its user namespace.  Its implicit one-to-one map leaves the
+    // process at the host numeric uid/gid, so the later pivot-root mounts fail
+    // without host privilege.  Map exactly this daemon identity to namespace
+    // root: no subordinate or additional host identities become reachable.
+    // SAFETY: geteuid/getegid take no pointers and have no failure case.
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    let namespace_args = virtiofs_namespace_args(uid, gid);
     for (index, share) in req.shares.iter().enumerate() {
         let virtiofsd = probe.virtiofsd.as_ref().with_context(|| {
             "this instance has a shared directory, but the pinned virtiofsd helper is missing"
@@ -1449,6 +1465,7 @@ fn spawn_fs_helpers(probe: &Probe, req: &BootReq) -> Result<Vec<(String, PathBuf
             .arg(format!("--socket-path={}", socket.display()))
             .arg(format!("--shared-dir={}", share.host_path))
             .arg("--cache=never")
+            .args(&namespace_args)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log.try_clone()?))
             .stderr(Stdio::from(log))
@@ -1469,6 +1486,14 @@ fn spawn_fs_helpers(probe: &Probe, req: &BootReq) -> Result<Vec<(String, PathBuf
         helpers.push((share.tag.clone(), socket));
     }
     Ok(helpers)
+}
+
+fn virtiofs_namespace_args(uid: libc::uid_t, gid: libc::gid_t) -> [String; 3] {
+    [
+        "--sandbox=namespace".into(),
+        format!("--uid-map=:0:{uid}:1:"),
+        format!("--gid-map=:0:{gid}:1:"),
+    ]
 }
 
 /// Capture a child only after it has crossed the fork-to-exec boundary.
@@ -2434,6 +2459,18 @@ fn reap(mut child: Child) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn virtiofs_namespace_maps_only_the_daemon_identity_to_root() {
+        assert_eq!(
+            virtiofs_namespace_args(1001, 121),
+            [
+                "--sandbox=namespace",
+                "--uid-map=:0:1001:1:",
+                "--gid-map=:0:121:1:",
+            ]
+        );
+    }
 
     #[test]
     fn instance_networks_are_stable_private_and_locally_administered() {

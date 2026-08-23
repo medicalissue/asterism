@@ -16,7 +16,9 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{bail, Context, Result};
 
-use asterism_core::hv::{BootReq, DiskFormat, Handle, Hypervisor, ImageKind, ImageRef, Machine};
+use asterism_core::hv::{
+    BootReq, DiskFormat, Handle, Hypervisor, ImageKind, ImageRef, Machine, ShareKind,
+};
 use asterism_core::instance::{Instance, PortForward};
 use asterism_core::proc::{Evidence, Ownership, ProcId};
 use asterism_core::{image, paths, profile, seed};
@@ -414,12 +416,19 @@ pub fn boot_req<'a>(inst: &'a Instance, hv: &dyn Hypervisor) -> Result<BootReq<'
             hv.id()
         )
     })?;
+    let virtiofs_module = if !shares.is_empty() && share_kind == Some(ShareKind::Virtiofs) {
+        hv.guest_virtiofs_module(req.base.kind)
+            .context("preparing the virtiofs module for the guest kernel")?
+    } else {
+        None
+    };
     seed::ensure(
         &inst.name,
         &req.seed,
         seed::Input {
             shares: &shares,
             share_kind,
+            virtiofs_module: virtiofs_module.as_deref(),
             extra: &guest_config,
             network_config: network_config.as_deref(),
             egress: &egress,

@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
+use data_encoding::BASE64;
 
 use crate::hv::ShareKind;
 use crate::instance::{Instance, Volume};
@@ -102,6 +103,10 @@ pub struct Egress {
 pub struct Input<'a> {
     pub shares: &'a [Share],
     pub share_kind: Option<ShareKind>,
+    /// Verified module paired with a direct-boot kernel whose initrd omits
+    /// virtiofs. Cloud images receive it through NoCloud; OCI roots carry it
+    /// in their generated init instead.
+    pub virtiofs_module: Option<&'a [u8]>,
     pub extra: &'a str,
     pub network_config: Option<&'a str>,
     pub egress: &'a Egress,
@@ -155,7 +160,7 @@ pub fn ensure(name: &str, seed: &Path, input: Input<'_>) -> Result<()> {
         bail!("cannot build mount units without a directory-share transport");
     }
     let stamp_path = seed.with_file_name("seed.stamp");
-    let stamp = fingerprint(
+    let stamp = fingerprint_with_module(
         name,
         input.shares,
         input.share_kind,
@@ -163,6 +168,7 @@ pub fn ensure(name: &str, seed: &Path, input: Input<'_>) -> Result<()> {
         input.network_config,
         input.egress,
         input.bootstrap,
+        input.virtiofs_module,
     );
     let current = std::fs::read_to_string(&stamp_path).unwrap_or_default();
     if seed.exists() && current.trim() == stamp {
@@ -183,6 +189,7 @@ pub fn ensure(name: &str, seed: &Path, input: Input<'_>) -> Result<()> {
 /// seed of every instance that does not use any — a reissued seed carries a
 /// new `instance-id`, which makes a guest run its first-boot work again.
 /// A missing or empty `network` is folded the same way, for the same reason.
+#[cfg(test)]
 fn fingerprint(
     name: &str,
     shares: &[Share],
@@ -191,6 +198,21 @@ fn fingerprint(
     network: Option<&str>,
     egress: &Egress,
     bootstrap: &Bootstrap,
+) -> String {
+    fingerprint_with_module(
+        name, shares, share_kind, extra, network, egress, bootstrap, None,
+    )
+}
+
+fn fingerprint_with_module(
+    name: &str,
+    shares: &[Share],
+    share_kind: Option<ShareKind>,
+    extra: &str,
+    network: Option<&str>,
+    egress: &Egress,
+    bootstrap: &Bootstrap,
+    virtiofs_module: Option<&[u8]>,
 ) -> String {
     let mut material = format!("v{SEED_TEMPLATE_VERSION}\n{name}\n");
     if !shares.is_empty() {
@@ -205,6 +227,14 @@ fn fingerprint(
             "{}\t{}\t{}\n",
             share.tag, share.guest_path, share.host_path
         ));
+    }
+    if let Some(module) = virtiofs_module {
+        // The module was verified against its pinned package before reaching
+        // the seed. Bind the exact retained derivative to both the seed cache
+        // and NoCloud instance identity so it cannot change underneath either.
+        material.push_str("virtiofs-module-blake3\t");
+        material.push_str(&blake3::hash(module).to_hex());
+        material.push('\n');
     }
     if !extra.is_empty() {
         material.push_str(extra);
@@ -246,7 +276,7 @@ fn fingerprint(
 /// Guests get an `ast` user carrying the dedicated Asterism key plus any
 /// keys already in ~/.ssh, so both `ast ssh` and plain ssh work.
 fn build(name: &str, seed: &Path, input: &Input<'_>) -> Result<()> {
-    let stamp = fingerprint(
+    let stamp = fingerprint_with_module(
         name,
         input.shares,
         input.share_kind,
@@ -254,6 +284,7 @@ fn build(name: &str, seed: &Path, input: &Input<'_>) -> Result<()> {
         input.network_config,
         input.egress,
         input.bootstrap,
+        input.virtiofs_module,
     );
     let mut keys = vec![ensure_asterism_key()?];
     if let Ok(home) = std::env::var("HOME") {
@@ -275,11 +306,12 @@ fn build(name: &str, seed: &Path, input: &Input<'_>) -> Result<()> {
     // merged key by key rather than concatenated. A key that cannot be
     // merged says so instead of quietly losing one side.
     let config = merge(
-        &asterism_config(
+        &asterism_config_with_module(
             input.shares,
             input.share_kind,
             input.egress,
             input.bootstrap,
+            input.virtiofs_module,
         ),
         input.extra,
     )
@@ -366,19 +398,67 @@ fn asterism_config(
     egress: &Egress,
     bootstrap: &Bootstrap,
 ) -> String {
+    asterism_config_with_module(shares, share_kind, egress, bootstrap, None)
+}
+
+fn asterism_config_with_module(
+    shares: &[Share],
+    share_kind: Option<ShareKind>,
+    egress: &Egress,
+    bootstrap: &Bootstrap,
+    virtiofs_module: Option<&[u8]>,
+) -> String {
     let mut out = String::from("bootcmd:\n");
     out.push_str(HOSTKEY_BOOTCMD);
     out.push_str("write_files:\n");
     out.push_str(HOSTKEY_UNIT);
     out.push_str(&mount_units(shares, share_kind));
+    out.push_str(&virtiofs_module_file(virtiofs_module));
     out.push_str(&egress_files(egress));
     out.push_str(&bootstrap_files(bootstrap));
     out.push_str("runcmd:\n");
     out.push_str(&isolated_runcmd(HOSTKEY_RUNCMD));
+    out.push_str(&isolated_runcmd(&virtiofs_module_runcmd(virtiofs_module)));
     out.push_str(&isolated_runcmd(&mount_runcmd(shares, share_kind)));
     out.push_str(&isolated_runcmd(&egress_runcmd(egress)));
     out.push_str(&isolated_runcmd(&bootstrap_runcmd(bootstrap)));
     out
+}
+
+const GUEST_VIRTIOFS_MODULE: &str = "/var/lib/asterism/virtiofs.ko";
+
+fn virtiofs_module_file(module: Option<&[u8]>) -> String {
+    let Some(module) = module else {
+        return String::new();
+    };
+    let encoded = BASE64.encode(module);
+    let mut out = format!(
+        "\x20 - path: {GUEST_VIRTIOFS_MODULE}\n\
+         \x20   permissions: '0600'\n\
+         \x20   encoding: b64\n\
+         \x20   content: |\n"
+    );
+    for line in encoded.as_bytes().chunks(76) {
+        out.push_str("      ");
+        out.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
+        out.push('\n');
+    }
+    out
+}
+
+fn virtiofs_module_runcmd(module: Option<&[u8]>) -> String {
+    if module.is_none() {
+        return String::new();
+    }
+    format!(
+        "\x20 - |\n\
+         \x20   if ! grep -qw virtiofs /proc/filesystems; then\n\
+         \x20     if ! insmod {GUEST_VIRTIOFS_MODULE}; then\n\
+         \x20       echo 'asterism: could not load the pinned virtiofs kernel module' >&2\n\
+         \x20       exit 1\n\
+         \x20     fi\n\
+         \x20   fi\n"
+    )
 }
 
 /// Keep one cloud-init shell fragment from terminating the entries after it.
@@ -1095,6 +1175,55 @@ mod tests {
         );
         assert!(!config.contains("Type=9p"), "{config}");
         assert!(!config.contains("trans=virtio"), "{config}");
+    }
+
+    #[test]
+    fn direct_kernel_virtiofs_module_is_verified_input_loaded_before_mounts() {
+        let shares = [share("/workspace/source", "/mnt/ast/source")];
+        let config = asterism_config_with_module(
+            &shares,
+            Some(ShareKind::Virtiofs),
+            &Egress::default(),
+            &Bootstrap::default(),
+            Some(b"virtiofs"),
+        );
+        assert!(
+            config.contains("- path: /var/lib/asterism/virtiofs.ko"),
+            "{config}"
+        );
+        assert!(config.contains("encoding: b64"), "{config}");
+        assert!(config.contains("dmlydGlvZnM="), "{config}");
+        let runcmd = compiled_runcmd(&config);
+        let load = runcmd.find("insmod /var/lib/asterism/virtiofs.ko").unwrap();
+        let mount = runcmd
+            .find("systemctl enable --now \"$unit\"")
+            .unwrap_or_else(|| panic!("{runcmd}"));
+        assert!(load < mount, "{runcmd}");
+        assert!(runcmd.contains("could not load the pinned virtiofs kernel module"));
+        let without = fingerprint_with_module(
+            "dev",
+            &shares,
+            Some(ShareKind::Virtiofs),
+            "",
+            None,
+            &Egress::default(),
+            &Bootstrap::default(),
+            None,
+        );
+        let with = fingerprint_with_module(
+            "dev",
+            &shares,
+            Some(ShareKind::Virtiofs),
+            "",
+            None,
+            &Egress::default(),
+            &Bootstrap::default(),
+            Some(b"virtiofs"),
+        );
+        assert_ne!(
+            with, without,
+            "the module bytes must move the seed identity"
+        );
     }
 
     /// Two halves of the user-data can each need `runcmd:`, and YAML would

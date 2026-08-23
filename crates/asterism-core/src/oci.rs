@@ -1796,9 +1796,9 @@ fn virtiofs_module_path() -> PathBuf {
 
 /// The verified module paired with the OCI guest kernel.
 ///
-/// Only VZ directory shares need this. QEMU supplies 9p instead, so callers
-/// that do not select virtiofs never read or embed the module.
-fn virtiofs_module() -> Result<Vec<u8>> {
+/// Only virtiofs directory shares need this. QEMU supplies 9p instead, so
+/// callers that do not select virtiofs never read or embed the module.
+pub fn virtiofs_module() -> Result<Vec<u8>> {
     let module = virtiofs_module_path();
     if !module.exists() {
         bail!(

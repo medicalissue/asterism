@@ -678,6 +678,16 @@ pub trait Hypervisor: Send + Sync {
         Ok(None)
     }
 
+    /// A verified virtiofs module that must be carried in a cloud-image seed
+    /// when this backend direct-boots a kernel whose initrd omits it.
+    ///
+    /// Most backends boot the image's own kernel and return `None`. A direct
+    /// kernel backend may return the module paired with that kernel without
+    /// making backend-neutral seed construction know which VMM it serves.
+    fn guest_virtiofs_module(&self, _image_kind: ImageKind) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
     /// Create anything missing on disk: root overlay, firmware vars.
     /// Idempotent.
     fn prepare(&self, req: &BootReq) -> Result<Prepared>;
