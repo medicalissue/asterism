@@ -660,6 +660,24 @@ pub trait Hypervisor: Send + Sync {
         Ok(String::new())
     }
 
+    /// NoCloud `network-config` this backend's guests need, written next to
+    /// `user-data` in the seed [`crate::seed`] builds.
+    ///
+    /// `None` for a backend whose guests get an address some other way —
+    /// QEMU's user-mode net runs DHCP, Virtualization.framework does too —
+    /// which is the normal case and the default. It exists for a hypervisor
+    /// that puts a static address on a TAP and does not run a DHCP server:
+    /// stock cloud images then have nothing to talk to until cloud-init
+    /// applies this document, which it does before its Network Stage.
+    ///
+    /// Backend-neutral callers reach this through the trait rather than
+    /// asking which backend they hold. An empty document is treated as
+    /// `None` by the seed builder: adding this slot must not reissue
+    /// existing seeds.
+    fn guest_network_config(&self, _inst: &Instance) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Create anything missing on disk: root overlay, firmware vars.
     /// Idempotent.
     fn prepare(&self, req: &BootReq) -> Result<Prepared>;
@@ -877,6 +895,7 @@ mod tests {
             },
         );
         assert_eq!(Bare.guest_config(&inst).unwrap(), "");
+        assert_eq!(Bare.guest_network_config(&inst).unwrap(), None);
     }
 
     #[test]
