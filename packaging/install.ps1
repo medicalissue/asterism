@@ -30,7 +30,22 @@ $ErrorActionPreference = 'Stop'
 
 $Repo = 'medicalissue/asterism'
 $Version = $env:ASTERISM_VERSION
-$Prefix = if ($env:ASTERISM_PREFIX) { $env:ASTERISM_PREFIX } else { Join-Path $env:LOCALAPPDATA 'Asterism' }
+$Elevated = $false
+try {
+    $Elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+} catch { $Elevated = $false }
+# LocalSystem may only execute an ImagePath from a protected prefix. An
+# elevated install therefore lands in Program Files; a per-user prefix is
+# for the CLI only and `ast service install` will refuse it.
+$Prefix = if ($env:ASTERISM_PREFIX) {
+    $env:ASTERISM_PREFIX
+} elseif ($Elevated -and $env:ProgramFiles) {
+    Join-Path $env:ProgramFiles 'Asterism'
+} elseif ($env:LOCALAPPDATA) {
+    Join-Path $env:LOCALAPPDATA 'Asterism'
+} else {
+    Join-Path $PSScriptRoot 'Asterism'
+}
 $Force = $env:ASTERISM_FORCE -eq '1'
 $RequireSig = $env:ASTERISM_REQUIRE_SIGNATURE -eq '1'
 $PinnedSha = $env:ASTERISM_SHA256
@@ -124,6 +139,22 @@ function Uninstall-Service {
     & sc.exe delete $ServiceName 2>$null | Out-Null
 }
 
+function Install-FirewallRule([string]$Program) {
+    $name = 'Asterism device daemon'
+    $netsh = Get-Command netsh -ErrorAction SilentlyContinue
+    if (-not $netsh) {
+        Say "netsh is not on PATH; add firewall rule '$name' for $Program by hand"
+        return
+    }
+    & netsh advfirewall firewall delete rule name=$name 2>$null | Out-Null
+    $added = & netsh advfirewall firewall add rule name=$name dir=in action=allow program=$Program enable=yes profile=any 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Say "firewall rule '$name' allows inbound $Program"
+    } else {
+        Say "could not create firewall rule '$name' ($added). ast doctor will fail the firewall check until it exists."
+    }
+}
+
 function Install-Release {
     $target = Get-Target
     if (-not $Version) {
@@ -209,13 +240,18 @@ function Install-Release {
             Test-Authenticode (Join-Path $Prefix $rel)
         }
         Write-Receipt $Version $target 'release' $got $files
+        Install-FirewallRule (Join-Path $Prefix 'bin\astd.exe')
         if ($installed -and $installed -ne $Version) {
             Say "upgraded $installed -> $Version"
         }
         Say ''
         Say 'Windows persistence is a Windows Service. After install:'
         Say '    ast doctor'
-        Say '    ast service install'
+        if ($Elevated -and $Prefix -match 'Program Files') {
+            Say '    ast service install'
+        } else {
+            Say '    (SCM LocalSystem is refused for a user-writable prefix; reinstall elevated into Program Files to persist)'
+        }
         $binPath = Join-Path $Prefix 'bin'
         if (-not ($env:Path -split ';' | Where-Object { $_ -eq $binPath })) {
             Say ''
@@ -233,6 +269,10 @@ function Uninstall-Release {
         Die "no install receipt at $r — nothing to uninstall."
     }
     Uninstall-Service
+    $netsh = Get-Command netsh -ErrorAction SilentlyContinue
+    if ($netsh) {
+        & netsh advfirewall firewall delete rule name='Asterism device daemon' 2>$null | Out-Null
+    }
     $files = Read-ReceiptField 'files'
     foreach ($rel in ($files -split ' ')) {
         $f = Join-Path $Prefix $rel
