@@ -816,6 +816,14 @@ pub struct Part {
     pub note: Option<String>,
 }
 
+/// Names that select an instance's whole compute placement on the CLI.
+///
+/// CPU and physical RAM are supplied together. `cpu` remains an alias for
+/// compatibility, but neither resource can be placed independently.
+pub fn is_compute_part(part: &str) -> bool {
+    matches!(part, "compute" | "cpu")
+}
+
 pub fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -912,6 +920,14 @@ mod tests {
         let raw: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&inst).unwrap()).unwrap();
         assert_eq!(raw["cpu_device"], "desktop");
+    }
+
+    #[test]
+    fn compute_is_canonical_and_ram_is_not_a_placement_part() {
+        assert!(is_compute_part("compute"));
+        assert!(is_compute_part("cpu"));
+        assert!(!is_compute_part("ram"));
+        assert!(!is_compute_part("cpu/ram"));
     }
 
     #[test]
