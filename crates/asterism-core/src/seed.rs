@@ -96,6 +96,18 @@ pub struct Egress {
     pub handles: Vec<(String, String)>,
 }
 
+/// Backend-neutral and backend-supplied facts that determine one NoCloud
+/// seed. Keeping these together means adding a new seed artifact does not
+/// widen the seed builder's call boundary.
+pub struct Input<'a> {
+    pub shares: &'a [Share],
+    pub share_kind: Option<ShareKind>,
+    pub extra: &'a str,
+    pub network_config: Option<&'a str>,
+    pub egress: &'a Egress,
+    pub bootstrap: &'a Bootstrap,
+}
+
 impl Egress {
     pub fn is_empty(&self) -> bool {
         self.handles.is_empty()
@@ -138,28 +150,25 @@ pub fn shares(inst: &Instance) -> Vec<Share> {
 /// fingerprint moves, so a guest that has been up for a month applies the
 /// new work at its next boot rather than staying at whatever it was built
 /// with.
-pub fn ensure(
-    name: &str,
-    seed: &Path,
-    shares: &[Share],
-    share_kind: Option<ShareKind>,
-    extra: &str,
-    network: Option<&str>,
-    egress: &Egress,
-    bootstrap: &Bootstrap,
-) -> Result<()> {
-    if !shares.is_empty() && share_kind.is_none() {
+pub fn ensure(name: &str, seed: &Path, input: Input<'_>) -> Result<()> {
+    if !input.shares.is_empty() && input.share_kind.is_none() {
         bail!("cannot build mount units without a directory-share transport");
     }
     let stamp_path = seed.with_file_name("seed.stamp");
-    let stamp = fingerprint(name, shares, share_kind, extra, network, egress, bootstrap);
+    let stamp = fingerprint(
+        name,
+        input.shares,
+        input.share_kind,
+        input.extra,
+        input.network_config,
+        input.egress,
+        input.bootstrap,
+    );
     let current = std::fs::read_to_string(&stamp_path).unwrap_or_default();
     if seed.exists() && current.trim() == stamp {
         return Ok(());
     }
-    build(
-        name, seed, shares, share_kind, extra, network, egress, bootstrap,
-    )?;
+    build(name, seed, &input)?;
     std::fs::write(&stamp_path, &stamp)?;
     Ok(())
 }
@@ -236,17 +245,16 @@ fn fingerprint(
 
 /// Guests get an `ast` user carrying the dedicated Asterism key plus any
 /// keys already in ~/.ssh, so both `ast ssh` and plain ssh work.
-fn build(
-    name: &str,
-    seed: &Path,
-    shares: &[Share],
-    share_kind: Option<ShareKind>,
-    extra: &str,
-    network: Option<&str>,
-    egress: &Egress,
-    bootstrap: &Bootstrap,
-) -> Result<()> {
-    let stamp = fingerprint(name, shares, share_kind, extra, network, egress, bootstrap);
+fn build(name: &str, seed: &Path, input: &Input<'_>) -> Result<()> {
+    let stamp = fingerprint(
+        name,
+        input.shares,
+        input.share_kind,
+        input.extra,
+        input.network_config,
+        input.egress,
+        input.bootstrap,
+    );
     let mut keys = vec![ensure_asterism_key()?];
     if let Ok(home) = std::env::var("HOME") {
         if let Ok(entries) = std::fs::read_dir(PathBuf::from(home).join(".ssh")) {
@@ -267,8 +275,13 @@ fn build(
     // merged key by key rather than concatenated. A key that cannot be
     // merged says so instead of quietly losing one side.
     let config = merge(
-        &asterism_config(shares, share_kind, egress, bootstrap),
-        extra,
+        &asterism_config(
+            input.shares,
+            input.share_kind,
+            input.egress,
+            input.bootstrap,
+        ),
+        input.extra,
     )
     .with_context(|| format!("building the seed for {name:?}"))?;
 
@@ -289,7 +302,7 @@ fn build(
     let stage = seed.parent().unwrap().join("seed-files");
     let _ = std::fs::remove_dir_all(&stage);
     std::fs::create_dir_all(&stage)?;
-    write_nocloud_files(&stage, &user_data, &meta_data, network)?;
+    write_nocloud_files(&stage, &user_data, &meta_data, input.network_config)?;
 
     let _ = std::fs::remove_file(seed);
     if cfg!(target_os = "macos") {

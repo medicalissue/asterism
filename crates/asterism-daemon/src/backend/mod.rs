@@ -417,12 +417,14 @@ pub fn boot_req<'a>(inst: &'a Instance, hv: &dyn Hypervisor) -> Result<BootReq<'
     seed::ensure(
         &inst.name,
         &req.seed,
-        &shares,
-        share_kind,
-        &guest_config,
-        network_config.as_deref(),
-        &egress,
-        &bootstrap,
+        seed::Input {
+            shares: &shares,
+            share_kind,
+            extra: &guest_config,
+            network_config: network_config.as_deref(),
+            egress: &egress,
+            bootstrap: &bootstrap,
+        },
     )
     .context("building cloud-init seed")?;
     req.shares = shares;
