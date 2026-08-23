@@ -164,10 +164,13 @@ if [ "$BACKEND" = chv ]; then
   STATUS="$($AST status "$INST" 2>&1)"
   VMM_PID="$(sed -n 's/^running: chv pid \([0-9][0-9]*\),.*/\1/p' <<<"$STATUS")"
   [ -n "$VMM_PID" ] || fail "CHV status did not name its VMM pid:"$'\n'"$STATUS"
-  VMM_EXE="$(readlink -f "/proc/$VMM_PID/exe" 2>/dev/null || true)"
   EXPECTED_CHV="$(readlink -f "$(dirname "$ASTD")/cloud-hypervisor")"
-  [ "$VMM_EXE" = "$EXPECTED_CHV" ] \
-    || fail "CHV pid $VMM_PID executes $VMM_EXE, not shipped $EXPECTED_CHV"
+  # The shipped helper carries file capabilities on Linux.  The kernel may
+  # therefore deny readlink(2) on /proc/<pid>/exe even to the same uid after
+  # exec; the backend uses the NUL-terminated argv[0] for the same reason.
+  VMM_ARGV0="$(tr '\0' '\n' <"/proc/$VMM_PID/cmdline" | sed -n '1p')"
+  [ "$VMM_ARGV0" = "$EXPECTED_CHV" ] \
+    || fail "CHV pid $VMM_PID argv[0] is $VMM_ARGV0, not shipped $EXPECTED_CHV"
   [ -s "$ASTERISM_HOME/instances/$INST/virtiofs-0.resource.json" ] \
     || fail "CHV boot did not retain precise virtiofsd ownership"
   if pgrep -f '(^|/)qemu-system-[^ ]*' >/dev/null 2>&1; then
