@@ -26,11 +26,11 @@ use crate::snapshot::Snapshot;
 /// Virtualization.framework has no qcow2 at all, which is why this is data
 /// on the disk rather than an assumption in the boot code.
 ///
-/// * `Raw` is the one every backend can read, and what Asterism stores and
-///   creates: copy-on-write comes from the filesystem (`clonefile(2)` on
-///   APFS) rather than from the format.
-/// * `Qcow2` is legacy — instances created before that, and disk images a
-///   user points at directly. QEMU still boots them; VZ never will.
+/// * `Raw` is the one every backend can read. Raw-only backends convert
+///   catalog qcow2 into it lazily; copy-on-write comes from the filesystem
+///   (`clonefile(2)` on APFS) rather than from the format.
+/// * `Qcow2` is what publishers ship and what Cloud Hypervisor boots
+///   directly; also a local file a user points at. VZ never reads it.
 /// * `Asif` is Apple's own sparse format (macOS 26+), an opportunistic
 ///   upgrade for VZ hosts and not created yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

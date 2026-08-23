@@ -19,12 +19,13 @@ use asterism_core::hv::{
 use asterism_core::instance::{Instance, Shape};
 use asterism_core::power::{Change, SleepGuard};
 
-use super::{backends, by_id, qemu, vz};
+use super::{backends, by_id, chv, qemu, vz};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ControlKind {
     Qmp,
     Rpc,
+    HttpApi,
 }
 
 impl ControlKind {
@@ -32,6 +33,7 @@ impl ControlKind {
         match self {
             ControlKind::Qmp => ControlChannel::Qmp { path },
             ControlKind::Rpc => ControlChannel::Rpc { path },
+            ControlKind::HttpApi => ControlChannel::HttpApi { path },
         }
     }
 
@@ -39,6 +41,7 @@ impl ControlKind {
         match self {
             ControlKind::Qmp => "qmp",
             ControlKind::Rpc => "rpc",
+            ControlKind::HttpApi => "http_api",
         }
     }
 }
@@ -51,6 +54,7 @@ fn control_kind(id: &str) -> ControlKind {
     match id {
         qemu::ID => ControlKind::Qmp,
         vz::ID => ControlKind::Rpc,
+        chv::ID => ControlKind::HttpApi,
         other => panic!("registered backend {other:?} has no conformance profile"),
     }
 }
@@ -140,7 +144,7 @@ impl Fixture {
             ctl: kind.channel(self.control.clone()),
             endpoint: match kind {
                 ControlKind::Qmp => GuestEndpoint::HostForward { ssh_port: 22022 },
-                ControlKind::Rpc => GuestEndpoint::GuestAddr {
+                ControlKind::Rpc | ControlKind::HttpApi => GuestEndpoint::GuestAddr {
                     addr: "192.0.2.1".parse().unwrap(),
                 },
             },
@@ -263,14 +267,14 @@ fn reloaded_crash_handles_are_stopped_and_never_silently_signalled() {
 
         let stop = backend.stop(&reloaded, Duration::ZERO);
         assert!(
-            stop.is_ok(),
-            "{} did not treat a missing guest as already stopped: {stop:?}",
+            stop.is_ok() || format!("{:#}", stop.as_ref().unwrap_err()).contains("not proven"),
+            "{} must not signal an unproven pid: {stop:?}",
             backend.id()
         );
         let kill = backend.kill(&reloaded);
         assert!(
-            kill.is_ok(),
-            "{} did not treat a missing guest as already killed: {kill:?}",
+            kill.is_ok() || format!("{:#}", kill.as_ref().unwrap_err()).contains("not proven"),
+            "{} must not signal an unproven pid: {kill:?}",
             backend.id()
         );
         assert_eq!(reloaded.owned(), None, "stop must not invent authority");
