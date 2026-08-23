@@ -93,6 +93,7 @@ fi
 # guest policy, then execute only those binaries as the fresh service account.
 # This avoids granting that account access to the runner's home/toolchain.
 CUSE_OBSERVER_TARGET="${RUNNER_TEMP:-/tmp}/asterism-cuse-observer-target"
+CUSE_OBSERVER_INSTALL="/var/tmp/asterism-cuse-observers-${GITHUB_RUN_ID:-$$}"
 CUSE_TEST_BINARY=""
 CUSE_LIVE_BINARY=""
 if [ "$gate_rc" -eq 0 ]; then
@@ -137,6 +138,44 @@ if [ "$gate_rc" -eq 0 ]; then
     record "observer_compile_identity=ordinary_runner"
     record "observer_execute_identity=guest_service_asterism-gpu"
     record "observer_service_toolchain_access=false"
+  fi
+fi
+
+# GitHub's tool target lives below /home/runner, which the fresh service
+# identity must not be allowed to traverse. Install byte-identical observers
+# into a root-owned executable location instead of weakening either account.
+if [ "$gate_rc" -eq 0 ]; then
+  source_test_sha="$(sha256sum "$CUSE_TEST_BINARY" | awk '{print $1}')"
+  source_live_sha="$(sha256sum "$CUSE_LIVE_BINARY" | awk '{print $1}')"
+  set +e
+  {
+    sudo -n install -d -o root -g root -m 0755 "$CUSE_OBSERVER_INSTALL"
+    sudo -n install -o root -g root -m 0755 \
+      "$CUSE_TEST_BINARY" "$CUSE_OBSERVER_INSTALL/asterism-core-tests"
+    sudo -n install -o root -g root -m 0755 \
+      "$CUSE_LIVE_BINARY" "$CUSE_OBSERVER_INSTALL/live-cuse-gate"
+  } >"$EVIDENCE/observer-install.log" 2>&1
+  observer_install_rc=$?
+  set -e
+  record "observer_install_exit=$observer_install_rc"
+  if [ "$observer_install_rc" -ne 0 ]; then
+    block "exact CUSE observers could not be staged for the service identity" || gate_rc=1
+  else
+    CUSE_TEST_BINARY="$CUSE_OBSERVER_INSTALL/asterism-core-tests"
+    CUSE_LIVE_BINARY="$CUSE_OBSERVER_INSTALL/live-cuse-gate"
+    installed_test_sha="$(sha256sum "$CUSE_TEST_BINARY" | awk '{print $1}')"
+    installed_live_sha="$(sha256sum "$CUSE_LIVE_BINARY" | awk '{print $1}')"
+    record "observer_test_sha256=$installed_test_sha"
+    record "observer_live_sha256=$installed_live_sha"
+    if [ "$source_test_sha" != "$installed_test_sha" ] ||
+      [ "$source_live_sha" != "$installed_live_sha" ]; then
+      block "staged CUSE observer digest differs from the ordinary-runner build" || gate_rc=1
+    elif [ "$(stat -Lc '%U:%G:%a' "$CUSE_TEST_BINARY")" != root:root:755 ] ||
+      [ "$(stat -Lc '%U:%G:%a' "$CUSE_LIVE_BINARY")" != root:root:755 ]; then
+      block "staged CUSE observers are not root-owned mode 0755" || gate_rc=1
+    else
+      record "observer_staging=root_owned_0755_byte_identical"
+    fi
   fi
 fi
 
@@ -322,6 +361,10 @@ if [ -e /etc/udev/rules.d/70-asterism-cuse.rules ] ||
       | tee -a "$SUMMARY"
     record "guest_boundary_teardown=pass"
   fi
+fi
+
+if [ -d "$CUSE_OBSERVER_INSTALL" ]; then
+  sudo -n rm -rf "$CUSE_OBSERVER_INSTALL"
 fi
 
 if [ "$gate_rc" -eq 0 ]; then
