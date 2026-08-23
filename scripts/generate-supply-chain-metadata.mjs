@@ -56,7 +56,7 @@ const uniqueComponents = components.filter((component, index) =>
 const licenses = {
   format: "asterism-third-party-license-manifest-v1",
   release: releaseVersion,
-  artifacts: ["ast", "astd", "astd-vz"],
+  artifacts: ["ast", "astd", "astd-vz", "asterism-update"],
   components: uniqueComponents,
 };
 const sbom = {
@@ -70,7 +70,7 @@ const sbom = {
       version: releaseVersion,
       properties: [{
         name: "asterism:release-artifacts",
-        value: "ast,astd,astd-vz",
+        value: "ast,astd,astd-vz,asterism-update",
       }],
     },
   },
