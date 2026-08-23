@@ -186,11 +186,9 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$ASTERISM_HOME/images"
-# Reuse already-pulled images instead of re-downloading. The .raw is the one
-# that matters: a base already in raw form is what lets `ast pull` below be a
-# no-op. Converting a .qcow2 is the one step in this script that still shells
-# out to qemu-img (core/image.rs), which is a property of the image store and
-# not of the vz backend — hence the message on the pull.
+# Reuse already-pulled images instead of re-downloading. A cached qcow2 is
+# deliberately valid input: the native Rust materializer turns it into sparse
+# raw without QEMU before VZ sees it.
 # ...from the harness's own cache, never ~/.asterism: that one belongs to the
 # user's daemon and can be written to while this is reading it.
 harness_seed_images "$ASTERISM_HOME"
@@ -238,10 +236,7 @@ boot_seconds() {
 
 harness_cache_image "$AST" "$IMAGE" || fail "could not cache $IMAGE"
 harness_seed_images "$ASTERISM_HOME"
-pull_out="$("$AST" pull "$IMAGE" 2>&1)" || fail \
-  "pull $IMAGE:"$'\n'"$pull_out"$'\n'"(a base image that is still qcow2 is converted with qemu-img, \
-which is the image store's dependency, not the vz backend's — put a raw base in \
-$(harness_cache_dir)/images to run this on a device with no QEMU at all)"
+pull_out="$("$AST" pull "$IMAGE" 2>&1)" || fail "pull $IMAGE:"$'\n'"$pull_out"
 
 # ---- the vz instance -------------------------------------------------------
 #

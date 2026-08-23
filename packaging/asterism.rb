@@ -1,8 +1,9 @@
 # Asterism — Homebrew formula.
 #
-# Homebrew is the distributor of record here. `depends_on "qemu"` asks
-# Homebrew to install QEMU under its own terms; Asterism never ships a QEMU
-# binary and never links QEMU code. See docs/LICENSING.md §2.
+# Homebrew is the distributor of record here. Native VZ is the default macOS
+# backend and image materialisation is pure Rust, so QEMU is intentionally not
+# a formula dependency. Users selecting the compatibility backend install it
+# separately under its own terms.
 #
 # Homebrew only installs formulae that live in a tap — a loose .rb path or a
 # raw URL is rejected — so this file is the source of truth and the tap
@@ -32,7 +33,6 @@ class Asterism < Formula
 
   depends_on "rust" => :build
   depends_on "minisign"
-  depends_on "qemu"
 
   def install
     # `brew style` wants `cargo install *std_cargo_args` here, and this is a
@@ -81,8 +81,10 @@ class Asterism < Formula
 
   def caveats
     <<~EOS
-      Asterism runs virtual machines with QEMU, installed here as a dependency.
-      Asterism does not distribute QEMU.
+      Asterism uses Virtualization.framework by default on macOS. QEMU is an
+      optional compatibility backend and is not installed by this formula;
+      install it separately with `brew install qemu` before using
+      `--backend qemu`.
 
       `ast` starts the `astd` daemon on demand; there is nothing to launch by
       hand. State lives in ~/.asterism (override with ASTERISM_HOME).
@@ -106,7 +108,5 @@ class Asterism < Formula
     assert_predicate bin/"astd", :executable?
     assert_predicate bin/"astd-vz", :executable? if OS.mac?
 
-    # QEMU is a hard runtime dependency, not a suggestion.
-    assert_path_exists formula_opt_bin("qemu")/"qemu-img"
   end
 end

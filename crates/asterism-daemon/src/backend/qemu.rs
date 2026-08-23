@@ -187,8 +187,17 @@ impl Qemu {
 
 impl Probe {
     fn run() -> Result<Self> {
-        let system = tool(&format!("qemu-system-{}", image::host_arch()))?;
-        let img = tool("qemu-img")?;
+        let install = if cfg!(target_os = "macos") {
+            "install the optional compatibility backend with `brew install qemu`"
+        } else {
+            "install the optional QEMU system package and qemu-img/qemu-utils"
+        };
+        let system = tool(&format!("qemu-system-{}", image::host_arch())).with_context(|| {
+            format!("the optional qemu compatibility backend is unavailable; {install}")
+        })?;
+        let img = tool("qemu-img").with_context(|| {
+            format!("the optional qemu compatibility backend is unavailable; {install}")
+        })?;
         // The binaries, then the accelerator: a host with no KVM cannot run
         // a guest at all, whatever else it has, and each of these is asked
         // of the host in its own right rather than standing in for another.

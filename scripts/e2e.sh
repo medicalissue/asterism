@@ -27,6 +27,7 @@ harness_own_home "$ASTERISM_HOME"
 # throwaway key and this machine's addresses to a public discovery service.
 export ASTERISM_MESH=local
 IMAGE="${E2E_IMAGE:-debian:13}"
+BACKEND="${E2E_BACKEND:-qemu}"
 INST=e2e
 VOL="$ASTERISM_HOME/e2e-vol"   # dash on purpose: covers systemd \x2d escaping
 MARKER="marker-$$"
@@ -76,20 +77,20 @@ harness_seed_images "$ASTERISM_HOME"
 
 # The backend is named, not left to the daemon.
 #
-# This lane pins qemu because it exercises the 9p implementation and QEMU's
-# snapshot path together. The storage-parts lane covers the same directory
-# journey through VZ's virtiofs implementation.
+# QEMU remains the compatibility default for this historical lane. Native
+# no-QEMU evidence sets E2E_BACKEND=chv and exercises the same lifecycle over
+# Cloud Hypervisor/virtiofs.
 expect "create"  "$INST  defined"  \
-  "$AST" create "$INST" --backend qemu --image "$IMAGE" --mem 2G --disk 10G
+  "$AST" create "$INST" --backend "$BACKEND" --image "$IMAGE" --mem 2G --disk 10G
 expect "attach"  "/mnt/ast/e2e-vol" "$AST" attach "$INST" --volume "$VOL"
 expect "up"      "$INST  running"  "$AST" up "$INST"
 
-# And what it actually booted on, asserted rather than assumed: `--backend
-# qemu` is a request, and this is the line that catches a daemon that honours
+# And what it actually booted on, asserted rather than assumed: the explicit
+# backend is a request, and this is the line that catches a daemon that honours
 # it in its output and not in the guest.
-harness_assert_backend "$AST" "$INST" qemu \
+harness_assert_backend "$AST" "$INST" "$BACKEND" \
   || fail "the marker below would be proving something about a different backend"
-echo "ok: the guest is on qemu, exercising the 9p directory transport"
+echo "ok: the guest is on $BACKEND, exercising its directory transport"
 
 # First boot: sshd can come up before cloud-init has mounted the volumes,
 # so give the marker a bounded retry instead of failing on the race.
@@ -102,7 +103,7 @@ for _ in $(seq 1 30); do
   sleep 3
 done
 [ -n "$marker_seen" ] || fail "marker not visible in guest after first boot"
-echo "ok: marker via 9p"
+echo "ok: marker via the $BACKEND directory transport"
 
 expect "down"     "$INST  stopped"          "$AST" down "$INST"
 expect "snapshot" "$INST  snapshot clean"   "$AST" snapshot "$INST" clean

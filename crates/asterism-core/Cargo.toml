@@ -17,6 +17,9 @@ hostname.workspace = true
 # of numbers, which is a 4x expansion against a transport with a hard frame
 # cap. Already in the tree behind asterism-mesh.
 data-encoding = "2"
+# Qcow2 catalog images use headerless DEFLATE for compressed clusters. The
+# rust backend keeps materialisation native and adds no host library.
+flate2.workspace = true
 # The canonical HTTP types. The secrets policy engine reads and writes real
 # headers, and `http::HeaderMap` is the type every maintained Rust HTTP
 # component in this tree already speaks — including its `set_sensitive` flag,

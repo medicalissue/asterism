@@ -419,6 +419,14 @@ if grep -n 'master' "$INSTALL"; then
 fi
 ok "no reference to a master branch anywhere in the installer"
 
+if grep -qE 'depends_on[[:space:]]+"qemu"' "${ROOT}/packaging/asterism.rb"; then
+	fail "the default Homebrew formula still installs QEMU"
+fi
+if grep -qE 'apt-get install.*qemu|dnf install.*qemu' "$INSTALL"; then
+	fail "the default installer still contains a QEMU package install path"
+fi
+ok "default Homebrew and Linux installs contain no QEMU package dependency"
+
 # Every privileged command goes through run_root, which prints it and asks
 # first. One `sudo` in the whole file, and it is that one.
 sudo_calls="$(grep -cE '^[[:space:]]*sudo ' "$INSTALL" || true)"

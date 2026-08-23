@@ -996,24 +996,6 @@ note_linger() {
 	say "    loginctl enable-linger ${user}"
 }
 
-# Explicit compatibility installs may still use this helper. It is not called
-# by either Linux product install path.
-ensure_qemu_linux() {
-	if have qemu-system-x86_64 || have qemu-system-aarch64; then
-		return 0
-	fi
-	say "QEMU is missing, and Asterism needs it to run virtual machines."
-	if have apt-get; then
-		run_root apt-get install -y qemu-system qemu-utils
-	elif have dnf; then
-		run_root dnf install -y qemu-kvm qemu-img
-	else
-		err "This script only knows apt and dnf."
-		err "Install QEMU with your package manager, then re-run this script."
-		exit 1
-	fi
-}
-
 # ---- Homebrew --------------------------------------------------------------
 
 find_brew() {

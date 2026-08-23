@@ -236,6 +236,15 @@ fn copy_preserving_holes(src: &Path, dst: &Path) -> Result<Density> {
     Ok(density(support, &extents, meta.len()))
 }
 
+/// Image-store copy for a publisher that already ships raw bytes.
+///
+/// Kept as a narrow wrapper so callers do not need the clone fallback's
+/// density vocabulary; they only need the same create-new, failure cleanup
+/// and hole preservation guarantees.
+pub(crate) fn copy_sparse(src: &Path, dst: &Path) -> Result<()> {
+    copy_preserving_holes(src, dst).map(|_| ())
+}
+
 /// Create `dst`, hand it to `f`, and leave nothing behind if `f` fails.
 ///
 /// `create_new` is what makes "never overwrite" a fact about the open rather

@@ -320,8 +320,9 @@ no `master` branch, and still has exactly one `sudo` in it.
 
 ## Licensing
 
-`depends_on "qemu"` asks Homebrew to install QEMU under its own terms.
-Asterism never ships a QEMU binary and never links QEMU code; on the release
-path QEMU is not installed at all, only mentioned when it is missing.
+The Homebrew formula and release installer do not install QEMU. Native VZ and
+Cloud Hypervisor are the product paths, and qcow2-to-raw materialisation is
+implemented in Rust. QEMU remains an optional compatibility backend installed
+separately under its own terms; Asterism never ships or links its code.
 The formula likewise obtains the standalone `minisign` verifier from Homebrew;
 neither verifier code nor its binary is bundled into Asterism.
