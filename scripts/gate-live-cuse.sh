@@ -307,6 +307,7 @@ fi
 if [ "$gate_rc" -eq 0 ]; then
   set +e
   run_as_service_user env ASTERISM_BUILD_ID="$TARGET_COMMIT" \
+    ASTERISM_CUSE_TARGET_COMMIT="$TARGET_COMMIT" \
     "$CUSE_LIVE_BINARY" 2>&1 \
     | tee "$EVIDENCE/live-lifecycle.log"
   lifecycle_rc=${PIPESTATUS[0]}
