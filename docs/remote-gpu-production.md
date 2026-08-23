@@ -77,6 +77,9 @@ provider loss, generation-fenced recovery, expiry, token redaction, durable
 attachment status, and backup rebinding.
 
 The product acceptance gate still requires two real NVIDIA provider devices.
+The fail-closed matrix, deterministic two-device harness, `nvcc` kernel,
+no-cost dstack task (do not apply until Sol's server is healthy), and
+cost-input live in [remote-gpu-nvidia-gate.md](remote-gpu-nvidia-gate.md).
 It must record, from the exact commit under test:
 
 - CUDA result bytes through the guest-local `/dev/nvidia0` adapter;
