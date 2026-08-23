@@ -130,6 +130,36 @@ pub struct Resolved {
 }
 
 impl Resolved {
+    /// The verified artifact a backend may consume.
+    ///
+    /// A store written by an older release can contain only the adopted
+    /// qcow2 download while its raw derivative has not been materialised yet.
+    /// Keeping that distinction here lets a qcow2-capable backend use the
+    /// verified file without making raw-only backends learn about staging.
+    pub fn boot_path(&self) -> Result<(&Path, DiskFormat)> {
+        if self.path.exists() {
+            return Ok((&self.path, detect_format(&self.path)?));
+        }
+        if let Some(staging) = self.staging.as_ref().filter(|path| path.exists()) {
+            return Ok((staging, detect_format(staging)?));
+        }
+        bail!(
+            "{} is not on this device yet — pull it first: ast pull {}",
+            self.name,
+            self.name
+        )
+    }
+
+    fn active_record(&self) -> PathBuf {
+        if self.path.exists() {
+            self.record.clone()
+        } else if let Some(staging) = self.staging.as_ref().filter(|path| path.exists()) {
+            staging.clone()
+        } else {
+            self.record.clone()
+        }
+    }
+
     /// What kind of thing the bytes are — a disk to boot, or a root
     /// filesystem that needs a kernel put in front of it.
     pub fn kind(&self) -> ImageKind {
@@ -152,14 +182,9 @@ impl Resolved {
     pub fn verify_bootable(&self) -> Result<()> {
         // Not pulled is not the same as not sound, and the fix is different
         // enough that they must not share a sentence.
-        if !self.path.exists() {
-            bail!(
-                "{} is not on this device yet — pull it first: ast pull {}",
-                self.name,
-                self.name
-            );
-        }
-        verify::check_recorded(&self.path, &self.record, Depth::from_env())
+        let (path, _) = self.boot_path()?;
+        let record = self.active_record();
+        verify::check_recorded(path, &record, Depth::from_env())
             .with_context(|| format!("{} cannot be booted from", self.name))?;
         self.pin_satisfied()
     }
@@ -183,7 +208,8 @@ impl Resolved {
         let Some(want) = &self.expected else {
             return Ok(());
         };
-        let Some(record) = verify::provenance(&self.record) else {
+        let record_path = self.active_record();
+        let Some(record) = verify::provenance(&record_path) else {
             return Ok(());
         };
         let want = want.to_string();
@@ -299,6 +325,16 @@ impl Resolved {
         let Some(staging) = self.staging.as_ref().filter(|s| s.exists()) else {
             return Ok(false); // not pulled yet; the caller says so, not us
         };
+
+        // A staged artifact adopted by a current store has its own record.
+        // Recheck it before conversion: otherwise a changed qcow2 could be
+        // converted into a newly recorded raw image and lose the only proof
+        // tying it to the original download. Older stores may lack this
+        // sidecar, so their migration still follows the legacy path below.
+        if verify::provenance(staging).is_some() {
+            verify::check_recorded(staging, staging, Depth::from_env())
+                .with_context(|| format!("{} has a changed staged image", self.name))?;
+        }
 
         // What the download was, before it is turned into something else.
         // A converted image has no upstream digest of its own — nobody
@@ -883,9 +919,14 @@ fn catalog_row(reference: &str, depth: Depth) -> Result<ImageRow> {
             .unwrap_or_else(|| resolved.path.clone())
     };
     let pulled = path.exists();
-    let verified = resolved.path.exists()
-        && verify::check_recorded(&resolved.path, &resolved.record, depth).is_ok()
-        && resolved.pin_satisfied(&path).is_ok();
+    let verified = if resolved.path.exists() {
+        verify::check_recorded(&resolved.path, &resolved.record, depth).is_ok()
+            && resolved.pin_satisfied().is_ok()
+    } else if let Some(staging) = resolved.staging.as_ref().filter(|path| path.exists()) {
+        verify::check_recorded(staging, staging, depth).is_ok() && resolved.pin_satisfied().is_ok()
+    } else {
+        false
+    };
     let bytes = if pulled { file_len(&path)? } else { 0 };
     let digest = if resolved.path.exists() {
         verify::provenance(&resolved.path).map(|record| {
@@ -1704,6 +1745,52 @@ mod tests {
             "the staging copy is not kept"
         );
         assert!(!r.materialise().unwrap(), "and again is a no-op");
+    }
+
+    #[test]
+    fn a_verified_staged_qcow2_is_bootable_without_materialising_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("debian-13.raw");
+        let staging = dir.path().join("debian-13.qcow2");
+        let mut bytes = vec![0u8; 72];
+        bytes[..4].copy_from_slice(b"QFI\xfb");
+        bytes[4..8].copy_from_slice(&3u32.to_be_bytes());
+        bytes[24..32].copy_from_slice(&(1u64 << 30).to_be_bytes());
+        let part = dir.path().join("debian-13.qcow2.part");
+        std::fs::write(&part, &bytes).unwrap();
+        verify::adopt(
+            &part,
+            &staging,
+            None,
+            Source::new("download", "https://mirror.example/debian.qcow2"),
+        )
+        .unwrap();
+        assert!(verify::provenance(&staging).is_some());
+
+        let r = Resolved {
+            name: "debian:13".into(),
+            url: Some("https://mirror.example/debian.qcow2".into()),
+            record: path.clone(),
+            path,
+            format: DiskFormat::Raw,
+            staging: Some(staging.clone()),
+            oci: None,
+            expected: None,
+        };
+        let (boot, format) = r.boot_path().unwrap();
+        assert_eq!(boot, staging);
+        assert_eq!(format, DiskFormat::Qcow2);
+        r.verify_bootable().unwrap();
+        assert!(
+            !r.path.exists(),
+            "qcow2-capable callers do not need raw output"
+        );
+
+        std::fs::write(&staging, [bytes.as_slice(), &[1]].concat()).unwrap();
+        assert!(
+            r.verify_bootable().is_err(),
+            "tampered staging is fail-closed"
+        );
     }
 
     #[test]

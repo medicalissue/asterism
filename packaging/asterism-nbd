@@ -66,6 +66,11 @@ valid_owner() {
 	esac
 }
 
+valid_pid() {
+	case "$1" in '' | *[!0-9]*) return 1 ;; esac
+	[ "$1" -gt 0 ]
+}
+
 # Publish each record through a same-directory rename. A direct `>` would
 # expose an empty or truncated owner to a second helper after a signal or a
 # full filesystem. The claim directory itself is published only after both
@@ -100,7 +105,8 @@ reclaim_staging_claims() {
 claim_is_complete() {
 	claim=$1
 	owner=$(claim_owner "$claim" 2>/dev/null || true)
-	valid_owner "$owner"
+	helper_pid=$(cat "$claim/helper-pid" 2>/dev/null || true)
+	valid_owner "$owner" && valid_pid "$helper_pid"
 }
 
 # An older helper (or a crash exactly while upgrading it) can leave a claim
@@ -297,4 +303,4 @@ if ! grant_device "$device"; then
 	rollback_attach "$device" "$claim"
 	die "could not grant the invoking account access to $device"
 fi
-printf '%s\n' "$(cat "/sys/block/$(device_name "$device")/pid")" >"$claim/kernel-pid"
+printf '%s\n' "$(cat "$sysfs/$(device_name "$device")/pid")" >"$claim/kernel-pid"

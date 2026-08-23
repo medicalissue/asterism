@@ -288,9 +288,16 @@ pub fn image_ref_recording(reference: &str) -> Result<ImageRef> {
 /// Failing here is right — the alternative is telling the user their image
 /// is not pulled when it plainly is. On a vz host it is not optional at
 /// all: Virtualization.framework cannot read qcow2.
-fn materialised_image_ref(reference: &str) -> Result<ImageRef> {
+fn materialised_image_ref(reference: &str, retain_qcow2: bool) -> Result<ImageRef> {
     let resolved = image::resolve(reference)?;
-    if resolved.materialise()? {
+    let retain_staged_qcow2 = retain_qcow2
+        && !resolved.path.exists()
+        && resolved
+            .staging
+            .as_ref()
+            .filter(|path| path.exists())
+            .is_some_and(|path| image::detect_format(path).ok() == Some(DiskFormat::Qcow2));
+    if !retain_staged_qcow2 && resolved.materialise()? {
         eprintln!("astd: converted {} to a raw base image", resolved.name);
     }
     // The last gate before a hypervisor is handed a path, and the reason
@@ -299,11 +306,13 @@ fn materialised_image_ref(reference: &str) -> Result<ImageRef> {
     // where "still the image that was pulled" is established, for a cloud
     // image, an OCI rootfs and a file the user pointed at alike.
     resolved.verify_bootable()?;
+    let (path, format) = resolved.boot_path()?;
+    let path = path.to_owned();
     Ok(ImageRef {
         kind: resolved.kind(),
         name: resolved.name,
-        path: resolved.path,
-        format: resolved.format,
+        path,
+        format,
     })
 }
 
@@ -318,9 +327,13 @@ pub fn disk_req(inst: &Instance) -> Result<BootReq<'_>> {
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("instance has no image — recreate it with --image"))?;
     let dir = paths::instance_dir(&inst.name);
+    let retain_qcow2 = for_instance(inst)?
+        .caps()
+        .disk_formats
+        .contains(&DiskFormat::Qcow2);
     Ok(BootReq {
         instance: inst,
-        base: materialised_image_ref(reference)?,
+        base: materialised_image_ref(reference, retain_qcow2)?,
         seed: dir.join("seed.iso"),
         console: dir.join("console.log"),
         shares: Vec::new(),
