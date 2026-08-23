@@ -282,8 +282,26 @@ linux_guest_files() {
 	printf '%s' 'bin/guest-gpu/bin/asterism-gpu-guest bin/guest-gpu/lib/libcuda.so.1.0.0 bin/guest-gpu/lib/libcuda.so.1 bin/guest-gpu/lib/libcuda.so'
 }
 
+validate_linux_guest_artifacts() {
+	source_dir="${1:-}"
+	[ -n "$source_dir" ] || die "guest GPU artifact root is empty. Refusing to copy from an ambient /bin path."
+	case "$source_dir" in
+	/*) ;;
+	*) die "guest GPU artifact root is not absolute: ${source_dir}" ;;
+	esac
+	[ -x "${source_dir}/bin/asterism-gpu-guest" ] ||
+		die "guest GPU artifact root has no executable service: ${source_dir}"
+	[ -f "${source_dir}/lib/libcuda.so.1.0.0" ] ||
+		die "guest GPU artifact root has no generated libcuda: ${source_dir}"
+	[ "$(readlink "${source_dir}/lib/libcuda.so.1" 2>/dev/null || true)" = libcuda.so.1.0.0 ] ||
+		die "guest GPU artifact root has no exact libcuda.so.1 link: ${source_dir}"
+	[ "$(readlink "${source_dir}/lib/libcuda.so" 2>/dev/null || true)" = libcuda.so.1 ] ||
+		die "guest GPU artifact root has no exact libcuda.so link: ${source_dir}"
+}
+
 place_linux_guest() {
-	source_dir="$1"
+	source_dir="${1:-}"
+	validate_linux_guest_artifacts "$source_dir"
 	for rel in bin/asterism-gpu-guest lib/libcuda.so.1.0.0 lib/libcuda.so.1 lib/libcuda.so; do
 		place_at "${source_dir}/${rel}" "bin/guest-gpu/${rel}"
 	done
@@ -846,7 +864,13 @@ install_source() {
 		--package asterism-cli --package asterism-daemon)
 	linux_helpers=0
 	if [ "$(uname -s)" = "Linux" ]; then
-		guest_artifacts="$("${src}/scripts/build-guest-gpu-artifacts.sh" | tail -n 1)"
+		# The destination is installer-owned and absolute. Never derive a copy
+		# root from build output: an empty line would otherwise collapse the
+		# service source to /bin/asterism-gpu-guest. Build and validate the exact
+		# checked-out ref before prepare_chv_source performs any root mutation.
+		guest_artifacts="${TMPDIR_SELF}/guest-gpu"
+		"${src}/scripts/build-guest-gpu-artifacts.sh" "$guest_artifacts"
+		validate_linux_guest_artifacts "$guest_artifacts"
 		prepare_chv_source "$src"
 		linux_helpers=1
 	fi

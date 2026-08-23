@@ -739,6 +739,33 @@ set_host Darwin arm64
 
 # ---- 9. the source escape hatch --------------------------------------------
 
+# Keep the Linux source lane tied to an installer-owned absolute directory.
+# This is deliberately a source-contract check: the hermetic Darwin fixture
+# below does not execute Linux builds, while the hosted gate exercises the
+# real compiler and /dev/cuse boundary. Ordering matters because the guest
+# payload must be complete before prepare_chv_source can install host packages.
+source_contract="$(sed -n '/^install_source()/,/^prepare_chv_source()/p' "$INSTALL")"
+# These are literal source snippets; expansion would defeat the regression.
+# shellcheck disable=SC2016
+grep -qF 'guest_artifacts="${TMPDIR_SELF}/guest-gpu"' <<<"$source_contract" \
+	|| fail "the Linux source build has no nonempty installer-owned guest artifact root"
+# shellcheck disable=SC2016
+build_guest_line="$(grep -nF '"${src}/scripts/build-guest-gpu-artifacts.sh" "$guest_artifacts"' <<<"$source_contract" | cut -d: -f1)"
+# shellcheck disable=SC2016
+validate_guest_line="$(grep -nF 'validate_linux_guest_artifacts "$guest_artifacts"' <<<"$source_contract" | cut -d: -f1)"
+# shellcheck disable=SC2016
+prepare_chv_line="$(grep -nF 'prepare_chv_source "$src"' <<<"$source_contract" | cut -d: -f1)"
+[ -n "$build_guest_line" ] && [ -n "$validate_guest_line" ] && [ -n "$prepare_chv_line" ] \
+	|| fail "the Linux source guest artifact contract is incomplete"
+[ "$build_guest_line" -lt "$validate_guest_line" ] && [ "$validate_guest_line" -lt "$prepare_chv_line" ] \
+	|| fail "Linux source artifacts are not validated before privileged preparation"
+# shellcheck disable=SC2016
+grep -qF '$(linux_guest_files)' <<<"$source_contract" \
+	|| fail "the source install journal does not own the guest GPU payload"
+grep -qF 'remove_receipt_files || return 1' <<<"$(sed -n '/^rollback_incomplete_install()/,/^receipt_lists()/p' "$INSTALL")" \
+	|| fail "interrupted-install rollback does not remove journal-owned payloads"
+ok "the Linux source artifact path is absolute, validated before root mutation, and journal-owned"
+
 fresh_prefix source
 rm -f "${WORK}/cloned-ref" "${WORK}/cargo-args"
 run_install ok ASTERISM_METHOD=source XDG_CACHE_HOME="${WORK}/cache"
