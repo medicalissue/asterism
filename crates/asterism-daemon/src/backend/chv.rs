@@ -363,7 +363,12 @@ impl Hypervisor for Chv {
             direct_kernel: true,
             port_forward: false,
             guest_egress: None,
-            disk_formats: &[DiskFormat::Raw, DiskFormat::Qcow2],
+            // New Cloud Hypervisor instances use the same sparse raw base
+            // seam as VZ. Existing `disk.qcow2` instances remain readable in
+            // `prepare`; qcow2 is omitted here so a catalog source is
+            // materialized once and can be grown safely to the requested
+            // shape without an external converter.
+            disk_formats: &[DiskFormat::Raw],
         }
     }
 
@@ -3093,6 +3098,6 @@ mod tests {
         assert!(caps.disk_hotplug && caps.direct_kernel);
         assert!(caps.nbd_disks);
         assert!(!caps.port_forward && caps.guest_egress.is_none());
-        assert_eq!(caps.disk_formats, &[DiskFormat::Raw, DiskFormat::Qcow2]);
+        assert_eq!(caps.disk_formats, &[DiskFormat::Raw]);
     }
 }

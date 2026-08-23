@@ -74,9 +74,10 @@ SSH keys with cloud-init, and applies optional bootstrap profiles for tools
 such as git, tmux, Node, Claude Code, and Codex.
 
 On macOS, Asterism uses Virtualization.framework when it satisfies the
-instance's requirements and otherwise uses QEMU with Hypervisor.framework
-acceleration. Pass `--backend vz` or `--backend qemu` to require one and get a
-specific capability refusal when it cannot serve the instance.
+instance's requirements. QEMU is an optional compatibility backend, not an
+install dependency. Pass `--backend vz` or install QEMU separately and pass
+`--backend qemu` to require one and get a specific capability refusal when it
+cannot serve the instance.
 
 On Linux, a tagged release ships pinned Cloud Hypervisor v53.0 and virtiofsd
 v1.14.0 beside `ast` and `astd`. QEMU remains an explicit compatibility

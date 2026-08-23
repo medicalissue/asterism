@@ -116,8 +116,8 @@ impl CreateRequirements {
         if !caps.disk_formats.contains(&self.disk_format) {
             bail!(
                 "the {} backend cannot read a {} disk, and this base image is one — \
-                 it boots {}, so the image would have to be converted first \
-                 (`qemu-img convert -O raw`)",
+                 it boots {}, so import a standalone raw copy first or select \
+                 a backend that reads the source format",
                 hv.id(),
                 self.disk_format,
                 readable(caps.disk_formats)

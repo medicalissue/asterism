@@ -34,6 +34,7 @@ pub mod power;
 pub mod proc;
 pub mod profile;
 pub mod protocol;
+mod qcow2;
 pub mod registry;
 pub mod remote_gpu;
 pub mod rewrite;
