@@ -8,7 +8,7 @@
 //!
 //! Which backend runs an instance is decided **once, at create**, and
 //! recorded on the instance ([`asterism_core::hv::Machine`]). Two things
-//! follow: a device can run qemu and vz instances side by side, and an
+//! follow: a device can run qemu, vz, and hyperv instances side by side, and an
 //! instance never silently changes hypervisor underneath its disks.
 
 use std::path::Path;
@@ -21,6 +21,7 @@ use asterism_core::instance::{Instance, PortForward};
 use asterism_core::proc::{Evidence, Ownership, ProcId};
 use asterism_core::{image, paths, profile, seed};
 
+pub mod hyperv;
 pub mod qemu;
 pub mod qmp;
 pub mod vz;
@@ -36,7 +37,13 @@ mod conformance;
 fn backends() -> &'static [Arc<dyn Hypervisor>] {
     static BACKENDS: OnceLock<Vec<Arc<dyn Hypervisor>>> = OnceLock::new();
     BACKENDS
-        .get_or_init(|| vec![Arc::new(qemu::Qemu::new()), Arc::new(vz::Vz::new())])
+        .get_or_init(|| {
+            vec![
+                Arc::new(qemu::Qemu::new()),
+                Arc::new(vz::Vz::new()),
+                Arc::new(hyperv::HyperV::new()),
+            ]
+        })
         .as_slice()
 }
 
@@ -151,11 +158,11 @@ fn select_with(
         });
     }
 
-    // VZ is the lightest path on a capable host. Capability mismatches are
-    // ordinary reasons to try QEMU: OCI direct boot, loopback publishing and
-    // qcow2 base images all need facilities VZ does not currently expose.
+    // Each native host backend is tried before the portable QEMU path.
+    // Capability mismatches are ordinary reasons to continue: OCI direct
+    // boot, loopback publishing and qcow2 base images still need QEMU.
     let mut refusals = Vec::new();
-    for id in [vz::ID, qemu::ID] {
+    for id in [hyperv::ID, vz::ID, qemu::ID] {
         match resolve(id).and_then(|hv| runnable(hv, requirements)) {
             Ok(selection) => return Ok(selection),
             Err(error) => refusals.push(format!("{id}: {error:#}")),
@@ -170,8 +177,9 @@ fn select_with(
 /// Select and probe the backend for a create request.
 ///
 /// An explicit `--backend` is forced: its own probe or capability refusal is
-/// returned. The default tries the fastest/lightest capable backend now — VZ
-/// first, then QEMU — and returns both reasons if neither can run the request.
+/// returned. The default tries the native host backend first — Hyper-V, then
+/// VZ, then the portable QEMU path — and returns every refusal if none can
+/// run the request.
 pub fn select_for(requested: Option<&str>, requirements: CreateRequirements) -> Result<Machine> {
     select_with(requested, requirements, by_id)
 }
@@ -1181,9 +1189,13 @@ mod tests {
     fn backends_are_reached_by_id_and_unknown_ones_are_named() {
         assert_eq!(by_id("qemu").unwrap().id(), "qemu");
         assert_eq!(by_id("vz").unwrap().id(), "vz");
+        assert_eq!(by_id("hyperv").unwrap().id(), "hyperv");
         let err = format!("{:#}", by_id("xen").err().expect("no xen backend"));
         assert!(err.contains("xen"), "{err}");
-        assert!(err.contains("qemu") && err.contains("vz"), "{err}");
+        assert!(
+            err.contains("qemu") && err.contains("vz") && err.contains("hyperv"),
+            "{err}"
+        );
     }
 
     /// An OCI image is a filesystem with no bootloader, so it can only be
