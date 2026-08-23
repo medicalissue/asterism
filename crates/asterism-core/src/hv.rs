@@ -398,17 +398,18 @@ impl std::fmt::Display for ShareKind {
     }
 }
 
-/// How a guest reaches a listener the daemon put up for it, and — the part
-/// that matters — how it does so without that listener being reachable by
-/// anything else.
+/// How a guest reaches the host egress plane, and — the part that matters —
+/// how it does so without a listener being reachable by anything else.
 ///
 /// This is a capability and not a constant because it is genuinely a property
-/// of the *hypervisor's* networking, and the two backends in this tree differ
-/// on it in a way that cannot be papered over. A backend with no safe answer
-/// says `None`, and the secrets data plane refuses to bind on it. That is the
-/// whole reason this enum exists: the alternative to refusing is binding a
-/// wildcard address and calling the result guest-only, which would put an
-/// unauthenticated proxy for somebody's API keys on their LAN.
+/// of the *hypervisor's* door into the host, and the backends in this tree
+/// differ on it in a way that cannot be papered over. Callers match on this
+/// enum rather than on [`Hypervisor::id`]: a new backend that can offer one
+/// of these routes opts in here, and a backend with no safe answer says
+/// `None`. That is the whole reason the enum exists. The alternative to
+/// refusing is binding a wildcard address and calling the result guest-only,
+/// which would put an unauthenticated proxy for somebody's API keys on the
+/// LAN.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuestEgress {
     /// The backend runs a user-mode NAT whose gateway address is a virtual
@@ -419,6 +420,19 @@ pub enum GuestEgress {
         /// The address the guest calls the host by: `10.0.2.2` for QEMU's
         /// user-net, whose layout is fixed and documented.
         gateway: &'static str,
+    },
+    /// The guest binds a loopback HTTP CONNECT proxy of its own. Streams
+    /// ride an authenticated virtio socket to the host egress plane. The
+    /// host binds no TCP listener at all — which is the whole of why this
+    /// is safe on a shared NAT, where a host-side bind the guest could
+    /// reach would also be reachable by other guests and, on some
+    /// configurations, the LAN.
+    GuestLoopback {
+        /// Address the in-guest proxy binds. Always loopback.
+        bind: &'static str,
+        /// TCP port the in-guest proxy listens on. Stable so a seed can
+        /// name it without a host-side allocation.
+        port: u16,
     },
 }
 

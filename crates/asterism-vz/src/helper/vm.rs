@@ -22,7 +22,8 @@
 use std::cell::{Cell, RefCell};
 use std::ffi::{c_int, c_void};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
-use std::path::Path;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -30,7 +31,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass, MainThreadOnly};
+use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass, MainThreadOnly, Message};
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSDate, NSError, NSFileHandle, NSObject, NSObjectProtocol,
     NSRunLoop, NSString, NSURL,
@@ -48,11 +49,12 @@ use objc2_virtualization::{
     VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
     VZVirtioEntropyDeviceConfiguration, VZVirtioFileSystemDeviceConfiguration,
     VZVirtioNetworkDeviceConfiguration, VZVirtioSocketConnection, VZVirtioSocketDevice,
-    VZVirtioSocketDeviceConfiguration, VZVirtioTraditionalMemoryBalloonDeviceConfiguration,
-    VZVirtualMachine, VZVirtualMachineConfiguration, VZVirtualMachineDelegate,
-    VZVirtualMachineState,
+    VZVirtioSocketDeviceConfiguration, VZVirtioSocketListener, VZVirtioSocketListenerDelegate,
+    VZVirtioTraditionalMemoryBalloonDeviceConfiguration, VZVirtualMachine,
+    VZVirtualMachineConfiguration, VZVirtualMachineDelegate, VZVirtualMachineState,
 };
 
+use asterism_vz::guest::Key;
 use asterism_vz::{Config, Disk, State, StopReason, StorageError};
 
 /// Shared between the delegate object and the run loop. `Rc`, not `Arc`:
@@ -249,6 +251,57 @@ define_class!(
     }
 );
 
+struct EgressIvars {
+    key: Key,
+    sock: PathBuf,
+    instance: String,
+    connections: Rc<RefCell<Vec<Retained<VZVirtioSocketConnection>>>>,
+}
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "AsterismVzEgressListener"]
+    #[ivars = EgressIvars]
+    struct EgressDelegate;
+
+    unsafe impl NSObjectProtocol for EgressDelegate {}
+
+    unsafe impl VZVirtioSocketListenerDelegate for EgressDelegate {
+        #[unsafe(method(listener:shouldAcceptNewConnection:fromSocketDevice:))]
+        fn should_accept(
+            &self,
+            _listener: &VZVirtioSocketListener,
+            connection: &VZVirtioSocketConnection,
+            _device: &VZVirtioSocketDevice,
+        ) -> bool {
+            let fd = match duplicate_socket_fd(unsafe { connection.fileDescriptor() }) {
+                Ok(fd) => fd,
+                Err(e) => {
+                    eprintln!(
+                        "astd-vz: {}: refusing an egress connection: {e}",
+                        self.ivars().instance
+                    );
+                    return false.into();
+                }
+            };
+            let held = connection.retain();
+            self.ivars().connections.borrow_mut().push(held);
+            let key = self.ivars().key.clone();
+            let sock = self.ivars().sock.clone();
+            let instance = self.ivars().instance.clone();
+            std::thread::spawn(move || {
+                // SAFETY: duplicate_socket_fd gave us our own descriptor.
+                let stream = unsafe { UnixStream::from_raw_fd(fd) };
+                if let Err(e) = asterism_vz::egress::serve_host_stream(stream, &key, &sock) {
+                    eprintln!("astd-vz: {instance}: egress stream ended: {e:#}");
+                }
+            });
+            true.into()
+        }
+    }
+);
+
 fn url(path: &Path) -> Retained<NSURL> {
     NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()))
 }
@@ -385,6 +438,10 @@ pub struct Machine {
     /// framework's own accounting honest, and dropping it is how a session
     /// that has ended is actually torn down.
     connection: RefCell<Option<Retained<VZVirtioSocketConnection>>>,
+    /// Host-side vsock listener for secret-egress streams. Weak-delegate
+    /// plus the listener itself, both retained for the life of the VM.
+    egress_listener: RefCell<Option<Retained<VZVirtioSocketListener>>>,
+    _egress_delegate: RefCell<Option<Retained<EgressDelegate>>>,
     pub signals: Rc<Signals>,
 }
 
@@ -790,6 +847,8 @@ pub unsafe fn start(config: &Config) -> Result<Machine> {
         socket_device,
         connecting: RefCell::new(None),
         connection: RefCell::new(None),
+        egress_listener: RefCell::new(None),
+        _egress_delegate: RefCell::new(None),
         signals,
     })
 }
@@ -939,6 +998,44 @@ impl Machine {
     /// Has a connect been asked for and not yet answered?
     pub fn connect_in_flight(&self) -> bool {
         self.connecting.borrow().is_some()
+    }
+
+    /// Listen on the egress vsock port and splice each authenticated stream
+    /// onto `sock`, which astd binds. Fail closed if that path is missing.
+    ///
+    /// # Safety
+    /// Main thread only.
+    pub unsafe fn listen_egress(&self, key: Key, sock: PathBuf, instance: String) {
+        let Some(device) = self.socket_device.as_ref() else {
+            eprintln!("astd-vz: {instance}: no virtio socket device — no egress listener");
+            return;
+        };
+        let Some(mtm) = MainThreadMarker::new() else {
+            eprintln!("astd-vz: {instance}: egress listener must be installed on the main thread");
+            return;
+        };
+        let connections = Rc::new(RefCell::new(Vec::new()));
+        let delegate = {
+            let this = EgressDelegate::alloc(mtm).set_ivars(EgressIvars {
+                key,
+                sock,
+                instance: instance.clone(),
+                connections,
+            });
+            let this: Retained<EgressDelegate> = msg_send![super(this), init];
+            this
+        };
+        let listener = unsafe { VZVirtioSocketListener::new() };
+        unsafe {
+            listener.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+            device.setSocketListener_forPort(&listener, asterism_vz::egress::PORT);
+        }
+        *self.egress_listener.borrow_mut() = Some(listener);
+        *self._egress_delegate.borrow_mut() = Some(delegate);
+        eprintln!(
+            "astd-vz: {instance}: egress listener on vsock port {}",
+            asterism_vz::egress::PORT
+        );
     }
 
     /// Release the connection a finished session was running on.
