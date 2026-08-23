@@ -177,6 +177,11 @@ fn main() -> anyhow::Result<()> {
     };
     let mut agent = agent::Agent::default();
     let mut reconnect = Reconnect::new();
+    if let (Some(key), Some(path)) = (agent_key.as_ref(), config.egress_sock.as_ref()) {
+        unsafe {
+            machine.listen_egress(key.clone(), path.clone(), config.instance.clone());
+        }
+    }
 
     // The guest's address, hunted on a thread of its own — the fallback for
     // a guest with no agent to ask. Both halves of the hunt block — reading

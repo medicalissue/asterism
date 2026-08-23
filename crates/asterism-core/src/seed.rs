@@ -85,7 +85,9 @@ impl Share {
 /// instance — which is what a handle is for.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Egress {
-    /// Where the guest reaches the proxy: `http://10.0.2.2:38123`.
+    /// Where the guest reaches the proxy: `http://10.0.2.2:38123` on a
+    /// loopback-gateway backend, or `http://127.0.0.1:18765` on a guest
+    /// that binds its own loopback proxy and carries streams over vsock.
     pub proxy: String,
     /// PEM of this instance's own CA, whose private key stays on the host.
     pub ca_pem: String,

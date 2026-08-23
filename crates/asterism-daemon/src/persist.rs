@@ -219,6 +219,11 @@ pub async fn resurrect(registry: &Arc<Mutex<Shard>>) {
                     .unwrap_or_else(|| "no process of its own".into())
             );
             crate::volume::reattach(&inst).await;
+            // The egress unix/TCP listener died with this process. The
+            // helper (and the guest) outlived us; restoring the plane is
+            // what makes the next CONNECT fail closed until we are back,
+            // then succeed again — not hang on a socket nothing owns.
+            crate::egress::refresh_bindings(&inst);
             continue;
         }
         if inst.policy.restart == Restart::Never {

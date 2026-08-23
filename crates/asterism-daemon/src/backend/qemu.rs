@@ -268,8 +268,9 @@ impl Hypervisor for Qemu {
             // The same user-net, seen from the other side: connections the
             // guest makes to 10.0.2.2 are proxied to this host's loopback, so
             // a listener on 127.0.0.1 is reachable from the guest and from
-            // nothing on the wire. That is the whole of what the secrets
-            // egress proxy needs, and it is why it works here and not on vz.
+            // nothing on the wire. VZ's door is a different [`GuestEgress`]
+            // variant — guest loopback over vsock — matched by the egress
+            // plane as a typed route, not as `if backend == "vz"`.
             guest_egress: Some(GuestEgress::LoopbackGateway {
                 gateway: GUEST_GATEWAY,
             }),

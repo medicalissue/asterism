@@ -52,6 +52,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+pub mod egress;
 pub mod guest;
 
 /// Name of the helper binary, as `astd` looks for it and as `codesign`
@@ -136,6 +137,12 @@ pub struct Config {
     /// NAT, exactly as it did before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_key: Option<PathBuf>,
+    /// Unix socket the helper splices authenticated egress streams onto.
+    /// astd binds it; the helper only connects. Absent on a helper older
+    /// than the egress plane, and on a guest with no agent key — both mean
+    /// the same thing: no vsock listener, and a guest CONNECT fail-closes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_sock: Option<PathBuf>,
 }
 
 /// Virtualization.framework's native Linux boot-loader inputs.
@@ -580,6 +587,7 @@ mod tests {
             mac: mac_for("dev"),
             dhcp_lease_is_endpoint: true,
             agent_key: Some("/i/dev/agent.key".into()),
+            egress_sock: Some("/i/dev/egress/vsock.sock".into()),
         };
         config.write(&path).unwrap();
         assert_eq!(Config::read(&path).unwrap(), config);
@@ -598,6 +606,7 @@ mod tests {
         assert!(config.direct_kernel.is_none());
         assert!(!config.dhcp_lease_is_endpoint);
         assert!(config.shares.is_empty());
+        assert!(config.egress_sock.is_none());
     }
 
     #[test]

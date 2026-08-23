@@ -48,8 +48,8 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use asterism_core::hv::{
-    BootReq, Caps, ControlChannel, DirectKernel, DiskFormat, DiskSpec, GuestEndpoint, GuestHealth,
-    Handle, Hypervisor, ImageKind, Prepared, Ready, RunState, ShareKind, SnapshotId,
+    BootReq, Caps, ControlChannel, DirectKernel, DiskFormat, DiskSpec, GuestEgress, GuestEndpoint,
+    GuestHealth, Handle, Hypervisor, ImageKind, Prepared, Ready, RunState, ShareKind, SnapshotId,
 };
 use asterism_core::instance::{now_unix, Instance};
 use asterism_core::proc::{ProcId, Signal};
@@ -389,15 +389,16 @@ impl Hypervisor for Vz {
             // The guest gets an address of its own on the NAT, so there is
             // nothing to forward from this host's loopback.
             port_forward: false,
-            // And for the same reason, no guest-only door into this host.
-            // macOS's NAT puts the guest on a shared bridge with an address
-            // of its own; a listener the guest could reach would have to be
-            // bound on that bridge's host address, which is a real interface
-            // that other guests — and, on some configurations, the LAN — can
-            // reach too. There is no loopback path here, so this says so and
-            // the secrets data plane refuses to bind on vz rather than
-            // opening an unauthenticated proxy for somebody's API keys.
-            guest_egress: None,
+            // The guest-only door is the authenticated virtio socket the
+            // helper already holds, not a TCP listener on the shared NAT.
+            // The guest agent binds loopback inside the guest and carries
+            // CONNECT streams over vsock; astd binds a unix socket the
+            // helper splices onto. Caps is truthful only because that
+            // whole path exists in this build.
+            guest_egress: Some(GuestEgress::GuestLoopback {
+                bind: asterism_vz::egress::GUEST_PROXY_BIND,
+                port: asterism_vz::egress::GUEST_PROXY_PORT,
+            }),
             disk_formats: &[DiskFormat::Raw],
         }
     }
@@ -495,6 +496,17 @@ impl Hypervisor for Vz {
             cmdline: direct.cmdline.clone(),
         });
 
+        // The key, not the bytes: `vz.json` is what a human reads to find
+        // out what a running guest was built from, and a secret does not
+        // belong in it. Only named when it is actually there — an instance
+        // whose seed predates the agent has no key file, and telling the
+        // helper to look for one would be a boot that complains instead of
+        // one that falls back.
+        let agent_key = prep
+            .kernel
+            .is_none()
+            .then(|| paths::guest_agent_key_path(&inst.name))
+            .filter(|path| path.exists());
         let config = Config {
             instance: inst.name.clone(),
             root: prep.root_path()?.to_owned(),
@@ -517,17 +529,15 @@ impl Hypervisor for Vz {
             // this instance's pinned MAC, so a current matching lease is
             // the endpoint rather than merely a candidate for an ssh probe.
             dhcp_lease_is_endpoint: prep.kernel.is_some(),
-            // The key, not the bytes: `vz.json` is what a human reads to
-            // find out what a running guest was built from, and a secret
-            // does not belong in it. Only named when it is actually there —
-            // an instance whose seed predates the agent has no key file,
-            // and telling the helper to look for one would be a boot that
-            // complains instead of one that falls back.
-            agent_key: prep
-                .kernel
-                .is_none()
-                .then(|| paths::guest_agent_key_path(&inst.name))
-                .filter(|path| path.exists()),
+            agent_key: agent_key.clone(),
+            // Named when the agent is named: the helper listens on vsock
+            // and splices onto this unix socket. astd binds it from the
+            // egress plane; the helper only connects. Absent on a guest
+            // with no agent, so an old helper's missing field and a guest
+            // that cannot CONNECT fail closed the same way.
+            egress_sock: agent_key
+                .as_ref()
+                .map(|_| crate::egress::vsock_path(&inst.name)),
         };
         let config_path = req.dir.join("vz.json");
         config.write(&config_path)?;

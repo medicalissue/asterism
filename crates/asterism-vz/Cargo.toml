@@ -98,6 +98,7 @@ features = [
     "VZVirtioSocketConnection",
     "VZVirtioSocketDevice",
     "VZVirtioSocketDeviceConfiguration",
+    "VZVirtioSocketListener",
     "VZVirtioTraditionalMemoryBalloonDeviceConfiguration",
     "VZVirtualMachine",
     "VZVirtualMachineConfiguration",
