@@ -177,15 +177,30 @@ impl Key {
     /// two proofs of one handshake are different values and neither can
     /// stand in for the other.
     pub fn proof(&self, version: u32, side: &str, guest_nonce: &str, host_nonce: &str) -> String {
+        self.proof_for("asterism-guest", version, side, guest_nonce, host_nonce)
+    }
+
+    /// The same construction under a different domain label.
+    ///
+    /// The egress data plane reuses this key but not this label, so a
+    /// control-channel proof can never be replayed as an egress proof.
+    pub fn proof_for(
+        &self,
+        domain: &str,
+        version: u32,
+        side: &str,
+        guest_nonce: &str,
+        host_nonce: &str,
+    ) -> String {
         hex(&hmac_sha256(
             &self.0,
-            format!("asterism-guest/{version} {side} {guest_nonce} {host_nonce}").as_bytes(),
+            format!("{domain}/{version} {side} {guest_nonce} {host_nonce}").as_bytes(),
         ))
     }
 }
 
 /// Compare two proofs without leaking where they first differ.
-fn same_proof(a: &str, b: &str) -> bool {
+pub(crate) fn same_proof(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -520,7 +535,7 @@ pub fn pick_version(theirs: &[u32]) -> Option<u32> {
         .copied()
 }
 
-fn read_line<T: serde::de::DeserializeOwned>(reader: &mut impl BufRead) -> Result<T> {
+pub(crate) fn read_line<T: serde::de::DeserializeOwned>(reader: &mut impl BufRead) -> Result<T> {
     let line = read_frame(reader)?;
     let line =
         std::str::from_utf8(&line).context("the guest agent sent a frame that was not utf-8")?;
@@ -535,7 +550,7 @@ fn read_line<T: serde::de::DeserializeOwned>(reader: &mut impl BufRead) -> Resul
 /// particular, the chunk containing the newline is checked too: a peer
 /// cannot fill the buffer to the limit and smuggle one more byte beside the
 /// terminator.
-fn read_frame(reader: &mut impl BufRead) -> Result<Vec<u8>> {
+pub(crate) fn read_frame(reader: &mut impl BufRead) -> Result<Vec<u8>> {
     let mut frame = Vec::new();
     loop {
         let chunk = reader.fill_buf()?;
@@ -564,7 +579,7 @@ fn read_frame(reader: &mut impl BufRead) -> Result<Vec<u8>> {
     }
 }
 
-fn write_line(writer: &mut impl Write, value: &impl Serialize) -> Result<()> {
+pub(crate) fn write_line(writer: &mut impl Write, value: &impl Serialize) -> Result<()> {
     let mut line = serde_json::to_vec(value)?;
     line.push(b'\n');
     writer.write_all(&line)?;
@@ -646,7 +661,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -695,13 +710,27 @@ import hmac
 import json
 import os
 import socket
+import struct
 import subprocess
 import sys
+import threading
 import time
 
 NAME = "asterism-guest"
 VERSIONS = [1]
 PORT = 1023
+# Separate data plane. The control channel above is host-connects-to-guest;
+# this is guest-connects-to-host, so a loopback HTTP CONNECT inside the
+# guest can reach the host without a TCP listener on the shared NAT.
+EGRESS_NAME = "asterism-egress"
+EGRESS_VERSIONS = [1]
+EGRESS_VSOCK_PORT = 1022
+EGRESS_TCP_PORT = 18765
+HOST_CID = 2
+FRAME_DATA = 1
+FRAME_WINDOW = 2
+FRAME_CLOSE = 3
+MAX_WINDOW = 256 * 1024
 # The one path that is not fixed: a test drives this very file without a
 # virtual machine, and it has no /etc to write into.
 KEY_PATH = os.environ.get("ASTERISM_AGENT_KEY", "/etc/asterism/agent.key")
@@ -735,7 +764,11 @@ def load_key():
 
 
 def proof(key, version, side, guest_nonce, host_nonce):
-    message = "asterism-guest/%d %s %s %s" % (version, side, guest_nonce, host_nonce)
+    return proof_for("asterism-guest", key, version, side, guest_nonce, host_nonce)
+
+
+def proof_for(domain, key, version, side, guest_nonce, host_nonce):
+    message = "%s/%d %s %s %s" % (domain, version, side, guest_nonce, host_nonce)
     return hmac.new(key, message.encode(), hashlib.sha256).hexdigest()
 
 
@@ -970,6 +1003,256 @@ def serve(key, inp, out):
             return
 
 
+class Credit:
+    """Bytes we may still send before the peer grants more WINDOW."""
+
+    def __init__(self, initial):
+        self.available = initial
+        self.cv = threading.Condition()
+
+    def take(self, want):
+        with self.cv:
+            while self.available < 1:
+                if not self.cv.wait(timeout=120):
+                    raise socket.timeout("the egress peer granted no window")
+            n = min(want, self.available, MAX_FRAME_BYTES)
+            self.available -= n
+            return n
+
+    def give(self, n):
+        with self.cv:
+            self.available += n
+            self.cv.notify_all()
+
+
+def write_frame(sock, typ, payload):
+    if len(payload) > MAX_FRAME_BYTES:
+        raise ValueError("egress frame larger than %d" % MAX_FRAME_BYTES)
+    sock.sendall(struct.pack("!BI", typ, len(payload)) + payload)
+
+
+def read_frame(sock):
+    hdr = b""
+    while len(hdr) < 5:
+        chunk = sock.recv(5 - len(hdr))
+        if not chunk:
+            return None
+        hdr += chunk
+    typ = hdr[0] if isinstance(hdr[0], int) else ord(hdr[0])
+    length = struct.unpack("!I", hdr[1:5])[0]
+    if length > MAX_FRAME_BYTES:
+        log("closing an egress stream whose frame exceeded %d bytes" % MAX_FRAME_BYTES)
+        return None
+    payload = b""
+    while len(payload) < length:
+        chunk = sock.recv(length - len(payload))
+        if not chunk:
+            return None
+        payload += chunk
+    return typ, payload
+
+
+def send_sock(sock, obj):
+    sock.sendall((json.dumps(obj) + "\n").encode())
+
+
+def recv_line(sock):
+    buf = b""
+    while b"\n" not in buf:
+        chunk = sock.recv(1)
+        if not chunk:
+            return None
+        buf += chunk
+        if len(buf) > MAX_FRAME_BYTES:
+            raise ValueError("egress handshake frame exceeded %d bytes" % MAX_FRAME_BYTES)
+    return json.loads(buf.decode().strip())
+
+
+def egress_handshake(sock, key):
+    """Guest side of the vsock data-plane handshake."""
+    guest_nonce = os.urandom(16).hex()
+    send_sock(sock, {
+        "agent": EGRESS_NAME,
+        "versions": EGRESS_VERSIONS,
+        "nonce": guest_nonce,
+    })
+    accept = recv_line(sock)
+    if accept is None:
+        raise ValueError("the host closed the egress handshake")
+    version = accept.get("version")
+    if version not in EGRESS_VERSIONS:
+        send_sock(sock, {
+            "ok": False,
+            "error": "this guest egress speaks %s, and the host chose %r"
+                     % (EGRESS_VERSIONS, version),
+        })
+        raise ValueError("capability refused: host chose egress version %r" % (version,))
+    host_nonce = str(accept.get("nonce", ""))
+    want = proof_for("asterism-egress", key, version, "host", guest_nonce, host_nonce)
+    if not hmac.compare_digest(want, str(accept.get("proof", ""))):
+        send_sock(sock, {
+            "ok": False,
+            "error": "the host did not prove it holds this instance's key",
+        })
+        raise ValueError("capability refused: the host did not hold this instance's key")
+    send_sock(sock, {
+        "ok": True,
+        "proof": proof_for("asterism-egress", key, version, "guest", guest_nonce, host_nonce),
+    })
+    return version
+
+
+def splice_plain_and_framed(plain, framed):
+    credit = Credit(MAX_WINDOW)
+    write_lock = threading.Lock()
+    done = threading.Event()
+
+    def raw_to_framed():
+        try:
+            while not done.is_set():
+                allowed = credit.take(MAX_FRAME_BYTES)
+                chunk = plain.recv(allowed)
+                with write_lock:
+                    if not chunk:
+                        write_frame(framed, FRAME_CLOSE, b"")
+                        return
+                    write_frame(framed, FRAME_DATA, chunk)
+        except Exception as failure:
+            log("egress splice to host ended: %s" % failure)
+        finally:
+            done.set()
+
+    def framed_to_raw():
+        try:
+            while not done.is_set():
+                frame = read_frame(framed)
+                if frame is None:
+                    return
+                typ, payload = frame
+                if typ == FRAME_CLOSE:
+                    return
+                if typ == FRAME_WINDOW:
+                    if len(payload) != 4:
+                        raise ValueError("a WINDOW frame must carry a 32-bit credit")
+                    credit.give(struct.unpack("!I", payload)[0])
+                    continue
+                if typ == FRAME_DATA:
+                    if payload:
+                        plain.sendall(payload)
+                        with write_lock:
+                            write_frame(framed, FRAME_WINDOW, struct.pack("!I", len(payload)))
+                    continue
+                raise ValueError("unknown egress frame type %r" % (typ,))
+        except Exception as failure:
+            log("egress splice from host ended: %s" % failure)
+        finally:
+            done.set()
+            try:
+                plain.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    out = threading.Thread(target=raw_to_framed)
+    back = threading.Thread(target=framed_to_raw)
+    out.start()
+    back.start()
+    out.join()
+    back.join()
+
+
+def connect_egress(key, unix_path):
+    """Open the host data plane: vsock in a guest, unix in a test."""
+    if unix_path:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(unix_path)
+    else:
+        sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+        sock.connect((HOST_CID, EGRESS_VSOCK_PORT))
+    sock.settimeout(120)
+    egress_handshake(sock, key)
+    return sock
+
+
+def handle_proxy(plain, key, unix_path):
+    """One loopback CONNECT: handshake, splice, fail closed."""
+    framed = None
+    try:
+        framed = connect_egress(key, unix_path)
+        splice_plain_and_framed(plain, framed)
+    except Exception as failure:
+        log("egress to the host failed: %s" % failure)
+        try:
+            # Named capability refusal, never the request bytes.
+            plain.sendall(
+                b"HTTP/1.1 502 Bad Gateway\r\n"
+                b"Content-Type: text/plain; charset=utf-8\r\n"
+                b"Connection: close\r\n"
+                b"\r\n"
+                b"asterism: this host is not offering guest egress\n"
+            )
+        except OSError:
+            pass
+    finally:
+        if framed is not None:
+            try:
+                framed.close()
+            except OSError:
+                pass
+        try:
+            plain.close()
+        except OSError:
+            pass
+
+
+def proxy_loop(key, bind, unix_path):
+    """Loopback-only HTTP CONNECT proxy. Never a wildcard bind."""
+    host, port_s = bind.rsplit(":", 1)
+    port = int(port_s)
+    if host not in ("127.0.0.1", "::1"):
+        log("refusing to bind an egress proxy on %s (loopback only)" % host)
+        return
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((host, port))
+    sock.listen(16)
+    log("egress proxy on %s:%d" % (host, port))
+    while True:
+        try:
+            conn, addr = sock.accept()
+        except OSError as failure:
+            log("egress proxy accept ended: %s" % failure)
+            return
+        if addr[0] not in ("127.0.0.1", "::1"):
+            log("refused a non-loopback caller of the egress proxy")
+            conn.close()
+            continue
+        conn.settimeout(120)
+        threading.Thread(
+            target=handle_proxy, args=(conn, key, unix_path), daemon=True
+        ).start()
+
+
+def maybe_start_proxy(argv, key):
+    """Start the loopback proxy unless this process is a control-channel test."""
+    unix_path = None
+    if "--egress-connect-unix" in argv:
+        unix_path = argv[argv.index("--egress-connect-unix") + 1]
+    bind = None
+    if "--proxy-listen-tcp" in argv:
+        bind = argv[argv.index("--proxy-listen-tcp") + 1]
+    # --stdio and --listen-unix are the control-channel test transports.
+    # They must not grow a proxy unless the test asked for one, or every
+    # existing handshake fixture would also bind 18765.
+    testing = "--stdio" in argv or "--listen-unix" in argv
+    if bind is None and testing:
+        return
+    if bind is None:
+        bind = "%s:%d" % ("127.0.0.1", EGRESS_TCP_PORT)
+    threading.Thread(
+        target=proxy_loop, args=(key, bind, unix_path), daemon=True
+    ).start()
+
+
 def listener(argv):
     """Where to serve: vsock in a guest, a unix socket or stdio in a test.
 
@@ -996,6 +1279,7 @@ def listener(argv):
 
 def main(argv):
     key = load_key()
+    maybe_start_proxy(argv, key)
     sock = listener(argv)
     if sock is None:
         serve(key, sys.stdin.buffer, sys.stdout.buffer)
@@ -1165,7 +1449,7 @@ fn revision(key: &Key) -> String {
 mod tests {
     use super::*;
 
-    use std::io::BufReader;
+    use std::io::{BufReader, Read, Write};
     use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
     /// Drive a handshake against a canned script and return why it failed.
@@ -1228,6 +1512,11 @@ mod tests {
         // is the whole point: this is what a cloned disk fails.
         let other = Key::parse(&"11".repeat(32)).unwrap();
         assert_ne!(base, other.proof(1, "host", "aaaa", "bbbb"));
+        // And a control-channel proof is not an egress proof.
+        assert_ne!(
+            base,
+            k.proof_for("asterism-egress", 1, "host", "aaaa", "bbbb")
+        );
     }
 
     #[test]
@@ -1826,5 +2115,93 @@ mod tests {
             String::from_utf8_lossy(&ran.stderr).contains("no python3"),
             "and it says why it gave up"
         );
+    }
+
+    /// The in-guest proxy is loopback, the HMAC domain is not the control
+    /// channel's, and a wildcard bind is not in the text we ship.
+    #[test]
+    fn the_shipped_agent_exposes_only_a_loopback_egress_proxy() {
+        assert!(
+            AGENT_PY.contains("EGRESS_TCP_PORT = 18765"),
+            "stable seed port"
+        );
+        assert!(AGENT_PY.contains("EGRESS_VSOCK_PORT = 1022"));
+        assert!(AGENT_PY.contains("asterism-egress"));
+        assert!(AGENT_PY.contains("127.0.0.1"));
+        assert!(
+            AGENT_PY.contains("refusing to bind an egress proxy"),
+            "a non-loopback bind is a refusal, not a fallback"
+        );
+        assert!(
+            !AGENT_PY.contains("0.0.0.0"),
+            "the guest agent must never mention a wildcard bind"
+        );
+        assert!(
+            AGENT_PY.contains("this host is not offering guest egress"),
+            "old helper / missing plane is a capability refusal"
+        );
+    }
+
+    /// Drive the real agent's loopback proxy without a host plane: CONNECT
+    /// fail-closes with a capability refusal, and does not hang.
+    #[test]
+    fn the_real_agent_loopback_proxy_fail_closes_without_a_host_plane() {
+        let Some((_agent, port)) = spawn_proxy_agent(&key()) else {
+            return;
+        };
+        let mut stream = None;
+        for _ in 0..50 {
+            if let Ok(s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+                stream = Some(s);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let Some(mut stream) = stream else {
+            panic!("the agent never bound 127.0.0.1:{port}");
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .write_all(b"CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com:443\r\n\r\n")
+            .unwrap();
+        let mut buf = Vec::new();
+        let _ = stream.read_to_end(&mut buf);
+        let body = String::from_utf8_lossy(&buf);
+        assert!(
+            body.contains("502") || body.contains("not offering guest egress"),
+            "expected a capability refusal, got {body:?}"
+        );
+        assert!(
+            !body.contains("sk-"),
+            "a refusal must not echo anything that looks like a secret"
+        );
+    }
+
+    fn spawn_proxy_agent(key: &Key) -> Option<(Agent, u16)> {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("asterism-guest");
+        std::fs::write(&script, AGENT_PY).unwrap();
+        let key_path = dir.path().join("agent.key");
+        std::fs::write(&key_path, key.hex()).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+        let port = listener.local_addr().ok()?.port();
+        drop(listener);
+        let child = match Command::new("python3")
+            .arg(&script)
+            .arg("--stdio")
+            .arg("--proxy-listen-tcp")
+            .arg(format!("127.0.0.1:{port}"))
+            .env("ASTERISM_AGENT_KEY", &key_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return None,
+        };
+        Some((Agent { child, _dir: dir }, port))
     }
 }

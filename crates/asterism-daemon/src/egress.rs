@@ -63,7 +63,7 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
@@ -180,9 +180,18 @@ struct EgressPlane {
     running: StdMutex<BTreeMap<String, Proxy>>,
 }
 
+/// How this instance's proxy is reached from the guest.
+enum Listen {
+    /// Host TCP loopback, advertised to the guest as `gateway:port`.
+    Loopback { port: u16 },
+    /// Unix socket the helper splices vsock onto. The guest sees only its
+    /// own loopback proxy; this host binds no TCP port at all.
+    Unix { path: PathBuf },
+}
+
 /// One instance's proxy, while it is up.
 struct Proxy {
-    port: u16,
+    listen: Listen,
     ca_pem: String,
     /// Set when this proxy is taken down, and read by every request still in
     /// flight. Aborting the accept loop stops new connections; connections
@@ -202,6 +211,12 @@ impl Drop for Proxy {
         // further connection being accepted at all.
         self.revoked.store(true, Ordering::SeqCst);
         self.task.abort();
+        // The helper splices onto this path. Removing it is what makes a
+        // detach or astd-down fail closed for the *next* vsock connect,
+        // rather than hanging on a socket file nothing owns.
+        if let Listen::Unix { path } = &self.listen {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -260,11 +275,10 @@ pub(crate) fn check_can_bind(inst: &Instance) -> Result<()> {
     // able to use once it is.
     if hv.probe().is_ok() && hv.caps().guest_egress.is_none() {
         bail!(
-            "the {} backend gives each guest an address on a shared network, so there is \
-             no listener this device could put up that only {:?} can reach — a bound \
-             secret needs a guest-only door, and binding a wildcard address instead \
-             would publish a proxy for this secret on your LAN. Run this instance on a \
-             backend with user-mode networking (qemu, today)",
+            "the {} backend has no guest-only door into this device, so there is \
+             no listener that only {:?} can reach — a bound secret needs one of \
+             the routes in GuestEgress, and binding a wildcard address instead \
+             would publish a proxy for this secret on your LAN",
             hv.id(),
             inst.name
         );
@@ -272,15 +286,31 @@ pub(crate) fn check_can_bind(inst: &Instance) -> Result<()> {
     Ok(())
 }
 
-/// Where the guest reaches this device, according to its backend.
-fn gateway(inst: &Instance) -> Result<&'static str> {
+/// The typed route this instance's backend offers, if any.
+fn route(inst: &Instance) -> Result<GuestEgress> {
     let hv = backend::for_instance(inst)?;
-    match hv.caps().guest_egress {
-        Some(GuestEgress::LoopbackGateway { gateway }) => Ok(gateway),
-        None => bail!(
+    hv.caps().guest_egress.ok_or_else(|| {
+        anyhow!(
             "the {} backend has no guest-only path to this device",
             hv.id()
-        ),
+        )
+    })
+}
+
+/// The URL a seed writes for a given route.
+///
+/// For a loopback gateway the host's bound port is part of the URL. For a
+/// guest-loopback route the port is inside the guest and does not come
+/// from a host bind at all.
+fn proxy_url(route: GuestEgress, host_port: Option<u16>) -> Result<String> {
+    match route {
+        GuestEgress::LoopbackGateway { gateway } => {
+            let port = host_port.ok_or_else(|| {
+                anyhow!("a loopback-gateway route needs a host TCP port to advertise")
+            })?;
+            Ok(format!("http://{gateway}:{port}"))
+        }
+        GuestEgress::GuestLoopback { bind, port } => Ok(format!("http://{bind}:{port}")),
     }
 }
 
@@ -298,10 +328,10 @@ pub(crate) fn seed_config(inst: &Instance) -> Result<seed::Egress> {
         return Ok(seed::Egress::default());
     }
     check_can_bind(inst)?;
-    let gateway = gateway(inst)?;
-    let (port, ca_pem) = ensure_running(inst)?;
+    let route = route(inst)?;
+    let (host_port, ca_pem) = ensure_running(inst, route)?;
     Ok(seed::Egress {
-        proxy: format!("http://{gateway}:{port}"),
+        proxy: proxy_url(route, host_port)?,
         ca_pem,
         authorities: inst
             .secrets
@@ -345,41 +375,41 @@ pub(crate) fn refresh_bindings(inst: &Instance) {
     // reissues the seed — so taking the listener away because the last
     // binding went would break every unbound connection that guest makes, for
     // as long as it stays up. What comes back honours nothing.
-    if let Err(e) = ensure_running(inst) {
-        eprintln!(
+    match route(inst) {
+        Ok(route) => {
+            if let Err(e) = ensure_running(inst, route) {
+                eprintln!(
+                    "astd: {}'s egress proxy did not come back: {e:#}",
+                    inst.name
+                );
+            }
+        }
+        Err(e) => eprintln!(
             "astd: {}'s egress proxy did not come back: {e:#}",
             inst.name
-        );
+        ),
     }
 }
 
-/// The port and CA of this instance's proxy, starting it if it is not up.
-fn ensure_running(inst: &Instance) -> Result<(u16, String)> {
+/// Bring the listener up for this route. Returns the host TCP port only
+/// for [`GuestEgress::LoopbackGateway`]; a guest-loopback route has no
+/// host TCP port at all.
+fn ensure_running(inst: &Instance, route: GuestEgress) -> Result<(Option<u16>, String)> {
     let plane = plane()?;
     let mut running = plane.running.lock().expect("egress plane poisoned");
     if let Some(proxy) = running.get(&inst.name) {
         if !proxy.task.is_finished() {
-            return Ok((proxy.port, proxy.ca_pem.clone()));
+            let port = match proxy.listen {
+                Listen::Loopback { port } => Some(port),
+                Listen::Unix { .. } => None,
+            };
+            return Ok((port, proxy.ca_pem.clone()));
         }
         running.remove(&inst.name);
     }
 
     let authority = Authority::load_or_create(&egress_dir(&inst.name), &inst.name)?;
     let ca_pem = authority.ca_pem.clone();
-
-    // Loopback only, and that is the whole security argument for this
-    // listener: QEMU's user-net proxies a guest's connection to `10.0.2.2:p`
-    // onto this device's `127.0.0.1:p`, so binding loopback is reachable from
-    // the guest and from nothing on the wire. The same door `ast create -p`
-    // and `ast ssh` already use.
-    let preferred = stable_port(&inst.name);
-    let (listener, port) = bind_loopback(preferred)?;
-    if preferred != Some(port) {
-        // Remembered so that a reboot does not move the proxy out from under
-        // a guest whose seed named a port — and if it has moved, the seed's
-        // fingerprint changes and the guest is told.
-        let _ = std::fs::write(port_path(&inst.name), port.to_string());
-    }
 
     let revoked = Arc::new(AtomicBool::new(false));
     let ctx = Arc::new(ProxyCtx {
@@ -392,17 +422,43 @@ fn ensure_running(inst: &Instance) -> Result<(u16, String)> {
         }),
         revoked: revoked.clone(),
     });
-    let task = tokio::runtime::Handle::current().spawn(accept_loop(listener, ctx));
+
+    let (listen, task) = match route {
+        GuestEgress::LoopbackGateway { .. } => {
+            // Loopback only, and that is the whole security argument for
+            // this listener: QEMU's user-net proxies a guest's connection
+            // to `10.0.2.2:p` onto this device's `127.0.0.1:p`, so binding
+            // loopback is reachable from the guest and from nothing on the
+            // wire. The same door `ast create -p` and `ast ssh` already use.
+            let preferred = stable_port(&inst.name);
+            let (listener, port) = bind_loopback(preferred)?;
+            if preferred != Some(port) {
+                let _ = std::fs::write(port_path(&inst.name), port.to_string());
+            }
+            let task = tokio::runtime::Handle::current().spawn(accept_loop(listener, ctx));
+            (Listen::Loopback { port }, task)
+        }
+        GuestEgress::GuestLoopback { .. } => {
+            let path = vsock_path(&inst.name);
+            let listener = bind_unix(&path)?;
+            let task = tokio::runtime::Handle::current().spawn(accept_unix(listener, ctx));
+            (Listen::Unix { path }, task)
+        }
+    };
+    let host_port = match &listen {
+        Listen::Loopback { port } => Some(*port),
+        Listen::Unix { .. } => None,
+    };
     running.insert(
         inst.name.clone(),
         Proxy {
-            port,
+            listen,
             ca_pem: ca_pem.clone(),
             task,
             revoked,
         },
     );
-    Ok((port, ca_pem))
+    Ok((host_port, ca_pem))
 }
 
 fn egress_dir(instance: &str) -> PathBuf {
@@ -411,6 +467,15 @@ fn egress_dir(instance: &str) -> PathBuf {
 
 fn port_path(instance: &str) -> PathBuf {
     egress_dir(instance).join("port")
+}
+
+/// Unix socket the vz helper splices authenticated vsock streams onto.
+///
+/// Not a TCP port. The helper connects; astd binds. Mode 0600, next to the
+/// CA, so a process that cannot read the instance directory cannot present
+/// itself as this guest's egress plane.
+pub(crate) fn vsock_path(instance: &str) -> PathBuf {
+    egress_dir(instance).join("vsock.sock")
 }
 
 fn stable_port(instance: &str) -> Option<u16> {
@@ -449,6 +514,27 @@ fn bind_loopback_with<T>(
         .map_or_else(|| bind(loopback(0)), Ok)
 }
 
+fn bind_unix(path: &Path) -> Result<tokio::net::UnixListener> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    if path.exists() {
+        // A leftover file from a previous astd. A *live* listener would
+        // still be in the plane's map; we only get here after that entry
+        // was dropped. Steal the path rather than refuse a boot.
+        let _ = std::fs::remove_file(path);
+    }
+    let listener = std::os::unix::net::UnixListener::bind(path)
+        .with_context(|| format!("binding the guest egress plane at {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    listener.set_nonblocking(true)?;
+    Ok(tokio::net::UnixListener::from_std(listener)?)
+}
+
 /// What one instance's proxy knows.
 struct ProxyCtx {
     instance: String,
@@ -469,27 +555,40 @@ async fn accept_loop(listener: TcpListener, ctx: Arc<ProxyCtx>) {
         let Ok((stream, _)) = listener.accept().await else {
             continue;
         };
-        let ctx = ctx.clone();
-        tokio::spawn(async move {
-            // The outer connection speaks plain HTTP and carries exactly one
-            // useful verb, CONNECT. hyper owns the framing, the header caps
-            // and every smuggling refusal that goes with them.
-            let served = http1::Builder::new()
-                .max_headers(MAX_HEADERS)
-                .serve_connection(
-                    TokioIo::new(stream),
-                    service_fn(move |req| connect_service(req, ctx.clone())),
-                )
-                .with_upgrades()
-                .await;
-            if let Err(e) = served {
-                // No address and no header: a proxy that logs both has
-                // written a map of who talks to whom next to the credentials.
-                if !e.is_incomplete_message() {
-                    eprintln!("astd: an egress connection ended early");
-                }
-            }
-        });
+        tokio::spawn(serve_connect(stream, ctx.clone()));
+    }
+}
+
+async fn accept_unix(listener: tokio::net::UnixListener, ctx: Arc<ProxyCtx>) {
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            continue;
+        };
+        tokio::spawn(serve_connect(stream, ctx.clone()));
+    }
+}
+
+async fn serve_connect<S>(stream: S, ctx: Arc<ProxyCtx>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    // The outer connection speaks plain HTTP and carries exactly one
+    // useful verb, CONNECT. hyper owns the framing, the header caps
+    // and every smuggling refusal that goes with them.
+    let served = http1::Builder::new()
+        .max_headers(MAX_HEADERS)
+        .serve_connection(
+            TokioIo::new(stream),
+            service_fn(move |req| connect_service(req, ctx.clone())),
+        )
+        .with_upgrades()
+        .await;
+    if let Err(e) = served {
+        // No address and no header: a proxy that logs both has
+        // written a map of who talks to whom next to the credentials.
+        if !e.is_incomplete_message() {
+            eprintln!("astd: an egress connection ended early");
+        }
     }
 }
 
@@ -1584,5 +1683,92 @@ mod tests {
         }
         // And a leaf for a bound authority chains to it.
         assert!(one.acceptor("api.anthropic.com:443").is_ok());
+    }
+
+    #[test]
+    fn a_guest_loopback_route_names_a_loopback_proxy_and_no_host_port() {
+        let url = proxy_url(
+            GuestEgress::GuestLoopback {
+                bind: "127.0.0.1",
+                port: 18765,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(url, "http://127.0.0.1:18765");
+        assert!(!url.contains("10.0.2.2"));
+        assert!(
+            proxy_url(
+                GuestEgress::LoopbackGateway {
+                    gateway: "10.0.2.2"
+                },
+                None
+            )
+            .is_err(),
+            "a gateway route without a host port is not a URL"
+        );
+        assert_eq!(
+            proxy_url(
+                GuestEgress::LoopbackGateway {
+                    gateway: "10.0.2.2"
+                },
+                Some(38123)
+            )
+            .unwrap(),
+            "http://10.0.2.2:38123"
+        );
+    }
+
+    /// The VZ path must never bind a TCP port, even on loopback: the guest
+    /// cannot reach this host's loopback, and a non-loopback bind would be
+    /// the LAN listener Caps exists to refuse.
+    #[tokio::test]
+    async fn a_unix_egress_listener_is_not_a_network_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vsock.sock");
+        let listener = bind_unix(&path).expect("a unix plane");
+        let meta = std::fs::metadata(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+            assert!(
+                meta.file_type().is_socket(),
+                "{path:?} is not a unix socket"
+            );
+            let mode = meta.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{mode:#o} is readable by someone else");
+        }
+        drop(listener);
+    }
+
+    /// The unix plane speaks the same CONNECT refusal as TCP: a verb it
+    /// does not carry is 400, and nothing is bound to a network port.
+    #[tokio::test]
+    async fn a_unix_plane_refuses_anything_but_connect_and_never_binds_tcp() {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("vsock.sock");
+        let authority = Authority::load_or_create(dir.path(), "dev").unwrap();
+        let listener = bind_unix(&sock).unwrap();
+        let ctx = Arc::new(ProxyCtx {
+            instance: "dev".into(),
+            bindings: vec![binding("api.anthropic.com")],
+            authority,
+            source: Arc::new(FakeSource { seen }),
+            revoked: Arc::new(AtomicBool::new(false)),
+        });
+        tokio::spawn(accept_unix(listener, ctx));
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: api.anthropic.com\r\n\r\n")
+            .await
+            .unwrap();
+        let mut answer = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut answer)).await;
+        let answer = String::from_utf8_lossy(&answer);
+        assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
+        assert!(answer.contains("CONNECT"), "{answer}");
     }
 }
