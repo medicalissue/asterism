@@ -18,12 +18,12 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::remote_gpu::{
-    self as gpu, AbiRange, AuthenticatedPeer, ControlError, ControlErrorCode, Executor, Reply,
-    Request, Response, ProductionProvider, MAX_WIRE_FRAME_BYTES,
+    self as gpu, AbiRange, AuthenticatedPeer, ControlError, ControlErrorCode, Executor,
+    ProductionProvider, Reply, Request, Response, MAX_WIRE_FRAME_BYTES,
 };
 use crate::remote_gpu_guest::{
     self as guest, CudaCall, CudaResult, GuestDeviceKind, GuestFrame, GuestReply,
-    DEFAULT_CREDIT_WINDOW, PROJECTION_KIND, CUDA_ERROR_NOT_SUPPORTED,
+    CUDA_ERROR_NOT_SUPPORTED, DEFAULT_CREDIT_WINDOW, PROJECTION_KIND,
 };
 
 /// Protocol version that introduced the GPU mesh stream.
@@ -38,7 +38,10 @@ pub struct GpuMeshOpen {
 }
 
 impl GpuMeshOpen {
-    pub fn new(instance_id: impl Into<String>, provider_generation: u64) -> Result<Self, PathError> {
+    pub fn new(
+        instance_id: impl Into<String>,
+        provider_generation: u64,
+    ) -> Result<Self, PathError> {
         let instance_id = instance_id.into();
         if instance_id.trim().is_empty() || instance_id.len() > 128 {
             return Err(PathError::new(
@@ -46,7 +49,9 @@ impl GpuMeshOpen {
             ));
         }
         if provider_generation == 0 {
-            return Err(PathError::new("gpu mesh open requires a non-zero provider generation"));
+            return Err(PathError::new(
+                "gpu mesh open requires a non-zero provider generation",
+            ));
         }
         Ok(Self {
             instance_id,
@@ -166,7 +171,9 @@ pub fn decode_frame<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, Pat
         )));
     }
     if bytes.len() != 4 + len {
-        return Err(PathError::new("GPU mesh frame length does not match the prefix"));
+        return Err(PathError::new(
+            "GPU mesh frame length does not match the prefix",
+        ));
     }
     serde_json::from_slice(&bytes[4..]).map_err(|err| PathError::new(err.to_string()))
 }
@@ -185,7 +192,10 @@ pub struct ConsumerHop {
 }
 
 impl ConsumerHop {
-    pub fn new(instance_id: impl Into<String>, provider_generation: u64) -> Result<Self, PathError> {
+    pub fn new(
+        instance_id: impl Into<String>,
+        provider_generation: u64,
+    ) -> Result<Self, PathError> {
         let open = GpuMeshOpen::new(instance_id, provider_generation)?;
         Ok(Self {
             instance_id: open.instance_id,
@@ -217,9 +227,10 @@ impl ConsumerHop {
             GpuMeshFrame::Refused { .. }
             | GpuMeshFrame::DeviceLost { .. }
             | GpuMeshFrame::Revoked { .. }
-            | GpuMeshFrame::Skew { .. } => {
-                Err(PathError::new(format_fail_closed(&frame, "GPU mesh call failed closed")))
-            }
+            | GpuMeshFrame::Skew { .. } => Err(PathError::new(format_fail_closed(
+                &frame,
+                "GPU mesh call failed closed",
+            ))),
             GpuMeshFrame::Close => Ok(()),
             GpuMeshFrame::Call { .. } | GpuMeshFrame::Cancel { .. } => Err(PathError::new(
                 "consumer received a provider-originated call frame",
@@ -278,9 +289,7 @@ fn format_fail_closed(frame: &GpuMeshFrame, fallback: &str) -> String {
         GpuMeshFrame::Skew {
             expected_generation,
             observed,
-        } => format!(
-            "GPU generation skew: attachment {expected_generation}, provider {observed}"
-        ),
+        } => format!("GPU generation skew: attachment {expected_generation}, provider {observed}"),
         GpuMeshFrame::DeviceLost { reason } => format!("GPU device lost: {reason}"),
         GpuMeshFrame::Revoked { instance_id } => format!("GPU lease revoked for {instance_id}"),
         GpuMeshFrame::Refused { message, .. } => message.clone(),
@@ -356,13 +365,13 @@ impl ProviderHop {
                     session,
                 })
             }
-            Ok(_) => Err(PathError::new("provider hello returned a non-session reply")),
-            Err(err) if err.code == ControlErrorCode::StaleGeneration => {
-                Ok(GpuMeshFrame::Skew {
-                    expected_generation: open.provider_generation,
-                    observed: self.production.authority().generation(),
-                })
-            }
+            Ok(_) => Err(PathError::new(
+                "provider hello returned a non-session reply",
+            )),
+            Err(err) if err.code == ControlErrorCode::StaleGeneration => Ok(GpuMeshFrame::Skew {
+                expected_generation: open.provider_generation,
+                observed: self.production.authority().generation(),
+            }),
             Err(err) if err.code == ControlErrorCode::Revoked => Ok(GpuMeshFrame::Revoked {
                 instance_id: open.instance_id,
             }),
@@ -405,9 +414,7 @@ impl ProviderHop {
                     })
                 }
             }
-            GpuMeshFrame::Close => {
-                Ok(GpuMeshFrame::Close)
-            }
+            GpuMeshFrame::Close => Ok(GpuMeshFrame::Close),
             other => Ok(GpuMeshFrame::Refused {
                 code: ControlErrorCode::InvalidRequest,
                 message: format!("provider rejected unexpected mesh frame {other:?}"),
@@ -606,7 +613,10 @@ impl GuestMeshPath {
         self.crossed.push(reply_bytes.clone());
         self.consumer.apply_mesh(reply_frame.clone())?;
         match reply_frame {
-            GpuMeshFrame::Reply { id: reply_id, reply } if reply_id == id => Ok(reply),
+            GpuMeshFrame::Reply {
+                id: reply_id,
+                reply,
+            } if reply_id == id => Ok(reply),
             other => Err(fail_closed_error(&other)),
         }
     }
@@ -673,8 +683,14 @@ mod tests {
     }
 
     fn path() -> (GuestMeshPath, gpu::GpuAttachment, String) {
-        GuestMeshPath::attach(peer(1), production("desktop"), "inst-1", 64 * 1024 * 1024, 1_000)
-            .unwrap()
+        GuestMeshPath::attach(
+            peer(1),
+            production("desktop"),
+            "inst-1",
+            64 * 1024 * 1024,
+            1_000,
+        )
+        .unwrap()
     }
 
     fn alloc(path: &mut GuestMeshPath, bytes: u64) -> String {
@@ -794,9 +810,7 @@ mod tests {
         let (mut path, _, _) = path();
         alloc(&mut path, 8);
         path.provider_lost("provider process gone");
-        let err = path
-            .cuda(CudaCall::MemAlloc { bytes: 8 })
-            .unwrap_err();
+        let err = path.cuda(CudaCall::MemAlloc { bytes: 8 }).unwrap_err();
         assert!(
             err.message.contains("lost")
                 || err.message.contains("not ready")
@@ -821,7 +835,12 @@ mod tests {
         let open: GpuMeshOpen = decode_frame(&consumer.open_bytes().unwrap()).unwrap();
         let reply = provider.accept_open(open).unwrap();
         assert!(
-            matches!(reply, GpuMeshFrame::Skew { .. } | GpuMeshFrame::Revoked { .. } | GpuMeshFrame::Refused { .. }),
+            matches!(
+                reply,
+                GpuMeshFrame::Skew { .. }
+                    | GpuMeshFrame::Revoked { .. }
+                    | GpuMeshFrame::Refused { .. }
+            ),
             "{reply:?}"
         );
     }

@@ -22,6 +22,7 @@ use crate::remote_gpu::{ControlError, ControlErrorCode, Executor, GUEST_DEVICE_P
 /// instead of being silently dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReleasePath {
+    GuestMeshProvider,
     MeshDirect,
     MeshRelay,
     LocalDirect,
@@ -32,6 +33,7 @@ pub enum ReleasePath {
 impl ReleasePath {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::GuestMeshProvider => "guest-mesh-provider",
             Self::MeshDirect => "direct",
             Self::MeshRelay => "relay",
             Self::LocalDirect => "local-direct",
@@ -42,6 +44,7 @@ impl ReleasePath {
 
     pub fn parse(value: &str) -> Result<Self, ControlError> {
         match value.trim() {
+            "guest-mesh-provider" => Ok(Self::GuestMeshProvider),
             "direct" => Ok(Self::MeshDirect),
             "relay" => Ok(Self::MeshRelay),
             "local-direct" => Ok(Self::LocalDirect),
@@ -55,7 +58,7 @@ impl ReleasePath {
     }
 
     fn admits_hardware_pass(self) -> bool {
-        matches!(self, Self::MeshDirect | Self::MeshRelay)
+        matches!(self, Self::GuestMeshProvider)
     }
 }
 
@@ -110,8 +113,10 @@ pub struct RealProviderCandidate {
 pub struct ReleaseGateEvidence {
     pub candidate_sha: String,
     pub tree_digest: String,
+    pub runner_digest: String,
     pub guest_image_digest: String,
     pub provider_image_digest: String,
+    pub guest_container_id: String,
     pub guest: GuestProjectionCandidate,
     pub provider: RealProviderCandidate,
     pub direct_path: bool,
@@ -124,10 +129,18 @@ pub struct ReleaseGateEvidence {
     pub provider_astd_restarted: bool,
     pub provider_helper_restarted: bool,
     pub guest_restarted: bool,
+    pub provider_astd_pid_before: u32,
+    pub provider_astd_pid_after: u32,
+    pub provider_helper_pid_before: u32,
+    pub provider_helper_pid_after: u32,
+    pub guest_pid_before: u32,
+    pub guest_pid_after: u32,
     pub revoke: bool,
     pub contention: bool,
     pub loss: bool,
     pub version_skew_fresh_session: bool,
+    pub version_skew_error: String,
+    pub mesh_open_bearer: bool,
     /// Claim from the paid host that CUDA actually ran. The judge still
     /// refuses the claim when any other field is a reference/mock/direct
     /// stand-in.
@@ -160,8 +173,19 @@ pub fn judge_nvidia_release_gate(
     refuse_forbidden_stand_ins(evidence)?;
     require_pin(&evidence.candidate_sha, "candidate_sha")?;
     require_pin(&evidence.tree_digest, "tree_digest")?;
+    require_digest(&evidence.runner_digest, "runner_digest")?;
     require_digest(&evidence.guest_image_digest, "guest_image_digest")?;
     require_digest(&evidence.provider_image_digest, "provider_image_digest")?;
+    require_nonempty(&evidence.guest_container_id, "guest_container_id")?;
+    if matches!(
+        evidence.guest_container_id.as_str(),
+        "mock" | "local" | "host"
+    ) {
+        return Err(ControlError::new(
+            ControlErrorCode::Unavailable,
+            "guest_container_id identifies a stand-in, not an Asterism guest/container",
+        ));
+    }
     require_named_device(&evidence.guest.mesh_device_name, "guest_device_name")?;
     require_named_device(&evidence.provider.mesh_device_name, "provider_device_name")?;
     if evidence.guest.mesh_device_name == evidence.provider.mesh_device_name {
@@ -224,6 +248,17 @@ pub fn judge_nvidia_release_gate(
         "provider CUDA helper process was not actually restarted",
     )?;
     require_flag(evidence.guest_restarted, "guest was not actually restarted")?;
+    require_pid_change(
+        evidence.provider_astd_pid_before,
+        evidence.provider_astd_pid_after,
+        "provider astd",
+    )?;
+    require_pid_change(
+        evidence.provider_helper_pid_before,
+        evidence.provider_helper_pid_after,
+        "provider helper",
+    )?;
+    require_pid_change(evidence.guest_pid_before, evidence.guest_pid_after, "guest")?;
     require_flag(evidence.revoke, "revoke was not exercised")?;
     require_flag(evidence.contention, "lease contention was not exercised")?;
     require_flag(evidence.loss, "provider loss was not exercised")?;
@@ -231,6 +266,18 @@ pub fn judge_nvidia_release_gate(
         evidence.version_skew_fresh_session,
         "ABI version skew was not negotiated on a fresh session",
     )?;
+    if evidence.version_skew_error != "unsupported_version" {
+        return Err(ControlError::new(
+            ControlErrorCode::Unavailable,
+            "fresh-session skew must fail with UnsupportedVersion, not Conflict",
+        ));
+    }
+    if evidence.mesh_open_bearer {
+        return Err(ControlError::new(
+            ControlErrorCode::Unauthorized,
+            "mesh opening evidence contains a bearer",
+        ));
+    }
     if !evidence.hardware_cuda_executed {
         return Err(ControlError::new(
             ControlErrorCode::Unavailable,
@@ -263,10 +310,11 @@ fn require_pin(value: &str, field: &str) -> Result<(), ControlError> {
 
 fn require_digest(value: &str, field: &str) -> Result<(), ControlError> {
     let trimmed = value.trim();
-    if trimmed.len() >= 32
-        && trimmed
+    if trimmed.len() == 71
+        && trimmed.starts_with("sha256:")
+        && trimmed[7..]
             .chars()
-            .all(|ch| ch.is_ascii_hexdigit() || ch == ':')
+            .all(|ch| matches!(ch, '0'..='9' | 'a'..='f'))
     {
         Ok(())
     } else {
@@ -329,8 +377,57 @@ fn require_flag(ok: bool, message: &str) -> Result<(), ControlError> {
     }
 }
 
+fn require_pid_change(before: u32, after: u32, process: &str) -> Result<(), ControlError> {
+    if before == 0 || after == 0 || before == after {
+        Err(ControlError::new(
+            ControlErrorCode::Unavailable,
+            format!("{process} PID did not prove a real restart ({before} -> {after})"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn is_git_oid(value: &str) -> bool {
     value.len() == 40 && value.chars().all(|ch| matches!(ch, '0'..='9' | 'a'..='f'))
+}
+
+fn take_report_field(
+    fields: &mut std::collections::BTreeMap<String, String>,
+    key: &str,
+) -> Result<String, ControlError> {
+    fields.remove(key).ok_or_else(|| {
+        ControlError::new(
+            ControlErrorCode::InvalidRequest,
+            format!("release-gate missing {key}"),
+        )
+    })
+}
+
+fn take_report_flag(
+    fields: &mut std::collections::BTreeMap<String, String>,
+    key: &str,
+) -> Result<bool, ControlError> {
+    match take_report_field(fields, key)?.as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(ControlError::new(
+            ControlErrorCode::InvalidRequest,
+            format!("{key} must be true or false, got {other}"),
+        )),
+    }
+}
+
+fn take_report_pid(
+    fields: &mut std::collections::BTreeMap<String, String>,
+    key: &str,
+) -> Result<u32, ControlError> {
+    take_report_field(fields, key)?.parse::<u32>().map_err(|_| {
+        ControlError::new(
+            ControlErrorCode::InvalidRequest,
+            format!("{key} must be a positive process id"),
+        )
+    })
 }
 
 /// Parse `key=value` lines the gate script prints. Unknown keys are
@@ -345,7 +442,10 @@ pub fn parse_release_gate_report(text: &str) -> Result<ReleaseGateEvidence, Cont
         let Some((key, value)) = line.split_once('=') else {
             return Err(ControlError::new(
                 ControlErrorCode::InvalidRequest,
-                format!("release-gate line {}: expected key=value, got {line}", line_no + 1),
+                format!(
+                    "release-gate line {}: expected key=value, got {line}",
+                    line_no + 1
+                ),
             ));
         };
         if fields.insert(key.to_owned(), value.to_owned()).is_some() {
@@ -355,35 +455,17 @@ pub fn parse_release_gate_report(text: &str) -> Result<ReleaseGateEvidence, Cont
             ));
         }
     }
-    let take = |key: &str| -> Result<String, ControlError> {
-        fields.remove(key).ok_or_else(|| {
-            ControlError::new(
-                ControlErrorCode::InvalidRequest,
-                format!("release-gate missing {key}"),
-            )
-        })
-    };
-    let flag = |key: &str| -> Result<bool, ControlError> {
-        match take(key)?.as_str() {
-            "true" => Ok(true),
-            "false" => Ok(false),
-            other => Err(ControlError::new(
-                ControlErrorCode::InvalidRequest,
-                format!("{key} must be true or false, got {other}"),
-            )),
-        }
-    };
-    let path = ReleasePath::parse(&take("path")?)?;
+    let path = ReleasePath::parse(&take_report_field(&mut fields, "path")?)?;
     if !path.admits_hardware_pass() {
         return Err(ControlError::new(
             ControlErrorCode::Unavailable,
             format!(
-                "path={} cannot hardware-PASS; require authenticated mesh direct or relay",
+                "path={} cannot hardware-PASS; require complete guest-mesh-provider path",
                 path.as_str()
             ),
         ));
     }
-    let executor = match take("executor")?.as_str() {
+    let executor = match take_report_field(&mut fields, "executor")?.as_str() {
         "cuda" => Executor::Cuda,
         "reference" => Executor::Reference,
         other => {
@@ -393,40 +475,58 @@ pub fn parse_release_gate_report(text: &str) -> Result<ReleaseGateEvidence, Cont
             ))
         }
     };
-    let helper_kind = ProviderHelperKind::parse(&take("provider_helper_kind")?)?;
+    let helper_kind =
+        ProviderHelperKind::parse(&take_report_field(&mut fields, "provider_helper_kind")?)?;
     let evidence = ReleaseGateEvidence {
-        candidate_sha: take("candidate_sha")?,
-        tree_digest: take("tree_digest")?,
-        guest_image_digest: take("guest_image_digest")?,
-        provider_image_digest: take("provider_image_digest")?,
+        candidate_sha: take_report_field(&mut fields, "candidate_sha")?,
+        tree_digest: take_report_field(&mut fields, "tree_digest")?,
+        runner_digest: take_report_field(&mut fields, "runner_digest")?,
+        guest_image_digest: take_report_field(&mut fields, "guest_image_digest")?,
+        provider_image_digest: take_report_field(&mut fields, "provider_image_digest")?,
+        guest_container_id: take_report_field(&mut fields, "guest_container_id")?,
         guest: GuestProjectionCandidate {
-            device_path: take("guest_path")?,
-            libcuda_path: take("libcuda_path")?,
-            mesh_device_name: take("guest_device_name")?,
-            mesh_device_id: take("guest_device_id")?,
+            device_path: take_report_field(&mut fields, "guest_path")?,
+            libcuda_path: take_report_field(&mut fields, "libcuda_path")?,
+            mesh_device_name: take_report_field(&mut fields, "guest_device_name")?,
+            mesh_device_id: take_report_field(&mut fields, "guest_device_id")?,
         },
         provider: RealProviderCandidate {
             executor,
             helper_kind,
-            mesh_device_name: take("provider_device_name")?,
-            mesh_device_id: take("provider_device_id")?,
+            mesh_device_name: take_report_field(&mut fields, "provider_device_name")?,
+            mesh_device_id: take_report_field(&mut fields, "provider_device_id")?,
         },
-        direct_path: flag("direct_path")? || path == ReleasePath::MeshDirect,
-        relay_path: flag("relay_path")? || path == ReleasePath::MeshRelay,
-        first_gpu_uuid: take("first_gpu_uuid")?,
-        second_gpu_uuid: take("second_gpu_uuid")?,
-        driver_version: take("driver_version")?,
-        cuda_runtime_version: take("cuda_runtime_version")?,
-        guest_output: take("guest_output")?,
-        provider_astd_restarted: flag("provider_astd_restarted")?,
-        provider_helper_restarted: flag("provider_helper_restarted")?,
-        guest_restarted: flag("guest_restarted")?,
-        revoke: flag("revoke")?,
-        contention: flag("contention")?,
-        loss: flag("loss")?,
-        version_skew_fresh_session: flag("version_skew_fresh_session")?,
-        hardware_cuda_executed: flag("hardware_cuda_executed")?,
+        direct_path: take_report_flag(&mut fields, "direct_path")?
+            || path == ReleasePath::MeshDirect,
+        relay_path: take_report_flag(&mut fields, "relay_path")? || path == ReleasePath::MeshRelay,
+        first_gpu_uuid: take_report_field(&mut fields, "first_gpu_uuid")?,
+        second_gpu_uuid: take_report_field(&mut fields, "second_gpu_uuid")?,
+        driver_version: take_report_field(&mut fields, "driver_version")?,
+        cuda_runtime_version: take_report_field(&mut fields, "cuda_runtime_version")?,
+        guest_output: take_report_field(&mut fields, "guest_output")?,
+        provider_astd_restarted: take_report_flag(&mut fields, "provider_astd_restarted")?,
+        provider_helper_restarted: take_report_flag(&mut fields, "provider_helper_restarted")?,
+        guest_restarted: take_report_flag(&mut fields, "guest_restarted")?,
+        provider_astd_pid_before: take_report_pid(&mut fields, "provider_astd_pid_before")?,
+        provider_astd_pid_after: take_report_pid(&mut fields, "provider_astd_pid_after")?,
+        provider_helper_pid_before: take_report_pid(&mut fields, "provider_helper_pid_before")?,
+        provider_helper_pid_after: take_report_pid(&mut fields, "provider_helper_pid_after")?,
+        guest_pid_before: take_report_pid(&mut fields, "guest_pid_before")?,
+        guest_pid_after: take_report_pid(&mut fields, "guest_pid_after")?,
+        revoke: take_report_flag(&mut fields, "revoke")?,
+        contention: take_report_flag(&mut fields, "contention")?,
+        loss: take_report_flag(&mut fields, "loss")?,
+        version_skew_fresh_session: take_report_flag(&mut fields, "version_skew_fresh_session")?,
+        version_skew_error: take_report_field(&mut fields, "version_skew_error")?,
+        mesh_open_bearer: take_report_flag(&mut fields, "mesh_open_bearer")?,
+        hardware_cuda_executed: take_report_flag(&mut fields, "hardware_cuda_executed")?,
     };
+    if let Some(key) = fields.keys().next() {
+        return Err(ControlError::new(
+            ControlErrorCode::InvalidRequest,
+            format!("release-gate contains unknown field {key}"),
+        ));
+    }
     Ok(evidence)
 }
 
@@ -438,9 +538,13 @@ mod tests {
         ReleaseGateEvidence {
             candidate_sha: "f656f017de3a0b34ce710350ee5e55fb2cb2e593".into(),
             tree_digest: "82f7ddea827bb629b73e19a771abd40641b2cbd2".into(),
-            guest_image_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            runner_digest:
+                "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".into(),
+            guest_image_digest:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
             provider_image_digest:
                 "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            guest_container_id: "asterism-guest-1234".into(),
             guest: GuestProjectionCandidate {
                 device_path: GUEST_DEVICE_PATH.into(),
                 libcuda_path: "/usr/lib/asterism/libcuda.so.1".into(),
@@ -463,10 +567,18 @@ mod tests {
             provider_astd_restarted: true,
             provider_helper_restarted: true,
             guest_restarted: true,
+            provider_astd_pid_before: 101,
+            provider_astd_pid_after: 102,
+            provider_helper_pid_before: 201,
+            provider_helper_pid_after: 202,
+            guest_pid_before: 301,
+            guest_pid_after: 302,
             revoke: true,
             contention: true,
             loss: true,
             version_skew_fresh_session: true,
+            version_skew_error: "unsupported_version".into(),
+            mesh_open_bearer: false,
             hardware_cuda_executed: true,
         }
     }
@@ -499,11 +611,11 @@ mod tests {
 
     #[test]
     fn local_direct_path_cannot_hardware_pass() {
-        let error = parse_release_gate_report(
-            "path=local-direct\nexecutor=cuda\n",
-        )
-        .unwrap_err();
-        assert!(error.message.contains("local-direct") || error.message.contains("cannot hardware-PASS"));
+        let error = parse_release_gate_report("path=local-direct\nexecutor=cuda\n").unwrap_err();
+        assert!(
+            error.message.contains("local-direct")
+                || error.message.contains("cannot hardware-PASS")
+        );
     }
 
     #[test]
