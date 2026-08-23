@@ -641,6 +641,30 @@ mod tests {
     }
 
     #[test]
+    fn conflict_is_not_version_skew_evidence() {
+        let mut evidence = complete_record();
+        evidence.version_skew_error = "conflict".into();
+        let error = judge_nvidia_release_gate(&evidence).unwrap_err();
+        assert!(error.message.contains("UnsupportedVersion"));
+    }
+
+    #[test]
+    fn unchanged_process_pid_cannot_prove_restart() {
+        let mut evidence = complete_record();
+        evidence.provider_helper_pid_after = evidence.provider_helper_pid_before;
+        let error = judge_nvidia_release_gate(&evidence).unwrap_err();
+        assert!(error.message.contains("PID"));
+    }
+
+    #[test]
+    fn bearer_in_mesh_open_cannot_hardware_pass() {
+        let mut evidence = complete_record();
+        evidence.mesh_open_bearer = true;
+        let error = judge_nvidia_release_gate(&evidence).unwrap_err();
+        assert_eq!(error.code, ControlErrorCode::Unauthorized);
+    }
+
+    #[test]
     fn one_named_device_cannot_hardware_pass() {
         let mut evidence = complete_record();
         evidence.provider.mesh_device_name = evidence.guest.mesh_device_name.clone();

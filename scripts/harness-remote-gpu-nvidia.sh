@@ -86,7 +86,11 @@ case "$RUNNER" in
   "$ROOT"/*) ;;
   *) fail "NVIDIA E2E runner must come from pinned candidate tree $ROOT" ;;
 esac
-RUNNER_DIGEST="$(shasum -a 256 "$RUNNER" | awk '{print "sha256:"$1}')"
+if command -v sha256sum >/dev/null 2>&1; then
+  RUNNER_DIGEST="$(sha256sum "$RUNNER" | awk '{print "sha256:"$1}')"
+else
+  RUNNER_DIGEST="$(shasum -a 256 "$RUNNER" | awk '{print "sha256:"$1}')"
+fi
 echo "runner_digest=$RUNNER_DIGEST"
 
 RUN="$(mktemp -d "${TMPDIR:-/tmp}/asterism-nvidia-release.XXXXXX")"
@@ -119,7 +123,8 @@ nvidia_gate_validate_runner_evidence "$RUNNER_EVIDENCE" \
   sed -n '/^[a-z_][a-z_]*=/p' "$RUNNER_EVIDENCE"
 } >"$EVIDENCE"
 
-nvidia_gate_judge "$EVIDENCE" || fail "judge refused the real-hardware record"
+nvidia_gate_judge "$EVIDENCE" >/dev/null \
+  || fail "judge refused the real-hardware record"
 cat "$EVIDENCE"
 echo "nvidia_gate=pass"
 ok "exact guest→mesh→provider NVIDIA release gate passed"
