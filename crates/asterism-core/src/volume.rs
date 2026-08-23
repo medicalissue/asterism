@@ -1036,7 +1036,7 @@ fn no_such(name: &str) -> String {
 /// busy" is not something anybody can act on.
 pub fn held_by(name: &str, lease: &Lease) -> String {
     format!(
-        "volume {name:?} is held by instance {:?} (cpu/ram on {}) at epoch {} — \
+        "volume {name:?} is held by instance {:?} (compute on {}) at epoch {} — \
          detach it there first: ast detach {} --volume {name}",
         lease.holder, lease.holder_device, lease.epoch, lease.holder
     )
@@ -1261,6 +1261,8 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("held by instance \"database\""), "{error}");
+        assert!(error.contains("compute on desktop"), "{error}");
+        assert!(!error.contains("cpu/ram"), "{error}");
 
         let mut slow = part("scratch", "nas", Locality::Remote, 7_000);
         slow.latency_micros = Some(7_000);

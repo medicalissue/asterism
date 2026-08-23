@@ -261,7 +261,7 @@ refute "an unknown device name is refused locally" "no device named" \
 # because that is the only useful thing left to tell them.
 
 refute "a name already used in the orbit cannot be created again" \
-  "instance \"$INST\" already exists in this orbit (cpu/ram on $B_NAME)" \
+  "instance \"$INST\" already exists in this orbit (compute on $B_NAME)" \
   env ASTERISM_HOME="$A" "$AST" create "$INST" --image "$DISK" --mem 512M --disk 1G
 
 # ...and the refusal left nothing behind on A.
@@ -271,18 +271,18 @@ grep -qF "no instances" <<<"$LOCAL_LS" \
 echo "ok: a refused claim leaves no half-created instance"
 
 # `ast ls` is the orbit's registry, not this device's shard of it, so the same
-# one row appears on both daemons — with a CPU column saying which device is
+# one row appears on both daemons — with a COMPUTE column saying which device is
 # supplying it, and no per-device grouping anywhere.
 for home in "$A" "$B"; do
   ORBIT_LS="$(ASTERISM_HOME="$home" "$AST" ls 2>&1)" || fail "ast ls failed:"$'\n'"$ORBIT_LS"
-  grep -qE "^NAME +STATUS +IMAGE +SHAPE +CPU +AGE +SSH$" <<<"$ORBIT_LS" \
-    || fail "ast ls has no CPU column:"$'\n'"$ORBIT_LS"
+  grep -qE "^NAME +STATUS +IMAGE +SHAPE +COMPUTE +AGE +SSH$" <<<"$ORBIT_LS" \
+    || fail "ast ls has no COMPUTE column:"$'\n'"$ORBIT_LS"
   grep -qE "^$INST +defined .*$B_NAME" <<<"$ORBIT_LS" \
-    || fail "ast ls does not show $INST with its cpu on $B_NAME:"$'\n'"$ORBIT_LS"
+    || fail "ast ls does not show $INST with its compute on $B_NAME:"$'\n'"$ORBIT_LS"
   [ "$(grep -c "^$INST " <<<"$ORBIT_LS")" = "1" ] \
     || fail "$INST appears more than once, so the namespace is not flat:"$'\n'"$ORBIT_LS"
 done
-echo "ok: ast ls shows one namespace from both daemons, with a CPU column"
+echo "ok: ast ls shows one namespace from both daemons, with a COMPUTE column"
 
 # --local is the debugging view, and it is the one that differs per device.
 expect "ls --local on B holds the row" "$INST" \
@@ -299,16 +299,19 @@ expect "status resolves across the orbit" "name:    $INST" \
   env ASTERISM_HOME="$A" "$AST" status "$INST"
 
 # `ast status` renders the parts, and every part names the device it comes
-# from. cpu and ram are one part because they are sourced as a pair.
+# from. Compute is one part because CPU and physical RAM are sourced as a pair.
 PARTS="$(ASTERISM_HOME="$A" "$AST" status "$INST" 2>&1)"
-grep -qE "^  cpu/ram +$B_NAME +2 cores" <<<"$PARTS" \
-  || fail "no cpu/ram part sourced from $B_NAME:"$'\n'"$PARTS"
-grep -qE "^  disk +$B_NAME +.*\(follows cpu\)" <<<"$PARTS" \
-  || fail "the disk does not follow the cpu:"$'\n'"$PARTS"
-grep -qE "^  network +$B_NAME +.*\(exit default: same as cpu\)" <<<"$PARTS" \
-  || fail "egress is not defaulted to the cpu device:"$'\n'"$PARTS"
+grep -qE "^  compute +$B_NAME +2 cores" <<<"$PARTS" \
+  || fail "no compute part sourced from $B_NAME:"$'\n'"$PARTS"
+grep -qE "^  disk +$B_NAME +.*\(follows compute\)" <<<"$PARTS" \
+  || fail "the disk does not follow compute:"$'\n'"$PARTS"
+grep -qE "^  network +$B_NAME +.*\(exit default: same as compute\)" <<<"$PARTS" \
+  || fail "egress is not defaulted to the compute device:"$'\n'"$PARTS"
 grep -qE "^  gpu +- +none$" <<<"$PARTS" \
   || fail "no gpu row:"$'\n'"$PARTS"
+if grep -qiE 'cpu/ram|(^|[^[:alpha:]])ram([^[:alpha:]]|$)' <<<"$PARTS"; then
+  fail "ast status still exposes a legacy parts label:"$'\n'"$PARTS"
+fi
 # No device has a privileged relationship to an instance, so nothing in the
 # output may imply one.
 if grep -qi "anchor" <<<"$PARTS"; then fail "ast status still speaks of anchors:"$'\n'"$PARTS"; fi
@@ -436,7 +439,7 @@ grep -qF "ast rename $DUP <new-name>" <<<"$HEALED" \
 echo "ok: the healed orbit found the collision and marked the newer creation"
 
 refute "a conflicted instance refuses to boot" \
-  "shares its name with another instance in this orbit (cpu/ram on $B_NAME)" \
+  "shares its name with another instance in this orbit (compute on $B_NAME)" \
   env ASTERISM_HOME="$A" "$AST" up "$DUP"
 refute "and says which command ends it" "ast rename $DUP <new-name>" \
   env ASTERISM_HOME="$A" "$AST" up "$DUP"
@@ -456,7 +459,7 @@ echo "ok: both instances are usable again under distinct names"
 
 # A rename cannot walk into another collision either.
 refute "renaming onto a name the orbit already uses is refused" \
-  "already exists in this orbit (cpu/ram on $B_NAME)" \
+  "already exists in this orbit (compute on $B_NAME)" \
   env ASTERISM_HOME="$A" "$AST" rename "$DUP-a" "$DUP"
 
 expect "the renamed instance works" "$DUP-a  running" \
@@ -517,7 +520,7 @@ grep -qE "^$INST +unknown .*$B_NAME" <<<"$GONE" \
   || fail "B's instances vanished from the orbit view when B did:"$'\n'"$GONE"
 grep -qE "^$DUP +unknown .*$B_NAME" <<<"$GONE" \
   || fail "B's $DUP vanished from the orbit view:"$'\n'"$GONE"
-grep -qF "the device supplying that instance's cpu is out of touch" <<<"$GONE" \
+grep -qF "the device supplying that instance's compute is out of touch" <<<"$GONE" \
   || fail "ast ls does not explain what unknown means:"$'\n'"$GONE"
 # A's own instance is still live in the same table: one namespace, two states.
 grep -qE "^$DUP-a +stopped .*$A_NAME" <<<"$GONE" \
