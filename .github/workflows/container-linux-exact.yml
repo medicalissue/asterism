@@ -68,6 +68,24 @@ jobs:
             dbus-x11 e2fsprogs gnome-keyring iproute2 jq libcap-ng-dev \
             libseccomp-dev libsecret-tools lsof pkg-config procps slirp4netns \
             uidmap
+          debugfs="$(command -v debugfs || true)"
+          test -n "$debugfs"
+          test -x "$debugfs"
+          # The exact target's shared resolver accepts this absolute fallback.
+          # Keep the product check intact: wire the Ubuntu package binary into
+          # that host capability path, then prove the actual executable.
+          if [ "$debugfs" != /usr/local/bin/debugfs ]; then
+            test ! -e /usr/local/bin/debugfs
+            sudo ln -s "$debugfs" /usr/local/bin/debugfs
+          fi
+          test -x /usr/local/bin/debugfs
+          {
+            printf 'package_path=%s\n' "$debugfs"
+            printf 'product_fallback=%s\n' "$(readlink -f /usr/local/bin/debugfs)"
+            dpkg-query -W -f='package=${Package}\nversion=${Version}\n' e2fsprogs
+            /usr/local/bin/debugfs -V
+            sha256sum "$(readlink -f /usr/local/bin/debugfs)"
+          } >"$GATE_EVIDENCE/debugfs-preflight.txt" 2>&1
 
       - name: Build the shipped payload from only the exact source
         env:
