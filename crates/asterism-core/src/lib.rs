@@ -24,6 +24,7 @@ pub mod doctor;
 pub mod durable;
 pub mod hosted_auth;
 pub mod hv;
+pub mod hyperv;
 pub mod image;
 pub mod instance;
 pub mod ipc;
@@ -44,6 +45,7 @@ pub mod snapshot;
 pub mod tools;
 pub mod verify;
 pub mod volume;
+pub mod windows_host;
 
 /// Version of the `astd`/`ast` pair this binary was built from.
 ///
