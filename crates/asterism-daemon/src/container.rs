@@ -2,11 +2,12 @@
 //!
 //! Linux uses a rootless user/mount/pid/network namespace plus a delegated
 //! cgroup-v2 leaf. The namespace holder exposes one private Unix control
-//! socket for state, exec and stop. Other hosts have typed adapters that
-//! refuse until their managed utility-VM implementation exists.
+//! socket for state, exec and stop. macOS runs the same contract inside a
+//! no-uplink VZ utility VM; other hosts retain typed fail-closed adapters.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -334,6 +335,7 @@ fn prepare_macos(inst: &Instance) -> Result<Prepared> {
         cpus: inst.shape.cpus,
         mem_mib: inst.shape.mem_mib,
         mac: asterism_vz::mac_for(&inst.name),
+        network_enabled: false,
         dhcp_lease_is_endpoint: false,
         agent_key: None,
     };
@@ -583,7 +585,7 @@ fn start_macos(config_path: &Path, mailbox: &Path) -> Result<Handle> {
         .join("vz-helper.log");
     let log =
         fs::File::create(&log_path).with_context(|| format!("opening {}", log_path.display()))?;
-    let mut child = Command::new(&helper)
+    let child = Command::new(&helper)
         .arg("--config")
         .arg(config_path)
         .stdin(Stdio::null())
@@ -591,16 +593,13 @@ fn start_macos(config_path: &Path, mailbox: &Path) -> Result<Handle> {
         .stderr(Stdio::from(log))
         .spawn()
         .with_context(|| format!("spawning {}", helper.display()))?;
-    let proc = ProcId::capture(child.id()).with_context(|| {
-        format!(
-            "the VZ helper exited immediately; inspect {}",
-            log_path.display()
-        )
-    });
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-    let proc = proc?;
+    let proc = match capture_or_kill_helper(child, &log_path, ProcId::capture) {
+        Ok(proc) => proc,
+        Err(error) => {
+            let _ = fs::remove_file(&config.ctl);
+            return Err(error);
+        }
+    };
 
     let started = Instant::now();
     let helper_deadline = started + HELPER_TIMEOUT;
@@ -670,6 +669,39 @@ fn start_macos(config_path: &Path, mailbox: &Path) -> Result<Handle> {
         }),
         started_at: asterism_core::instance::now_unix(),
     })
+}
+
+/// Capture durable ownership while the freshly spawned child handle is still
+/// available. If the platform cannot describe that process, the `Child`
+/// itself remains sufficient authority to kill and reap exactly what we just
+/// spawned; returning without doing so would orphan a live helper with no
+/// handle the caller could later stop.
+fn capture_or_kill_helper<F>(
+    mut child: std::process::Child,
+    log_path: &Path,
+    capture: F,
+) -> Result<ProcId>
+where
+    F: FnOnce(u32) -> Result<ProcId>,
+{
+    match capture(child.id()) {
+        Ok(proc) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            Ok(proc)
+        }
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(error).with_context(|| {
+                format!(
+                    "the VZ helper could not be recorded; inspect {}",
+                    log_path.display()
+                )
+            })
+        }
+    }
 }
 
 fn state_macos(handle: &Handle) -> Result<RunState> {
@@ -789,15 +821,23 @@ fn reset_mailbox(mailbox: &Path) -> Result<()> {
         "cgroup",
         "cgroup.events",
     ] {
-        let path = mailbox.join(name);
-        match fs::remove_dir_all(&path) {
-            Ok(()) => continue,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => {
-                fs::remove_file(&path)?;
-            }
-            Err(error) => return Err(error.into()),
-        }
+        remove_mailbox_entry(&mailbox.join(name))?;
+    }
+    Ok(())
+}
+
+/// Remove one protocol-owned path without ever traversing a symlink planted
+/// by a stale or compromised guest.
+fn remove_mailbox_entry(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_dir() {
+        fs::remove_dir_all(path)?;
+    } else {
+        fs::remove_file(path)?;
     }
     Ok(())
 }
@@ -816,9 +856,9 @@ fn utility_call(
     let input = mailbox.join("in");
     let output = mailbox.join("out");
     let stage = mailbox.join(format!(".in-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&stage);
-    let _ = fs::remove_dir_all(&input);
-    let _ = fs::remove_dir_all(&output);
+    remove_mailbox_entry(&stage)?;
+    remove_mailbox_entry(&input)?;
+    remove_mailbox_entry(&output)?;
     fs::create_dir_all(&stage)?;
 
     match request {
@@ -852,11 +892,15 @@ fn utility_call(
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let result = fs::read_to_string(output.join("result"))?;
+    let output_metadata = fs::symlink_metadata(&output)?;
+    if !output_metadata.file_type().is_dir() {
+        bail!("container utility VM reply directory is not a real directory");
+    }
+    let result = read_mailbox_text(&output.join("result"), 64 * 1024)?;
     let response = match result.trim() {
         "ready" => ControlResponse::Ready { host_pid: 0 },
         "exec" => ControlResponse::Exec {
-            status: fs::read_to_string(output.join("status"))?
+            status: read_mailbox_text(&output.join("status"), 64)?
                 .trim()
                 .parse()
                 .context("parsing utility-VM exec status")?,
@@ -865,38 +909,52 @@ fn utility_call(
         },
         "stopping" => ControlResponse::Stopping,
         "error" => ControlResponse::Error {
-            message: fs::read_to_string(output.join("message"))?
+            message: read_mailbox_text(&output.join("message"), 64 * 1024)?
                 .trim()
                 .to_owned(),
         },
         other => bail!("container utility VM returned unknown result {other:?}"),
     };
-    let _ = fs::remove_dir_all(&input);
-    let _ = fs::remove_dir_all(&output);
+    remove_mailbox_entry(&input)?;
+    remove_mailbox_entry(&output)?;
     Ok(response)
 }
 
 fn read_bounded_file(path: &Path) -> Result<String> {
+    read_mailbox_text(path, MAX_EXEC_OUTPUT)
+}
+
+fn read_mailbox_text(path: &Path, limit: usize) -> Result<String> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        bail!(
+            "utility-VM mailbox entry {} is not a regular file",
+            path.display()
+        );
+    }
     let mut bytes = Vec::new();
-    fs::File::open(path)?
-        .take((MAX_EXEC_OUTPUT + 1) as u64)
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?
+        .take((limit + 1) as u64)
         .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_EXEC_OUTPUT {
-        bytes.truncate(MAX_EXEC_OUTPUT);
+    if bytes.len() > limit {
+        bytes.truncate(limit);
         bytes.extend_from_slice(b"\n[output truncated by astd]\n");
     }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn cgroup_populated(cgroup: &Path) -> Result<bool> {
-    let events = match fs::read_to_string(cgroup.join("cgroup.events")) {
-        Ok(events) => events,
+    let path = cgroup.join("cgroup.events");
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("reading lifecycle state from {}", cgroup.display()))
-        }
+        Err(error) => return Err(error.into()),
     };
+    let events = read_mailbox_text(&path, 64 * 1024)
+        .with_context(|| format!("reading lifecycle state from {}", cgroup.display()))?;
     events
         .lines()
         .find_map(|line| line.strip_prefix("populated "))
@@ -1313,6 +1371,46 @@ mod tests {
         let text = read_bounded_file(&path).unwrap();
         assert_eq!(text.matches('x').count(), MAX_EXEC_OUTPUT);
         assert!(text.ends_with("[output truncated by astd]\n"));
+    }
+
+    #[test]
+    fn utility_mailbox_never_traverses_guest_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = outside.path().join("sentinel");
+        fs::write(&sentinel, "host data").unwrap();
+
+        let planted_dir = dir.path().join("out");
+        std::os::unix::fs::symlink(outside.path(), &planted_dir).unwrap();
+        remove_mailbox_entry(&planted_dir).unwrap();
+        assert!(!planted_dir.exists());
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "host data");
+
+        let planted_file = dir.path().join("stdout");
+        std::os::unix::fs::symlink(&sentinel, &planted_file).unwrap();
+        assert!(read_bounded_file(&planted_file).is_err());
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "host data");
+    }
+
+    #[test]
+    fn failed_helper_identity_capture_kills_and_reaps_the_spawned_process() {
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let error = capture_or_kill_helper(child, Path::new("helper.log"), |_| {
+            bail!("forced capture refusal")
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("could not be recorded"), "{error}");
+
+        // Reaping is part of the contract: kill(0) reports ESRCH rather than
+        // succeeding on a zombie left behind by the failed launch.
+        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        assert_eq!(rc, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 
     #[test]

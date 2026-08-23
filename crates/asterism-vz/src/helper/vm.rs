@@ -603,15 +603,21 @@ unsafe fn build_config(
     vm_config.setDirectorySharingDevices(&NSArray::from_retained_slice(&shares));
 
     // ---- network -------------------------------------------------------
-    // NAT needs no entitlement approval; bridged would need the restricted
-    // com.apple.vm.networking. The MAC is pinned rather than random because
-    // it is the only key into /var/db/dhcpd_leases (spike landmine 8).
-    let net = VZVirtioNetworkDeviceConfiguration::new();
-    net.setAttachment(Some(&Retained::into_super(
-        VZNATNetworkDeviceAttachment::new(),
-    )));
-    net.setMACAddress(mac);
-    let nets: Vec<Retained<VZNetworkDeviceConfiguration>> = vec![Retained::into_super(net)];
+    // An empty list is how a container utility VM gets no uplink. Merely
+    // skipping DHCP discovery would still leave a NAT attachment available
+    // to a privileged workload. Ordinary VMs retain the historical NAT NIC.
+    let mut nets: Vec<Retained<VZNetworkDeviceConfiguration>> = Vec::new();
+    if config.network_enabled {
+        // NAT needs no entitlement approval; bridged would need the restricted
+        // com.apple.vm.networking. The MAC is pinned rather than random because
+        // it is the only key into /var/db/dhcpd_leases (spike landmine 8).
+        let net = VZVirtioNetworkDeviceConfiguration::new();
+        net.setAttachment(Some(&Retained::into_super(
+            VZNATNetworkDeviceAttachment::new(),
+        )));
+        net.setMACAddress(mac);
+        nets.push(Retained::into_super(net));
+    }
     vm_config.setNetworkDevices(&NSArray::from_retained_slice(&nets));
 
     // ---- serial console ------------------------------------------------

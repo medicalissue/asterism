@@ -519,6 +519,7 @@ impl Hypervisor for Vz {
             cpus: inst.shape.cpus,
             mem_mib: inst.shape.mem_mib,
             mac: asterism_vz::mac_for(&inst.name),
+            network_enabled: true,
             // An OCI rootfs has no cloud image in which to install the
             // Python guest agent or sshd. Its generated init runs DHCP with
             // this instance's pinned MAC, so a current matching lease is
@@ -1174,24 +1175,79 @@ fn is_quarantined(bin: &Path) -> bool {
         .is_ok_and(|out| out.status.success())
 }
 
-/// Does this binary carry both entitlements required by the helper?
+/// Does this binary have a valid strict signature carrying both true-valued
+/// entitlements required by the helper?
 ///
 /// `codesign -d --entitlements -` prints the entitlement plist; an unsigned
 /// binary, or one cargo has rewritten since it was signed, prints an error
 /// instead. Either way the answer is the same: it cannot create a VM.
 fn is_entitled(bin: &Path) -> bool {
+    let verified = Command::new("codesign")
+        .args(["--verify", "--strict", "--verbose=2"])
+        .arg(bin)
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if !verified {
+        return false;
+    }
     let Ok(out) = Command::new("codesign")
-        .args(["-d", "--entitlements", "-"])
+        .args(["-d", "--entitlements", ":-"])
         .arg(bin)
         .output()
     else {
         return false;
     };
-    // Older codesign writes the plist to stderr, newer to stdout.
-    let printed =
-        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
-    printed.contains(asterism_vz::ENTITLEMENT)
-        && printed.contains(asterism_vz::NETWORK_CLIENT_ENTITLEMENT)
+    out.status.success()
+        && (entitlements_are_true(&out.stdout) || entitlements_are_true(&out.stderr))
+}
+
+/// Parse a codesign entitlement plist and require boolean true values.
+///
+/// Searching the diagnostic text for key names is not evidence: codesign can
+/// print a key whose value is false, and malformed output can contain the same
+/// substring. Keep this parser separate so those refusal cases are testable on
+/// every platform, including builders without `/usr/bin/codesign`.
+fn entitlements_are_true(bytes: &[u8]) -> bool {
+    let Some(start) = bytes.windows(b"<plist".len()).position(|w| w == b"<plist") else {
+        return false;
+    };
+    let Some(relative_end) = bytes[start..]
+        .windows(b"</plist>".len())
+        .position(|w| w == b"</plist>")
+    else {
+        return false;
+    };
+    let end = start + relative_end + b"</plist>".len();
+    let Ok(plist) = xmltree::Element::parse(&bytes[start..end]) else {
+        return false;
+    };
+    let Some(dict) = plist.get_child("dict") else {
+        return false;
+    };
+    let entries: Vec<&xmltree::Element> = dict
+        .children
+        .iter()
+        .filter_map(|node| node.as_element())
+        .collect();
+    [
+        asterism_vz::ENTITLEMENT,
+        asterism_vz::NETWORK_CLIENT_ENTITLEMENT,
+    ]
+    .into_iter()
+    .all(|required| {
+        let matching: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, element)| {
+                (element.name == "key" && element.get_text().as_deref() == Some(required))
+                    .then_some(index)
+            })
+            .collect();
+        matching.len() == 1
+            && entries
+                .get(matching[0] + 1)
+                .is_some_and(|value| value.name == "true")
+    })
 }
 
 /// `sw_vers -productVersion`, e.g. `15.6.1`.
@@ -1588,6 +1644,26 @@ mod tests {
         std::fs::write(&fake, b"#!/bin/sh\ntrue\n").unwrap();
         assert!(!is_entitled(&fake));
         assert!(!is_entitled(&dir.path().join("absent")));
+    }
+
+    #[test]
+    fn entitlement_keys_require_structural_boolean_true_values() {
+        let valid = format!(
+            r#"noise<plist version="1.0"><dict><key>{}</key><true/><key>{}</key><true/></dict></plist>noise"#,
+            asterism_vz::ENTITLEMENT,
+            asterism_vz::NETWORK_CLIENT_ENTITLEMENT,
+        );
+        assert!(entitlements_are_true(valid.as_bytes()));
+
+        let false_value = valid.replacen("<true/>", "<false/>", 1);
+        assert!(!entitlements_are_true(false_value.as_bytes()));
+        let key_as_text = format!(
+            "<plist><dict><key>{}</key><true/><key>note</key><string>{}</string></dict></plist>",
+            asterism_vz::ENTITLEMENT,
+            asterism_vz::NETWORK_CLIENT_ENTITLEMENT,
+        );
+        assert!(!entitlements_are_true(key_as_text.as_bytes()));
+        assert!(!entitlements_are_true(b"not a plist"));
     }
 
     /// A handle that owns no process: nothing to take down, and nothing

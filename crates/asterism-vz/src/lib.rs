@@ -118,6 +118,13 @@ pub struct Config {
     /// `/var/db/dhcpd_leases` — a random MAC means no way to guess the
     /// guest's address when the guest cannot be asked for it.
     pub mac: String,
+    /// Whether the guest receives a NAT-backed virtio network device.
+    ///
+    /// Missing means the historical networked behavior so configs written
+    /// by an older daemon remain usable. Container utility VMs set this to
+    /// false: their private control transports do not require an uplink.
+    #[serde(default = "default_true")]
+    pub network_enabled: bool,
     /// Treat a matching DHCP lease as the guest endpoint without requiring
     /// an ssh banner. OCI root filesystems set this because their generated
     /// init runs DHCP but deliberately carries neither sshd nor the Python
@@ -188,6 +195,10 @@ pub enum Disk {
 pub struct Share {
     pub path: PathBuf,
     pub tag: String,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 impl Config {
@@ -578,6 +589,7 @@ mod tests {
             cpus: 2,
             mem_mib: 2048,
             mac: mac_for("dev"),
+            network_enabled: true,
             dhcp_lease_is_endpoint: true,
             agent_key: Some("/i/dev/agent.key".into()),
         };
@@ -596,8 +608,21 @@ mod tests {
         let config: Config = serde_json::from_str(json).unwrap();
         assert!(config.extra_disks.is_empty());
         assert!(config.direct_kernel.is_none());
+        assert!(config.network_enabled);
         assert!(!config.dhcp_lease_is_endpoint);
         assert!(config.shares.is_empty());
+    }
+
+    #[test]
+    fn a_config_can_explicitly_remove_every_network_device() {
+        let json = r#"{"instance":"utility","root":"/d.raw","seed":"/s.iso",
+            "efi_vars":"/e.bin","console":"/c.log","ctl":"/v.sock",
+            "cpus":1,"mem_mib":512,"mac":"52:54:00:aa:bb:cc",
+            "network_enabled":false}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(!config.network_enabled);
+        let encoded = serde_json::to_string(&config).unwrap();
+        assert!(encoded.contains(r#""network_enabled":false"#), "{encoded}");
     }
 
     #[test]
