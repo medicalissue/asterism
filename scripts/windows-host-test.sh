@@ -246,11 +246,11 @@ ok "a pinned Authenticode thumbprint is refused without a matching signature"
 
 # install.ps1 and update.ps1 parse as PowerShell when pwsh is present.
 if command -v pwsh >/dev/null 2>&1; then
-	pwsh -NoProfile -Command "& { \$null = [System.Management.Automation.Language.Parser]::ParseFile('${ROOT}/packaging/install.ps1', [ref]\$null, [ref]\$errs); if (\$errs) { \$errs | ForEach-Object { \$_.ToString() }; exit 1 } }" \
+	pwsh -NoProfile -Command "& { \$errs = \$null; \$null = [System.Management.Automation.Language.Parser]::ParseFile('${ROOT}/packaging/install.ps1', [ref]\$null, [ref]\$errs); if (\$errs) { \$errs | ForEach-Object { \$_.ToString() }; exit 1 } }" \
 		|| fail "install.ps1 parse"
-	pwsh -NoProfile -Command "& { \$null = [System.Management.Automation.Language.Parser]::ParseFile('${ROOT}/packaging/update.ps1', [ref]\$null, [ref]\$errs); if (\$errs) { \$errs | ForEach-Object { \$_.ToString() }; exit 1 } }" \
+	pwsh -NoProfile -Command "& { \$errs = \$null; \$null = [System.Management.Automation.Language.Parser]::ParseFile('${ROOT}/packaging/update.ps1', [ref]\$null, [ref]\$errs); if (\$errs) { \$errs | ForEach-Object { \$_.ToString() }; exit 1 } }" \
 		|| fail "update.ps1 parse"
-	pwsh -NoProfile -Command "& { \$null = [System.Management.Automation.Language.Parser]::ParseFile('${ROOT}/scripts/windows-host-fixtures.ps1', [ref]\$null, [ref]\$errs); if (\$errs) { \$errs | ForEach-Object { \$_.ToString() }; exit 1 } }" \
+	pwsh -NoProfile -Command "& { \$errs = \$null; \$null = [System.Management.Automation.Language.Parser]::ParseFile('${ROOT}/scripts/windows-host-fixtures.ps1', [ref]\$null, [ref]\$errs); if (\$errs) { \$errs | ForEach-Object { \$_.ToString() }; exit 1 } }" \
 		|| fail "windows-host-fixtures.ps1 parse"
 	ok "install.ps1, update.ps1 and windows-host-fixtures.ps1 parse"
 	pwsh -NoProfile -File "${ROOT}/scripts/windows-host-fixtures.ps1" \
