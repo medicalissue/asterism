@@ -71,14 +71,14 @@ nvidia_gate_validate_runner_evidence() {
       *) echo "NVIDIA GATE FAIL: runner line is not key=value" >&2; return 1 ;;
     esac
     case "$key" in
-      guest_image_digest|provider_image_digest|guest_container_id|guest_device_name|provider_device_name|guest_device_id|provider_device_id|path|direct_path|relay_path|guest_path|libcuda_path|executor|provider_helper_kind|guest_output|provider_astd_pid_before|provider_astd_pid_after|provider_helper_pid_before|provider_helper_pid_after|guest_pid_before|guest_pid_after|provider_astd_restarted|provider_helper_restarted|guest_restarted|revoke|contention|loss|version_skew_fresh_session|version_skew_error|mesh_open_bearer|hardware_cuda_executed|driver_digest|libcuda_digest|guest_binary_digest|transcript_root) ;;
+      guest_image_digest|provider_image_digest|guest_container_id|guest_device_name|provider_device_name|guest_device_id|provider_device_id|path|direct_path|relay_path|guest_path|libcuda_path|executor|provider_helper_kind|guest_output|provider_astd_pid_before|provider_astd_pid_after|provider_helper_pid_before|provider_helper_pid_after|guest_pid_before|guest_pid_after|provider_astd_restarted|provider_helper_restarted|guest_restarted|revoke|contention|loss|version_skew_fresh_session|version_skew_error|mesh_open_bearer|hardware_cuda_executed|driver_digest|astd_digest|libcuda_digest|guest_binary_digest|guest_launcher_digest|transcript_root) ;;
       *) echo "NVIDIA GATE FAIL: forbidden runner evidence key $key" >&2; return 1 ;;
     esac
     case "$seen" in *" $key "*) echo "NVIDIA GATE FAIL: duplicate runner key $key" >&2; return 1 ;; esac
     seen="$seen$key "
   done <"$file"
 
-  for required in guest_image_digest provider_image_digest guest_container_id guest_device_name provider_device_name guest_device_id provider_device_id path direct_path relay_path guest_path libcuda_path executor provider_helper_kind guest_output provider_astd_pid_before provider_astd_pid_after provider_helper_pid_before provider_helper_pid_after guest_pid_before guest_pid_after provider_astd_restarted provider_helper_restarted guest_restarted revoke contention loss version_skew_fresh_session version_skew_error mesh_open_bearer hardware_cuda_executed driver_digest libcuda_digest guest_binary_digest transcript_root; do
+  for required in guest_image_digest provider_image_digest guest_container_id guest_device_name provider_device_name guest_device_id provider_device_id path direct_path relay_path guest_path libcuda_path executor provider_helper_kind guest_output provider_astd_pid_before provider_astd_pid_after provider_helper_pid_before provider_helper_pid_after guest_pid_before guest_pid_after provider_astd_restarted provider_helper_restarted guest_restarted revoke contention loss version_skew_fresh_session version_skew_error mesh_open_bearer hardware_cuda_executed driver_digest astd_digest libcuda_digest guest_binary_digest guest_launcher_digest transcript_root; do
     nvidia_gate_require_kv "$file" "$required" >/dev/null || return 1
   done
 }
@@ -151,14 +151,18 @@ nvidia_gate_judge() {
   nvidia_gate_is_sha256 "$guest_digest" || { echo "NVIDIA GATE FAIL: guest image digest" >&2; return 1; }
   nvidia_gate_is_sha256 "$provider_digest" || { echo "NVIDIA GATE FAIL: provider image digest" >&2; return 1; }
 
-  local driver_artifact libcuda_artifact guest_artifact transcript_root
+  local driver_artifact astd_artifact libcuda_artifact guest_artifact launcher_artifact transcript_root
   driver_artifact="$(nvidia_gate_require_kv "$file" driver_digest)" || return 1
+  astd_artifact="$(nvidia_gate_require_kv "$file" astd_digest)" || return 1
   libcuda_artifact="$(nvidia_gate_require_kv "$file" libcuda_digest)" || return 1
   guest_artifact="$(nvidia_gate_require_kv "$file" guest_binary_digest)" || return 1
+  launcher_artifact="$(nvidia_gate_require_kv "$file" guest_launcher_digest)" || return 1
   transcript_root="$(nvidia_gate_require_kv "$file" transcript_root)" || return 1
   nvidia_gate_is_sha256 "$driver_artifact" || { echo "NVIDIA GATE FAIL: driver artifact digest" >&2; return 1; }
+  nvidia_gate_is_sha256 "$astd_artifact" || { echo "NVIDIA GATE FAIL: astd artifact digest" >&2; return 1; }
   nvidia_gate_is_sha256 "$libcuda_artifact" || { echo "NVIDIA GATE FAIL: libcuda artifact digest" >&2; return 1; }
   nvidia_gate_is_sha256 "$guest_artifact" || { echo "NVIDIA GATE FAIL: guest artifact digest" >&2; return 1; }
+  nvidia_gate_is_sha256 "$launcher_artifact" || { echo "NVIDIA GATE FAIL: guest launcher digest" >&2; return 1; }
   nvidia_gate_is_blake3 "$transcript_root" || { echo "NVIDIA GATE FAIL: transcript root" >&2; return 1; }
   [ "$libcuda" = "$libcuda_artifact" ] || { echo "NVIDIA GATE FAIL: libcuda digest binding" >&2; return 1; }
 
