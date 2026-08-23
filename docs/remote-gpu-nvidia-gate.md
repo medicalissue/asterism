@@ -21,8 +21,8 @@ filed as NVIDIA hardware evidence.
 | `crates/asterism-core/src/remote_gpu_nvidia.rs` | Fail-closed driver/CUDA/CC matrix and deterministic two-device harness |
 | `crates/asterism-core/examples/remote_gpu_nvidia_harness.rs` | Source runner for the contract; always prints `hardware_cuda_executed=false` |
 | `scripts/harness-remote-gpu-nvidia.sh` | Hardware wrapper: independently observes SHA/tree/GPU inventory, invokes the pinned-tree E2E runner, and judges its closed evidence schema |
-| `crates/asterism-nvidia-e2e-driver` | Compiled process driver and verifier for hash-chained daemon/helper/guest/route transcripts; refuses synthetic or reference records |
-| `scripts/lib/nvidia-e2e-runner.sh` | Builds the driver, daemon, ABI shim, and guest payload from the clean pinned checkout in a private target directory |
+| `crates/asterism-nvidia-e2e-driver` | Guest projection adapter. It talks to the guest `astd` local socket and emits raw observations; it contains no provider, relay, or acceptance verifier. |
+| `scripts/lib/nvidia-e2e-runner.sh` | Builds the exact candidate, pairs two real daemon identities through invite/SAS, then records direct/relay success and active revoke/loss observations. It cannot accept them. |
 | `scripts/lib/nvidia-guest-container.sh` | Runs the payload in a digest-pinned read-only container with only projected `/dev/nvidia0` and the audited libcuda mounted |
 | `scripts/lib/guest_remote_cuda_vector_add.c` | CUDA application payload intended to execute inside the Asterism guest/container |
 | `scripts/test-nvidia-release-gate.sh` | Source-only fixtures proving reference, local-direct, stale PID, bearer, Conflict-skew, and hardware-false records are refused |
@@ -75,11 +75,18 @@ The matching dstack 0.21.2 CLI validated the task against project `main` at
 - expected wall clock 20–40 minutes
 - expected spend **about 1–3 USD** if applied once and stopped
 
-The plan reported no fleets, so submission is blocked without spending. The
-pinned-tree runner performs a clean locked release build in a private temporary
-target directory. No environment variable can replace the driver, daemon,
-guest payload, ABI shim, provider image, or guest image. Missing build or
-container prerequisites fail closed.
+The plan reported no fleets, so submission is blocked without spending. Apply
+must start from a detached checkout of the exact candidate under review and
+supply `ASTERISM_PINNED_SHA`; the task rejects any different `HEAD`. This
+replaces the impossible pattern of embedding a commit's own future object ID
+inside that commit. The runner builds in a private temporary target directory.
+
+Acceptance is outside the candidate. The independent reviewer supplies
+`ASTERISM_NVIDIA_VERIFIER_IMAGE` and its exact sha256 digest. The candidate
+produces only a read-only directory of raw JSON, daemon logs, container
+identities, crossed frames, and artifact hashes. The offline verifier container
+receives that directory read-only and is the only component allowed to emit
+normalized PASS evidence. The candidate has no `verify` subcommand.
 
 Preferred SKUs when offers are healthy: 2× L4 24 GB, 2× RTX 4090 24 GB, or
 2× A10 24 GB. Do not use V100/P100; CUDA 13 images do not support them and
@@ -96,7 +103,8 @@ IDs, driver, CUDA runtime, and route kind:
 
 - CUDA result bytes through the guest-local `/dev/nvidia0` adapter
 - guest application output `6.0,2.0,6.0` from projected `/dev/nvidia0` and injected libcuda
-- direct and relay traversal across two distinct named mesh device IDs
+- direct and relay traversal reported by iroh across the same two paired daemon
+  keys; relay evidence disables IP transports and never uses a Unix proxy
 - provider-process / provider-device loss while work is active
 - peer and instance revocation during an active session
 - concurrent lease-slot fencing
@@ -104,7 +112,7 @@ IDs, driver, CUDA runtime, and route kind:
 - fresh-session version skew returning `UnsupportedVersion`, never `Conflict`
 - exact candidate SHA, tree digest, runner digest, guest/provider image digests
 - exact driver, ABI shim, and guest-binary digests plus a hash-chained transcript root
-- a second verifier invocation whose executable digest equals the recorded driver digest
+- an immutable external verifier-image digest selected by the independent reviewer
 - unsupported driver/CUDA matrix fail-closed
 - `hardware_cuda_executed=true` only from that run
 

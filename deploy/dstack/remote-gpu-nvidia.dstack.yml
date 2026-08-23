@@ -6,7 +6,7 @@
 #
 # Schema: official task reference
 # https://dstack.ai/docs/reference/dstack.yml/task.md
-#   type, name, digest-pinned image, repos.url+hash,
+#   type, name, digest-pinned image, exact local candidate checkout,
 #   resources.gpu.vendor/count/memory/compute_capability, spot_policy,
 #   max_price, max_duration, idle_duration, retry.
 #
@@ -15,8 +15,8 @@
 # Apply only when the plan shows 2x NVIDIA, CC 7.5+, under max_price 2.50.
 # Expected spend about 1–3 USD if the gate finishes in under an hour.
 #
-# Hardware PASS is recorded only when the paid host checks out repos.hash
-# (the integrated 13.2 + 13.3 + 13.4 candidate), ASTERISM_PINNED_SHA matches,
+# Hardware PASS is recorded only when dstack uploads the detached exact
+# candidate checkout, ASTERISM_PINNED_SHA matches,
 # ASTERISM_NVIDIA_E2E_RUNNER names an executable from that checkout, and
 # scripts/harness-remote-gpu-nvidia.sh judges the guest→mesh→provider path.
 # CPU reference and host-direct CUDA cannot PASS.
@@ -28,22 +28,27 @@ image: docker.io/nvidia/cuda:13.0.0-devel-ubuntu24.04@sha256:435220c0fef35cbf712
 docker: true
 
 repos:
-  - url: https://github.com/medicalissue/asterism.git
-    hash: "f0d35132b4ced8a7e757fa3ffaf2f19b2e2c373f"
+  # Apply from the detached checkout of the exact SHA under review. dstack
+  # uploads that checkout; ASTERISM_PINNED_SHA is reviewer-supplied at apply
+  # time because a Git commit cannot contain its own object ID.
+  - local_path: ../..
     path: /dstack/run
 
 working_dir: /dstack/run
 
 env:
   - ASTERISM_SOURCE_ONLY=0
-  - ASTERISM_PINNED_SHA=f0d35132b4ced8a7e757fa3ffaf2f19b2e2c373f
+  - ASTERISM_PINNED_SHA
   - ASTERISM_NVIDIA_E2E_RUNNER=/dstack/run/scripts/lib/nvidia-e2e-runner.sh
+  - ASTERISM_NVIDIA_VERIFIER_IMAGE
+  - ASTERISM_NVIDIA_VERIFIER_DIGEST
   - CARGO_HOME=/dstack/cargo
   - RUSTUP_HOME=/dstack/rustup
   - PATH=/dstack/cargo/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 commands:
   - test "$(git rev-parse HEAD)" = "$ASTERISM_PINNED_SHA"
+  - test -z "$(git status --porcelain --untracked-files=no)"
   - git rev-parse HEAD
   - git rev-parse HEAD^{tree}
   - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/asterism-rustup-init.sh

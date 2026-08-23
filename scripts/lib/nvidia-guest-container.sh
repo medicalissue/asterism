@@ -26,5 +26,12 @@ CONTAINER_ID="$(docker create --network none --read-only \
   --env ASTERISM_LIBCUDA=/usr/lib/libcuda.so.1 \
   "$IMAGE" /asterism/guest)"
 trap 'docker rm -f "$CONTAINER_ID" >/dev/null 2>&1 || true' EXIT
+docker start "$CONTAINER_ID" >/dev/null
+CONTAINER_PID="$(docker inspect --format '{{.State.Pid}}' "$CONTAINER_ID")"
 printf 'guest_container_id=%s\n' "$CONTAINER_ID"
-docker start --attach "$CONTAINER_ID"
+printf 'guest_container_pid=%s\n' "$CONTAINER_PID"
+docker logs --follow "$CONTAINER_ID" &
+LOG_PID=$!
+STATUS="$(docker wait "$CONTAINER_ID")"
+wait "$LOG_PID"
+exit "$STATUS"

@@ -205,7 +205,30 @@ async fn main() -> Result<()> {
             .as_ref()
             .map(|mesh| mesh.device_id().to_string())
             .unwrap_or_else(|| "0".repeat(64));
-        if let Err(error) = node.gpu.install_live(gpu_name, gpu_id) {
+        let gpu_uuid = std::env::var("ASTERISM_GPU_UUID").ok();
+        let bootstrap = match (
+            std::env::var("ASTERISM_GPU_BOOTSTRAP_PEER").ok(),
+            std::env::var("ASTERISM_GPU_BOOTSTRAP_INSTANCE").ok(),
+            std::env::var("ASTERISM_GPU_BOOTSTRAP_MEMORY_BYTES").ok(),
+        ) {
+            (Some(peer), Some(instance), Some(memory)) => Some((
+                peer,
+                instance,
+                memory.parse::<u64>().context("ASTERISM_GPU_BOOTSTRAP_MEMORY_BYTES")?,
+            )),
+            (None, None, None) => None,
+            _ => anyhow::bail!(
+                "ASTERISM_GPU_BOOTSTRAP_PEER, _INSTANCE, and _MEMORY_BYTES must be set together"
+            ),
+        };
+        if let Err(error) = node.gpu.install_live(
+            gpu_name,
+            gpu_id,
+            gpu_uuid.as_deref(),
+            bootstrap
+                .as_ref()
+                .map(|(peer, instance, memory)| (peer.as_str(), instance.as_str(), *memory)),
+        ) {
             eprintln!("astd: GPU provider unavailable: {error:#}");
         }
     }
