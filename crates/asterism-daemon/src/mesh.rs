@@ -1393,8 +1393,36 @@ impl Mesh {
             .find(name)
             .await
             .into_iter()
+            // A fenced source is a recovery record, never current authority.
+            // Do not compare epochs across different instance IDs here: those
+            // are name collisions and must remain conflicts for the normal
+            // collision resolver rather than being silently selected away.
+            .filter(|(_, instance)| instance.moving.is_none())
             .next()
             .map(|(device, _)| device))
+    }
+
+    /// Find the fenced source that still owes a durable revoke after `target`
+    /// has published this exact instance and epoch.  This deliberately matches
+    /// identity as well as name: a same-name collision is not a move lineage.
+    pub async fn moving_source(
+        self: &Arc<Self>,
+        name: &str,
+        target: &str,
+        instance_id: &str,
+        epoch: u64,
+    ) -> Option<String> {
+        self.find(name)
+            .await
+            .into_iter()
+            .find_map(|(device, instance)| {
+                (instance.id == instance_id
+                    && instance
+                        .moving
+                        .as_ref()
+                        .is_some_and(|moving| moving.to_device == target && moving.epoch == epoch))
+                .then_some(device)
+            })
     }
 
     /// Every reachable device whose shard holds `name`. More than one is a
