@@ -235,6 +235,48 @@ fn recoverable_staging_dir(
     }
 }
 
+/// Identity-scoped staging for a different token is invisible to
+/// [`recoverable_staging_dir`]. A missing path is therefore not proof that
+/// nothing is staged, and a successful abort is resume proof, so the no-WAL
+/// arm must refuse when a name/epoch sibling's receipt is not this attempt.
+fn refuse_unmatched_staging_siblings(
+    name: &str,
+    instance_id: &str,
+    epoch: u64,
+    token: &str,
+) -> Result<()> {
+    let dir = paths::home_dir().join("instances");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+    };
+    let legacy = format!("{name}{STAGING}{epoch}");
+    let scoped_prefix = format!("{name}{STAGING}{epoch}-");
+    for entry in entries {
+        let path = entry?.path();
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if file_name != legacy && !file_name.starts_with(&scoped_prefix) {
+            continue;
+        }
+        if !path.is_dir() {
+            continue;
+        }
+        if Receipt::load(&path)
+            .and_then(|receipt| receipt.matches_attempt(instance_id, epoch, token))
+            .is_err()
+        {
+            bail!(
+                "staging {} does not match id/epoch/token; refusing to abort another move",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn live_socket(
     name: &str,
     instance_id: &str,
@@ -3757,6 +3799,12 @@ pub fn abort_target(
                 Ok(staging) => staging,
                 Err(e) => return error(e.context("refusing to abort unverified legacy staging")),
             };
+            if !staging.exists() {
+                if let Err(e) = refuse_unmatched_staging_siblings(name, instance_id, epoch, token) {
+                    return error(e);
+                }
+                return Response::Ok;
+            }
             let _ = std::fs::remove_file(paths::migration_socket_in(&staging));
             if let Err(e) = std::fs::remove_dir_all(&staging) {
                 if e.kind() != std::io::ErrorKind::NotFound {
@@ -6731,6 +6779,10 @@ mod tests {
             Some("wrong-coordinator-id"),
         )
         .is_err());
+        // Live splice checks above need a live WAL. abort_target's live arm
+        // requires a mesh source proof, which this test does not start.
+        third_txn.live = false;
+        save_authority(&third_txn).unwrap();
         assert!(matches!(
             abort_target(
                 &mut restarted,
