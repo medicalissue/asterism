@@ -216,8 +216,16 @@ cat >"${SHIMS}/chown" <<'EOF'
 #!/bin/sh
 exit 0
 EOF
+for command in newuidmap newgidmap slirp4netns debugfs ip unshare; do
+	cat >"${SHIMS}/${command}" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+done
 chmod +x "${SHIMS}/setcap" "${SHIMS}/nbd-client" "${SHIMS}/modprobe" \
-	"${SHIMS}/visudo" "${SHIMS}/sudo" "${SHIMS}/chown"
+	"${SHIMS}/visudo" "${SHIMS}/sudo" "${SHIMS}/chown" \
+	"${SHIMS}/newuidmap" "${SHIMS}/newgidmap" "${SHIMS}/slirp4netns" \
+	"${SHIMS}/debugfs" "${SHIMS}/ip" "${SHIMS}/unshare"
 
 # codesign, for the vz helper. Enough of one to answer the three questions
 # asked of it: sign this, does it carry the entitlement, does the signature

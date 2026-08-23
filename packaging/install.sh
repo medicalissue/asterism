@@ -1017,6 +1017,28 @@ configure_chv_linux() {
 	nbd_helper_source="$1"
 	[ "$(uname -s)" = "Linux" ] || return 0
 
+	# The native container adapter preserves the uid/gid model carried by an
+	# OCI image. `--map-root-user` alone maps one ID and breaks as soon as a
+	# service switches to (for example) nginx uid 101. Install the standard
+	# subordinate-ID helpers and the remaining namespace tools together; the
+	# daemon probe still fails closed when this account has no /etc/subuid or
+	# /etc/subgid range.
+	if ! have newuidmap || ! have newgidmap || ! have slirp4netns || \
+	   ! have debugfs || ! have ip || ! have unshare; then
+		if have apt-get; then
+			run_root apt-get install -y uidmap slirp4netns e2fsprogs iproute2 util-linux
+		elif have dnf; then
+			run_root dnf install -y shadow-utils slirp4netns e2fsprogs iproute util-linux
+		elif have zypper; then
+			run_root zypper --non-interactive install shadow slirp4netns e2fsprogs iproute2 util-linux
+		else
+			die "native containers need uidmap, slirp4netns, e2fsprogs, iproute2 and util-linux; install them, then re-run."
+		fi
+	fi
+	for command in newuidmap newgidmap slirp4netns debugfs ip unshare; do
+		have "$command" || die "the package manager completed but ${command} is still unavailable"
+	done
+
 	# nbd-client is named nbd-client on Debian/Ubuntu and nbd on Fedora/RHEL.
 	# kmod provides modprobe on both families. Install only when the host does
 	# not already carry the required command, so an existing administrator-
