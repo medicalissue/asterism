@@ -6,7 +6,11 @@ pub fn home_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("ASTERISM_HOME") {
         return PathBuf::from(dir);
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    // Windows native shells do not set HOME; USERPROFILE is the documented
+    // user-profile root and is what Credential Manager / SCM should agree on.
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".into());
     PathBuf::from(home).join(".asterism")
 }
 
@@ -191,7 +195,18 @@ pub fn volume_bridge_socket(instance: &str, host: &str, volume: &str) -> PathBuf
 /// hypervisor. Nothing here creates it, because a path function that touches
 /// the filesystem is a path function a refusal path cannot call.
 pub fn runtime_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("asterism-{}", crate::ipc::own_uid()))
+    std::env::temp_dir().join(format!("asterism-{}", runtime_uid()))
+}
+
+fn runtime_uid() -> String {
+    #[cfg(windows)]
+    {
+        std::env::var("USERNAME").unwrap_or_else(|_| "user".into())
+    }
+    #[cfg(not(windows))]
+    {
+        crate::ipc::own_uid().to_string()
+    }
 }
 
 /// The longest preferred socket path that is bound where it belongs.

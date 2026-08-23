@@ -173,9 +173,10 @@ stays exactly what it is today either way.
 
 ### Platforms
 
-Binaries are published for **macOS on Apple silicon** (`darwin-arm64`) and
-**Linux on x86-64 and arm64** (`linux-x86_64`, `linux-arm64`). Every other
-host is refused by name and pointed at the source build; there is no
+Binaries are published for **macOS on Apple silicon** (`darwin-arm64`),
+**Linux on x86-64 and arm64** (`linux-x86_64`, `linux-arm64`), and
+**Windows 11 Pro/Enterprise** (`windows-x86_64`, `windows-arm64`). Every
+other host is refused by name and pointed at the source build; there is no
 near-enough target, because a near-enough binary is one that does not run.
 
 A Linux archive is flat and self-contained: `ast`, `astd`, the pinned
@@ -190,6 +191,22 @@ invocation the transactional updater needs for that one installed VMM path.
 user unit; lingering (`loginctl enable-linger`) is what keeps that unit
 alive after logout. `ast doctor` executes the pinned helpers, NBD wrapper,
 and Secret Service rather than checking that files exist.
+
+Windows installs with the native PowerShell installer or the POSIX script
+under Git Bash:
+
+```console
+irm https://asterism.run/install.ps1 | iex
+curl -fsSL https://asterism.run/install.sh | sh     # Git Bash; detects MINGW/MSYS
+```
+
+A Windows tarball is `ast.exe`, `astd.exe`, `astd-hyperv.exe`, and the
+updater. The helper is required: there is no WHPX/QEMU product fallback.
+SHA-256 is mandatory. Authenticode is checked when
+`ASTERISM_AUTHENTICODE_THUMBPRINT` is set or `ASTERISM_REQUIRE_SIGNATURE=1`.
+Persistence is a Windows Service (`ast service install`); `ast doctor`
+reports edition, elevation, Hyper-V services, firewall, helper, and
+Credential Manager before any guest is created.
 
 ```console
 $ curl -fsSL https://asterism.run/install.sh | sh

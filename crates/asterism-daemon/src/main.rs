@@ -73,6 +73,26 @@ mod wake;
 
 use mesh::{ClientIo, Mesh, Splice};
 
+#[cfg(windows)]
+fn apply_service_home_from_args() {
+    // ImagePath is `astd.exe --service --home <dir>`. SCM starts with almost
+    // no environment, so the home has to be on the command line rather than
+    // inherited from the installing shell.
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--home" {
+            if let Some(home) = args.next() {
+                std::env::set_var("ASTERISM_HOME", home);
+            }
+            return;
+        }
+        if let Some(home) = arg.strip_prefix("--home=") {
+            std::env::set_var("ASTERISM_HOME", home);
+            return;
+        }
+    }
+}
+
 /// This device's own state: its shard of the orbit registry, and the name the
 /// orbit knows it by.
 ///
@@ -95,8 +115,7 @@ impl Node {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // Release activation has to prove the staged daemon before it replaces a
     // running one. This path touches no state and binds no socket, so a
     // downgrade refusal remains a refusal before mutation.
@@ -108,7 +127,34 @@ async fn main() -> Result<()> {
     if print_early_exit() {
         return Ok(());
     }
+    if std::env::args().any(|arg| arg == "--service") {
+        #[cfg(windows)]
+        {
+            apply_service_home_from_args();
+            return asterism_core::windows_host::dispatch_service(
+                asterism_core::windows_host::SERVICE_NAME,
+                || runtime().block_on(run_daemon()),
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            anyhow::bail!(
+                "astd --service is the Windows Service dispatcher; this build is {}",
+                std::env::consts::OS
+            );
+        }
+    }
+    runtime().block_on(run_daemon())
+}
 
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+}
+
+async fn run_daemon() -> Result<()> {
     // Before anything: the signals that mean "stop". Registering one is what
     // makes it ours — until then the default disposition applies, and for
     // both of these that is death with nothing tidied up. The socket is
