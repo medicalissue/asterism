@@ -162,6 +162,9 @@ jobs:
       - name: The installer's test suite
         run: bash scripts/install-test.sh
 
+      - name: Windows host integration (hermetic, no Cargo)
+        run: bash scripts/windows-host-test.sh
+
       - name: The formula renders, and is Ruby
         run: |
           set -eu
@@ -212,3 +215,43 @@ jobs:
           name: rc-evidence
           path: ${{ runner.temp }}/rc.evidence
           if-no-files-found: ignore
+
+  # Windows host integration and distribution. The unix daemon does not yet
+  # compile on Windows (AF_UNIX door, process identity), so this lane does
+  # not invoke Cargo. It proves the installer, updater, Authenticode seam,
+  # helper contract and doctor/service rows that a clean Windows machine
+  # actually runs. The native Hyper-V backend remains as-lvf.8.
+  windows-host:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Static host-integration gate
+        shell: bash
+        run: bash scripts/check-windows-host.sh
+
+      - name: Hermetic Windows installer suite
+        shell: bash
+        run: bash scripts/windows-host-test.sh
+
+      - name: Parse the native installer and updater
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($file in @('packaging/install.ps1', 'packaging/update.ps1')) {
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Join-Path $pwd $file), [ref]$null, [ref]$errs)
+            if ($errs) {
+              $errs | ForEach-Object { $_.ToString() }
+              throw "$file parse failed"
+            }
+          }
+
+      - name: Authenticode-ready signing recipe is present
+        shell: bash
+        run: |
+          set -eu
+          grep -q 'Get-AuthenticodeSignature' packaging/install.ps1
+          grep -q 'ASTERISM_AUTHENTICODE_THUMBPRINT' packaging/install.sh
+          grep -q 'astd-hyperv.exe' packaging/install.ps1
+          grep -q 'sc.exe' crates/asterism-core/src/windows_host.rs

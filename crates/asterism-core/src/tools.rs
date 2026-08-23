@@ -12,12 +12,21 @@ use anyhow::{bail, Context, Result};
 /// The daemon may be launched with a minimal PATH (launchd, systemd, a
 /// double-clicked app), so check the usual spots rather than trusting it.
 pub fn tool(name: &str) -> Result<PathBuf> {
-    let candidates = [
+    let mut candidates = vec![
         PathBuf::from(name),
         PathBuf::from("/opt/homebrew/bin").join(name),
         PathBuf::from("/usr/local/bin").join(name),
         PathBuf::from("/usr/bin").join(name),
     ];
+    if cfg!(windows) {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            candidates.push(PathBuf::from(local).join("Asterism").join("bin").join(name));
+        }
+        if let Some(pf) = std::env::var_os("ProgramFiles") {
+            candidates.push(PathBuf::from(pf).join("Asterism").join("bin").join(name));
+        }
+        candidates.push(PathBuf::from(r"C:\Windows\System32").join(name));
+    }
     for c in &candidates {
         let found = if c.is_absolute() {
             c.exists()

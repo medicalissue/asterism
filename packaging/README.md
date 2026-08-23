@@ -171,10 +171,26 @@ stays exactly what it is today either way.
 
 ### Platforms
 
-Binaries are published for **macOS on Apple silicon** (`darwin-arm64`), and
-that is the whole list. Every other host is refused by name and pointed at
-the source build; there is no near-enough target, because a near-enough
-binary is one that does not run.
+Binaries are published for **macOS on Apple silicon** (`darwin-arm64`) and
+**Windows 11 Pro/Enterprise** (`windows-x86_64`, `windows-arm64`). Every
+other host is refused by name and pointed at the source build; there is no
+near-enough target, because a near-enough binary is one that does not run.
+
+Windows installs with the native PowerShell installer or the POSIX script
+under Git Bash:
+
+```console
+irm https://asterism.run/install.ps1 | iex
+curl -fsSL https://asterism.run/install.sh | sh     # Git Bash; detects MINGW/MSYS
+```
+
+A Windows tarball is `ast.exe`, `astd.exe`, `astd-hyperv.exe`, and the
+updater. The helper is required: there is no WHPX/QEMU product fallback.
+SHA-256 is mandatory. Authenticode is checked when
+`ASTERISM_AUTHENTICODE_THUMBPRINT` is set or `ASTERISM_REQUIRE_SIGNATURE=1`.
+Persistence is a Windows Service (`ast service install`); `ast doctor`
+reports edition, elevation, Hyper-V services, firewall, helper, and
+Credential Manager before any guest is created.
 
 ```console
 $ curl -fsSL https://asterism.run/install.sh | ASTERISM_METHOD=source sh
