@@ -262,6 +262,42 @@ impl Chv {
     }
 }
 
+/// Cloud-init's earliest stage loads the modules that make its own guest
+/// agent reachable. CHV direct-boots Asterism's pinned Ubuntu kernel even
+/// when the root disk is Debian, so loading from the root's `/lib/modules`
+/// would mix kernel releases. These bytes came from the package pinned next
+/// to that kernel and are folded into the seed fingerprint verbatim.
+fn vsock_module_config(modules: &[oci::KernelModule]) -> String {
+    let mut out = String::from(
+        "bootcmd:\n - |\n   # Asterism: load modules paired with the direct-boot kernel.\n   (\n   set -e\n   umask 077\n",
+    );
+    for module in modules {
+        out.push_str(&format!(
+            "   base64 -d > /run/asterism-{}.ko <<'ASTERISM_MODULE_{}'\n",
+            module.name,
+            module.name.to_ascii_uppercase()
+        ));
+        let encoded = module.base64();
+        for line in encoded.as_bytes().chunks(76) {
+            out.push_str("   ");
+            out.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "   ASTERISM_MODULE_{}\n",
+            module.name.to_ascii_uppercase()
+        ));
+    }
+    for module in modules {
+        out.push_str(&format!(
+            "   [ -d /sys/module/{0} ] || insmod /run/asterism-{0}.ko\n",
+            module.name
+        ));
+    }
+    out.push_str("   rm -f /run/asterism-*.ko\n   ) || echo 'asterism: the direct-boot vsock modules could not be loaded' >&2\n");
+    out
+}
+
 /// Validate a qcow2 image without changing its metadata. Cloud Hypervisor can
 /// consume qcow2 directly, but growing it requires a format-aware metadata
 /// rewrite; the no-runtime-converter path therefore accepts only an image
@@ -369,7 +405,15 @@ impl Hypervisor for Chv {
 
     fn guest_config(&self, inst: &asterism_core::instance::Instance) -> Result<String> {
         let key = Key::ensure(&paths::guest_agent_key_path(&inst.name))?;
-        Ok(guest::cloud_config(&key))
+        let modules = oci::vsock_modules()?;
+        let mut config = vsock_module_config(&modules);
+        let agent = guest::cloud_config(&key);
+        config.push_str(
+            agent
+                .strip_prefix("bootcmd:\n")
+                .context("the guest agent cloud-config has no bootcmd sequence")?,
+        );
+        Ok(config)
     }
 
     fn guest_network_config(
@@ -2434,6 +2478,38 @@ fn reap(mut child: Child) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_boot_vsock_modules_load_in_dependency_order_before_the_agent() {
+        let modules = [
+            oci::KernelModule {
+                name: "vsock",
+                bytes: b"core".to_vec(),
+            },
+            oci::KernelModule {
+                name: "vmw_vsock_virtio_transport_common",
+                bytes: b"common".to_vec(),
+            },
+            oci::KernelModule {
+                name: "vmw_vsock_virtio_transport",
+                bytes: b"transport".to_vec(),
+            },
+        ];
+        let mut config = vsock_module_config(&modules);
+        config.push_str(" - |\n   echo agent-ready\n");
+        asterism_core::seed::mergeable(&config).expect("the seed can carry module payloads");
+
+        let core = config.find("insmod /run/asterism-vsock.ko").unwrap();
+        let common = config
+            .find("insmod /run/asterism-vmw_vsock_virtio_transport_common.ko")
+            .unwrap();
+        let transport = config
+            .find("insmod /run/asterism-vmw_vsock_virtio_transport.ko")
+            .unwrap();
+        let agent = config.find("agent-ready").unwrap();
+        assert!(core < common && common < transport && transport < agent);
+        assert_eq!(config.matches("bootcmd:").count(), 1);
+    }
 
     #[test]
     fn instance_networks_are_stable_private_and_locally_administered() {
