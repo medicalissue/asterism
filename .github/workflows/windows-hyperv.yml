@@ -2,7 +2,7 @@ name: windows-hyperv
 
 on:
   push:
-    branches: [main]
+    branches: [main, validation/as-m35-windows-7ec8712]
   pull_request:
   workflow_dispatch:
 
