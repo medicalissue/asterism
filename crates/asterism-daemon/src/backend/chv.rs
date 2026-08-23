@@ -2782,7 +2782,7 @@ mod tests {
         let request = BootReq {
             instance: &instance,
             dir: dir.path().to_owned(),
-            base: ImageRef {
+            base: asterism_core::hv::ImageRef {
                 name: "test:raw".into(),
                 path: dir.path().join("base.raw"),
                 format: DiskFormat::Raw,
