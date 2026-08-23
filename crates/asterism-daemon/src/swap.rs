@@ -185,12 +185,42 @@ fn source_decision_lock(instance_id: &str, epoch: u64) -> Arc<tokio::sync::Mutex
 /// Under `instances/`, next to the real ones, so it is on the same filesystem
 /// and the commit is a rename rather than a copy — and named so that no
 /// instance could ever be called that.
-pub fn staging_dir(name: &str, epoch: u64) -> PathBuf {
+pub fn staging_dir(name: &str, instance_id: &str, epoch: u64, token: &str) -> PathBuf {
+    // A name and epoch fence the normal move protocol, but they do not
+    // identify an attempted move by themselves.  In particular, a stale
+    // attempt must not be able to remove or adopt bytes staged by a newer
+    // id/token winner while recovery is running.  Keep the human-readable
+    // name/epoch prefix and add a stable, filesystem-safe identity suffix so
+    // replay and restart still locate the same tree.
+    let identity = blake3::hash(format!("{instance_id}\0{token}").as_bytes()).to_hex();
+    paths::instance_dir(&format!("{name}{STAGING}{epoch}-{}", &identity[..12]))
+}
+
+fn staging_for(txn: &AuthorityTxn) -> PathBuf {
+    recoverable_staging_dir(&txn.name, &txn.instance_id, txn.epoch, &txn.token)
+}
+
+fn legacy_staging_dir(name: &str, epoch: u64) -> PathBuf {
     paths::instance_dir(&format!("{name}{STAGING}{epoch}"))
 }
 
-pub(crate) fn live_socket(name: &str, epoch: u64) -> PathBuf {
-    paths::migration_socket_in(&staging_dir(name, epoch))
+/// Locate a staged tree created by this protocol revision, or a verified
+/// predecessor when a restart is finishing an already-existing move.
+fn recoverable_staging_dir(name: &str, instance_id: &str, epoch: u64, token: &str) -> PathBuf {
+    let scoped = staging_dir(name, instance_id, epoch, token);
+    if scoped.exists() {
+        return scoped;
+    }
+    let legacy = legacy_staging_dir(name, epoch);
+    if legacy.exists() {
+        legacy
+    } else {
+        scoped
+    }
+}
+
+pub(crate) fn live_socket(name: &str, instance_id: &str, epoch: u64, token: &str) -> PathBuf {
+    paths::migration_socket_in(&recoverable_staging_dir(name, instance_id, epoch, token))
 }
 
 pub(crate) fn authorize_live_splice(
@@ -315,7 +345,12 @@ pub(crate) fn save_live_import_receipt(
 ) -> Result<()> {
     with_authority_txn(|| {
         validate_live_import_locked(manifest, epoch, token, source_device, source_device_id)?;
-        receipt.save(&staging_dir(&manifest.instance.name, epoch))
+        receipt.save(&staging_dir(
+            &manifest.instance.name,
+            &manifest.instance.id,
+            epoch,
+            token,
+        ))
     })
 }
 
@@ -394,7 +429,7 @@ pub fn sweep_staging() {
                     loaded.value.phase,
                     MoveAuthorityPhase::Committed | MoveAuthorityPhase::Aborted
                 ) {
-                    claimed.insert(staging_dir(&loaded.value.name, loaded.value.epoch));
+                    claimed.insert(staging_for(&loaded.value));
                 }
             }
         }
@@ -2739,7 +2774,7 @@ fn prepare_disk_target(instance_id: &str, name: &str, epoch: u64, token: &str) -
             txn.phase
         ));
     }
-    let staging = staging_dir(name, epoch);
+    let staging = staging_for(&txn);
     let export = (|| -> Result<MigrationDiskExport> {
         let hv = backend::for_instance(&txn.manifest.instance)?;
         let req = backend::migration_req(&txn.manifest.instance, staging)?;
@@ -2785,7 +2820,7 @@ fn disk_ready_target(instance_id: &str, name: &str, epoch: u64, token: &str) -> 
             error(anyhow!("target disk is not exported for mirroring"))
         };
     }
-    let staging = staging_dir(name, epoch);
+    let staging = staging_for(&txn);
     let mut receipt = match Receipt::load(&staging) {
         Ok(receipt) => receipt,
         Err(e) => return error(e),
@@ -2836,7 +2871,7 @@ fn live_prepare_target(
             manifest.instance.cpu_device
         ));
     }
-    let staging = staging_dir(&manifest.instance.name, epoch);
+    let staging = staging_dir(&manifest.instance.name, &manifest.instance.id, epoch, token);
     if let Err(e) = verify(&staging, manifest, epoch, token) {
         return error(e.context("the live pre-copy is incomplete"));
     }
@@ -2905,7 +2940,7 @@ fn live_prepare_target(
         Ok(None) => return error(anyhow!("target intent must precede live preparation")),
         Err(e) => return error(e),
     }
-    let socket = live_socket(&manifest.instance.name, epoch);
+    let socket = live_socket(&manifest.instance.name, &manifest.instance.id, epoch, token);
     let _ = std::fs::remove_file(&socket);
     let started = (|| -> Result<Handle> {
         let hv = backend::for_instance(&manifest.instance)?;
@@ -3115,7 +3150,7 @@ fn recover_target(
         Err(e) => return error(e),
     }
 
-    let staging = staging_dir(name, epoch);
+    let staging = staging_for(&txn);
     let hv = match backend::for_instance(&txn.manifest.instance) {
         Ok(hv) => hv,
         Err(e) => return error(e),
@@ -3144,7 +3179,7 @@ fn recover_target(
         }
     }
     if !txn.ram_eof {
-        let socket = live_socket(name, epoch);
+        let socket = live_socket(name, instance_id, epoch, token);
         let _ = std::fs::remove_file(&socket);
         let handle = match hv.migrate_in(
             &req,
@@ -3243,7 +3278,7 @@ pub fn commit_target(
     device: &str,
 ) -> Response {
     let name = manifest.instance.name.clone();
-    let staging = staging_dir(&name, epoch);
+    let staging = staging_dir(&name, &manifest.instance.id, epoch, token);
     let mut txn = match load_authority(&manifest.instance.id, epoch) {
         Ok(Some(txn)) => txn,
         Ok(None) => {
@@ -3411,7 +3446,7 @@ fn qmp_path_after_publish(current: &Path, staging: &Path, name: &str) -> PathBuf
 /// startup and an RPC replay use this same function after any crash boundary.
 fn finish_target_commit(reg: &mut Shard, txn: &mut AuthorityTxn, device: &str) -> Result<Instance> {
     let name = txn.name.clone();
-    let staging = staging_dir(&name, txn.epoch);
+    let staging = staging_for(txn);
     let live = paths::instance_dir(&name);
 
     if !live.exists() {
@@ -3489,7 +3524,7 @@ fn finish_target_commit(reg: &mut Shard, txn: &mut AuthorityTxn, device: &str) -
     live_sessions().remove(&(name.clone(), txn.epoch));
     let _ = std::fs::remove_file(Receipt::path(&live));
     let _ = std::fs::remove_file(live.join(LIVE_HANDLE));
-    let _ = std::fs::remove_file(live_socket(&name, txn.epoch));
+    let _ = std::fs::remove_file(live_socket(&name, &txn.instance_id, txn.epoch, &txn.token));
     let _ = std::fs::remove_file(live.join(LIVE_SOCKET));
     let _ = std::fs::remove_file(live.join(LIVE_AUTHORITY));
     Ok(instance)
@@ -3633,7 +3668,11 @@ pub fn abort_target(
             // authority WAL before adoption. At this point there is no live
             // guest and no published tree to fence: retain the original
             // idempotent abort behavior and remove only this epoch's staging.
-            let staging = staging_dir(name, epoch);
+            // A peer from before identity-scoped staging may have left the
+            // old name/epoch path behind. It has no authority WAL, so inspect
+            // it only as a backward-compatible cleanup candidate and still
+            // require its receipt to match the caller below.
+            let staging = recoverable_staging_dir(name, instance_id, epoch, token);
             match load_authority_for_name_epoch(name, epoch) {
                 Ok(Some(existing)) => {
                     return error(anyhow!(
@@ -3774,24 +3813,31 @@ fn finish_target_abort(txn: &mut AuthorityTxn) -> Result<()> {
     }
     let name = txn.name.clone();
     let epoch = txn.epoch;
+    let staging = staging_for(txn);
     let handle = live_sessions()
         .remove(&(name.to_owned(), epoch))
         .or_else(|| txn.handle.clone())
         .or_else(|| {
-            std::fs::read(staging_dir(&name, epoch).join(LIVE_HANDLE))
+            std::fs::read(staging_for(txn).join(LIVE_HANDLE))
                 .ok()
                 .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         });
+    let has_recorded_handle = handle.is_some();
     if let Some(handle) = handle {
         if let Err(e) = backend::for_handle(&handle.backend).and_then(|hv| hv.kill(&handle)) {
             return Err(e.context("fencing the uncommitted target guest"));
         }
     }
-    if txn.live {
-        let staging = staging_dir(&name, epoch);
+    // A durable Prepared record normally has a staging tree, a recorded
+    // incoming handle, or a disk export to retire. A direct replay can find
+    // only the decision WAL: there is then no target-owned process or byte
+    // to fence, so asking a backend to abort a phantom target would turn a
+    // valid durable Aborted winner into an error and keep the source fenced.
+    let has_target_resources = staging.exists() || has_recorded_handle || txn.disk_export.is_some();
+    if txn.live && has_target_resources {
         let cleanup = (|| -> Result<()> {
             let hv = backend::for_instance(&txn.manifest.instance)?;
-            let req = backend::migration_req(&txn.manifest.instance, staging)?;
+            let req = backend::migration_req(&txn.manifest.instance, staging.clone())?;
             hv.migration_target_abort(&req)
         })();
         if let Err(e) = cleanup {
@@ -3805,7 +3851,6 @@ fn finish_target_abort(txn: &mut AuthorityTxn) -> Result<()> {
             }
         }
     }
-    let staging = staging_dir(&name, epoch);
     let _ = std::fs::remove_file(paths::migration_socket_in(&staging));
     if let Err(e) = std::fs::remove_dir_all(&staging) {
         if e.kind() != std::io::ErrorKind::NotFound {
@@ -4689,9 +4734,14 @@ mod tests {
     fn a_staging_directory_can_never_be_an_instance() {
         // Instance names are ascii letters, digits and '-'; the staging
         // marker is neither, which is what makes an abandoned one harmless.
-        let staged = staging_dir("dev", 7);
+        let staged = staging_dir("dev", "instance-id", 7, "move-token");
         let leaf = staged.file_name().unwrap().to_string_lossy().into_owned();
-        assert_eq!(leaf, "dev.moving-7");
+        assert!(leaf.starts_with("dev.moving-7-"));
+        assert_ne!(
+            staged,
+            staging_dir("dev", "replacement-id", 7, "replacement-token"),
+            "a stale move may not share the newer move's staging tree"
+        );
         assert!(
             asterism_core::registry::check_name(&leaf).is_err(),
             "{leaf}"
@@ -5012,7 +5062,12 @@ mod tests {
         std::env::set_var("ASTERISM_HOME", home.path());
 
         fn staged(manifest: &MoveManifest, epoch: u64) {
-            let dir = staging_dir(&manifest.instance.name, epoch);
+            let dir = staging_dir(
+                &manifest.instance.name,
+                &manifest.instance.id,
+                epoch,
+                "token",
+            );
             std::fs::create_dir_all(&dir).unwrap();
             Receipt {
                 instance_id: manifest.instance.id.clone(),
@@ -6066,7 +6121,13 @@ mod tests {
             commit_target(&mut reg, &wrong_manifest, stale_epoch, "token", "desktop",),
             Response::Error { .. }
         ));
-        assert!(staging_dir(&stale_manifest.instance.name, stale_epoch).exists());
+        assert!(staging_dir(
+            &stale_manifest.instance.name,
+            &stale_manifest.instance.id,
+            stale_epoch,
+            "token"
+        )
+        .exists());
         assert!(matches!(
             abort_target(
                 &mut reg,
@@ -6087,7 +6148,13 @@ mod tests {
             ),
             Response::Error { .. }
         ));
-        assert!(staging_dir(&stale_manifest.instance.name, stale_epoch).exists());
+        assert!(staging_dir(
+            &stale_manifest.instance.name,
+            &stale_manifest.instance.id,
+            stale_epoch,
+            "token"
+        )
+        .exists());
 
         let mut offline_stale = manifest_of(Vec::new());
         offline_stale.instance.name = "offline-stale-abort".into();
@@ -6104,7 +6171,13 @@ mod tests {
             ),
             Response::Error { .. }
         ));
-        assert!(staging_dir(&offline_stale.instance.name, offline_stale_epoch).exists());
+        assert!(staging_dir(
+            &offline_stale.instance.name,
+            &offline_stale.instance.id,
+            offline_stale_epoch,
+            "token"
+        )
+        .exists());
         assert!(matches!(
             abort_target(
                 &mut reg,
@@ -6115,7 +6188,13 @@ mod tests {
             ),
             Response::Ok
         ));
-        assert!(!staging_dir(&offline_stale.instance.name, offline_stale_epoch).exists());
+        assert!(!staging_dir(
+            &offline_stale.instance.name,
+            &offline_stale.instance.id,
+            offline_stale_epoch,
+            "token"
+        )
+        .exists());
 
         // Every target-side RPC and both live bulk splice authorizers reject
         // stale identity components before process or filesystem mutation.
@@ -6355,7 +6434,12 @@ mod tests {
         ] {
             assert!(result.is_err());
         }
-        let import_staging = staging_dir(&import_manifest.instance.name, import_epoch);
+        let import_staging = staging_dir(
+            &import_manifest.instance.name,
+            &import_manifest.instance.id,
+            import_epoch,
+            "token",
+        );
         std::fs::create_dir_all(&import_staging).unwrap();
         let import_receipt = Receipt {
             instance_id: import_manifest.instance.id.clone(),
@@ -6601,7 +6685,7 @@ mod tests {
                 ..
             }
         ));
-        assert!(!staging_dir("claimed-name", third_epoch).exists());
+        assert!(!staging_dir("claimed-name", &third.instance.id, third_epoch, "token").exists());
         assert!(
             paths::instance_dir("claimed-name").is_dir(),
             "conditional abort must not remove an unrelated live tree"
@@ -6653,7 +6737,12 @@ mod tests {
             authority.live = true;
             authority.handle = Some(dead_handle.clone());
             save_authority(&authority).unwrap();
-            let staging = staging_dir(&manifest.instance.name, epoch);
+            let staging = staging_dir(
+                &manifest.instance.name,
+                &manifest.instance.id,
+                epoch,
+                "token",
+            );
             save_authority_marker(&staging, &authority).unwrap();
             durable::publish_dir(&staging, &paths::instance_dir(&manifest.instance.name)).unwrap();
             let mut row = manifest.instance.clone();
@@ -6685,7 +6774,7 @@ mod tests {
         // An offline or protocol-5 abort has no authority WAL. It still
         // removes exactly its staging epoch and returns the old response.
         let legacy_epoch = 9;
-        let legacy = staging_dir("legacy", legacy_epoch);
+        let legacy = legacy_staging_dir("legacy", legacy_epoch);
         std::fs::create_dir_all(&legacy).unwrap();
         std::fs::write(legacy.join("partial"), b"bytes").unwrap();
         assert!(matches!(

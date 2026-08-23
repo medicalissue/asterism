@@ -2979,7 +2979,7 @@ async fn serve_live_splice(
         .await?;
         return Ok(());
     }
-    let socket = crate::swap::live_socket(name, epoch);
+    let socket = crate::swap::live_socket(name, instance_id, epoch, token);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let local = loop {
         match tokio::net::UnixStream::connect(&socket).await {
@@ -3210,7 +3210,7 @@ async fn import(
         None
     };
 
-    let staging = swap::staging_dir(&name, epoch);
+    let staging = swap::staging_dir(&name, &manifest.instance.id, epoch, token);
     // An earlier attempt at this same epoch is not something to resume: the
     // manifest may have moved on and a half-file is worse than no file.
     let _ = std::fs::remove_dir_all(&staging);
