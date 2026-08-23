@@ -142,7 +142,7 @@ pub fn volume_image_path(name: &str) -> PathBuf {
     volume_dir(name).join("disk.raw")
 }
 
-/// Where `qemu-storage-daemon` serves one epoch's NBD export.
+/// Where `astd`'s native exporter serves one epoch's NBD export.
 ///
 /// The epoch is in the filename on purpose: a new lease is a new socket, so
 /// revoking the old one is an unlink and a stale consumer's reconnect finds
@@ -151,16 +151,18 @@ pub fn volume_export_socket(name: &str, epoch: u64) -> PathBuf {
     short_socket(volume_dir(name).join(format!("nbd-e{epoch}.sock")))
 }
 
-/// Pidfile of that storage daemon, written by `--pidfile`.
+/// Legacy qemu-storage-daemon pidfile. Native exporters deliberately do not
+/// create this; the path remains only for safe migration cleanup.
 pub fn volume_export_pid(name: &str, epoch: u64) -> PathBuf {
     volume_dir(name).join(format!("nbd-e{epoch}.pid"))
 }
 
-/// The local unix socket QEMU connects to for a volume attached to `instance`.
+/// The local unix socket the selected backend connects to for a volume
+/// attached to `instance`.
 ///
 /// This end of the splice is always local — that is the local illusion doing
-/// its work. QEMU sees a unix socket on the machine it is running on and
-/// never learns that the daemon behind it is forwarding to another device.
+/// its work. The backend sees a unix socket on the machine it is running on
+/// and never learns that the daemon behind it is forwarding to another device.
 pub fn volume_bridge_socket(instance: &str, host: &str, volume: &str) -> PathBuf {
     let safe = |s: &str| -> String {
         s.chars()
