@@ -284,6 +284,7 @@ fn main() -> anyhow::Result<()> {
 
     let reason: StopReason = 'run: loop {
         vm::pump(Duration::from_millis(100));
+        unsafe { machine.prune_egress() };
 
         if let Some(key) = agent_key.as_ref() {
             keep_session(

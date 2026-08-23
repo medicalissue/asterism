@@ -269,11 +269,30 @@ pub(crate) fn orbit() -> Result<(Node, Option<Arc<Mesh>>)> {
 /// an orbit name against a hostname, which are not the same string.
 pub(crate) fn check_can_bind(inst: &Instance) -> Result<()> {
     let hv = backend::for_instance(inst)?;
-    // Only a backend we could actually ask is allowed to refuse: on a device
-    // where the hypervisor is not installed yet, `caps()` knows nothing, and
-    // that must not become a refusal to record a binding the instance will be
-    // able to use once it is.
-    if hv.probe().is_ok() && hv.caps().guest_egress.is_none() {
+    let offered = hv.caps().guest_egress;
+    let usable = hv.caps_for(inst).guest_egress;
+    if usable.is_some() {
+        return Ok(());
+    }
+    if offered.is_some() {
+        // The backend has a door; this image cannot use it. Refuse even
+        // when the hypervisor is not installed on this device — the image
+        // will not grow an agent later, and binding now would mutate a
+        // record nothing can serve.
+        bail!(
+            "the {} backend cannot bind a secret on {:?}: this image is a \
+             direct-kernel/OCI root filesystem, so it has no guest agent to \
+             carry the GuestLoopback route — bind the secret on a cloud image, \
+             or run this instance on a backend whose egress does not need one",
+            hv.id(),
+            inst.name
+        );
+    }
+    // Only a backend we could actually ask is allowed to refuse a
+    // backend-wide missing door: on a device where the hypervisor is not
+    // installed yet, `caps()` knows nothing, and that must not become a
+    // refusal to record a binding the instance will be able to use once it is.
+    if hv.probe().is_ok() {
         bail!(
             "the {} backend has no guest-only door into this device, so there is \
              no listener that only {:?} can reach — a bound secret needs one of \
@@ -286,13 +305,14 @@ pub(crate) fn check_can_bind(inst: &Instance) -> Result<()> {
     Ok(())
 }
 
-/// The typed route this instance's backend offers, if any.
+/// The typed route this instance can actually use, if any.
 fn route(inst: &Instance) -> Result<GuestEgress> {
     let hv = backend::for_instance(inst)?;
-    hv.caps().guest_egress.ok_or_else(|| {
+    hv.caps_for(inst).guest_egress.ok_or_else(|| {
         anyhow!(
-            "the {} backend has no guest-only path to this device",
-            hv.id()
+            "the {} backend has no guest-only path to this device for {:?}",
+            hv.id(),
+            inst.name
         )
     })
 }
@@ -1683,6 +1703,29 @@ mod tests {
         }
         // And a leaf for a bound authority chains to it.
         assert!(one.acceptor("api.anthropic.com:443").is_ok());
+    }
+
+    #[test]
+    fn binding_a_secret_on_vz_oci_is_refused_before_mutation() {
+        let mut inst = Instance::new(
+            "oci-web",
+            "dev",
+            "alpine:latest",
+            asterism_core::instance::Shape::default(),
+            asterism_core::hv::Machine {
+                backend: "vz".into(),
+                machine_type: "generic".into(),
+                cpu: "host".into(),
+                hv_version: "test".into(),
+            },
+        );
+        inst.image_kind = asterism_core::hv::ImageKind::OciRootfs;
+        let err = check_can_bind(&inst).unwrap_err().to_string();
+        assert!(
+            err.contains("direct-kernel") || err.contains("OCI"),
+            "{err}"
+        );
+        assert!(err.contains("guest agent"), "{err}");
     }
 
     #[test]

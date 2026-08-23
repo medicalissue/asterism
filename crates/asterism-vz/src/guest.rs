@@ -1112,10 +1112,16 @@ def splice_plain_and_framed(plain, framed):
             while not done.is_set():
                 allowed = credit.take(MAX_FRAME_BYTES)
                 chunk = plain.recv(allowed)
-                with write_lock:
-                    if not chunk:
+                if not chunk:
+                    with write_lock:
                         write_frame(framed, FRAME_CLOSE, b"")
                         return
+                # We took `allowed` but only used len(chunk). Give the rest
+                # back so a short recv does not shrink the window forever —
+                # same as the Rust half.
+                if len(chunk) < allowed:
+                    credit.give(allowed - len(chunk))
+                with write_lock:
                     write_frame(framed, FRAME_DATA, chunk)
         except Exception as failure:
             log("egress splice to host ended: %s" % failure)
@@ -2140,6 +2146,10 @@ mod tests {
             AGENT_PY.contains("this host is not offering guest egress"),
             "old helper / missing plane is a capability refusal"
         );
+        assert!(
+            AGENT_PY.contains("credit.give(allowed - len(chunk))"),
+            "short recv must refund unused window credit, like Rust"
+        );
     }
 
     /// Drive the real agent's loopback proxy without a host plane: CONNECT
@@ -2179,7 +2189,87 @@ mod tests {
         );
     }
 
+    /// Drive the real Python agent with many 1-byte writes. The host grants
+    /// no extra WINDOW after the handshake, so without refunding
+    /// `allowed-len(chunk)` the window dies after four short recvs and a
+    /// fifth byte never arrives. With the refund, the sustained payload
+    /// lands.
+    #[test]
+    fn the_real_python_agent_refunds_credit_across_short_reads() {
+        let k = key();
+        let dir = tempfile::tempdir().unwrap();
+        let vsock_path = dir.path().join("vsock.sock");
+        let listener = match std::os::unix::net::UnixListener::bind(&vsock_path) {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let collected = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let host = {
+            let collected = collected.clone();
+            let k = k.clone();
+            std::thread::spawn(move || {
+                let (stream, _) = listener.accept().expect("agent connected");
+                stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut writer = stream.try_clone().unwrap();
+                crate::egress::open_host(&mut reader, &mut writer, &k).unwrap();
+                // Never grant extra WINDOW: leaked take() credit cannot
+                // recover, which is what proves the guest refund.
+                drop(writer);
+                loop {
+                    match crate::egress::read_frame(&mut reader) {
+                        Ok(Some((1, payload))) => {
+                            collected.lock().unwrap().extend_from_slice(&payload);
+                        }
+                        Ok(Some((3, _))) | Ok(None) => break,
+                        Ok(Some(_)) => continue,
+                        Err(_) => break,
+                    }
+                }
+            })
+        };
+        let Some((_agent, port)) = spawn_proxy_agent_with(&k, Some(&vsock_path)) else {
+            return;
+        };
+        let mut client = None;
+        for _ in 0..50 {
+            if let Ok(s) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+                client = Some(s);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let mut client = client.expect("the agent never bound the loopback proxy");
+        client.set_nodelay(true).ok();
+        client.set_write_timeout(Some(Duration::from_secs(5))).ok();
+        // Eight one-byte writes. MAX_WINDOW / MAX_FRAME_BYTES = 4, so a
+        // fifth short recv hangs without the refund.
+        let n = 8u8;
+        for i in 0..n {
+            client.write_all(&[i]).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                if collected.lock().unwrap().len() >= (i as usize) + 1 {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "short-read byte {i} never arrived; credit likely leaked"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        drop(client);
+        let _ = host.join();
+        let got = collected.lock().unwrap().clone();
+        assert_eq!(got, (0..n).collect::<Vec<_>>());
+    }
+
     fn spawn_proxy_agent(key: &Key) -> Option<(Agent, u16)> {
+        spawn_proxy_agent_with(key, None)
+    }
+
+    fn spawn_proxy_agent_with(key: &Key, egress_unix: Option<&Path>) -> Option<(Agent, u16)> {
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("asterism-guest");
         std::fs::write(&script, AGENT_PY).unwrap();
@@ -2188,11 +2278,15 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
         let port = listener.local_addr().ok()?.port();
         drop(listener);
-        let child = match Command::new("python3")
-            .arg(&script)
+        let mut cmd = Command::new("python3");
+        cmd.arg(&script)
             .arg("--stdio")
             .arg("--proxy-listen-tcp")
-            .arg(format!("127.0.0.1:{port}"))
+            .arg(format!("127.0.0.1:{port}"));
+        if let Some(path) = egress_unix {
+            cmd.arg("--egress-connect-unix").arg(path);
+        }
+        let child = match cmd
             .env("ASTERISM_AGENT_KEY", &key_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

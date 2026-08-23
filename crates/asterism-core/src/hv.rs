@@ -649,6 +649,19 @@ pub trait Hypervisor: Send + Sync {
     /// What this backend can do — callers must gate on this, never on `id()`.
     fn caps(&self) -> Caps;
 
+    /// Caps for this concrete instance, not the backend's optimistic set.
+    ///
+    /// [`Hypervisor::caps`] is what the backend can offer for an image that
+    /// actually has the machinery. Some doors depend on the image: VZ guest
+    /// egress rides the Python agent the cloud-init seed installs, and an
+    /// OCI/direct-kernel boot never gets one. Callers that bind a secret or
+    /// write a seed must gate on this so they refuse before mutating a
+    /// record that cannot be served.
+    fn caps_for(&self, inst: &Instance) -> Caps {
+        let _ = inst;
+        self.caps()
+    }
+
     /// Cloud-config every guest of this backend needs, appended to the seed
     /// [`crate::seed`] builds.
     ///

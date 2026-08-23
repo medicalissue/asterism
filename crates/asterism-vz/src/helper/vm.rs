@@ -25,6 +25,8 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -251,11 +253,64 @@ define_class!(
     }
 );
 
+/// Occupancy of in-flight egress vsock streams. Bound to worker lifetime:
+/// a finished stream is pruned so VZ can close the connection object,
+/// rather than retained for the VM's whole life. A guest that opens more
+/// than this is refused (backpressure) instead of accumulating forever.
+const MAX_EGRESS_STREAMS: usize = 16;
+
+struct LiveEgress {
+    conn: Retained<VZVirtioSocketConnection>,
+    done: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+fn prune_finished_flags(flags: &mut Vec<Arc<AtomicBool>>) {
+    flags.retain(|done| !done.load(Ordering::Relaxed));
+}
+
+#[cfg(test)]
+fn try_admit_stream(flags: &mut Vec<Arc<AtomicBool>>, done: Arc<AtomicBool>, max: usize) -> bool {
+    prune_finished_flags(flags);
+    if flags.len() >= max {
+        return false;
+    }
+    flags.push(done);
+    true
+}
+
+fn prune_live(live: &RefCell<Vec<LiveEgress>>) {
+    live.borrow_mut().retain(|slot| {
+        if slot.done.load(Ordering::Relaxed) {
+            // Main thread: VZ connection objects are queue-bound.
+            unsafe { slot.conn.close() };
+            false
+        } else {
+            true
+        }
+    });
+}
+
+fn admit_live(
+    live: &RefCell<Vec<LiveEgress>>,
+    conn: Retained<VZVirtioSocketConnection>,
+    done: Arc<AtomicBool>,
+) -> bool {
+    prune_live(live);
+    let mut slots = live.borrow_mut();
+    if slots.len() >= MAX_EGRESS_STREAMS {
+        unsafe { conn.close() };
+        return false;
+    }
+    slots.push(LiveEgress { conn, done });
+    true
+}
+
 struct EgressIvars {
     key: Key,
     sock: PathBuf,
     instance: String,
-    connections: Rc<RefCell<Vec<Retained<VZVirtioSocketConnection>>>>,
+    live: Rc<RefCell<Vec<LiveEgress>>>,
 }
 
 define_class!(
@@ -285,8 +340,17 @@ define_class!(
                     return false.into();
                 }
             };
-            let held = connection.retain();
-            self.ivars().connections.borrow_mut().push(held);
+            let done = Arc::new(AtomicBool::new(false));
+            if !admit_live(&self.ivars().live, connection.retain(), done.clone()) {
+                // SAFETY: we own this duplicate and nothing else will take it.
+                drop(unsafe { UnixStream::from_raw_fd(fd) });
+                eprintln!(
+                    "astd-vz: {}: refusing an egress connection: {MAX_EGRESS_STREAMS} \
+                     concurrent streams already open",
+                    self.ivars().instance
+                );
+                return false.into();
+            }
             let key = self.ivars().key.clone();
             let sock = self.ivars().sock.clone();
             let instance = self.ivars().instance.clone();
@@ -296,6 +360,7 @@ define_class!(
                 if let Err(e) = asterism_vz::egress::serve_host_stream(stream, &key, &sock) {
                     eprintln!("astd-vz: {instance}: egress stream ended: {e:#}");
                 }
+                done.store(true, Ordering::Relaxed);
             });
             true.into()
         }
@@ -442,6 +507,9 @@ pub struct Machine {
     /// plus the listener itself, both retained for the life of the VM.
     egress_listener: RefCell<Option<Retained<VZVirtioSocketListener>>>,
     _egress_delegate: RefCell<Option<Retained<EgressDelegate>>>,
+    /// Live egress connections, retained only while their worker is running.
+    /// The run loop prunes completed ones so VZ can close them.
+    egress_live: Rc<RefCell<Vec<LiveEgress>>>,
     pub signals: Rc<Signals>,
 }
 
@@ -849,6 +917,7 @@ pub unsafe fn start(config: &Config) -> Result<Machine> {
         connection: RefCell::new(None),
         egress_listener: RefCell::new(None),
         _egress_delegate: RefCell::new(None),
+        egress_live: Rc::new(RefCell::new(Vec::new())),
         signals,
     })
 }
@@ -1014,13 +1083,13 @@ impl Machine {
             eprintln!("astd-vz: {instance}: egress listener must be installed on the main thread");
             return;
         };
-        let connections = Rc::new(RefCell::new(Vec::new()));
+        let live = self.egress_live.clone();
         let delegate = {
             let this = EgressDelegate::alloc(mtm).set_ivars(EgressIvars {
                 key,
                 sock,
                 instance: instance.clone(),
-                connections,
+                live,
             });
             let this: Retained<EgressDelegate> = msg_send![super(this), init];
             this
@@ -1038,6 +1107,16 @@ impl Machine {
         );
     }
 
+    /// Close completed egress streams. Bound to worker lifetime, not VM
+    /// lifetime: a finished splice must not keep its
+    /// `VZVirtioSocketConnection` until the guest dies.
+    ///
+    /// # Safety
+    /// Main thread only.
+    pub unsafe fn prune_egress(&self) {
+        prune_live(&self.egress_live);
+    }
+
     /// Release the connection a finished session was running on.
     ///
     /// # Safety
@@ -1046,6 +1125,7 @@ impl Machine {
         if let Some(conn) = self.connection.borrow_mut().take() {
             conn.close();
         }
+        self.prune_egress();
     }
 
     /// `stopWithCompletionHandler:` — the power cord.
@@ -1093,6 +1173,30 @@ const SO_TYPE: c_int = 0x1008;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finished_egress_streams_are_pruned_and_the_bound_refuses() {
+        let mut flags: Vec<Arc<AtomicBool>> = Vec::new();
+        let a = Arc::new(AtomicBool::new(false));
+        let b = Arc::new(AtomicBool::new(false));
+        assert!(try_admit_stream(&mut flags, a.clone(), 2));
+        assert!(try_admit_stream(&mut flags, b.clone(), 2));
+        assert!(
+            !try_admit_stream(&mut flags, Arc::new(AtomicBool::new(false)), 2),
+            "at capacity the next stream is refused"
+        );
+        a.store(true, Ordering::Relaxed);
+        assert!(
+            try_admit_stream(&mut flags, Arc::new(AtomicBool::new(false)), 2),
+            "a finished worker is pruned, so a new stream is admitted"
+        );
+        assert_eq!(flags.len(), 2);
+        assert!(
+            !flags.iter().any(|d| d.load(Ordering::Relaxed)),
+            "admitted slots are still live"
+        );
+        assert_eq!(MAX_EGRESS_STREAMS, 16);
+    }
 
     #[test]
     fn reconnect_descriptor_must_still_be_a_socket() {

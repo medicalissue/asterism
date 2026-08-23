@@ -355,6 +355,9 @@ pub fn boot_req<'a>(inst: &'a Instance, hv: &dyn Hypervisor) -> Result<BootReq<'
     // A bound instance's proxy comes up here, before the seed is written,
     // because the port it settles on is one of the things the seed has to
     // say. An instance with no bindings gets an empty config and no listener.
+    // seed_config gates on the instance's Caps, not the backend-wide set:
+    // a VZ OCI guest has no agent, so GuestLoopback is not offered for it
+    // even though the backend advertises the route for cloud images.
     let egress = crate::egress::seed_config(inst)?;
 
     // What this instance was asked to become, past the image it boots.
