@@ -1373,7 +1373,6 @@ fn wait_bounded(
 
 #[cfg(target_os = "linux")]
 fn set_nonblocking(pipe: &impl std::os::fd::AsRawFd) -> Result<()> {
-    use std::os::fd::AsRawFd;
     let fd = pipe.as_raw_fd();
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
