@@ -238,7 +238,11 @@ export function setDeviceShell(enabled: boolean): Promise<DeviceShell> {
 
 export interface VolumeRow {
   name: string;
+  owner: string;
   size: string;
+  access: string;
+  durability: string;
+  sharing: string;
   state: string;
   holder: string;
   holder_device: string;
@@ -249,6 +253,7 @@ export interface Volumes {
   inventory:
     | {kind: 'unreachable'; reason: string}
     | {kind: 'rows'; rows: VolumeRow[]};
+  unreachable: {device: string; reason: string}[];
 }
 
 export function loadVolumes(): Promise<Volumes> {
@@ -386,9 +391,9 @@ const PREVIEW_DEVICES: Devices = {fleet: {kind: 'rows', rows: [
 ]}};
 
 const PREVIEW_VOLUMES: Volumes = {inventory: {kind: 'rows', rows: [
-  {name: 'agent-work', size: '100 GB', state: 'attached', holder: 'night-shift', holder_device: 'desk-mini', epoch: 12},
-  {name: 'artifacts', size: '250 GB', state: 'available', holder: '—', holder_device: '—', epoch: 4},
-]}};
+  {name: 'agent-work', owner: 'desk-mini', size: '100 GB', access: 'local', durability: 'single-device', sharing: 'single-writer', state: 'attached', holder: 'night-shift', holder_device: 'desk-mini', epoch: 12},
+  {name: 'artifacts', owner: 'nas', size: '250 GB', access: 'direct · 0.8ms', durability: 'single-device', sharing: 'single-writer', state: 'available', holder: '', holder_device: '', epoch: 4},
+]}, unreachable: [{device: 'studio', reason: 'device is offline'}]};
 
 const PREVIEW_SETTINGS: Settings = {
   autostart: true,

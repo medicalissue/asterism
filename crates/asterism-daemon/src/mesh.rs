@@ -207,6 +207,9 @@ enum MeshRequest {
         volume: String,
         /// The instance the bytes are for — the lease holder.
         holder: String,
+        /// Immutable identity of that instance.
+        #[serde(default)]
+        holder_id: String,
         /// The epoch that lease was granted at.
         epoch: u64,
     },
@@ -254,8 +257,28 @@ impl MeshRequest {
         match self {
             MeshRequest::Rpc { request } => request.since(),
             MeshRequest::DeviceShell { .. } => 4,
+            // This changes the pipe's authority semantics: its holder identity
+            // and epoch are the provider-side writer fence, so an older peer
+            // must refuse it rather than treating it as an ordinary splice.
+            MeshRequest::VolumeSplice { .. } => 7,
             _ => compat::FIRST_PROTOCOL,
         }
+    }
+
+    /// Whether this is a storage operation whose protocol-7 authority fence
+    /// must be negotiated before the frame is written to a provider.
+    fn needs_storage_negotiation(&self) -> bool {
+        matches!(
+            self,
+            MeshRequest::VolumeSplice { .. }
+                | MeshRequest::Rpc {
+                    request: Request::AttachStorage { .. }
+                        | Request::VolumeCatalog
+                        | Request::VolumeLease { .. }
+                        | Request::VolumeReconnect { .. }
+                        | Request::VolumeRelease { .. },
+                }
+        )
     }
 
     /// Whether the far side answers this with control frames or with bulk.
@@ -451,6 +474,9 @@ pub struct Mesh {
     pending: Arc<Mutex<Option<Arc<PendingPairing>>>>,
     /// One connection per peer, kept warm. Keyed by device id.
     conns: Mutex<HashMap<String, MeshConnection>>,
+    /// Version selected by the liveness ping for each warm connection. This
+    /// is transport observation, so it is deliberately in-memory only.
+    speaking: Mutex<HashMap<String, u32>>,
     /// Last measured reachability for each peer. This is observation, not
     /// identity or placement state, and deliberately dies with the daemon.
     telemetry: Mutex<HashMap<String, PeerTelemetry>>,
@@ -689,6 +715,7 @@ impl Mesh {
             orbit: node.orbit.clone(),
             pending: Arc::new(Mutex::new(None)),
             conns: Mutex::new(HashMap::new()),
+            speaking: Mutex::new(HashMap::new()),
             telemetry: Mutex::new(HashMap::new()),
             active: Mutex::new(HashMap::new()),
         });
@@ -797,6 +824,7 @@ impl Mesh {
         if let Some(connection) = self.conns.lock().await.remove(&device.device_id) {
             connection.close(b"device revoked");
         }
+        self.speaking.lock().await.remove(&device.device_id);
         if let Some(connections) = self.active.lock().await.remove(&device.device_id) {
             for connection in connections {
                 connection.close(b"device revoked");
@@ -865,10 +893,16 @@ impl Mesh {
         }
         let device = self.device(name).await?;
         let connection = self.live_connection(&device).await?;
+        let request = MeshRequest::Rpc { request: inner };
+        // A protocol-6 provider can parse the RPC envelope but cannot safely
+        // serve storage's protocol-7 lease semantics. Learn the selected
+        // version on the old ping stream before emitting the storage frame.
+        self.require_peer_version(&connection, &request, &device.name)
+            .await?;
         // Deliberately unbounded from here: `ast --device desktop create` can
         // legitimately spend minutes pulling an image, and a timeout on the
         // far device's work would turn slow into broken.
-        match ask(&connection, &MeshRequest::Rpc { request: inner })
+        match ask(&connection, &request)
             .await
             .with_context(|| format!("device {name:?} stopped answering"))?
         {
@@ -1439,6 +1473,7 @@ impl Mesh {
         device: &str,
         volume: &str,
         holder: &str,
+        holder_id: &str,
         epoch: u64,
     ) -> Result<(asterism_mesh::MeshStream, LinkObservation)> {
         let peer = self.device(device).await?;
@@ -1446,16 +1481,19 @@ impl Mesh {
             .live_connection(&peer)
             .await
             .with_context(|| format!("{}: {device}", crate::volume::UNREACHABLE))?;
+        let request = MeshRequest::VolumeSplice {
+            volume: volume.to_owned(),
+            holder: holder.to_owned(),
+            holder_id: holder_id.to_owned(),
+            epoch,
+        };
+        // The provider's pre-storage implementation knew this stream shape,
+        // but not its immutable holder fence. Refuse locally after negotiating
+        // rather than let it accept a write it cannot authoritatively fence.
+        self.require_peer_version(&connection, &request, &peer.name)
+            .await?;
         let mut stream = connection.open_stream().await?;
-        open_stream_with(
-            &mut stream.send,
-            &MeshRequest::VolumeSplice {
-                volume: volume.to_owned(),
-                holder: holder.to_owned(),
-                epoch,
-            },
-        )
-        .await?;
+        open_stream_with(&mut stream.send, &request).await?;
         match read_frame::<MeshReply>(&mut stream.recv).await? {
             MeshReply::SpliceReady => {}
             MeshReply::Rpc {
@@ -1958,9 +1996,10 @@ impl Mesh {
                     .await;
                 bail!("device {:?} is no longer in this orbit", device.name);
             }
-            if let Ok(Ok(MeshReply::Pong { .. })) =
+            if let Ok(Ok(MeshReply::Pong { speaking, .. })) =
                 tokio::time::timeout(PROBE_TIMEOUT, ask(&cached, &MeshRequest::Ping)).await
             {
+                self.remember_spoken(&device.device_id, speaking).await;
                 self.observe_success(
                     &device.device_id,
                     &cached,
@@ -2004,13 +2043,31 @@ impl Mesh {
                 // message.
                 answer.with_context(|| format!("could not reach device {:?}", device.name))
             });
-        if let Err(e) = proof {
-            self.discard_connection(&device.device_id, &connection, b"mesh probe failed")
+        let speaking = match proof {
+            Ok(MeshReply::Pong { speaking, .. }) => speaking,
+            Ok(other) => {
+                self.discard_connection(
+                    &device.device_id,
+                    &connection,
+                    b"mesh probe was not a pong",
+                )
                 .await;
-            self.observe_failure(&device.device_id, "dial_answered_but_mesh_failed")
-                .await;
-            return Err(e);
-        }
+                self.observe_failure(&device.device_id, "dial_answered_with_non_ping_reply")
+                    .await;
+                bail!(
+                    "device {:?} answered a mesh ping with {other:?}",
+                    device.name
+                );
+            }
+            Err(e) => {
+                self.discard_connection(&device.device_id, &connection, b"mesh probe failed")
+                    .await;
+                self.observe_failure(&device.device_id, "dial_answered_but_mesh_failed")
+                    .await;
+                return Err(e);
+            }
+        };
+        self.remember_spoken(&device.device_id, speaking).await;
         self.observe_success(&device.device_id, &connection, started.elapsed(), reason)
             .await;
 
@@ -2023,6 +2080,43 @@ impl Mesh {
         // guesswork again.
         self.record_addrs(device).await;
         Ok(connection)
+    }
+
+    /// Record the version a peer selected on its liveness ping. An old pong
+    /// had no `speaking` field; serde supplies zero, which means the original
+    /// unnumbered wire rather than a nonexistent protocol zero.
+    async fn remember_spoken(&self, device_id: &str, speaking: u32) {
+        self.speaking
+            .lock()
+            .await
+            .insert(device_id.to_owned(), speaking.max(compat::FIRST_PROTOCOL));
+    }
+
+    async fn spoken_on(&self, connection: &MeshConnection) -> Option<u32> {
+        self.speaking
+            .lock()
+            .await
+            .get(&connection.remote_device_id().to_string())
+            .copied()
+    }
+
+    /// Refuse a protocol-7 storage frame before writing it to a provider that
+    /// selected an older version on the liveness ping which `live_connection`
+    /// has just completed. This reuses that negotiated result rather than
+    /// adding a second round trip to every storage operation.
+    async fn require_peer_version(
+        &self,
+        connection: &MeshConnection,
+        request: &MeshRequest,
+        peer: &str,
+    ) -> Result<()> {
+        if !request.needs_storage_negotiation() {
+            return Ok(());
+        }
+        let spoken = self.spoken_on(connection).await.with_context(|| {
+            format!("device {peer:?} completed no compatibility ping before this storage request")
+        })?;
+        require_spoken(request, spoken, peer)
     }
 
     /// Closes one exact connection and forgets every cache/registry reference
@@ -2044,6 +2138,7 @@ impl Mesh {
             conns.remove(device_id);
         }
         drop(conns);
+        self.speaking.lock().await.remove(device_id);
         self.untrack(device_id, stable).await;
     }
 
@@ -2492,6 +2587,7 @@ async fn serve_volume_splice(
     mut stream: asterism_mesh::MeshStream,
     volume: &str,
     holder: &str,
+    holder_id: &str,
     epoch: u64,
     requester_device: &str,
     requester_device_id: &str,
@@ -2499,6 +2595,7 @@ async fn serve_volume_splice(
     let export = match crate::volume::open_export(
         volume,
         holder,
+        holder_id,
         epoch,
         requester_device,
         requester_device_id,
@@ -3271,12 +3368,14 @@ async fn serve_stream(
         MeshRequest::VolumeSplice {
             volume,
             holder,
+            holder_id,
             epoch,
         } => {
             return serve_volume_splice(
                 stream,
                 &volume,
                 &holder,
+                &holder_id,
                 epoch,
                 &requester_device,
                 &requester_device_id,
@@ -3391,6 +3490,21 @@ async fn ask(connection: &MeshConnection, request: &MeshRequest) -> Result<MeshR
         MeshReply::Incompatible { message, .. } => bail!(message),
         reply => Ok(reply),
     }
+}
+
+/// The pure half of [`Mesh::require_peer_version`], kept separate so both
+/// storage directions have a source regression without needing a live old
+/// binary.
+fn require_spoken(request: &MeshRequest, spoken: u32, peer: &str) -> Result<()> {
+    if request.since() <= spoken {
+        return Ok(());
+    }
+    bail!(compat::frame_too_new(
+        request.name(),
+        request.since(),
+        spoken,
+        &format!("storage provider {peer:?}"),
+    ));
 }
 
 /// Write a stream's opening frame, with this daemon's range on it.
@@ -3967,6 +4081,61 @@ mod tests {
         client.close().await;
     }
 
+    /// Storage's NBD pipe is not an ordinary splice: its holder identity and
+    /// epoch enforce the provider-side single-writer fence. A protocol-6 peer
+    /// must receive a compatibility refusal before either side treats it as a
+    /// pipe.
+    #[tokio::test]
+    async fn a_protocol_six_peer_is_refused_before_a_fenced_volume_splice() {
+        let (client, connection, _dir) = wired().await;
+        let frame = r#"{"protocol":6,"min_protocol":6,"kind":"volume_splice","volume":"tank","holder":"agent","holder_id":"instance-id","epoch":7}"#;
+
+        match raw_ask(&connection, frame).await.unwrap() {
+            MeshReply::Incompatible { message, .. } => {
+                assert!(
+                    message.contains("volume connection needs Asterism protocol 7"),
+                    "{message}"
+                );
+                assert!(message.contains("speaking protocol 6"), "{message}");
+            }
+            other => panic!("a protocol-6 volume splice was not refused: {other:?}"),
+        }
+
+        connection.close(b"done");
+        client.close().await;
+    }
+
+    /// The opposite skew direction is just as important: this newer consumer
+    /// must not write a storage RPC or a fenced splice to a protocol-6
+    /// provider merely because that older provider can still parse the outer
+    /// envelope.
+    #[test]
+    fn a_newer_sender_refuses_protocol_six_storage_before_writing_it() {
+        let lease = MeshRequest::Rpc {
+            request: Request::VolumeLease {
+                volume: "tank".into(),
+                holder: "agent".into(),
+                holder_id: "instance-id".into(),
+                holder_device: "desktop".into(),
+                holder_device_id: "desktop-id".into(),
+                intent_id: None,
+            },
+        };
+        let splice = MeshRequest::VolumeSplice {
+            volume: "tank".into(),
+            holder: "agent".into(),
+            holder_id: "instance-id".into(),
+            epoch: 7,
+        };
+
+        for request in [&lease, &splice] {
+            let error = require_spoken(request, 6, "nas").unwrap_err().to_string();
+            assert!(error.contains("needs Asterism protocol 7"), "{error}");
+            assert!(error.contains("speaking protocol 6"), "{error}");
+            assert!(error.contains("storage provider \"nas\""), "{error}");
+        }
+    }
+
     /// The other direction of the same morning: a peer from the *future* that
     /// has dropped support for today's wire. It is refused — but in a
     /// sentence carried on a frame, not by a dropped stream, because "that
@@ -4182,6 +4351,7 @@ mod tests {
             orbit: node.orbit.clone(),
             pending: Arc::new(Mutex::new(None)),
             conns: Mutex::new(HashMap::new()),
+            speaking: Mutex::new(HashMap::new()),
             telemetry: Mutex::new(HashMap::new()),
             active: Mutex::new(HashMap::new()),
         });
@@ -4268,6 +4438,7 @@ mod tests {
             orbit,
             pending: Arc::new(Mutex::new(None)),
             conns: Mutex::new(HashMap::new()),
+            speaking: Mutex::new(HashMap::new()),
             telemetry: Mutex::new(HashMap::new()),
             active: Mutex::new(HashMap::new()),
         });

@@ -120,7 +120,7 @@ mod tests {
                 match section {
                     Section::Instances => crate::instances::Instances::of(&[]).lines(),
                     Section::Devices => crate::devices::Devices::of(&[], &[]).lines(),
-                    Section::Volumes => crate::volumes::Volumes::of(&[]).lines(),
+                    Section::Volumes => crate::volumes::Volumes::of(&asterism_core::volume::Catalog::default()).lines(),
                     Section::Settings => crate::settings::Settings {
                         autostart: false,
                         backends: Vec::new(),

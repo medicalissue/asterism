@@ -162,8 +162,15 @@ operations across the mesh.
 
   ```console
   $ ast --device storage volume create data --size 100G
-  $ ast attach agent --volume storage:data
+  $ ast volume ls
+  $ ast attach agent --volume data
   ```
+
+  `ast volume ls` is one orbit catalog: each row identifies the owning device,
+  measured access latency, single-device durability, single-writer sharing and
+  current lease. Placement prefers an eligible local part, then the lowest
+  measured latency. Use `storage:data` to constrain an attach to one owner, or
+  `--max-latency-ms` to refuse a path before any lease or guest state changes.
 
 - **Secrets** keep their values in a source device's macOS login Keychain. The
   guest receives an opaque handle, and Asterism exchanges it for the value
