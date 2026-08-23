@@ -109,6 +109,13 @@ pub struct MoveFile {
     pub allocated: u64,
     /// Permission bits. `seed.iso` and a disk are not the same secret.
     pub mode: u32,
+    /// Content address of the file's bytes (`blake3:<hex>`).
+    ///
+    /// Length is not identity: a same-length substitution must fail closed
+    /// on Committed replay. Empty from a peer older than this field, and a
+    /// WAL that stored no digest cannot authenticate the published tree.
+    #[serde(default)]
+    pub digest: String,
 }
 
 /// Everything a cpu-part swap will carry, computed on the source device
@@ -183,12 +190,14 @@ mod tests {
                     len: 20 << 30,
                     allocated: 1 << 30,
                     mode: 0o600,
+                    digest: String::new(),
                 },
                 MoveFile {
                     path: "seed.iso".into(),
                     len: 366 << 10,
                     allocated: 366 << 10,
                     mode: 0o644,
+                    digest: String::new(),
                 },
             ],
             local_volumes: vec!["/mnt/ast/tank".into()],
@@ -327,5 +336,18 @@ mod tests {
         };
         assert_eq!(live.since(), 7);
         assert_eq!(live.versioned_name(), Some("token-fenced migration"));
+    }
+
+    #[test]
+    fn a_move_file_without_digest_still_deserializes() {
+        let old: MoveFile =
+            serde_json::from_str(r#"{"path":"disk.raw","len":12,"allocated":12,"mode":384}"#)
+                .unwrap();
+        assert_eq!(old.path, "disk.raw");
+        assert_eq!(old.len, 12);
+        assert!(
+            old.digest.is_empty(),
+            "an older peer has no digest to send, so replay cannot authenticate that file"
+        );
     }
 }

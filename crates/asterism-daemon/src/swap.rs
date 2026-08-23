@@ -1103,8 +1103,9 @@ fn published_for(txn: &AuthorityTxn) -> bool {
 /// Commit consumes the in-tree marker on purpose: the durable WAL is then
 /// the authority, and a later status, reply-loss, or restart must not demand
 /// that marker back. Exact identity still has to hold — instance id, epoch,
-/// token/WAL, matching row, and the live tree's file digest — and a
-/// substituted directory fails closed.
+/// token/WAL, matching row, and a rehash of each live file against the
+/// digest stored in the manifest/WAL. Length is not identity: a same-length
+/// substitution, a truncated file, or a foreign marker fails closed.
 fn prove_committed_published(reg: &Shard, txn: &AuthorityTxn, device: &str) -> Result<()> {
     if txn.phase != MoveAuthorityPhase::Committed {
         bail!("target authority is {:?}, not durably committed", txn.phase);
@@ -1154,6 +1155,27 @@ fn prove_committed_published(reg: &Shard, txn: &AuthorityTxn, device: &str) -> R
                 file.len
             );
         }
+        if file.digest.is_empty() {
+            bail!(
+                "{} in the committed live tree has no digest authority for id {:?} epoch {}",
+                file.path,
+                txn.instance_id,
+                txn.epoch
+            );
+        }
+        let expected = Digest::parse(&file.digest).with_context(|| {
+            format!(
+                "{} in the committed live tree has an unusable digest for id {:?} epoch {}",
+                file.path, txn.instance_id, txn.epoch
+            )
+        })?;
+        expected.verify_file(
+            &path,
+            &format!(
+                "{} in the committed live tree for id {:?} epoch {}",
+                file.path, txn.instance_id, txn.epoch
+            ),
+        )?;
     }
     Ok(())
 }
@@ -1347,6 +1369,7 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<MoveFile>) -> Result<()> {
             len: meta.len(),
             allocated: cow::allocated(&cow::extents(&path)?),
             mode: meta.permissions().mode() & 0o777,
+            digest: Digest::of_file(verify::OWN_ALGO, &path)?.to_string(),
         });
     }
     Ok(())
@@ -5142,6 +5165,7 @@ mod tests {
             len: 4096,
             allocated: 4096,
             mode: 0o600,
+            digest: String::new(),
         }]);
 
         // No receipt at all: the transfer never finished.
@@ -6820,12 +6844,17 @@ mod tests {
         );
 
         // Live tree digest is part of that identity: a truncated published
-        // file is substitution, not a successful Committed replay.
+        // file is substitution, not a successful Committed replay. Same-length
+        // byte mutation is too — length is not content.
+        let published_bytes = b"target bytes";
+        let published_digest =
+            verify::Digest::of_bytes(verify::OWN_ALGO, published_bytes).to_string();
         let mut digest_manifest = manifest_of(vec![MoveFile {
             path: "disk.raw".into(),
-            len: 12,
-            allocated: 12,
+            len: published_bytes.len() as u64,
+            allocated: published_bytes.len() as u64,
             mode: 0o600,
+            digest: published_digest,
         }]);
         digest_manifest.instance.name = "committed-digest".into();
         digest_manifest.instance.id = "committed-digest-id".into();
@@ -6837,14 +6866,16 @@ mod tests {
             "token",
         );
         std::fs::create_dir_all(&digest_staging).unwrap();
-        std::fs::write(digest_staging.join("disk.raw"), b"target bytes").unwrap();
+        std::fs::write(digest_staging.join("disk.raw"), published_bytes).unwrap();
         Receipt {
             instance_id: digest_manifest.instance.id.clone(),
             epoch: digest_epoch,
             token: "token".into(),
             from_device: digest_manifest.instance.cpu_device.clone(),
-            bytes: 12,
-            files: [("disk.raw".to_owned(), 12u64)].into_iter().collect(),
+            bytes: published_bytes.len() as u64,
+            files: [("disk.raw".to_owned(), published_bytes.len() as u64)]
+                .into_iter()
+                .collect(),
         }
         .save(&digest_staging)
         .unwrap();
@@ -6883,7 +6914,25 @@ mod tests {
             ),
             Response::Error { .. }
         ));
-        std::fs::write(digest_live.join("disk.raw"), b"target bytes").unwrap();
+        let mutated = b"forged bytes";
+        assert_eq!(
+            mutated.len(),
+            published_bytes.len(),
+            "the mutation must keep the published length so only the digest can catch it"
+        );
+        std::fs::write(digest_live.join("disk.raw"), mutated).unwrap();
+        assert!(matches!(
+            target_status(
+                &mut restarted,
+                &digest_manifest.instance.id,
+                "committed-digest",
+                digest_epoch,
+                "token",
+                "desktop",
+            ),
+            Response::Error { .. }
+        ));
+        std::fs::write(digest_live.join("disk.raw"), published_bytes).unwrap();
         assert!(matches!(
             target_status(
                 &mut restarted,
