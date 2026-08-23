@@ -1,4 +1,4 @@
-# Two-device NVIDIA hardware gate
+# Exact real-NVIDIA release gate
 
 The production GPU part presents `/dev/nvidia0` inside an attached instance.
 Transport, authentication, leases, revocation, device loss and ABI version
@@ -20,8 +20,10 @@ filed as NVIDIA hardware evidence.
 | `crates/asterism-daemon/src/gpu.rs` | Daemon/mesh routing into the CUDA helper. Unix helper socket, no public listener, no token persistence. |
 | `crates/asterism-core/src/remote_gpu_nvidia.rs` | Fail-closed driver/CUDA/CC matrix and deterministic two-device harness |
 | `crates/asterism-core/examples/remote_gpu_nvidia_harness.rs` | Source runner for the contract; always prints `hardware_cuda_executed=false` |
-| `scripts/harness-remote-gpu-nvidia.sh` | Hardware wrapper: inventory, matrix, `nvcc` kernel on two devices, contract runner |
-| `scripts/lib/remote_gpu_vector_add.cu` | Tiny host CUDA kernel used only on the paid gate |
+| `scripts/harness-remote-gpu-nvidia.sh` | Hardware wrapper: independently observes SHA/tree/GPU inventory, invokes the pinned-tree E2E runner, and judges its closed evidence schema |
+| `scripts/lib/nvidia-e2e-runner.sh` | Fail-closed adapter to the candidate-built process driver; never fabricates evidence or falls back to reference/local-direct CUDA |
+| `scripts/lib/guest_remote_cuda_vector_add.c` | CUDA application payload intended to execute inside the Asterism guest/container |
+| `scripts/test-nvidia-release-gate.sh` | Source-only fixtures proving reference, local-direct, stale PID, bearer, Conflict-skew, and hardware-false records are refused |
 | `deploy/dstack/remote-gpu-nvidia.dstack.yml` | Provider-side dstack **task** config. Do not apply from development machines. |
 
 ## Fail-closed matrix
@@ -36,11 +38,11 @@ A provider is refused, not skipped, unless all of the following hold:
 
 CUDA 11, driver 470, Volta 7.0, a single GPU, or a truncated inventory are
 errors. CI without two NVIDIA devices must report the gate **unavailable**
-(script exit 2). A contract-only reference run is exit 3 and still not a
-hardware pass. Exit 0 is reserved for two-device CUDA kernel evidence plus
-the production contract.
+(script exit 2). Exit 0 is reserved for the single complete
+guest→projection→mesh→provider record; reference and local-direct diagnostics
+remain non-PASS evidence.
 
-## Deterministic harness
+## Source-only contract harness
 
 `prove_two_device_nvidia_contract` uses two admitted GPU identities and the
 reference ABI executor. It proves:
@@ -60,27 +62,27 @@ non-loopback plaintext listener and has no cloud-only dependency.
 
 ## dstack plan (do not apply here)
 
-Local server status at recovery time:
-
-- `GET /` → HTTP 500
-- offers path → HTTP 500 (previously 405)
-
-That is Sol's external execution blocker. The task file is still the
-cost-input:
+The matching dstack 0.21.2 CLI validated the task against project `main` at
+`http://127.0.0.1:3001`. Port 3000 is Dagster. The no-cost plan resolved:
 
 - 1 on-demand host
 - 2× NVIDIA GPUs, 16 GB+ each, CC 7.5+
 - driver 550+, CUDA 12.4–13.x (dstack default image is CUDA 13.0 + `nvcc: true`)
 - `max_price: 2.50` USD/hour
 - `max_duration: 1h`, `idle_duration: 5m`, `retry: false`
-- expected wall clock 20–40 minutes including rustup
+- expected wall clock 20–40 minutes
 - expected spend **about 1–3 USD** if applied once and stopped
+
+The plan reported no fleets, so submission is blocked without spending. The
+pinned-tree runner also refuses execution unless the integrated candidate has
+built `target/release/asterism-nvidia-e2e-driver`; absence cannot fall through
+to a reference or host-direct path.
 
 Preferred SKUs when offers are healthy: 2× L4 24 GB, 2× RTX 4090 24 GB, or
 2× A10 24 GB. Do not use V100/P100; CUDA 13 images do not support them and
 the matrix refuses CC < 7.5.
 
-Sol applies only after a plan preview (`echo n | dstack apply -f deploy/dstack/remote-gpu-nvidia.dstack.yml`)
+Sol applies only after a plan preview (`echo n | dstack apply --project main -f deploy/dstack/remote-gpu-nvidia.dstack.yml`)
 shows two NVIDIA GPUs under the price cap. Never apply from this tree as a
 side effect of CI.
 
@@ -90,11 +92,14 @@ From the **exact Git SHA** under test, with both GPU UUIDs, both mesh device
 IDs, driver, CUDA runtime, and route kind:
 
 - CUDA result bytes through the guest-local `/dev/nvidia0` adapter
-- `scripts/lib/remote_gpu_vector_add.cu` passing on device 0 and device 1
+- guest application output `6.0,2.0,6.0` from projected `/dev/nvidia0` and injected libcuda
+- direct and relay traversal across two distinct named mesh device IDs
 - provider-process / provider-device loss while work is active
 - peer and instance revocation during an active session
 - concurrent lease-slot fencing
-- daemon and provider restart with a new generation
+- provider astd, helper, and guest PID changes across real restarts
+- fresh-session version skew returning `UnsupportedVersion`, never `Conflict`
+- exact candidate SHA, tree digest, runner digest, guest/provider image digests
 - unsupported driver/CUDA matrix fail-closed
 - `hardware_cuda_executed=true` only from that run
 

@@ -227,6 +227,14 @@ nvidia_gate_validate_dstack() {
     echo "dstack: repos.hash must be a 40-character git oid (got ${hash:-empty})" >&2
     return 1
   }
+  grep -q "ASTERISM_PINNED_SHA=$hash" "$yml" || {
+    echo "dstack: ASTERISM_PINNED_SHA must equal repos.hash" >&2
+    return 1
+  }
+  grep -q 'ASTERISM_NVIDIA_E2E_RUNNER=/dstack/run/scripts/lib/nvidia-e2e-runner.sh' "$yml" || {
+    echo "dstack: exact pinned-tree E2E runner must be selected" >&2
+    return 1
+  }
   echo "dstack_schema=valid"
   echo "dstack_pinned_sha=$hash"
 }
