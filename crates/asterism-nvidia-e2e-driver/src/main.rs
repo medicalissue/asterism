@@ -40,8 +40,10 @@ struct Bundle {
     candidate_sha: String,
     tree_digest: String,
     driver_digest: String,
+    astd_digest: String,
     libcuda_digest: String,
     guest_binary_digest: String,
+    guest_launcher_digest: String,
     guest_image_digest: String,
     provider_image_digest: String,
     guest_device_name: String,
@@ -126,11 +128,13 @@ fn run(args: &[String]) -> Result<()> {
     let libcuda = PathBuf::from(env_required("ASTERISM_NVIDIA_LIBCUDA")?);
     let guest_binary = PathBuf::from(env_required("ASTERISM_NVIDIA_GUEST_BINARY")?);
     let astd = PathBuf::from(env_required("ASTERISM_NVIDIA_ASTD")?);
+    let guest_launcher = PathBuf::from(env_required("ASTERISM_NVIDIA_GUEST_LAUNCHER")?);
     for (label, path) in [
         ("driver", executable.as_path()),
         ("libcuda", libcuda.as_path()),
         ("guest binary", guest_binary.as_path()),
         ("astd", astd.as_path()),
+        ("guest launcher", guest_launcher.as_path()),
     ] {
         ensure!(
             path.is_file(),
@@ -192,8 +196,10 @@ fn run(args: &[String]) -> Result<()> {
         candidate_sha,
         tree_digest,
         driver_digest: sha256_file(&executable)?,
+        astd_digest: sha256_file(&astd)?,
         libcuda_digest: sha256_file(&libcuda)?,
         guest_binary_digest: sha256_file(&guest_binary)?,
+        guest_launcher_digest: sha256_file(&guest_launcher)?,
         guest_image_digest: env_required("ASTERISM_NVIDIA_GUEST_IMAGE_DIGEST")?,
         provider_image_digest: env_required("ASTERISM_NVIDIA_PROVIDER_IMAGE_DIGEST")?,
         guest_device_name: guest_name,
@@ -352,17 +358,9 @@ fn execute_one(args: &[String]) -> Result<()> {
 
     let guest_binary = PathBuf::from(env_required("ASTERISM_NVIDIA_GUEST_BINARY")?);
     let libcuda = PathBuf::from(env_required("ASTERISM_NVIDIA_LIBCUDA")?);
-    let mut command = if let Ok(launcher) = std::env::var("ASTERISM_NVIDIA_GUEST_LAUNCHER") {
-        let mut command = Command::new(launcher);
-        command.arg(&guest_binary).arg(&device_path).arg(&libcuda);
-        command
-    } else {
-        let mut command = Command::new(&guest_binary);
-        command
-            .env("ASTERISM_GUEST_NVIDIA_DEVICE", &device_path)
-            .env("ASTERISM_LIBCUDA", &libcuda);
-        command
-    };
+    let launcher = env_required("ASTERISM_NVIDIA_GUEST_LAUNCHER")?;
+    let mut command = Command::new(launcher);
+    command.arg(&guest_binary).arg(&device_path).arg(&libcuda);
     let guest = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -594,8 +592,10 @@ fn verify_bundle(bundle: &Bundle) -> Result<()> {
     ensure!(bundle.first_gpu_uuid != bundle.second_gpu_uuid);
     for digest in [
         &bundle.driver_digest,
+        &bundle.astd_digest,
         &bundle.libcuda_digest,
         &bundle.guest_binary_digest,
+        &bundle.guest_launcher_digest,
         &bundle.guest_image_digest,
         &bundle.provider_image_digest,
     ] {
@@ -686,7 +686,7 @@ fn write_evidence(path: &Path, bundle: &Bundle) -> Result<()> {
         .digest
         .clone();
     let text = format!(
-        "guest_image_digest={}\nprovider_image_digest={}\nguest_container_id=asterism-container-{}\nguest_device_name={}\nprovider_device_name={}\nguest_device_id={}\nprovider_device_id={}\npath=guest-mesh-provider\ndirect_path=true\nrelay_path=true\nguest_path=/dev/nvidia0\nlibcuda_path=sha256:{}\nexecutor=cuda\nprovider_helper_kind=process\nguest_output=6.0,2.0,6.0\nprovider_astd_pid_before={}\nprovider_astd_pid_after={}\nprovider_helper_pid_before={}\nprovider_helper_pid_after={}\nguest_pid_before={}\nguest_pid_after={}\nprovider_astd_restarted=true\nprovider_helper_restarted=true\nguest_restarted=true\nrevoke=true\ncontention=true\nloss=true\nversion_skew_fresh_session=true\nversion_skew_error=unsupported_version\nmesh_open_bearer=false\nhardware_cuda_executed=true\ndriver_digest={}\nlibcuda_digest={}\nguest_binary_digest={}\ntranscript_root={}\n",
+        "guest_image_digest={}\nprovider_image_digest={}\nguest_container_id=asterism-container-{}\nguest_device_name={}\nprovider_device_name={}\nguest_device_id={}\nprovider_device_id={}\npath=guest-mesh-provider\ndirect_path=true\nrelay_path=true\nguest_path=/dev/nvidia0\nlibcuda_path=sha256:{}\nexecutor=cuda\nprovider_helper_kind=process\nguest_output=6.0,2.0,6.0\nprovider_astd_pid_before={}\nprovider_astd_pid_after={}\nprovider_helper_pid_before={}\nprovider_helper_pid_after={}\nguest_pid_before={}\nguest_pid_after={}\nprovider_astd_restarted=true\nprovider_helper_restarted=true\nguest_restarted=true\nrevoke=true\ncontention=true\nloss=true\nversion_skew_fresh_session=true\nversion_skew_error=unsupported_version\nmesh_open_bearer=false\nhardware_cuda_executed=true\ndriver_digest={}\nastd_digest={}\nlibcuda_digest={}\nguest_binary_digest={}\nguest_launcher_digest={}\ntranscript_root={}\n",
         bundle.guest_image_digest,
         bundle.provider_image_digest,
         bundle.run_id,
@@ -702,8 +702,10 @@ fn write_evidence(path: &Path, bundle: &Bundle) -> Result<()> {
         required_event(bundle, "projected_cuda_executed", "path=direct;")?.pid,
         required_event(bundle, "projected_cuda_executed", "path=relay;")?.pid,
         bundle.driver_digest,
+        bundle.astd_digest,
         bundle.libcuda_digest,
         bundle.guest_binary_digest,
+        bundle.guest_launcher_digest,
         transcript_root,
     );
     fs::write(path, text)?;
@@ -926,8 +928,10 @@ mod tests {
             candidate_sha: "a".repeat(40),
             tree_digest: "b".repeat(40),
             driver_digest: digest.clone(),
+            astd_digest: digest.clone(),
             libcuda_digest: digest.clone(),
             guest_binary_digest: digest.clone(),
+            guest_launcher_digest: digest.clone(),
             guest_image_digest: digest.clone(),
             provider_image_digest: digest,
             guest_device_name: "guest".into(),
