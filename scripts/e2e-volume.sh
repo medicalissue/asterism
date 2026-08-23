@@ -49,6 +49,12 @@ case "$BACKEND" in
   *) echo "VOLUME E2E FAIL: unknown backend: $BACKEND" >&2; exit 2 ;;
 esac
 
+# Cloud Hypervisor consumes the publisher-verified qcow2 directly and, by
+# design, refuses to rewrite its metadata. The pinned Debian 13 cloud image is
+# exactly 3 GiB; raw-backed VZ/QEMU instances retain the suite's 10 GiB grow.
+ROOT_DISK_GIB=10
+[ "$BACKEND" = chv ] && ROOT_DISK_GIB=3
+
 # shellcheck source-path=SCRIPTDIR source=lib/harness.sh
 . "$ROOT/scripts/lib/harness.sh"
 harness_begin volume
@@ -386,7 +392,7 @@ ASTERISM_HOME="$A" "$AST" pull "$IMAGE" >/dev/null 2>&1 \
 # block device on both backends.
 expect "create the instance on A ($BACKEND)" "$INST  defined" \
   env ASTERISM_HOME="$A" "$AST" create "$INST" --backend "$BACKEND" --image "$IMAGE" \
-    --mem 2G --disk 10G
+    --mem 2G --disk "${ROOT_DISK_GIB}G"
 
 mkdir -p "$SHARED"
 chmod 0777 "$SHARED"
