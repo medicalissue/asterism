@@ -81,12 +81,16 @@ supply `ASTERISM_PINNED_SHA`; the task rejects any different `HEAD`. This
 replaces the impossible pattern of embedding a commit's own future object ID
 inside that commit. The runner builds in a private temporary target directory.
 
-Acceptance is outside the candidate. The independent reviewer supplies
+Execution observation and acceptance are outside the candidate. The independent reviewer supplies
 `ASTERISM_NVIDIA_VERIFIER_IMAGE` and its exact sha256 digest. The candidate
-produces only a read-only directory of raw JSON, daemon logs, container
-identities, crossed frames, and artifact hashes. The offline verifier container
-receives that directory read-only and is the only component allowed to emit
-normalized PASS evidence. The candidate has no `verify` subcommand.
+tree is mounted read-only into that image. Its `/run-and-verify` entrypoint
+invokes the exact runner, observes daemon/container processes while live, and
+then validates raw JSON, daemon logs, container identities, crossed frames, and
+artifact hashes. It is the only component allowed to emit normalized PASS
+evidence. A separate result mount is shared with the host Docker daemon so the
+guest's projected socket and compiled artifacts retain real, verifier-observed
+host paths; every other nested bind path is rejected. The candidate has no
+`verify` subcommand.
 
 Preferred SKUs when offers are healthy: 2× L4 24 GB, 2× RTX 4090 24 GB, or
 2× A10 24 GB. Do not use V100/P100; CUDA 13 images do not support them and
