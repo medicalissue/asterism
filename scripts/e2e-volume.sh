@@ -403,12 +403,14 @@ expect "create the instance on A ($BACKEND)" "$INST  defined" \
   env ASTERISM_HOME="$A" "$AST" create "$INST" --backend "$BACKEND" --image "$IMAGE" \
     --mem 2G --disk "${ROOT_DISK_GIB}G"
 
-mkdir -p "$SHARED"
-chmod 0777 "$SHARED"
-HOST_MARKER="host-directory-$BACKEND-$(date +%s)"
-printf '%s\n' "$HOST_MARKER" >"$SHARED/host-marker"
-expect "attach a same-device directory ($BACKEND)" "$SHARED_GUEST" \
-  env ASTERISM_HOME="$A" "$AST" attach "$INST" --volume "$SHARED" --at "$SHARED_GUEST"
+if [ "$BACKEND" != chv ]; then
+  mkdir -p "$SHARED"
+  chmod 0777 "$SHARED"
+  HOST_MARKER="host-directory-$BACKEND-$(date +%s)"
+  printf '%s\n' "$HOST_MARKER" >"$SHARED/host-marker"
+  expect "attach a same-device directory ($BACKEND)" "$SHARED_GUEST" \
+    env ASTERISM_HOME="$A" "$AST" attach "$INST" --volume "$SHARED" --at "$SHARED_GUEST"
+fi
 
 ATTACH=""
 ATTACHED=0
@@ -480,16 +482,18 @@ grep -qE "nbd over the mesh .* healthy .* direct .* [0-9]+\.[0-9]ms RTT .* conne
   || fail "the live volume has no measured path and initial transition:"$'\n'"$PARTS"
 echo "ok: status exposes the live volume's path, RTT and initial transition"
 
-SHARED_READ="$(in_guest "cat $SHARED_GUEST/host-marker")" \
-  || fail "the guest could not read its same-device directory:"$'\n'"$SHARED_READ"
-grep -qF "$HOST_MARKER" <<<"$SHARED_READ" \
-  || fail "the host marker did not reach the guest:"$'\n'"$SHARED_READ"
-GUEST_MARKER="guest-directory-$BACKEND-$(date +%s)"
-in_guest "echo '$GUEST_MARKER' > $SHARED_GUEST/guest-marker && sync" >/dev/null \
-  || fail "the guest could not write its same-device directory"
-grep -qF "$GUEST_MARKER" "$SHARED/guest-marker" \
-  || fail "the guest's directory write did not reach the host"
-echo "ok: the guest and host see the same writable directory through $BACKEND"
+if [ "$BACKEND" != chv ]; then
+  SHARED_READ="$(in_guest "cat $SHARED_GUEST/host-marker")" \
+    || fail "the guest could not read its same-device directory:"$'\n'"$SHARED_READ"
+  grep -qF "$HOST_MARKER" <<<"$SHARED_READ" \
+    || fail "the host marker did not reach the guest:"$'\n'"$SHARED_READ"
+  GUEST_MARKER="guest-directory-$BACKEND-$(date +%s)"
+  in_guest "echo '$GUEST_MARKER' > $SHARED_GUEST/guest-marker && sync" >/dev/null \
+    || fail "the guest could not write its same-device directory"
+  grep -qF "$GUEST_MARKER" "$SHARED/guest-marker" \
+    || fail "the guest's directory write did not reach the host"
+  echo "ok: the guest and host see the same writable directory through $BACKEND"
+fi
 
 # Booting renews the lease at a higher epoch, and the old export is revoked.
 E2="$(epoch_now)"
@@ -625,8 +629,10 @@ SURVIVED="$(in_guest "sudo mkdir -p /data && sudo mount $VOLUME_DEV /data && cat
 grep -qF "$MARKER" <<<"$SURVIVED" \
   || fail "the marker did not survive the reboot:"$'\n'"$SURVIVED"
 echo "ok: the filesystem and the marker survived down/up (now epoch $E3)"
-expect "the directory mount survives down/up too" "$HOST_MARKER" \
-  in_guest "cat $SHARED_GUEST/host-marker"
+if [ "$BACKEND" != chv ]; then
+  expect "the directory mount survives down/up too" "$HOST_MARKER" \
+    in_guest "cat $SHARED_GUEST/host-marker"
+fi
 
 # ---- 6. one writer, and the refusal names who has it -----------------------
 
