@@ -1,0 +1,211 @@
+#!/bin/sh
+# Root-side boundary for Asterism's NBD attachment lane. The installer owns
+# this file and sudoers names this exact path; astd never receives general
+# root access or permission to invoke nbd-client directly.
+set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+LOCK=/run/lock/asterism-nbd.lock
+STATE=/run/asterism-nbd
+
+# The lock is deliberately acquired in this root-only boundary. Locking in
+# astd leaves a gap for another authorized caller (or a stale daemon) between
+# the unprivileged free-device check and this helper's nbd-client invocation.
+# `flock` keeps the whole claim/attach/detach/ownership transaction together.
+if [ "${ASTERISM_NBD_LOCK_HELD-}" != 1 ]; then
+	flock_bin=$(command -v flock) || {
+		printf 'asterism-nbd: flock is required by the installed privilege boundary\n' >&2
+		exit 2
+	}
+	ASTERISM_NBD_LOCK_HELD=1 exec "$flock_bin" -x "$LOCK" "$0" "$@"
+fi
+
+die() {
+	printf 'asterism-nbd: %s\n' "$*" >&2
+	exit 2
+}
+
+caller_uid=${SUDO_UID-}
+caller_gid=${SUDO_GID-}
+valid_id() {
+	case "$1" in '' | *[!0-9]*) return 1 ;; esac
+	[ "$1" -ge 0 ]
+}
+
+[ -d "$STATE" ] || die "the installed NBD ownership state directory is missing"
+if [ -z "$caller_uid" ]; then caller_uid=$(id -u); fi
+if [ -z "$caller_gid" ]; then caller_gid=$(id -g); fi
+valid_id "$caller_uid" && valid_id "$caller_gid" ||
+	die "the invoking uid/gid is not numeric"
+
+device_name() {
+	case "$1" in
+	/dev/nbd[0-9] | /dev/nbd[0-9][0-9]) printf '%s' "${1##*/}" ;;
+	*) return 1 ;;
+	esac
+}
+
+claim_path() { printf '%s/%s' "$STATE" "$(device_name "$1")"; }
+
+claim_owner() {
+	claim=$1
+	[ -f "$claim/owner" ] || return 1
+	cat "$claim/owner"
+}
+
+claim_device() {
+	device=$1
+	claim=$(claim_path "$device") || die "invalid NBD device"
+	# mkdir is the atomic owner claim. The state directory is root-owned, so a
+	# caller cannot replace another owner's record between this check and use.
+	if ! mkdir "$claim" 2>/dev/null; then
+		# A helper can die after publishing its claim but before nbd-client. Under
+		# the lock, a claim with no live attachment and no live helper is safe to
+		# retire; an attached claim remains authoritative for its owner.
+		claim_pid=$(cat "$claim/helper-pid" 2>/dev/null || true)
+		if ! attached "$device" && [ -n "$claim_pid" ] && ! kill -0 "$claim_pid" 2>/dev/null; then
+			rm -rf "$claim"
+			mkdir "$claim" 2>/dev/null ||
+				die "$device is already claimed by another Asterism owner"
+		else
+			die "$device is already claimed by another Asterism owner"
+		fi
+	fi
+	if ! printf '%s:%s\n' "$caller_uid" "$caller_gid" >"$claim/owner"; then
+		rmdir "$claim" 2>/dev/null || :
+		die "could not persist the owner claim for $device"
+	fi
+	printf '%s\n' "$$" >"$claim/helper-pid"
+}
+
+release_claim() {
+	claim=$1
+	rm -f "$claim/owner" "$claim/helper-pid" "$claim/kernel-pid"
+	rmdir "$claim" 2>/dev/null || :
+}
+
+# `astd` is deliberately unprivileged. sudo supplies the invoking account in
+# SUDO_UID/GID; grant that account access to only the device selected for this
+# attach, and restore root ownership as soon as it is detached. A missing
+# sudo identity is allowed for administrator-run diagnostics, but a normal
+# unprivileged daemon always reaches this path through sudo.
+grant_device() {
+	device=$1
+	if [ -n "$caller_uid" ] || [ -n "$caller_gid" ]; then
+		valid_id "$caller_uid" && valid_id "$caller_gid" ||
+			return 1
+		if ! chown "$caller_uid:$caller_gid" "$device"; then
+			return 1
+		fi
+	fi
+	chmod 0600 "$device"
+}
+
+restore_device() {
+	device=$1
+	chown root:root "$device" || die "could not restore root ownership of $device"
+	chmod 0600 "$device" || die "could not restore permissions on $device"
+}
+
+attached() {
+	name=$(device_name "$1") || return 1
+	[ -s "/sys/block/${name}/pid" ]
+}
+
+rollback_attach() {
+	device=$1
+	claim=$2
+	ok=1
+	if attached "$device"; then
+		"$client" -d "$device" >/dev/null 2>&1 || ok=0
+	fi
+	# This runs on every failed attach, including a chmod/chown failure. Do not
+	# leave a user-owned block node behind just because nbd-client failed late.
+	if [ -e "$device" ]; then
+		chown root:root "$device" 2>/dev/null || ok=0
+		chmod 0600 "$device" 2>/dev/null || ok=0
+	fi
+	# Keep the root claim when rollback could not detach or restore the node;
+	# the next authorized cleanup can retry without exposing a new owner to a
+	# stale device.
+	[ "$ok" -eq 1 ] && release_claim "$claim"
+	return "$ok"
+}
+
+nbd_device() {
+	case "$1" in
+	/dev/nbd[0-9] | /dev/nbd[0-9][0-9]) ;;
+	*) return 1 ;;
+	esac
+	index=${1#/dev/nbd}
+	[ "$index" -le 63 ]
+}
+
+[ "$(id -u)" = "0" ] || die "must run as root through the installed sudo policy"
+client=$(command -v nbd-client) || die "nbd-client is not installed"
+
+case "${1-}" in
+-d)
+	if [ "$#" -ne 2 ] || ! nbd_device "$2"; then
+		die "invalid detach request"
+	fi
+	device=$2
+	claim=$(claim_path "$device") || die "invalid detach request"
+	owner=$(claim_owner "$claim") || die "$device has no Asterism ownership claim"
+	[ "$owner" = "$caller_uid:$caller_gid" ] ||
+		die "refusing to detach $device: it belongs to another owner"
+	if ! "$client" "$@"; then
+		# Keep the claim for a retry, but put the node back under root before
+		# reporting failure. A failed detach is not permission to leave a
+		# user-owned device available to unrelated processes.
+		chown root:root "$device" 2>/dev/null || :
+		chmod 0600 "$device" 2>/dev/null || :
+		exit 1
+	fi
+	if ! restore_device "$device"; then
+		exit 1
+	fi
+	release_claim "$claim"
+	exit 0
+	;;
+-unix)
+	[ "$#" -eq 5 ] || [ "$#" -eq 6 ] || die "invalid Unix attach request"
+	case "$2" in /*) ;; *) die "the NBD Unix socket must be an absolute path" ;; esac
+	nbd_device "$3" || die "the target must be /dev/nbd0 through /dev/nbd63"
+	[ "$4" = "-N" ] && [ -n "$5" ] || die "the NBD export must be named"
+	[ "$#" -eq 5 ] || [ "$6" = "-readonly" ] || die "invalid Unix attach options"
+	;;
+*)
+	[ "$#" -eq 5 ] || [ "$#" -eq 6 ] || die "invalid network attach request"
+	case "$1" in '' | -*) die "the NBD host must be named, not an option" ;; esac
+	case "$2" in *[!0-9]* | '') die "the NBD port must be numeric" ;; esac
+	[ "$2" -ge 1 ] && [ "$2" -le 65535 ] || die "the NBD port is out of range"
+	nbd_device "$3" || die "the target must be /dev/nbd0 through /dev/nbd63"
+	[ "$4" = "-N" ] && [ -n "$5" ] || die "the NBD export must be named"
+	[ "$#" -eq 5 ] || [ "$6" = "-readonly" ] || die "invalid network attach options"
+	;;
+esac
+
+device=$3
+claim=$(claim_path "$device") || die "invalid NBD device"
+claim_device "$device"
+if attached "$device"; then
+	rollback_attach "$device" "$claim"
+	die "$device is already attached; refusing to reuse another owner's NBD connection"
+fi
+
+if ! "$client" "$@"; then
+	rollback_attach "$device" "$claim"
+	die "nbd-client failed while attaching $device"
+fi
+if ! attached "$device"; then
+	rollback_attach "$device" "$claim"
+	die "nbd-client succeeded but the kernel did not publish an attachment for $device"
+fi
+if ! grant_device "$device"; then
+	rollback_attach "$device" "$claim"
+	die "could not grant the invoking account access to $device"
+fi
+printf '%s\n' "$(cat "/sys/block/$(device_name "$device")/pid")" >"$claim/kernel-pid"
