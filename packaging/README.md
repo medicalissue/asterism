@@ -203,8 +203,9 @@ irm https://asterism.run/install.ps1 | iex
 curl -fsSL https://asterism.run/install.sh | sh     # Git Bash; detects MINGW/MSYS
 ```
 
-A Windows tarball is `ast.exe`, `astd.exe`, `astd-hyperv.exe`, and the
-updater. The helper is required: there is no WHPX/QEMU product fallback.
+A Windows tarball is `ast.exe`, `astd.exe`, `astd-hyperv.exe`, the updater,
+and the matching `install.ps1` that the installed updater invokes. The helper
+and both update scripts are required: there is no WHPX/QEMU product fallback.
 SHA-256 is mandatory. Authenticode is checked when
 `ASTERISM_AUTHENTICODE_THUMBPRINT` is set or `ASTERISM_REQUIRE_SIGNATURE=1`.
 An elevated install lands in Program Files so SCM may use LocalSystem; a

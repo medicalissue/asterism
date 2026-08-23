@@ -698,6 +698,10 @@ install_release() {
 	if [ -f "${unpack}/asterism-update${exe}" ]; then updater=1; else updater=0; fi
 	if [ -f "${unpack}/asterism-update" ]; then updater_sh=1; else updater_sh=0; fi
 	if [ -f "${unpack}/asterism-update.ps1" ]; then updater_ps1=1; else updater_ps1=0; fi
+	if [ -f "${unpack}/install.ps1" ]; then installer_ps1=1; else installer_ps1=0; fi
+	if [ "$target" != "${target#windows-}" ] && { [ "$updater_ps1" != "1" ] || [ "$installer_ps1" != "1" ]; }; then
+		die "${artifact} must package asterism-update.ps1 and install.ps1 together. Refusing a Windows updater that cannot apply."
+	fi
 	case "$target" in
 	linux-*)
 		for helper in cloud-hypervisor virtiofsd; do
@@ -724,6 +728,9 @@ install_release() {
 	fi
 	if [ "$updater_ps1" = "1" ]; then
 		receipt_files="${receipt_files} libexec/asterism/asterism-update.ps1"
+	fi
+	if [ "$installer_ps1" = "1" ]; then
+		receipt_files="${receipt_files} libexec/asterism/install.ps1"
 	fi
 	if [ "$linux_helpers" = "1" ]; then
 		intent_system_files="$(linux_system_files)"
@@ -767,6 +774,9 @@ install_release() {
 	fi
 	if [ "$updater_ps1" = "1" ]; then
 		place_at "${unpack}/asterism-update.ps1" libexec/asterism/asterism-update.ps1
+	fi
+	if [ "$installer_ps1" = "1" ]; then
+		place_at "${unpack}/install.ps1" libexec/asterism/install.ps1
 	fi
 	# shellcheck disable=SC2086
 	write_receipt "$version" "$target" release "$got" $receipt_files

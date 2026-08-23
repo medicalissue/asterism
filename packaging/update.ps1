@@ -17,8 +17,11 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('status', 'check', 'apply', 'recover')]
+    [ValidateSet('status', 'check', 'apply', 'recover', 'channel')]
     [string]$Command = 'status',
+    [Parameter(Position = 1)]
+    [ValidateSet('stable', 'beta', 'nightly')]
+    [string]$Channel,
     [switch]$Yes,
     [switch]$RollbackFixture
 )
@@ -53,7 +56,9 @@ $BackupDir = Join-Path $StateDir 'update-backup'
 $StageDir = Join-Path $StateDir 'update-stage'
 $BaseUrl = if ($env:ASTERISM_UPDATE_BASE_URL) { $env:ASTERISM_UPDATE_BASE_URL } else { 'https://github.com/medicalissue/asterism/releases/download' }
 $UnitNames = @('ast.exe', 'astd.exe', 'astd-hyperv.exe')
+$LibexecNames = @('asterism-update.ps1', 'install.ps1')
 $script:OwnsTransaction = $false
+$script:ClaimStream = $null
 
 function Get-Target {
     if ($env:ASTERISM_UPDATE_TARGET) { return $env:ASTERISM_UPDATE_TARGET }
@@ -72,37 +77,82 @@ function Current-Version {
 }
 
 function Write-Claim([string]$Owner, [string]$Id, [string]$Phase) {
+    if (-not $script:ClaimStream) {
+        throw 'cannot write an update claim without owning its file handle'
+    }
     $body = @(
         "owner=$Owner"
         "id=$Id"
         "phase=$Phase"
     ) -join "`n"
-    Set-Content -Path $ClaimFile -Value $body -Encoding ascii
+    $bytes = [Text.Encoding]::ASCII.GetBytes("$body`n")
+    $script:ClaimStream.Position = 0
+    $script:ClaimStream.SetLength(0)
+    $script:ClaimStream.Write($bytes, 0, $bytes.Length)
+    $script:ClaimStream.Flush($true)
 }
 
 function Read-Claim {
     if (-not (Test-Path $ClaimFile)) { return $null }
+    if ($script:ClaimStream) {
+        $script:ClaimStream.Flush()
+        $script:ClaimStream.Position = 0
+        $bytes = New-Object byte[] ([int]$script:ClaimStream.Length)
+        [void]$script:ClaimStream.Read($bytes, 0, $bytes.Length)
+        $lines = ([Text.Encoding]::ASCII.GetString($bytes)) -split "`r?`n"
+    } else {
+        $lines = Get-Content $ClaimFile
+    }
     $map = @{}
-    foreach ($line in Get-Content $ClaimFile) {
+    foreach ($line in $lines) {
         if ($line -match '^(owner|id|phase)=(.*)$') { $map[$Matches[1]] = $Matches[2] }
+    }
+    foreach ($field in @('owner', 'id', 'phase')) {
+        if (-not $map.ContainsKey($field) -or -not $map[$field]) {
+            throw "update claim has no $field; refusing to mutate an unknown transaction"
+        }
     }
     return $map
 }
 
 function Try-Claim([string]$Owner, [string]$Id) {
     New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
-    if (Test-Path $ClaimFile) {
-        Die 'another updater process owns the activation transaction'
-    }
     try {
-        $stream = [System.IO.File]::Open($ClaimFile, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-        $bytes = [Text.Encoding]::ASCII.GetBytes("owner=$Owner`nid=$Id`nphase=claimed`n")
-        $stream.Write($bytes, 0, $bytes.Length)
-        $stream.Close()
+        # Keep the handle for the entire transaction. Readers such as `status`
+        # may inspect it, but another updater cannot write or delete it. When
+        # this process dies Windows releases the handle and recovery can take
+        # exclusive ownership of the stale transaction.
+        $script:ClaimStream = [System.IO.File]::Open(
+            $ClaimFile,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::Read
+        )
     } catch [System.IO.IOException] {
         Die 'another updater process owns the activation transaction'
     }
     $script:OwnsTransaction = $true
+    Write-Claim -Owner $Owner -Id $Id -Phase 'claimed'
+}
+
+function Lock-InterruptedClaim {
+    try {
+        $script:ClaimStream = [System.IO.File]::Open(
+            $ClaimFile,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::Read
+        )
+    } catch [System.IO.IOException] {
+        Die 'another updater process owns the activation transaction; refusing recovery'
+    }
+    $script:OwnsTransaction = $true
+    try {
+        return (Read-Claim)
+    } catch {
+        Release-ClaimHandle
+        throw
+    }
 }
 
 function Backup-Current {
@@ -111,9 +161,10 @@ function Backup-Current {
         $src = Join-Path $Bin $name
         if (Test-Path $src) { Copy-Item -Force $src (Join-Path $BackupDir $name) }
     }
-    $updater = Join-Path $Prefix 'libexec\asterism\asterism-update.ps1'
-    if (Test-Path $updater) {
-        Copy-Item -Force $updater (Join-Path $BackupDir 'asterism-update.ps1')
+    $libexec = Join-Path $Prefix 'libexec\asterism'
+    foreach ($name in $LibexecNames) {
+        $src = Join-Path $libexec $name
+        if (Test-Path $src) { Copy-Item -Force $src (Join-Path $BackupDir $name) }
     }
     Write-Claim -Owner $PID -Id (Read-Claim).id -Phase 'backed-up'
 }
@@ -125,28 +176,62 @@ function Restore-Backup {
         $src = Join-Path $BackupDir $name
         if (Test-Path $src) { Copy-Item -Force $src (Join-Path $Bin $name) }
     }
-    $updater = Join-Path $BackupDir 'asterism-update.ps1'
-    if (Test-Path $updater) {
-        $destDir = Join-Path $Prefix 'libexec\asterism'
-        New-Item -ItemType Directory -Force -Path $destDir | Out-Null
-        Copy-Item -Force $updater (Join-Path $destDir 'asterism-update.ps1')
+    $destDir = Join-Path $Prefix 'libexec\asterism'
+    foreach ($name in $LibexecNames) {
+        $src = Join-Path $BackupDir $name
+        if (Test-Path $src) {
+            New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+            Copy-Item -Force $src (Join-Path $destDir $name)
+        }
     }
     Say 'rolled back to the previous unit'
 }
 
-function Drop-Claim {
-    if (Test-Path $ClaimFile) { Remove-Item -Force $ClaimFile }
+function Release-ClaimHandle {
+    if ($script:ClaimStream) {
+        $script:ClaimStream.Dispose()
+        $script:ClaimStream = $null
+    }
     $script:OwnsTransaction = $false
 }
 
-function Recover-Interrupted {
-    $claim = Read-Claim
-    if (-not $claim) { return }
-    if ($claim.phase -ne 'done') {
-        Say "recovering interrupted transaction $($claim.id) (phase $($claim.phase))"
-        Restore-Backup
+function Drop-Claim {
+    if (-not $script:OwnsTransaction -or -not $script:ClaimStream) {
+        throw 'refusing to delete an update claim this process does not own'
     }
-    Drop-Claim
+    Release-ClaimHandle
+    if (Test-Path $ClaimFile) { Remove-Item -Force $ClaimFile }
+}
+
+function Recover-Interrupted {
+    if (-not (Test-Path $ClaimFile)) { return }
+    $claim = Lock-InterruptedClaim
+    try {
+        if ($claim.phase -ne 'done') {
+            Say "recovering interrupted transaction $($claim.id) (phase $($claim.phase))"
+            Restore-Backup
+        }
+        Drop-Claim
+    } catch {
+        # A failed restore remains recoverable. Release our lock, but leave the
+        # claim and backup untouched for the next deliberate recovery attempt.
+        if ($script:ClaimStream) { Release-ClaimHandle }
+        throw
+    }
+}
+
+function Read-Channel {
+    $channel = 'stable'
+    if (Test-Path $ChannelFile) { $channel = (Get-Content $ChannelFile -Raw).Trim() }
+    if ($channel -notin @('stable', 'beta', 'nightly')) {
+        Die "unknown saved channel $channel; choose stable, beta, or nightly"
+    }
+    return $channel
+}
+
+function Save-Channel([string]$Name) {
+    New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
+    Set-Content -Path $ChannelFile -Value $Name -Encoding ascii
 }
 
 function Invoke-RollbackFixture {
@@ -169,8 +254,7 @@ function Invoke-RollbackFixture {
 
 switch ($Command) {
     'status' {
-        $channel = 'stable'
-        if (Test-Path $ChannelFile) { $channel = (Get-Content $ChannelFile -Raw).Trim() }
+        $channel = Read-Channel
         Write-Host "channel   $channel"
         Write-Host "version   $(Current-Version)"
         Write-Host 'manager   asterism'
@@ -191,6 +275,14 @@ switch ($Command) {
         Recover-Interrupted
         Say 'no pending transaction'
     }
+    'channel' {
+        if ($Channel) {
+            Save-Channel $Channel
+            Say "channel is now $Channel"
+        } else {
+            Write-Host (Read-Channel)
+        }
+    }
     'apply' {
         if ($RollbackFixture) {
             Invoke-RollbackFixture
@@ -199,10 +291,7 @@ switch ($Command) {
         Recover-Interrupted
         $installer = Join-Path (Split-Path -Parent $PSCommandPath) 'install.ps1'
         if (-not (Test-Path $installer)) {
-            $installer = Join-Path $PSScriptRoot '..\install.ps1'
-        }
-        if (-not (Test-Path $installer)) {
-            Die 'install.ps1 is not next to the updater'
+            Die 'the Windows release did not package install.ps1 next to the updater; reinstall from a complete artifact'
         }
         Try-Claim -Owner $PID -Id ([guid]::NewGuid().ToString('n'))
         try {
@@ -211,9 +300,6 @@ switch ($Command) {
             $env:ASTERISM_YES = '1'
             Write-Claim -Owner $PID -Id (Read-Claim).id -Phase 'activating'
             & $installer
-            if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) {
-                throw "installer exited $LASTEXITCODE"
-            }
             Write-Claim -Owner $PID -Id (Read-Claim).id -Phase 'done'
             Drop-Claim
             Say 'update activated'

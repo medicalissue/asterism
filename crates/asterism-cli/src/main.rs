@@ -4404,11 +4404,11 @@ fn update_command(cmd: UpdateCommand) -> Result<()> {
             )
         })?;
 
-    let mut process = if updater
+    let is_powershell = updater
         .extension()
         .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("ps1"))
-    {
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("ps1"));
+    let mut process = if is_powershell {
         let mut shell = std::process::Command::new(if cfg!(windows) {
             "powershell.exe"
         } else {
@@ -4437,7 +4437,7 @@ fn update_command(cmd: UpdateCommand) -> Result<()> {
         UpdateCommand::Apply { yes } => {
             process.arg("apply");
             if yes {
-                process.arg("--yes");
+                process.arg(if is_powershell { "-Yes" } else { "--yes" });
             }
         }
         UpdateCommand::Channel { name } => {

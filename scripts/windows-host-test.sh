@@ -25,6 +25,31 @@ ok() {
 bash "${ROOT}/scripts/check-windows-host.sh" || fail "check-windows-host.sh"
 ok "static Windows host gate"
 
+# The host-integration gate must compose with the real native-backend file
+# names. It rejects forbidden control implementations by content, not merely
+# because those candidate files exist.
+NATIVE_FIXTURES="${WORK}/native-boundary"
+mkdir -p "$NATIVE_FIXTURES"
+cat >"${NATIVE_FIXTURES}/valid.rs" <<'EOF'
+fn launch_native_compute_core() { /* narrow native adapter */ }
+#[test]
+fn hcs_document_has_no_fallbacks() { assert!(!"hcs".contains("whpx")); }
+EOF
+bash "${ROOT}/scripts/check-windows-host.sh" --native-only "${NATIVE_FIXTURES}/valid.rs" >/dev/null \
+	|| fail "valid native backend candidate was rejected"
+for forbidden in whpx qemu powershell; do
+	case "$forbidden" in
+	whpx) line='fn launch() { let backend = "WHPX"; }' ;;
+	qemu) line='fn launch() { Command::new("qemu-system-x86_64"); }' ;;
+	powershell) line='fn launch() { Command::new("powershell.exe"); }' ;;
+	esac
+	printf '%s\n' "$line" >"${NATIVE_FIXTURES}/${forbidden}.rs"
+	if bash "${ROOT}/scripts/check-windows-host.sh" --native-only "${NATIVE_FIXTURES}/${forbidden}.rs" >/dev/null 2>&1; then
+		fail "native boundary accepted forbidden ${forbidden} control"
+	fi
+done
+ok "native backend files compose while WHPX, QEMU and ad-hoc PowerShell controls fail"
+
 # ---- shims -----------------------------------------------------------------
 
 SHIMS="${WORK}/shims"
@@ -66,8 +91,9 @@ make_windows_release() {
 		chmod +x "${stage}/${bin}"
 	done
 	cp "${ROOT}/packaging/update.ps1" "${stage}/asterism-update.ps1"
+	cp "${ROOT}/packaging/install.ps1" "${stage}/install.ps1"
 	tar -czf "${dir}/asterism-${version}-${target}.tar.gz" -C "$stage" \
-		ast.exe astd.exe astd-hyperv.exe asterism-update.ps1
+		ast.exe astd.exe astd-hyperv.exe asterism-update.ps1 install.ps1
 	(cd "$dir" && {
 		if command -v shasum >/dev/null 2>&1; then
 			shasum -a 256 "asterism-${version}-${target}.tar.gz"
@@ -129,11 +155,12 @@ run_install ok ASTERISM_PREFIX="$PREFIX" ASTERISM_VERSION=v0.1.0
 [ -x "${PREFIX}/bin/astd.exe" ] || fail "astd.exe was not installed"
 [ -x "${PREFIX}/bin/astd-hyperv.exe" ] || fail "astd-hyperv.exe was not installed"
 [ -f "${PREFIX}/libexec/asterism/asterism-update.ps1" ] || fail "update.ps1 was not installed"
+[ -f "${PREFIX}/libexec/asterism/install.ps1" ] || fail "install.ps1 was not packaged next to the updater"
 grep -q '^target=windows-x86_64$' "${PREFIX}/share/asterism/install-receipt.env" \
 	|| fail "receipt target is not windows-x86_64"
 grep -q 'astd-hyperv.exe' "${PREFIX}/share/asterism/install-receipt.env" \
 	|| fail "receipt does not list astd-hyperv.exe"
-ok "windows-x86_64 release installs ast.exe, astd.exe, astd-hyperv.exe and a receipt"
+ok "windows-x86_64 release installs binaries and a self-contained updater pair"
 
 run_install ok ASTERISM_PREFIX="$PREFIX" ASTERISM_VERSION=v0.1.0
 says "already installed"
@@ -162,6 +189,29 @@ run_install refused ASTERISM_PREFIX="$PREFIX" ASTERISM_VERSION=v0.1.1 ASTERISM_B
 says "astd-hyperv"
 [ ! -e "${PREFIX}/bin/ast.exe" ] || fail "a partial Windows tarball still installed ast.exe"
 ok "a Windows tarball without astd-hyperv.exe is refused"
+
+# A Windows artifact must package the matching installer beside its updater;
+# otherwise `ast update apply` would install successfully and fail only later.
+PREFIX="${WORK}/prefix-noinstaller"
+mkdir -p "${PREFIX}/bin" "${FAKE}/v0.1.2"
+stage="${WORK}/stage-noinstaller"
+mkdir -p "$stage"
+for bin in ast.exe astd.exe astd-hyperv.exe; do
+	printf '#!/bin/sh\necho %s\n' "$bin" >"${stage}/${bin}"
+	chmod +x "${stage}/${bin}"
+done
+cp "${ROOT}/packaging/update.ps1" "${stage}/asterism-update.ps1"
+tar -czf "${FAKE}/v0.1.2/asterism-v0.1.2-windows-x86_64.tar.gz" -C "$stage" \
+	ast.exe astd.exe astd-hyperv.exe asterism-update.ps1
+(cd "${FAKE}/v0.1.2" && {
+	if command -v shasum >/dev/null 2>&1; then shasum -a 256 asterism-v0.1.2-windows-x86_64.tar.gz
+	else sha256sum asterism-v0.1.2-windows-x86_64.tar.gz
+	fi
+} >SHA256SUMS)
+run_install refused ASTERISM_PREFIX="$PREFIX" ASTERISM_VERSION=v0.1.2 ASTERISM_BASE_URL="file://${FAKE}"
+says "install.ps1"
+[ ! -e "${PREFIX}/bin/ast.exe" ] || fail "artifact without install.ps1 mutated ast.exe"
+ok "a Windows updater without packaged install.ps1 is refused before mutation"
 
 # Arm64 target detection.
 set_host MINGW64_NT-10.0 arm64
