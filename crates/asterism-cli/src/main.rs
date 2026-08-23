@@ -5,7 +5,7 @@
 //! the daemon reports bounded phase progress after the store is durable.
 //!
 //! It talks to *that* daemon and no other, ever. `ast up dev` does not know or
-//! care which device in the orbit is supplying `dev`'s cpu and ram: the
+//! care which device in the orbit is supplying `dev`'s compute: the
 //! instance namespace is flat and orbit-wide, so the name is enough, and the
 //! daemon in front of you resolves it and forwards the request if the row
 //! lives elsewhere. The CLI holds no device key, opens no mesh connection, and
@@ -64,7 +64,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Define a new instance, sourcing its cpu and ram from this device.
+    /// Define a new instance, sourcing its compute from this device.
     ///
     /// The name is claimed across the whole orbit, so it means one instance
     /// everywhere.
@@ -84,10 +84,10 @@ enum Command {
         /// server, so the port it listens on is the way in. Repeatable.
         #[arg(short = 'p', long = "publish", value_name = "HOST:GUEST")]
         publish: Vec<String>,
-        /// How many cores the guest gets.
+        /// vCPU quota on this device's compute placement.
         #[arg(long, default_value_t = 2)]
         cpus: u32,
-        /// Memory, e.g. 2048M or 4G.
+        /// Physical RAM quota on the same compute device, e.g. 2048M or 4G.
         #[arg(long, default_value = "2G")]
         mem: String,
         /// Disk size, e.g. 20G.
@@ -112,9 +112,9 @@ enum Command {
     },
     /// Boot an instance.
     ///
-    /// Where its cpu and ram come from is the instance's business, not the
+    /// Where its compute comes from is the instance's business, not the
     /// command's: the name resolves across the orbit and the boot happens on
-    /// whichever device supplies them.
+    /// whichever device supplies it.
     Up {
         /// The instance to boot.
         name: String,
@@ -160,7 +160,7 @@ enum Command {
     /// device that did not answer is still listed, with its status
     /// `unknown` — the instance is real, its state is merely stale.
     Ls {
-        /// Only the instances this device supplies cpu for (debugging).
+        /// Only the instances this device supplies compute for (debugging).
         #[arg(long)]
         local: bool,
     },
@@ -300,7 +300,7 @@ enum Command {
     /// A DIRECTORY (`--volume /tank/media`) is shared with the guest and
     /// mounted at a path. Three things have to be true, and each of them is
     /// refused in words rather than discovered later: the directory is on
-    /// the same device as the instance's cpu and ram (directory sharing has
+    /// the same device as the instance's compute (directory sharing has
     /// no network transport), the backend offers a share transport (9p on
     /// qemu or virtiofs on vz), and the guest kernel supports that transport.
     /// Cloud images receive a mount unit in their seed; OCI images receive
@@ -387,15 +387,14 @@ enum Command {
     },
     /// Change one of an instance's parts.
     ///
-    /// Today there is one: `cpu`, which is the device supplying cpu and ram.
-    /// The orbit is a pool of parts and an instance is a computer assembled
-    /// from them, so this really is one line of a parts table — the
-    /// instance's name, its id and its snapshots do not move, because they
-    /// were never on a device.
+    /// Canonical today: `compute`, the orbit device supplying CPU, physical
+    /// RAM, and VM/container execution state as one placement unit. `cpu`
+    /// is a compatibility alias for the same part. The instance's name, its
+    /// id and its snapshots do not move, because they were never on a device.
     Set {
         /// The instance whose part is changing.
         name: String,
-        /// The part to change. `cpu` is the only one today.
+        /// The part to change. `compute` is canonical; `cpu` is an alias.
         #[arg(value_name = "PART")]
         part: String,
         /// The device to source it from.
@@ -404,19 +403,18 @@ enum Command {
         // clap would hand this positional's value to it.
         #[arg(value_name = "DEVICE")]
         to: String,
-        /// Shut the guest down first. Moving cpu/ram is offline on every
+        /// Shut the guest down first. Moving compute is offline on every
         /// backend Asterism has, so a running instance is refused without it.
         #[arg(long)]
         down: bool,
     },
-    /// Move an instance's cpu and ram to another device.
+    /// Move an instance's compute to another device.
     ///
-    /// The same thing as `ast set <instance> cpu <device>`, spelled the way
-    /// people ask for it.
+    /// Alias of `ast set <instance> compute <device>`.
     Move {
         /// The instance to move.
         name: String,
-        /// The device that will supply its cpu and ram from here on.
+        /// The device that will supply its compute from here on.
         #[arg(value_name = "DEVICE")]
         to: String,
         /// Shut the guest down first.
@@ -869,7 +867,7 @@ fn main() -> Result<()> {
         }
         Command::Move { name, to, down } => {
             local_only("move", device.as_deref())?;
-            return set_part(&name, "cpu", &to, down);
+            return set_part(&name, "compute", &to, down);
         }
         // A volume is a device's part of the pool, so these are about the
         // daemon in front of you unless `--device` aims them elsewhere.
@@ -2089,20 +2087,21 @@ fn device_shell_policy(action: Option<DeviceShellCommand>) -> Result<()> {
 
 // ---- parts -----------------------------------------------------------------
 
-/// `ast set <instance> cpu <device>`, and its alias `ast move`.
+/// `ast set <instance> compute <device>`, and its aliases `cpu` and `ast move`.
 ///
 /// The daemon does all of it — resolving the instance across the orbit,
 /// probing the target, fencing the source, moving the bytes and committing —
 /// and reports each step as it happens, because the middle one is a disk
 /// crossing a network and takes as long as it takes. All this end does is
-/// print.
+/// print. The wire command remains `set_cpu` so older daemons still parse it.
 fn set_part(name: &str, part: &str, device: &str, down: bool) -> Result<()> {
-    // One part today, and saying which one is better than a flag: the user
-    // has to be able to see, from the command, what is being changed.
-    if !matches!(part, "cpu" | "cpu/ram" | "ram") {
+    // One placement unit today, and saying which one is better than a flag:
+    // the user has to be able to see, from the command, what is being changed.
+    if !asterism_core::instance::is_compute_part(part) {
         bail!(
-            "there is no {part:?} part to set. Today `ast set <instance> cpu <device>` \
-             moves cpu and ram, which come as a pair; volumes are changed with \
+            "there is no {part:?} part to set. `ast set <instance> compute <device>` \
+             moves compute (CPU, physical RAM, and execution state) as one placement \
+             unit; `cpu` and `ast move` remain aliases. Volumes are changed with \
              `ast attach` and `ast detach`"
         );
     }
@@ -3063,11 +3062,11 @@ fn check_profiles(name: &str) -> Result<()> {
 
 /// Print the guest's serial console, wherever the guest is.
 ///
-/// When this device is the one supplying the instance's cpu, the console is a
-/// file in the instance directory and is read straight off disk — which is
-/// also the only way `--follow` can work, since following is a file operation
-/// and there is no file here otherwise. When the cpu is elsewhere, the daemon
-/// reads it there and sends the tail back.
+/// When this device is the one supplying the instance's compute, the console
+/// is a file in the instance directory and is read straight off disk — which
+/// is also the only way `--follow` can work, since following is a file
+/// operation and there is no file here otherwise. When compute is elsewhere,
+/// the daemon reads it there and sends the tail back.
 fn logs(name: &str, follow: bool, lines: u32) -> Result<()> {
     if !on_this_device(name)? {
         if follow {
@@ -3873,10 +3872,11 @@ fn uname_line() -> String {
 
 /// `ast ls`: one table, one namespace.
 ///
-/// The CPU column says which device is supplying each instance's cpu and ram.
-/// It is a column and not a grouping on purpose — the rows are one flat list
-/// because the namespace is one flat namespace, and where the cpu comes from
-/// is a property of the instance, like its shape or its age.
+/// The COMPUTE column says which device is supplying each instance's compute
+/// placement. It is a column and not a grouping on purpose — the rows are
+/// one flat list because the namespace is one flat namespace, and where
+/// compute comes from is a property of the instance, like its shape or its
+/// age.
 fn print_table(rows: &[OrbitRow]) {
     if rows.is_empty() {
         println!("no instances — start with: ast create <name>");
@@ -3884,7 +3884,7 @@ fn print_table(rows: &[OrbitRow]) {
     }
     println!(
         "{:<14} {:<9} {:<14} {:<16} {:<12} {:<6} SSH",
-        "NAME", "STATUS", "IMAGE", "SHAPE", "CPU", "AGE"
+        "NAME", "STATUS", "IMAGE", "SHAPE", "COMPUTE", "AGE"
     );
     let mut stale = false;
     let mut conflicts = Vec::new();
@@ -3920,13 +3920,13 @@ fn print_table(rows: &[OrbitRow]) {
             status,
             short_image(inst.image.as_deref().unwrap_or("-")),
             shape,
-            inst.cpu_device,
+            inst.compute_device(),
             age(inst.created_at),
             ssh,
         );
     }
     if stale {
-        println!("\nunknown: the device supplying that instance's cpu is out of touch");
+        println!("\nunknown: the device supplying that instance's compute is out of touch");
     }
     for name in conflicts {
         println!("\nconflict: {name} shares its name — rename it: ast rename {name} <new-name>");
@@ -3974,21 +3974,22 @@ fn print_detail(inst: &Instance, guest_health: Option<&GuestHealth>) {
     if let Some(conflict) = &inst.conflict {
         println!(
             "conflict: another instance in this orbit is also called {:?} \
-             (cpu/ram on {}) — rename this one: ast rename {} <new-name>",
+             (compute on {}) — rename this one: ast rename {} <new-name>",
             inst.name, conflict.other_cpu_device, inst.name
         );
     }
     // Only worth a line once it has happened: an instance that has never had
-    // its cpu part swapped is the ordinary case and does not need telling.
+    // its compute placement swapped is the ordinary case and does not need
+    // telling.
     if inst.move_epoch > 0 {
         println!(
-            "moves:   {} (cpu/ram has been re-sourced that many times)",
+            "moves:   {} (compute has been re-sourced that many times)",
             inst.move_epoch
         );
     }
     // Worth a line only when it is not the obvious answer: a guest trusts
     // the key in its seed, and after a move that is not the device running it.
-    if inst.seeded_by() != inst.cpu_device {
+    if inst.seeded_by() != inst.compute_device() {
         println!(
             "seed:    built on {} — its guest key is the one this guest trusts",
             inst.seeded_by()
@@ -4007,7 +4008,7 @@ fn print_detail(inst: &Instance, guest_health: Option<&GuestHealth>) {
     }
 
     // Every row names the device the part comes from. Most of them name the
-    // same device, and say why: the disk follows the cpu because that is the
+    // same device, and say why: the disk follows compute because that is the
     // cheapest place for it, not because that device owns the instance.
     println!("\nparts:");
     let parts = inst.parts();
@@ -4091,10 +4092,10 @@ fn kib(value: u64) -> String {
 /// are facts about the file: a disk cloned from a raw base occupies almost
 /// nothing until the guest writes to it, and a `disk.qcow2` says this
 /// instance predates raw disks and still takes the old snapshot path
-/// (BACKENDS.md §4). Only when this device supplies the cpu/ram; another
+/// (BACKENDS.md §4). Only when this device supplies compute; another
 /// device's disks are not ours to stat.
 fn local_disk(inst: &Instance) -> Option<String> {
-    if inst.cpu_device != asterism_core::instance::local_host() {
+    if inst.compute_device() != asterism_core::instance::local_host() {
         return None;
     }
     let dir = paths::instance_dir(&inst.name);
@@ -5018,6 +5019,70 @@ mod tests {
                 "guest:   192.168.64.7 · up 2m · ssh listening · cloud-init done",
                 "health:  load 0.42 · memory 1536 MiB available",
             ]
+        );
+    }
+
+    fn parse_cli(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("ast").chain(args.iter().copied())).unwrap()
+    }
+
+    #[test]
+    fn set_compute_is_the_canonical_placement_command() {
+        match parse_cli(&["set", "agent", "compute", "desktop"]).command {
+            Command::Set {
+                name,
+                part,
+                to,
+                down,
+            } => {
+                assert_eq!(name, "agent");
+                assert_eq!(part, "compute");
+                assert_eq!(to, "desktop");
+                assert!(!down);
+                assert!(asterism_core::instance::is_compute_part(&part));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_cpu_and_move_remain_aliases_of_compute() {
+        match parse_cli(&["set", "agent", "cpu", "desktop", "--down"]).command {
+            Command::Set {
+                name,
+                part,
+                to,
+                down,
+            } => {
+                assert_eq!(name, "agent");
+                assert_eq!(part, "cpu");
+                assert_eq!(to, "desktop");
+                assert!(down);
+                assert!(asterism_core::instance::is_compute_part(&part));
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse_cli(&["move", "agent", "desktop", "--down"]).command {
+            Command::Move { name, to, down } => {
+                assert_eq!(name, "agent");
+                assert_eq!(to, "desktop");
+                assert!(down);
+            }
+            other => panic!("{other:?}"),
+        }
+        let help = {
+            use clap::CommandFactory;
+            Cli::command()
+                .find_subcommand("set")
+                .expect("set")
+                .clone()
+                .render_long_help()
+                .to_string()
+        };
+        assert!(help.contains("compute"), "{help}");
+        assert!(
+            help.contains("cpu"),
+            "the alias still has to be documented: {help}"
         );
     }
 }

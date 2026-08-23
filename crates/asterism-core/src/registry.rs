@@ -3,12 +3,12 @@
 //!
 //! The orbit is a pool of parts; an instance is a computer assembled from
 //! them. There is exactly **one** instance registry per orbit, and it is flat:
-//! `dev` names one instance, wherever in the pool its cpu and ram are being
+//! `dev` names one instance, wherever in the pool its compute is being
 //! sourced from today. "The laptop's dev" is not a thing that can be said.
 //!
 //! That one registry is never stored in one piece, because storing it in one
 //! piece would need a device that is always up to store it on. Instead each
-//! device persists a [`Shard`] — the rows for the instances whose cpu/ram it
+//! device persists a [`Shard`] — the rows for the instances whose compute it
 //! supplies — at `$ASTERISM_HOME/state.json`, and the whole registry is
 //! assembled at read time by asking every reachable device in the orbit for
 //! its shard. `astd`'s mesh module does the assembling; this module is one
@@ -20,7 +20,7 @@
 //!   only refuse a name it already holds; refusing a name held elsewhere needs
 //!   the other shards, so `ast create` asks them before it gets here.
 //! * **A device is not privileged.** It supplies parts. Which device supplies
-//!   an instance's cpu and ram is a mutable attribute of the instance, not a
+//!   an instance's compute is a mutable attribute of the instance, not a
 //!   relationship the device has to it.
 //!
 //! Writes go through [`crate::durable`], so a crash mid-save never leaves a
@@ -121,7 +121,7 @@ impl AnyShard {
 /// One row of the assembled orbit registry, as `ast ls` prints it.
 ///
 /// Separate from [`Instance`] because it carries something the record itself
-/// cannot know: whether the device supplying this instance's cpu/ram answered
+/// cannot know: whether the device supplying this instance's compute answered
 /// while the view was being assembled. A row that came out of the last-seen
 /// cache instead of a live shard says so, and prints its status as `unknown` —
 /// the instance is real, its state is merely stale.
@@ -264,7 +264,7 @@ impl Shard {
         }
     }
 
-    /// Define an instance in this shard, sourcing its cpu and ram from
+    /// Define an instance in this shard, sourcing its compute from
     /// `cpu_device`. `machine` records the runnable backend that was probed
     /// before this row was created.
     ///
@@ -665,8 +665,9 @@ impl Shard {
 /// the instance, not a claim by the device.
 pub fn taken(existing: &Instance) -> String {
     format!(
-        "instance {:?} already exists in this orbit (cpu/ram on {})",
-        existing.name, existing.cpu_device
+        "instance {:?} already exists in this orbit (compute on {})",
+        existing.name,
+        existing.compute_device()
     )
 }
 
@@ -674,7 +675,7 @@ pub fn taken(existing: &Instance) -> String {
 pub fn conflicted(inst: &Instance, conflict: &Conflict) -> String {
     format!(
         "instance {:?} shares its name with another instance in this orbit \
-         (cpu/ram on {}) — rename this one first: ast rename {} <new-name>",
+         (compute on {}) — rename this one first: ast rename {} <new-name>",
         inst.name, conflict.other_cpu_device, inst.name
     )
 }
@@ -899,11 +900,11 @@ mod tests {
         assert!(err.contains("as a directory"), "{err}");
     }
 
-    /// A cpu-part swap changes one line of an instance's parts table. The
-    /// rest of it — the id, the creation time, the snapshots — is the
-    /// instance's own and does not move, because it was never on a device.
+    /// A compute-placement swap changes one line of an instance's parts
+    /// table. The rest of it — the id, the creation time, the snapshots — is
+    /// the instance's own and does not move, because it was never on a device.
     #[test]
-    fn adopting_a_moved_instance_keeps_everything_but_the_cpu_device() {
+    fn adopting_a_moved_instance_keeps_everything_but_compute() {
         let mut source = Shard::load(&scratch()).unwrap();
         let mut inst = source
             .create("dev", "laptop", "debian:13", Shape::default(), machine())
@@ -936,12 +937,12 @@ mod tests {
             "one instance, one id"
         );
         assert_eq!(adopted.created_at, source.get("dev").unwrap().created_at);
-        assert_eq!(adopted.cpu_device, "desktop", "only the part moved");
+        assert_eq!(adopted.compute_device(), "desktop", "only the part moved");
         assert_eq!(adopted.move_epoch, 1);
         assert_eq!(
             adopted.seeded_by(),
             "laptop",
-            "the seed did not move with the cpu"
+            "the seed did not move with compute"
         );
 
         // A shard that already holds the name refuses, in the orbit's words.
@@ -965,7 +966,7 @@ mod tests {
             .to_string();
         assert_eq!(
             err,
-            "instance \"dev\" already exists in this orbit (cpu/ram on laptop)"
+            "instance \"dev\" already exists in this orbit (compute on laptop)"
         );
         assert!(shard
             .create("has space", "laptop", "u", Shape::default(), machine())
@@ -1065,7 +1066,7 @@ mod tests {
             text.contains("shares its name with another instance in this orbit"),
             "{text}"
         );
-        assert!(text.contains("cpu/ram on desktop"), "{text}");
+        assert!(text.contains("compute on desktop"), "{text}");
         assert!(text.contains("ast rename dev <new-name>"), "{text}");
     }
 
@@ -1091,8 +1092,8 @@ mod tests {
         let inst = shard.get("dev").unwrap();
         assert_eq!(inst.status, Status::Running);
         // The device that was called this instance's anchor is the device
-        // supplying its cpu and ram; only the framing changed.
-        assert_eq!(inst.cpu_device, "laptop");
+        // supplying its compute; only the framing changed.
+        assert_eq!(inst.compute_device(), "laptop");
         let h = inst
             .handle
             .as_ref()
@@ -1393,6 +1394,39 @@ mod tests {
             legacy,
             "the pre-migration shape is on the disk exactly as it was"
         );
+    }
+
+    /// A shard written with the current user vocabulary still loads, and a
+    /// save still writes `cpu_device` so older readers keep working.
+    #[test]
+    fn a_shard_that_says_compute_device_still_loads_and_writes_cpu_device() {
+        let path = scratch();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"dev":{
+                "id":"6f1c","name":"dev","compute_device":"laptop","status":"defined",
+                "created_at":1700000000,"volumes":[],"image":"debian:13",
+                "machine":{"backend":"qemu","machine_type":"virt","cpu":"host","hv_version":"test"}
+            }}"#,
+        )
+        .unwrap();
+
+        let shard = Shard::load(&path).unwrap();
+        let inst = shard.get("dev").unwrap();
+        assert_eq!(inst.compute_device(), "laptop");
+        assert_eq!(inst.cpu_device, "laptop");
+
+        shard.save().unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let saved = &raw["instances"]["dev"];
+        assert_eq!(saved["cpu_device"], "laptop");
+        assert!(
+            saved.get("compute_device").is_none(),
+            "old readers must still see cpu_device: {saved}"
+        );
+        assert!(saved.get("anchor").is_none(), "{saved}");
     }
 
     #[test]

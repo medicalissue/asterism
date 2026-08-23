@@ -228,6 +228,23 @@ mod tests {
             serde_json::from_str(r#"{"cmd":"set_cpu","name":"dev","device":"desktop"}"#).unwrap();
         assert!(matches!(bare, Request::SetCpu { down: false, .. }));
 
+        // Canonical user vocabulary is compute; the wire name stays set_cpu
+        // so older daemons still accept what this build writes.
+        let aliased: Request = serde_json::from_str(
+            r#"{"cmd":"set_compute","name":"dev","device":"desktop","down":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            aliased,
+            Request::SetCpu {
+                down: true,
+                ref name,
+                ref device,
+            } if name == "dev" && device == "desktop"
+        ));
+        let written = serde_json::to_value(&bare).unwrap();
+        assert_eq!(written["cmd"], "set_cpu", "{written}");
+
         // A fenced instance answers what reads and nothing that writes.
         assert!(Request::Status { name: "dev".into() }.survives_a_move());
         assert!(Request::Logs {

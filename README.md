@@ -28,7 +28,7 @@ Asterism assembles compute, storage, GPUs, routes, and secrets from wherever
 they live, then keeps your agent running 24/7. The `ast` CLI drives a local
 `astd` daemon and boots isolated instances from cloud or OCI images.
 
-A set of devices becomes an **orbit**: one computer whose CPU, memory, storage,
+A set of devices becomes an **orbit**: one computer whose compute, storage,
 secrets, and network reach can come from different places. Asterism runs
 persistent agents in real VMs, keeps each guest isolated behind its own kernel
 and disk, and lets you operate every instance by name from any device in the
@@ -125,7 +125,7 @@ $ ast ls
 Instance names form one orbit-wide namespace. `ast create` and `ast rename`
 claim a name across the orbit, and ordinary commands such as `ast up agent`,
 `ast ssh agent`, and `ast status agent` locate it and forward the request to
-the device supplying its CPU. `ast ls` combines every device's registry shard
+the device supplying its compute. `ast ls` combines every device's registry shard
 into one view and marks the state from an unreachable device as `unknown`.
 The global `--device` option is for device-local administration and debugging,
 not for reaching an instance.
@@ -134,22 +134,31 @@ not for reaching an instance.
 
 A device contributes parts. An orbit is the trusted pool of those devices. An
 instance keeps the durable identity assembled from those parts, without a
-special source device. CPU, root disk, and remote block volumes work today;
-GPU and custom egress remain planned.
+special source device. Compute, root disk, and remote block volumes work
+today; GPU and custom egress remain planned.
+
+Compute is one placement unit: CPU, physical RAM, and VM/container execution
+state from one orbit device. GPU, storage, network, and exit points can
+attach independently. Asterism does not promise cache-coherent CPU and RAM
+from two devices as one shared machine. Shape `--cpus` and `--mem` are
+quotas on the selected compute device.
 
 `ast status` shows where an instance's parts come from. Software inside the
 guest sees ordinary local resources even when Asterism carries their
-operations across the mesh.
+operations across the mesh. See [docs/compute-placement.md](docs/compute-placement.md)
+for the architecture contract.
 
-- **CPU and memory** come from one device. Move them offline without changing
-  the instance's name or identity; its root disk and snapshots transfer
+- **Compute** comes from one device. Move it offline without changing the
+  instance's name or identity; its root disk and snapshots transfer
   peer-to-peer as part of the move.
 
   ```console
-  $ ast move agent desktop --down
+  $ ast set agent compute desktop --down
   ```
 
-- **Directory shares** expose a directory from the CPU device through 9p on
+  `ast set agent cpu desktop` and `ast move agent desktop` remain aliases.
+
+- **Directory shares** expose a directory from the compute device through 9p on
   QEMU or virtiofs on VZ.
 
   ```console
@@ -177,7 +186,7 @@ operations across the mesh.
   ```
 
 Remote block volumes currently require the QEMU backend. Directory shares
-must be on the same device as the instance's CPU and memory.
+must be on the same device as the instance's compute.
 
 ## Reach guests and devices
 

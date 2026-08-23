@@ -101,7 +101,7 @@ pub enum Request {
         #[serde(default)]
         backend: Option<String>,
         /// Guest ports to publish on the loopback of the device supplying
-        /// cpu/ram (`ast create -p 8080:80`). Empty from a CLI that predates
+        /// compute (`ast create -p 8080:80`). Empty from a CLI that predates
         /// them, which is every `ast create` of a cloud image.
         #[serde(default)]
         publish: Vec<PortForward>,
@@ -133,7 +133,7 @@ pub enum Request {
     Remove {
         name: String,
     },
-    /// One device's shard of the orbit registry — the instances whose cpu/ram
+    /// One device's shard of the orbit registry — the instances whose compute
     /// it supplies. What one daemon asks another for while assembling
     /// [`Request::ListOrbit`], and what `ast ls --local` prints.
     List,
@@ -155,6 +155,7 @@ pub enum Request {
     /// rule that decides which of the two is told.
     MarkConflicted {
         name: String,
+        #[serde(alias = "other_compute_device")]
         other_cpu_device: String,
     },
     AttachVolume {
@@ -270,9 +271,9 @@ pub enum Request {
     },
     /// Where to point `ssh` at to reach this instance's guest.
     ///
-    /// Answered with a loopback address every time. When the guest's cpu/ram
-    /// are on this device that is the hypervisor's own forwarded port; when
-    /// they are elsewhere the daemon binds an ephemeral listener and splices
+    /// Answered with a loopback address every time. When the guest's compute
+    /// is on this device that is the hypervisor's own forwarded port; when
+    /// it is elsewhere the daemon binds an ephemeral listener and splices
     /// it to the far daemon over the mesh, so `ast ssh dev` is one command
     /// from anywhere and never mentions a device.
     SshEndpoint {
@@ -527,20 +528,24 @@ pub enum Request {
         value: SecretValue,
     },
 
-    // ---- swapping the cpu part ----------------------------------------------
+    // ---- swapping compute placement -----------------------------------------
     //
-    // `ast set <instance> cpu <device>` — an offline migration, and in the
-    // model's own words a change to one line of an instance's parts table.
-    // The daemon in front of the user drives it; the frames below are the
-    // steps it drives, each aimed at one named device and therefore each
-    // reporting no subject (see [`Request::subject`]).
-    /// Swap the device supplying an instance's cpu and ram.
+    // `ast set <instance> compute <device>` — an offline migration, and in
+    // the model's own words a change to one line of an instance's parts
+    // table. `set cpu` and `ast move` are aliases of the same command. The
+    // daemon in front of the user drives it; the frames below are the steps
+    // it drives, each aimed at one named device and therefore each reporting
+    // no subject (see [`Request::subject`]).
+    /// Swap the device supplying an instance's compute placement.
     ///
     /// Answered with a stream of [`Response::Move`] lines, because it is a
     /// job and not a question: bytes crossing a network are worth watching.
+    /// The wire name stays `set_cpu` so older daemons still parse it;
+    /// `set_compute` is accepted as an alias.
+    #[serde(rename = "set_cpu", alias = "set_compute")]
     SetCpu {
         name: String,
-        /// The device that will supply cpu and ram from here on.
+        /// The device that will supply compute from here on.
         device: String,
         /// Shut the guest down first, rather than refusing to move a
         /// running instance. Offline migration is the only kind that works
@@ -576,7 +581,7 @@ pub enum Request {
     },
     /// The bytes are all here and verified: adopt them. The staging
     /// directory becomes the instance directory and the row is written with
-    /// this device supplying cpu, at `epoch`.
+    /// this device supplying compute, at `epoch`.
     MoveCommitTarget {
         manifest: Box<MoveManifest>,
         epoch: u64,
@@ -706,11 +711,12 @@ impl Request {
             | Request::SecretSourceRotate { .. }
             | Request::SecretSourceEgress { .. } => None,
 
-            // Every step of a cpu-part swap names one device on purpose and
-            // is aimed at it. Half of them go to a device that does *not*
-            // hold the row — that is what a move is — so resolving them by
-            // instance name would send them back to the wrong end of the
-            // transfer, and `set cpu` itself names the destination.
+            // Every step of a compute-placement swap names one device on
+            // purpose and is aimed at it. Half of them go to a device that
+            // does *not* hold the row — that is what a move is — so
+            // resolving them by instance name would send them back to the
+            // wrong end of the transfer, and `set compute` itself names the
+            // destination.
             Request::SetCpu { .. }
             | Request::MoveOffer { .. }
             | Request::MoveProbe { .. }
@@ -1814,5 +1820,32 @@ mod tests {
             "bad request: unknown variant `snapshot_restore`, expected one of `ping`, `create`"
         ));
         assert!(!is_unknown_variant_error("no instance named \"dev\""));
+    }
+
+    /// Compute is the user vocabulary; the conflict frame still writes
+    /// `other_cpu_device` so older peers parse it.
+    #[test]
+    fn mark_conflicted_accepts_compute_alias_and_writes_cpu_device() {
+        let aliased: Request = serde_json::from_str(
+            r#"{"cmd":"mark_conflicted","name":"dev","other_compute_device":"desktop"}"#,
+        )
+        .unwrap();
+        match aliased {
+            Request::MarkConflicted {
+                name,
+                other_cpu_device,
+            } => {
+                assert_eq!(name, "dev");
+                assert_eq!(other_cpu_device, "desktop");
+            }
+            other => panic!("{other:?}"),
+        }
+        let written = serde_json::to_value(&Request::MarkConflicted {
+            name: "dev".into(),
+            other_cpu_device: "desktop".into(),
+        })
+        .unwrap();
+        assert_eq!(written["other_cpu_device"], "desktop");
+        assert!(written.get("other_compute_device").is_none());
     }
 }
