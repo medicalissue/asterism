@@ -1707,7 +1707,7 @@ mod tests {
                 Shard::load(&dir.join("state.json")).unwrap(),
             )),
             orbit: Arc::new(tokio::sync::Mutex::new(
-                crate::orbit::Orbit::load(&dir.join("orbit.json")).unwrap(),
+                asterism_core::orbit::Orbit::load(&dir.join("orbit.json")).unwrap(),
             )),
             shell: crate::device_shell::Manager::load_at(dir),
         }
