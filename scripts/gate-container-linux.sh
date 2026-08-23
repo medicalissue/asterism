@@ -185,8 +185,8 @@ trap 'unexpected_error "$LINENO" "$BASH_COMMAND"' ERR
 trap cleanup EXIT INT TERM
 
 STAGE=preflight
-for command in dbus-daemon find git gnome-keyring-daemon grep jq pgrep readlink \
-  sha256sum slirp4netns stat systemctl unshare; do
+for command in dbus-daemon find git gnome-keyring-daemon grep jq newgidmap \
+  newuidmap pgrep readlink sha256sum slirp4netns stat systemctl unshare; do
   command -v "$command" >/dev/null || fatal "missing prerequisite: $command"
 done
 [ "$(uname -s)" = Linux ] || fatal "observer host is not Linux"
