@@ -25,8 +25,8 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use asterism_core::hv::{
-    ContainerControlEndpoint, ContainerRuntimeIdentity, ControlChannel, Handle, ImageKind,
-    KernelObjectIdentity, Machine, RunState,
+    ContainerControlEndpoint, ContainerNetworkEndpoint, ContainerRuntimeIdentity, ControlChannel,
+    Handle, ImageKind, KernelObjectIdentity, Machine, RunState,
 };
 use asterism_core::instance::{Instance, RuntimeKind};
 use asterism_core::proc::{Ownership, ProcId, Signal};
@@ -628,10 +628,13 @@ pub fn start(prepared: &Prepared) -> Result<Handle> {
             return Err(failed_start(error, &spec, &wrapper, Some(&proc)));
         }
     };
-    if let Err(error) = start_slirp(host_pid, &spec.network, deadline) {
-        let error = error.context("configuring rootless container networking");
-        return Err(failed_start(error, &spec, &wrapper, Some(&proc)));
-    }
+    let network_process = match start_slirp(host_pid, &spec.network, deadline) {
+        Ok(process) => process,
+        Err(error) => {
+            let error = error.context("configuring rootless container networking");
+            return Err(failed_start(error, &spec, &wrapper, Some(&proc)));
+        }
+    };
     Ok(Handle {
         backend: LINUX_ID.into(),
         pid: Some(host_pid),
@@ -648,6 +651,10 @@ pub fn start(prepared: &Prepared) -> Result<Handle> {
             network_namespace,
             cgroup: spec.cgroup,
             identity: Some(identity),
+            network: Some(ContainerNetworkEndpoint {
+                api: spec.network.api,
+                process: network_process,
+            }),
         }),
         started_at: asterism_core::instance::now_unix(),
     })
@@ -715,7 +722,7 @@ fn abort_start(spec: &Spec, wrapper: &ProcId, holder: Option<&ProcId>) -> Result
 /// install every published loopback forward. No shell command or host firewall
 /// rule can create a listener here; a successful API response is required.
 #[cfg(target_os = "linux")]
-fn start_slirp(host_pid: u32, network: &Network, deadline: Instant) -> Result<()> {
+fn start_slirp(host_pid: u32, network: &Network, deadline: Instant) -> Result<ProcId> {
     let _ = fs::remove_file(&network.api);
     let slirp = tools::tool("slirp4netns")?;
     let mut child = Command::new(slirp)
@@ -728,6 +735,14 @@ fn start_slirp(host_pid: u32, network: &Network, deadline: Instant) -> Result<()
         .stderr(Stdio::null())
         .spawn()
         .context("starting slirp4netns for the rootless container")?;
+    let process = match ProcId::capture(child.id()) {
+        Ok(process) => process,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error).context("capturing the slirp4netns process identity");
+        }
+    };
     while !network.api.exists() {
         if let Some(status) = child.try_wait()? {
             bail!("slirp4netns exited before its control API was ready ({status})");
@@ -766,11 +781,11 @@ fn start_slirp(host_pid: u32, network: &Network, deadline: Instant) -> Result<()
     std::thread::spawn(move || {
         let _ = child.wait();
     });
-    Ok(())
+    Ok(process)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn start_slirp(_host_pid: u32, _network: &Network, _deadline: Instant) -> Result<()> {
+fn start_slirp(_host_pid: u32, _network: &Network, _deadline: Instant) -> Result<ProcId> {
     bail!("slirp4netns is only available to the Linux rootless adapter")
 }
 
@@ -1007,6 +1022,7 @@ pub fn stop(handle: &Handle, deadline: Duration) -> Result<()> {
         .as_ref()
         .context("container handle has no control endpoint")?;
     let _ = call(handle, &ControlRequest::Stop, Some(CONTROL_DEADLINE))?;
+    stop_network(control)?;
     let until = Instant::now() + deadline;
     while Instant::now() < until {
         if !cgroup_populated(&control.cgroup)? {
@@ -1027,6 +1043,32 @@ pub fn stop(handle: &Handle, deadline: Duration) -> Result<()> {
         }
     }
     bail!("container did not stop before its lifecycle deadline")
+}
+
+fn stop_network(control: &ContainerControlEndpoint) -> Result<()> {
+    let Some(network) = &control.network else {
+        return Ok(());
+    };
+    let _ = network.process.signal(Signal::Term)?;
+    let graceful = Instant::now() + Duration::from_millis(500);
+    while network.process.alive() && Instant::now() < graceful {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    if network.process.alive() {
+        let _ = network.process.signal(Signal::Kill)?;
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while network.process.alive() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    if network.process.alive() {
+        bail!(
+            "slirp4netns pid {} did not stop before its lifecycle deadline",
+            network.process.pid
+        );
+    }
+    let _ = fs::remove_file(&network.api);
+    Ok(())
 }
 
 pub fn exec(
@@ -1285,6 +1327,7 @@ pub fn helper_main(spec_path: &Path) -> Result<()> {
     for device in ["null", "zero", "random", "urandom"] {
         bind_device(&spec.rootfs, device)?;
     }
+    install_fd_links(&spec.rootfs)?;
     safe_mount_target(&spec.rootfs, Path::new("/proc"))?;
     let console = fs::OpenOptions::new()
         .create(true)
@@ -1362,6 +1405,31 @@ pub fn helper_main(spec_path: &Path) -> Result<()> {
         }
     }
     let _ = fs::remove_file(&spec.control);
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", all(test, target_family = "unix")))]
+fn install_fd_links(rootfs: &Path) -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let dev = safe_mount_target(rootfs, Path::new("/dev"))?;
+    for (name, target) in [
+        ("fd", "/proc/self/fd"),
+        ("stdin", "/proc/self/fd/0"),
+        ("stdout", "/proc/self/fd/1"),
+        ("stderr", "/proc/self/fd/2"),
+    ] {
+        let path = dev.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => {
+                bail!("container device link target {} is a directory", path.display())
+            }
+            Ok(_) => fs::remove_file(&path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        symlink(target, &path)?;
+    }
     Ok(())
 }
 
@@ -1755,7 +1823,7 @@ mod tests {
         assert!(delegation_root("/").is_err());
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(target_family = "unix")]
     fn control_fixture(dir: &Path, pid: u32) -> ContainerControlEndpoint {
         let cgroup = dir.join("cgroup");
         fs::create_dir(&cgroup).unwrap();
@@ -1786,6 +1854,7 @@ mod tests {
             network_namespace,
             cgroup,
             identity: Some(identity),
+            network: None,
         }
     }
 
@@ -1814,6 +1883,7 @@ mod tests {
             network_namespace: "/proc/42/ns/net".into(),
             cgroup: "/sys/fs/cgroup/user.slice/asterism-dev".into(),
             identity: None,
+            network: None,
         };
         let wire = serde_json::to_string(&endpoint).unwrap();
         assert!(wire.contains("container-control.sock"));
@@ -1831,6 +1901,7 @@ mod tests {
             network_namespace: "/proc/42/ns/net".into(),
             cgroup: "/sys/fs/cgroup/user.slice/asterism-dev".into(),
             identity: None,
+            network: None,
         };
         let handle = Handle {
             backend: LINUX_ID.into(),
@@ -1845,6 +1916,45 @@ mod tests {
         };
         assert!(handle.endpoint.is_none());
         assert_eq!(handle.ctl.path(), handle.container_control.unwrap().socket);
+    }
+
+    #[test]
+    #[cfg(target_family = "unix")]
+    fn standard_fd_links_make_container_stdout_reachable() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("dev")).unwrap();
+        install_fd_links(root.path()).unwrap();
+        assert_eq!(
+            fs::read_link(root.path().join("dev/fd")).unwrap(),
+            Path::new("/proc/self/fd")
+        );
+        assert_eq!(
+            fs::read_link(root.path().join("dev/stdout")).unwrap(),
+            Path::new("/proc/self/fd/1")
+        );
+        assert_eq!(
+            fs::read_link(root.path().join("dev/stderr")).unwrap(),
+            Path::new("/proc/self/fd/2")
+        );
+    }
+
+    #[test]
+    #[cfg(target_family = "unix")]
+    fn stopping_a_container_retires_its_exact_network_process_and_api() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let process = ProcId::capture(child.id()).unwrap();
+        let api = dir.path().join("slirp.sock");
+        fs::write(&api, "owned").unwrap();
+        let mut control = control_fixture(dir.path(), std::process::id());
+        control.network = Some(ContainerNetworkEndpoint {
+            api: api.clone(),
+            process: process.clone(),
+        });
+        stop_network(&control).unwrap();
+        let _ = child.wait();
+        assert!(!process.alive());
+        assert!(!api.exists());
     }
 
     #[test]

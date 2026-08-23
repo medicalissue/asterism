@@ -266,6 +266,19 @@ pub struct ContainerControlEndpoint {
     /// closed in the native-container adapter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<ContainerRuntimeIdentity>,
+    /// The rootless network process and private API socket owned by this
+    /// container. It is separate from the namespace holder's cgroup, so the
+    /// exact process identity must travel with the durable handle for `down`
+    /// and daemon-restart cleanup to retire its host forwards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<ContainerNetworkEndpoint>,
+}
+
+/// Durable authority for one container's rootless network process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerNetworkEndpoint {
+    pub api: PathBuf,
+    pub process: ProcId,
 }
 
 /// A kernel object's stable identity for the lifetime of that object.

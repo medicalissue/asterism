@@ -114,8 +114,9 @@ if [ "$gate_rc" -eq 0 ]; then
     block "exact CUSE test observer did not build" || gate_rc=1
   else
     CUSE_TEST_BINARY="$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "asterism_core" and .profile.test == true) | .executable // empty' "$EVIDENCE/observer-test-build.jsonl" | tail -n 1)"
-    [ -n "$CUSE_TEST_BINARY" ] && [ -x "$CUSE_TEST_BINARY" ] \
-      || { block "exact CUSE test observer binary was not resolved" || gate_rc=1; }
+    if [ -z "$CUSE_TEST_BINARY" ] || [ ! -x "$CUSE_TEST_BINARY" ]; then
+      block "exact CUSE test observer binary was not resolved" || gate_rc=1
+    fi
   fi
 fi
 if [ "$gate_rc" -eq 0 ]; then
@@ -131,8 +132,9 @@ if [ "$gate_rc" -eq 0 ]; then
     block "exact live CUSE observer did not build" || gate_rc=1
   else
     CUSE_LIVE_BINARY="$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "live_cuse_gate") | .executable // empty' "$EVIDENCE/observer-live-build.jsonl" | tail -n 1)"
-    [ -n "$CUSE_LIVE_BINARY" ] && [ -x "$CUSE_LIVE_BINARY" ] \
-      || { block "exact live CUSE observer binary was not resolved" || gate_rc=1; }
+    if [ -z "$CUSE_LIVE_BINARY" ] || [ ! -x "$CUSE_LIVE_BINARY" ]; then
+      block "exact live CUSE observer binary was not resolved" || gate_rc=1
+    fi
   fi
   if [ "$gate_rc" -eq 0 ]; then
     record "observer_compile_identity=ordinary_runner"

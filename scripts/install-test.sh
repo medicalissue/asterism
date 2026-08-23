@@ -773,10 +773,12 @@ build_guest_line="$(grep -nF '"${src}/scripts/build-guest-gpu-artifacts.sh" "$gu
 validate_guest_line="$(grep -nF 'validate_linux_guest_artifacts "$guest_artifacts"' <<<"$source_contract" | cut -d: -f1)"
 # shellcheck disable=SC2016
 prepare_chv_line="$(grep -nF 'prepare_chv_source "$src"' <<<"$source_contract" | cut -d: -f1)"
-[ -n "$build_guest_line" ] && [ -n "$validate_guest_line" ] && [ -n "$prepare_chv_line" ] \
-	|| fail "the Linux source guest artifact contract is incomplete"
-[ "$build_guest_line" -lt "$validate_guest_line" ] && [ "$validate_guest_line" -lt "$prepare_chv_line" ] \
-	|| fail "Linux source artifacts are not validated before privileged preparation"
+if [ -z "$build_guest_line" ] || [ -z "$validate_guest_line" ] || [ -z "$prepare_chv_line" ]; then
+	fail "the Linux source guest artifact contract is incomplete"
+fi
+if [ "$build_guest_line" -ge "$validate_guest_line" ] || [ "$validate_guest_line" -ge "$prepare_chv_line" ]; then
+	fail "Linux source artifacts are not validated before privileged preparation"
+fi
 # shellcheck disable=SC2016
 grep -qF '$(linux_guest_files)' <<<"$source_contract" \
 	|| fail "the source install journal does not own the guest GPU payload"

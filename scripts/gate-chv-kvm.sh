@@ -38,7 +38,9 @@ actual_parent_tree="$(git -C "$SOURCE" rev-parse 'HEAD^^{tree}')"
 [ "$actual_parent_tree" = "$PARENT_TREE" ] \
   || fail "source parent tree is $actual_parent_tree, expected immutable $PARENT_TREE"
 [ -c /dev/kvm ] || fail "/dev/kvm is absent or is not a character device"
-[ -r /dev/kvm ] && [ -w /dev/kvm ] || fail "/dev/kvm is not open read-write"
+if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+  fail "/dev/kvm is not open read-write"
+fi
 
 # shellcheck disable=SC1091
 . "$SOURCE/packaging/linux-components.env"

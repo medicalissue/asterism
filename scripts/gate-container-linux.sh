@@ -284,7 +284,9 @@ STATE="$ASTERISM_HOME/state.json"
 CGROUP="$(jq -r --arg name "$INSTANCE" \
   '.instances[] | select(.name == $name) | .handle.container_control.cgroup // empty' \
   "$STATE")"
-[ -n "$CGROUP" ] && [ -d "$CGROUP" ] || fatal "state did not retain a live delegated cgroup"
+if [ -z "$CGROUP" ] || [ ! -d "$CGROUP" ]; then
+  fatal "state did not retain a live delegated cgroup"
+fi
 for namespace in user mnt pid net; do
   guest_ns="$(readlink "/proc/$CONTAINER_PID/ns/$namespace")"
   host_ns="$(readlink "/proc/self/ns/$namespace")"

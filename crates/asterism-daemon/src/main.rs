@@ -1384,6 +1384,7 @@ mod tests {
                 network_namespace: kernel_id(&network_namespace),
                 cgroup: kernel_id(&cgroup),
             }),
+            network: None,
         };
         let handle = Handle {
             backend: container::LINUX_ID.into(),
