@@ -313,9 +313,24 @@ pub(crate) fn read_frame(reader: &mut impl Read) -> io::Result<Option<(u8, Vec<u
 /// Either side closing is a CLOSE frame and then EOF. A frame larger than
 /// [`MAX_FRAME_BYTES`] is a hard error, not a skip.
 pub fn splice_plain_and_framed(plain: UnixStream, vsock: UnixStream) -> Result<()> {
+    let vsock_read = vsock.try_clone().context("cloning the vsock splice fd")?;
+    splice_from_vsock_read(plain, vsock, vsock_read)
+}
+
+/// Same splice as [`splice_plain_and_framed`], but the vsock reader is the
+/// one that already consumed the newline handshake.
+///
+/// `open_host` / `open_guest` parse Welcome or Accept through a
+/// [`BufReader`]. If that reader is dropped and framed IO resumes on a
+/// fresh clone of the original fd, any DATA that arrived in the same write
+/// as the handshake line is stranded in the buffer and never delivered.
+fn splice_from_vsock_read<R: Read + Send + 'static>(
+    plain: UnixStream,
+    vsock: UnixStream,
+    vsock_read: R,
+) -> Result<()> {
     let plain_read = plain.try_clone().context("cloning the plain splice fd")?;
     let plain_write = plain;
-    let vsock_read = vsock.try_clone().context("cloning the vsock splice fd")?;
     let vsock_write = Arc::new(Mutex::new(vsock));
     let send_credit = Credit::new(MAX_WINDOW);
 
@@ -365,7 +380,7 @@ fn raw_to_framed(
 }
 
 fn framed_to_raw(
-    mut vsock: UnixStream,
+    mut vsock: impl Read,
     mut plain: UnixStream,
     vsock_write: Arc<Mutex<UnixStream>>,
     send_credit: Arc<Credit>,
@@ -405,6 +420,11 @@ fn framed_to_raw(
 
 /// Host half of one stream: handshake, then splice onto `plain_path`.
 ///
+/// The handshake reader is the splice reader. Welcome is a newline JSON
+/// line parsed through a [`BufReader`]; the first DATA/CONNECT frame can
+/// arrive in the same write, and those leftover bytes must stay on this
+/// transport rather than being dropped with the handshake buffer.
+///
 /// If the unix socket is missing the handshake still completes (the guest
 /// proved itself) and then the stream is closed. Fail closed, not a hang
 /// waiting for astd to come back on this connection — the next CONNECT
@@ -415,7 +435,6 @@ pub fn serve_host_stream(vsock: UnixStream, key: &Key, plain_path: &Path) -> Res
     let mut reader = BufReader::new(vsock.try_clone()?);
     let mut writer = vsock.try_clone()?;
     open_host(&mut reader, &mut writer, key)?;
-    drop(reader);
     drop(writer);
     let plain = match UnixStream::connect(plain_path) {
         Ok(plain) => plain,
@@ -431,7 +450,9 @@ pub fn serve_host_stream(vsock: UnixStream, key: &Key, plain_path: &Path) -> Res
             });
         }
     };
-    splice_plain_and_framed(plain, vsock)
+    // Keep `reader`: Welcome and the first DATA frame can arrive in one
+    // write. The buffered leftover is those bytes.
+    splice_from_vsock_read(plain, vsock, reader)
 }
 
 /// Guest half of one stream: handshake, then splice onto an already-open
@@ -442,14 +463,14 @@ pub fn serve_guest_stream(vsock: UnixStream, key: &Key, plain: UnixStream) -> Re
     let mut reader = BufReader::new(vsock.try_clone()?);
     let mut writer = vsock.try_clone()?;
     open_guest(&mut reader, &mut writer, key)?;
-    drop(reader);
     drop(writer);
-    splice_plain_and_framed(plain, vsock)
+    splice_from_vsock_read(plain, vsock, reader)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guest;
     use std::io::BufReader;
     use std::os::unix::fs::FileTypeExt;
     use std::os::unix::net::UnixListener;
@@ -677,6 +698,94 @@ mod tests {
         let _ = host.join();
         let _ = guest.join();
         server.join().unwrap();
+    }
+
+    /// Welcome and the first DATA frame arrive in one write. The production
+    /// host path (`serve_host_stream`) must still deliver those bytes: a
+    /// BufReader that parses Welcome and is then dropped would strand them.
+    #[test]
+    fn coalesced_welcome_and_first_frame_complete_the_production_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plane.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let payload = b"CONNECT api.example.com:443 HTTP/1.1\r\n\r\n";
+        let reply = b"HTTP/1.1 200 OK\r\n\r\n";
+        let server = std::thread::spawn({
+            let payload = payload.to_vec();
+            let reply = reply.to_vec();
+            move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+                let mut buf = vec![0u8; payload.len()];
+                stream
+                    .read_exact(&mut buf)
+                    .expect("coalesced first DATA frame never reached the host plane");
+                assert_eq!(buf, payload);
+                stream.write_all(&reply).unwrap();
+            }
+        });
+
+        let (guest_end, host_end) = pair();
+        let k = key();
+        guest_end
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .ok();
+        guest_end
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .ok();
+
+        let host = std::thread::spawn({
+            let k = k.clone();
+            move || serve_host_stream(host_end, &k, &path)
+        });
+
+        let guest_nonce = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut guest_r = BufReader::new(guest_end.try_clone().unwrap());
+        let mut guest_w = guest_end.try_clone().unwrap();
+        guest::write_line(
+            &mut guest_w,
+            &Hello {
+                agent: AGENT.into(),
+                versions: VERSIONS.to_vec(),
+                nonce: guest_nonce.into(),
+            },
+        )
+        .unwrap();
+        let accept: Accept = guest::read_line(&mut guest_r).expect("host Accept");
+        let mut coalesced = serde_json::to_vec(&Welcome {
+            ok: true,
+            proof: k.proof_for(DOMAIN, accept.version, "guest", guest_nonce, &accept.nonce),
+            error: None,
+        })
+        .unwrap();
+        coalesced.push(b'\n');
+        coalesced.push(DATA);
+        coalesced.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        coalesced.extend_from_slice(payload);
+        guest_w.write_all(&coalesced).unwrap();
+        guest_w.flush().unwrap();
+
+        let mut saw_reply = false;
+        while let Ok(Some((typ, body))) = read_frame(&mut guest_r) {
+            if typ == DATA && body == reply {
+                saw_reply = true;
+                break;
+            }
+            if typ == CLOSE {
+                break;
+            }
+        }
+        assert!(
+            saw_reply,
+            "production path must complete: coalesced CONNECT delivered, reply framed back"
+        );
+
+        drop(guest_w);
+        drop(guest_r);
+        drop(guest_end);
+        server.join().unwrap();
+        let _ = host.join();
     }
 
     /// The in-guest bind is loopback. The host plane is a unix socket.
