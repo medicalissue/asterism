@@ -1511,6 +1511,7 @@ fn container_utility_init_with_module(config: &Config, shares: &[Share], module:
          # pid, and network namespaces.\n\
          BB=/.asterism/busybox\n\
          CTL=/run/asterism-ctl\n\
+         EXEC=/run/asterism-exec\n\
          child=\n\
          payload=\n\
          $BB mkdir -p /proc /sys /dev /tmp /run /sys/fs/cgroup \"$CTL\" 2>/dev/null\n\
@@ -1583,6 +1584,11 @@ fn container_utility_init_with_module(config: &Config, shares: &[Share], module:
          if ! $BB mkdir -p /sys/fs/cgroup/asterism; then\n\
          \x20 echo 'asterism: could not create the container cgroup'\n\
          \x20 halt\n\
+         fi\n\
+         $BB mkdir -p \"$EXEC\"\n\
+         if ! $BB mount -t tmpfs -o mode=0700,nosuid,nodev,noexec tmpfs \"$EXEC\"; then\n\
+         \x20 echo 'asterism: could not create the private exec relay'\n\
+         \x20 halt\n\
          fi\n",
         tag = sh_quote(CONTAINER_CONTROL_TAG),
     ));
@@ -1626,11 +1632,13 @@ fn container_utility_init_with_module(config: &Config, shares: &[Share], module:
         oci_identity_command(config.user.as_deref(), &words.join(" "))
     };
     let isolated_command = sh_quote(&format!(
-        "BB=/.asterism/busybox; CTL=/run/asterism-ctl; \
+        "BB=/.asterism/busybox; CTL=/run/asterism-ctl; EXEC=/run/asterism-exec; \
          while [ ! -f /run/asterism-userns-go ]; do $BB sleep 0.01; done; \
          $BB mount --make-rprivate / || exit 125; \
          $BB umount \"$CTL\" || exit 125; \
          $BB mount -t tmpfs -o nosuid,nodev,noexec tmpfs \"$CTL\" || exit 125; \
+         $BB umount \"$EXEC\" || exit 125; \
+         $BB mount -t tmpfs -o nosuid,nodev,noexec tmpfs \"$EXEC\" || exit 125; \
          $BB umount /proc || exit 125; \
          $BB mount -t proc -o nosuid,nodev,noexec proc /proc || exit 125; \
          $BB ip link set lo up 2>/dev/null; \
@@ -1722,23 +1730,23 @@ fn container_utility_init_with_module(config: &Config, shares: &[Share], module:
          \x20         set -- \"$@\" \"$arg\"\n\
          \x20         i=$((i + 1))\n\
          \x20       done\n\
-         \x20       $BB rm -f /run/asterism-exec-out /run/asterism-exec-err\n\
-         \x20       $BB mkfifo /run/asterism-exec-out /run/asterism-exec-err\n\
-         \x20       $BB head -c 1048577 < /run/asterism-exec-out > \"$CTL/out/stdout\" & out_reader=$!\n\
-         \x20       $BB head -c 1048577 < /run/asterism-exec-err > \"$CTL/out/stderr\" & err_reader=$!\n\
-         \x20       $BB nsenter -t \"$payload\" -U -m -p -n -- $BB sh -c {exec_shell} asterism-exec \"$@\" >/run/asterism-exec-out 2>/run/asterism-exec-err &\n\
+         \x20       $BB rm -f \"$EXEC/out\" \"$EXEC/err\" \"$EXEC/cgroup-error\"\n\
+         \x20       $BB mkfifo \"$EXEC/out\" \"$EXEC/err\"\n\
+         \x20       ($BB head -c 1048577; $BB cat >/dev/null) < \"$EXEC/out\" > \"$CTL/out/stdout\" & out_reader=$!\n\
+         \x20       ($BB head -c 1048577; $BB cat >/dev/null) < \"$EXEC/err\" > \"$CTL/out/stderr\" & err_reader=$!\n\
+         \x20       (if ! echo 0 > /sys/fs/cgroup/asterism/cgroup.procs; then echo failed > \"$EXEC/cgroup-error\"; exit 125; fi; exec $BB nsenter -t \"$payload\" -U -m -p -n -- $BB sh -c {exec_shell} asterism-exec \"$@\") >\"$EXEC/out\" 2>\"$EXEC/err\" &\n\
          \x20       exec_child=$!\n\
-         \x20       if ! echo \"$exec_child\" > /sys/fs/cgroup/asterism/cgroup.procs; then\n\
-         \x20         $BB kill -KILL \"$exec_child\" 2>/dev/null\n\
+         \x20       wait \"$exec_child\"\n\
+         \x20       exec_status=$?\n\
+         \x20       if [ -f \"$EXEC/cgroup-error\" ]; then\n\
          \x20         echo error > \"$CTL/out/result\"\n\
          \x20         echo 'could not place exec in the container cgroup' > \"$CTL/out/message\"\n\
          \x20       else\n\
-         \x20         wait \"$exec_child\"\n\
-         \x20         echo $? > \"$CTL/out/status\"\n\
+         \x20         echo \"$exec_status\" > \"$CTL/out/status\"\n\
          \x20         echo exec > \"$CTL/out/result\"\n\
          \x20       fi\n\
          \x20       wait \"$out_reader\" 2>/dev/null; wait \"$err_reader\" 2>/dev/null\n\
-         \x20       $BB rm -f /run/asterism-exec-out /run/asterism-exec-err\n\
+         \x20       $BB rm -f \"$EXEC/out\" \"$EXEC/err\" \"$EXEC/cgroup-error\"\n\
          \x20       ;;\n\
          \x20     stop)\n\
          \x20       echo stopping > \"$CTL/out/result\"\n\
@@ -2557,6 +2565,21 @@ mod tests {
         assert!(
             script.contains("mount -t tmpfs -o nosuid,nodev,noexec tmpfs \"$CTL\""),
             "the payload sees a private empty control mount"
+        );
+        assert!(
+            script.contains("mount -t tmpfs -o mode=0700,nosuid,nodev,noexec tmpfs \"$EXEC\""),
+            "exec relays live on a utility-only mount"
+        );
+        assert!(script.contains("umount \"$EXEC\""));
+        assert!(script.contains("mkfifo \"$EXEC/out\" \"$EXEC/err\""));
+        assert!(!script.contains("/run/asterism-exec-out"));
+        let cgroup_first = script
+            .find("(if ! echo 0 > /sys/fs/cgroup/asterism/cgroup.procs")
+            .unwrap();
+        let nsenter_after = script[cgroup_first..].find("exec $BB nsenter").unwrap();
+        assert!(
+            nsenter_after > 0,
+            "the exec wrapper enters cgroup2 before nsenter forks"
         );
         assert!(script.contains("/proc/$child/uid_map"));
         assert!(script.contains("/proc/$child/gid_map"));
