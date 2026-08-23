@@ -43,6 +43,10 @@ pub const EXEC_DEADLINE: Duration = Duration::from_secs(30);
 const CONTROL_DEADLINE: Duration = Duration::from_secs(2);
 #[cfg(target_os = "linux")]
 const CONTROL_CGROUP: &str = "asterism-control";
+/// Map the caller to container root while assigning the remaining container
+/// IDs from its subordinate ranges. A one-ID map makes ordinary OCI images
+/// fail as soon as a service changes to its declared uid (nginx uses 101).
+const ROOTLESS_USER_ARGS: &[&str] = &["--user", "--map-auto", "--map-root-user"];
 
 trait Adapter: Send + Sync {
     fn id(&self) -> &'static str;
@@ -66,20 +70,26 @@ impl Adapter for LinuxRootless {
         {
             let unshare = tools::tool("unshare")
                 .context("the Linux rootless container adapter needs util-linux unshare")?;
+            tools::tool("newuidmap").context(
+                "native containers need uidmap and an /etc/subuid range for this account",
+            )?;
+            tools::tool("newgidmap").context(
+                "native containers need uidmap and an /etc/subgid range for this account",
+            )?;
             tools::tool("debugfs")
                 .context("the Linux rootless container adapter needs e2fsprogs debugfs")?;
             tools::tool("slirp4netns").context(
                 "the Linux rootless container adapter needs slirp4netns for outbound networking",
             )?;
             tools::tool("ip").context("the Linux rootless container adapter needs iproute2 ip")?;
-            tools::run(Command::new(unshare).args([
-                "--user",
-                "--map-root-user",
-                "--mount",
-                "--",
-                "true",
-            ]))
-            .context("this host does not permit an unprivileged user/mount namespace")?;
+            tools::run(
+                Command::new(unshare)
+                    .args(ROOTLESS_USER_ARGS)
+                    .args(["--mount", "--", "true"]),
+            )
+            .context(
+                "this host does not permit a subordinate-ID user namespace; assign this account ranges in /etc/subuid and /etc/subgid",
+            )?;
             let probe = delegated_cgroup(&format!("probe{}", std::process::id()), 1, 16)?;
             fs::remove_dir(probe).context("removing the container delegation probe")?;
             Ok(Machine {
@@ -510,9 +520,8 @@ pub fn start(prepared: &Prepared) -> Result<Handle> {
     let unshare = tools::tool("unshare")?;
     let exe = std::env::current_exe()?;
     let mut child = Command::new(unshare)
+        .args(ROOTLESS_USER_ARGS)
         .args([
-            "--user",
-            "--map-root-user",
             "--mount",
             "--propagation",
             "private",
@@ -1722,6 +1731,15 @@ fn host_pid() -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rootless_namespaces_map_ordinary_oci_service_accounts() {
+        assert!(ROOTLESS_USER_ARGS.contains(&"--map-root-user"));
+        assert!(
+            ROOTLESS_USER_ARGS.contains(&"--map-auto"),
+            "a one-ID map cannot represent nginx uid 101 or other image users"
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
