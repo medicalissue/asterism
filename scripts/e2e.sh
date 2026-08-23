@@ -85,6 +85,15 @@ expect() {
 if [ "$BACKEND" = chv ]; then
   harness_cache_image "$AST" "${E2E_KERNEL_IMAGE:-busybox:musl}" \
     || fail "could not cache the pinned CHV guest kernel payload"
+fi
+
+# The image comes from the harness cache, filled once by the binary under
+# test if it is not there yet, so only a first run downloads anything. The
+# pull afterwards is what registers the copied file in this home's store; it
+# has nothing left to fetch.
+harness_cache_image "$AST" "$IMAGE" || fail "could not cache $IMAGE"
+harness_seed_images "$ASTERISM_HOME"
+if [ "$BACKEND" = chv ]; then
   KERNEL_DIR="$ASTERISM_HOME/images/kernel"
   for payload in "$KERNEL_DIR"/*-vmlinuz "$KERNEL_DIR"/*-initrd \
     "$KERNEL_DIR"/*-virtiofs.ko; do
@@ -96,13 +105,6 @@ if [ "$BACKEND" = chv ]; then
     fi
   done
 fi
-
-# The image comes from the harness cache, filled once by the binary under
-# test if it is not there yet, so only a first run downloads anything. The
-# pull afterwards is what registers the copied file in this home's store; it
-# has nothing left to fetch.
-harness_cache_image "$AST" "$IMAGE" || fail "could not cache $IMAGE"
-harness_seed_images "$ASTERISM_HOME"
 "$AST" pull "$IMAGE" >/dev/null 2>&1 || fail "pull $IMAGE"
 
 # The backend is named, not left to the daemon.
