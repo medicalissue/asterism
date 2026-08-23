@@ -56,6 +56,7 @@ use asterism_core::{paths, VERSION};
 use transport::{Admitted, Framing};
 
 mod backend;
+mod container;
 mod device_shell;
 mod egress;
 mod images;
@@ -97,6 +98,15 @@ impl Node {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if matches!(
+        std::env::args().nth(1).as_deref(),
+        Some("__container-helper")
+    ) {
+        let spec = std::env::args_os()
+            .nth(2)
+            .context("container helper needs its spec path")?;
+        return container::helper_main(std::path::Path::new(&spec));
+    }
     // Release activation has to prove the staged daemon before it replaces a
     // running one. This path touches no state and binds no socket, so a
     // downgrade refusal remains a refusal before mutation.

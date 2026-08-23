@@ -138,12 +138,13 @@ impl Fixture {
             pid: Some(pid),
             proc: None,
             ctl: kind.channel(self.control.clone()),
-            endpoint: match kind {
+            endpoint: Some(match kind {
                 ControlKind::Qmp => GuestEndpoint::HostForward { ssh_port: 22022 },
                 ControlKind::Rpc => GuestEndpoint::GuestAddr {
                     addr: "192.0.2.1".parse().unwrap(),
                 },
-            },
+            }),
+            container_control: None,
             started_at: 1,
         }
     }
