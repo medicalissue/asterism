@@ -1321,6 +1321,20 @@ mod tests {
             .expect("a guest client")
     }
 
+    /// A native-container client loads the CA from the rootfs path installed
+    /// by the runtime lifecycle, rather than receiving authority bytes out of
+    /// band from the test.
+    #[cfg(target_os = "linux")]
+    fn container_guest(proxy_port: u16, ca_path: &std::path::Path) -> reqwest::Client {
+        let ca_pem = std::fs::read(ca_path).expect("the runtime-installed container CA");
+        reqwest::Client::builder()
+            .add_root_certificate(reqwest::Certificate::from_pem(&ca_pem).unwrap())
+            .proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{proxy_port}")).unwrap())
+            .timeout(Duration::from_secs(20))
+            .build()
+            .expect("a container client")
+    }
+
     /// The end-to-end proof, and the reason the rest of this module exists.
     ///
     /// A real HTTPS client inside a "guest", a real CONNECT, a real TLS
@@ -1630,6 +1644,18 @@ mod tests {
 
         let bridge = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = bridge.local_addr().unwrap().port();
+        let rootfs = tempfile::tempdir().unwrap();
+        let runtime_egress = asterism_core::seed::Egress {
+            proxy: format!("http://127.0.0.1:{port}"),
+            ca_pem,
+            authorities: vec![format!("localhost:{}", up.port)],
+            handles: vec![("ANTHROPIC_API_KEY".into(), handle_text.clone())],
+        };
+        let trust_env = crate::container::install_egress_trust(rootfs.path(), &runtime_egress)
+            .expect("the container runtime installs its egress trust");
+        assert!(trust_env
+            .iter()
+            .any(|entry| entry == "SSL_CERT_FILE=/.asterism/ca-bundle.pem"));
         let bridge_socket = socket.clone();
         let bridge_task = tokio::spawn(async move {
             let (mut guest, _) = bridge.accept().await.unwrap();
@@ -1637,7 +1663,7 @@ mod tests {
             copy_bidirectional(&mut guest, &mut host).await.unwrap();
         });
 
-        let response = guest(port, &ca_pem)
+        let response = container_guest(port, &rootfs.path().join(".asterism/egress-ca.pem"))
             .post(format!("https://localhost:{}/v1/messages", up.port))
             .header("x-api-key", handle_text)
             .body("{}")

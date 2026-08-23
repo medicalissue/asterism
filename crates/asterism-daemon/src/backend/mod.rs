@@ -327,6 +327,29 @@ fn materialised_image_ref(reference: &str, retain_qcow2: bool) -> Result<ImageRe
     })
 }
 
+/// Resolve and verify the image recorded on an instance for a native
+/// container runtime.
+///
+/// Runtime dispatch has already selected the container adapter before this
+/// seam is called. A native root filesystem is always consumed as raw ext4,
+/// so it must not consult the instance's similarly named hypervisor backend
+/// or retain a qcow2 staging artifact. In particular, `linux-rootless` is a
+/// container adapter id and intentionally does not belong in [`by_id`].
+pub(crate) fn container_rootfs(inst: &Instance) -> Result<ImageRef> {
+    container_rootfs_with(inst, materialised_image_ref)
+}
+
+fn container_rootfs_with(
+    inst: &Instance,
+    materialise: impl FnOnce(&str, bool) -> Result<ImageRef>,
+) -> Result<ImageRef> {
+    let reference = inst
+        .image
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("instance has no image — recreate it with --image"))?;
+    materialise(reference, false)
+}
+
 /// Assemble everything a backend needs for `inst`, without building a seed.
 ///
 /// Enough for `prepare()` and the disk-level snapshot operations, which
@@ -1258,6 +1281,38 @@ mod tests {
             err.contains("qemu") && err.contains("vz") && err.contains(chv::ID),
             "{err}"
         );
+    }
+
+    #[test]
+    fn native_container_rootfs_bypasses_the_hypervisor_registry() {
+        let mut instance = Instance::new(
+            "dev",
+            "laptop",
+            "docker.io/library/alpine:latest",
+            asterism_core::instance::Shape::default(),
+            Machine {
+                backend: crate::container::LINUX_ID.into(),
+                machine_type: "linux-userns-cgroup-v2".into(),
+                cpu: "x86_64".into(),
+                hv_version: "native".into(),
+            },
+        );
+        instance.runtime = asterism_core::instance::RuntimeKind::Container;
+        instance.image_kind = ImageKind::OciRootfs;
+
+        let rootfs = container_rootfs_with(&instance, |reference, retain_qcow2| {
+            assert_eq!(reference, "docker.io/library/alpine:latest");
+            assert!(!retain_qcow2, "debugfs consumes a raw ext4 rootfs");
+            Ok(ImageRef {
+                name: reference.into(),
+                path: "/images/alpine.raw".into(),
+                format: DiskFormat::Raw,
+                kind: ImageKind::OciRootfs,
+            })
+        })
+        .expect("linux-rootless is runtime metadata, not a hypervisor lookup");
+
+        assert_eq!(rootfs.path, PathBuf::from("/images/alpine.raw"));
     }
 
     /// An OCI image is a filesystem with no bootloader, so it can only be

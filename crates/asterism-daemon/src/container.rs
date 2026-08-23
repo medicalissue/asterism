@@ -39,6 +39,8 @@ pub const WINDOWS_ID: &str = "windows-hyperv-container-utility-vm";
 const MAX_EXEC_OUTPUT: usize = 1024 * 1024;
 pub const EXEC_DEADLINE: Duration = Duration::from_secs(30);
 const CONTROL_DEADLINE: Duration = Duration::from_secs(2);
+const EGRESS_CA_PATH: &str = "/.asterism/egress-ca.pem";
+const EGRESS_BUNDLE_PATH: &str = "/.asterism/ca-bundle.pem";
 
 trait Adapter: Send + Sync {
     fn id(&self) -> &'static str;
@@ -216,7 +218,10 @@ pub fn prepare(inst: &Instance) -> Result<Prepared> {
         bail!("native container block volumes need a rootless block-device mapper; refusing to expose a regular-file placeholder as a disk");
     }
 
-    let req = crate::backend::disk_req(inst)?;
+    // Runtime dispatch selected this adapter before prepare. Resolve the OCI
+    // filesystem through the native-container seam instead of treating the
+    // adapter id as a hypervisor registry key.
+    let base = crate::backend::container_rootfs(inst)?;
     let dir = paths::instance_dir(&inst.name);
     fs::create_dir_all(&dir)?;
     let rootfs = dir.join("container-rootfs");
@@ -231,18 +236,13 @@ pub fn prepare(inst: &Instance) -> Result<Prepared> {
             .replace('\\', "\\\\")
             .replace('"', "\\\"");
         let command = format!("rdump / \"{destination}\"");
-        tools::run(
-            Command::new(debugfs)
-                .args(["-R", &command])
-                .arg(&req.base.path),
-        )
-        .context("extracting the OCI ext4 image without a privileged mount")?;
+        tools::run(Command::new(debugfs).args(["-R", &command]).arg(&base.path))
+            .context("extracting the OCI ext4 image without a privileged mount")?;
         fs::rename(&stage, &rootfs).context("publishing the extracted container rootfs")?;
     }
 
     let config: serde_json::Value = serde_json::from_slice(
-        &fs::read(req.base.path.with_extension("json"))
-            .context("reading the OCI config sidecar")?,
+        &fs::read(base.path.with_extension("json")).context("reading the OCI config sidecar")?,
     )?;
     let image = &config["config"];
     let strings = |key: &str| -> Vec<String> {
@@ -277,6 +277,7 @@ pub fn prepare(inst: &Instance) -> Result<Prepared> {
             .into_iter()
             .map(|(name, value)| format!("{name}={value}")),
     );
+    env.extend(install_egress_trust(&rootfs, &egress)?);
     let spec = dir.join("container.json");
     let binds = asterism_core::seed::shares(inst)
         .into_iter()
@@ -307,6 +308,82 @@ pub fn prepare(inst: &Instance) -> Result<Prepared> {
     };
     fs::write(&spec, serde_json::to_vec_pretty(&value)?)?;
     Ok(Prepared { spec })
+}
+
+/// Install the public half of a container's egress authority in its private
+/// root filesystem and return the environment that makes common TLS clients
+/// use it.
+///
+/// The image's system bundle is copied, never modified. This keeps public
+/// roots working while adding the per-instance CA, and gives even a scratch
+/// image a usable one-certificate bundle. The two distribution anchor paths
+/// also make the trust visible to software that discovers the native store
+/// directly. Every target crosses [`safe_file_target`], so an image cannot
+/// redirect these public bytes to a host path with a symlink.
+pub(crate) fn install_egress_trust(
+    rootfs: &Path,
+    egress: &asterism_core::seed::Egress,
+) -> Result<Vec<String>> {
+    if egress.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let write_public = |guest: &str, contents: &[u8]| -> Result<()> {
+        let target = safe_file_target(rootfs, Path::new(guest))?;
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&target, contents)
+            .with_context(|| format!("installing container trust at {guest}"))
+    };
+
+    write_public(EGRESS_CA_PATH, egress.ca_pem.as_bytes())?;
+    for anchor in [
+        "/usr/local/share/ca-certificates/asterism-egress.crt",
+        "/etc/pki/ca-trust/source/anchors/asterism-egress.crt",
+    ] {
+        // These are compatibility drop-ins, not the runtime's authoritative
+        // bundle. An image may legitimately make one parent a symlink; skip
+        // that optional store rather than following it or refusing launch.
+        if safe_file_target(rootfs, Path::new(anchor)).is_ok() {
+            write_public(anchor, egress.ca_pem.as_bytes())?;
+        }
+    }
+
+    let mut bundle = Vec::new();
+    for candidate in [
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/cert.pem",
+    ] {
+        let Ok(path) = safe_file_target(rootfs, Path::new(candidate)) else {
+            continue;
+        };
+        if let Ok(existing) = fs::read(path) {
+            if !existing.is_empty() {
+                bundle = existing;
+                break;
+            }
+        }
+    }
+    if !bundle.is_empty() && !bundle.ends_with(b"\n") {
+        bundle.push(b'\n');
+    }
+    bundle.extend_from_slice(egress.ca_pem.as_bytes());
+    if !bundle.ends_with(b"\n") {
+        bundle.push(b'\n');
+    }
+    write_public(EGRESS_BUNDLE_PATH, &bundle)?;
+
+    Ok([
+        ("SSL_CERT_FILE", EGRESS_BUNDLE_PATH),
+        ("CURL_CA_BUNDLE", EGRESS_BUNDLE_PATH),
+        ("REQUESTS_CA_BUNDLE", EGRESS_BUNDLE_PATH),
+        ("NODE_EXTRA_CA_CERTS", EGRESS_CA_PATH),
+    ]
+    .into_iter()
+    .map(|(name, value)| format!("{name}={value}"))
+    .collect())
 }
 
 /// Place generated profile files in the extracted OCI root without ever
@@ -1822,6 +1899,55 @@ mod tests {
         std::os::unix::fs::symlink("/tmp", root.path().join("etc")).unwrap();
         assert!(safe_file_target(root.path(), Path::new("/etc/profile.d/asterism.sh")).is_err());
         assert!(safe_file_target(root.path(), Path::new("/../../escape")).is_err());
+    }
+
+    #[test]
+    fn bound_egress_installs_runtime_trust_and_reasserts_client_environment() {
+        let root = tempfile::tempdir().unwrap();
+        let system_bundle = root.path().join("etc/ssl/certs/ca-certificates.crt");
+        fs::create_dir_all(system_bundle.parent().unwrap()).unwrap();
+        fs::write(&system_bundle, b"SYSTEM ROOT\n").unwrap();
+        let egress = asterism_core::seed::Egress {
+            proxy: "http://127.0.0.1:3128".into(),
+            ca_pem: "-----BEGIN CERTIFICATE-----\nINSTANCE CA\n-----END CERTIFICATE-----\n".into(),
+            authorities: vec!["api.example.com:443".into()],
+            handles: vec![("API_TOKEN".into(), "opaque-handle".into())],
+        };
+
+        let env = install_egress_trust(root.path(), &egress).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.path().join(".asterism/egress-ca.pem")).unwrap(),
+            egress.ca_pem
+        );
+        let bundle = fs::read_to_string(root.path().join(".asterism/ca-bundle.pem")).unwrap();
+        assert!(bundle.starts_with("SYSTEM ROOT\n"), "{bundle}");
+        assert!(bundle.ends_with(&egress.ca_pem), "{bundle}");
+        assert_eq!(
+            fs::read_to_string(
+                root.path()
+                    .join("usr/local/share/ca-certificates/asterism-egress.crt")
+            )
+            .unwrap(),
+            egress.ca_pem
+        );
+        assert_eq!(
+            env,
+            [
+                "SSL_CERT_FILE=/.asterism/ca-bundle.pem",
+                "CURL_CA_BUNDLE=/.asterism/ca-bundle.pem",
+                "REQUESTS_CA_BUNDLE=/.asterism/ca-bundle.pem",
+                "NODE_EXTRA_CA_CERTS=/.asterism/egress-ca.pem",
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_egress_does_not_mutate_the_container_rootfs() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(install_egress_trust(root.path(), &Default::default())
+            .unwrap()
+            .is_empty());
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
     }
 
     #[test]
