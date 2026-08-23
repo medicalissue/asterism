@@ -9,7 +9,7 @@ use std::fs;
 #[cfg(any(target_os = "linux", all(test, target_family = "unix")))]
 use std::io::Read;
 use std::io::{BufRead, BufReader, Write};
-#[cfg(target_family = "unix")]
+#[cfg(any(target_os = "linux", all(test, target_family = "unix")))]
 use std::net::Shutdown;
 #[cfg(any(target_os = "linux", all(test, target_family = "unix")))]
 use std::os::unix::net::UnixListener;
