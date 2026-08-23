@@ -238,6 +238,13 @@ client=${ASTERISM_NBD_CLIENT:-}
 [ -n "$client" ] || client=$(command -v nbd-client) || die "nbd-client is not installed"
 
 case "${1-}" in
+--probe)
+	[ "$#" -eq 1 ] || die "invalid privileged probe"
+	[ -f "$LOCK" ] || die "the installed NBD lock is missing"
+	[ -d "$STATE" ] || die "the installed NBD ownership state directory is missing"
+	printf 'asterism-nbd: privileged boundary probe succeeded\n' >&2
+	exit 0
+	;;
 -d)
 	if [ "$#" -ne 2 ] || ! nbd_device "$2"; then
 		die "invalid detach request"
