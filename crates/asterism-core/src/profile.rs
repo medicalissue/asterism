@@ -613,13 +613,13 @@ const UNIT: &str = "[Unit]\n\
     WantedBy=multi-user.target\n";
 
 /// The `runcmd` half: enable the unit and let go of it.
-const RUNCMD: &str = "if command -v systemctl >/dev/null 2>&1; then\n\
+const RUNCMD: &str = "if command -v systemctl >/dev/null 2>&1 \\\n    && [ \"$(cat /proc/1/comm 2>/dev/null)\" = systemd ]; then\n\
     \x20 systemctl daemon-reload\n\
     \x20 systemctl enable asterism-bootstrap.service >/dev/null 2>&1 || true\n\
     \x20 systemctl start --no-block asterism-bootstrap.service >/dev/null 2>&1 \\\n\
     \x20   || echo 'asterism: could not start asterism-bootstrap — run it by hand' >&2\n\
     else\n\
-    \x20 # No systemd here, so this boot gets the bootstrap and later boots do\n\
+    \x20 # No systemd PID 1 here, so this boot gets the bootstrap and later boots do\n\
     \x20 # not. asterism-check reports the stamp either way, which is how a\n\
     \x20 # guest in that state is told apart from one that finished.\n\
     \x20 setsid /usr/local/sbin/asterism-bootstrap >/var/log/asterism-bootstrap.log 2>&1 &\n\
@@ -976,6 +976,8 @@ mod tests {
         let runcmd = Bootstrap::resolve(&names(&["base"])).unwrap().runcmd();
         assert!(runcmd.contains("systemctl start --no-block asterism-bootstrap.service"));
         assert!(runcmd.contains("systemctl enable asterism-bootstrap.service"));
+        assert!(runcmd.contains("cat /proc/1/comm"));
+        assert!(runcmd.contains("= systemd"));
         assert!(!runcmd.contains("apt-get"));
         // Enabled, so a guest cut off mid-install finishes at the next boot.
         assert!(UNIT.contains("WantedBy=multi-user.target"));
@@ -987,5 +989,64 @@ mod tests {
         assert!(!UNIT.contains("cloud-final"), "{UNIT}");
         // And the driver does nothing at all when the guest is already there.
         assert!(DRIVER.contains("bootstrap already applied"));
+    }
+
+    /// A systemctl binary is not evidence that systemd owns PID 1. OCI images
+    /// often ship the client while running a shell or application as init.
+    #[cfg(unix)]
+    #[test]
+    fn systemctl_without_systemd_pid_one_runs_the_direct_driver() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let comm = dir.path().join("comm");
+        let driver = dir.path().join("driver");
+        let log = dir.path().join("bootstrap.log");
+        let direct = dir.path().join("direct-ran");
+        let systemctl_ran = dir.path().join("systemctl-ran");
+        std::fs::write(&comm, "container-init\n").unwrap();
+        std::fs::write(
+            bin.join("systemctl"),
+            format!("#!/bin/sh\ntouch '{}'\n", systemctl_ran.display()),
+        )
+        .unwrap();
+        std::fs::write(bin.join("setsid"), "#!/bin/sh\nexec \"$@\"\n").unwrap();
+        std::fs::write(
+            &driver,
+            format!("#!/bin/sh\ntouch '{}'\n", direct.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            bin.join("systemctl"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::set_permissions(bin.join("setsid"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = RUNCMD
+            .replace("/proc/1/comm", comm.to_str().unwrap())
+            .replace(
+                "/usr/local/sbin/asterism-bootstrap",
+                driver.to_str().unwrap(),
+            )
+            .replace("/var/log/asterism-bootstrap.log", log.to_str().unwrap());
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !direct.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(direct.exists(), "direct bootstrap path never ran");
+        assert!(
+            !systemctl_ran.exists(),
+            "systemctl ran without systemd PID 1"
+        );
     }
 }
