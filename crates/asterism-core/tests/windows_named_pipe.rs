@@ -1,6 +1,7 @@
 #![cfg(windows)]
 
 use std::io::{self, Read, Write};
+use std::time::{Duration, Instant};
 
 use asterism_core::ipc::{self, Door, SocketState};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -45,7 +46,17 @@ async fn real_named_pipe_round_trip_peer_identity_and_lifetime() {
 
     drop(server);
     drop(door);
-    assert_eq!(ipc::audit_socket(&sock).unwrap(), SocketState::Missing);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while ipc::audit_socket(&sock).unwrap() != SocketState::Missing {
+        // Mio's named-pipe registration shares the kernel handle with the
+        // runtime until the reactor processes deregistration.
+        assert!(
+            Instant::now() < deadline,
+            "the pipe name survived its last kernel handle"
+        );
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[tokio::test]
