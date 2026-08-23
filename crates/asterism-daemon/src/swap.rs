@@ -1098,6 +1098,66 @@ fn published_for(txn: &AuthorityTxn) -> bool {
         .is_some_and(|loaded| loaded.value == AuthorityMarker::of(txn))
 }
 
+/// Prove a WAL that already says `Committed` still names the published target.
+///
+/// Commit consumes the in-tree marker on purpose: the durable WAL is then
+/// the authority, and a later status, reply-loss, or restart must not demand
+/// that marker back. Exact identity still has to hold — instance id, epoch,
+/// token/WAL, matching row, and the live tree's file digest — and a
+/// substituted directory fails closed.
+fn prove_committed_published(reg: &Shard, txn: &AuthorityTxn, device: &str) -> Result<()> {
+    if txn.phase != MoveAuthorityPhase::Committed {
+        bail!("target authority is {:?}, not durably committed", txn.phase);
+    }
+    let live = paths::instance_dir(&txn.name);
+    if !live.is_dir() {
+        bail!(
+            "{} is missing for committed id {:?} epoch {}",
+            live.display(),
+            txn.instance_id,
+            txn.epoch
+        );
+    }
+    if !published_for(txn) && live.join(LIVE_AUTHORITY).exists() {
+        bail!(
+            "{} exists but is not the published tree for id {:?} epoch {}",
+            live.display(),
+            txn.instance_id,
+            txn.epoch
+        );
+    }
+    match reg.get(&txn.name).ok().filter(|instance| {
+        instance.id == txn.instance_id
+            && instance.move_epoch == txn.epoch
+            && instance.cpu_device == device
+    }) {
+        Some(_) => {}
+        None => bail!(
+            "transaction says committed but its target row is missing or does not match id {:?} epoch {} on {device}",
+            txn.instance_id,
+            txn.epoch
+        ),
+    }
+    for file in &txn.manifest.files {
+        let path = live.join(&file.path);
+        let meta = std::fs::metadata(&path).with_context(|| {
+            format!(
+                "{} is missing from the committed live tree for id {:?} epoch {}",
+                file.path, txn.instance_id, txn.epoch
+            )
+        })?;
+        if meta.len() != file.len {
+            bail!(
+                "{} in the committed live tree is {} bytes and should be {}",
+                file.path,
+                meta.len(),
+                file.len
+            );
+        }
+    }
+    Ok(())
+}
+
 fn validate_target_replay(
     txn: &AuthorityTxn,
     manifest: &MoveManifest,
@@ -3566,6 +3626,14 @@ fn finish_target_commit(reg: &mut Shard, txn: &mut AuthorityTxn, device: &str) -
     let live = paths::instance_dir(&name);
 
     if !live.exists() {
+        if txn.phase == MoveAuthorityPhase::Committed {
+            bail!(
+                "{} is missing for committed id {:?} epoch {}",
+                live.display(),
+                txn.instance_id,
+                txn.epoch
+            );
+        }
         verify(&staging, &txn.manifest, txn.epoch, &txn.token)?;
         save_authority_marker(&staging, txn)?;
         if let Some(parent) = live.parent() {
@@ -3574,12 +3642,18 @@ fn finish_target_commit(reg: &mut Shard, txn: &mut AuthorityTxn, device: &str) -
         durable::publish_dir(&staging, &live)
             .with_context(|| format!("publishing {}", live.display()))?;
     } else if !published_for(txn) {
-        bail!(
-            "{} exists but is not the published tree for id {:?} epoch {}",
-            live.display(),
-            txn.instance_id,
-            txn.epoch
-        );
+        // After commit the marker is gone by design. A Committed WAL may
+        // still prove this exact published tree; any other phase cannot.
+        if txn.phase == MoveAuthorityPhase::Committed {
+            prove_committed_published(reg, txn, device)?;
+        } else {
+            bail!(
+                "{} exists but is not the published tree for id {:?} epoch {}",
+                live.display(),
+                txn.instance_id,
+                txn.epoch
+            );
+        }
     }
 
     let existing = reg.get(&name).ok().cloned();
@@ -3595,6 +3669,7 @@ fn finish_target_commit(reg: &mut Shard, txn: &mut AuthorityTxn, device: &str) -
             );
         }
         if txn.live
+            && txn.phase != MoveAuthorityPhase::Committed
             && instance.status == Status::Running
             && !instance.handle.as_ref().is_some_and(backend::alive)
         {
@@ -3642,6 +3717,7 @@ fn finish_target_commit(reg: &mut Shard, txn: &mut AuthorityTxn, device: &str) -
     let _ = std::fs::remove_file(live.join(LIVE_HANDLE));
     let _ = std::fs::remove_file(live_socket(&name, &txn.instance_id, txn.epoch, &txn.token)?);
     let _ = std::fs::remove_file(live.join(LIVE_SOCKET));
+    // Consumed: later Committed status must prove this tree without it.
     let _ = std::fs::remove_file(live.join(LIVE_AUTHORITY));
     Ok(instance)
 }
@@ -3746,10 +3822,14 @@ fn target_status(
             "precommit target has publication evidence without a no-return WAL; refusing to infer authority"
         ));
     }
-    if matches!(
-        txn.phase,
-        MoveAuthorityPhase::Committing | MoveAuthorityPhase::Committed
-    ) {
+    if txn.phase == MoveAuthorityPhase::Committed {
+        // Marker removal is the success path. Replaying Committed must prove
+        // the published identity without asking for the consumed marker, or
+        // source cleanup stalls forever after a lost status reply.
+        if let Err(e) = prove_committed_published(reg, &txn, device) {
+            return error(e.context("reconciling target authority"));
+        }
+    } else if txn.phase == MoveAuthorityPhase::Committing {
         if let Err(e) = finish_target_commit(reg, &mut txn, device) {
             return error(e.context("reconciling target authority"));
         }
@@ -6668,6 +6748,272 @@ mod tests {
         assert!(matches!(
             commit_target(&mut restarted, &first, first_epoch, "token", "desktop"),
             Response::Instance { .. }
+        ));
+
+        // A second status after the marker was consumed must still prove the
+        // exact published identity. Wrong-token remains a closed failure.
+        let replayed = target_status(
+            &mut restarted,
+            &first.instance.id,
+            "dev",
+            first_epoch,
+            "token",
+            "desktop",
+        );
+        assert!(
+            matches!(
+                replayed,
+                Response::MoveAuthority {
+                    phase: MoveAuthorityPhase::Committed,
+                    ..
+                }
+            ),
+            "{replayed:?}"
+        );
+        assert!(matches!(
+            target_status(
+                &mut restarted,
+                &first.instance.id,
+                "dev",
+                first_epoch,
+                "wrong-token",
+                "desktop",
+            ),
+            Response::Error { .. }
+        ));
+
+        // A substituted live tree fails closed even though the WAL already
+        // says Committed: a foreign marker is not this published identity.
+        let live = paths::instance_dir("dev");
+        let mut foreign = txn(&first, first_epoch, MoveAuthorityPhase::Committed);
+        foreign.instance_id = "substituted-id".into();
+        save_authority_marker(&live, &foreign).unwrap();
+        assert!(matches!(
+            target_status(
+                &mut restarted,
+                &first.instance.id,
+                "dev",
+                first_epoch,
+                "token",
+                "desktop",
+            ),
+            Response::Error { .. }
+        ));
+        std::fs::remove_file(live.join(LIVE_AUTHORITY)).unwrap();
+        let restored = target_status(
+            &mut restarted,
+            &first.instance.id,
+            "dev",
+            first_epoch,
+            "token",
+            "desktop",
+        );
+        assert!(
+            matches!(
+                restored,
+                Response::MoveAuthority {
+                    phase: MoveAuthorityPhase::Committed,
+                    ..
+                }
+            ),
+            "{restored:?}"
+        );
+
+        // Live tree digest is part of that identity: a truncated published
+        // file is substitution, not a successful Committed replay.
+        let mut digest_manifest = manifest_of(vec![MoveFile {
+            path: "disk.raw".into(),
+            len: 12,
+            allocated: 12,
+            mode: 0o600,
+        }]);
+        digest_manifest.instance.name = "committed-digest".into();
+        digest_manifest.instance.id = "committed-digest-id".into();
+        let digest_epoch = 5;
+        let digest_staging = staging_dir(
+            &digest_manifest.instance.name,
+            &digest_manifest.instance.id,
+            digest_epoch,
+            "token",
+        );
+        std::fs::create_dir_all(&digest_staging).unwrap();
+        std::fs::write(digest_staging.join("disk.raw"), b"target bytes").unwrap();
+        Receipt {
+            instance_id: digest_manifest.instance.id.clone(),
+            epoch: digest_epoch,
+            token: "token".into(),
+            from_device: digest_manifest.instance.cpu_device.clone(),
+            bytes: 12,
+            files: [("disk.raw".to_owned(), 12u64)].into_iter().collect(),
+        }
+        .save(&digest_staging)
+        .unwrap();
+        let mut digest_txn = txn(
+            &digest_manifest,
+            digest_epoch,
+            MoveAuthorityPhase::Committing,
+        );
+        save_authority(&digest_txn).unwrap();
+        finish_target_commit(&mut restarted, &mut digest_txn, "desktop").unwrap();
+        let digest_live = paths::instance_dir("committed-digest");
+        assert!(!digest_live.join(LIVE_AUTHORITY).exists());
+        assert!(matches!(
+            target_status(
+                &mut restarted,
+                &digest_manifest.instance.id,
+                "committed-digest",
+                digest_epoch,
+                "token",
+                "desktop",
+            ),
+            Response::MoveAuthority {
+                phase: MoveAuthorityPhase::Committed,
+                ..
+            }
+        ));
+        std::fs::write(digest_live.join("disk.raw"), b"short").unwrap();
+        assert!(matches!(
+            target_status(
+                &mut restarted,
+                &digest_manifest.instance.id,
+                "committed-digest",
+                digest_epoch,
+                "token",
+                "desktop",
+            ),
+            Response::Error { .. }
+        ));
+        std::fs::write(digest_live.join("disk.raw"), b"target bytes").unwrap();
+        assert!(matches!(
+            target_status(
+                &mut restarted,
+                &digest_manifest.instance.id,
+                "committed-digest",
+                digest_epoch,
+                "token",
+                "desktop",
+            ),
+            Response::MoveAuthority {
+                phase: MoveAuthorityPhase::Committed,
+                ..
+            }
+        ));
+
+        // Committing still requires the in-tree marker. A markerless live
+        // directory is a collision until the WAL itself says Committed.
+        let mut committing_manifest = manifest_of(Vec::new());
+        committing_manifest.instance.name = "committing-no-marker".into();
+        committing_manifest.instance.id = "committing-no-marker-id".into();
+        let committing_epoch = 6;
+        std::fs::create_dir_all(paths::instance_dir("committing-no-marker")).unwrap();
+        let committing_txn = txn(
+            &committing_manifest,
+            committing_epoch,
+            MoveAuthorityPhase::Committing,
+        );
+        save_authority(&committing_txn).unwrap();
+        assert!(matches!(
+            target_status(
+                &mut restarted,
+                &committing_manifest.instance.id,
+                "committing-no-marker",
+                committing_epoch,
+                "token",
+                "desktop",
+            ),
+            Response::Error { .. }
+        ));
+        assert_eq!(
+            load_authority(&committing_manifest.instance.id, committing_epoch)
+                .unwrap()
+                .unwrap()
+                .phase,
+            MoveAuthorityPhase::Committing
+        );
+
+        // Source cleanup after that committed proof survives restart and a
+        // lost row-save reply: the completion WAL is the replay oracle.
+        let mut source = manifest_of(Vec::new()).instance;
+        source.name = "committed-status-source".into();
+        source.id = "committed-status-source-id".into();
+        let source_epoch = 3;
+        let source_token = "committed-status-token";
+        source.moving = Some(Moving {
+            to_device: "desktop".into(),
+            to_device_id: "target-id".into(),
+            epoch: source_epoch,
+            started_at: now_unix(),
+            token: source_token.into(),
+            lane: 0,
+            coordinator_id: "coordinator-id".into(),
+            phase: MoveSourcePhase::Committed,
+            live: true,
+        });
+        restarted.adopt(source.clone()).unwrap();
+        restarted.save().unwrap();
+        let source_dir = paths::instance_dir(&source.name);
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(source_dir.join("disk.raw"), b"source bytes").unwrap();
+        let mut restarted = Shard::load(&state).unwrap();
+        let proof_after_restart = target_status(
+            &mut restarted,
+            &first.instance.id,
+            "dev",
+            first_epoch,
+            "token",
+            "desktop",
+        );
+        assert!(
+            matches!(
+                proof_after_restart,
+                Response::MoveAuthority {
+                    phase: MoveAuthorityPhase::Committed,
+                    ..
+                }
+            ),
+            "{proof_after_restart:?}"
+        );
+        let armed = faults::arm_once(
+            "committed-status-source-row",
+            Point::Rename,
+            state.display().to_string(),
+            io::ErrorKind::Other,
+        );
+        assert!(matches!(
+            commit_source_after_proof(
+                &mut restarted,
+                &source.id,
+                &source.name,
+                source_epoch,
+                source_token,
+            ),
+            Response::Error { .. }
+        ));
+        drop(armed);
+        let mut restarted = Shard::load(&state).unwrap();
+        assert!(restarted.get(&source.name).is_ok());
+        assert!(matches!(
+            commit_source_after_proof(
+                &mut restarted,
+                &source.id,
+                &source.name,
+                source_epoch,
+                source_token,
+            ),
+            Response::Ok
+        ));
+        assert!(restarted.get(&source.name).is_err());
+        assert!(!source_dir.exists());
+        let mut restarted = Shard::load(&state).unwrap();
+        assert!(matches!(
+            commit_source_after_proof(
+                &mut restarted,
+                &source.id,
+                &source.name,
+                source_epoch,
+                source_token,
+            ),
+            Response::Ok
         ));
 
         // Failure after the row save but before the WAL says Committed: a
