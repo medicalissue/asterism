@@ -362,10 +362,40 @@ fn audit_socket_as(sock: &Path, ours: u32) -> Result<SocketState> {
 /// whichever way it dies.
 #[derive(Debug)]
 pub struct Door {
+    // Fields are dropped in declaration order. The listener must be closed
+    // before the election is explicitly released: once another daemon can
+    // win, this one must no longer be accepting connections.
     listener: UnixListener,
     sock: PathBuf,
     /// The election. Never read; dropping it is what gives the home up.
-    _lock: File,
+    election: Election,
+}
+
+/// The held daemon election.
+///
+/// This is a type, rather than a bare [`File`], so giving the election up is
+/// an explicit `LOCK_UN` operation. Relying on `close(2)` to do both jobs at
+/// once leaves immediate stale-socket takeover coupled to the kernel's file
+/// close retirement. In particular, macOS can briefly report the just-closed
+/// lock as contended. The file close remains a fallback if the explicit
+/// unlock were ever to fail.
+///
+/// A runtime that takes this out of [`Door`] must store it after its listener,
+/// so Rust's declaration-order field destruction closes the listener first.
+#[derive(Debug)]
+pub struct Election {
+    file: File,
+}
+
+impl Drop for Election {
+    fn drop(&mut self) {
+        // Safe: `file` owns a live fd and LOCK_UN is a constant operation.
+        // Drop cannot report an error; closing `file` immediately afterwards
+        // is the kernel-backed fallback release on every supported host.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
 }
 
 impl Door {
@@ -396,7 +426,7 @@ impl Door {
         Ok(Door {
             listener,
             sock: sock.to_path_buf(),
-            _lock: lock,
+            election: Election { file: lock },
         })
     }
 
@@ -409,8 +439,8 @@ impl Door {
     /// The lock has to outlive the listener — a daemon that gave its home up
     /// while still accepting is exactly the second daemon this prevents — so
     /// it comes back out with it rather than being dropped here.
-    pub fn into_parts(self) -> (UnixListener, File, PathBuf) {
-        (self.listener, self._lock, self.sock)
+    pub fn into_parts(self) -> (UnixListener, Election, PathBuf) {
+        (self.listener, self.election, self.sock)
     }
 
     /// The socket this door is behind.
@@ -629,6 +659,7 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::io::FromRawFd;
     use std::os::unix::net::UnixStream;
 
     fn mode_of(path: &Path) -> u32 {
@@ -879,6 +910,77 @@ mod tests {
         drop(first);
     }
 
+    /// Drive the election from both sides of teardown. While an incumbent is
+    /// alive every barrier-released contender must lose without disturbing
+    /// its listener. Once it drops, the same simultaneous start must elect
+    /// exactly one replacement, and that winner must be the socket listener.
+    /// There is no timing allowance here: authority, not a probe or retry,
+    /// determines every outcome.
+    #[test]
+    fn concurrent_contenders_never_overlap_the_incumbent_or_each_other() {
+        const ROUNDS: usize = 64;
+        const RACERS: usize = 8;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let sock = home.join("astd.sock");
+
+        for round in 0..ROUNDS {
+            let incumbent = Door::open(&home, &sock).unwrap();
+            let start = std::sync::Arc::new(std::sync::Barrier::new(RACERS + 1));
+            let contenders = (0..RACERS)
+                .map(|_| {
+                    let home = home.clone();
+                    let sock = sock.clone();
+                    let start = std::sync::Arc::clone(&start);
+                    std::thread::spawn(move || {
+                        start.wait();
+                        Door::open(&home, &sock).map_err(|e| format!("{e:#}"))
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            start.wait();
+            let refusals = contenders
+                .into_iter()
+                .map(|contender| contender.join().expect("contender panicked"))
+                .collect::<Vec<_>>();
+            assert!(
+                refusals.iter().all(
+                    |outcome| matches!(outcome, Err(e) if e.contains("another astd already holds"))
+                ),
+                "round {round} let a contender overlap the incumbent: {refusals:?}"
+            );
+            UnixStream::connect(&sock).expect("the incumbent stopped accepting");
+
+            drop(incumbent);
+            let start = std::sync::Arc::new(std::sync::Barrier::new(RACERS + 1));
+            let contenders = (0..RACERS)
+                .map(|_| {
+                    let home = home.clone();
+                    let sock = sock.clone();
+                    let start = std::sync::Arc::clone(&start);
+                    std::thread::spawn(move || {
+                        start.wait();
+                        Door::open(&home, &sock).map_err(|e| format!("{e:#}"))
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            start.wait();
+            let outcomes = contenders
+                .into_iter()
+                .map(|contender| contender.join().expect("contender panicked"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                outcomes.iter().filter(|outcome| outcome.is_ok()).count(),
+                1,
+                "round {round} did not elect exactly one replacement: {outcomes:?}"
+            );
+            UnixStream::connect(&sock).expect("the elected replacement is not accepting");
+        }
+    }
+
     /// A daemon that died — cleanly or not — leaves a socket file at a path
     /// that nothing is listening on. The next one has to take it over, and
     /// with the election in hand it can do that without asking anybody
@@ -889,24 +991,25 @@ mod tests {
         let home = tmp.path().join("home");
         let sock = home.join("astd.sock");
 
-        let dead = Door::open(&home, &sock).unwrap();
-        drop(dead);
-        assert!(
-            sock.exists(),
-            "this test is about the file a crash leaves behind"
-        );
+        let mut dead = Door::open(&home, &sock).unwrap();
+        for _ in 0..10_000 {
+            drop(dead);
+            assert!(
+                sock.exists(),
+                "this test is about the file a crash leaves behind"
+            );
 
-        // Do not probe the dead listener before replacing it. On macOS the
-        // pathname can briefly keep accepting connects while the close is
-        // being retired, even though dropping `dead` has already released
-        // the election. That observation is neither required nor safe to use
-        // as authority for an unlink: holding the election is the authority.
-        // Reopening immediately is the regression test, including when socket
-        // teardown is delayed by the scheduler.
-        let door = Door::open(&home, &sock).unwrap();
-        UnixStream::connect(&sock).expect("the replacement is accepting");
-        assert_eq!(mode_of(&sock), 0o600);
-        drop(door);
+            // Do not probe the dead listener before replacing it. On macOS the
+            // pathname can briefly keep accepting connects while the close is
+            // being retired, even though dropping `dead` has already released
+            // the election. That observation is neither required nor safe to use
+            // as authority for an unlink: holding the election is the authority.
+            // Reopening immediately is the regression test, including when socket
+            // teardown is delayed by the scheduler.
+            dead = Door::open(&home, &sock).unwrap();
+            UnixStream::connect(&sock).expect("the replacement is accepting");
+            assert_eq!(mode_of(&sock), 0o600);
+        }
     }
 
     /// A symlink at the socket path is cleared rather than followed.
@@ -1002,6 +1105,42 @@ mod tests {
             lock_file(&lock, Wait::No).unwrap().is_some(),
             "it was never given back"
         );
+    }
+
+    /// Keep the election's open-file description alive past `Election`'s
+    /// drop, deterministically modelling a close the kernel has not retired
+    /// yet. The explicit unlock must make takeover independent of that close;
+    /// a bare `File` whose release relied on close would remain contended.
+    #[test]
+    fn dropping_the_election_unlocks_before_file_close_retires() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        private_dir(&home).unwrap();
+        let lock = home.join("astd.lock");
+
+        let election = Election {
+            file: lock_file(&lock, Wait::No)
+                .unwrap()
+                .expect("nobody had the election"),
+        };
+        // Safe: `dup` takes a live fd. A successful result is a new owned fd,
+        // transferred immediately to `File` below.
+        let duplicate = unsafe { libc::dup(election.file.as_raw_fd()) };
+        assert!(
+            duplicate >= 0,
+            "duplicating the election: {}",
+            io::Error::last_os_error()
+        );
+        // Safe: `duplicate` is a fresh descriptor owned by this scope.
+        let close_still_retiring = unsafe { File::from_raw_fd(duplicate) };
+
+        drop(election);
+        let replacement = lock_file(&lock, Wait::No)
+            .unwrap()
+            .expect("explicit unlock left the election contended");
+
+        drop(replacement);
+        drop(close_still_retiring);
     }
 
     /// One protocol, one ceiling. A request a daemon may send another over

@@ -36,28 +36,32 @@ use asterism_core::protocol::Response;
 
 /// The bound socket, the election that proves it is ours, and the slots.
 pub(crate) struct Door {
+    // Fields are destroyed in declaration order. Keeping the election last
+    // ensures every normal drop closes the Tokio listener before another
+    // daemon can acquire authority.
     listener: UnixListener,
     slots: Arc<Semaphore>,
     sock: std::path::PathBuf,
     /// The `flock(2)` that makes this the only daemon on this home. Never
     /// read; it is released when this process dies, whichever way it dies.
-    _lock: std::fs::File,
+    _election: ipc::Election,
 }
 
 impl Door {
     /// Win the election, bind, and be ready to accept.
     pub(crate) fn open(home: &std::path::Path, sock: &std::path::Path) -> Result<Door> {
-        let (listener, lock, sock) = ipc::Door::open(home, sock)?.into_parts();
-        listener
+        let door = ipc::Door::open(home, sock)?;
+        door.listener()
             .set_nonblocking(true)
             .context("putting the astd socket in non-blocking mode")?;
+        let (listener, election, sock) = door.into_parts();
         let listener = UnixListener::from_std(listener)
             .with_context(|| format!("serving {}", sock.display()))?;
         Ok(Door {
             listener,
             slots: Arc::new(Semaphore::new(ipc::MAX_CONNECTIONS)),
             sock,
-            _lock: lock,
+            _election: election,
         })
     }
 
