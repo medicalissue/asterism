@@ -240,6 +240,16 @@ async fn main() -> Result<()> {
 
     volume::adopt_export_identities().await;
 
+    // A target rename can reach disk before its shard row.  Reconcile that
+    // durable receipt and replay grant activation before accepting any
+    // request, otherwise a restarted coordinator may reopen the still-fenced
+    // source or select a collision.  Stopped moved rows are included: persist
+    // resurrection only visits Running guests.
+    {
+        let mut shard = node.shard.lock().await;
+        swap::reconcile_startup(&mut shard).await?;
+    }
+
     // What this device was running, it runs again — before the first
     // request is served, and then continuously (see `persist`).
     persist::resurrect(&node.shard).await?;

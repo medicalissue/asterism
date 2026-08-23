@@ -1389,17 +1389,13 @@ impl Mesh {
 
     /// Which device holds the row for `name`, if any reachable one does.
     pub async fn locate(self: &Arc<Self>, name: &str) -> Result<Option<String>> {
-        Ok(self
-            .find(name)
-            .await
-            .into_iter()
-            // A fenced source is a recovery record, never current authority.
-            // Do not compare epochs across different instance IDs here: those
-            // are name collisions and must remain conflicts for the normal
-            // collision resolver rather than being silently selected away.
-            .filter(|(_, instance)| instance.moving.is_none())
-            .next()
-            .map(|(device, _)| device))
+        authority_device(name, self.find(name).await)
+    }
+
+    /// Reachable peer rows for one name.  Move recovery combines these with
+    /// its local shard so the same collision rule applies to the whole orbit.
+    pub async fn holders(self: &Arc<Self>, name: &str) -> Vec<(String, Instance)> {
+        self.find(name).await
     }
 
     /// Find the fenced source that still owes a durable revoke after `target`
@@ -2592,6 +2588,30 @@ impl Mesh {
              (home relay {relays}) — ASTERISM_MESH=local opts out"
         );
     }
+}
+
+/// Same-name rows with distinct instance IDs are a collision, never a move.
+/// Same-ID copies are ordered by move epoch; a fenced source loses to a
+/// published target at the same epoch.
+pub(crate) fn authority_device(
+    name: &str,
+    mut hits: Vec<(String, Instance)>,
+) -> Result<Option<String>> {
+    let Some((_, first)) = hits.first() else {
+        return Ok(None);
+    };
+    if hits.iter().any(|(_, instance)| instance.id != first.id) {
+        bail!(
+            "instance name {name:?} is held by distinct instance IDs; resolve the name collision before locating it"
+        );
+    }
+    hits.sort_by(|(left_device, left), (right_device, right)| {
+        left.move_epoch
+            .cmp(&right.move_epoch)
+            .then_with(|| left.moving.is_none().cmp(&right.moving.is_none()))
+            .then_with(|| left_device.cmp(right_device))
+    });
+    Ok(hits.pop().map(|(device, _)| device))
 }
 
 /// Which rows in an assembled view lost a name collision, and which device
@@ -5551,6 +5571,62 @@ mod tests {
             1,
             "that one is the rename case"
         );
+    }
+
+    #[test]
+    fn locate_rejects_distinct_instance_ids_sharing_a_name() {
+        let mut left = Instance::new(
+            "dev",
+            "laptop",
+            "debian:13",
+            Default::default(),
+            test_machine(),
+        );
+        let mut right = Instance::new(
+            "dev",
+            "desktop",
+            "debian:13",
+            Default::default(),
+            test_machine(),
+        );
+        left.id = "aaaa".into();
+        right.id = "bbbb".into();
+        let err = authority_device(
+            "dev",
+            vec![("laptop".into(), left), ("desktop".into(), right)],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("distinct instance IDs"), "{err}");
+    }
+
+    #[test]
+    fn locate_prefers_the_unfenced_higher_epoch_of_the_same_id() {
+        let mut source = Instance::new(
+            "dev",
+            "laptop",
+            "debian:13",
+            Default::default(),
+            test_machine(),
+        );
+        source.id = "same".into();
+        source.move_epoch = 2;
+        source.moving = Some(asterism_core::instance::Moving {
+            to_device: "desktop".into(),
+            epoch: 3,
+            started_at: 0,
+        });
+        let mut target = source.clone();
+        target.cpu_device = "desktop".into();
+        target.move_epoch = 3;
+        target.moving = None;
+        let device = authority_device(
+            "dev",
+            vec![("laptop".into(), source), ("desktop".into(), target)],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(device, "desktop");
     }
 
     #[test]
