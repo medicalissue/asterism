@@ -30,10 +30,9 @@
 #
 #   * the BYTES are the published bytes — the sha256 of what landed in the
 #     prefix appears in the SHA256SUMS that came with it;
-#   * the BUILD is one build — `ast`, `astd`, the vz helper and, when it is
-#     installed, the desktop app all report the same immutable build id. A
-#     tarball assembled from two builds passes a digest check and fails this
-#     one.
+#   * the BUILD is one build — `ast`, `astd`, and the vz helper all report
+#     the same immutable build id. A tarball assembled from two builds
+#     passes a digest check and fails this one.
 #
 # The cache the image lanes pull through is shared between runs and lives
 # under ~/.cache, not ~/.asterism: a base image is a gigabyte and a harness
