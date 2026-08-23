@@ -187,6 +187,13 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
                 // The instance directory goes below, and this instance's CA
                 // private key is in it.
                 egress::stop(&inst.name);
+                if inst.runtime == RuntimeKind::Container {
+                    if let Err(error) = crate::container::remove(&inst) {
+                        return attach_response(Err(error).context(
+                            "container removal refused until its isolation boundary is gone",
+                        ));
+                    }
+                }
             }
             reg.remove(&name).inspect(|inst| {
                 persist::forget(&inst.name);
@@ -344,8 +351,15 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
         // A file on this device's disk, read here rather than by the CLI, so
         // that the answer is the same whoever asked and from wherever.
         Request::Logs { name, lines } => {
-            return match reg.get(&name).map(|i| i.name.clone()) {
-                Ok(name) => match console_tail(&name, lines) {
+            return match reg.get(&name) {
+                Ok(instance) => match instance
+                    .handle
+                    .as_ref()
+                    .filter(|_| instance.runtime == RuntimeKind::Container)
+                    .map_or_else(
+                        || console_tail(&instance.name, lines),
+                        |handle| crate::container::logs(handle, &instance.name, lines),
+                    ) {
                     Ok((text, truncated)) => Response::Log { text, truncated },
                     Err(e) => Response::Error {
                         message: format!("{e:#}"),

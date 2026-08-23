@@ -1,13 +1,18 @@
 //! Native container runtime boundary.
 //!
 //! Linux uses a rootless user/mount/pid/network namespace plus a delegated
-//! cgroup-v2 leaf. The namespace holder exposes one private Unix control
-//! socket for state, exec and stop. Other hosts have typed adapters that
-//! refuse until their managed utility-VM implementation exists.
+//! cgroup-v2 leaf. Windows uses a managed Linux utility VM over an identity-
+//! checked point-to-point Hyper-V socket. Both implement the same typed lifecycle and
+//! neither invents an SSH or Docker endpoint.
 
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(unix)]
+use std::io::{BufRead, BufReader};
+use std::io::{Read, Write};
+#[cfg(target_os = "linux")]
+use std::os::unix::net::UnixListener;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -16,7 +21,8 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use asterism_core::hv::{
-    ContainerControlEndpoint, ControlChannel, Handle, ImageKind, Machine, RunState,
+    ContainerControlEndpoint, ContainerControlTransport, ContainerIsolation, ControlChannel,
+    Handle, ImageKind, Machine, RunState,
 };
 use asterism_core::instance::{Instance, RuntimeKind};
 use asterism_core::proc::{ProcId, Signal};
@@ -25,11 +31,60 @@ use asterism_core::{paths, tools};
 pub const LINUX_ID: &str = "linux-rootless";
 pub const MACOS_ID: &str = "macos-vz-container-utility-vm";
 pub const WINDOWS_ID: &str = "windows-hyperv-container-utility-vm";
+#[cfg(target_os = "linux")]
 const MAX_EXEC_OUTPUT: usize = 1024 * 1024;
+
+mod windows_hyperv;
 
 trait Adapter: Send + Sync {
     fn id(&self) -> &'static str;
     fn probe(&self) -> Result<Machine>;
+
+    fn prepare(&self, _inst: &Instance) -> Result<Prepared> {
+        bail!(
+            "the {} container adapter cannot prepare an instance on this host",
+            self.id()
+        )
+    }
+
+    fn start(&self, _prepared: &Prepared) -> Result<Handle> {
+        bail!(
+            "the {} container adapter cannot start an instance on this host",
+            self.id()
+        )
+    }
+
+    fn state(&self, _handle: &Handle) -> Result<RunState> {
+        bail!(
+            "the {} container adapter cannot inspect an instance on this host",
+            self.id()
+        )
+    }
+
+    fn stop(&self, _handle: &Handle, _deadline: Duration) -> Result<()> {
+        bail!(
+            "the {} container adapter cannot stop an instance on this host",
+            self.id()
+        )
+    }
+
+    fn exec(&self, _handle: &Handle, _argv: Vec<String>) -> Result<(i32, String, String)> {
+        bail!(
+            "the {} container adapter cannot exec on this host",
+            self.id()
+        )
+    }
+
+    fn logs(&self, _handle: &Handle, _name: &str, _lines: u32) -> Result<(String, bool)> {
+        bail!(
+            "the {} container adapter cannot read logs on this host",
+            self.id()
+        )
+    }
+
+    fn remove(&self, _inst: &Instance) -> Result<()> {
+        Ok(())
+    }
 }
 
 struct LinuxRootless;
@@ -68,6 +123,30 @@ impl Adapter for LinuxRootless {
         #[cfg(not(target_os = "linux"))]
         bail!("the {LINUX_ID} adapter is unavailable on this host")
     }
+
+    fn prepare(&self, inst: &Instance) -> Result<Prepared> {
+        linux_prepare(inst)
+    }
+
+    fn start(&self, prepared: &Prepared) -> Result<Handle> {
+        linux_start(prepared)
+    }
+
+    fn state(&self, handle: &Handle) -> Result<RunState> {
+        linux_state(handle)
+    }
+
+    fn stop(&self, handle: &Handle, deadline: Duration) -> Result<()> {
+        linux_stop(handle, deadline)
+    }
+
+    fn exec(&self, handle: &Handle, argv: Vec<String>) -> Result<(i32, String, String)> {
+        linux_exec(handle, argv)
+    }
+
+    fn logs(&self, _handle: &Handle, name: &str, lines: u32) -> Result<(String, bool)> {
+        tail_log(&paths::instance_dir(name).join("console.log"), lines)
+    }
 }
 
 impl Adapter for MacosVzUtilityVm {
@@ -86,7 +165,35 @@ impl Adapter for WindowsHyperVUtilityVm {
     }
 
     fn probe(&self) -> Result<Machine> {
-        bail!("the {} adapter is typed but unsupported: the managed Hyper-V utility VM lifecycle is not implemented", self.id())
+        windows_hyperv::probe()
+    }
+
+    fn prepare(&self, inst: &Instance) -> Result<Prepared> {
+        windows_hyperv::prepare(inst)
+    }
+
+    fn start(&self, prepared: &Prepared) -> Result<Handle> {
+        windows_hyperv::start(prepared)
+    }
+
+    fn state(&self, handle: &Handle) -> Result<RunState> {
+        windows_hyperv::state(handle)
+    }
+
+    fn stop(&self, handle: &Handle, deadline: Duration) -> Result<()> {
+        windows_hyperv::stop(handle, deadline)
+    }
+
+    fn exec(&self, handle: &Handle, argv: Vec<String>) -> Result<(i32, String, String)> {
+        windows_hyperv::exec(handle, argv)
+    }
+
+    fn logs(&self, handle: &Handle, name: &str, lines: u32) -> Result<(String, bool)> {
+        windows_hyperv::logs(handle, name, lines)
+    }
+
+    fn remove(&self, inst: &Instance) -> Result<()> {
+        windows_hyperv::remove(inst)
     }
 }
 
@@ -99,6 +206,15 @@ fn host_adapter() -> &'static dyn Adapter {
     return &WindowsHyperVUtilityVm;
     #[allow(unreachable_code)]
     &MacosVzUtilityVm
+}
+
+fn adapter_for(id: &str) -> Result<&'static dyn Adapter> {
+    match id {
+        LINUX_ID => Ok(&LinuxRootless),
+        MACOS_ID => Ok(&MacosVzUtilityVm),
+        WINDOWS_ID => Ok(&WindowsHyperVUtilityVm),
+        other => bail!("unknown container adapter {other:?}"),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +262,7 @@ enum ControlResponse {
 
 #[derive(Debug)]
 pub struct Prepared {
+    adapter: &'static str,
     spec: PathBuf,
 }
 
@@ -162,15 +279,16 @@ pub fn prepare(inst: &Instance) -> Result<Prepared> {
             host_adapter().id()
         );
     }
-    if host_adapter().id() != LINUX_ID {
-        return host_adapter().probe().map(|_| unreachable!());
-    }
     if inst.runtime != RuntimeKind::Container {
         bail!("instance {:?} is not a container", inst.name);
     }
     if inst.image_kind != ImageKind::OciRootfs {
         bail!("runtime=container requires an OCI image, not a bootable disk image");
     }
+    host_adapter().prepare(inst)
+}
+
+fn linux_prepare(inst: &Instance) -> Result<Prepared> {
     if !inst.publish.is_empty() {
         bail!("rootless container port publishing is unsupported until the slirp control adapter is present; no port was published");
     }
@@ -253,7 +371,10 @@ pub fn prepare(inst: &Instance) -> Result<Prepared> {
         binds,
     };
     fs::write(&spec, serde_json::to_vec_pretty(&value)?)?;
-    Ok(Prepared { spec })
+    Ok(Prepared {
+        adapter: LINUX_ID,
+        spec,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -296,6 +417,10 @@ fn delegated_cgroup(_id: &str, _cpus: u32, _mem_mib: u32) -> Result<PathBuf> {
 }
 
 pub fn start(prepared: &Prepared) -> Result<Handle> {
+    adapter_for(prepared.adapter)?.start(prepared)
+}
+
+fn linux_start(prepared: &Prepared) -> Result<Handle> {
     let spec: Spec = serde_json::from_slice(&fs::read(&prepared.spec)?)?;
     let _ = fs::remove_file(&spec.control);
     let unshare = tools::tool("unshare")?;
@@ -361,27 +486,34 @@ pub fn start(prepared: &Prepared) -> Result<Handle> {
         },
         endpoint: None,
         container_control: Some(ContainerControlEndpoint {
-            socket: spec.control,
-            user_namespace: ns("user"),
-            mount_namespace: ns("mnt"),
-            pid_namespace: ns("pid"),
-            network_namespace: ns("net"),
-            cgroup: spec.cgroup,
+            transport: ContainerControlTransport::UnixSocket { path: spec.control },
+            isolation: ContainerIsolation::LinuxNamespaces {
+                user: ns("user"),
+                mount: ns("mnt"),
+                pid: ns("pid"),
+                network: ns("net"),
+                cgroup: spec.cgroup,
+            },
         }),
         started_at: asterism_core::instance::now_unix(),
     })
 }
 
 pub fn state(handle: &Handle) -> Result<RunState> {
+    adapter_for(&handle.backend)?.state(handle)
+}
+
+fn linux_state(handle: &Handle) -> Result<RunState> {
     let Some(control) = &handle.container_control else {
         bail!("container handle has no container control endpoint");
     };
+    let (socket, cgroup) = linux_endpoint(control)?;
     match call(
-        &control.socket,
+        socket,
         &ControlRequest::Hello,
         Some(Duration::from_secs(1)),
     ) {
-        Ok(ControlResponse::Ready { .. }) if cgroup_populated(&control.cgroup)? => {
+        Ok(ControlResponse::Ready { .. }) if cgroup_populated(cgroup)? => {
             Ok(RunState::Running)
         }
         Ok(ControlResponse::Ready { .. }) => {
@@ -389,31 +521,32 @@ pub fn state(handle: &Handle) -> Result<RunState> {
         }
         Ok(ControlResponse::Error { message }) => bail!(message),
         Ok(_) => bail!("container control returned the wrong response to a liveness probe"),
-        Err(error) if cgroup_populated(&control.cgroup)? => Err(error).context(
+        Err(error) if cgroup_populated(cgroup)? => Err(error).context(
             "container cgroup is populated but its control channel is unavailable; refusing to declare it stopped",
         ),
         Err(_) => {
-            let _ = fs::remove_file(&control.socket);
-            let _ = fs::remove_dir(&control.cgroup);
+            let _ = fs::remove_file(socket);
+            let _ = fs::remove_dir(cgroup);
             Ok(RunState::Stopped)
         }
     }
 }
 
 pub fn stop(handle: &Handle, deadline: Duration) -> Result<()> {
+    adapter_for(&handle.backend)?.stop(handle, deadline)
+}
+
+fn linux_stop(handle: &Handle, deadline: Duration) -> Result<()> {
     let control = handle
         .container_control
         .as_ref()
         .context("container handle has no control endpoint")?;
-    let _ = call(
-        &control.socket,
-        &ControlRequest::Stop,
-        Some(Duration::from_secs(2)),
-    )?;
+    let (socket, cgroup) = linux_endpoint(control)?;
+    let _ = call(socket, &ControlRequest::Stop, Some(Duration::from_secs(2)))?;
     let until = Instant::now() + deadline;
     while Instant::now() < until {
-        if !cgroup_populated(&control.cgroup)? {
-            let _ = fs::remove_dir(&control.cgroup);
+        if !cgroup_populated(cgroup)? {
+            let _ = fs::remove_dir(cgroup);
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -422,8 +555,8 @@ pub fn stop(handle: &Handle, deadline: Duration) -> Result<()> {
         proc.signal(Signal::Kill)?;
         let killed = Instant::now() + Duration::from_secs(5);
         while Instant::now() < killed {
-            if !cgroup_populated(&control.cgroup)? {
-                let _ = fs::remove_dir(&control.cgroup);
+            if !cgroup_populated(cgroup)? {
+                let _ = fs::remove_dir(cgroup);
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(25));
@@ -433,6 +566,10 @@ pub fn stop(handle: &Handle, deadline: Duration) -> Result<()> {
 }
 
 pub fn exec(handle: &Handle, argv: Vec<String>) -> Result<(i32, String, String)> {
+    adapter_for(&handle.backend)?.exec(handle, argv)
+}
+
+fn linux_exec(handle: &Handle, argv: Vec<String>) -> Result<(i32, String, String)> {
     if argv.is_empty() {
         bail!("container exec needs a command");
     }
@@ -440,7 +577,8 @@ pub fn exec(handle: &Handle, argv: Vec<String>) -> Result<(i32, String, String)>
         .container_control
         .as_ref()
         .context("container handle has no control endpoint")?;
-    match call(&control.socket, &ControlRequest::Exec { argv }, None)? {
+    let (socket, _) = linux_endpoint(control)?;
+    match call(socket, &ControlRequest::Exec { argv }, None)? {
         ControlResponse::Exec {
             status,
             stdout,
@@ -451,6 +589,27 @@ pub fn exec(handle: &Handle, argv: Vec<String>) -> Result<(i32, String, String)>
     }
 }
 
+pub fn logs(handle: &Handle, name: &str, lines: u32) -> Result<(String, bool)> {
+    adapter_for(&handle.backend)?.logs(handle, name, lines)
+}
+
+pub fn remove(inst: &Instance) -> Result<()> {
+    adapter_for(&inst.machine.backend)?.remove(inst)
+}
+
+fn linux_endpoint(control: &ContainerControlEndpoint) -> Result<(&Path, &Path)> {
+    let socket = match &control.transport {
+        ContainerControlTransport::UnixSocket { path } => path.as_path(),
+        _ => bail!("Linux container handle does not carry a Unix control socket"),
+    };
+    let cgroup = match &control.isolation {
+        ContainerIsolation::LinuxNamespaces { cgroup, .. } => cgroup.as_path(),
+        _ => bail!("Linux container handle does not carry namespace isolation"),
+    };
+    Ok((socket, cgroup))
+}
+
+#[cfg(unix)]
 fn call(
     socket: &Path,
     request: &ControlRequest,
@@ -464,6 +623,15 @@ fn call(
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line)?;
     Ok(serde_json::from_str(&line)?)
+}
+
+#[cfg(not(unix))]
+fn call(
+    _socket: &Path,
+    _request: &ControlRequest,
+    _timeout: Option<Duration>,
+) -> Result<ControlResponse> {
+    bail!("Unix container control sockets are unavailable on this host")
 }
 
 fn cgroup_populated(cgroup: &Path) -> Result<bool> {
@@ -483,6 +651,7 @@ fn cgroup_populated(cgroup: &Path) -> Result<bool> {
 }
 
 /// Entry point invoked only under `unshare`; never starts the daemon.
+#[cfg(target_os = "linux")]
 pub fn helper_main(spec_path: &Path) -> Result<()> {
     let spec: Spec = serde_json::from_slice(&fs::read(spec_path)?)?;
     let _ = fs::remove_file(&spec.control);
@@ -561,6 +730,12 @@ pub fn helper_main(spec_path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "linux"))]
+pub fn helper_main(_spec_path: &Path) -> Result<()> {
+    bail!("the namespace container helper runs only on Linux")
+}
+
+#[cfg(target_os = "linux")]
 fn spawn(
     argv: &[String],
     env: &[String],
@@ -598,6 +773,7 @@ fn spawn(
         .with_context(|| format!("executing {program:?} in the container"))
 }
 
+#[cfg(target_os = "linux")]
 fn wait_bounded(mut child: std::process::Child) -> Result<(i32, String, String)> {
     let stdout = child
         .stdout
@@ -635,6 +811,7 @@ fn wait_bounded(mut child: std::process::Child) -> Result<(i32, String, String)>
 /// Resolve a guest mount point without following image-controlled symlinks.
 /// A malicious rootfs must not turn `/data` into a host path before the bind
 /// happens, even though the bind itself is private to the mount namespace.
+#[cfg(any(target_os = "linux", test))]
 fn safe_mount_target(rootfs: &Path, guest: &Path) -> Result<PathBuf> {
     use std::path::Component;
     if !guest.is_absolute() {
@@ -674,6 +851,7 @@ fn safe_mount_target(rootfs: &Path, guest: &Path) -> Result<PathBuf> {
     Ok(target)
 }
 
+#[cfg(target_os = "linux")]
 fn bind_device(rootfs: &Path, name: &str) -> Result<()> {
     let dev = safe_mount_target(rootfs, Path::new("/dev"))?;
     let target = dev.join(name);
@@ -704,11 +882,6 @@ fn chroot(root: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
-fn chroot(_root: &Path) -> Result<()> {
-    bail!("container helper is Linux-only")
-}
-
 #[cfg(target_os = "linux")]
 fn bind_mount(source: &Path, target: &Path) -> Result<()> {
     use std::ffi::CString;
@@ -731,11 +904,6 @@ fn bind_mount(source: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
-fn bind_mount(_source: &Path, _target: &Path) -> Result<()> {
-    bail!("container bind mounts are Linux-only")
-}
-
 #[cfg(target_os = "linux")]
 fn mount_proc() -> Result<()> {
     let result = unsafe {
@@ -754,11 +922,7 @@ fn mount_proc() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
-fn mount_proc() -> Result<()> {
-    bail!("container proc mount is Linux-only")
-}
-
+#[cfg(target_os = "linux")]
 fn host_pid() -> Result<u32> {
     let status = fs::read_to_string("/proc/self/status")?;
     status
@@ -770,6 +934,42 @@ fn host_pid() -> Result<u32> {
         .context("parsing the namespace holder's host pid")
 }
 
+const LOG_TAIL_BYTES: u64 = 4 * 1024 * 1024;
+
+fn tail_log(path: &Path, lines: u32) -> Result<(String, bool)> {
+    use std::io::{Seek, SeekFrom};
+
+    let mut file = fs::File::open(path).with_context(|| {
+        format!(
+            "no container log at {} yet — `ast up` starts one",
+            path.display()
+        )
+    })?;
+    let size = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    let from = size.saturating_sub(LOG_TAIL_BYTES);
+    let mut clipped = from > 0;
+    if clipped {
+        file.seek(SeekFrom::Start(from))?;
+    }
+    let mut bytes = Vec::new();
+    file.take(LOG_TAIL_BYTES).read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let text = if clipped {
+        text.split_once('\n')
+            .map(|(_, rest)| rest.to_owned())
+            .unwrap_or_default()
+    } else {
+        text
+    };
+    if lines == 0 {
+        return Ok((text, clipped));
+    }
+    let all: Vec<&str> = text.lines().collect();
+    let keep = all.len().min(lines as usize);
+    clipped |= keep < all.len();
+    Ok((all[all.len() - keep..].join("\n"), clipped))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -777,12 +977,16 @@ mod tests {
     #[test]
     fn control_wire_has_no_tcp_or_ssh_placeholder() {
         let endpoint = ContainerControlEndpoint {
-            socket: "/run/user/1000/asterism/dev/container-control.sock".into(),
-            user_namespace: "/proc/42/ns/user".into(),
-            mount_namespace: "/proc/42/ns/mnt".into(),
-            pid_namespace: "/proc/42/ns/pid".into(),
-            network_namespace: "/proc/42/ns/net".into(),
-            cgroup: "/sys/fs/cgroup/user.slice/asterism-dev".into(),
+            transport: ContainerControlTransport::UnixSocket {
+                path: "/run/user/1000/asterism/dev/container-control.sock".into(),
+            },
+            isolation: ContainerIsolation::LinuxNamespaces {
+                user: "/proc/42/ns/user".into(),
+                mount: "/proc/42/ns/mnt".into(),
+                pid: "/proc/42/ns/pid".into(),
+                network: "/proc/42/ns/net".into(),
+                cgroup: "/sys/fs/cgroup/user.slice/asterism-dev".into(),
+            },
         };
         let wire = serde_json::to_string(&endpoint).unwrap();
         assert!(wire.contains("container-control.sock"));
@@ -793,35 +997,44 @@ mod tests {
     #[test]
     fn container_handle_uses_only_the_typed_control_endpoint() {
         let control = ContainerControlEndpoint {
-            socket: "/run/user/1000/asterism/dev/container-control.sock".into(),
-            user_namespace: "/proc/42/ns/user".into(),
-            mount_namespace: "/proc/42/ns/mnt".into(),
-            pid_namespace: "/proc/42/ns/pid".into(),
-            network_namespace: "/proc/42/ns/net".into(),
-            cgroup: "/sys/fs/cgroup/user.slice/asterism-dev".into(),
+            transport: ContainerControlTransport::UnixSocket {
+                path: "/run/user/1000/asterism/dev/container-control.sock".into(),
+            },
+            isolation: ContainerIsolation::LinuxNamespaces {
+                user: "/proc/42/ns/user".into(),
+                mount: "/proc/42/ns/mnt".into(),
+                pid: "/proc/42/ns/pid".into(),
+                network: "/proc/42/ns/net".into(),
+                cgroup: "/sys/fs/cgroup/user.slice/asterism-dev".into(),
+            },
         };
         let handle = Handle {
             backend: LINUX_ID.into(),
             pid: Some(42),
             proc: None,
             ctl: ControlChannel::Rpc {
-                path: control.socket.clone(),
+                path: "/run/user/1000/asterism/dev/container-control.sock".into(),
             },
             endpoint: None,
             container_control: Some(control),
             started_at: 1,
         };
         assert!(handle.endpoint.is_none());
-        assert_eq!(handle.ctl.path(), handle.container_control.unwrap().socket);
+        let endpoint = handle.container_control.unwrap();
+        let ContainerControlTransport::UnixSocket { path } = endpoint.transport else {
+            panic!("Linux handle lost its Unix control transport")
+        };
+        assert_eq!(handle.ctl.path(), path);
     }
 
     #[test]
-    fn unsupported_platform_adapters_are_named_contracts() {
+    fn platform_adapters_are_named_contracts() {
         let macos: &dyn Adapter = &MacosVzUtilityVm;
         let windows: &dyn Adapter = &WindowsHyperVUtilityVm;
         assert_eq!(macos.id(), "macos-vz-container-utility-vm");
         assert_eq!(windows.id(), "windows-hyperv-container-utility-vm");
         assert!(macos.probe().is_err());
+        #[cfg(not(target_os = "windows"))]
         assert!(windows.probe().is_err());
     }
 

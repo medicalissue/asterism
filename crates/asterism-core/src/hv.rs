@@ -225,19 +225,49 @@ pub enum GuestEndpoint {
     GuestAddr { addr: IpAddr },
 }
 
+/// How the daemon reaches a container's private lifecycle agent.
+///
+/// Neither transport is a user-facing network endpoint. Linux has a local
+/// Unix socket. A Windows utility VM has a point-to-point Hyper-V socket whose
+/// VM and service GUIDs identify both ends without allocating a TCP port.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ContainerControlTransport {
+    UnixSocket { path: PathBuf },
+    HyperVSocket { vm_id: String, service_id: String },
+}
+
+/// The isolation boundary which owns a container control endpoint.
+///
+/// These are deliberately typed rather than filling the Linux namespace
+/// fields with made-up Windows paths. Callers can therefore prove that the
+/// answering control agent is inside the isolation boundary recorded at boot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ContainerIsolation {
+    LinuxNamespaces {
+        user: PathBuf,
+        mount: PathBuf,
+        pid: PathBuf,
+        network: PathBuf,
+        cgroup: PathBuf,
+    },
+    UtilityVm {
+        vm_id: String,
+        config: PathBuf,
+        rootfs: PathBuf,
+    },
+}
+
 /// The private control plane for a native container.
 ///
 /// This is intentionally not a [`GuestEndpoint`]. A container has no SSH
-/// listener to invent: readiness means this Unix socket answers from the
-/// process holding the recorded namespaces and delegated cgroup.
+/// listener to invent: readiness means this endpoint answers from the
+/// recorded namespace or utility-VM isolation boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContainerControlEndpoint {
-    pub socket: PathBuf,
-    pub user_namespace: PathBuf,
-    pub mount_namespace: PathBuf,
-    pub pid_namespace: PathBuf,
-    pub network_namespace: PathBuf,
-    pub cgroup: PathBuf,
+    pub transport: ContainerControlTransport,
+    pub isolation: ContainerIsolation,
 }
 
 impl GuestEndpoint {
