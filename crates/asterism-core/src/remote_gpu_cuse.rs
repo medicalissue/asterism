@@ -7,8 +7,10 @@
 //! binding a socket is.
 
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -347,15 +349,21 @@ fn unique_devname() -> String {
 fn wait_for_node(path: &Path) -> io::Result<()> {
     let until = std::time::Instant::now() + Duration::from_secs(2);
     while std::time::Instant::now() < until {
-        if path.exists() {
+        let accessible = CString::new(path.as_os_str().as_bytes()).is_ok_and(|path| unsafe {
+            libc::access(path.as_ptr(), libc::R_OK | libc::W_OK) == 0
+        });
+        if path.exists() && accessible {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(10));
     }
-    // The kernel may have allocated a device without udev publishing the
-    // node yet. The guest path is already a symlink target; opening it later
-    // will fail loudly if the node never appears.
-    Ok(())
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "CUSE node {} was not published read/write for the guest service identity",
+            path.display()
+        ),
+    ))
 }
 
 fn read_one_request(dev: &mut File) -> io::Result<(u32, u32, u64)> {

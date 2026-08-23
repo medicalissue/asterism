@@ -1,1 +1,2 @@
 KERNEL=="cuse", SUBSYSTEM=="misc", GROUP="asterism-gpu", MODE="0660"
+KERNEL=="asterism-n0-*", GROUP="asterism-gpu", MODE="0660"

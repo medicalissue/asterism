@@ -1812,6 +1812,7 @@ mod tests {
         assert!(cloud.contains("User=asterism-gpu"));
         assert!(cloud.contains("Group=asterism-gpu"));
         assert!(cloud.contains(GUEST_CUSE_UDEV_RULE.trim()));
+        assert!(cloud.contains("KERNEL==\"asterism-n0-*\""));
         assert!(cloud.contains("DeviceAllow=/dev/cuse rw"));
         assert!(cloud.contains("CapabilityBoundingSet="));
         assert!(!cloud.contains("MODE=\"0666\""));
