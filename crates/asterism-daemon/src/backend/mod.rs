@@ -4,7 +4,7 @@
 //! Backends are stateless and per-host; per-instance state lives in
 //! `~/.asterism/instances/<name>/`. Everything else in the daemon holds
 //! `&dyn Hypervisor` and gates on [`Caps`](asterism_core::hv::Caps), so
-//! adding a third backend is a change to [`by_id`] and nothing else.
+//! adding a third backend is a change to [`by_id`] and the default order.
 //!
 //! Which backend runs an instance is decided **once, at create**, and
 //! recorded on the instance ([`asterism_core::hv::Machine`]). Two things
@@ -21,6 +21,7 @@ use asterism_core::instance::{Instance, PortForward};
 use asterism_core::proc::{Evidence, Ownership, ProcId};
 use asterism_core::{image, paths, profile, seed};
 
+pub mod chv;
 pub mod qemu;
 pub mod qmp;
 pub mod vz;
@@ -36,8 +37,23 @@ mod conformance;
 fn backends() -> &'static [Arc<dyn Hypervisor>] {
     static BACKENDS: OnceLock<Vec<Arc<dyn Hypervisor>>> = OnceLock::new();
     BACKENDS
-        .get_or_init(|| vec![Arc::new(qemu::Qemu::new()), Arc::new(vz::Vz::new())])
+        .get_or_init(|| {
+            vec![
+                Arc::new(vz::Vz::new()),
+                Arc::new(chv::Chv::new()),
+                Arc::new(qemu::Qemu::new()),
+            ]
+        })
         .as_slice()
+}
+
+/// Default create order: native product backend first, QEMU last.
+///
+/// VZ is the Mac path. Cloud Hypervisor is the Linux path. QEMU is the
+/// explicit compatibility backend on both and is never selected ahead of a
+/// native backend that can run the request.
+fn default_backend_ids() -> &'static [&'static str] {
+    &[vz::ID, chv::ID, qemu::ID]
 }
 
 /// A backend by its stable id, or the list of the ones that exist.
@@ -151,11 +167,11 @@ fn select_with(
         });
     }
 
-    // VZ is the lightest path on a capable host. Capability mismatches are
-    // ordinary reasons to try QEMU: OCI direct boot, loopback publishing and
-    // qcow2 base images all need facilities VZ does not currently expose.
+    // Native product backends first. Capability or probe mismatches fall
+    // through: OCI direct boot, loopback publishing and qcow2 base images
+    // all need facilities VZ does not currently expose, and CHV is Linux-only.
     let mut refusals = Vec::new();
-    for id in [vz::ID, qemu::ID] {
+    for &id in default_backend_ids() {
         match resolve(id).and_then(|hv| runnable(hv, requirements)) {
             Ok(selection) => return Ok(selection),
             Err(error) => refusals.push(format!("{id}: {error:#}")),
@@ -170,8 +186,9 @@ fn select_with(
 /// Select and probe the backend for a create request.
 ///
 /// An explicit `--backend` is forced: its own probe or capability refusal is
-/// returned. The default tries the fastest/lightest capable backend now — VZ
-/// first, then QEMU — and returns both reasons if neither can run the request.
+/// returned. The default tries the fastest/lightest capable backend now — VZ,
+/// then Cloud Hypervisor, then QEMU — and returns every reason if none can
+/// run the request.
 pub fn select_for(requested: Option<&str>, requirements: CreateRequirements) -> Result<Machine> {
     select_with(requested, requirements, by_id)
 }
@@ -290,13 +307,7 @@ pub fn image_ref_recording(reference: &str) -> Result<ImageRef> {
 /// all: Virtualization.framework cannot read qcow2.
 fn materialised_image_ref(reference: &str, retain_qcow2: bool) -> Result<ImageRef> {
     let resolved = image::resolve(reference)?;
-    let retain_staged_qcow2 = retain_qcow2
-        && !resolved.path.exists()
-        && resolved
-            .staging
-            .as_ref()
-            .filter(|path| path.exists())
-            .is_some_and(|path| image::detect_format(path).ok() == Some(DiskFormat::Qcow2));
+    let retain_staged_qcow2 = retain_qcow2 && resolved.verified_qcow2_staging().is_some();
     if !retain_staged_qcow2 && resolved.materialise()? {
         eprintln!("astd: converted {} to a raw base image", resolved.name);
     }
@@ -453,12 +464,17 @@ const QEMU_EXECS: &[&str] = &["qemu-system-*"];
 /// (and its helper moved) while the guest kept running.
 const VZ_EXECS: &[&str] = &[asterism_vz::HELPER_BIN];
 
+/// The pinned Cloud Hypervisor helper. Matched by name so a daemon upgrade
+/// that moves the binary does not orphan a guest that kept running.
+const CHV_EXECS: &[&str] = &["cloud-hypervisor"];
+
 /// Which executables a handle for this backend may be holding, or `None` for
 /// a backend with no process of its own.
 fn execs_for(backend: &str) -> Option<&'static [&'static str]> {
     match backend {
         qemu::ID => Some(QEMU_EXECS),
         vz::ID => Some(VZ_EXECS),
+        chv::ID => Some(CHV_EXECS),
         _ => None,
     }
 }
@@ -480,12 +496,16 @@ fn execs_for(backend: &str) -> Option<&'static [&'static str]> {
 /// * **the vz helper** is given `--config <dir>/vz.json`, the file that
 ///   tells it which disk to attach and which socket to bind. A helper
 ///   carrying it was started to run this instance and no other.
+/// * **Cloud Hypervisor** is given `--api-socket <dir>/chv-api.sock` (the
+///   handle's control path) and writes `<dir>/chv.pid`. Either names this
+///   instance's VMM and no other.
 fn instance_evidence(inst: &Instance, h: &Handle) -> Vec<std::path::PathBuf> {
     let dir = paths::instance_dir(&inst.name);
     let mut names = vec![h.ctl.path().to_owned()];
     match h.backend.as_str() {
         qemu::ID => names.push(dir.join("qemu.pid")),
         vz::ID => names.push(dir.join("vz.json")),
+        chv::ID => names.push(dir.join("chv.pid")),
         _ => {}
     }
     names
@@ -994,8 +1014,9 @@ mod tests {
         fn each_backend_names_the_programs_it_spawns() {
             assert_eq!(execs_for(qemu::ID), Some(QEMU_EXECS));
             assert_eq!(execs_for(vz::ID), Some(VZ_EXECS));
-            assert_eq!(execs_for("chv"), None);
+            assert_eq!(execs_for(chv::ID), Some(CHV_EXECS));
             assert_eq!(VZ_EXECS, &["astd-vz"]);
+            assert_eq!(CHV_EXECS, &["cloud-hypervisor"]);
         }
 
         /// And what each backend offers as proof. Every path is inside the
@@ -1007,6 +1028,7 @@ mod tests {
             for (backend, expected) in [
                 (qemu::ID, dir.join("qemu.pid")),
                 (vz::ID, dir.join("vz.json")),
+                (chv::ID, dir.join("chv.pid")),
             ] {
                 let h = Handle {
                     backend: backend.into(),
@@ -1151,6 +1173,19 @@ mod tests {
         }
     }
 
+    fn host3(
+        vz: Arc<dyn Hypervisor>,
+        chv: Arc<dyn Hypervisor>,
+        qemu: Arc<dyn Hypervisor>,
+    ) -> impl Fn(&str) -> Result<Arc<dyn Hypervisor>> {
+        move |id| match id {
+            "vz" => Ok(vz.clone()),
+            "chv" => Ok(chv.clone()),
+            "qemu" => Ok(qemu.clone()),
+            other => bail!("unknown backend {other:?}"),
+        }
+    }
+
     fn image(kind: ImageKind) -> ImageRef {
         ImageRef {
             name: "test-image".into(),
@@ -1194,9 +1229,18 @@ mod tests {
     fn backends_are_reached_by_id_and_unknown_ones_are_named() {
         assert_eq!(by_id("qemu").unwrap().id(), "qemu");
         assert_eq!(by_id("vz").unwrap().id(), "vz");
+        assert_eq!(by_id(chv::ID).unwrap().id(), chv::ID);
+        assert_eq!(default_backend_ids(), &[vz::ID, chv::ID, qemu::ID]);
+        assert!(
+            backends().iter().any(|backend| backend.id() == chv::ID),
+            "Linux default cannot resolve CHV unless it is registered"
+        );
         let err = format!("{:#}", by_id("xen").err().expect("no xen backend"));
         assert!(err.contains("xen"), "{err}");
-        assert!(err.contains("qemu") && err.contains("vz"), "{err}");
+        assert!(
+            err.contains("qemu") && err.contains("vz") && err.contains(chv::ID),
+            "{err}"
+        );
     }
 
     /// An OCI image is a filesystem with no bootloader, so it can only be
@@ -1302,6 +1346,61 @@ mod tests {
         assert!(
             error.contains("qemu") && error.contains("qemu missing"),
             "{error}"
+        );
+    }
+
+    /// Linux's product backend is Cloud Hypervisor. VZ is not runnable there,
+    /// and QEMU must not win the default just because it is registered too.
+    #[test]
+    fn linux_default_resolves_chv_ahead_of_qemu() {
+        let vz = fake("vz", Some("the vz backend is macOS-only"), false, false);
+        let chv = fake_reading(
+            "chv",
+            None,
+            true,
+            false,
+            &[DiskFormat::Raw, DiskFormat::Qcow2],
+        );
+        let qemu = fake_reading(
+            "qemu",
+            None,
+            true,
+            true,
+            &[DiskFormat::Raw, DiskFormat::Qcow2],
+        );
+        let disk = image(ImageKind::Disk);
+        let selected = select_with(
+            None,
+            CreateRequirements::new(&disk, &[]),
+            host3(vz.clone(), chv.clone(), qemu.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            selected.backend, "chv",
+            "Linux default must resolve CHV, not QEMU"
+        );
+
+        let qcow2 = local_qcow2();
+        let selected = select_with(
+            None,
+            CreateRequirements::new(&qcow2, &[]),
+            host3(vz.clone(), chv.clone(), qemu.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            selected.backend, "chv",
+            "CHV reads publisher-verified qcow2"
+        );
+
+        let selected = select_with(
+            None,
+            CreateRequirements::new(&disk, &[]),
+            host3(vz, fake("chv", Some("no /dev/kvm"), true, false), qemu),
+        )
+        .unwrap();
+        assert_eq!(
+            selected.backend, "qemu",
+            "QEMU is the compatibility fallback, not the Linux default"
         );
     }
 
@@ -1465,6 +1564,15 @@ mod tests {
         };
         assert_eq!(for_instance(&inst).unwrap().id(), "vz");
         assert_eq!(for_handle("vz").unwrap().id(), "vz");
+
+        inst.machine = Machine {
+            backend: chv::ID.into(),
+            machine_type: "cloud-hypervisor".into(),
+            cpu: "host".into(),
+            hv_version: "53.0".into(),
+        };
+        assert_eq!(for_instance(&inst).unwrap().id(), chv::ID);
+        assert_eq!(for_handle(chv::ID).unwrap().id(), chv::ID);
 
         // VZ exposes the same directory part through virtiofs, so attaching
         // it is valid whether or not this test host can actually probe VZ.
