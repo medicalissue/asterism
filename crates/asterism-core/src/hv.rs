@@ -225,11 +225,14 @@ pub enum GuestEndpoint {
     GuestAddr { addr: IpAddr },
 }
 
-/// The private control plane for a native container.
+/// The private control plane for a container runtime.
 ///
 /// This is intentionally not a [`GuestEndpoint`]. A container has no SSH
-/// listener to invent: readiness means this Unix socket answers from the
-/// process holding the recorded namespaces and delegated cgroup.
+/// listener to invent: readiness means this endpoint answers for the recorded
+/// namespaces and cgroup. `socket` retains its wire-compatible name; it is a
+/// Unix socket for a native adapter and the host side of a private virtiofs
+/// mailbox for a utility-VM adapter. The remaining paths are host namespace
+/// handles in the former case and guest-published descriptors in the latter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContainerControlEndpoint {
     pub socket: PathBuf,

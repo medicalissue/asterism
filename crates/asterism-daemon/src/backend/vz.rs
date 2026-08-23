@@ -162,6 +162,13 @@ pub struct Vz {
     lost_disks: Mutex<HashSet<ProcId>>,
 }
 
+/// Fail-closed checks the container utility-VM adapter reuses: helper
+/// present, not quarantined, and entitled to create a VZ machine.
+pub fn require_signed_helper() -> Result<(PathBuf, String)> {
+    let probe = Probe::run()?;
+    Ok((probe.helper, probe.os_version))
+}
+
 /// What this host can tell us about running VZ guests, worked out once.
 struct Probe {
     /// The signed helper binary.

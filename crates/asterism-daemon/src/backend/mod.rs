@@ -445,7 +445,7 @@ const VZ_EXECS: &[&str] = &[asterism_vz::HELPER_BIN];
 fn execs_for(backend: &str) -> Option<&'static [&'static str]> {
     match backend {
         qemu::ID => Some(QEMU_EXECS),
-        vz::ID => Some(VZ_EXECS),
+        vz::ID | crate::container::MACOS_ID => Some(VZ_EXECS),
         _ => None,
     }
 }
@@ -472,7 +472,7 @@ fn instance_evidence(inst: &Instance, h: &Handle) -> Vec<std::path::PathBuf> {
     let mut names = vec![h.ctl.path().to_owned()];
     match h.backend.as_str() {
         qemu::ID => names.push(dir.join("qemu.pid")),
-        vz::ID => names.push(dir.join("vz.json")),
+        vz::ID | crate::container::MACOS_ID => names.push(dir.join("vz.json")),
         _ => {}
     }
     names
@@ -983,6 +983,7 @@ mod tests {
         fn each_backend_names_the_programs_it_spawns() {
             assert_eq!(execs_for(qemu::ID), Some(QEMU_EXECS));
             assert_eq!(execs_for(vz::ID), Some(VZ_EXECS));
+            assert_eq!(execs_for(crate::container::MACOS_ID), Some(VZ_EXECS));
             assert_eq!(execs_for("chv"), None);
             assert_eq!(VZ_EXECS, &["astd-vz"]);
         }
@@ -996,6 +997,7 @@ mod tests {
             for (backend, expected) in [
                 (qemu::ID, dir.join("qemu.pid")),
                 (vz::ID, dir.join("vz.json")),
+                (crate::container::MACOS_ID, dir.join("vz.json")),
             ] {
                 let h = Handle {
                     backend: backend.into(),

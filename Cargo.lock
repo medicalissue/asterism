@@ -235,6 +235,7 @@ dependencies = [
  "asterism-vz",
  "blake3",
  "bytes",
+ "data-encoding",
  "http",
  "http-body-util",
  "hyper",

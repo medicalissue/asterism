@@ -13,10 +13,11 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use data_encoding::BASE64;
 use serde::{Deserialize, Serialize};
 
 use asterism_core::hv::{
-    ContainerControlEndpoint, ControlChannel, Handle, ImageKind, Machine, RunState,
+    ContainerControlEndpoint, ControlChannel, Handle, Hypervisor, ImageKind, Machine, RunState,
 };
 use asterism_core::instance::{Instance, RuntimeKind};
 use asterism_core::proc::{ProcId, Signal};
@@ -76,7 +77,14 @@ impl Adapter for MacosVzUtilityVm {
     }
 
     fn probe(&self) -> Result<Machine> {
-        bail!("the {} adapter is typed but unsupported: the managed VZ utility VM lifecycle is not implemented", self.id())
+        let (_, os_version) = crate::backend::vz::require_signed_helper()
+            .context("the macOS container utility VM needs the signed VZ helper")?;
+        Ok(Machine {
+            backend: self.id().into(),
+            machine_type: "vz-container-utility-vm".into(),
+            cpu: "host".into(),
+            hv_version: os_version,
+        })
     }
 }
 
@@ -146,7 +154,13 @@ enum ControlResponse {
 
 #[derive(Debug)]
 pub struct Prepared {
-    spec: PathBuf,
+    kind: PreparedKind,
+}
+
+#[derive(Debug)]
+enum PreparedKind {
+    Linux { spec: PathBuf },
+    MacosVz { config: PathBuf, mailbox: PathBuf },
 }
 
 pub fn machine() -> Result<Machine> {
@@ -161,9 +175,6 @@ pub fn prepare(inst: &Instance) -> Result<Prepared> {
             inst.machine.backend,
             host_adapter().id()
         );
-    }
-    if host_adapter().id() != LINUX_ID {
-        return host_adapter().probe().map(|_| unreachable!());
     }
     if inst.runtime != RuntimeKind::Container {
         bail!("instance {:?} is not a container", inst.name);
@@ -182,6 +193,13 @@ pub fn prepare(inst: &Instance) -> Result<Prepared> {
     }
     if !inst.secrets.is_empty() {
         bail!("native container secret egress is unsupported; refusing to start without the requested bindings");
+    }
+
+    if host_adapter().id() == MACOS_ID {
+        return prepare_macos(inst);
+    }
+    if host_adapter().id() != LINUX_ID {
+        return host_adapter().probe().map(|_| unreachable!());
     }
 
     let req = crate::backend::disk_req(inst)?;
@@ -253,7 +271,80 @@ pub fn prepare(inst: &Instance) -> Result<Prepared> {
         binds,
     };
     fs::write(&spec, serde_json::to_vec_pretty(&value)?)?;
-    Ok(Prepared { spec })
+    Ok(Prepared {
+        kind: PreparedKind::Linux { spec },
+    })
+}
+
+fn prepare_macos(inst: &Instance) -> Result<Prepared> {
+    crate::backend::vz::require_signed_helper()
+        .context("the macOS container utility VM needs the signed VZ helper")?;
+    // Keep the probe's path check at preparation time as well as create time:
+    // an upgraded or replaced helper must fail before any guest is spawned.
+    let req = crate::backend::disk_req(inst)?;
+    let vz = crate::backend::vz::Vz::new();
+    let prep = vz.prepare(&req)?;
+    let root = prep.root_path()?.to_owned();
+    let direct = prep
+        .kernel
+        .as_ref()
+        .context("the VZ utility VM needs the verified OCI direct-boot kernel")?;
+
+    let image = asterism_core::oci::instance_config(&req.base.path, &root)?;
+    let shares = asterism_core::seed::shares(inst);
+    let init = asterism_core::oci::container_utility_init(&image, &shares)?;
+    asterism_core::oci::install_init(&root, &init)
+        .context("installing the container utility-VM init")?;
+
+    let mailbox = req.dir.join("container-control");
+    fs::create_dir_all(&mailbox)
+        .with_context(|| format!("creating utility-VM mailbox {}", mailbox.display()))?;
+    reset_mailbox(&mailbox)?;
+
+    let mut vz_shares: Vec<asterism_vz::Share> = shares
+        .iter()
+        .map(|share| asterism_vz::Share {
+            path: PathBuf::from(&share.host_path),
+            tag: share.tag.clone(),
+        })
+        .collect();
+    vz_shares.push(asterism_vz::Share {
+        path: mailbox.clone(),
+        tag: asterism_core::oci::CONTAINER_CONTROL_TAG.into(),
+    });
+
+    let config = asterism_vz::Config {
+        instance: inst.name.clone(),
+        root,
+        seed: req.seed,
+        efi_vars: req.dir.join("efi-vars.bin"),
+        direct_kernel: Some(asterism_vz::LinuxBoot {
+            kernel: direct.kernel.clone(),
+            initrd: direct.initrd.clone(),
+            cmdline: format!(
+                "root=/dev/vda rw console=hvc0 net.ifnames=0 panic=10 init={} asterism.time={}",
+                asterism_core::oci::INIT_PATH,
+                asterism_core::instance::now_unix(),
+            ),
+        }),
+        console: req.console,
+        ctl: paths::vz_socket_path(&inst.name),
+        extra_disks: Vec::new(),
+        shares: vz_shares,
+        cpus: inst.shape.cpus,
+        mem_mib: inst.shape.mem_mib,
+        mac: asterism_vz::mac_for(&inst.name),
+        dhcp_lease_is_endpoint: false,
+        agent_key: None,
+    };
+    let config_path = req.dir.join("vz.json");
+    config.write(&config_path)?;
+    Ok(Prepared {
+        kind: PreparedKind::MacosVz {
+            config: config_path,
+            mailbox,
+        },
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -296,7 +387,11 @@ fn delegated_cgroup(_id: &str, _cpus: u32, _mem_mib: u32) -> Result<PathBuf> {
 }
 
 pub fn start(prepared: &Prepared) -> Result<Handle> {
-    let spec: Spec = serde_json::from_slice(&fs::read(&prepared.spec)?)?;
+    let spec_path = match &prepared.kind {
+        PreparedKind::Linux { spec } => spec,
+        PreparedKind::MacosVz { config, mailbox } => return start_macos(config, mailbox),
+    };
+    let spec: Spec = serde_json::from_slice(&fs::read(spec_path)?)?;
     let _ = fs::remove_file(&spec.control);
     let unshare = tools::tool("unshare")?;
     let exe = std::env::current_exe()?;
@@ -315,7 +410,7 @@ pub fn start(prepared: &Prepared) -> Result<Handle> {
         ])
         .arg(exe)
         .arg("__container-helper")
-        .arg(&prepared.spec)
+        .arg(spec_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -373,6 +468,9 @@ pub fn start(prepared: &Prepared) -> Result<Handle> {
 }
 
 pub fn state(handle: &Handle) -> Result<RunState> {
+    if handle.backend == MACOS_ID {
+        return state_macos(handle);
+    }
     let Some(control) = &handle.container_control else {
         bail!("container handle has no container control endpoint");
     };
@@ -401,6 +499,9 @@ pub fn state(handle: &Handle) -> Result<RunState> {
 }
 
 pub fn stop(handle: &Handle, deadline: Duration) -> Result<()> {
+    if handle.backend == MACOS_ID {
+        return stop_macos(handle, deadline);
+    }
     let control = handle
         .container_control
         .as_ref()
@@ -440,6 +541,21 @@ pub fn exec(handle: &Handle, argv: Vec<String>) -> Result<(i32, String, String)>
         .container_control
         .as_ref()
         .context("container handle has no control endpoint")?;
+    if handle.backend == MACOS_ID {
+        return match utility_call(
+            &control.socket,
+            &ControlRequest::Exec { argv },
+            Duration::from_secs(300),
+        )? {
+            ControlResponse::Exec {
+                status,
+                stdout,
+                stderr,
+            } => Ok((status, stdout, stderr)),
+            ControlResponse::Error { message } => bail!(message),
+            _ => bail!("container utility VM returned the wrong response to exec"),
+        };
+    }
     match call(&control.socket, &ControlRequest::Exec { argv }, None)? {
         ControlResponse::Exec {
             status,
@@ -449,6 +565,195 @@ pub fn exec(handle: &Handle, argv: Vec<String>) -> Result<(i32, String, String)>
         ControlResponse::Error { message } => bail!(message),
         _ => bail!("container control returned the wrong response to exec"),
     }
+}
+
+fn start_macos(config_path: &Path, mailbox: &Path) -> Result<Handle> {
+    const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
+    const BOOT_TIMEOUT: Duration = Duration::from_secs(180);
+
+    let config = asterism_vz::Config::read(config_path)?;
+    let (helper, _) = crate::backend::vz::require_signed_helper()
+        .context("the macOS container utility VM needs the signed VZ helper")?;
+    wait_for_previous_vz_helper(&config.ctl, Duration::from_secs(45))?;
+    reset_mailbox(mailbox)?;
+
+    let log_path = config_path
+        .parent()
+        .context("the VZ config has no instance directory")?
+        .join("vz-helper.log");
+    let log =
+        fs::File::create(&log_path).with_context(|| format!("opening {}", log_path.display()))?;
+    let mut child = Command::new(&helper)
+        .arg("--config")
+        .arg(config_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log.try_clone()?))
+        .stderr(Stdio::from(log))
+        .spawn()
+        .with_context(|| format!("spawning {}", helper.display()))?;
+    let proc = ProcId::capture(child.id()).with_context(|| {
+        format!(
+            "the VZ helper exited immediately; inspect {}",
+            log_path.display()
+        )
+    })?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+
+    let started = Instant::now();
+    let helper_deadline = started + HELPER_TIMEOUT;
+    let boot_deadline = started + BOOT_TIMEOUT;
+    let ready = loop {
+        if !proc.alive() {
+            break Err(anyhow::anyhow!(
+                "the VZ helper exited before the container utility VM became ready; inspect {}",
+                log_path.display()
+            ));
+        }
+        match asterism_vz::info(&config.ctl, Duration::from_secs(1)) {
+            Ok(info) if info.pid != proc.pid => {
+                break Err(anyhow::anyhow!(
+                    "another VZ helper (pid {}) owns {}",
+                    info.pid,
+                    config.ctl.display()
+                ))
+            }
+            Ok(info) if !info.state.is_live() => {
+                break Err(anyhow::anyhow!(
+                    "the VZ helper reports the utility VM as {:?}",
+                    info.state
+                ))
+            }
+            Ok(_) => match utility_call(mailbox, &ControlRequest::Hello, Duration::from_secs(1)) {
+                Ok(ControlResponse::Ready { .. }) if cgroup_populated(mailbox)? => break Ok(()),
+                Ok(ControlResponse::Error { message }) => break Err(anyhow::anyhow!(message)),
+                _ if Instant::now() < boot_deadline => {}
+                _ => {
+                    break Err(anyhow::anyhow!(
+                        "the container utility VM did not establish its mailbox at {}",
+                        mailbox.display()
+                    ))
+                }
+            },
+            Err(_) if Instant::now() >= helper_deadline => {
+                break Err(anyhow::anyhow!(
+                    "the VZ helper never answered on {}; inspect {}",
+                    config.ctl.display(),
+                    log_path.display()
+                ))
+            }
+            Err(_) => {}
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    if let Err(error) = ready {
+        let _ = proc.signal(Signal::Kill);
+        let _ = fs::remove_file(&config.ctl);
+        return Err(error);
+    }
+
+    Ok(Handle {
+        backend: MACOS_ID.into(),
+        pid: Some(proc.pid),
+        proc: Some(proc),
+        ctl: ControlChannel::Rpc { path: config.ctl },
+        endpoint: None,
+        container_control: Some(ContainerControlEndpoint {
+            socket: mailbox.to_owned(),
+            user_namespace: mailbox.join("ns_user"),
+            mount_namespace: mailbox.join("ns_mnt"),
+            pid_namespace: mailbox.join("ns_pid"),
+            network_namespace: mailbox.join("ns_net"),
+            cgroup: mailbox.to_owned(),
+        }),
+        started_at: asterism_core::instance::now_unix(),
+    })
+}
+
+fn state_macos(handle: &Handle) -> Result<RunState> {
+    let control = handle
+        .container_control
+        .as_ref()
+        .context("container handle has no control endpoint")?;
+    let info = match asterism_vz::info(handle.ctl.path(), Duration::from_secs(2)) {
+        Ok(info) => info,
+        Err(error) if handle.owned().is_some_and(|proc| proc.alive()) => {
+            return Err(error).context(
+                "the signed VZ helper is alive but its control channel is unavailable; refusing to declare the container stopped",
+            )
+        }
+        Err(_) => return Ok(RunState::Stopped),
+    };
+    if handle.pid != Some(info.pid) || !info.state.is_live() {
+        return Ok(RunState::Stopped);
+    }
+    match utility_call(
+        &control.socket,
+        &ControlRequest::Hello,
+        Duration::from_secs(1),
+    ) {
+        Ok(ControlResponse::Ready { .. }) if cgroup_populated(&control.cgroup)? => {
+            Ok(RunState::Running)
+        }
+        Ok(ControlResponse::Ready { .. }) => bail!(
+            "the utility-VM control plane answered after its container cgroup became empty"
+        ),
+        Ok(ControlResponse::Error { message }) => bail!(message),
+        Ok(_) => bail!("container utility VM returned the wrong liveness response"),
+        Err(error) => Err(error).context(
+            "the VZ guest is running but its container mailbox is unavailable; refusing to declare it stopped",
+        ),
+    }
+}
+
+fn stop_macos(handle: &Handle, deadline: Duration) -> Result<()> {
+    let control = handle
+        .container_control
+        .as_ref()
+        .context("container handle has no control endpoint")?;
+    let started = Instant::now();
+    let asked = utility_call(
+        &control.socket,
+        &ControlRequest::Stop,
+        Duration::from_secs(3),
+    );
+    if matches!(asked, Ok(ControlResponse::Stopping)) {
+        if let Some(proc) = handle.owned() {
+            let remaining = deadline
+                .checked_sub(started.elapsed())
+                .unwrap_or(Duration::from_millis(100));
+            if proc.wait_gone(remaining) {
+                return Ok(());
+            }
+        }
+    }
+
+    // The mailbox is the normal path. If PID 1 could not answer it, reuse the
+    // signed helper's authenticated shutdown and process-identity escalation.
+    let remaining = deadline
+        .checked_sub(started.elapsed())
+        .unwrap_or(Duration::from_millis(100));
+    crate::backend::vz::Vz::new().stop(handle, remaining)
+}
+
+fn wait_for_previous_vz_helper(ctl: &Path, budget: Duration) -> Result<()> {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        match asterism_vz::info(ctl, Duration::from_secs(1)) {
+            Ok(info) if info.state.is_live() => bail!(
+                "a VZ helper at {} still owns a live utility VM (pid {})",
+                ctl.display(),
+                info.pid
+            ),
+            Ok(_) => std::thread::sleep(Duration::from_millis(100)),
+            Err(_) => {
+                let _ = fs::remove_file(ctl);
+                return Ok(());
+            }
+        }
+    }
+    bail!("the previous VZ helper did not release {}", ctl.display())
 }
 
 fn call(
@@ -464,6 +769,122 @@ fn call(
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line)?;
     Ok(serde_json::from_str(&line)?)
+}
+
+/// Reset only protocol-owned entries in the host/guest virtiofs mailbox.
+/// Volume contents never live here, and a stale reply must never satisfy a
+/// request issued after a daemon or utility-VM restart.
+fn reset_mailbox(mailbox: &Path) -> Result<()> {
+    fs::create_dir_all(mailbox)?;
+    for name in [
+        "in",
+        "out",
+        "boot-ready",
+        "child",
+        "ns_user",
+        "ns_mnt",
+        "ns_pid",
+        "ns_net",
+        "cgroup",
+        "cgroup.events",
+    ] {
+        let path = mailbox.join(name);
+        match fs::remove_dir_all(&path) {
+            Ok(()) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => {
+                fs::remove_file(&path)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+/// One request over the utility VM's virtiofs mailbox.
+///
+/// Requests are published by rename and `go` is written last; replies are
+/// consumed only after the guest writes `done`. The daemon serializes instance
+/// mutations, so this deliberately has no second lock protocol that could be
+/// stranded by a crashed daemon.
+fn utility_call(
+    mailbox: &Path,
+    request: &ControlRequest,
+    timeout: Duration,
+) -> Result<ControlResponse> {
+    let input = mailbox.join("in");
+    let output = mailbox.join("out");
+    let stage = mailbox.join(format!(".in-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&stage);
+    let _ = fs::remove_dir_all(&input);
+    let _ = fs::remove_dir_all(&output);
+    fs::create_dir_all(&stage)?;
+
+    match request {
+        ControlRequest::Hello => fs::write(stage.join("cmd"), "hello\n")?,
+        ControlRequest::Exec { argv } => {
+            fs::write(stage.join("cmd"), "exec\n")?;
+            fs::write(stage.join("n"), format!("{}\n", argv.len()))?;
+            for (index, argument) in argv.iter().enumerate() {
+                if argument.as_bytes().contains(&0) {
+                    bail!("container exec argument {index} contains NUL");
+                }
+                fs::write(
+                    stage.join(index.to_string()),
+                    BASE64.encode(argument.as_bytes()),
+                )?;
+            }
+        }
+        ControlRequest::Stop => fs::write(stage.join("cmd"), "stop\n")?,
+    }
+    fs::write(stage.join("go"), b"go\n")?;
+    fs::rename(&stage, &input)?;
+
+    let deadline = Instant::now() + timeout;
+    while !output.join("done").exists() {
+        if Instant::now() >= deadline {
+            bail!(
+                "container utility VM did not answer {:?} within {:.1}s",
+                request,
+                timeout.as_secs_f64()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let result = fs::read_to_string(output.join("result"))?;
+    let response = match result.trim() {
+        "ready" => ControlResponse::Ready { host_pid: 0 },
+        "exec" => ControlResponse::Exec {
+            status: fs::read_to_string(output.join("status"))?
+                .trim()
+                .parse()
+                .context("parsing utility-VM exec status")?,
+            stdout: read_bounded_file(&output.join("stdout"))?,
+            stderr: read_bounded_file(&output.join("stderr"))?,
+        },
+        "stopping" => ControlResponse::Stopping,
+        "error" => ControlResponse::Error {
+            message: fs::read_to_string(output.join("message"))?
+                .trim()
+                .to_owned(),
+        },
+        other => bail!("container utility VM returned unknown result {other:?}"),
+    };
+    let _ = fs::remove_dir_all(&input);
+    let _ = fs::remove_dir_all(&output);
+    Ok(response)
+}
+
+fn read_bounded_file(path: &Path) -> Result<String> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take((MAX_EXEC_OUTPUT + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_EXEC_OUTPUT {
+        bytes.truncate(MAX_EXEC_OUTPUT);
+        bytes.extend_from_slice(b"\n[output truncated by astd]\n");
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn cgroup_populated(cgroup: &Path) -> Result<bool> {
@@ -816,13 +1237,81 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_platform_adapters_are_named_contracts() {
+    fn platform_adapters_are_named_contracts() {
         let macos: &dyn Adapter = &MacosVzUtilityVm;
         let windows: &dyn Adapter = &WindowsHyperVUtilityVm;
         assert_eq!(macos.id(), "macos-vz-container-utility-vm");
         assert_eq!(windows.id(), "windows-hyperv-container-utility-vm");
-        assert!(macos.probe().is_err());
         assert!(windows.probe().is_err());
+    }
+
+    #[test]
+    fn utility_mailbox_preserves_exec_arguments_and_collects_the_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let mailbox = dir.path().to_owned();
+        let guest_mailbox = mailbox.clone();
+        let guest = std::thread::spawn(move || {
+            let input = guest_mailbox.join("in");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !input.join("go").exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "host never published the request"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(
+                fs::read_to_string(input.join("cmd")).unwrap().trim(),
+                "exec"
+            );
+            assert_eq!(fs::read_to_string(input.join("n")).unwrap().trim(), "2");
+            let decode = |index: usize| {
+                let encoded = fs::read_to_string(input.join(index.to_string())).unwrap();
+                String::from_utf8(BASE64.decode(encoded.as_bytes()).unwrap()).unwrap()
+            };
+            assert_eq!(decode(0), "printf");
+            assert_eq!(decode(1), "line one\nline two\n");
+
+            let output = guest_mailbox.join("out");
+            fs::create_dir(&output).unwrap();
+            fs::write(output.join("status"), "7\n").unwrap();
+            fs::write(output.join("stdout"), "out\n").unwrap();
+            fs::write(output.join("stderr"), "err\n").unwrap();
+            fs::write(output.join("result"), "exec\n").unwrap();
+            fs::write(output.join("done"), "done\n").unwrap();
+        });
+
+        let response = utility_call(
+            &mailbox,
+            &ControlRequest::Exec {
+                argv: vec!["printf".into(), "line one\nline two\n".into()],
+            },
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        guest.join().unwrap();
+        match response {
+            ControlResponse::Exec {
+                status,
+                stdout,
+                stderr,
+            } => {
+                assert_eq!(status, 7);
+                assert_eq!(stdout, "out\n");
+                assert_eq!(stderr, "err\n");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn utility_exec_output_is_bounded_like_native_exec() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("output");
+        fs::write(&path, vec![b'x'; MAX_EXEC_OUTPUT + 100]).unwrap();
+        let text = read_bounded_file(&path).unwrap();
+        assert_eq!(text.matches('x').count(), MAX_EXEC_OUTPUT);
+        assert!(text.ends_with("[output truncated by astd]\n"));
     }
 
     #[test]

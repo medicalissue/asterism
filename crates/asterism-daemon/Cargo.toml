@@ -16,6 +16,7 @@ asterism-mesh.workspace = true
 asterism-vz.workspace = true
 anyhow.workspace = true
 blake3.workspace = true
+data-encoding = "2"
 libc = "0.2"
 # The secrets egress data plane, and every line of it is somebody else's
 # maintained code. Asterism owns the policy — which authority, which handle,
