@@ -44,6 +44,16 @@ use crate::{backend, egress, persist, swap, volume, Node};
 /// safe because the durable intent remains and the next startup retries it.
 const STORAGE_RECOVERY_DEADLINE: Duration = Duration::from_secs(30);
 
+/// The one exclusion window for journal recovery and live mesh mutations.
+///
+/// Reconciliation may wait on a provider, but it must not work on a cloned
+/// shard and assign that stale whole document back after a mesh request has
+/// committed another intent. The bounded deadline keeps this exclusion from
+/// becoming an unbounded startup stall.
+async fn lock_recovery_shard(node: &Node) -> tokio::sync::MutexGuard<'_, Shard> {
+    node.shard.lock().await
+}
+
 /// Answer one request against this device's shard.
 ///
 /// Reached from the unix socket and from a mesh stream alike — a forwarded
@@ -1232,7 +1242,7 @@ pub(crate) async fn reconcile_pending_attaches(node: &Node) {
         // Keep the live shard locked across this bounded recovery operation:
         // saving a detached clone and assigning it back later could otherwise
         // erase a mesh-originated mutation that landed in between.
-        let mut reg = node.shard.lock().await;
+        let mut reg = lock_recovery_shard(node).await;
         match tokio::time::timeout(
             STORAGE_RECOVERY_DEADLINE,
             reconcile_one_attach(&mut reg, &mut intents, &intent),
@@ -1562,7 +1572,7 @@ pub(crate) async fn reconcile_pending_releases(node: &Node) {
     for intent in intents.list() {
         // See attach recovery above: this must mutate the live locked shard,
         // never write a startup clone over concurrent mesh-originated work.
-        let mut reg = node.shard.lock().await;
+        let mut reg = lock_recovery_shard(node).await;
         match tokio::time::timeout(
             STORAGE_RECOVERY_DEADLINE,
             reconcile_one_release(&mut reg, &mut intents, &intent),
@@ -1684,6 +1694,38 @@ mod tests {
             cpu: "host".into(),
             hv_version: "test".into(),
         }
+    }
+
+    /// A failed journal recovery retains the live shard exclusion until the
+    /// failing operation returns. A concurrent mesh mutation therefore waits
+    /// instead of being overwritten by a stale whole-document save.
+    #[tokio::test]
+    async fn recovery_failure_keeps_mesh_mutations_out_of_its_live_shard_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node {
+            shard: Arc::new(tokio::sync::Mutex::new(
+                Shard::load(&dir.path().join("state.json")).unwrap(),
+            )),
+            orbit: Arc::new(tokio::sync::Mutex::new(
+                crate::orbit::Orbit::load(&dir.path().join("orbit.json")).unwrap(),
+            )),
+            shell: crate::device_shell::Manager::load_at(dir.path()),
+        };
+
+        let failure: Result<()> = async {
+            let _recovery = lock_recovery_shard(&node).await;
+            assert!(
+                node.shard.try_lock().is_err(),
+                "a mesh mutation entered while recovery still owns the live shard"
+            );
+            anyhow::bail!("simulated provider recovery failure")
+        }
+        .await;
+        assert!(failure.is_err());
+        assert!(
+            node.shard.try_lock().is_ok(),
+            "the recovery lock was not released after its failure"
+        );
     }
 
     /// The normal dead-handle reconciliation path must not turn the missing
