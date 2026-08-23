@@ -19,8 +19,14 @@ cd "$ROOT"
 harness_begin lifecycle
 harness_binaries "$ROOT"
 
-# Fresh, SHORT home: unix socket paths are capped near 104 bytes.
-export ASTERISM_HOME="/private/tmp/ast-e2e-$$"
+# Fresh, SHORT home: unix socket paths are capped near 104 bytes. macOS has
+# /private/tmp; Linux's equivalent is /tmp.
+if [ -d /private/tmp ] && [ -w /private/tmp ]; then
+  SHORT_TMP=/private/tmp
+else
+  SHORT_TMP=/tmp
+fi
+export ASTERISM_HOME="$SHORT_TMP/ast-e2e-$$"
 harness_own_home "$ASTERISM_HOME"
 
 # A single-device test has no orbit, so it has no business publishing a
