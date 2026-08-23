@@ -895,11 +895,14 @@ mod tests {
             sock.exists(),
             "this test is about the file a crash leaves behind"
         );
-        assert!(
-            UnixStream::connect(&sock).is_err(),
-            "and about nobody being behind it"
-        );
 
+        // Do not probe the dead listener before replacing it. On macOS the
+        // pathname can briefly keep accepting connects while the close is
+        // being retired, even though dropping `dead` has already released
+        // the election. That observation is neither required nor safe to use
+        // as authority for an unlink: holding the election is the authority.
+        // Reopening immediately is the regression test, including when socket
+        // teardown is delayed by the scheduler.
         let door = Door::open(&home, &sock).unwrap();
         UnixStream::connect(&sock).expect("the replacement is accepting");
         assert_eq!(mode_of(&sock), 0o600);

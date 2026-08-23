@@ -6,9 +6,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/asterism-nbd-install.XXXXXX")"
-VERSION=v0.0.0-nbd-e2e
+RELEASE_VERSION=v0.0.0-nbd-e2e
 PREFIX="${WORK}/prefix"
-RELEASES="${WORK}/releases/${VERSION}"
+RELEASES="${WORK}/releases/${RELEASE_VERSION}"
 STAGE="${WORK}/stage"
 SOCKET="${WORK}/volume.sock"
 IMAGE="${WORK}/volume.raw"
@@ -55,7 +55,7 @@ for license in cloud-hypervisor-Apache-2.0 cloud-hypervisor-BSD-3-Clause \
 	virtiofsd-Apache-2.0 virtiofsd-BSD-3-Clause; do
 	printf 'installer lifecycle test fixture\n' >"$STAGE/share/asterism/licenses/${license}.txt"
 done
-artifact="asterism-${VERSION}-linux-$(uname -m)"
+artifact="asterism-${RELEASE_VERSION}-linux-$(uname -m)"
 case "$artifact" in *-linux-aarch64) artifact="${artifact%-aarch64}-arm64" ;; esac
 tar -czf "${RELEASES}/${artifact}.tar.gz" -C "$STAGE" \
 	ast astd cloud-hypervisor virtiofsd share
@@ -63,7 +63,7 @@ tar -czf "${RELEASES}/${artifact}.tar.gz" -C "$STAGE" \
 
 # shellcheck disable=SC1091
 echo "host: $(. /etc/os-release && printf '%s' "$PRETTY_NAME"); $(uname -r); $(uname -m)"
-ASTERISM_VERSION="$VERSION" \
+ASTERISM_VERSION="$RELEASE_VERSION" \
 	ASTERISM_PREFIX="$PREFIX" \
 	ASTERISM_BASE_URL="file://${WORK}/releases" \
 	ASTERISM_YES=1 \

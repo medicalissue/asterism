@@ -270,16 +270,22 @@ case "${1-}" in
 	[ "$#" -eq 5 ] || [ "$#" -eq 6 ] || die "invalid Unix attach request"
 	case "$2" in /*) ;; *) die "the NBD Unix socket must be an absolute path" ;; esac
 	nbd_device "$3" || die "the target must be /dev/nbd0 through /dev/nbd63"
-	[ "$4" = "-N" ] && [ -n "$5" ] || die "the NBD export must be named"
+	if [ "$4" != "-N" ] || [ -z "$5" ]; then
+		die "the NBD export must be named"
+	fi
 	[ "$#" -eq 5 ] || [ "$6" = "-readonly" ] || die "invalid Unix attach options"
 	;;
 *)
 	[ "$#" -eq 5 ] || [ "$#" -eq 6 ] || die "invalid network attach request"
 	case "$1" in '' | -*) die "the NBD host must be named, not an option" ;; esac
 	case "$2" in *[!0-9]* | '') die "the NBD port must be numeric" ;; esac
-	[ "$2" -ge 1 ] && [ "$2" -le 65535 ] || die "the NBD port is out of range"
+	if [ "$2" -lt 1 ] || [ "$2" -gt 65535 ]; then
+		die "the NBD port is out of range"
+	fi
 	nbd_device "$3" || die "the target must be /dev/nbd0 through /dev/nbd63"
-	[ "$4" = "-N" ] && [ -n "$5" ] || die "the NBD export must be named"
+	if [ "$4" != "-N" ] || [ -z "$5" ]; then
+		die "the NBD export must be named"
+	fi
 	[ "$#" -eq 5 ] || [ "$6" = "-readonly" ] || die "invalid network attach options"
 	;;
 esac

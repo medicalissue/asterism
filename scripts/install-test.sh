@@ -124,6 +124,16 @@ esac
 EOF
 chmod +x "${SHIMS}/uname"
 
+# Keep Linux linger assertions independent of the machine running this suite.
+# The installer still exercises its real detection path, but this fixture is
+# explicitly a user whose systemd linger setting is off.
+cat >"${SHIMS}/loginctl" <<'EOF'
+#!/bin/sh
+[ "$1" = "show-user" ] && [ "$3" = "-p" ] && [ "$4" = "Linger" ] || exit 1
+printf 'Linger=no\n'
+EOF
+chmod +x "${SHIMS}/loginctl"
+
 set_host() {
 	printf '%s' "$1" >"${WORK}/uname-s"
 	printf '%s' "$2" >"${WORK}/uname-m"
