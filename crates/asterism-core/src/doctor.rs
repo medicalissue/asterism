@@ -198,7 +198,11 @@ fn probe_version_binary(name: &'static str, path: &Path, pin: &str, missing: &st
                 Check {
                     name,
                     status: Status::Ok,
-                    detail: format!("{} ({})", stdout.trim().lines().next().unwrap_or(pin), path.display()),
+                    detail: format!(
+                        "{} ({})",
+                        stdout.trim().lines().next().unwrap_or(pin),
+                        path.display()
+                    ),
                 }
             } else {
                 Check {
@@ -458,8 +462,9 @@ fn sleep_check() -> Check {
             Err(_) => Check {
                 name: "sleep",
                 status: Status::Fail,
-                detail: "systemd-inhibit is not executable, so running guests cannot block idle sleep"
-                    .into(),
+                detail:
+                    "systemd-inhibit is not executable, so running guests cannot block idle sleep"
+                        .into(),
             },
         }
     }
@@ -709,10 +714,9 @@ mod tests {
 
     #[test]
     fn an_empty_architecture_digest_is_refused() {
-        let err = LinuxPins::parse(
-            "CLOUD_HYPERVISOR_VERSION=v53.0\nCLOUD_HYPERVISOR_AARCH64_URL=\n",
-        )
-        .unwrap_err();
+        let err =
+            LinuxPins::parse("CLOUD_HYPERVISOR_VERSION=v53.0\nCLOUD_HYPERVISOR_AARCH64_URL=\n")
+                .unwrap_err();
         assert!(
             err.to_string().contains("CLOUD_HYPERVISOR_AARCH64_URL"),
             "{err}"
@@ -745,7 +749,11 @@ mod tests {
             "Name=org.freedesktop.secrets\n",
             ""
         ));
-        assert!(!secret_service_from_bus(false, "Name=org.freedesktop.secrets\n", ""));
+        assert!(!secret_service_from_bus(
+            false,
+            "Name=org.freedesktop.secrets\n",
+            ""
+        ));
         assert!(!secret_service_from_bus(true, "", ""));
     }
 

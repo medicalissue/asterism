@@ -518,6 +518,31 @@ says "already installed: v0.0.9"
 never_says "downloading"
 ok "a release with no helper is not reinstalled on every run looking for one"
 
+# A process can die after its durable intent is published but before the
+# final receipt replaces it. The next run must treat every path in that
+# journal as owned rollback work, converge to uninstalled, and only then
+# begin the requested install.
+fresh_prefix interrupted-install
+mkdir -p "${PREFIX}/share/asterism"
+printf 'partial bytes\n' >"${PREFIX}/bin/abandoned-by-interrupted-install"
+cat >"${PREFIX}/share/asterism/install-receipt.env" <<EOF
+phase=installing
+version=v0.0.8
+target=darwin-arm64
+method=release
+sha256=test
+files=bin/abandoned-by-interrupted-install
+system_files=
+EOF
+run_install ok
+says "recovering interrupted install transaction"
+says "removed ${PREFIX}/bin/abandoned-by-interrupted-install"
+[ ! -e "${PREFIX}/bin/abandoned-by-interrupted-install" ] \
+	|| fail "a path from an interrupted install survived recovery"
+grep -q '^phase=complete$' <<<"$(receipt)" \
+	|| fail "recovery did not finish with a complete receipt:"$'\n'"$(receipt)"
+ok "an interrupted install is rolled back from its durable intent before retry"
+
 # ---- 5. uninstall ----------------------------------------------------------
 
 fresh_prefix uninstall

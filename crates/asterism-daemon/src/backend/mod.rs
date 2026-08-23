@@ -985,6 +985,8 @@ mod tests {
             assert!(!adopt_identities(&mut reg), "nothing left to adopt");
             let other = ProcId {
                 started_us: real.started_us + 1,
+                boot_id: real.boot_id.clone(),
+                started_ticks: real.started_ticks.map(|ticks| ticks + 1),
                 ..real.clone()
             };
             reg.adopt_handle_identity("known", other).unwrap();

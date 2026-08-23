@@ -1886,6 +1886,8 @@ mod tests {
         let h = handle(Some(ProcId {
             pid: 1,
             started_us: 1,
+            boot_id: None,
+            started_ticks: None,
             exec: None,
         }));
         let err = hv.snapshot(&h, "t").unwrap_err().to_string();
@@ -2028,10 +2030,12 @@ mod tests {
             real.alive(),
             "the foreign process is alive before the check"
         );
-        let stale = ProcId {
-            started_us: real.started_us - 1,
-            ..real.clone()
-        };
+        let mut stale = real.clone();
+        if let Some(ticks) = stale.started_ticks.as_mut() {
+            *ticks -= 1;
+        } else {
+            stale.started_us -= 1;
+        }
         let h = handle(Some(stale));
 
         assert_eq!(hv.state(&h).unwrap(), RunState::Stopped);
@@ -2055,6 +2059,8 @@ mod tests {
         let h = handle(Some(ProcId {
             pid,
             started_us: 1,
+            boot_id: None,
+            started_ticks: None,
             exec: None,
         }));
         assert_eq!(hv.state(&h).unwrap(), RunState::Stopped);
