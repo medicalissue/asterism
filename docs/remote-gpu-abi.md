@@ -7,7 +7,9 @@ not expose which host or transport supplies those parts.
 
 This is the data-plane seam, plus a portable proof of it. The production
 admission, placement, lease, revocation, health and recovery control plane is
-described in [remote-gpu-production.md](remote-gpu-production.md). It is not
+described in [remote-gpu-production.md](remote-gpu-production.md). The
+fail-closed NVIDIA two-device gate is in
+[remote-gpu-nvidia-gate.md](remote-gpu-nvidia-gate.md). It is not
 yet a production NVIDIA device implementation. The proof projects a regular file at
 `<guest-root>/dev/nvidia0`, opens it as guest software would, and carries the
 device operations to a separate provider process. A production Linux guest
