@@ -3,7 +3,7 @@ name: Cloud Hypervisor exact KVM gate
 on:
   push:
     branches:
-      - "polecat/**/as-lvf.23+exact-*"
+      - "polecat/**/as-lvf.23**"
   workflow_dispatch:
 
 permissions:
