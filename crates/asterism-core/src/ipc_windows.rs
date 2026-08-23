@@ -1,10 +1,11 @@
 //! Windows local control-plane door.
 //!
 //! `ast` and `astd` use a byte-mode Windows named pipe, never a TCP port. The
-//! pipe name is derived from the logical socket path and the current Windows
-//! user SID, so distinct users and `ASTERISM_HOME`s cannot collide. Every
-//! server instance carries a protected DACL granting access only to that SID,
-//! and rejects remote clients in the kernel.
+//! pipe name is derived from the canonical `ASTERISM_HOME` path and its owner
+//! SID, so the LocalSystem service and its interactive client agree while
+//! distinct owners and homes cannot collide. Every server instance carries a
+//! protected DACL granting access only to the service identity and that home
+//! owner, and rejects remote clients in the kernel.
 //!
 //! The DACL is the first boundary, not the only one. After `ConnectNamedPipe`
 //! completes, the daemon asks Windows to impersonate that exact pipe client,
@@ -32,15 +33,16 @@ use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::Mutex;
 use windows_sys::Win32::Foundation::{
     CloseHandle, LocalFree, ERROR_FILE_NOT_FOUND, ERROR_IO_PENDING, ERROR_PATH_NOT_FOUND,
-    ERROR_PIPE_BUSY, ERROR_SEM_TIMEOUT, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
-    WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_PIPE_BUSY, ERROR_SEM_TIMEOUT, ERROR_SUCCESS, GENERIC_READ, GENERIC_WRITE, HANDLE,
+    INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    GetLengthSid, GetTokenInformation, RevertToSelf, TokenUser, SECURITY_ATTRIBUTES, TOKEN_QUERY,
-    TOKEN_USER,
+    GetLengthSid, GetTokenInformation, RevertToSelf, TokenUser, OWNER_SECURITY_INFORMATION,
+    SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, SECURITY_IDENTIFICATION,
@@ -134,21 +136,22 @@ impl Stream {
             return Err(error);
         }
 
-        let waited = unsafe { WaitForSingleObject(event.0, timeout_ms(timeout)) };
-        if waited == WAIT_TIMEOUT {
-            unsafe {
-                CancelIoEx(self.file.as_raw_handle() as HANDLE, &overlapped);
-                // Keep the buffer and OVERLAPPED alive until cancellation is
-                // complete; returning before this wait would be use-after-free.
-                WaitForSingleObject(event.0, INFINITE);
-            }
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "the named-pipe operation timed out",
-            ));
-        }
+        let waited = wait_for_operation(event.0, timeout_ms(timeout));
         if waited != WAIT_OBJECT_0 {
-            return Err(io::Error::last_os_error());
+            let failure = if waited == WAIT_TIMEOUT {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the named-pipe operation timed out",
+                )
+            } else {
+                io::Error::last_os_error()
+            };
+            // Once Windows has accepted an OVERLAPPED operation, neither its
+            // buffer nor the OVERLAPPED itself may be released until the I/O
+            // reaches a terminal state. This applies to WAIT_FAILED and every
+            // other unexpected wait result just as much as to a timeout.
+            cancel_and_drain(self.file.as_raw_handle() as HANDLE, &mut overlapped);
+            return Err(failure);
         }
         let completed = unsafe {
             GetOverlappedResult(
@@ -162,6 +165,33 @@ impl Stream {
             return Err(io::Error::last_os_error());
         }
         Ok(transferred as usize)
+    }
+}
+
+fn wait_for_operation(event: HANDLE, timeout: u32) -> u32 {
+    #[cfg(feature = "windows-ipc-conformance")]
+    if std::env::var_os("ASTERISM_TEST_PIPE_WAIT_FAILURE").is_some() {
+        return u32::MAX;
+    }
+    unsafe { WaitForSingleObject(event, timeout) }
+}
+
+/// Cancel a pending operation and synchronously collect its final result.
+/// `GetOverlappedResult(..., TRUE)` is the ownership boundary: even when
+/// cancellation loses a race or itself reports an error, it does not return
+/// until the operation has completed and the caller-owned storage is free.
+fn cancel_and_drain(handle: HANDLE, overlapped: &mut OVERLAPPED) {
+    unsafe {
+        let cancelled = CancelIoEx(handle, overlapped);
+        #[cfg(feature = "windows-ipc-conformance")]
+        let cancelled = if std::env::var_os("ASTERISM_TEST_PIPE_CANCEL_FAILURE").is_some() {
+            0
+        } else {
+            cancelled
+        };
+        let _ = cancelled;
+        let mut transferred = 0;
+        let _ = GetOverlappedResult(handle, overlapped, &mut transferred, 1);
     }
 }
 
@@ -282,10 +312,11 @@ pub struct Listener {
 }
 
 impl Listener {
-    fn bind(sock: &Path) -> Result<Listener> {
-        let owner_sid = Arc::new(current_process_sid().context("reading the astd owner SID")?);
-        let name = pipe_name(sock, &owner_sid);
-        let next = create_server(&name, &owner_sid, true)
+    fn bind(home: &Path, sock: &Path) -> Result<Listener> {
+        let (name, owner_sid) = pipe_identity(home, sock)?;
+        let owner_sid = Arc::new(owner_sid);
+        let service_sid = current_process_sid().context("reading the astd service SID")?;
+        let next = create_server(&name, &service_sid, &owner_sid, true)
             .with_context(|| format!("binding Windows named pipe {name}"))?;
         Ok(Listener {
             name,
@@ -300,10 +331,22 @@ impl Listener {
             .take()
             .expect("the named-pipe accept mutex always owns one instance");
         if let Err(error) = connected.connect().await {
-            *next = Some(create_server(&self.name, &self.owner_sid, false)?);
+            let service_sid = current_process_sid()?;
+            *next = Some(create_server(
+                &self.name,
+                &service_sid,
+                &self.owner_sid,
+                false,
+            )?);
             return Err(error);
         }
-        *next = Some(create_server(&self.name, &self.owner_sid, false)?);
+        let service_sid = current_process_sid()?;
+        *next = Some(create_server(
+            &self.name,
+            &service_sid,
+            &self.owner_sid,
+            false,
+        )?);
         Ok(ServerStream {
             pipe: connected,
             owner_sid: Arc::clone(&self.owner_sid),
@@ -312,8 +355,9 @@ impl Listener {
 }
 
 pub fn connect(sock: &Path) -> io::Result<Stream> {
-    let sid = current_process_sid()?;
-    connect_name(&pipe_name(sock, &sid))
+    let home = home_for_socket(sock);
+    let (name, _) = pipe_identity(&home, sock)?;
+    connect_name(&name)
 }
 
 fn connect_name(name: &str) -> io::Result<Stream> {
@@ -340,9 +384,22 @@ fn connect_name(name: &str) -> io::Result<Stream> {
     })
 }
 
-fn create_server(name: &str, sid: &[u8], first: bool) -> io::Result<NamedPipeServer> {
-    let sid = sid_string(sid)?;
-    let sddl = wide(format!("O:{sid}D:P(A;;GA;;;{sid})"));
+fn create_server(
+    name: &str,
+    service_sid: &[u8],
+    owner_sid: &[u8],
+    first: bool,
+) -> io::Result<NamedPipeServer> {
+    let service_sid = sid_string(service_sid)?;
+    let owner_sid = sid_string(owner_sid)?;
+    let owner_ace = if owner_sid == service_sid {
+        String::new()
+    } else {
+        format!("(A;;GRGW;;;{owner_sid})")
+    };
+    let sddl = wide(format!(
+        "O:{service_sid}D:P(A;;GA;;;{service_sid}){owner_ace}"
+    ));
     let mut descriptor = null_mut();
     let converted = unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -396,7 +453,7 @@ fn admit_peer_as(stream: &ServerStream, expected_sid: &[u8]) -> Result<u32> {
         .context("reading the Windows named-pipe client's OS identity")?;
     if actual != expected_sid {
         bail!(
-            "refusing Windows named-pipe peer SID {}; astd belongs to SID {}",
+            "refusing Windows named-pipe peer SID {}; ASTERISM_HOME belongs to SID {}",
             sid_string(&actual).unwrap_or_else(|_| "<unprintable>".into()),
             sid_string(expected_sid).unwrap_or_else(|_| "<unprintable>".into()),
         );
@@ -408,13 +465,35 @@ fn pipe_client_sid(pipe: HANDLE) -> io::Result<Vec<u8>> {
     if unsafe { ImpersonateNamedPipeClient(pipe) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    let _revert = Revert;
     let mut token = null_mut();
-    if unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) } == 0 {
-        return Err(io::Error::last_os_error());
+    let opened = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) };
+    let open_error = (opened == 0).then(io::Error::last_os_error);
+    // Microsoft requires process termination if this fails: continuing would
+    // leave a Tokio worker executing as the untrusted pipe client.
+    revert_to_self_or_abort(unsafe { RevertToSelf() });
+    if let Some(error) = open_error {
+        return Err(error);
     }
     let token = Handle(token);
     token_sid(token.0)
+}
+
+fn revert_to_self_or_abort(reverted: i32) {
+    if reverted == 0 {
+        eprintln!("astd: fatal: RevertToSelf failed after named-pipe impersonation");
+        std::process::abort();
+    }
+}
+
+#[cfg(feature = "windows-ipc-conformance")]
+pub fn force_revert_failure_for_conformance() -> ! {
+    revert_to_self_or_abort(0);
+    unreachable!()
+}
+
+#[cfg(feature = "windows-ipc-conformance")]
+pub fn pipe_name_for_conformance(home: &Path, sock: &Path) -> io::Result<String> {
+    pipe_identity(home, sock).map(|(name, _)| name)
 }
 
 fn current_process_sid() -> io::Result<Vec<u8>> {
@@ -473,10 +552,60 @@ fn sid_string(sid: &[u8]) -> io::Result<String> {
     }
 }
 
-fn pipe_name(sock: &Path, sid: &[u8]) -> String {
+fn pipe_identity(home: &Path, sock: &Path) -> io::Result<(String, Vec<u8>)> {
+    let canonical_home = std::fs::canonicalize(home)?;
+    let owner_sid = file_owner_sid(&canonical_home)?;
+    Ok((pipe_name(&canonical_home, sock, &owner_sid), owner_sid))
+}
+
+fn file_owner_sid(path: &Path) -> io::Result<Vec<u8>> {
+    let path = wide(path.as_os_str());
+    let mut owner = null_mut();
+    let mut descriptor = null_mut();
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            path.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    let descriptor = LocalAllocation(descriptor);
+    let len = unsafe { GetLengthSid(owner) } as usize;
+    if len == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let sid = unsafe { std::slice::from_raw_parts(owner.cast::<u8>(), len) }.to_vec();
+    drop(descriptor);
+    Ok(sid)
+}
+
+fn home_for_socket(sock: &Path) -> PathBuf {
+    let configured = crate::paths::home_dir();
+    if crate::paths::socket_path() == sock {
+        configured
+    } else {
+        sock.parent().unwrap_or_else(|| Path::new(".")).to_path_buf()
+    }
+}
+
+fn pipe_name(home: &Path, sock: &Path, sid: &[u8]) -> String {
     let mut material = Vec::new();
-    for unit in sock.as_os_str().encode_wide() {
+    for unit in home.as_os_str().encode_wide() {
         material.extend_from_slice(&unit.to_le_bytes());
+    }
+    material.extend_from_slice(&0u16.to_le_bytes());
+    if let Some(name) = sock.file_name() {
+        for unit in name.encode_wide() {
+            material.extend_from_slice(&unit.to_le_bytes());
+        }
     }
     material.extend_from_slice(sid);
     let digest = blake3::hash(&material).to_hex();
@@ -530,8 +659,12 @@ pub enum SocketState {
 }
 
 pub fn audit_socket(sock: &Path) -> Result<SocketState> {
-    let sid = current_process_sid().context("reading the current Windows user SID")?;
-    let name = pipe_name(sock, &sid);
+    let home = home_for_socket(sock);
+    let (name, _) = match pipe_identity(&home, sock) {
+        Ok(identity) => identity,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(SocketState::Missing),
+        Err(error) => return Err(error).context("deriving the Windows named-pipe identity"),
+    };
     let name = wide(&name);
     if unsafe { WaitNamedPipeW(name.as_ptr(), 0) } != 0 {
         return Ok(SocketState::Ready);
@@ -558,7 +691,7 @@ impl Door {
         if let Some(parent) = sock.parent() {
             private_dir(parent)?;
         }
-        let listener = Listener::bind(sock)?;
+        let listener = Listener::bind(home, sock)?;
         Ok(Door {
             listener,
             sock: sock.to_path_buf(),
@@ -646,16 +779,6 @@ impl Drop for LocalWideString {
     fn drop(&mut self) {
         unsafe {
             LocalFree(self.0.cast());
-        }
-    }
-}
-
-struct Revert;
-
-impl Drop for Revert {
-    fn drop(&mut self) {
-        unsafe {
-            RevertToSelf();
         }
     }
 }

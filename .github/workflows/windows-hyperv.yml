@@ -67,6 +67,12 @@ jobs:
       - name: Exercise named-pipe transport and OS peer admission
         run: cargo test --locked --package asterism-core --features windows-ipc-conformance --test windows_named_pipe -- --test-threads=1
 
+      - name: Exercise LocalSystem service IPC from an interactive ast
+        shell: pwsh
+        run: |
+          cargo build --locked --bin ast --bin astd
+          ./scripts/windows-local-system-ipc.ps1 -Ast ./target/debug/ast.exe -Astd ./target/debug/astd.exe
+
       - name: Console Ctrl-C exits without an SCM waiter hang
         env:
           ASTERISM_BUILD_ID: ${{ github.sha }}

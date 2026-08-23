@@ -93,6 +93,33 @@ fn apply_service_home_from_args() {
     }
 }
 
+#[cfg(windows)]
+fn service_name_from_args() -> Result<String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        let value = if arg == "--service-name" {
+            args.next()
+        } else {
+            arg.strip_prefix("--service-name=").map(str::to_owned)
+        };
+        if let Some(value) = value {
+            const TEST_PREFIX: &str = "com.asterism.astd.test.";
+            if value.len() > 120
+                || !value.starts_with(TEST_PREFIX)
+                || value.ends_with('.')
+                || value.contains("..")
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+            {
+                anyhow::bail!("invalid temporary Windows service name {value:?}");
+            }
+            return Ok(value);
+        }
+    }
+    Ok(asterism_core::windows_host::SERVICE_NAME.to_owned())
+}
+
 /// This device's own state: its shard of the orbit registry, and the name the
 /// orbit knows it by.
 ///
@@ -131,8 +158,9 @@ fn main() -> Result<()> {
         #[cfg(windows)]
         {
             apply_service_home_from_args();
+            let service_name = service_name_from_args()?;
             return asterism_core::windows_host::dispatch_service(
-                asterism_core::windows_host::SERVICE_NAME,
+                &service_name,
                 || runtime().block_on(run_daemon(StopSource::Service)),
             );
         }

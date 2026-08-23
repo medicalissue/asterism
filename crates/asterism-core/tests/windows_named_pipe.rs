@@ -8,6 +8,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use windows_sys::Win32::Security::{ImpersonateAnonymousToken, RevertToSelf};
 use windows_sys::Win32::System::Threading::GetCurrentThread;
 
+const CHILD_MODE: &str = "ASTERISM_WINDOWS_PIPE_CHILD";
+
 #[tokio::test]
 async fn real_named_pipe_round_trip_peer_identity_and_lifetime() {
     let temp = tempfile::tempdir().unwrap();
@@ -102,4 +104,80 @@ fn overlapped_client_read_honors_its_deadline() {
     });
     let _server = runtime.block_on(door.listener().accept()).unwrap();
     assert_eq!(client.join().unwrap(), io::ErrorKind::TimedOut);
+}
+
+#[test]
+fn pipe_identity_is_stable_for_one_home_and_separates_home_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    let first_sock = first.join("astd.sock");
+    let first_again = ipc::pipe_name_for_conformance(&first, &first_sock).unwrap();
+    assert_eq!(
+        first_again,
+        ipc::pipe_name_for_conformance(&first, &first_sock).unwrap()
+    );
+    assert_ne!(
+        first_again,
+        ipc::pipe_name_for_conformance(&second, &second.join("astd.sock")).unwrap(),
+        "two paths owned by the same SID must still name different pipes"
+    );
+}
+
+#[test]
+fn unexpected_wait_and_cancel_failures_drain_pending_io_in_a_subprocess() {
+    if std::env::var(CHILD_MODE).as_deref() == Ok("wait-failure") {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let sock = home.join("astd.sock");
+        let door = runtime.block_on(async { Door::open(&home, &sock).unwrap() });
+        let mut client = ipc::connect(&sock).unwrap();
+        let _server = runtime.block_on(door.listener().accept()).unwrap();
+        std::env::set_var("ASTERISM_TEST_PIPE_WAIT_FAILURE", "1");
+        std::env::set_var("ASTERISM_TEST_PIPE_CANCEL_FAILURE", "1");
+        let mut byte = [0; 1];
+        assert!(client.read(&mut byte).is_err());
+        return;
+    }
+
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "unexpected_wait_and_cancel_failures_drain_pending_io_in_a_subprocess",
+            "--nocapture",
+        ])
+        .env(CHILD_MODE, "wait-failure")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "pending I/O drain child failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn revert_failure_is_fail_stop_in_a_subprocess() {
+    if std::env::var(CHILD_MODE).as_deref() == Ok("revert-failure") {
+        ipc::force_revert_failure_for_conformance();
+    }
+
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "revert_failure_is_fail_stop_in_a_subprocess",
+            "--nocapture",
+        ])
+        .env(CHILD_MODE, "revert-failure")
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "RevertToSelf failure returned alive");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("fatal: RevertToSelf failed"),
+        "fail-stop diagnostic was missing: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

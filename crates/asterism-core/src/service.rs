@@ -91,7 +91,21 @@ pub struct Spec {
 impl Spec {
     /// The spec for the astd that belongs to the running binary.
     pub fn current() -> Result<Spec> {
-        Spec::for_program(&daemon_program()?)
+        let mut spec = Spec::for_program(&daemon_program()?)?;
+        #[cfg(windows)]
+        {
+            // LocalSystem's USERPROFILE is not the installing user's profile.
+            // Always materialize and record the intended home while still in
+            // the interactive process, making its filesystem owner the
+            // canonical client identity used by the named-pipe transport.
+            let home = spec.home.take().unwrap_or_else(crate::paths::home_dir);
+            std::fs::create_dir_all(&home)
+                .with_context(|| format!("creating service home {}", home.display()))?;
+            spec.home = Some(std::fs::canonicalize(&home).with_context(|| {
+                format!("canonicalizing service home {}", home.display())
+            })?);
+        }
+        Ok(spec)
     }
 
     pub fn for_program(program: &Path) -> Result<Spec> {

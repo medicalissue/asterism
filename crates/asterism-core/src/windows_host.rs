@@ -194,6 +194,15 @@ fn service_bin_path_with_home(program: &Path, home: &Path) -> String {
     )
 }
 
+fn service_bin_path_with_home_and_name(program: &Path, home: &Path, name: &str) -> String {
+    let base = service_bin_path_with_home(program, home);
+    if name == SERVICE_NAME {
+        base
+    } else {
+        format!("{base} --service-name \"{name}\"")
+    }
+}
+
 /// True when `program` lives under a Windows directory that non-admins
 /// cannot replace. LocalSystem may only execute an ImagePath from one of
 /// these roots; a user-writable prefix is a privilege-escalation path.
@@ -226,7 +235,7 @@ pub fn sc_create_args(spec: &Spec, name: &str) -> Result<Vec<String>> {
         );
     }
     let bin = match &spec.home {
-        Some(home) => service_bin_path_with_home(&spec.program, home),
+        Some(home) => service_bin_path_with_home_and_name(&spec.program, home, name),
         None => service_bin_path(&spec.program),
     };
     Ok(vec![
@@ -1427,6 +1436,14 @@ mod tests {
             "{joined}"
         );
         assert!(!joined.to_ascii_lowercase().contains("qemu"));
+    }
+
+    #[test]
+    fn temporary_scm_name_is_baked_into_the_dispatcher_command() {
+        let name = "com.asterism.astd.test.localsystem-123";
+        let joined = sc_create_args(&spec(), name).unwrap().join(" ");
+        assert!(joined.contains(&format!("--service-name \"{name}\"")));
+        assert!(joined.contains("--home"));
     }
 
     #[test]
