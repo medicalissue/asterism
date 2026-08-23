@@ -46,10 +46,16 @@ impl Drop for KillOnDrop {
 fn wait_until_listening(child: &mut Child, pidfile: &std::path::Path) {
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
-        assert!(
-            child.try_wait().expect("querying astd").is_none(),
-            "astd exited before publishing its pid file"
-        );
+        if let Some(status) = child.try_wait().expect("querying astd") {
+            let mut stderr = String::new();
+            child
+                .stderr
+                .take()
+                .expect("captured astd stderr")
+                .read_to_string(&mut stderr)
+                .expect("reading early astd stderr");
+            panic!("astd exited before publishing its pid file ({status}): {stderr}");
+        }
         if pidfile.is_file() {
             return;
         }
