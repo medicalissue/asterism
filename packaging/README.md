@@ -5,6 +5,7 @@ The CLI ships from this repository:
 | | what it is | how it is installed |
 |---|---|---|
 | **CLI** | `ast`, the `astd` daemon, and the code-signed `astd-vz` helper | `install.sh`, or Homebrew |
+
 The CLI binaries belong on `PATH` and get upgraded from a shell. Desktop is
 released privately and is not built or packaged from this source tree. The
 updater deliberately retains its authenticated Desktop-manifest boundary: a
@@ -13,6 +14,8 @@ and activates with the CLI unit using same-filesystem renames. Any partial
 replacement or daemon restart failure restores the entire previous unit.
 Running guests are left alive for the restarted daemon to re-adopt, and a
 signed channel is never allowed to downgrade an installed release.
+Desktop downloads are distributed separately through
+[`asterism.run/download`](https://asterism.run/download).
 
 ```console
 $ ast update status
@@ -99,7 +102,7 @@ generated UUID. Re-running
 against the same lockfile produces byte-identical files. `SHA256SUMS` covers
 both metadata files alongside the shipped binaries.
 
-The CI supply-chain job audits those exact lockfiles, scans all reachable Git
+The CI supply-chain job audits that exact lockfile, scans all reachable Git
 history and the checked-out tree locally for secrets, and tests the generator
 twice for deterministic output. Its exception policy is documented in
 [`docs/supply-chain-exceptions.md`](../docs/supply-chain-exceptions.md).

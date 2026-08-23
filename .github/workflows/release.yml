@@ -560,16 +560,17 @@ jobs:
           version="${{ needs.build.outputs.version }}"
           base="https://github.com/${{ github.repository }}/releases/download/${version}"
           cli="asterism-${version}-darwin-arm64.tar.gz"
-          app="Asterism-${version}-darwin-arm64.app.tar.gz"
           linux_x86="asterism-${version}-linux-x86_64.tar.gz"
           linux_arm="asterism-${version}-linux-arm64.tar.gz"
           cli_sha="$(sha256sum "dist/${version}/${cli}" | awk '{print $1}')"
-          app_sha="$(sha256sum "dist/${version}/${app}" | awk '{print $1}')"
           linux_x86_sha="$(sha256sum "dist/${version}/${linux_x86}" | awk '{print $1}')"
           linux_arm_sha="$(sha256sum "dist/${version}/${linux_arm}" | awk '{print $1}')"
+          # Desktop artifacts come from the private Desktop release. Preserve
+          # empty app fields when adding public Linux archives to this signed
+          # manifest so this repository never claims to publish private bytes.
           repo/scripts/render-release-manifest.sh stable "$version" \
             "${version#v}+${{ github.sha }}" darwin-arm64 \
-            "${base}/${cli}" "$cli_sha" "${base}/${app}" "$app_sha" \
+            "${base}/${cli}" "$cli_sha" "" "" \
             "${base}/${linux_x86}" "$linux_x86_sha" \
             "${base}/${linux_arm}" "$linux_arm_sha" \
             >"dist/${version}/RELEASE.json"
