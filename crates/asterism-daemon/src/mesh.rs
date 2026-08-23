@@ -2979,7 +2979,21 @@ async fn serve_live_splice(
         .await?;
         return Ok(());
     }
-    let socket = crate::swap::live_socket(name, instance_id, epoch, token);
+    let socket = match crate::swap::live_socket(name, instance_id, epoch, token) {
+        Ok(socket) => socket,
+        Err(e) => {
+            write_frame(
+                &mut stream.send,
+                &MeshReply::Rpc {
+                    response: Response::Error {
+                        message: format!("refusing unverified legacy recovery socket: {e:#}"),
+                    },
+                },
+            )
+            .await?;
+            return Ok(());
+        }
+    };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let local = loop {
         match tokio::net::UnixStream::connect(&socket).await {

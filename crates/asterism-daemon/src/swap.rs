@@ -196,7 +196,7 @@ pub fn staging_dir(name: &str, instance_id: &str, epoch: u64, token: &str) -> Pa
     paths::instance_dir(&format!("{name}{STAGING}{epoch}-{}", &identity[..12]))
 }
 
-fn staging_for(txn: &AuthorityTxn) -> PathBuf {
+fn staging_for(txn: &AuthorityTxn) -> Result<PathBuf> {
     recoverable_staging_dir(&txn.name, &txn.instance_id, txn.epoch, &txn.token)
 }
 
@@ -204,23 +204,49 @@ fn legacy_staging_dir(name: &str, epoch: u64) -> PathBuf {
     paths::instance_dir(&format!("{name}{STAGING}{epoch}"))
 }
 
-/// Locate a staged tree created by this protocol revision, or a verified
-/// predecessor when a restart is finishing an already-existing move.
-fn recoverable_staging_dir(name: &str, instance_id: &str, epoch: u64, token: &str) -> PathBuf {
+fn is_legacy_staging_name(name: &str) -> bool {
+    name.rsplit_once(STAGING)
+        .is_some_and(|(_, epoch)| epoch.parse::<u64>().is_ok())
+}
+
+/// Locate a staged tree created by this protocol revision, or an old-format
+/// tree whose durable receipt proves it belongs to this exact attempt.
+///
+/// The old `name + epoch` spelling is only a locator, never authority.  In
+/// particular, a restarted name may refer to a different instance that won
+/// the same epoch, so an absent, corrupt, or foreign receipt is a refusal
+/// rather than permission to touch that directory.
+fn recoverable_staging_dir(
+    name: &str,
+    instance_id: &str,
+    epoch: u64,
+    token: &str,
+) -> Result<PathBuf> {
     let scoped = staging_dir(name, instance_id, epoch, token);
     if scoped.exists() {
-        return scoped;
+        return Ok(scoped);
     }
     let legacy = legacy_staging_dir(name, epoch);
     if legacy.exists() {
-        legacy
+        Receipt::load(&legacy)?.matches_attempt(instance_id, epoch, token)?;
+        Ok(legacy)
     } else {
-        scoped
+        Ok(scoped)
     }
 }
 
-pub(crate) fn live_socket(name: &str, instance_id: &str, epoch: u64, token: &str) -> PathBuf {
-    paths::migration_socket_in(&recoverable_staging_dir(name, instance_id, epoch, token))
+pub(crate) fn live_socket(
+    name: &str,
+    instance_id: &str,
+    epoch: u64,
+    token: &str,
+) -> Result<PathBuf> {
+    Ok(paths::migration_socket_in(&recoverable_staging_dir(
+        name,
+        instance_id,
+        epoch,
+        token,
+    )?))
 }
 
 pub(crate) fn authorize_live_splice(
@@ -419,17 +445,31 @@ fn live_sessions() -> MutexGuard<'static, BTreeMap<(String, u64), Handle>> {
 /// would not be called this any more.
 pub fn sweep_staging() {
     let mut claimed = BTreeSet::new();
+    let mut verified_legacy = BTreeSet::new();
     let authority_dir = paths::home_dir().join(AUTHORITY_DIR);
     if let Ok(entries) = std::fs::read_dir(authority_dir) {
         for entry in entries.flatten() {
             if let Ok(Some(loaded)) =
                 durable::load_json::<AuthorityTxn>(&entry.path(), "a move authority transaction")
             {
+                let staging = match staging_for(&loaded.value) {
+                    Ok(staging) => staging,
+                    Err(e) => {
+                        eprintln!(
+                            "astd: retaining legacy staging for {:?} epoch {}: {e:#}",
+                            loaded.value.name, loaded.value.epoch
+                        );
+                        continue;
+                    }
+                };
+                if staging == legacy_staging_dir(&loaded.value.name, loaded.value.epoch) {
+                    verified_legacy.insert(staging.clone());
+                }
                 if !matches!(
                     loaded.value.phase,
                     MoveAuthorityPhase::Committed | MoveAuthorityPhase::Aborted
                 ) {
-                    claimed.insert(staging_for(&loaded.value));
+                    claimed.insert(staging);
                 }
             }
         }
@@ -444,10 +484,18 @@ pub fn sweep_staging() {
         if !name.contains(STAGING) {
             continue;
         }
-        if claimed.contains(&entry.path()) {
+        let path = entry.path();
+        if claimed.contains(&path) {
             continue;
         }
-        let handle_path = entry.path().join(LIVE_HANDLE);
+        if is_legacy_staging_name(name) && !verified_legacy.contains(&path) {
+            eprintln!(
+                "astd: retaining {} — legacy staging has no matching durable identity receipt",
+                path.display()
+            );
+            continue;
+        }
+        let handle_path = path.join(LIVE_HANDLE);
         if let Ok(bytes) = std::fs::read(&handle_path) {
             if let Ok(handle) = serde_json::from_slice::<Handle>(&bytes) {
                 let _ = backend::for_handle(&handle.backend).and_then(|hv| hv.kill(&handle));
@@ -455,8 +503,8 @@ pub fn sweep_staging() {
         }
         // A deep home uses a short runtime path outside staging, so removing
         // the directory alone would leave the backend socket behind.
-        let _ = std::fs::remove_file(paths::migration_socket_in(&entry.path()));
-        match std::fs::remove_dir_all(entry.path()) {
+        let _ = std::fs::remove_file(paths::migration_socket_in(&path));
+        match std::fs::remove_dir_all(&path) {
             Ok(()) => eprintln!(
                 "astd: swept {} — an interrupted move left it, and it was never bootable",
                 entry.path().display()
@@ -1101,6 +1149,17 @@ impl Receipt {
         let bytes = std::fs::read(Self::path(dir))
             .context("this transfer never finished — there is no record of what arrived")?;
         Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    /// Prove that a legacy `name + epoch` directory belongs to one exact
+    /// authority transaction before it is used for recovery or cleanup.
+    fn matches_attempt(&self, instance_id: &str, epoch: u64, token: &str) -> Result<()> {
+        if self.instance_id != instance_id || self.epoch != epoch || self.token != token {
+            bail!(
+                "legacy staging receipt does not match id/epoch/token; refusing to touch another move"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -2774,7 +2833,10 @@ fn prepare_disk_target(instance_id: &str, name: &str, epoch: u64, token: &str) -
             txn.phase
         ));
     }
-    let staging = staging_for(&txn);
+    let staging = match staging_for(&txn) {
+        Ok(staging) => staging,
+        Err(e) => return error(e.context("refusing to export unverified legacy staging")),
+    };
     let export = (|| -> Result<MigrationDiskExport> {
         let hv = backend::for_instance(&txn.manifest.instance)?;
         let req = backend::migration_req(&txn.manifest.instance, staging)?;
@@ -2820,7 +2882,10 @@ fn disk_ready_target(instance_id: &str, name: &str, epoch: u64, token: &str) -> 
             error(anyhow!("target disk is not exported for mirroring"))
         };
     }
-    let staging = staging_for(&txn);
+    let staging = match staging_for(&txn) {
+        Ok(staging) => staging,
+        Err(e) => return error(e.context("refusing to read unverified legacy staging")),
+    };
     let mut receipt = match Receipt::load(&staging) {
         Ok(receipt) => receipt,
         Err(e) => return error(e),
@@ -2940,7 +3005,10 @@ fn live_prepare_target(
         Ok(None) => return error(anyhow!("target intent must precede live preparation")),
         Err(e) => return error(e),
     }
-    let socket = live_socket(&manifest.instance.name, &manifest.instance.id, epoch, token);
+    let socket = match live_socket(&manifest.instance.name, &manifest.instance.id, epoch, token) {
+        Ok(socket) => socket,
+        Err(e) => return error(e.context("refusing to recover an unverified legacy socket")),
+    };
     let _ = std::fs::remove_file(&socket);
     let started = (|| -> Result<Handle> {
         let hv = backend::for_instance(&manifest.instance)?;
@@ -3150,7 +3218,10 @@ fn recover_target(
         Err(e) => return error(e),
     }
 
-    let staging = staging_for(&txn);
+    let staging = match staging_for(&txn) {
+        Ok(staging) => staging,
+        Err(e) => return error(e.context("refusing to recover unverified legacy staging")),
+    };
     let hv = match backend::for_instance(&txn.manifest.instance) {
         Ok(hv) => hv,
         Err(e) => return error(e),
@@ -3179,7 +3250,10 @@ fn recover_target(
         }
     }
     if !txn.ram_eof {
-        let socket = live_socket(name, instance_id, epoch, token);
+        let socket = match live_socket(name, instance_id, epoch, token) {
+            Ok(socket) => socket,
+            Err(e) => return error(e.context("refusing to recover an unverified legacy socket")),
+        };
         let _ = std::fs::remove_file(&socket);
         let handle = match hv.migrate_in(
             &req,
@@ -3446,7 +3520,7 @@ fn qmp_path_after_publish(current: &Path, staging: &Path, name: &str) -> PathBuf
 /// startup and an RPC replay use this same function after any crash boundary.
 fn finish_target_commit(reg: &mut Shard, txn: &mut AuthorityTxn, device: &str) -> Result<Instance> {
     let name = txn.name.clone();
-    let staging = staging_for(txn);
+    let staging = staging_for(txn)?;
     let live = paths::instance_dir(&name);
 
     if !live.exists() {
@@ -3524,7 +3598,7 @@ fn finish_target_commit(reg: &mut Shard, txn: &mut AuthorityTxn, device: &str) -
     live_sessions().remove(&(name.clone(), txn.epoch));
     let _ = std::fs::remove_file(Receipt::path(&live));
     let _ = std::fs::remove_file(live.join(LIVE_HANDLE));
-    let _ = std::fs::remove_file(live_socket(&name, &txn.instance_id, txn.epoch, &txn.token));
+    let _ = std::fs::remove_file(live_socket(&name, &txn.instance_id, txn.epoch, &txn.token)?);
     let _ = std::fs::remove_file(live.join(LIVE_SOCKET));
     let _ = std::fs::remove_file(live.join(LIVE_AUTHORITY));
     Ok(instance)
@@ -3665,14 +3739,9 @@ pub fn abort_target(
         }
         Ok(None) => {
             // Offline moves and peers from before protocol 6 have no target
-            // authority WAL before adoption. At this point there is no live
-            // guest and no published tree to fence: retain the original
-            // idempotent abort behavior and remove only this epoch's staging.
-            // A peer from before identity-scoped staging may have left the
-            // old name/epoch path behind. It has no authority WAL, so inspect
-            // it only as a backward-compatible cleanup candidate and still
-            // require its receipt to match the caller below.
-            let staging = recoverable_staging_dir(name, instance_id, epoch, token);
+            // authority WAL before adoption. A legacy name/epoch directory is
+            // nevertheless never ours merely because it has the same name:
+            // prove its receipt before any socket or recursive cleanup.
             match load_authority_for_name_epoch(name, epoch) {
                 Ok(Some(existing)) => {
                     return error(anyhow!(
@@ -3684,20 +3753,10 @@ pub fn abort_target(
                 Ok(None) => {}
                 Err(e) => return error(e),
             }
-            if staging.exists() && !instance_id.is_empty() {
-                let receipt = match Receipt::load(&staging) {
-                    Ok(receipt) => receipt,
-                    Err(e) => return error(e),
-                };
-                if receipt.instance_id != instance_id
-                    || receipt.epoch != epoch
-                    || receipt.token != token
-                {
-                    return error(anyhow!(
-                        "target staging does not match abort id/epoch/token"
-                    ));
-                }
-            }
+            let staging = match recoverable_staging_dir(name, instance_id, epoch, token) {
+                Ok(staging) => staging,
+                Err(e) => return error(e.context("refusing to abort unverified legacy staging")),
+            };
             let _ = std::fs::remove_file(paths::migration_socket_in(&staging));
             if let Err(e) = std::fs::remove_dir_all(&staging) {
                 if e.kind() != std::io::ErrorKind::NotFound {
@@ -3813,12 +3872,12 @@ fn finish_target_abort(txn: &mut AuthorityTxn) -> Result<()> {
     }
     let name = txn.name.clone();
     let epoch = txn.epoch;
-    let staging = staging_for(txn);
+    let staging = staging_for(txn)?;
     let handle = live_sessions()
         .remove(&(name.to_owned(), epoch))
         .or_else(|| txn.handle.clone())
         .or_else(|| {
-            std::fs::read(staging_for(txn).join(LIVE_HANDLE))
+            std::fs::read(staging.join(LIVE_HANDLE))
                 .ok()
                 .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         });
@@ -6771,14 +6830,86 @@ mod tests {
             );
         }
 
-        // An offline or protocol-5 abort has no authority WAL. It still
-        // removes exactly its staging epoch and returns the old response.
+        // An offline or protocol-5 abort has no authority WAL. Its old
+        // name/epoch staging spelling is usable only when the receipt binds
+        // it to this exact id and token: never let a same-name/epoch tree
+        // donate a handle, socket, or recursive delete to a replacement.
         let legacy_epoch = 9;
         let legacy = legacy_staging_dir("legacy", legacy_epoch);
         std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(legacy.join("partial"), b"bytes").unwrap();
+        let foreign_handle = legacy.join(LIVE_HANDLE);
+        std::fs::write(&foreign_handle, b"foreign handle must survive").unwrap();
+        std::fs::write(Receipt::path(&legacy), b"not-json").unwrap();
+        assert!(recoverable_staging_dir("legacy", "replacement", legacy_epoch, "token").is_err());
         assert!(matches!(
-            abort_target(&mut restarted, "", "legacy", legacy_epoch, "token"),
+            abort_target(
+                &mut restarted,
+                "replacement",
+                "legacy",
+                legacy_epoch,
+                "token"
+            ),
+            Response::Error { .. }
+        ));
+        sweep_staging();
+        assert!(
+            foreign_handle.exists(),
+            "corrupt legacy receipt must retain its handle"
+        );
+
+        Receipt {
+            instance_id: "foreign".into(),
+            epoch: legacy_epoch,
+            token: "foreign-token".into(),
+            from_device: "laptop".into(),
+            bytes: 0,
+            files: BTreeMap::new(),
+        }
+        .save(&legacy)
+        .unwrap();
+        assert!(recoverable_staging_dir("legacy", "replacement", legacy_epoch, "token").is_err());
+        assert!(matches!(
+            abort_target(
+                &mut restarted,
+                "replacement",
+                "legacy",
+                legacy_epoch,
+                "token"
+            ),
+            Response::Error { .. }
+        ));
+        assert!(
+            foreign_handle.exists(),
+            "foreign legacy tree must not be aborted"
+        );
+        sweep_staging();
+        assert!(
+            foreign_handle.exists(),
+            "foreign legacy tree must not be swept"
+        );
+
+        Receipt {
+            instance_id: "replacement".into(),
+            epoch: legacy_epoch,
+            token: "token".into(),
+            from_device: "laptop".into(),
+            bytes: 0,
+            files: BTreeMap::new(),
+        }
+        .save(&legacy)
+        .unwrap();
+        assert_eq!(
+            recoverable_staging_dir("legacy", "replacement", legacy_epoch, "token").unwrap(),
+            legacy
+        );
+        assert!(matches!(
+            abort_target(
+                &mut restarted,
+                "replacement",
+                "legacy",
+                legacy_epoch,
+                "token"
+            ),
             Response::Ok
         ));
         assert!(!legacy.exists());
