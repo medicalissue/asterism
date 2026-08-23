@@ -210,8 +210,7 @@ async fn main() -> Result<()> {
     // An attach spans the provider's lease book and this consumer's instance
     // shard. Settle its independent journal before resurrection can hand any
     // ambiguously recorded disk to a hypervisor.
-    instance::reconcile_pending_attaches(&node).await;
-    instance::reconcile_pending_releases(&node).await;
+    instance::reconcile_pending_storage(&node).await;
 
     // The egress plane, for the same reason and in the same shape: a bound
     // guest's proxy is put up by the boot that builds its seed, and the

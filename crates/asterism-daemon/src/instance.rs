@@ -1227,9 +1227,12 @@ async fn abort_attach(
 }
 
 /// Reconcile every attach which crossed only part of its two-device saga.
-/// Called after the volume plane exists and before guest resurrection, so an
-/// uncommitted disk can never reach a hypervisor after daemon restart.
-pub(crate) async fn reconcile_pending_attaches(node: &Node) {
+///
+/// The caller owns the live shard for this entire pass. That includes loading
+/// the independent journal: a mesh request also owns the shard while it
+/// creates an intent, so a stale whole-journal save cannot erase an intent
+/// written between recovery's load and an item's completion or abort.
+async fn reconcile_pending_attaches(reg: &mut Shard) {
     let mut intents = match AttachIntents::load(&paths::volume_attach_intents_path()) {
         Ok(intents) => intents,
         Err(e) => {
@@ -1238,14 +1241,9 @@ pub(crate) async fn reconcile_pending_attaches(node: &Node) {
         }
     };
     for intent in intents.list() {
-        // Mesh streams may already be arriving while startup reconciles.
-        // Keep the live shard locked across this bounded recovery operation:
-        // saving a detached clone and assigning it back later could otherwise
-        // erase a mesh-originated mutation that landed in between.
-        let mut reg = lock_recovery_shard(node).await;
         match tokio::time::timeout(
             STORAGE_RECOVERY_DEADLINE,
-            reconcile_one_attach(&mut reg, &mut intents, &intent),
+            reconcile_one_attach(reg, &mut intents, &intent),
         )
         .await
         {
@@ -1559,9 +1557,9 @@ async fn reconcile_one_release(
 }
 
 /// Re-drive every detach whose provider acknowledgement or consumer commit
-/// was interrupted. This runs before guest resurrection, so a row whose
-/// writer fence was released is removed before it can reach a hypervisor.
-pub(crate) async fn reconcile_pending_releases(node: &Node) {
+/// was interrupted. The caller retains the same exclusion acquired before
+/// the attach journal was read; do not make a separately synchronized pass.
+async fn reconcile_pending_releases(reg: &mut Shard) {
     let mut intents = match ReleaseIntents::load(&paths::volume_release_intents_path()) {
         Ok(intents) => intents,
         Err(e) => {
@@ -1570,12 +1568,9 @@ pub(crate) async fn reconcile_pending_releases(node: &Node) {
         }
     };
     for intent in intents.list() {
-        // See attach recovery above: this must mutate the live locked shard,
-        // never write a startup clone over concurrent mesh-originated work.
-        let mut reg = lock_recovery_shard(node).await;
         match tokio::time::timeout(
             STORAGE_RECOVERY_DEADLINE,
-            reconcile_one_release(&mut reg, &mut intents, &intent),
+            reconcile_one_release(reg, &mut intents, &intent),
         )
         .await
         {
@@ -1596,6 +1591,16 @@ pub(crate) async fn reconcile_pending_releases(node: &Node) {
             ),
         }
     }
+}
+
+/// Recover both storage journals in the one exclusion window shared with
+/// mesh-originated storage mutations. The lock begins before either durable
+/// map is loaded and ends only after every whole-map recovery write, so no
+/// pending attach or release can be lost to a stale journal snapshot.
+pub(crate) async fn reconcile_pending_storage(node: &Node) {
+    let mut reg = lock_recovery_shard(node).await;
+    reconcile_pending_attaches(&mut reg).await;
+    reconcile_pending_releases(&mut reg).await;
 }
 
 /// A volume on this device is about to be handed to a hypervisor, so it has
@@ -1696,36 +1701,108 @@ mod tests {
         }
     }
 
-    /// A failed journal recovery retains the live shard exclusion until the
-    /// failing operation returns. A concurrent mesh mutation therefore waits
-    /// instead of being overwritten by a stale whole-document save.
-    #[tokio::test]
-    async fn recovery_failure_keeps_mesh_mutations_out_of_its_live_shard_window() {
-        let dir = tempfile::tempdir().unwrap();
-        let node = Node {
+    fn recovery_node(dir: &std::path::Path) -> Node {
+        Node {
             shard: Arc::new(tokio::sync::Mutex::new(
-                Shard::load(&dir.path().join("state.json")).unwrap(),
+                Shard::load(&dir.join("state.json")).unwrap(),
             )),
             orbit: Arc::new(tokio::sync::Mutex::new(
-                crate::orbit::Orbit::load(&dir.path().join("orbit.json")).unwrap(),
+                crate::orbit::Orbit::load(&dir.join("orbit.json")).unwrap(),
             )),
-            shell: crate::device_shell::Manager::load_at(dir.path()),
-        };
+            shell: crate::device_shell::Manager::load_at(dir),
+        }
+    }
+
+    /// Recovery writes a whole journal map after each item. A mesh attach
+    /// that starts while recovery is failing must be serialized behind the
+    /// recovery load-and-save window, or that stale map will erase it.
+    #[tokio::test]
+    async fn failed_attach_recovery_preserves_a_mesh_created_durable_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attach-intents.json");
+        let node = recovery_node(dir.path());
+        let first = AttachIntent::new("dev", "dev-id", "first", "nas", "nas-id", "mac-id");
+        let second = AttachIntent::new("dev", "dev-id", "second", "nas", "nas-id", "mac-id");
+        AttachIntents::load(&path)
+            .unwrap()
+            .begin_durable(first.clone())
+            .unwrap();
+
+        let recovery = lock_recovery_shard(&node).await;
+        let mut stale = AttachIntents::load(&path).unwrap();
+        let mesh_node = node.clone();
+        let mesh_path = path.clone();
+        let mesh_intent = second.clone();
+        let mesh_write = tokio::spawn(async move {
+            let _mesh = mesh_node.shard.lock().await;
+            AttachIntents::load(&mesh_path)
+                .unwrap()
+                .begin_durable(mesh_intent)
+                .unwrap();
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !mesh_write.is_finished(),
+            "mesh created an attach intent inside recovery's stale journal window"
+        );
 
         let failure: Result<()> = async {
-            let _recovery = lock_recovery_shard(&node).await;
-            assert!(
-                node.shard.try_lock().is_err(),
-                "a mesh mutation entered while recovery still owns the live shard"
-            );
-            anyhow::bail!("simulated provider recovery failure")
+            stale.complete_durable(&first)?;
+            anyhow::bail!("simulated attach recovery failure after durable completion")
         }
         .await;
         assert!(failure.is_err());
+        drop(recovery);
+        mesh_write.await.unwrap();
+
+        let persisted = AttachIntents::load(&path).unwrap();
+        assert!(persisted.contains(&second), "mesh attach intent was lost");
+    }
+
+    /// Release recovery has the same whole-map write shape as attach recovery.
+    /// A pending detach written by a mesh request while a prior recovery fails
+    /// must remain in the durable journal for the next startup.
+    #[tokio::test]
+    async fn failed_release_recovery_preserves_a_mesh_created_durable_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("release-intents.json");
+        let node = recovery_node(dir.path());
+        let first = ReleaseIntent::new("dev", "dev-id", "first", "nas", "nas-id", "mac-id", 7);
+        let second = ReleaseIntent::new("dev", "dev-id", "second", "nas", "nas-id", "mac-id", 8);
+        ReleaseIntents::load(&path)
+            .unwrap()
+            .begin_durable(first.clone())
+            .unwrap();
+
+        let recovery = lock_recovery_shard(&node).await;
+        let mut stale = ReleaseIntents::load(&path).unwrap();
+        let mesh_node = node.clone();
+        let mesh_path = path.clone();
+        let mesh_intent = second.clone();
+        let mesh_write = tokio::spawn(async move {
+            let _mesh = mesh_node.shard.lock().await;
+            ReleaseIntents::load(&mesh_path)
+                .unwrap()
+                .begin_durable(mesh_intent)
+                .unwrap();
+        });
+        tokio::task::yield_now().await;
         assert!(
-            node.shard.try_lock().is_ok(),
-            "the recovery lock was not released after its failure"
+            !mesh_write.is_finished(),
+            "mesh created a release intent inside recovery's stale journal window"
         );
+
+        let failure: Result<()> = async {
+            stale.complete_durable(&first)?;
+            anyhow::bail!("simulated release recovery failure after durable completion")
+        }
+        .await;
+        assert!(failure.is_err());
+        drop(recovery);
+        mesh_write.await.unwrap();
+
+        let persisted = ReleaseIntents::load(&path).unwrap();
+        assert!(persisted.contains(&second), "mesh release intent was lost");
     }
 
     /// The normal dead-handle reconciliation path must not turn the missing
