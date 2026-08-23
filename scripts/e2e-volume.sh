@@ -383,6 +383,15 @@ expect "provider-local administration remains available" "$VOL" \
 # From the harness's own cache, never ~/.asterism: that one belongs to the
 # user's daemon and may be written to while this is reading it.
 harness_cache_image "$AST" "$IMAGE" || fail "could not cache $IMAGE"
+if [ "$BACKEND" = chv ]; then
+  # CHV directly boots Asterism's separately verified guest kernel. Catalog
+  # cloud disks carry their own bootloader but do not populate that shared
+  # kernel store, while the OCI pull path does. Seed it explicitly so this
+  # standalone native-backend lane starts from an honestly fresh cache.
+  KERNEL_SEED_IMAGE="${E2E_CHV_KERNEL_IMAGE:-docker.io/library/busybox:musl}"
+  harness_cache_image "$AST" "$KERNEL_SEED_IMAGE" \
+    || fail "could not cache the CHV guest kernel via $KERNEL_SEED_IMAGE"
+fi
 harness_seed_images "$A"
 ASTERISM_HOME="$A" "$AST" pull "$IMAGE" >/dev/null 2>&1 \
   || fail "no $IMAGE image available for A (pull it once: ast pull $IMAGE)"
