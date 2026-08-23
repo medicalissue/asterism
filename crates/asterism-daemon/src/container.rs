@@ -17,6 +17,8 @@ use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(target_os = "linux")]
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -39,6 +41,8 @@ pub const WINDOWS_ID: &str = "windows-hyperv-container-utility-vm";
 const MAX_EXEC_OUTPUT: usize = 1024 * 1024;
 pub const EXEC_DEADLINE: Duration = Duration::from_secs(30);
 const CONTROL_DEADLINE: Duration = Duration::from_secs(2);
+#[cfg(target_os = "linux")]
+const CONTROL_CGROUP: &str = "asterism-control";
 
 trait Adapter: Send + Sync {
     fn id(&self) -> &'static str;
@@ -373,14 +377,19 @@ fn safe_file_target(rootfs: &Path, guest: &Path) -> Result<PathBuf> {
 
 #[cfg(target_os = "linux")]
 fn delegated_cgroup(id: &str, cpus: u32, mem_mib: u32) -> Result<PathBuf> {
+    static DELEGATION: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = DELEGATION
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| anyhow::anyhow!("container cgroup delegation lock was poisoned"))?;
     let membership = fs::read_to_string("/proc/self/cgroup")?;
     let relative = membership
         .lines()
         .find_map(|line| line.strip_prefix("0::"))
         .context("this host is not using the unified cgroup-v2 hierarchy")?;
-    let leaf = Path::new("/sys/fs/cgroup")
-        .join(relative.trim_start_matches('/'))
-        .join(format!("asterism-{}", id.replace('-', "")));
+    let root = delegation_root(relative)?;
+    prepare_delegated_root(&root)?;
+    let leaf = root.join(format!("asterism-{}", id.replace('-', "")));
     fs::create_dir(&leaf).with_context(|| {
         format!(
             "creating delegated cgroup {} (rootless cgroup delegation is required)",
@@ -404,6 +413,90 @@ fn delegated_cgroup(id: &str, cpus: u32, mem_mib: u32) -> Result<PathBuf> {
         return Err(error).context("configuring delegated memory/cpu cgroup controllers");
     }
     Ok(leaf)
+}
+
+#[cfg(target_os = "linux")]
+fn delegation_root(relative: &str) -> Result<PathBuf> {
+    let relative = relative.trim();
+    if relative.is_empty() || relative == "/" {
+        bail!("rootless container cgroups require a delegated service subtree");
+    }
+    let current = Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
+    if current.file_name().and_then(|name| name.to_str()) == Some(CONTROL_CGROUP) {
+        return current
+            .parent()
+            .map(Path::to_path_buf)
+            .context("the Asterism control cgroup has no delegated parent");
+    }
+    Ok(current)
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_delegated_root(root: &Path) -> Result<()> {
+    let control = root.join(CONTROL_CGROUP);
+    match fs::create_dir(&control) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "creating the manager leaf under delegated cgroup {}",
+                    root.display()
+                )
+            })
+        }
+    }
+
+    // A cgroup-v2 domain may not both contain processes and distribute CPU or
+    // memory to children. Move every process in this one delegated unit into
+    // the manager leaf; descendants they spawn inherit that leaf, while each
+    // container runtime later moves into an instance sibling.
+    for _ in 0..16 {
+        let members = fs::read_to_string(root.join("cgroup.procs"))?;
+        if members.trim().is_empty() {
+            break;
+        }
+        for pid in members.lines().filter(|pid| !pid.trim().is_empty()) {
+            if let Err(error) = fs::write(control.join("cgroup.procs"), format!("{pid}\n")) {
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error).with_context(|| {
+                        format!("moving process {pid} into {}", control.display())
+                    });
+                }
+            }
+        }
+    }
+    if !fs::read_to_string(root.join("cgroup.procs"))?
+        .trim()
+        .is_empty()
+    {
+        bail!(
+            "delegated cgroup {} kept receiving manager processes while it was being split",
+            root.display()
+        );
+    }
+
+    let available = fs::read_to_string(root.join("cgroup.controllers"))?;
+    let available: std::collections::HashSet<_> = available.split_whitespace().collect();
+    for controller in ["cpu", "memory", "pids"] {
+        if !available.contains(controller) {
+            bail!(
+                "delegated cgroup {} does not offer the {controller} controller",
+                root.display()
+            );
+        }
+    }
+    fs::write(
+        root.join("cgroup.subtree_control"),
+        "+cpu +memory +pids",
+    )
+    .with_context(|| {
+        format!(
+            "enabling cpu/memory/pids in delegated cgroup {}",
+            root.display()
+        )
+    })?;
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1623,6 +1716,20 @@ fn host_pid() -> Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_manager_leaf_resolves_back_to_one_delegated_root() {
+        assert_eq!(
+            delegation_root("/user.slice/asterism.service").unwrap(),
+            Path::new("/sys/fs/cgroup/user.slice/asterism.service")
+        );
+        assert_eq!(
+            delegation_root("/user.slice/asterism.service/asterism-control").unwrap(),
+            Path::new("/sys/fs/cgroup/user.slice/asterism.service")
+        );
+        assert!(delegation_root("/").is_err());
+    }
 
     #[cfg(target_os = "linux")]
     fn control_fixture(dir: &Path, pid: u32) -> ContainerControlEndpoint {
