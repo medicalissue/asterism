@@ -249,7 +249,7 @@ pub(crate) fn orbit() -> Result<(Node, Option<Arc<Mesh>>)> {
 ///   on their LAN. See [`GuestEgress`].
 ///
 /// There is deliberately no check that this is the device supplying the
-/// instance's cpu part. Reaching here means this device holds the row, which
+/// instance's compute. Reaching here means this device holds the row, which
 /// is the same fact — and writing it down a second time would mean comparing
 /// an orbit name against a hostname, which are not the same string.
 pub(crate) fn check_can_bind(inst: &Instance) -> Result<()> {

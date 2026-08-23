@@ -383,7 +383,7 @@ impl std::fmt::Debug for GuestHandle {
 ///
 /// Everything here is either public metadata or the opaque handle, and that
 /// is the invariant the whole feature rests on: this struct is written into
-/// `state.json`, printed by `ast status`, and carried across a cpu-part move,
+/// `state.json`, printed by `ast status`, and carried across a compute move,
 /// so if material could reach it, material would reach all three.
 ///
 /// `version` is a *note*, not a pin. The value it named may have been rotated

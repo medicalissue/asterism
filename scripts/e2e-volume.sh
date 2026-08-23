@@ -712,7 +712,7 @@ expect "and back to the first" "a disk in the guest" \
 # paths. Move compute onto the storage owner and back; each boot renews the
 # lease for the new compute device while the part's owner never changes.
 
-ASTERISM_HOME="$A" "$AST" move "$INST" "$B_NAME" >"$RUN/move-to-provider.out" 2>&1 \
+ASTERISM_HOME="$A" "$AST" set "$INST" compute "$B_NAME" >"$RUN/move-to-provider.out" 2>&1 \
   || fail "moving compute to the storage provider failed:"$'\n'"$(cat "$RUN/move-to-provider.out")"
 expect "the moved instance boots with provider-local storage" "$INST  running" \
   env ASTERISM_HOME="$A" "$AST" up "$INST"
@@ -724,7 +724,7 @@ expect "the volume bytes survive compute placement on their owner" "$MARKER" \
 
 expect "stop before moving compute back" "$INST  stopped" \
   env ASTERISM_HOME="$A" "$AST" down "$INST"
-ASTERISM_HOME="$A" "$AST" move "$INST" "$A_NAME" >"$RUN/move-back.out" 2>&1 \
+ASTERISM_HOME="$A" "$AST" set "$INST" compute "$A_NAME" >"$RUN/move-back.out" 2>&1 \
   || fail "moving compute back from the provider failed:"$'\n'"$(cat "$RUN/move-back.out")"
 expect "the instance boots after storage becomes remote again" "$INST  running" \
   env ASTERISM_HOME="$A" "$AST" up "$INST"
