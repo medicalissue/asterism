@@ -1,6 +1,8 @@
 #![cfg(windows)]
 
 use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use asterism_core::ipc::{self, Door, SocketState};
@@ -10,10 +12,60 @@ use windows_sys::Win32::System::Threading::GetCurrentThread;
 
 const CHILD_MODE: &str = "ASTERISM_WINDOWS_PIPE_CHILD";
 
+fn user_owned_home(parent: &Path) -> PathBuf {
+    let home = parent.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    // Hosted Windows runs tests from an elevated token whose default owner is
+    // BUILTIN\Administrators. That is not the identity model under test: a
+    // real ASTERISM_HOME belongs to the interactive account, even when its
+    // service runs as LocalSystem. Give this scratch home that exact owner and
+    // a protected DACL before either side derives the pipe identity.
+    let output = Command::new("whoami.exe").output().unwrap();
+    assert!(
+        output.status.success(),
+        "whoami failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let account = String::from_utf8(output.stdout).unwrap();
+    let account = account.trim();
+    assert!(!account.is_empty(), "whoami returned an empty account");
+
+    let output = Command::new("icacls.exe")
+        .arg(&home)
+        .args(["/setowner", account, "/Q"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "setting the test-home owner failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let account_ace = format!("{account}:(OI)(CI)(F)");
+    let output = Command::new("icacls.exe")
+        .arg(&home)
+        .args([
+            "/inheritance:r",
+            "/grant:r",
+            &account_ace,
+            "*S-1-5-18:(OI)(CI)(F)",
+            "/Q",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "protecting the test home failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    home
+}
+
 #[tokio::test]
 async fn real_named_pipe_round_trip_peer_identity_and_lifetime() {
     let temp = tempfile::tempdir().unwrap();
-    let home = temp.path().join("home");
+    let home = user_owned_home(temp.path());
     let sock = home.join("astd.sock");
     let door = Door::open(&home, &sock).unwrap();
     assert_eq!(ipc::audit_socket(&sock).unwrap(), SocketState::Ready);
@@ -64,7 +116,7 @@ async fn real_named_pipe_round_trip_peer_identity_and_lifetime() {
 #[tokio::test]
 async fn pipe_acl_refuses_an_unauthorized_os_token() {
     let temp = tempfile::tempdir().unwrap();
-    let home = temp.path().join("home");
+    let home = user_owned_home(temp.path());
     let sock = home.join("astd.sock");
     let _door = Door::open(&home, &sock).unwrap();
     let attempt = std::thread::spawn(move || {
@@ -89,7 +141,7 @@ async fn pipe_acl_refuses_an_unauthorized_os_token() {
 fn overlapped_client_read_honors_its_deadline() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let temp = tempfile::tempdir().unwrap();
-    let home = temp.path().join("home");
+    let home = user_owned_home(temp.path());
     let sock = home.join("astd.sock");
     let door = runtime.block_on(async { Door::open(&home, &sock).unwrap() });
 
@@ -109,10 +161,10 @@ fn overlapped_client_read_honors_its_deadline() {
 #[test]
 fn pipe_identity_is_stable_for_one_home_and_separates_home_paths() {
     let temp = tempfile::tempdir().unwrap();
-    let first = temp.path().join("first");
-    let second = temp.path().join("second");
-    std::fs::create_dir_all(&first).unwrap();
-    std::fs::create_dir_all(&second).unwrap();
+    let first_root = temp.path().join("first");
+    let second_root = temp.path().join("second");
+    let first = user_owned_home(&first_root);
+    let second = user_owned_home(&second_root);
     let first_sock = first.join("astd.sock");
     let first_again = ipc::pipe_name_for_conformance(&first, &first_sock).unwrap();
     assert_eq!(
@@ -131,7 +183,7 @@ fn unexpected_wait_and_cancel_failures_drain_pending_io_in_a_subprocess() {
     if std::env::var(CHILD_MODE).as_deref() == Ok("wait-failure") {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("home");
+        let home = user_owned_home(temp.path());
         let sock = home.join("astd.sock");
         let door = runtime.block_on(async { Door::open(&home, &sock).unwrap() });
         let mut client = ipc::connect(&sock).unwrap();

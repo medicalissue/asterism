@@ -16,6 +16,8 @@ $installedAst = Join-Path $installRoot 'ast.exe'
 $installedAstd = Join-Path $installRoot 'astd.exe'
 $servicePid = 0
 $pipeName = $null
+$interactiveIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$interactiveSid = $interactiveIdentity.User.Value
 
 function Get-AsterismPipes {
     @(Get-ChildItem -LiteralPath '\\.\pipe\' -ErrorAction Stop |
@@ -46,7 +48,15 @@ Copy-Item -LiteralPath $Astd -Destination $installedAstd
 # LocalService can traverse the home and read its owner SID, but cannot write
 # it. Its probe therefore reaches the pipe DACL instead of failing on a parent
 # directory lookup, and cannot win the daemon election as a fallback.
-& icacls.exe $home '/grant:r' '*S-1-5-18:(OI)(CI)(F)' '*S-1-5-19:(OI)(CI)(RX)' | Out-Null
+& icacls.exe $home '/setowner' "*$interactiveSid" '/Q' | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "could not assign ASTERISM_HOME to interactive SID $interactiveSid"
+}
+& icacls.exe $home '/inheritance:r' '/grant:r' `
+    "*${interactiveSid}:(OI)(CI)(F)" '*S-1-5-18:(OI)(CI)(F)' '*S-1-5-19:(OI)(CI)(RX)' '/Q' | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw 'could not protect the user-owned ASTERISM_HOME'
+}
 & icacls.exe $probeRoot '/grant:r' '*S-1-5-19:(OI)(CI)(M)' | Out-Null
 
 $env:ASTERISM_HOME = $home
@@ -127,7 +137,7 @@ Set-Content -LiteralPath $ResultPath -Value $LASTEXITCODE -Encoding ascii
         throw "LocalSystem astd pid $servicePid survived service stop"
     }
 
-    Write-Host "LocalSystem service IPC PASS: service=$service pid=$servicePid pipe=$pipeName owner=$([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value)"
+    Write-Host "LocalSystem service IPC PASS: service=$service pid=$servicePid pipe=$pipeName owner=$interactiveSid"
 }
 finally {
     & schtasks.exe /Delete /TN $task /F 2>$null | Out-Null
