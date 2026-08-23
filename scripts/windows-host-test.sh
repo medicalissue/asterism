@@ -57,6 +57,14 @@ FAKE="${WORK}/releases"
 mkdir -p "$SHIMS" "$FAKE"
 export PATH="${SHIMS}:$PATH"
 
+# Git for Windows gives Bash POSIX paths while its native curl expects a
+# Windows file URL. Keep the release fixture local, but translate the path at
+# that process boundary so the same suite really executes on windows-latest.
+case "$(uname -s)" in
+MINGW* | MSYS* | CYGWIN*) FAKE_URL="file:///$(cygpath -m "$FAKE")" ;;
+*) FAKE_URL="file://${FAKE}" ;;
+esac
+
 cat >"${SHIMS}/uname" <<EOF
 #!/bin/sh
 case "\$1" in
@@ -122,8 +130,8 @@ run_install() {
 	OUT="$(env PATH="${SHIMS}:${PATH}" \
 		ASTERISM_YES=1 \
 		ASTERISM_PREFIX="$PREFIX" \
-		ASTERISM_BASE_URL="file://${FAKE}" \
-		ASTERISM_INDEX_URL="file://${FAKE}/latest.json" \
+		ASTERISM_BASE_URL="$FAKE_URL" \
+		ASTERISM_INDEX_URL="$FAKE_URL/latest.json" \
 		${envs[@]+"${envs[@]}"} sh "$INSTALL" ${args[@]+"${args[@]}"} 2>&1)"
 	status=$?
 	set -e
@@ -185,7 +193,7 @@ tar -czf "${FAKE}/v0.1.1/asterism-v0.1.1-windows-x86_64.tar.gz" -C "$stage" ast.
 	else sha256sum asterism-v0.1.1-windows-x86_64.tar.gz
 	fi
 } >SHA256SUMS)
-run_install refused ASTERISM_PREFIX="$PREFIX" ASTERISM_VERSION=v0.1.1 ASTERISM_BASE_URL="file://${FAKE}"
+run_install refused ASTERISM_PREFIX="$PREFIX" ASTERISM_VERSION=v0.1.1 ASTERISM_BASE_URL="$FAKE_URL"
 says "astd-hyperv"
 [ ! -e "${PREFIX}/bin/ast.exe" ] || fail "a partial Windows tarball still installed ast.exe"
 ok "a Windows tarball without astd-hyperv.exe is refused"
@@ -208,7 +216,7 @@ tar -czf "${FAKE}/v0.1.2/asterism-v0.1.2-windows-x86_64.tar.gz" -C "$stage" \
 	else sha256sum asterism-v0.1.2-windows-x86_64.tar.gz
 	fi
 } >SHA256SUMS)
-run_install refused ASTERISM_PREFIX="$PREFIX" ASTERISM_VERSION=v0.1.2 ASTERISM_BASE_URL="file://${FAKE}"
+run_install refused ASTERISM_PREFIX="$PREFIX" ASTERISM_VERSION=v0.1.2 ASTERISM_BASE_URL="$FAKE_URL"
 says "install.ps1"
 [ ! -e "${PREFIX}/bin/ast.exe" ] || fail "artifact without install.ps1 mutated ast.exe"
 ok "a Windows updater without packaged install.ps1 is refused before mutation"
