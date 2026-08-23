@@ -20,6 +20,9 @@ sha() { shasum -a 256 "$1" | awk '{print $1}'; }
 mode_of() {
   stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1"
 }
+inode_of() {
+  stat -f '%i' "$1" 2>/dev/null || stat -c '%i' "$1"
+}
 
 VERIFIER="$WORK/verifier"
 cat >"$VERIFIER" <<'SH'
@@ -32,8 +35,12 @@ SETCAP="$WORK/setcap"
 cat >"$SETCAP" <<SH
 #!/bin/sh
 [ "\$1" = cap_net_admin+ep ] || exit 93
-chmod 0700 "\$2"
 printf '%s\n' "\$2" >>"$WORK/setcap-calls"
+[ ! -e "$WORK/setcap-fail" ] || {
+  echo 'injected permanent setcap failure' >&2
+  exit 92
+}
+chmod 0700 "\$2"
 SH
 chmod +x "$SETCAP"
 
@@ -326,6 +333,7 @@ install_linux_old() {
   PREFIX="$WORK/prefix-linux"
   HOME_STATE="$WORK/home-linux"
   rm -rf "$PREFIX" "$HOME_STATE" "$WORK/activations"
+  rm -f "$WORK/setcap-calls" "$WORK/setcap-fail"
   mkdir -p "$PREFIX/bin" "$PREFIX/libexec/asterism"
   make_program "$PREFIX/bin/ast" ast 0.0.1 0.0.1+old
   make_program "$PREFIX/bin/astd" astd 0.0.1 0.0.1+old
@@ -350,6 +358,20 @@ run_linux_update() {
     ASTERISM_UPDATE_PUBKEY=test-public-key \
     ASTERISM_UPDATE_SETCAP="$SETCAP" \
     "$PREFIX/libexec/asterism/asterism-update" "$@"
+}
+
+assert_linux_transaction_clean() {
+  local context="$1" path
+  [ ! -e "$HOME_STATE/update-transaction.claim" ] ||
+    fail "$context: transaction claim remains"
+  [ -z "$(find "$HOME_STATE" -maxdepth 1 -name 'update-transaction.*' -print -quit 2>/dev/null)" ] ||
+    fail "$context: private transaction directory remains"
+  for path in \
+    "$PREFIX/bin/ast" "$PREFIX/bin/astd" "$PREFIX/bin/cloud-hypervisor" \
+    "$PREFIX/bin/virtiofsd" "$PREFIX/libexec/asterism/asterism-update"; do
+    [ ! -e "${path}.previous.update" ] || fail "$context: backup remains for $path"
+    [ ! -e "${path}.previous.update.absent" ] || fail "$context: absence marker remains for $path"
+  done
 }
 
 make_linux_release 0.0.2 0.0.2+new
@@ -378,6 +400,36 @@ fi
 [ "$(mode_of "$PREFIX/bin/cloud-hypervisor")" = 700 ] ||
   fail "linux rollback did not restore cap_net_admin metadata"
 ok "Linux activation and rollback preserve Cloud Hypervisor capability metadata"
+
+install_linux_old
+old_chv_inode=$(inode_of "$PREFIX/bin/cloud-hypervisor")
+touch "$WORK/setcap-fail"
+if run_linux_update apply --yes >"$WORK/linux-setcap-failure" 2>&1; then
+  fail "linux update succeeded despite permanent setcap failure"
+fi
+grep -q 'could not apply cap_net_admin to the new Cloud Hypervisor' "$WORK/linux-setcap-failure" ||
+  fail "linux update did not surface the original capability failure"
+[ "$(build_of "$PREFIX/bin/ast")" = 0.0.1+old ] ||
+  fail "permanent setcap failure did not preserve old ast"
+[ "$(build_of "$PREFIX/bin/astd")" = 0.0.1+old ] ||
+  fail "permanent setcap failure did not preserve old astd"
+"$PREFIX/bin/cloud-hypervisor" | grep -q 'v53.0 old' ||
+  fail "permanent setcap failure did not restore old Cloud Hypervisor"
+[ "$(inode_of "$PREFIX/bin/cloud-hypervisor")" = "$old_chv_inode" ] ||
+  fail "permanent setcap failure replaced the old Cloud Hypervisor inode"
+[ "$(mode_of "$PREFIX/bin/cloud-hypervisor")" = 700 ] ||
+  fail "permanent setcap failure lost the old Cloud Hypervisor capability metadata"
+assert_linux_transaction_clean "permanent setcap rollback"
+rm -f "$WORK/setcap-fail"
+run_linux_update apply --yes >"$WORK/linux-after-setcap-failure"
+[ "$(build_of "$PREFIX/bin/ast")" = 0.0.2+new ] ||
+  fail "retry after setcap repair did not activate ast"
+[ "$(build_of "$PREFIX/bin/astd")" = 0.0.2+new ] ||
+  fail "retry after setcap repair did not activate astd"
+"$PREFIX/bin/cloud-hypervisor" | grep -qv 'old' ||
+  fail "retry after setcap repair did not activate the new Cloud Hypervisor"
+assert_linux_transaction_clean "retry after setcap repair"
+ok "permanent setcap failure rolls back cleanly and does not wedge the next update"
 
 install_linux_old
 mkdir -p "$PREFIX/share/asterism/artifact.lock"
