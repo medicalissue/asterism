@@ -27,13 +27,6 @@ jobs:
           command: check bans licenses sources
           arguments: --all-features --locked
 
-      - name: Audit the locked GUI Rust graph and license policy
-        uses: EmbarkStudios/cargo-deny-action@4de59db63a066737e557c2c4dd3d1f70206de781 # v2.0.10 peeled commit
-        with:
-          command: check bans licenses sources
-          arguments: --all-features --locked
-          manifest-path: gui/Cargo.toml
-
       # cargo-deny-action v2.0.10 embeds cargo-deny 0.18.0, whose advisory
       # parser predates RustSec's CVSS 4.0 records. Keep that pinned action for
       # license/source policy and use a current, version-pinned cargo-audit for
@@ -43,14 +36,10 @@ jobs:
         with:
           tool: cargo-audit@0.22.2
 
-      - name: Audit the locked Rust graphs for vulnerabilities
+      - name: Audit the locked Rust graph for vulnerabilities
         run: |
           set -eu
           cargo audit --file Cargo.lock
-          cargo audit --file gui/Cargo.lock
-
-      - name: Audit the locked GUI npm graph
-        run: npm --prefix gui/ui audit --package-lock-only --audit-level=low --ignore-scripts
 
       - name: Install pinned gitleaks
         env:
@@ -196,10 +185,10 @@ jobs:
           # than its size suggests: it is the only thing standing between a
           # build and an entitled helper, and when it fails vz is not broken
           # loudly, it is simply unavailable.
-          for f in scripts/*.sh scripts/lib/*.sh gui/*.sh; do
+          for f in scripts/*.sh scripts/lib/*.sh; do
             bash -n "$f"
           done
-          shellcheck -x scripts/*.sh scripts/lib/*.sh gui/*.sh
+          shellcheck -x scripts/*.sh scripts/lib/*.sh
 
       - name: The harness's own suite
         run: bash scripts/harness-test.sh
@@ -233,16 +222,6 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 peeled commit
-
-      # The desktop app's crate does not compile without its built frontend
-      # (`tauri::generate_context!` reads gui/ui/dist while it expands), so
-      # this is what lets the `unit` suite include the app's tests rather
-      # than report that it skipped them.
-      - name: Build the desktop app's frontend
-        run: |
-          set -eu
-          npm --prefix gui/ui ci
-          npm --prefix gui/ui run build
 
       # The build id is stamped at compile time and is what the identity gate
       # compares across binaries. Naming the commit here makes a CI run's

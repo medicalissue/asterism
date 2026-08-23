@@ -17,9 +17,9 @@
 //!     is a legitimate way to build this, and it must not fail the build. It
 //!     is honest about not knowing rather than inventing a plausible id.
 //!
-//! Every binary in the tree links `asterism-core`, so stamping it in one
-//! place is what makes `ast`, `astd` and the GUI agree — and disagreement
-//! between them is then a real finding rather than a build-script artefact.
+//! Every public binary in this tree links `asterism-core`, so stamping it in
+//! one place makes `ast` and `astd` agree. The separately released Desktop
+//! checks that same identity at its signed manifest boundary.
 
 use std::process::Command;
 
