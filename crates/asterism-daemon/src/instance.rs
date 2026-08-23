@@ -1710,6 +1710,7 @@ mod tests {
                 asterism_core::orbit::Orbit::load(&dir.join("orbit.json")).unwrap(),
             )),
             shell: crate::device_shell::Manager::load_at(dir),
+            gpu: crate::gpu::Manager::new(),
         }
     }
 

@@ -412,7 +412,7 @@ fn production_for(
             total_memory_bytes: admitted.device.memory_bytes,
             max_memory_per_lease: admitted.device.memory_bytes,
             max_leases,
-            lease_ttl_secs: 30,
+            lease_ttl_secs: 600,
         },
     )?;
     Ok(ProductionProvider::new(
@@ -538,6 +538,7 @@ fn prove_version_skew(
     peer: &AuthenticatedPeer,
     capability: &str,
 ) -> Result<bool, ControlError> {
+    let _ = provider.guest_lost("instance-right");
     let skew = provider.open_session(peer, capability, AbiRange { min: 2, max: 2 }, 1_090);
     if skew.is_ok() {
         return Err(ControlError::new(
@@ -1095,6 +1096,7 @@ gpu index=0 uuid=GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa memory_bytes=257698037
         let peer = harness_peer(0x0a);
         let (capability, _, _) =
             attach_and_open(&mut production, &peer, "skewed", 16 * 1024 * 1024, 1).unwrap();
+        assert!(production.guest_lost("skewed"));
         let error = production
             .open_session(&peer, &capability, AbiRange { min: 2, max: 2 }, 2)
             .unwrap_err();

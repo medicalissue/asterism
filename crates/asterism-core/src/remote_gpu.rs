@@ -964,6 +964,22 @@ impl LeaseAuthority {
         self.generation
     }
 
+    pub fn gpu_uuid(&self) -> &str {
+        &self.gpu_uuid
+    }
+
+    pub fn provider_device(&self) -> &str {
+        &self.provider_device
+    }
+
+    pub fn provider_device_id(&self) -> &str {
+        &self.provider_device_id
+    }
+
+    pub fn has_instance(&self, instance_id: &str) -> bool {
+        self.instances.contains_key(instance_id)
+    }
+
     pub fn renew(
         &mut self,
         peer: &AuthenticatedPeer,
@@ -1128,6 +1144,34 @@ impl ProductionProvider {
 
     pub fn authority_mut(&mut self) -> &mut LeaseAuthority {
         &mut self.authority
+    }
+
+    pub fn capabilities(&self) -> &Capabilities {
+        self.abi.capabilities()
+    }
+
+    /// Attach if this instance has no live lease so daemon-path Init and
+    /// device queries execute against a real provider rather than a stub.
+    pub fn ensure_attached(
+        &mut self,
+        peer: &AuthenticatedPeer,
+        instance_id: &str,
+        memory_bytes: u64,
+        now: u64,
+    ) -> Result<GpuAttachment, ControlError> {
+        if self.authority.has_instance(instance_id) {
+            return Ok(GpuAttachment {
+                provider_device: self.authority.provider_device().to_owned(),
+                provider_device_id: self.authority.provider_device_id().to_owned(),
+                provider_gpu_uuid: self.authority.gpu_uuid().to_owned(),
+                memory_bytes,
+                provider_generation: self.authority.generation(),
+                attached_at: now,
+            });
+        }
+        self.authority
+            .attach(peer, instance_id, memory_bytes, now)
+            .map(|(_, attachment)| attachment)
     }
 
     /// Negotiate one ABI session for one live lease. A lease owns at most one

@@ -385,6 +385,8 @@ pub struct Machine {
     /// framework's own accounting honest, and dropping it is how a session
     /// that has ended is actually torn down.
     connection: RefCell<Option<Retained<VZVirtioSocketConnection>>>,
+    gpu_connecting: RefCell<Option<Rc<RefCell<Option<Connected>>>>>,
+    gpu_connection: RefCell<Option<Retained<VZVirtioSocketConnection>>>,
     pub signals: Rc<Signals>,
 }
 
@@ -790,6 +792,8 @@ pub unsafe fn start(config: &Config) -> Result<Machine> {
         socket_device,
         connecting: RefCell::new(None),
         connection: RefCell::new(None),
+        gpu_connecting: RefCell::new(None),
+        gpu_connection: RefCell::new(None),
         signals,
     })
 }
@@ -947,6 +951,77 @@ impl Machine {
     /// Main thread only.
     pub unsafe fn close_agent(&self) {
         if let Some(conn) = self.connection.borrow_mut().take() {
+            conn.close();
+        }
+    }
+
+    /// Connect to the guest GPU vsock independently of the guest-agent port.
+    ///
+    /// # Safety
+    /// Main thread only.
+    pub unsafe fn start_connect_gpu(&self) -> Result<()> {
+        let device = self
+            .socket_device
+            .as_ref()
+            .ok_or_else(|| anyhow!("this guest has no virtio socket device"))?;
+        if self.gpu_connecting.borrow().is_some() {
+            bail!(
+                "a connect to vsock port {} is already in flight",
+                asterism_core::remote_gpu_guest::GUEST_GPU_VSOCK_PORT
+            );
+        }
+        if self.gpu_connection.borrow().is_some() {
+            bail!("this guest already has a GPU vsock connection open");
+        }
+        let slot: Rc<RefCell<Option<Connected>>> = Rc::default();
+        let handler = {
+            let slot = slot.clone();
+            RcBlock::new(
+                move |conn: *mut VZVirtioSocketConnection, err: *mut NSError| {
+                    let outcome = match unsafe { err.as_ref() } {
+                        Some(err) => Err(err.localizedDescription().to_string()),
+                        None => match unsafe { Retained::retain(conn) } {
+                            None => Err("VZ reported neither a connection nor an error".to_owned()),
+                            Some(conn) => {
+                                duplicate_socket_fd(conn.fileDescriptor()).map(|fd| (conn, fd))
+                            }
+                        },
+                    };
+                    *slot.borrow_mut() = Some(outcome);
+                },
+            )
+        };
+        device.connectToPort_completionHandler(
+            asterism_core::remote_gpu_guest::GUEST_GPU_VSOCK_PORT,
+            &handler,
+        );
+        *self.gpu_connecting.borrow_mut() = Some(slot);
+        Ok(())
+    }
+
+    /// # Safety
+    /// Main thread only.
+    pub unsafe fn take_connect_gpu(&self) -> Option<Result<RawFd>> {
+        let slot = self.gpu_connecting.borrow().clone()?;
+        let outcome = slot.borrow_mut().take()?;
+        *self.gpu_connecting.borrow_mut() = None;
+        Some(match outcome {
+            Err(why) => Err(anyhow!("connecting to the guest GPU hop: {why}")),
+            Ok((conn, fd)) => {
+                *self.gpu_connection.borrow_mut() = Some(conn);
+                Ok(fd)
+            }
+        })
+    }
+
+    pub fn gpu_connect_in_flight(&self) -> bool {
+        self.gpu_connecting.borrow().is_some()
+    }
+
+    /// # Safety
+    /// Main thread only.
+    pub unsafe fn close_gpu(&self) {
+        if let Some(conn) = self.gpu_connection.borrow_mut().take() {
             conn.close();
         }
     }
