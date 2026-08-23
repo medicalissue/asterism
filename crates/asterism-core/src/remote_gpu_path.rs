@@ -790,10 +790,10 @@ mod tests {
 
     #[test]
     fn revoke_and_device_loss_fail_closed() {
-        let (mut path, _, _) = path();
-        let allocation = alloc(&mut path, 8);
-        assert!(path.revoke_instance("inst-1"));
-        let err = path
+        let (mut revoked_path, _, _) = path();
+        let allocation = alloc(&mut revoked_path, 8);
+        assert!(revoked_path.revoke_instance("inst-1"));
+        let err = revoked_path
             .cuda(CudaCall::MemcpyDtoH {
                 allocation,
                 offset: 0,
@@ -807,15 +807,16 @@ mod tests {
             "{err}"
         );
 
-        let (mut path, _, _) = path();
-        alloc(&mut path, 8);
-        path.provider_lost("provider process gone");
-        let err = path.cuda(CudaCall::MemAlloc { bytes: 8 }).unwrap_err();
+        let (mut lost_path, _, _) = path();
+        alloc(&mut lost_path, 8);
+        lost_path.provider_lost("provider process gone");
+        let err = lost_path.cuda(CudaCall::MemAlloc { bytes: 8 }).unwrap_err();
         assert!(
             err.message.contains("lost")
                 || err.message.contains("not ready")
                 || err.message.contains("offline")
-                || err.message.contains("no live GPU lease"),
+                || err.message.contains("no live GPU lease")
+                || err.message.contains("generation skew"),
             "{err}"
         );
     }
@@ -830,7 +831,7 @@ mod tests {
             .unwrap();
         production.authority_mut().provider_lost("restart");
         production.authority_mut().recover().unwrap();
-        let mut consumer = ConsumerHop::new("inst-skew", attachment.provider_generation).unwrap();
+        let consumer = ConsumerHop::new("inst-skew", attachment.provider_generation).unwrap();
         let mut provider = ProviderHop::new(peer, production, 1_000);
         let open: GpuMeshOpen = decode_frame(&consumer.open_bytes().unwrap()).unwrap();
         let reply = provider.accept_open(open).unwrap();

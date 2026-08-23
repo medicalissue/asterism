@@ -12,6 +12,11 @@ nvidia_gate_is_sha256() {
   [[ "$value" =~ ^sha256:[0-9a-f]{64}$ ]]
 }
 
+nvidia_gate_is_blake3() {
+  local value="$1"
+  [[ "$value" =~ ^blake3:[0-9a-f]{64}$ ]]
+}
+
 nvidia_gate_require_kv() {
   local file="$1" key="$2"
   local value
@@ -66,14 +71,14 @@ nvidia_gate_validate_runner_evidence() {
       *) echo "NVIDIA GATE FAIL: runner line is not key=value" >&2; return 1 ;;
     esac
     case "$key" in
-      guest_image_digest|provider_image_digest|guest_container_id|guest_device_name|provider_device_name|guest_device_id|provider_device_id|path|direct_path|relay_path|guest_path|libcuda_path|executor|provider_helper_kind|guest_output|provider_astd_pid_before|provider_astd_pid_after|provider_helper_pid_before|provider_helper_pid_after|guest_pid_before|guest_pid_after|provider_astd_restarted|provider_helper_restarted|guest_restarted|revoke|contention|loss|version_skew_fresh_session|version_skew_error|mesh_open_bearer|hardware_cuda_executed) ;;
+      guest_image_digest|provider_image_digest|guest_container_id|guest_device_name|provider_device_name|guest_device_id|provider_device_id|path|direct_path|relay_path|guest_path|libcuda_path|executor|provider_helper_kind|guest_output|provider_astd_pid_before|provider_astd_pid_after|provider_helper_pid_before|provider_helper_pid_after|guest_pid_before|guest_pid_after|provider_astd_restarted|provider_helper_restarted|guest_restarted|revoke|contention|loss|version_skew_fresh_session|version_skew_error|mesh_open_bearer|hardware_cuda_executed|driver_digest|libcuda_digest|guest_binary_digest|transcript_root) ;;
       *) echo "NVIDIA GATE FAIL: forbidden runner evidence key $key" >&2; return 1 ;;
     esac
     case "$seen" in *" $key "*) echo "NVIDIA GATE FAIL: duplicate runner key $key" >&2; return 1 ;; esac
     seen="$seen$key "
   done <"$file"
 
-  for required in guest_image_digest provider_image_digest guest_container_id guest_device_name provider_device_name guest_device_id provider_device_id path direct_path relay_path guest_path libcuda_path executor provider_helper_kind guest_output provider_astd_pid_before provider_astd_pid_after provider_helper_pid_before provider_helper_pid_after guest_pid_before guest_pid_after provider_astd_restarted provider_helper_restarted guest_restarted revoke contention loss version_skew_fresh_session version_skew_error mesh_open_bearer hardware_cuda_executed; do
+  for required in guest_image_digest provider_image_digest guest_container_id guest_device_name provider_device_name guest_device_id provider_device_id path direct_path relay_path guest_path libcuda_path executor provider_helper_kind guest_output provider_astd_pid_before provider_astd_pid_after provider_helper_pid_before provider_helper_pid_after guest_pid_before guest_pid_after provider_astd_restarted provider_helper_restarted guest_restarted revoke contention loss version_skew_fresh_session version_skew_error mesh_open_bearer hardware_cuda_executed driver_digest libcuda_digest guest_binary_digest transcript_root; do
     nvidia_gate_require_kv "$file" "$required" >/dev/null || return 1
   done
 }
@@ -118,12 +123,8 @@ nvidia_gate_judge() {
   fi
 
   libcuda="$(nvidia_gate_require_kv "$file" libcuda_path)" || return 1
-  case "$libcuda" in
-    ''|mock*|/dev/null)
-      echo "NVIDIA GATE FAIL: libcuda_path is missing or mock" >&2
-      return 1
-      ;;
-  esac
+  nvidia_gate_is_sha256 "$libcuda" \
+    || { echo "NVIDIA GATE FAIL: libcuda_path is not an audited sha256" >&2; return 1; }
 
   guest_name="$(nvidia_gate_require_kv "$file" guest_device_name)" || return 1
   provider_name="$(nvidia_gate_require_kv "$file" provider_device_name)" || return 1
@@ -149,6 +150,17 @@ nvidia_gate_judge() {
   provider_digest="$(nvidia_gate_require_kv "$file" provider_image_digest)" || return 1
   nvidia_gate_is_sha256 "$guest_digest" || { echo "NVIDIA GATE FAIL: guest image digest" >&2; return 1; }
   nvidia_gate_is_sha256 "$provider_digest" || { echo "NVIDIA GATE FAIL: provider image digest" >&2; return 1; }
+
+  local driver_artifact libcuda_artifact guest_artifact transcript_root
+  driver_artifact="$(nvidia_gate_require_kv "$file" driver_digest)" || return 1
+  libcuda_artifact="$(nvidia_gate_require_kv "$file" libcuda_digest)" || return 1
+  guest_artifact="$(nvidia_gate_require_kv "$file" guest_binary_digest)" || return 1
+  transcript_root="$(nvidia_gate_require_kv "$file" transcript_root)" || return 1
+  nvidia_gate_is_sha256 "$driver_artifact" || { echo "NVIDIA GATE FAIL: driver artifact digest" >&2; return 1; }
+  nvidia_gate_is_sha256 "$libcuda_artifact" || { echo "NVIDIA GATE FAIL: libcuda artifact digest" >&2; return 1; }
+  nvidia_gate_is_sha256 "$guest_artifact" || { echo "NVIDIA GATE FAIL: guest artifact digest" >&2; return 1; }
+  nvidia_gate_is_blake3 "$transcript_root" || { echo "NVIDIA GATE FAIL: transcript root" >&2; return 1; }
+  [ "$libcuda" = "$libcuda_artifact" ] || { echo "NVIDIA GATE FAIL: libcuda digest binding" >&2; return 1; }
 
   first_uuid="$(nvidia_gate_require_kv "$file" first_gpu_uuid)" || return 1
   second_uuid="$(nvidia_gate_require_kv "$file" second_gpu_uuid)" || return 1
@@ -188,27 +200,27 @@ nvidia_gate_judge() {
   nvidia_gate_require_true "$file" loss || return 1
   nvidia_gate_require_true "$file" version_skew_fresh_session || return 1
   nvidia_gate_require_true "$file" hardware_cuda_executed || return 1
+  nvidia_gate_require_true "$file" provenance_verified || return 1
 
   echo "nvidia_gate=pass"
   return 0
 }
 
 # Official dstack task schema (https://dstack.ai/docs/reference/dstack.yml/task.md).
-# python and nvcc are mutually exclusive with image. repos.hash is the commit pin.
+# The provider image and repos.hash are immutable digest/OID pins.
 nvidia_gate_validate_dstack() {
   local yml="$1"
-  local hash
+  local hash image
   grep -q '^type: task$' "$yml" || { echo "dstack: type must be task" >&2; return 1; }
   grep -q '^name: asterism-remote-gpu-nvidia-gate$' "$yml" || {
     echo "dstack: name must be asterism-remote-gpu-nvidia-gate" >&2
     return 1
   }
-  grep -q '^python:' "$yml" || { echo "dstack: python is required" >&2; return 1; }
-  grep -q '^nvcc: true$' "$yml" || { echo "dstack: nvcc: true is required" >&2; return 1; }
-  if grep -q '^image:' "$yml"; then
-    echo "dstack: image is mutually exclusive with python/nvcc" >&2
-    return 1
-  fi
+  image="$(awk '/^image:/{gsub(/["'\'']/, "", $2); print $2; exit}' "$yml")"
+  [[ "$image" =~ @sha256:[0-9a-f]{64}$ ]] || { echo "dstack: provider image must be digest-pinned" >&2; return 1; }
+  ! grep -q '^python:' "$yml" || { echo "dstack: python conflicts with pinned image" >&2; return 1; }
+  ! grep -q '^nvcc:' "$yml" || { echo "dstack: nvcc conflicts with pinned image" >&2; return 1; }
+  grep -q '^docker: true$' "$yml" || { echo "dstack: nested guest container support is required" >&2; return 1; }
   grep -q '^spot_policy: on-demand$' "$yml" || { echo "dstack: spot_policy on-demand" >&2; return 1; }
   grep -q '^retry: false$' "$yml" || { echo "dstack: retry must be false" >&2; return 1; }
   grep -q 'vendor: nvidia' "$yml" || { echo "dstack: gpu vendor nvidia" >&2; return 1; }

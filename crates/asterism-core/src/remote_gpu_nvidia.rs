@@ -417,7 +417,7 @@ fn production_for(
             total_memory_bytes: admitted.device.memory_bytes,
             max_memory_per_lease: admitted.device.memory_bytes,
             max_leases,
-            lease_ttl_secs: 30,
+            lease_ttl_secs: 300,
         },
     )?;
     Ok(ProductionProvider::new(

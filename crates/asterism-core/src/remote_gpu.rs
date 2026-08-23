@@ -1105,10 +1105,6 @@ impl LeaseAuthority {
         &self.gpu_uuid
     }
 
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
-
     pub fn leased_memory_bytes(&self) -> u64 {
         self.leased_memory_bytes
     }

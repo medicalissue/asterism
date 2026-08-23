@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail, Result};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
 use asterism_core::instance::now_unix;
@@ -214,7 +213,7 @@ pub(crate) async fn serve_local<'a, 'b>(
     let Some(mesh) = mesh else {
         io.send(&Response::GpuGuestRefused {
             code: "no_mesh".into(),
-            message: asterism_core::orbit::NO_MESH.into(),
+            message: crate::orbit::NO_MESH.into(),
         })
         .await?;
         return Ok(());
