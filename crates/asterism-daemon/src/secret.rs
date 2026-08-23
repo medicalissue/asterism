@@ -2,7 +2,8 @@
 //!
 //! Secret values never enter `$ASTERISM_HOME`.  The JSON file here is only an
 //! orbit metadata catalog; material is held by [`SecretStore`] (the login
-//! Keychain on macOS, explicitly unavailable elsewhere).  Public operations
+//! Keychain on macOS, FreeDesktop Secret Service on Linux, explicitly
+//! unavailable elsewhere).  Public operations
 //! fan out to independent source devices through the existing authenticated
 //! mesh.
 //!
@@ -33,8 +34,8 @@ use crate::mesh::Mesh;
 use crate::Node;
 
 const CATALOG_VERSION: u32 = 1;
-#[cfg(target_os = "macos")]
-const KEYCHAIN_SERVICE: &str = "dev.asterism.secret";
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const PLATFORM_SERVICE: &str = "dev.asterism.secret";
 
 static PLANE: OnceLock<Arc<SecretPlane>> = OnceLock::new();
 
@@ -64,30 +65,72 @@ impl PlatformSecretStore {
 impl SecretStore for PlatformSecretStore {
     fn put(&self, id: &SecretId, value: &[u8]) -> Result<()> {
         let account = self.account(id);
-        security_framework::passwords::set_generic_password(KEYCHAIN_SERVICE, &account, value)
+        security_framework::passwords::set_generic_password(PLATFORM_SERVICE, &account, value)
             .context("storing secret in the macOS login Keychain")
     }
 
     fn get(&self, id: &SecretId) -> Result<Vec<u8>> {
         let account = self.account(id);
-        security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, &account)
+        security_framework::passwords::get_generic_password(PLATFORM_SERVICE, &account)
             .context("reading secret from the macOS login Keychain")
     }
 
     fn remove(&self, id: &SecretId) -> Result<()> {
         let account = self.account(id);
-        security_framework::passwords::delete_generic_password(KEYCHAIN_SERVICE, &account)
+        security_framework::passwords::delete_generic_password(PLATFORM_SERVICE, &account)
             .context("removing secret from the macOS login Keychain")
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+struct PlatformSecretStore {
+    namespace: String,
+}
+
+#[cfg(target_os = "linux")]
+impl PlatformSecretStore {
+    fn entry(&self, id: &SecretId) -> Result<keyring::Entry> {
+        let account = format!("{}:{}", self.namespace, id.as_str());
+        keyring::Entry::new(PLATFORM_SERVICE, &account).context(
+            "opening FreeDesktop Secret Service (org.freedesktop.secrets); \
+             no plaintext fallback is used",
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl SecretStore for PlatformSecretStore {
+    fn put(&self, id: &SecretId, value: &[u8]) -> Result<()> {
+        self.entry(id)?
+            .set_secret(value)
+            .context("storing secret in FreeDesktop Secret Service")
+    }
+
+    fn get(&self, id: &SecretId) -> Result<Vec<u8>> {
+        match self.entry(id)?.get_secret() {
+            Ok(value) => Ok(value),
+            Err(keyring::Error::NoEntry) => {
+                bail!("secret {:?} is not in Secret Service", id.as_str())
+            }
+            Err(error) => Err(error).context("reading secret from FreeDesktop Secret Service"),
+        }
+    }
+
+    fn remove(&self, id: &SecretId) -> Result<()> {
+        match self.entry(id)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(error).context("removing secret from FreeDesktop Secret Service"),
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 struct PlatformSecretStore {
     #[allow(dead_code)]
     namespace: String,
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 impl SecretStore for PlatformSecretStore {
     fn put(&self, _: &SecretId, _: &[u8]) -> Result<()> {
         bail!("secret storage is unavailable on this platform; no plaintext fallback is used")
@@ -256,6 +299,7 @@ impl SecretPlane {
             }
         }
         self.store.put(&secret.id, value.as_bytes())?;
+        let snapshot = catalog.secrets.clone();
         let local = match catalog.secrets.iter_mut().find(|held| held.id == secret.id) {
             Some(held) => {
                 *held = merge([held.clone(), secret]).remove(0);
@@ -268,6 +312,7 @@ impl SecretPlane {
         };
         catalog.secrets.sort_by(|a, b| a.name.cmp(&b.name));
         if let Err(e) = catalog.save() {
+            catalog.secrets = snapshot;
             let _ = self.store.remove(&local.id);
             return Err(e);
         }
@@ -281,15 +326,28 @@ impl SecretPlane {
             .iter()
             .position(|secret| &secret.id == id)
             .ok_or_else(|| anyhow!("this device is not a source for secret {:?}", id.as_str()))?;
-        if catalog.secrets[index]
+        let held = catalog.secrets[index].clone();
+        let previous_bytes = if held
             .sources
             .iter()
             .any(|source| source.device_id == self.device_id)
         {
+            self.store.get(id).ok()
+        } else {
+            None
+        };
+        if previous_bytes.is_some() {
             self.store.remove(id)?;
         }
+        let snapshot = catalog.secrets.clone();
         let removed = catalog.secrets.remove(index);
-        catalog.save()?;
+        if let Err(e) = catalog.save() {
+            catalog.secrets = snapshot;
+            if let Some(bytes) = previous_bytes {
+                let _ = self.store.put(id, &bytes);
+            }
+            return Err(e);
+        }
         Ok(removed)
     }
 
@@ -340,6 +398,8 @@ impl SecretPlane {
                 secret.name
             );
         }
+        let previous_bytes = self.store.get(id).ok();
+        let previous_secret = secret.clone();
         self.store.put(id, value.as_bytes())?;
         secret.version = version;
         secret.updated_at = updated_at;
@@ -351,7 +411,18 @@ impl SecretPlane {
             }
         }
         let changed = secret.clone();
-        catalog.save()?;
+        if let Err(e) = catalog.save() {
+            *secret = previous_secret;
+            match previous_bytes {
+                Some(bytes) => {
+                    let _ = self.store.put(id, &bytes);
+                }
+                None => {
+                    let _ = self.store.remove(id);
+                }
+            }
+            return Err(e);
+        }
         Ok(changed)
     }
 
@@ -1455,6 +1526,41 @@ mod tests {
         let fresh = plane.list()[0].handle("laptop").unwrap();
         assert_eq!(fresh.source.revision, next);
         assert_eq!(plane.resolve(&fresh).unwrap().as_bytes(), b"new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotate_compensates_the_store_when_the_catalog_commit_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.json");
+        let store = MemoryStore::default();
+        let plane = local_plane(&path, "laptop", store.clone());
+        let lineage = ValueRevision::mint();
+        plane
+            .put(
+                secret(1, vec![source("laptop", 1, &lineage)]),
+                &value(b"v1"),
+            )
+            .unwrap();
+        assert_eq!(store.get(&id()).unwrap(), b"v1");
+
+        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(dir.path(), perms).unwrap();
+
+        let next = ValueRevision::mint();
+        let err = plane.rotate(&id(), 2, 2, &next, &value(b"v2"));
+        let mut restore = std::fs::metadata(dir.path()).unwrap().permissions();
+        restore.set_mode(0o755);
+        std::fs::set_permissions(dir.path(), restore).unwrap();
+        assert!(err.is_err(), "a frozen catalog must refuse the rotation");
+        assert_eq!(
+            store.get(&id()).unwrap(),
+            b"v1",
+            "Secret Service/store mutation must roll back when metadata does not commit"
+        );
+        assert_eq!(plane.list()[0].version, 1);
     }
 
     #[test]

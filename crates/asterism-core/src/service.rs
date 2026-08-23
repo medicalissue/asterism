@@ -594,10 +594,7 @@ mod imp {
                 anyhow::bail!("systemctl could not enable {}: {}", self.unit, out.trim());
             }
             report.step(format!("systemctl --user enable --now {}", self.unit));
-            // A user unit dies at logout unless lingering is on, which is
-            // the difference between "starts when I log in" and "never
-            // sleeps". It needs privileges we do not assume here.
-            report.step("for a daemon that survives logout: loginctl enable-linger $USER");
+            report.step(enable_linger()?);
             Ok(report)
         }
 
@@ -686,7 +683,65 @@ mod imp {
                     state.notes.push(format!("systemd state: {}", v.trim()));
                 }
             }
+            match linger_state() {
+                Ok(true) => state
+                    .notes
+                    .push("lingering is on: astd survives logout and starts at boot".into()),
+                Ok(false) => state.notes.push(format!(
+                    "lingering is off — astd dies at logout. Enable it with: loginctl enable-linger {}",
+                    user_name()
+                )),
+                Err(error) => state.notes.push(format!("linger: {error:#}")),
+            }
             Ok(state)
+        }
+    }
+
+    fn user_name() -> String {
+        std::env::var("USER").unwrap_or_else(|_| "$USER".into())
+    }
+
+    fn linger_state() -> Result<bool> {
+        if !std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .any(|dir| dir.join("loginctl").is_file())
+        {
+            anyhow::bail!("loginctl is not on PATH");
+        }
+        let (ok, out) =
+            run(std::process::Command::new("loginctl").args(["show-user", "-p", "Linger"]))?;
+        if !ok {
+            anyhow::bail!("{}", out.trim());
+        }
+        crate::doctor::parse_linger_property(&out)
+            .ok_or_else(|| anyhow::anyhow!("loginctl did not report Linger"))
+    }
+
+    /// A user unit dies at logout unless lingering is on, which is the
+    /// difference between "starts when I log in" and "never sleeps".
+    fn enable_linger() -> Result<String> {
+        let user = user_name();
+        match linger_state() {
+            Ok(true) => {
+                return Ok("lingering is on: astd survives logout and starts at boot".into())
+            }
+            Ok(false) => {}
+            Err(_) => {}
+        }
+        if !std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .any(|dir| dir.join("loginctl").is_file())
+        {
+            return Ok(format!(
+                "for a daemon that survives logout: loginctl enable-linger {user}"
+            ));
+        }
+        let (ok, out) = run(std::process::Command::new("loginctl").args(["enable-linger", &user]))?;
+        if ok {
+            Ok(format!("loginctl enable-linger {user}"))
+        } else {
+            Ok(format!(
+                "lingering is off ({}); enable it with: loginctl enable-linger {user}",
+                out.trim()
+            ))
         }
     }
 
@@ -733,6 +788,18 @@ mod imp {
             assert!(unit.contains("Restart=always"));
             assert!(unit.contains("Environment=ASTERISM_HOME=/srv/asterism"));
             assert!(unit.contains("WantedBy=default.target"));
+        }
+
+        #[test]
+        fn linger_properties_are_the_loginctl_words() {
+            assert_eq!(
+                crate::doctor::parse_linger_property("Linger=yes"),
+                Some(true)
+            );
+            assert_eq!(
+                crate::doctor::parse_linger_property("Linger=no"),
+                Some(false)
+            );
         }
     }
 }

@@ -50,3 +50,25 @@ rewrites a running executable in place.
 Cloud Hypervisor is Apache-2.0 and BSD-3-Clause; virtiofsd is Apache-2.0 and
 BSD-3-Clause. Their license texts are included by the Linux release packaging
 under `share/asterism/licenses/`.
+
+## Host integration
+
+`astd` is a systemd `--user` unit (`~/.config/systemd/user/astd.service`)
+with `Restart=always` and `WantedBy=default.target`. A user unit dies at
+logout unless lingering is on:
+
+```console
+$ ast service install
+$ loginctl enable-linger "$USER"
+$ ast doctor
+```
+
+While at least one instance is running, the daemon holds
+`systemd-inhibit --what=sleep:idle --mode=block`. The lock is a child of
+`astd`, so a dead daemon cannot keep the machine awake.
+
+Secret material lives in FreeDesktop Secret Service
+(`org.freedesktop.secrets`) under `dev.asterism.secret`. There is no
+plaintext file fallback. A headless host needs a session bus and a Secret
+Service provider (gnome-keyring, KWallet, or KeePassXC). `ast doctor`
+probes the bus name rather than checking that an environment variable is set.

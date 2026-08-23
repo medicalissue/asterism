@@ -42,18 +42,57 @@ tmp=""
 app_staged=""
 recovering=0
 owns_transaction=0
+ARTIFACT_LOCK=""
+ARTIFACT_LOCK_HELD=0
 cleanup() {
 	if [ "$recovering" = 0 ] && [ "$owns_transaction" = 1 ]; then
 		recover_interrupted force
 	fi
+	release_artifact_lock
 	[ -z "$tmp" ] || rm -rf "$tmp"
 	# A failed copy or activation may leave verified staging bytes beside an
 	# install destination. They are never active, but do not accumulate them.
-	for name in ast astd astd-vz; do rm -f "$BIN/.${name}.update.$$"; done
+	for name in ast astd astd-vz cloud-hypervisor virtiofsd; do rm -f "$BIN/.${name}.update.$$"; done
 	rm -f "$LIBEXEC/.asterism-update.update.$$"
 	[ -z "$app_staged" ] || rm -rf "$app_staged"
 }
 trap cleanup EXIT
+
+artifact_lock_path() {
+	printf '%s' "${PREFIX}/share/asterism/artifact.lock"
+}
+
+acquire_artifact_lock() {
+	ARTIFACT_LOCK="$(artifact_lock_path)"
+	mkdir -p "$(dirname "$ARTIFACT_LOCK")"
+	tries=0
+	while [ "$tries" -lt 50 ]; do
+		if mkdir "$ARTIFACT_LOCK" 2>/dev/null; then
+			printf '%s\n' "$$" >"$ARTIFACT_LOCK/owner"
+			ARTIFACT_LOCK_HELD=1
+			return 0
+		fi
+		owner=$(cat "$ARTIFACT_LOCK/owner" 2>/dev/null || true)
+		if [ -n "$owner" ] && ! ps -p "$owner" >/dev/null 2>&1; then
+			rm -rf "$ARTIFACT_LOCK"
+			tries=$((tries + 1))
+			continue
+		fi
+		sleep 0.1
+		tries=$((tries + 1))
+	done
+	die "another install, update, or uninstall holds the artifact lock at ${ARTIFACT_LOCK}"
+}
+
+release_artifact_lock() {
+	[ "$ARTIFACT_LOCK_HELD" = "1" ] || return 0
+	[ -n "$ARTIFACT_LOCK" ] || return 0
+	owner=$(cat "$ARTIFACT_LOCK/owner" 2>/dev/null || true)
+	if [ "$owner" = "$$" ]; then
+		rm -rf "$ARTIFACT_LOCK"
+	fi
+	ARTIFACT_LOCK_HELD=0
+}
 
 fetch() {
 	if have curl; then
@@ -81,6 +120,10 @@ field() {
 	value=$(sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$2" | head -n 1)
 	[ -n "$value" ] || die "signed manifest has no $1"
 	printf '%s' "$value"
+}
+
+optional_field() {
+	sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$2" | head -n 1
 }
 
 verify_manifest() {
@@ -175,10 +218,33 @@ load_manifest() {
 	else
 		case "$(uname -s)-$(uname -m)" in
 		Darwin-arm64 | Darwin-aarch64) host_target=darwin-arm64 ;;
+		Linux-x86_64 | Linux-amd64) host_target=linux-x86_64 ;;
+		Linux-aarch64 | Linux-arm64) host_target=linux-arm64 ;;
 		*) host_target=unsupported ;;
 		esac
 	fi
-	[ "$target" = "$host_target" ] || die "signed release target ${target} cannot run on ${host_target}"
+	if [ "$target" != "$host_target" ]; then
+		case "$host_target" in
+		linux-x86_64)
+			alt_url=$(optional_field linux_x86_64_archive_url "$tmp/RELEASE.json")
+			alt_sha=$(optional_field linux_x86_64_archive_sha256 "$tmp/RELEASE.json")
+			;;
+		linux-arm64)
+			alt_url=$(optional_field linux_arm64_archive_url "$tmp/RELEASE.json")
+			alt_sha=$(optional_field linux_arm64_archive_sha256 "$tmp/RELEASE.json")
+			;;
+		*)
+			alt_url=""
+			alt_sha=""
+			;;
+		esac
+		if [ -n "$alt_url" ] && [ -n "$alt_sha" ]; then
+			archive_url="$alt_url"
+			archive_sha="$alt_sha"
+		else
+			die "signed release target ${target} cannot run on ${host_target}"
+		fi
+	fi
 	[ "$(version_cmp "$ours" "$minimum")" -ge 0 ] ||
 		die "${version} needs updater ${minimum} or newer; install an intermediate release first"
 }
@@ -298,7 +364,7 @@ release_transaction() {
 
 component_destination() {
 	case "$1" in
-	ast | astd | astd-vz) printf '%s/%s' "$BIN" "$1" ;;
+	ast | astd | astd-vz | cloud-hypervisor | virtiofsd) printf '%s/%s' "$BIN" "$1" ;;
 	asterism-update) printf '%s' "$LIBEXEC/asterism-update" ;;
 	Asterism.app) [ -n "$transaction_app_path" ] && printf '%s' "$transaction_app_path" ;;
 	*) return 1 ;;
@@ -308,7 +374,7 @@ component_destination() {
 cleanup_transaction_staging() {
 	owner=$(sed -n '1p' "$TRANSACTION_DIR/owner-pid" 2>/dev/null || true)
 	case "$owner" in *[!0-9]* | '') return ;; esac
-	for name in ast astd astd-vz; do rm -f "$BIN/.${name}.update.${owner}"; done
+	for name in ast astd astd-vz cloud-hypervisor virtiofsd; do rm -f "$BIN/.${name}.update.${owner}"; done
 	rm -f "$LIBEXEC/.asterism-update.update.${owner}"
 	[ -z "$transaction_app_path" ] || rm -rf "$(dirname "$transaction_app_path")/.Asterism.app.update.${owner}"
 	durable_parent "$BIN/.ast.update.${owner}"
@@ -324,7 +390,7 @@ last_build=${last_build}"
 }
 
 discard_transaction_backups() {
-	for name in astd-vz astd asterism-update ast Asterism.app; do
+	for name in astd-vz astd asterism-update ast Asterism.app cloud-hypervisor virtiofsd; do
 		[ -f "$TRANSACTION_DIR/component-$name" ] || continue
 		dst=$(component_destination "$name") || continue
 		rm -rf "${dst}.previous.update" "${dst}.previous.update.absent"
@@ -336,7 +402,7 @@ rollback_transaction() {
 	err "recovering an interrupted update; restoring the previous compatible unit"
 	# Reverse activation order. A marker is durable before the first rename.
 	# If no backup exists, the destination was never moved and is left alone.
-	for name in Asterism.app ast asterism-update astd astd-vz; do
+	for name in Asterism.app ast asterism-update astd astd-vz cloud-hypervisor virtiofsd; do
 		[ -f "$TRANSACTION_DIR/component-$name" ] || continue
 		dst=$(component_destination "$name") || continue
 		backup="${dst}.previous.update"
@@ -487,6 +553,7 @@ on_signal() {
 
 apply_update() {
 	managed_by_brew && die "this installation belongs to Homebrew; run: brew upgrade asterism"
+	acquire_artifact_lock
 	load_manifest
 	cmp=$(version_cmp "$ours" "$version")
 	[ "$cmp" -le 0 ] || die "downgrade ${ours} -> ${version} refused before download or mutation"
@@ -501,24 +568,38 @@ apply_update() {
 	[ "$got" = "$archive_sha" ] || die "archive digest mismatch: expected ${archive_sha}, got ${got}"
 	mkdir -p "$tmp/stage"
 	tar -xzf "$tmp/release.tar.gz" -C "$tmp/stage" || die "could not unpack the verified update"
-	for name in ast astd astd-vz; do verify_binary "$name" "$tmp/stage/$name"; done
+	for name in ast astd; do verify_binary "$name" "$tmp/stage/$name"; done
 	[ -x "$tmp/stage/asterism-update" ] || die "the update archive has no executable asterism-update"
+	linux_payload=0
+	if [ -x "$tmp/stage/cloud-hypervisor" ] && [ -x "$tmp/stage/virtiofsd" ]; then
+		linux_payload=1
+	fi
+	if [ "$linux_payload" = 1 ]; then
+		[ -x "$tmp/stage/cloud-hypervisor" ] || die "the Linux update archive has no executable cloud-hypervisor"
+		[ -x "$tmp/stage/virtiofsd" ] || die "the Linux update archive has no executable virtiofsd"
+	else
+		verify_binary astd-vz "$tmp/stage/astd-vz"
+	fi
 
 	app_path="${ASTERISM_APP_PATH:-}"
-	if [ -z "$app_path" ]; then
-		for candidate in /Applications/Asterism.app "${HOME}/Applications/Asterism.app"; do
-			[ -d "$candidate" ] && { app_path="$candidate"; break; }
-		done
-	fi
-	if [ -n "$app_path" ]; then
-		[ -n "$app_url" ] && [ -n "$app_sha" ] ||
-			die "a desktop app is installed, but this signed release does not carry its matching app"
-		fetch "$app_url" "$tmp/app.tar.gz" || die "could not download ${app_url}"
-		got=$(sha256_of "$tmp/app.tar.gz")
-		[ "$got" = "$app_sha" ] || die "app digest mismatch: expected ${app_sha}, got ${got}"
-		mkdir -p "$tmp/app-stage"
-		tar -xzf "$tmp/app.tar.gz" -C "$tmp/app-stage" || die "could not unpack the verified app"
-		verify_binary asterism-gui "$tmp/app-stage/Asterism.app/Contents/MacOS/asterism-gui"
+	if [ "$linux_payload" != 1 ]; then
+		if [ -z "$app_path" ]; then
+			for candidate in /Applications/Asterism.app "${HOME}/Applications/Asterism.app"; do
+				[ -d "$candidate" ] && { app_path="$candidate"; break; }
+			done
+		fi
+		if [ -n "$app_path" ]; then
+			[ -n "$app_url" ] && [ -n "$app_sha" ] ||
+				die "a desktop app is installed, but this signed release does not carry its matching app"
+			fetch "$app_url" "$tmp/app.tar.gz" || die "could not download ${app_url}"
+			got=$(sha256_of "$tmp/app.tar.gz")
+			[ "$got" = "$app_sha" ] || die "app digest mismatch: expected ${app_sha}, got ${got}"
+			mkdir -p "$tmp/app-stage"
+			tar -xzf "$tmp/app.tar.gz" -C "$tmp/app-stage" || die "could not unpack the verified app"
+			verify_binary asterism-gui "$tmp/app-stage/Asterism.app/Contents/MacOS/asterism-gui"
+		fi
+	else
+		app_path=""
 	fi
 
 	mkdir -p "$BIN" "$LIBEXEC"
@@ -527,7 +608,12 @@ apply_update() {
 	# are consequently same-filesystem renames; a slow copy or a full disk
 	# cannot expose a half-written program as the active one. The transaction
 	# already owns these staging paths, so a killed copy is swept at startup.
-	for name in ast astd astd-vz; do
+	if [ "$linux_payload" = 1 ]; then
+		place_names="ast astd cloud-hypervisor virtiofsd"
+	else
+		place_names="ast astd astd-vz"
+	fi
+	for name in $place_names; do
 		cp "$tmp/stage/$name" "$BIN/.${name}.update.$$"
 		chmod 755 "$BIN/.${name}.update.$$"
 		durable_path "$BIN/.${name}.update.$$"
@@ -543,12 +629,20 @@ apply_update() {
 		durable_tree "$app_staged"
 	fi
 	if ! {
-		place_one astd-vz "$BIN/.astd-vz.update.$$" "$BIN/astd-vz" &&
-		place_one astd "$BIN/.astd.update.$$" "$BIN/astd" &&
-		place_one asterism-update "$LIBEXEC/.asterism-update.update.$$" "$LIBEXEC/asterism-update" &&
-		place_one ast "$BIN/.ast.update.$$" "$BIN/ast" &&
-		if [ -n "$app_path" ]; then
-			place_one Asterism.app "$app_staged" "$app_path"
+		if [ "$linux_payload" = 1 ]; then
+			place_one cloud-hypervisor "$BIN/.cloud-hypervisor.update.$$" "$BIN/cloud-hypervisor" &&
+			place_one virtiofsd "$BIN/.virtiofsd.update.$$" "$BIN/virtiofsd" &&
+			place_one astd "$BIN/.astd.update.$$" "$BIN/astd" &&
+			place_one asterism-update "$LIBEXEC/.asterism-update.update.$$" "$LIBEXEC/asterism-update" &&
+			place_one ast "$BIN/.ast.update.$$" "$BIN/ast"
+		else
+			place_one astd-vz "$BIN/.astd-vz.update.$$" "$BIN/astd-vz" &&
+			place_one astd "$BIN/.astd.update.$$" "$BIN/astd" &&
+			place_one asterism-update "$LIBEXEC/.asterism-update.update.$$" "$LIBEXEC/asterism-update" &&
+			place_one ast "$BIN/.ast.update.$$" "$BIN/ast" &&
+			if [ -n "$app_path" ]; then
+				place_one Asterism.app "$app_staged" "$app_path"
+			fi
 		fi &&
 		"$BIN/ast" __activate-update --build "$build"
 	}; then

@@ -290,4 +290,75 @@ if run_update apply --yes >"$WORK/downgrade" 2>&1; then fail "downgrade was acce
 [ "$(build_of "$PREFIX/bin/ast")" = 0.0.2+new ] || fail "downgrade refusal mutated ast"
 ok "downgrade policy runs before artifact download or mutation"
 
+# Linux payload: signed manifest, no vz helper, no app, transactional CHV.
+make_linux_release() {
+  local version="$1" build="$2" dir stage
+  dir="$WORK/releases/linux-$version"
+  stage="$WORK/stage-linux-$version"
+  rm -rf "$dir" "$stage"
+  mkdir -p "$dir" "$stage"
+  make_program "$stage/ast" ast "$version" "$build"
+  make_program "$stage/astd" astd "$version" "$build"
+  printf '#!/bin/sh\necho "cloud-hypervisor v53.0"\n' >"$stage/cloud-hypervisor"
+  printf '#!/bin/sh\necho "virtiofsd 1.14.0"\n' >"$stage/virtiofsd"
+  chmod +x "$stage/cloud-hypervisor" "$stage/virtiofsd"
+  make_updater "$stage/asterism-update"
+  tar -czf "$dir/unit.tar.gz" -C "$stage" ast astd cloud-hypervisor virtiofsd asterism-update
+  "$RENDER" stable "$version" "$build" linux-x86_64 \
+    "file://$dir/unit.tar.gz" "$(sha "$dir/unit.tar.gz")" \
+    "" "" >"$dir/RELEASE.json"
+  printf valid >"$dir/RELEASE.json.sig"
+}
+
+install_linux_old() {
+  PREFIX="$WORK/prefix-linux"
+  HOME_STATE="$WORK/home-linux"
+  rm -rf "$PREFIX" "$HOME_STATE" "$WORK/activations"
+  mkdir -p "$PREFIX/bin" "$PREFIX/libexec/asterism"
+  make_program "$PREFIX/bin/ast" ast 0.0.1 0.0.1+old
+  make_program "$PREFIX/bin/astd" astd 0.0.1 0.0.1+old
+  printf '#!/bin/sh\necho "cloud-hypervisor v53.0 old"\n' >"$PREFIX/bin/cloud-hypervisor"
+  printf '#!/bin/sh\necho "virtiofsd 1.14.0 old"\n' >"$PREFIX/bin/virtiofsd"
+  chmod +x "$PREFIX/bin/cloud-hypervisor" "$PREFIX/bin/virtiofsd"
+  make_updater "$PREFIX/libexec/asterism/asterism-update"
+}
+
+run_linux_update() {
+  env \
+    ASTERISM_UPDATE_AST_PATH="$PREFIX/bin/ast" \
+    ASTERISM_UPDATE_PREFIX="$PREFIX" \
+    ASTERISM_UPDATE_TARGET=linux-x86_64 \
+    ASTERISM_HOME="$HOME_STATE" \
+    ASTERISM_UPDATE_MANIFEST_URL="file://$MANIFEST" \
+    ASTERISM_UPDATE_VERIFIER="$VERIFIER" \
+    ASTERISM_UPDATE_PUBKEY=test-public-key \
+    "$PREFIX/libexec/asterism/asterism-update" "$@"
+}
+
+make_linux_release 0.0.2 0.0.2+new
+MANIFEST="$WORK/releases/linux-0.0.2/RELEASE.json"
+install_linux_old
+run_linux_update apply --yes >"$WORK/linux-applied"
+[ "$(build_of "$PREFIX/bin/ast")" = 0.0.2+new ] || fail "linux ast did not activate"
+[ "$(build_of "$PREFIX/bin/astd")" = 0.0.2+new ] || fail "linux astd did not activate"
+[ -x "$PREFIX/bin/cloud-hypervisor" ] || fail "linux update dropped cloud-hypervisor"
+[ -x "$PREFIX/bin/virtiofsd" ] || fail "linux update dropped virtiofsd"
+[ ! -e "$PREFIX/bin/astd-vz" ] || fail "linux update planted a vz helper"
+ok "Linux signed update activates ast, astd, CHV and virtiofsd as one unit"
+
+install_linux_old
+mkdir -p "$PREFIX/share/asterism/artifact.lock"
+sleep 30 &
+lock_pid=$!
+printf '%s\n' "$lock_pid" >"$PREFIX/share/asterism/artifact.lock/owner"
+if run_linux_update apply --yes >"$WORK/linux-lock" 2>&1; then
+  kill "$lock_pid" >/dev/null 2>&1 || true
+  fail "linux update stole the shared artifact lock"
+fi
+kill "$lock_pid" >/dev/null 2>&1 || true
+wait "$lock_pid" >/dev/null 2>&1 || true
+grep -q 'artifact lock' "$WORK/linux-lock" || fail "linux lock refusal was silent"
+[ "$(build_of "$PREFIX/bin/ast")" = 0.0.1+old ] || fail "lock refusal mutated linux ast"
+ok "install/update share one cross-process artifact lock"
+
 echo "UPDATE TEST GREEN — $pass checks"

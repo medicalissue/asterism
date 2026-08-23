@@ -399,7 +399,7 @@ jobs:
           version="${{ steps.version.outputs.version }}"
           archive="dist/${version}/asterism-${version}-${{ matrix.target }}.tar.gz"
           [ -f "$archive" ]
-          for member in ast astd cloud-hypervisor virtiofsd \
+          for member in ast astd cloud-hypervisor virtiofsd asterism-update \
             share/asterism/asterism-nbd share/asterism/linux-components.env \
             share/asterism/licenses/LICENSE-APACHE \
             share/asterism/licenses/LICENSE-MIT share/asterism/licenses/NOTICE \
@@ -430,6 +430,7 @@ jobs:
           [ -x "$prefix/bin/astd" ]
           [ -x "$prefix/bin/cloud-hypervisor" ]
           [ -x "$prefix/bin/virtiofsd" ]
+          [ -x "$prefix/libexec/asterism/asterism-update" ]
           "$prefix/bin/cloud-hypervisor" --version | grep -F 'v53.0'
           "$prefix/bin/ast" --version
           sh packaging/install.sh --uninstall
@@ -647,6 +648,44 @@ jobs:
             cp "dist/${target}/${version}/asterism-${version}-${target}.tar.gz" "dist/${version}/"
             cat "dist/${target}/${version}/SHA256SUMS.${target}" >>"dist/${version}/SHA256SUMS"
           done
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          path: repo
+      - name: Include Linux archives in the signed update manifest
+        env:
+          UPDATE_KEY_B64: ${{ secrets.UPDATE_MINISIGN_SECRET_KEY }}
+          UPDATE_PUBKEY: ${{ vars.ASTERISM_UPDATE_PUBKEY }}
+        run: |
+          set -eu
+          version="${{ needs.build.outputs.version }}"
+          base="https://github.com/${{ github.repository }}/releases/download/${version}"
+          cli="asterism-${version}-darwin-arm64.tar.gz"
+          app="Asterism-${version}-darwin-arm64.app.tar.gz"
+          linux_x86="asterism-${version}-linux-x86_64.tar.gz"
+          linux_arm="asterism-${version}-linux-arm64.tar.gz"
+          cli_sha="$(sha256sum "dist/${version}/${cli}" | awk '{print $1}')"
+          app_sha="$(sha256sum "dist/${version}/${app}" | awk '{print $1}')"
+          linux_x86_sha="$(sha256sum "dist/${version}/${linux_x86}" | awk '{print $1}')"
+          linux_arm_sha="$(sha256sum "dist/${version}/${linux_arm}" | awk '{print $1}')"
+          repo/scripts/render-release-manifest.sh stable "$version" \
+            "${version#v}+${{ github.sha }}" darwin-arm64 \
+            "${base}/${cli}" "$cli_sha" "${base}/${app}" "$app_sha" \
+            "${base}/${linux_x86}" "$linux_x86_sha" \
+            "${base}/${linux_arm}" "$linux_arm_sha" \
+            >"dist/${version}/RELEASE.json"
+          if [ -z "$UPDATE_KEY_B64" ]; then
+            echo "tagged releases require UPDATE_MINISIGN_SECRET_KEY" >&2
+            exit 1
+          fi
+          [ -n "$UPDATE_PUBKEY" ] || { echo "an update signing key requires ASTERISM_UPDATE_PUBKEY" >&2; exit 1; }
+          command -v minisign >/dev/null || sudo apt-get install -y minisign
+          printf '%s' "$UPDATE_KEY_B64" | base64 --decode >"${RUNNER_TEMP}/update.key"
+          minisign -S -l -W -s "${RUNNER_TEMP}/update.key" \
+            -m "dist/${version}/RELEASE.json" -x "dist/${version}/RELEASE.json.sig"
+          minisign -Vm "dist/${version}/RELEASE.json" \
+            -x "dist/${version}/RELEASE.json.sig" -P "$UPDATE_PUBKEY"
+          rm -f "${RUNNER_TEMP}/update.key"
 
       - name: Publish the release
         env:

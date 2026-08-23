@@ -21,6 +21,7 @@
 #   ASTERISM_VERSION=v0.1.0   install exactly this tag (default: latest release)
 #   ASTERISM_METHOD=release   release (default) | source | brew
 #   ASTERISM_PREFIX=DIR       install prefix (default: ~/.local)
+#   ASTERISM_SYSTEM_ROOT=DIR  test harness only: stage host files under DIR
 #   ASTERISM_YES=1            answer yes to every prompt (for CI)
 #   ASTERISM_FORCE=1          reinstall even when that version is already here
 #   ASTERISM_SHA256=HEX       expected digest of the tarball, pinned by hand
@@ -77,6 +78,8 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 TMPDIR_SELF=""
 INSTALL_TXN_ACTIVE=0
+ARTIFACT_LOCK=""
+ARTIFACT_LOCK_HELD=0
 cleanup() {
 	status=$?
 	trap - EXIT INT HUP TERM
@@ -86,10 +89,104 @@ cleanup() {
 		rollback_incomplete_install
 		set -e
 	fi
+	release_artifact_lock
 	[ -n "$TMPDIR_SELF" ] && rm -rf "$TMPDIR_SELF"
 	exit "$status"
 }
 trap cleanup EXIT INT HUP TERM
+
+# Install, update, and uninstall share this one prefix lock so a second
+# process cannot replace artifacts while another still owns them.
+artifact_lock_path() {
+	printf '%s' "${PREFIX}/share/asterism/artifact.lock"
+}
+
+acquire_artifact_lock() {
+	ARTIFACT_LOCK="$(artifact_lock_path)"
+	mkdir -p "$(dirname "$ARTIFACT_LOCK")"
+	tries=0
+	while [ "$tries" -lt 50 ]; do
+		if mkdir "$ARTIFACT_LOCK" 2>/dev/null; then
+			printf '%s\n' "$$" >"$ARTIFACT_LOCK/owner"
+			ARTIFACT_LOCK_HELD=1
+			return 0
+		fi
+		owner=$(cat "$ARTIFACT_LOCK/owner" 2>/dev/null || true)
+		if [ -n "$owner" ] && ! ps -p "$owner" >/dev/null 2>&1; then
+			rm -rf "$ARTIFACT_LOCK"
+			tries=$((tries + 1))
+			continue
+		fi
+		# A live owner, or an empty lock still being published.
+		sleep 0.1
+		tries=$((tries + 1))
+	done
+	die "another install, update, or uninstall holds the artifact lock at ${ARTIFACT_LOCK}"
+}
+
+release_artifact_lock() {
+	[ "$ARTIFACT_LOCK_HELD" = "1" ] || return 0
+	[ -n "$ARTIFACT_LOCK" ] || return 0
+	owner=$(cat "$ARTIFACT_LOCK/owner" 2>/dev/null || true)
+	if [ "$owner" = "$$" ]; then
+		rm -rf "$ARTIFACT_LOCK"
+	fi
+	ARTIFACT_LOCK_HELD=0
+}
+
+nbd_state_dir() {
+	printf '%s' "${SYSTEM_ROOT}/run/asterism-nbd"
+}
+
+nbd_helper_path() {
+	printf '%s' "${SYSTEM_ROOT}/usr/local/libexec/asterism/asterism-nbd"
+}
+
+# Complete claims are owner+helper-pid. Staging directories and ownerless
+# leftovers are recovery work, not live attachments.
+live_nbd_claims() {
+	state="$(nbd_state_dir)"
+	[ -d "$state" ] || return 1
+	for claim in "$state"/nbd*; do
+		[ -d "$claim" ] || continue
+		case "$claim" in *.new.*) continue ;; esac
+		if [ -f "$claim/owner" ] && [ -f "$claim/helper-pid" ]; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+drain_own_nbd_claims() {
+	state="$(nbd_state_dir)"
+	helper="$(nbd_helper_path)"
+	[ -d "$state" ] || return 0
+	our="$(id -u):$(id -g)"
+	for claim in "$state"/nbd*; do
+		[ -d "$claim" ] || continue
+		case "$claim" in *.new.*) continue ;; esac
+		[ -f "$claim/owner" ] && [ -f "$claim/helper-pid" ] || continue
+		owner=$(cat "$claim/owner" 2>/dev/null || true)
+		name=$(basename "$claim")
+		case "$name" in
+		nbd[0-9] | nbd[0-9][0-9]) ;;
+		*) continue ;;
+		esac
+		if [ "$owner" != "$our" ]; then
+			err "NBD claim ${name} belongs to ${owner}, not ${our}"
+			return 1
+		fi
+		if [ ! -x "$helper" ]; then
+			err "cannot drain ${name}: NBD helper is missing"
+			return 1
+		fi
+		run_root "$helper" -d "/dev/${name}" || {
+			err "could not detach live NBD claim on /dev/${name}"
+			return 1
+		}
+	done
+	return 0
+}
 
 # Ask out loud, on the terminal — not on stdin, which is this script itself
 # under `curl | sh`. No tty and no ASTERISM_YES means we cannot get consent,
@@ -656,7 +753,7 @@ install_release() {
 		say "upgraded ${installed} -> ${version}"
 	fi
 	note_vz "$vz"
-	if [ "$linux_helpers" = "1" ]; then note_chv; else note_qemu; fi
+	if [ "$linux_helpers" = "1" ]; then note_chv; note_linger; else note_qemu; fi
 	note_path
 }
 
@@ -758,7 +855,7 @@ install_source() {
 		write_receipt "$ref" "source" source "" bin/ast bin/astd libexec/asterism/asterism-update
 	fi
 	note_vz "$vz"
-	if [ "$linux_helpers" = "1" ]; then note_chv; else note_qemu; fi
+	if [ "$linux_helpers" = "1" ]; then note_chv; note_linger; else note_qemu; fi
 	note_path
 }
 
@@ -877,6 +974,24 @@ remove_chv_linux_policy() {
 note_chv() {
 	say "Linux instances default to bundled Cloud Hypervisor v53.0 over KVM."
 	say "QEMU is used only when selected explicitly as a compatibility backend."
+	say "next: ast service install   # persist astd across login"
+	say "      ast doctor            # linger, KVM, Secret Service, helpers"
+}
+
+note_linger() {
+	[ "$(uname -s)" = "Linux" ] || return 0
+	user="$(id -un 2>/dev/null || printf '%s' "$USER")"
+	if have loginctl; then
+		linger="$(loginctl show-user "$user" -p Linger 2>/dev/null || true)"
+		case "$linger" in
+		Linger=yes)
+			say "lingering is on: astd survives logout and starts at boot."
+			return 0
+			;;
+		esac
+	fi
+	say "astd is a systemd --user unit. It dies at logout unless lingering is on:"
+	say "    loginctl enable-linger ${user}"
 }
 
 # Explicit compatibility installs may still use this helper. It is not called
@@ -1140,6 +1255,13 @@ uninstall() {
 	if [ -z "$system_files" ] && receipt_lists bin/cloud-hypervisor; then
 		system_files="$(linux_system_files)"
 	fi
+	if live_nbd_claims; then
+		if ! drain_own_nbd_claims || live_nbd_claims; then
+			err "live NBD claims remain under $(nbd_state_dir)."
+			err "refusing to uninstall: the NBD helper and sudoers cleanup authority were kept so the attachment can still be detached."
+			exit 1
+		fi
+	fi
 	# Preserve the only ownership manifest until every deletion has completed.
 	write_receipt_document "$r" uninstalling "$version" "$target" "$method" "$sha" "$files" "$system_files"
 	remove_receipt_system_files
@@ -1240,6 +1362,7 @@ main() {
 	done
 
 	TMPDIR_SELF="$(mktemp -d "${TMPDIR:-/tmp}/asterism-install.XXXXXX")"
+	acquire_artifact_lock
 
 	if [ "$action" = "uninstall" ]; then
 		uninstall

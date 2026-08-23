@@ -110,4 +110,22 @@ fi
 	exit 1
 }
 
+# A collision must never detach another owner's attached device. Caller
+# 1000:1000 asking -d on a 2000:2000 claim leaves both the claim and the
+# kernel pid in place.
+printf '4242\n' >"$SYSFS/nbd0/pid"
+if run_helper "$HELPER" -d /dev/nbd0; then
+	echo "nbd-claim-test: detached another owner's attachment" >&2
+	exit 1
+fi
+[ -e "$SYSFS/nbd0/pid" ] || {
+	echo "nbd-claim-test: foreign kernel attachment was torn down" >&2
+	exit 1
+}
+[ -e "$STATE/nbd0/owner" ] || {
+	echo "nbd-claim-test: foreign attached claim was erased" >&2
+	exit 1
+}
+rm -f "$SYSFS/nbd0/pid"
+
 echo "nbd-claim-test: atomic publication and all recovery fixtures passed"

@@ -41,7 +41,7 @@ use asterism_core::ipc;
 use asterism_core::proc::{ProcId, Signal};
 use asterism_core::protocol::{self, Request, Response};
 use asterism_core::registry::OrbitRow;
-use asterism_core::{cow, image, oci, paths, service, snapshot, verify, VERSION};
+use asterism_core::{cow, doctor, image, oci, paths, service, snapshot, verify, VERSION};
 
 #[derive(Parser)]
 #[command(
@@ -505,6 +505,9 @@ enum Command {
     /// where this device keeps its state and what is running. Nothing here
     /// contacts another device and nothing here prints a secret.
     Bugreport,
+    /// Check whether this host can run Asterism: service, linger, sleep
+    /// inhibition, secret storage, and (on Linux) the pinned VMM helpers.
+    Doctor,
 }
 
 /// `ast snapshot ...` — taking one, and deleting one.
@@ -1030,6 +1033,10 @@ fn main() -> Result<()> {
         Command::Bugreport => {
             local_only("bugreport", device.as_deref())?;
             return print_bugreport();
+        }
+        Command::Doctor => {
+            local_only("doctor", device.as_deref())?;
+            return print_doctor();
         }
     };
 
@@ -3911,6 +3918,25 @@ fn print_bugreport() -> Result<()> {
     Ok(())
 }
 
+/// `ast doctor` — pass/fail host integration, not a bug report.
+fn print_doctor() -> Result<()> {
+    let checks = doctor::run();
+    for check in &checks {
+        println!(
+            "{:<4}  {:<18}  {}",
+            check.status.as_str(),
+            check.name,
+            check.detail
+        );
+    }
+    if doctor::all_clear(&checks) {
+        println!("doctor: ok");
+        Ok(())
+    } else {
+        bail!("doctor: host integration is incomplete")
+    }
+}
+
 /// The kernel line, which is how a macOS version gets named in a report
 /// somebody else has to reproduce.
 fn uname_line() -> String {
@@ -4466,6 +4492,7 @@ fn service_command(cmd: ServiceCommand) -> Result<()> {
             }
             println!("it starts on login and comes back if it exits.");
             println!("moved the astd binary? run `ast service install` again.");
+            println!("check the rest of this host with: ast doctor");
         }
         ServiceCommand::Uninstall => {
             let report = manager.uninstall()?;

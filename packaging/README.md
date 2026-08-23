@@ -86,6 +86,8 @@ $ sh install.sh --uninstall
 ```
 v0.1.0/
   asterism-v0.1.0-darwin-arm64.tar.gz   # ast, astd, astd-vz, asterism-update — flat
+  asterism-v0.1.0-linux-x86_64.tar.gz   # ast, astd, cloud-hypervisor, virtiofsd, asterism-update, share/
+  asterism-v0.1.0-linux-arm64.tar.gz    # same layout, aarch64 Cloud Hypervisor pin
   Asterism-v0.1.0-darwin-arm64.app.tar.gz # signed app payload used by the updater
   Asterism-v0.1.0-darwin-arm64.dmg      # signed manual installer; drag to Applications
   RELEASE.json                          # exact build, URLs, digests, minimum updater
@@ -171,13 +173,27 @@ stays exactly what it is today either way.
 
 ### Platforms
 
-Binaries are published for **macOS on Apple silicon** (`darwin-arm64`), and
-that is the whole list. Every other host is refused by name and pointed at
-the source build; there is no near-enough target, because a near-enough
-binary is one that does not run.
+Binaries are published for **macOS on Apple silicon** (`darwin-arm64`) and
+**Linux on x86-64 and arm64** (`linux-x86_64`, `linux-arm64`). Every other
+host is refused by name and pointed at the source build; there is no
+near-enough target, because a near-enough binary is one that does not run.
+
+A Linux archive is flat and self-contained: `ast`, `astd`, the pinned
+Cloud Hypervisor v53.0 static binary, virtiofsd v1.14.0, the signed
+updater, the NBD privilege wrapper, component lock file, and licenses.
+Installation needs neither a Rust toolchain nor a separately installed VMM.
+The installer grants the bundled VMM only `CAP_NET_ADMIN`, loads `nbd`
+with 64 devices, and installs a least-privilege sudoers rule for the
+argument-checking NBD helper. `ast service install` writes the systemd
+user unit; lingering (`loginctl enable-linger`) is what keeps that unit
+alive after logout. `ast doctor` executes the pinned helpers, NBD wrapper,
+and Secret Service rather than checking that files exist.
 
 ```console
-$ curl -fsSL https://asterism.run/install.sh | ASTERISM_METHOD=source sh
+$ curl -fsSL https://asterism.run/install.sh | sh
+$ ast service install
+$ loginctl enable-linger "$USER"
+$ ast doctor
 ```
 
 The source path still builds a **tag** by default. `ASTERISM_REF=main` is the
@@ -279,12 +295,14 @@ activation rollback, downgrade refusal, and Homebrew delegation. The installer
 suite builds a fake release on disk, serves it over `file://`, and
 shims `uname`, `git` and `cargo` where a test needs the machine to be a
 machine it is not. No network, and nothing is written outside one temp
-directory. Thirty-eight checks: the default install, an explicit version,
+directory. The suite covers the default install, an explicit version,
 a pinned digest, upgrade, downgrade, reinstall, `ASTERISM_FORCE`, uninstall
 and uninstalling twice, a tampered tarball, an unlisted artifact, a missing
-`SHA256SUMS`, an unreachable index, unreachable assets, four unsupported
-hosts, an unwritable prefix, and the source escape hatch with and without
-`ASTERISM_REF`.
+`SHA256SUMS`, an unreachable index, unreachable assets, unsupported
+hosts, a Linux exact-artifact install of the pinned Cloud Hypervisor and
+virtiofsd helpers plus NBD policy (including live-claim uninstall refusal
+and the shared artifact lock), an unwritable prefix, and the source
+escape hatch with and without `ASTERISM_REF`.
 
 The Homebrew path gets its own eight, all asserting on the version the tap's
 formula actually pinned rather than on what the script said it would do —

@@ -78,8 +78,19 @@ instance's requirements and otherwise uses QEMU with Hypervisor.framework
 acceleration. Pass `--backend vz` or `--backend qemu` to require one and get a
 specific capability refusal when it cannot serve the instance.
 
-Instances can restart after a guest crash or device reboot. Install `astd` as
-the user service that keeps them running:
+On Linux, a tagged release ships pinned Cloud Hypervisor v53.0 and virtiofsd
+v1.14.0 beside `ast` and `astd`. QEMU remains an explicit compatibility
+backend. After install, persist the daemon across logout and reboot:
+
+```console
+$ ast service install
+$ loginctl enable-linger $USER
+$ ast doctor
+$ ast up agent --restart always
+$ ast service status
+```
+
+On macOS, install `astd` as the user service that keeps instances running:
 
 ```console
 $ ast service install
@@ -172,7 +183,8 @@ operations across the mesh.
   measured latency. Use `storage:data` to constrain an attach to one owner, or
   `--max-latency-ms` to refuse a path before any lease or guest state changes.
 
-- **Secrets** keep their values in a source device's macOS login Keychain. The
+- **Secrets** keep their values in a source device's macOS login Keychain or
+  FreeDesktop Secret Service on Linux. The
   guest receives an opaque handle, and Asterism exchanges it for the value
   only on requests to the allowed authority. The value never enters the guest
   disk or a snapshot; platforms without a credential-store implementation

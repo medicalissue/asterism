@@ -72,11 +72,14 @@ cp "$ROOT/NOTICE" "$WORK/root/share/asterism/licenses/NOTICE"
 chmod 0755 "$WORK/root/share/asterism/asterism-nbd"
 
 cp "$CARGO_TARGET_DIR/release/ast" "$CARGO_TARGET_DIR/release/astd" "$WORK/root/bin/"
+cp "$ROOT/packaging/update.sh" "$WORK/root/bin/asterism-update"
+chmod 0755 "$WORK/root/bin/asterism-update"
 strip "$WORK/root/bin/ast" "$WORK/root/bin/astd"
 # The installer consumes a flat CLI payload. Keep runtime data under share,
-# but do not put the four executables below a bin/ prefix.
+# but do not put the executables below a bin/ prefix. asterism-update is the
+# same signed-channel updater Darwin ships, so `ast update` is reachable.
 tar -czf "$DIST/asterism-${VERSION}-${TARGET}.tar.gz" \
-  -C "$WORK/root/bin" ast astd cloud-hypervisor virtiofsd \
+  -C "$WORK/root/bin" ast astd cloud-hypervisor virtiofsd asterism-update \
   -C "$WORK/root" share LICENSE-APACHE LICENSE-MIT NOTICE
 archive="asterism-${VERSION}-${TARGET}.tar.gz"
 # SHA256SUMS is consumed by install.sh with an exact basename lookup. DIST is

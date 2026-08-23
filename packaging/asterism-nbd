@@ -37,8 +37,9 @@ valid_id() {
 [ -d "$STATE" ] || die "the installed NBD ownership state directory is missing"
 if [ -z "$caller_uid" ]; then caller_uid=$(id -u); fi
 if [ -z "$caller_gid" ]; then caller_gid=$(id -g); fi
-valid_id "$caller_uid" && valid_id "$caller_gid" ||
+if ! valid_id "$caller_uid" || ! valid_id "$caller_gid"; then
 	die "the invoking uid/gid is not numeric"
+fi
 
 device_name() {
 	case "$1" in
