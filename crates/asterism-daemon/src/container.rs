@@ -711,17 +711,46 @@ fn connect_unix_deadline(socket: &Path, deadline: Instant) -> Result<UnixStream>
     for (target, source) in address.sun_path.iter_mut().zip(path) {
         *target = *source as libc::c_char;
     }
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_UNIX,
-            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            0,
-        )
-    };
+    // Linux can set both properties atomically at creation. The flags are not
+    // portable Unix constants, so the macOS-hosted test build uses fcntl below.
+    #[cfg(target_os = "linux")]
+    let socket_type = libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let socket_type = libc::SOCK_STREAM;
+    let fd = unsafe { libc::socket(libc::AF_UNIX, socket_type, 0) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error()).context("creating slirp API socket");
     }
     let stream = unsafe { UnixStream::from_raw_fd(fd) };
+    #[cfg(not(target_os = "linux"))]
+    {
+        let status_flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+        if status_flags < 0
+            || unsafe {
+                libc::fcntl(
+                    stream.as_raw_fd(),
+                    libc::F_SETFL,
+                    status_flags | libc::O_NONBLOCK,
+                )
+            } < 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("making the slirp API socket nonblocking");
+        }
+        let descriptor_flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFD) };
+        if descriptor_flags < 0
+            || unsafe {
+                libc::fcntl(
+                    stream.as_raw_fd(),
+                    libc::F_SETFD,
+                    descriptor_flags | libc::FD_CLOEXEC,
+                )
+            } < 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("making the slirp API socket close-on-exec");
+        }
+    }
     let result = unsafe {
         libc::connect(
             stream.as_raw_fd(),
