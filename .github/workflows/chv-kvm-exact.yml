@@ -41,8 +41,8 @@ jobs:
           set -eux
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cloud-image-utils e2fsprogs iproute2 libcap2-bin nbd-client \
-            openssh-client qemu-utils
+            cloud-image-utils e2fsprogs iproute2 libcap2-bin libcap-ng-dev \
+            libseccomp-dev nbd-client openssh-client qemu-utils
 
       - name: Require real KVM and materialize the exact source
         run: |
@@ -56,6 +56,15 @@ jobs:
           git worktree add --detach "$exact" "$TARGET_SHA"
           test "$(git -C "$exact" rev-parse HEAD)" = "$TARGET_SHA"
           test "$(git -C "$exact" rev-parse 'HEAD^{tree}')" = "$TARGET_TREE"
+          evidence="${RUNNER_TEMP}/chv-kvm-evidence"
+          mkdir -p "$evidence"
+          {
+            echo "result=pending"
+            echo "source_sha=$TARGET_SHA"
+            echo "source_tree=$TARGET_TREE"
+            echo "observer_sha=$GITHUB_SHA"
+            echo "host=$(uname -srmo) $(stat -c '%A %U:%G %t:%T' /dev/kvm)"
+          } >"$evidence/summary.txt"
           echo "EXACT_SOURCE=$exact" >>"$GITHUB_ENV"
 
       - name: Build the shipped Linux payload from only the exact source
