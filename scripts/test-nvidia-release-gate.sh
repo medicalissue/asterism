@@ -102,6 +102,15 @@ fi
 
 nvidia_gate_validate_dstack "$ROOT/deploy/dstack/remote-gpu-nvidia.dstack.yml" >/dev/null
 
+# The candidate must not regain observation/acceptance authority through a
+# direct runner invocation or an unshared nested-Docker artifact path.
+grep -q '"$VERIFIER_IMAGE" /run-and-verify' "$ROOT/scripts/harness-remote-gpu-nvidia.sh"
+! grep -q '^"$RUNNER"' "$ROOT/scripts/harness-remote-gpu-nvidia.sh"
+grep -q 'ASTERISM_NVIDIA_DOCKER_HOST_RESULT=' "$ROOT/scripts/harness-remote-gpu-nvidia.sh"
+grep -q 'path is outside verifier result mount' "$ROOT/scripts/lib/nvidia-guest-container.sh"
+grep -q 'pair_devices direct-refresh' "$ROOT/scripts/lib/nvidia-e2e-runner.sh"
+grep -q 'pair_devices relay-refresh' "$ROOT/scripts/lib/nvidia-e2e-runner.sh"
+
 set +e
 ASTERISM_SOURCE_ONLY=1 "$ROOT/scripts/harness-remote-gpu-nvidia.sh" >"$TMP/source.out" 2>&1
 status=$?

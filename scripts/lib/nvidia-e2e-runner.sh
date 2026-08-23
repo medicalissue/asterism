@@ -82,16 +82,17 @@ wait_socket() {
 }
 stop_pid() { kill "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; }
 pair_devices() {
-  ASTERISM_HOME="$PROVIDER_HOME" "$AST" device invite --name "$PROVIDER_NAME" --yes >"$OUT/invite.log" 2>&1 &
+  local label="$1"
+  ASTERISM_HOME="$PROVIDER_HOME" "$AST" device invite --name "$PROVIDER_NAME" --yes >"$OUT/$label-invite.log" 2>&1 &
   local invite_pid=$! ticket=''
   for _ in $(seq 1 200); do
-    ticket="$(sed -n 's/.*ast device add \([^[:space:]]*\).*/\1/p' "$OUT/invite.log" | head -n1)"
+    ticket="$(sed -n 's/.*ast device add \([^[:space:]]*\).*/\1/p' "$OUT/$label-invite.log" | head -n1)"
     [ -n "$ticket" ] && break
     kill -0 "$invite_pid" 2>/dev/null || fail "device invite exited before printing a ticket"
     sleep 0.05
   done
   [ -n "$ticket" ] || fail "device invite produced no ticket"
-  ASTERISM_HOME="$GUEST_HOME" "$AST" device add "$ticket" --name "$GUEST_NAME" --yes >"$OUT/add.log" 2>&1
+  ASTERISM_HOME="$GUEST_HOME" "$AST" device add "$ticket" --name "$GUEST_NAME" --yes >"$OUT/$label-add.log" 2>&1
   wait "$invite_pid"
 }
 observe() {
@@ -109,7 +110,7 @@ PROVIDER_PID=$!
 start_guest direct "$OUT/bootstrap-guest.log"
 wait_socket "$PROVIDER_HOME/astd.sock" "$PROVIDER_PID"
 wait_socket "$GUEST_HOME/astd.sock" "$GUEST_PID"
-pair_devices
+pair_devices bootstrap
 GUEST_ID="$($DRIVER identity --home "$GUEST_HOME")"
 PROVIDER_ID="$($DRIVER identity --home "$PROVIDER_HOME")"
 printf 'guest_device_id=%s\nprovider_device_id=%s\n' "$GUEST_ID" "$PROVIDER_ID" >"$OUT/paired-identities"
@@ -123,6 +124,10 @@ INSTANCE_ID="$("$DRIVER" prepare --guest-home "$GUEST_HOME" --provider-home "$PR
 start_provider direct "$FIRST_UUID" "$GUEST_ID" "$INSTANCE_ID" "$OUT/direct-provider-astd.log"
 wait_socket "$PROVIDER_HOME/astd.sock" "$PROVIDER_PID"
 start_guest direct "$OUT/direct-guest-astd.log"; wait_socket "$GUEST_HOME/astd.sock" "$GUEST_PID"
+# Local-only endpoints bind ephemeral loopback ports. Refresh the pairing while
+# these exact daemon processes are live so the direct run cannot reuse the
+# bootstrap processes' stale addresses.
+pair_devices direct-refresh
 observe direct-success direct none "$FIRST_UUID"
 observe active-loss direct loss "$FIRST_UUID"
 stop_pid "$GUEST_PID"; stop_pid "$PROVIDER_PID"
@@ -135,6 +140,9 @@ INSTANCE_ID="$("$DRIVER" prepare --guest-home "$GUEST_HOME" --provider-home "$PR
 start_provider relay "$SECOND_UUID" "$GUEST_ID" "$INSTANCE_ID" "$OUT/relay-provider-astd.log"
 wait_socket "$PROVIDER_HOME/astd.sock" "$PROVIDER_PID"
 start_guest relay "$OUT/relay-guest-astd.log"; wait_socket "$GUEST_HOME/astd.sock" "$GUEST_PID"
+# Refresh through relay-only tickets as well. This both binds the restarted
+# daemon processes and leaves a transcript with no direct address hints.
+pair_devices relay-refresh
 observe relay-success relay none "$SECOND_UUID"
 observe active-revoke relay revoke "$SECOND_UUID"
 stop_pid "$GUEST_PID"; stop_pid "$PROVIDER_PID"

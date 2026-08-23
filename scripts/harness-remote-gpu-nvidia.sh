@@ -99,29 +99,39 @@ RUN="$(mktemp -d "${TMPDIR:-/tmp}/asterism-nvidia-release.XXXXXX")"
 trap 'rm -rf "$RUN"' EXIT
 RAW="$RUN/raw"
 EVIDENCE="$RUN/release.evidence"
-mkdir -p "$RAW"
+mkdir -p "$RAW" "$RUN/tmp"
 
 # Runner contract: run a CUDA application inside the Asterism guest/container,
 # across two named authenticated mesh devices, on the live provider. It must
 # restart provider astd/helper and the guest, and prove direct, relay, revoke,
 # contention, loss, and fresh-session skew. The wrapper supplies no defaults.
-export ASTERISM_NVIDIA_FIRST_GPU_UUID="${UUIDS[0]}"
-export ASTERISM_NVIDIA_SECOND_GPU_UUID="${UUIDS[1]}"
-"$RUNNER" --output-dir "$RAW"
-for raw in direct-success active-loss relay-success active-revoke; do
-  [ -s "$RAW/$raw.json" ] || fail "runner omitted raw observation $raw"
-done
-
-# The candidate can produce observations but cannot accept them. The image is
-# supplied and digest-pinned by the independent reviewer, runs read-only and
-# offline, and is the only component allowed to emit normalized PASS evidence.
-docker run --rm --network none --read-only \
-  --mount "type=bind,src=$RAW,dst=/evidence,readonly" \
-  "$VERIFIER_IMAGE" /verify \
-    --evidence /evidence \
+# The candidate is mounted read-only. The reviewer image owns orchestration,
+# observes daemon/container processes while they are live, invokes the exact
+# candidate runner itself, and then verifies the resulting transcripts. Thus
+# candidate code cannot choose what execution the acceptance process saw.
+docker run --rm --gpus all --network host --read-only --tmpfs /tmp:exec \
+  --mount "type=bind,src=$ROOT,dst=/candidate,readonly" \
+  --mount "type=bind,src=$RUN,dst=/result" \
+  --mount "type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock" \
+  --env ASTERISM_PINNED_SHA="$CANDIDATE_SHA" \
+  --env ASTERISM_NVIDIA_FIRST_GPU_UUID="${UUIDS[0]}" \
+  --env ASTERISM_NVIDIA_SECOND_GPU_UUID="${UUIDS[1]}" \
+  --env ASTERISM_GPU_GUEST_DEVICE_NAME="${ASTERISM_GPU_GUEST_DEVICE_NAME:-guest-gpu}" \
+  --env ASTERISM_GPU_PROVIDER_DEVICE_NAME="${ASTERISM_GPU_PROVIDER_DEVICE_NAME:-provider-gpu}" \
+  --env ASTERISM_NVIDIA_DOCKER_CONTAINER_RESULT=/result \
+  --env ASTERISM_NVIDIA_DOCKER_HOST_RESULT="$RUN" \
+  --env TMPDIR=/result/tmp \
+  "$VERIFIER_IMAGE" /run-and-verify \
+    --candidate /candidate \
+    --runner /candidate/scripts/lib/nvidia-e2e-runner.sh \
+    --raw /result/raw \
+    --output /result/release.evidence \
     --candidate-sha "$CANDIDATE_SHA" \
     --tree-digest "$TREE_DIGEST" \
-    --runner-digest "$RUNNER_DIGEST" >"$EVIDENCE"
+    --runner-digest "$RUNNER_DIGEST"
+for raw in direct-success active-loss relay-success active-revoke; do
+  [ -s "$RAW/$raw.json" ] || fail "external runner omitted raw observation $raw"
+done
 [ -s "$EVIDENCE" ] || fail "external verifier emitted no acceptance record"
 nvidia_gate_validate_runner_evidence "$EVIDENCE" \
   || fail "external verifier evidence is incomplete or contains forbidden keys"
