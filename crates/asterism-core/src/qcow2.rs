@@ -637,8 +637,10 @@ fn read_exact_at(file: &mut File, offset: u64, bytes: &mut [u8], what: &str) -> 
 
 fn be_u64s(bytes: &[u8]) -> Vec<u64> {
     bytes
-        .chunks_exact(8)
-        .map(|chunk| u64::from_be_bytes(chunk.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|chunk| u64::from_be_bytes(*chunk))
         .collect()
 }
 
