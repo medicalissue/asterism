@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, validation/as-ul6-windows-0736886]
   pull_request:
 
 env:
