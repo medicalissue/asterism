@@ -541,6 +541,14 @@ fn sync_tree(root: &Path) -> io::Result<()> {
 /// the whole reason the call is here is that skipping it loses the rename.
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
     faults::check_io(faults::Point::SyncDir, dir)?;
+    // FlushFileBuffers requires GENERIC_WRITE even when the handle names a
+    // directory. `File::open` asks only for read access on Windows, so its
+    // `sync_all` deterministically returns ERROR_ACCESS_DENIED, including for
+    // LocalSystem. The bytes themselves were already forced through a file
+    // handle; this write-capable directory handle is for the rename barrier.
+    #[cfg(windows)]
+    let handle = OpenOptions::new().read(true).write(true).open(dir)?;
+    #[cfg(not(windows))]
     let handle = File::open(dir)?;
     match handle.sync_all() {
         Ok(()) => Ok(()),
@@ -985,6 +993,13 @@ mod tests {
             !tmp_path(&path).exists(),
             "the staging file is consumed by the rename"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_real_windows_directory_handle_can_be_flushed() {
+        let dir = tempfile::tempdir().unwrap();
+        sync_dir(dir.path()).unwrap();
     }
 
     #[test]
