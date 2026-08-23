@@ -10,8 +10,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  ASTERISM_CUSE_TARGET_COMMIT: 747a6b9d4c2a300244f28be438f136af1fe15545
-  ASTERISM_CUSE_TARGET_TREE: 21f91cb23eafab1240181f977cd1d8e7078f9e47
+  ASTERISM_CUSE_TARGET_COMMIT: 4ee9a68af0583446e56823ddbb89edf474d6e111
+  ASTERISM_CUSE_TARGET_TREE: 0ab4ba145214ad40976597ef98775e3b329cd46d
 
 jobs:
   live-cuse:
@@ -42,7 +42,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2 commit
         with:
-          name: live-cuse-as-glji6-747a6b9d
+          name: live-cuse-as-glji6-4ee9a68a
           path: ${{ runner.temp }}/live-cuse-evidence
           if-no-files-found: error
           retention-days: 90

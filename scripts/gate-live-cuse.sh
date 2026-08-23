@@ -35,10 +35,14 @@ if [ "$gate_rc" -eq 0 ] && ! git merge-base --is-ancestor "$TARGET_COMMIT" HEAD;
 fi
 if [ "$gate_rc" -eq 0 ] && ! git diff --quiet "$TARGET_COMMIT" -- \
   Cargo.toml Cargo.lock crates/asterism-core/Cargo.toml \
-  crates/asterism-core/src/remote_gpu_cuse.rs; then
+  crates/asterism-core/src/remote_gpu_cuse.rs \
+  crates/asterism-core/src/remote_gpu_guest.rs \
+  crates/asterism-core/assets/70-asterism-cuse.rules; then
   git diff --name-only "$TARGET_COMMIT" -- \
     Cargo.toml Cargo.lock crates/asterism-core/Cargo.toml \
-    crates/asterism-core/src/remote_gpu_cuse.rs >>"$EVIDENCE/preflight.log"
+    crates/asterism-core/src/remote_gpu_cuse.rs \
+    crates/asterism-core/src/remote_gpu_guest.rs \
+    crates/asterism-core/assets/70-asterism-cuse.rules >>"$EVIDENCE/preflight.log"
   block "production CUSE inputs differ from immutable target" || gate_rc=1
 fi
 
