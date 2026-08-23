@@ -257,6 +257,10 @@ impl MeshRequest {
         match self {
             MeshRequest::Rpc { request } => request.since(),
             MeshRequest::DeviceShell { .. } => 4,
+            // This changes the pipe's authority semantics: its holder identity
+            // and epoch are the provider-side writer fence, so an older peer
+            // must refuse it rather than treating it as an ordinary splice.
+            MeshRequest::VolumeSplice { .. } => 7,
             _ => compat::FIRST_PROTOCOL,
         }
     }
@@ -3970,6 +3974,30 @@ mod tests {
                 assert!(instances.is_empty());
             }
             other => panic!("an old peer's list was answered with {other:?}"),
+        }
+
+        connection.close(b"done");
+        client.close().await;
+    }
+
+    /// Storage's NBD pipe is not an ordinary splice: its holder identity and
+    /// epoch enforce the provider-side single-writer fence. A protocol-6 peer
+    /// must receive a compatibility refusal before either side treats it as a
+    /// pipe.
+    #[tokio::test]
+    async fn a_protocol_six_peer_is_refused_before_a_fenced_volume_splice() {
+        let (client, connection, _dir) = wired().await;
+        let frame = r#"{"protocol":6,"min_protocol":6,"kind":"volume_splice","volume":"tank","holder":"agent","holder_id":"instance-id","epoch":7}"#;
+
+        match raw_ask(&connection, frame).await.unwrap() {
+            MeshReply::Incompatible { message, .. } => {
+                assert!(
+                    message.contains("volume connection needs Asterism protocol 7"),
+                    "{message}"
+                );
+                assert!(message.contains("speaking protocol 6"), "{message}");
+            }
+            other => panic!("a protocol-6 volume splice was not refused: {other:?}"),
         }
 
         connection.close(b"done");
