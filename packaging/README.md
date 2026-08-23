@@ -84,8 +84,10 @@ $ sh install.sh --uninstall
 ### What a release contains
 
 ```
-v0.1.0/
+  v0.1.0/
   asterism-v0.1.0-darwin-arm64.tar.gz   # ast, astd, astd-vz, asterism-update — flat
+  asterism-v0.1.0-linux-x86_64.tar.gz    # ast, astd, Cloud Hypervisor, virtiofsd, notices
+  asterism-v0.1.0-linux-arm64.tar.gz     # same Linux payload for arm64
   Asterism-v0.1.0-darwin-arm64.app.tar.gz # signed app payload used by the updater
   Asterism-v0.1.0-darwin-arm64.dmg      # signed manual installer; drag to Applications
   RELEASE.json                          # exact build, URLs, digests, minimum updater
