@@ -28,8 +28,12 @@ host the installer adds `nbd-client` plus `kmod` (`nbd` plus `kmod` on
 Fedora-family systems), loads `nbd` with 64 devices, and records the same
 setting under `modules-load.d` and `modprobe.d` for reboot. The daemon has no
 general root or `nbd-client` permission: sudoers allows the installing account
-to run only `/usr/local/libexec/asterism/asterism-nbd` without a prompt. That
-root-owned wrapper accepts only attach/detach forms used by Asterism and only
+to run `/usr/local/libexec/asterism/asterism-nbd` and the exact
+`setcap cap_net_admin+ep <installed-cloud-hypervisor>` updater command without
+a prompt. The latter restores the one capability lost when a verified update
+replaces the VMM inode; rollback restores the old capable inode and explicitly
+reapplies the same capability. The root-owned NBD wrapper accepts only
+attach/detach and diagnostic probe forms used by Asterism and only
 for `/dev/nbd0` through `/dev/nbd63`; after attach it grants the invoking
 unprivileged account access to that selected device only, then restores root
 ownership on detach. The wrapper owns a `flock` on

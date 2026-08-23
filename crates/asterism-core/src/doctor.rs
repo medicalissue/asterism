@@ -7,6 +7,8 @@
 //! disk. This module reports those facts as independent checks so a human
 //! (or `ast doctor`) can see exactly which one is missing.
 
+#[cfg(any(test, target_os = "linux"))]
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -489,26 +491,7 @@ fn sleep_check() -> Check {
 #[cfg(target_os = "linux")]
 fn linux_checks() -> Vec<Check> {
     let mut checks = Vec::new();
-    let kvm = Path::new("/dev/kvm");
-    if kvm.exists() {
-        let readable = std::fs::File::open(kvm).is_ok();
-        checks.push(Check {
-            name: "kvm",
-            status: if readable { Status::Ok } else { Status::Fail },
-            detail: if readable {
-                "/dev/kvm is present and readable".into()
-            } else {
-                "/dev/kvm exists but is not readable; add this user to the kvm group and log in again"
-                    .into()
-            },
-        });
-    } else {
-        checks.push(Check {
-            name: "kvm",
-            status: Status::Fail,
-            detail: "/dev/kvm is missing; Cloud Hypervisor cannot run".into(),
-        });
-    }
+    checks.push(probe_kvm(Path::new("/dev/kvm")));
 
     let pins = prefix_dir().and_then(|prefix| {
         std::fs::read_to_string(prefix.join("share/asterism/linux-components.env"))
@@ -573,7 +556,7 @@ fn linux_checks() -> Vec<Check> {
     checks
 }
 
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn probe_nbd_helper(nbd: &Path) -> Check {
     if !nbd.is_file() {
         return Check {
@@ -585,21 +568,34 @@ fn probe_nbd_helper(nbd: &Path) -> Check {
             ),
         };
     }
-    match run_probe(nbd, &[]) {
+    probe_nbd_helper_through(nbd, Path::new("sudo"))
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn probe_nbd_helper_through(nbd: &Path, sudo: &Path) -> Check {
+    match Command::new(sudo)
+        .arg("-n")
+        .arg(nbd)
+        .arg("--probe")
+        .output()
+    {
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            if nbd_helper_executed(&stderr) {
+            if out.status.success() && nbd_helper_executed(&stderr) {
                 Check {
                     name: "nbd-helper",
                     status: Status::Ok,
-                    detail: format!("helper executed ({})", nbd.display()),
+                    detail: format!(
+                        "privileged helper probe succeeded through sudo ({})",
+                        nbd.display()
+                    ),
                 }
             } else {
                 Check {
                     name: "nbd-helper",
                     status: Status::Fail,
                     detail: format!(
-                        "{} ran but did not identify as asterism-nbd: {}",
+                        "sudo -n {} --probe failed or did not identify as asterism-nbd: {}",
                         nbd.display(),
                         stderr.trim()
                     ),
@@ -610,6 +606,32 @@ fn probe_nbd_helper(nbd: &Path) -> Check {
             name: "nbd-helper",
             status: Status::Fail,
             detail: format!("could not execute {}: {error}", nbd.display()),
+        },
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn probe_kvm(kvm: &Path) -> Check {
+    if !kvm.exists() {
+        return Check {
+            name: "kvm",
+            status: Status::Fail,
+            detail: format!("{} is missing; Cloud Hypervisor cannot run", kvm.display()),
+        };
+    }
+    match OpenOptions::new().read(true).write(true).open(kvm) {
+        Ok(_) => Check {
+            name: "kvm",
+            status: Status::Ok,
+            detail: format!("{} opens read-write", kvm.display()),
+        },
+        Err(error) => Check {
+            name: "kvm",
+            status: Status::Fail,
+            detail: format!(
+                "{} does not open read-write ({error}); add this user to the kvm group and log in again",
+                kvm.display()
+            ),
         },
     }
 }
@@ -731,7 +753,7 @@ mod tests {
     }
 
     #[test]
-    fn nbd_helper_execution_is_the_identity_prefix_not_a_zero_exit() {
+    fn nbd_helper_identity_is_not_confused_with_unrelated_stderr() {
         assert!(nbd_helper_executed(
             "asterism-nbd: must run as root through the installed sudo policy\n"
         ));
@@ -790,12 +812,32 @@ mod tests {
     }
 
     #[test]
-    fn a_fixture_nbd_helper_probe_requires_the_identity_prefix() {
+    fn a_fixture_nbd_helper_probe_uses_sudo_and_requires_success() {
         let dir = tempfile::tempdir().unwrap();
         let helper = dir.path().join("asterism-nbd");
+        let sudo = dir.path().join("sudo");
+        std::fs::write(
+            &sudo,
+            "#!/bin/sh\n[ \"$1\" = -n ] || exit 90\nshift\nexec \"$@\"\n",
+        )
+        .unwrap();
         std::fs::write(
             &helper,
-            "#!/bin/sh\nprintf 'asterism-nbd: must run as root through the installed sudo policy\\n' >&2\nexit 2\n",
+            "#!/bin/sh\n[ \"$1\" = --probe ] || exit 91\nprintf 'asterism-nbd: privileged boundary probe succeeded\\n' >&2\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let check = probe_nbd_helper_through(&helper, &sudo);
+        assert_eq!(check.status, Status::Ok, "{}", check.detail);
+
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\nprintf 'asterism-nbd: privileged boundary probe failed\\n' >&2\nexit 2\n",
         )
         .unwrap();
         #[cfg(unix)]
@@ -803,16 +845,24 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let check = probe_nbd_helper(&helper);
-        assert_eq!(check.status, Status::Ok, "{}", check.detail);
-
-        std::fs::write(&helper, "#!/bin/sh\necho silent\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let check = probe_nbd_helper(&helper);
+        let check = probe_nbd_helper_through(&helper, &sudo);
         assert_eq!(check.status, Status::Fail, "{}", check.detail);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kvm_probe_requires_read_write_not_read_only_access() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let kvm = dir.path().join("kvm");
+        std::fs::write(&kvm, b"fixture").unwrap();
+        std::fs::set_permissions(&kvm, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(probe_kvm(&kvm).status, Status::Ok);
+
+        std::fs::set_permissions(&kvm, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let read_only = probe_kvm(&kvm);
+        assert_eq!(read_only.status, Status::Fail, "{}", read_only.detail);
+        assert!(read_only.detail.contains("read-write"));
     }
 }

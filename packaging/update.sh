@@ -37,6 +37,7 @@ LAST_FILE="$STATE_DIR/update-state.env"
 TRANSACTION_CLAIM="$STATE_DIR/update-transaction.claim"
 TRANSACTION_DIR=""
 TRANSACTION_ID=""
+activation_failure=""
 
 tmp=""
 app_staged=""
@@ -313,6 +314,29 @@ durable_parent() {
 	"$AST" __sync-update-path --parent-only "$1"
 }
 
+restore_chv_capability() {
+	chv="$BIN/cloud-hypervisor"
+	[ -f "$chv" ] || return 1
+	if [ -n "${ASTERISM_UPDATE_SETCAP:-}" ]; then
+		"$ASTERISM_UPDATE_SETCAP" cap_net_admin+ep "$chv"
+	elif [ "$(id -u)" = 0 ]; then
+		setcap cap_net_admin+ep "$chv"
+	else
+		# install.sh grants this account exactly this fixed setcap invocation.
+		# `-n` keeps an unattended updater from hanging on a password prompt.
+		sudo -n setcap cap_net_admin+ep "$chv"
+	fi || return 1
+	durable_path "$chv"
+}
+
+activate_chv_capability() {
+	if restore_chv_capability; then
+		return 0
+	fi
+	activation_failure="could not apply cap_net_admin to the new Cloud Hypervisor"
+	return 1
+}
+
 atomic_record() {
 	path="$1" value="$2"
 	record_tmp="${path}.tmp.$$"
@@ -410,6 +434,9 @@ rollback_transaction() {
 			rm -rf "$dst"
 			mv "$backup" "$dst" || die "could not restore $name from interrupted update"
 			if [ -d "$dst" ]; then durable_tree "$dst"; else durable_path "$dst"; fi
+			# Cloud Hypervisor's backup is the original inode, including its
+			# capability xattr. Re-running setcap here can repeat the activation
+			# failure and strand the transaction before journal cleanup.
 		elif [ -e "${backup}.absent" ]; then
 			rm -rf "$dst"
 			durable_parent "$dst"
@@ -522,14 +549,19 @@ place_one() {
 		if [ -d "$dst" ]; then
 			mv "$dst" "$backup" || return 97
 			durable_tree "$backup" || return 97
-		elif ! ln "$dst" "$backup" 2>/dev/null; then
+		elif ln "$dst" "$backup" 2>/dev/null; then
+			durable_path "$backup" || return 97
+		elif [ "$name" = cloud-hypervisor ]; then
+			# If hard-link protection rejects a capable root-owned binary, move
+			# the old inode rather than copying it and losing its capability xattr.
+			mv "$dst" "$backup" || return 97
+			durable_path "$backup" || return 97
+		else
 			backup_tmp="${backup}.tmp.$$"
 			rm -f "$backup_tmp"
 			cp -p "$dst" "$backup_tmp" || return 97
 			durable_path "$backup_tmp" || return 97
 			mv "$backup_tmp" "$backup" || return 97
-			durable_path "$backup" || return 97
-		else
 			durable_path "$backup" || return 97
 		fi
 	else
@@ -552,6 +584,7 @@ on_signal() {
 }
 
 apply_update() {
+	activation_failure=""
 	managed_by_brew && die "this installation belongs to Homebrew; run: brew upgrade asterism"
 	acquire_artifact_lock
 	load_manifest
@@ -631,6 +664,7 @@ apply_update() {
 	if ! {
 		if [ "$linux_payload" = 1 ]; then
 			place_one cloud-hypervisor "$BIN/.cloud-hypervisor.update.$$" "$BIN/cloud-hypervisor" &&
+			activate_chv_capability &&
 			place_one virtiofsd "$BIN/.virtiofsd.update.$$" "$BIN/virtiofsd" &&
 			place_one astd "$BIN/.astd.update.$$" "$BIN/astd" &&
 			place_one asterism-update "$LIBEXEC/.asterism-update.update.$$" "$LIBEXEC/asterism-update" &&
@@ -647,7 +681,7 @@ apply_update() {
 		"$BIN/ast" __activate-update --build "$build"
 	}; then
 		recover_interrupted force
-		die "the new build did not activate; the previous compatible unit was restored"
+		die "${activation_failure:-the new build did not activate}; the previous compatible unit was restored"
 	fi
 	atomic_record "$TRANSACTION_DIR/phase" committed
 	inject_fault transaction committed

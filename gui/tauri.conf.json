@@ -18,7 +18,7 @@
     "targets": ["app"],
     "category": "DeveloperTool",
     "shortDescription": "Asterism menu bar app",
-    "longDescription": "Menu bar control for Asterism instances: list, start and stop the instances anchored on this device, over the local astd socket.",
+    "longDescription": "Menu bar control for Asterism instances: list, start and stop the instances whose compute is on this device, over the local astd socket.",
     "copyright": "Asterism contributors",
     "icon": [
       "icons/32x32.png",

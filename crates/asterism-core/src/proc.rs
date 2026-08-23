@@ -1143,13 +1143,16 @@ mod tests {
     /// not capture the fixture until the kernel reports both the resolved
     /// shell executable and the instance-owned marker in its argv.
     fn holder(path: &Path) -> (Child, String) {
-        let mut child = Command::new("/bin/sh")
+        // Use the concrete shell binary rather than /bin/sh: on macOS the
+        // latter can hand off to bash after the first process-table sample,
+        // which would correctly look like an executable replacement.
+        let mut child = Command::new("/bin/bash")
             .args(["-c", "while :; do sleep 1; done", "asterism-proc-fixture"])
             .arg(path)
             .spawn()
             .unwrap();
         let pid = child.id();
-        let shell = std::fs::canonicalize("/bin/sh")
+        let shell = std::fs::canonicalize("/bin/bash")
             .expect("the portable shell fixture should resolve its executable");
         let marker = path.to_string_lossy().into_owned();
         let deadline = Instant::now() + Duration::from_secs(5);

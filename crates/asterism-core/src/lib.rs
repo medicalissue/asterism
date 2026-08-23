@@ -1,7 +1,9 @@
 //! Core types for Asterism.
 //!
 //! The orbit is a pool of parts; an instance is a computer assembled from
-//! them. That sentence is the shape of this crate: [`orbit`] is the set of
+//! them. Compute is one placement unit from one orbit device; GPU, storage,
+//! network, and exit points may attach independently. That sentence is the
+//! shape of this crate: [`orbit`] is the set of
 //! devices supplying the pool, [`instance`] is what gets assembled and which
 //! device each of its parts comes from, [`registry`] is the one flat
 //! orbit-wide namespace those instances live in (stored as a shard per

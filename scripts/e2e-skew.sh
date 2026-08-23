@@ -387,10 +387,16 @@ JSON
 cp "$H/state.json" "$H/state.legacy.json"
 
 start_here "$H"
-ASTERISM_HOME="$H" "$AST" ls 2>&1 | grep -q 'dev' \
-  || fail "the migrated row is not in the registry:"$'\n'"$(ASTERISM_HOME="$H" "$AST" ls 2>&1)"
+MIGRATED_LS="$(ASTERISM_HOME="$H" "$AST" ls 2>&1)"
+grep -q 'dev' <<<"$MIGRATED_LS" \
+  || fail "the migrated row is not in the registry:"$'\n'"$MIGRATED_LS"
+if grep -qiE 'anchor|cpu_device|cpu/ram' <<<"$MIGRATED_LS"; then
+  fail "a legacy registry key leaked into ast ls:"$'\n'"$MIGRATED_LS"
+fi
 python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); sys.exit(0 if "version" in s else 1)' \
   "$H/state.json" || fail "the live shard was not rewritten in this build's shape"
+python3 -c 'import json,sys; s=json.load(open(sys.argv[1])); i=s["instances"]["dev"]; sys.exit(0 if "anchor" not in i else 1)' \
+  "$H/state.json" || fail "the migration wrote the legacy placement key back"
 cmp -s "$H/state.json.bak" "$H/state.legacy.json" \
   || fail "the pre-migration shape is not at .bak byte for byte:"$'\n'"$(cat "$H/state.json.bak" 2>/dev/null)"
 ok "an upgraded shard is live in the new shape and the old shape is at .bak"

@@ -36,7 +36,7 @@ if [ -z "${E2E_VOLUME_BACKEND:-}" ]; then
 fi
 BACKEND="$E2E_VOLUME_BACKEND"
 case "$BACKEND" in
-  qemu|vz) ;;
+  qemu|vz|chv) ;;
   *) echo "VOLUME E2E FAIL: unknown backend: $BACKEND" >&2; exit 2 ;;
 esac
 
@@ -61,7 +61,7 @@ else
   SHORT_TMP=/tmp
 fi
 RUN="$SHORT_TMP/ast-vol-$$"
-A="$RUN/a"            # supplies cpu/ram: the guest runs here
+A="$RUN/a"            # supplies compute: the guest runs here
 B="$RUN/b"            # supplies the bytes: the volume lives here
 A_NAME="vol-a-$$"
 B_NAME="vol-b-$$"
@@ -71,18 +71,19 @@ VOL="tank"
 SHARED="$A/host-share"
 SHARED_GUEST="/workspace"
 IMAGE="${E2E_IMAGE:-debian:13}"
+ROOT_DISK_GIB="${E2E_DISK_GIB:-10}"
 # Five GiB leaves room for the filesystem and a real four-GiB payload.  The
 # transfer is intentionally non-sparse and goes through the guest's virtio
 # disk, the consumer bridge, QUIC, NBD, and the provider's raw image.
-VOLUME_GIB=5
+VOLUME_GIB="${E2E_VOLUME_GIB:-5}"
 VOLUME_BYTES=$((VOLUME_GIB * 1024 * 1024 * 1024))
-TRANSFER_BYTES=$((4 * 1024 * 1024 * 1024))
+TRANSFER_BYTES="${E2E_VOLUME_TRANSFER_BYTES:-$((4 * 1024 * 1024 * 1024))}"
 
 # ---- the processes this test starts ----------------------------------------
 #
 # Everything started here writes down its own pid inside its own
-# ASTERISM_HOME: astd in $home/astd.pid, each guest's qemu in
-# $home/instances/<name>/qemu.pid or VZ helper in vz.pid, each storage daemon in
+# ASTERISM_HOME: astd in $home/astd.pid, each guest in its backend-specific
+# $home/instances/<name>/{qemu,vz,chv}.pid, each storage daemon in
 # $home/volumes/<name>/nbd-e<epoch>.pid. Those files are what cleanup acts
 # on, so it can only ever reach a process this run started.
 #
@@ -133,7 +134,8 @@ cleanup() {
   done
   # Then what they left running. Both outlive astd by design.
   for home in "$A" "$B"; do
-    for f in "$home"/instances/*/qemu.pid "$home"/instances/*/vz.pid; do kill_pidfile "$f"; done
+    for f in "$home"/instances/*/qemu.pid "$home"/instances/*/vz.pid \
+      "$home"/instances/*/chv.pid; do kill_pidfile "$f"; done
     for f in "$home"/volumes/*/nbd-e*.pid; do kill_pidfile "$f"; done
     # Covers older backends whose only record was state.json. New VZ helpers
     # were stopped above through their daemon-independent vz.pid.
@@ -377,7 +379,7 @@ ASTERISM_HOME="$A" "$AST" pull "$IMAGE" >/dev/null 2>&1 \
 # block device on both backends.
 expect "create the instance on A ($BACKEND)" "$INST  defined" \
   env ASTERISM_HOME="$A" "$AST" create "$INST" --backend "$BACKEND" --image "$IMAGE" \
-    --mem 2G --disk 10G
+    --mem 2G --disk "${ROOT_DISK_GIB}G"
 
 mkdir -p "$SHARED"
 chmod 0777 "$SHARED"
@@ -410,7 +412,7 @@ grep -qF "the guest gets a plain disk" <<<"$ATTACH" \
 echo "ok: attach records a disk after $ATTEMPT measured attempt(s) and says the guest must format it"
 
 # The lease is on B, taken at attach time, and it names the instance and the
-# device supplying that instance's cpu.
+# device supplying that instance's compute.
 [ "$(holder_now)" = "$INST" ] || fail "B does not think $INST holds the lease"
 E1="$(epoch_now)"
 [ "$E1" = "1" ] || fail "the first lease should be epoch 1, got $E1"
@@ -614,7 +616,7 @@ expect "a second instance exists" "$OTHER  defined" \
 refute "a second instance cannot take a held volume" \
   "volume \"$VOL\" is held by instance \"$INST\"" \
   env ASTERISM_HOME="$A" "$AST" attach "$OTHER" --volume "$VOL"
-refute "and the refusal says which device is writing to it" "cpu/ram on $A_NAME" \
+refute "and the refusal says which device is writing to it" "compute on $A_NAME" \
   env ASTERISM_HOME="$A" "$AST" attach "$OTHER" --volume "$VOL"
 refute "and how to end it" "ast detach $INST --volume $VOL" \
   env ASTERISM_HOME="$A" "$AST" attach "$OTHER" --volume "$VOL"
@@ -706,34 +708,34 @@ expect "detach from the second instance" "$VOL detached" \
 expect "and back to the first" "a disk in the guest" \
   env ASTERISM_HOME="$A" "$AST" attach "$INST" --volume "$B_NAME:$VOL"
 
-# ---- 7b. cpu placement moves while storage ownership does not ---------------
+# ---- 7b. compute placement moves while storage ownership does not -----------
 #
 # The instance is stopped and both device endpoints still carry their paired
-# paths. Move cpu/ram onto the storage owner and back; each boot renews the
-# lease for the new cpu device while the part's owner never changes.
+# paths. Move compute onto the storage owner and back; each boot renews the
+# lease for the new compute device while the part's owner never changes.
 
-ASTERISM_HOME="$A" "$AST" move "$INST" "$B_NAME" >"$RUN/move-to-provider.out" 2>&1 \
-  || fail "moving cpu to the storage provider failed:"$'\n'"$(cat "$RUN/move-to-provider.out")"
+ASTERISM_HOME="$A" "$AST" set "$INST" compute "$B_NAME" >"$RUN/move-to-provider.out" 2>&1 \
+  || fail "moving compute to the storage provider failed:"$'\n'"$(cat "$RUN/move-to-provider.out")"
 expect "the moved instance boots with provider-local storage" "$INST  running" \
   env ASTERISM_HOME="$A" "$AST" up "$INST"
 [ "$(holder_device_now)" = "$B_NAME" ] \
-  || fail "the renewed lease did not follow cpu placement to $B_NAME"
+  || fail "the renewed lease did not follow compute placement to $B_NAME"
 VOLUME_DEV="$(find_volume_device)"
-expect "the volume bytes survive cpu placement on their owner" "$MARKER" \
+expect "the volume bytes survive compute placement on their owner" "$MARKER" \
   in_guest "sudo mkdir -p /data && sudo mount $VOLUME_DEV /data && cat /data/marker"
 
-expect "stop before moving cpu back" "$INST  stopped" \
+expect "stop before moving compute back" "$INST  stopped" \
   env ASTERISM_HOME="$A" "$AST" down "$INST"
-ASTERISM_HOME="$A" "$AST" move "$INST" "$A_NAME" >"$RUN/move-back.out" 2>&1 \
-  || fail "moving cpu back from the provider failed:"$'\n'"$(cat "$RUN/move-back.out")"
+ASTERISM_HOME="$A" "$AST" set "$INST" compute "$A_NAME" >"$RUN/move-back.out" 2>&1 \
+  || fail "moving compute back from the provider failed:"$'\n'"$(cat "$RUN/move-back.out")"
 expect "the instance boots after storage becomes remote again" "$INST  running" \
   env ASTERISM_HOME="$A" "$AST" up "$INST"
 [ "$(holder_device_now)" = "$A_NAME" ] \
-  || fail "the renewed lease did not follow cpu placement back to $A_NAME"
+  || fail "the renewed lease did not follow compute placement back to $A_NAME"
 VOLUME_DEV="$(find_volume_device)"
 expect "the guest still sees one local disk contract after both moves" "$MARKER" \
   in_guest "sudo mkdir -p /data && sudo mount $VOLUME_DEV /data && cat /data/marker"
-echo "ok: cpu moved to the storage owner and back; ownership stayed on B and the guest contract stayed local"
+echo "ok: compute moved to the storage owner and back; ownership stayed on B and the guest contract stayed local"
 
 # ---- 8. the export dies under a running guest, and comes back --------------
 #

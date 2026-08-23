@@ -938,19 +938,12 @@ configure_chv_linux() {
 
 	# The daemon never gets general nbd-client access. It may invoke only this
 	# root-owned argument-checking wrapper, and only without an environment-
-	# supplied command path. One policy is installed for the invoking account.
+	# supplied command path.
 	nbd_helper="${SYSTEM_ROOT}/usr/local/libexec/asterism/asterism-nbd"
 	run_root install -d -m 0755 "$(dirname "$nbd_helper")"
 	run_root install -m 0755 "$nbd_helper_source" "$nbd_helper"
 	nbd_user="$(id -un)"
 	case "$nbd_user" in *[!A-Za-z0-9_.-]*) die "cannot safely write sudoers policy for account ${nbd_user}" ;; esac
-	sudoers="${TMPDIR_SELF}/asterism-nbd.sudoers"
-	printf '%s ALL=(root) NOPASSWD: %s\n' "$nbd_user" "$nbd_helper" >"$sudoers"
-	have visudo || die "visudo is required to validate Asterism's least-privilege NBD policy"
-	run_root visudo -cf "$sudoers"
-	run_root install -d -m 0750 "${SYSTEM_ROOT}/etc/sudoers.d"
-	run_root install -m 0440 "$sudoers" "${SYSTEM_ROOT}/etc/sudoers.d/asterism-nbd-$(id -u)"
-
 	if ! have setcap; then
 		if have apt-get; then
 			run_root apt-get install -y libcap2-bin
@@ -961,6 +954,19 @@ configure_chv_linux() {
 		fi
 	fi
 	run_root setcap cap_net_admin+ep "${PREFIX}/bin/cloud-hypervisor"
+	setcap_bin=$(command -v setcap) || die "setcap disappeared while configuring Cloud Hypervisor"
+	sudoers="${TMPDIR_SELF}/asterism-nbd.sudoers"
+	printf '%s ALL=(root) NOPASSWD: %s\n' "$nbd_user" "$nbd_helper" >"$sudoers"
+	# The updater replaces the CHV inode transactionally, so Linux drops the
+	# file capability with the old inode. Permit only restoring this one
+	# capability on this one installed path; rollback itself restores the old
+	# capable inode from the transaction backup.
+	printf '%s ALL=(root) NOPASSWD: %s cap_net_admin+ep %s\n' \
+		"$nbd_user" "$setcap_bin" "${PREFIX}/bin/cloud-hypervisor" >>"$sudoers"
+	have visudo || die "visudo is required to validate Asterism's least-privilege NBD policy"
+	run_root visudo -cf "$sudoers"
+	run_root install -d -m 0750 "${SYSTEM_ROOT}/etc/sudoers.d"
+	run_root install -m 0440 "$sudoers" "${SYSTEM_ROOT}/etc/sudoers.d/asterism-nbd-$(id -u)"
 	if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
 		err "/dev/kvm is not read-write for this user. Add the user to the kvm group and log in again before starting an instance."
 	fi

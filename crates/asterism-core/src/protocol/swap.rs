@@ -1,4 +1,4 @@
-//! What a cpu-part swap carries, described before any of it moves.
+//! What a compute move carries, described before any of it moves.
 //!
 //! These types are payloads of the `Move*` frames rather than frames
 //! themselves, and they are here rather than beside the enum for the reason
@@ -93,7 +93,7 @@ pub struct MoveFile {
     pub mode: u32,
 }
 
-/// Everything a cpu-part swap will carry, computed on the source device
+/// Everything a compute move will carry, computed on the source device
 /// before any of it moves.
 ///
 /// This doubles as the estimate the roadmap asks for and as the completeness
@@ -227,6 +227,16 @@ mod tests {
         let bare: Request =
             serde_json::from_str(r#"{"cmd":"set_cpu","name":"dev","device":"desktop"}"#).unwrap();
         assert!(matches!(bare, Request::SetCpu { down: false, .. }));
+
+        // The migration alias reads canonical vocabulary while the wire keeps
+        // the older key for peers that have not upgraded yet.
+        let aliased: Request = serde_json::from_str(
+            r#"{"cmd":"set_compute","name":"dev","device":"desktop","down":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(aliased, Request::SetCpu { down: true, .. }));
+        let written = serde_json::to_value(&bare).unwrap();
+        assert_eq!(written["cmd"], "set_cpu", "{written}");
 
         // A fenced instance answers what reads and nothing that writes.
         assert!(Request::Status { name: "dev".into() }.survives_a_move());

@@ -17,6 +17,12 @@ pass=0
 fail() { echo "UPDATE-TEST FAIL: $*" >&2; exit 1; }
 ok() { pass=$((pass + 1)); echo "ok: $*"; }
 sha() { shasum -a 256 "$1" | awk '{print $1}'; }
+mode_of() {
+  stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1"
+}
+inode_of() {
+  stat -f '%i' "$1" 2>/dev/null || stat -c '%i' "$1"
+}
 
 VERIFIER="$WORK/verifier"
 cat >"$VERIFIER" <<'SH'
@@ -24,6 +30,19 @@ cat >"$VERIFIER" <<'SH'
 [ "$(cat "$2")" = valid ] && [ "$3" = test-public-key ]
 SH
 chmod +x "$VERIFIER"
+
+SETCAP="$WORK/setcap"
+cat >"$SETCAP" <<SH
+#!/bin/sh
+[ "\$1" = cap_net_admin+ep ] || exit 93
+printf '%s\n' "\$2" >>"$WORK/setcap-calls"
+[ ! -e "$WORK/setcap-fail" ] || {
+  echo 'injected permanent setcap failure' >&2
+  exit 92
+}
+chmod 0700 "\$2"
+SH
+chmod +x "$SETCAP"
 
 make_program() {
   local path="$1" name="$2" version="$3" build="$4"
@@ -314,12 +333,17 @@ install_linux_old() {
   PREFIX="$WORK/prefix-linux"
   HOME_STATE="$WORK/home-linux"
   rm -rf "$PREFIX" "$HOME_STATE" "$WORK/activations"
+  rm -f "$WORK/setcap-calls" "$WORK/setcap-fail"
   mkdir -p "$PREFIX/bin" "$PREFIX/libexec/asterism"
   make_program "$PREFIX/bin/ast" ast 0.0.1 0.0.1+old
   make_program "$PREFIX/bin/astd" astd 0.0.1 0.0.1+old
   printf '#!/bin/sh\necho "cloud-hypervisor v53.0 old"\n' >"$PREFIX/bin/cloud-hypervisor"
   printf '#!/bin/sh\necho "virtiofsd 1.14.0 old"\n' >"$PREFIX/bin/virtiofsd"
   chmod +x "$PREFIX/bin/cloud-hypervisor" "$PREFIX/bin/virtiofsd"
+  # A distinct executable mode is a portable fixture for inode metadata:
+  # replacing the file drops it, the capability restoration seam reapplies
+  # it, and rollback must recover the old inode with it intact.
+  chmod 0700 "$PREFIX/bin/cloud-hypervisor"
   make_updater "$PREFIX/libexec/asterism/asterism-update"
 }
 
@@ -332,7 +356,22 @@ run_linux_update() {
     ASTERISM_UPDATE_MANIFEST_URL="file://$MANIFEST" \
     ASTERISM_UPDATE_VERIFIER="$VERIFIER" \
     ASTERISM_UPDATE_PUBKEY=test-public-key \
+    ASTERISM_UPDATE_SETCAP="$SETCAP" \
     "$PREFIX/libexec/asterism/asterism-update" "$@"
+}
+
+assert_linux_transaction_clean() {
+  local context="$1" path
+  [ ! -e "$HOME_STATE/update-transaction.claim" ] ||
+    fail "$context: transaction claim remains"
+  [ -z "$(find "$HOME_STATE" -maxdepth 1 -name 'update-transaction.*' -print -quit 2>/dev/null)" ] ||
+    fail "$context: private transaction directory remains"
+  for path in \
+    "$PREFIX/bin/ast" "$PREFIX/bin/astd" "$PREFIX/bin/cloud-hypervisor" \
+    "$PREFIX/bin/virtiofsd" "$PREFIX/libexec/asterism/asterism-update"; do
+    [ ! -e "${path}.previous.update" ] || fail "$context: backup remains for $path"
+    [ ! -e "${path}.previous.update.absent" ] || fail "$context: absence marker remains for $path"
+  done
 }
 
 make_linux_release 0.0.2 0.0.2+new
@@ -343,8 +382,54 @@ run_linux_update apply --yes >"$WORK/linux-applied"
 [ "$(build_of "$PREFIX/bin/astd")" = 0.0.2+new ] || fail "linux astd did not activate"
 [ -x "$PREFIX/bin/cloud-hypervisor" ] || fail "linux update dropped cloud-hypervisor"
 [ -x "$PREFIX/bin/virtiofsd" ] || fail "linux update dropped virtiofsd"
+[ "$(mode_of "$PREFIX/bin/cloud-hypervisor")" = 700 ] ||
+  fail "linux update did not restore cap_net_admin metadata on cloud-hypervisor"
+grep -qxF "$PREFIX/bin/cloud-hypervisor" "$WORK/setcap-calls" ||
+  fail "linux update did not cross the capability restoration seam"
 [ ! -e "$PREFIX/bin/astd-vz" ] || fail "linux update planted a vz helper"
 ok "Linux signed update activates ast, astd, CHV and virtiofsd as one unit"
+
+install_linux_old
+if ASTERISM_UPDATE_FAIL_AFTER=astd run_linux_update apply --yes >"$WORK/linux-cap-rollback" 2>&1; then
+  fail "linux update succeeded after the capability-stage activation fault"
+fi
+[ "$(build_of "$PREFIX/bin/astd")" = 0.0.1+old ] ||
+  fail "linux capability-stage failure did not roll back astd"
+"$PREFIX/bin/cloud-hypervisor" | grep -q 'v53.0 old' ||
+  fail "linux capability-stage failure did not restore the old CHV inode"
+[ "$(mode_of "$PREFIX/bin/cloud-hypervisor")" = 700 ] ||
+  fail "linux rollback did not restore cap_net_admin metadata"
+ok "Linux activation and rollback preserve Cloud Hypervisor capability metadata"
+
+install_linux_old
+old_chv_inode=$(inode_of "$PREFIX/bin/cloud-hypervisor")
+touch "$WORK/setcap-fail"
+if run_linux_update apply --yes >"$WORK/linux-setcap-failure" 2>&1; then
+  fail "linux update succeeded despite permanent setcap failure"
+fi
+grep -q 'could not apply cap_net_admin to the new Cloud Hypervisor' "$WORK/linux-setcap-failure" ||
+  fail "linux update did not surface the original capability failure"
+[ "$(build_of "$PREFIX/bin/ast")" = 0.0.1+old ] ||
+  fail "permanent setcap failure did not preserve old ast"
+[ "$(build_of "$PREFIX/bin/astd")" = 0.0.1+old ] ||
+  fail "permanent setcap failure did not preserve old astd"
+"$PREFIX/bin/cloud-hypervisor" | grep -q 'v53.0 old' ||
+  fail "permanent setcap failure did not restore old Cloud Hypervisor"
+[ "$(inode_of "$PREFIX/bin/cloud-hypervisor")" = "$old_chv_inode" ] ||
+  fail "permanent setcap failure replaced the old Cloud Hypervisor inode"
+[ "$(mode_of "$PREFIX/bin/cloud-hypervisor")" = 700 ] ||
+  fail "permanent setcap failure lost the old Cloud Hypervisor capability metadata"
+assert_linux_transaction_clean "permanent setcap rollback"
+rm -f "$WORK/setcap-fail"
+run_linux_update apply --yes >"$WORK/linux-after-setcap-failure"
+[ "$(build_of "$PREFIX/bin/ast")" = 0.0.2+new ] ||
+  fail "retry after setcap repair did not activate ast"
+[ "$(build_of "$PREFIX/bin/astd")" = 0.0.2+new ] ||
+  fail "retry after setcap repair did not activate astd"
+"$PREFIX/bin/cloud-hypervisor" | grep -qv 'old' ||
+  fail "retry after setcap repair did not activate the new Cloud Hypervisor"
+assert_linux_transaction_clean "retry after setcap repair"
+ok "permanent setcap failure rolls back cleanly and does not wedge the next update"
 
 install_linux_old
 mkdir -p "$PREFIX/share/asterism/artifact.lock"

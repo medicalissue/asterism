@@ -19,8 +19,19 @@ cd "$ROOT"
 harness_begin lifecycle
 harness_binaries "$ROOT"
 
-# Fresh, SHORT home: unix socket paths are capped near 104 bytes.
-export ASTERISM_HOME="/private/tmp/ast-e2e-$$"
+# Fresh, SHORT home: unix socket paths are capped near 104 bytes. A hosted
+# exact-artifact gate may name its owned home explicitly so the pull, create
+# and boot all consume one target-bound store. macOS has /private/tmp;
+# Linux's equivalent is /tmp.
+if [ -n "${E2E_HOME:-}" ]; then
+  export ASTERISM_HOME="$E2E_HOME"
+elif [ -d /private/tmp ] && [ -w /private/tmp ]; then
+  SHORT_TMP=/private/tmp
+  export ASTERISM_HOME="$SHORT_TMP/ast-e2e-$$"
+else
+  SHORT_TMP=/tmp
+  export ASTERISM_HOME="$SHORT_TMP/ast-e2e-$$"
+fi
 harness_own_home "$ASTERISM_HOME"
 
 # A single-device test has no orbit, so it has no business publishing a
@@ -28,6 +39,7 @@ harness_own_home "$ASTERISM_HOME"
 export ASTERISM_MESH=local
 IMAGE="${E2E_IMAGE:-debian:13}"
 BACKEND="${E2E_BACKEND:-qemu}"
+DISK_GIB="${E2E_DISK_GIB:-10}"
 INST=e2e
 VOL="$ASTERISM_HOME/e2e-vol"   # dash on purpose: covers systemd \x2d escaping
 MARKER="marker-$$"
@@ -56,6 +68,10 @@ echo "$MARKER" > "$VOL/MARKER.txt"
 harness_seed_images "$ASTERISM_HOME"
 
 fail() { echo "E2E FAIL: $*" >&2; exit 1; }
+case "$BACKEND" in
+  qemu|chv) ;;
+  *) fail "unsupported lifecycle backend: $BACKEND" ;;
+esac
 
 # expect <desc> <needle> <cmd...>: run cmd, require success AND the needle
 # in its combined output.
@@ -67,13 +83,64 @@ expect() {
   echo "ok: $desc"
 }
 
+# CHV direct-boots disk images with Asterism's separately pinned kernel. A
+# catalog disk pull intentionally fetches only that disk, while an OCI pull
+# also fills the kernel/initrd/module cache. Prime it explicitly for the CHV
+# lane; the QEMU default remains unchanged.
+if [ "$BACKEND" = chv ]; then
+  harness_cache_image "$AST" "${E2E_KERNEL_IMAGE:-busybox:musl}" \
+    || fail "could not cache the pinned CHV guest kernel payload"
+fi
+
 # The image comes from the harness cache, filled once by the binary under
 # test if it is not there yet, so only a first run downloads anything. The
 # pull afterwards is what registers the copied file in this home's store; it
 # has nothing left to fetch.
 harness_cache_image "$AST" "$IMAGE" || fail "could not cache $IMAGE"
 harness_seed_images "$ASTERISM_HOME"
+if [ "$BACKEND" = chv ]; then
+  KERNEL_DIR="$ASTERISM_HOME/images/kernel"
+  for payload in "$KERNEL_DIR"/*-vmlinuz "$KERNEL_DIR"/*-initrd \
+    "$KERNEL_DIR"/*-virtiofs.ko; do
+    [ -f "$payload" ] || fail "pinned CHV boot payload is missing: $payload"
+    if [ -n "${ASTERISM_TEST_ARTIFACTS:-}" ]; then
+      printf 'boot_payload_sha256[%s]=%s\n' "$(basename "$payload")" \
+        "$(sha256sum "$payload" | awk '{print $1}')" \
+        >>"$ASTERISM_TEST_ARTIFACTS/summary.txt"
+    fi
+  done
+fi
 "$AST" pull "$IMAGE" >/dev/null 2>&1 || fail "pull $IMAGE"
+if [ "$BACKEND" = chv ] && [ -n "${ASTERISM_TEST_ARTIFACTS:-}" ] \
+  && [ -n "${E2E_BOOT_IMAGE_BASENAME:-}" ]; then
+  case "$E2E_BOOT_IMAGE_BASENAME" in
+    *[!A-Za-z0-9._-]* | *..*) fail "invalid boot image basename" ;;
+  esac
+  IMAGE_PATH=
+  for candidate in "$ASTERISM_HOME/images/$E2E_BOOT_IMAGE_BASENAME.raw" \
+    "$ASTERISM_HOME/images/$E2E_BOOT_IMAGE_BASENAME.qcow2"; do
+    [ -f "$candidate" ] || continue
+    [ -z "$IMAGE_PATH" ] \
+      || fail "pull $IMAGE left more than one active catalog artifact"
+    IMAGE_PATH="$candidate"
+  done
+  [ -n "$IMAGE_PATH" ] || fail "pull $IMAGE left no active catalog artifact"
+  IMAGE_PROVENANCE="$IMAGE_PATH.provenance"
+  [ -f "$IMAGE_PROVENANCE" ] \
+    || fail "pull $IMAGE left no provenance for $IMAGE_PATH"
+  {
+    printf 'boot_image=%s\n' "$IMAGE"
+    printf 'boot_image_file=%s\n' "$(basename "$IMAGE_PATH")"
+    printf 'boot_image_provenance_sha256=%s\n' \
+      "$(sha256sum "$IMAGE_PROVENANCE" | awk '{print $1}')"
+    sed -n \
+      -e 's/^content /boot_image_content=/' \
+      -e 's/^size /boot_image_size=/' \
+      -e 's/^source /boot_image_source=/' \
+      -e 's/^derived-from /boot_image_derived_from=/' \
+      "$IMAGE_PROVENANCE"
+  } >>"$ASTERISM_TEST_ARTIFACTS/summary.txt"
+fi
 
 # The backend is named, not left to the daemon.
 #
@@ -81,16 +148,48 @@ harness_seed_images "$ASTERISM_HOME"
 # no-QEMU evidence sets E2E_BACKEND=chv and exercises the same lifecycle over
 # Cloud Hypervisor/virtiofs.
 expect "create"  "$INST  defined"  \
-  "$AST" create "$INST" --backend "$BACKEND" --image "$IMAGE" --mem 2G --disk 10G
+  "$AST" create "$INST" --backend "$BACKEND" --image "$IMAGE" --mem 2G \
+    --disk "${DISK_GIB}G"
 expect "attach"  "/mnt/ast/e2e-vol" "$AST" attach "$INST" --volume "$VOL"
 expect "up"      "$INST  running"  "$AST" up "$INST"
 
-# And what it actually booted on, asserted rather than assumed: the explicit
-# backend is a request, and this is the line that catches a daemon that honours
+# And what it actually booted on, asserted rather than assumed: `--backend
+# backend` is a request, and this is the line that catches a daemon that honours
 # it in its output and not in the guest.
 harness_assert_backend "$AST" "$INST" "$BACKEND" \
   || fail "the marker below would be proving something about a different backend"
-echo "ok: the guest is on $BACKEND, exercising its directory transport"
+echo "ok: the guest is on $BACKEND"
+
+if [ "$BACKEND" = chv ]; then
+  STATUS="$($AST status "$INST" 2>&1)"
+  VMM_PID="$(sed -n 's/^running: chv pid \([0-9][0-9]*\),.*/\1/p' <<<"$STATUS")"
+  [ -n "$VMM_PID" ] || fail "CHV status did not name its VMM pid:"$'\n'"$STATUS"
+  EXPECTED_CHV="$(readlink -f "$(dirname "$ASTD")/cloud-hypervisor")"
+  # The shipped helper carries file capabilities on Linux.  The kernel may
+  # therefore deny readlink(2) on /proc/<pid>/exe even to the same uid after
+  # exec; the backend uses the NUL-terminated argv[0] for the same reason.
+  VMM_ARGV0="$(tr '\0' '\n' <"/proc/$VMM_PID/cmdline" | sed -n '1p')"
+  [ "$VMM_ARGV0" = "$EXPECTED_CHV" ] \
+    || fail "CHV pid $VMM_PID argv[0] is $VMM_ARGV0, not shipped $EXPECTED_CHV"
+  [ -s "$ASTERISM_HOME/instances/$INST/virtiofs-0.resource.json" ] \
+    || fail "CHV boot did not retain precise virtiofsd ownership"
+  if pgrep -f '(^|/)qemu-system-[^ ]*' >/dev/null 2>&1; then
+    fail "a qemu-system process exists during the CHV lifecycle"
+  fi
+  echo "ok: CHV pid $VMM_PID is the shipped helper; virtiofsd ownership is durable; no qemu-system exists"
+  GUEST_KERNEL="$($AST ssh "$INST" -- "uname -r")" \
+    || fail "could not read the direct-boot guest kernel release"
+  GUEST_VIRTIOFS="$($AST ssh "$INST" -- \
+    "grep -qw virtiofs /proc/filesystems && echo loaded")" \
+    || fail "the pinned virtiofs module is not loaded in the guest"
+  [ "$GUEST_VIRTIOFS" = loaded ] \
+    || fail "unexpected guest virtiofs state: $GUEST_VIRTIOFS"
+  if [ -n "${ASTERISM_TEST_ARTIFACTS:-}" ]; then
+    printf 'guest_kernel_release=%s\nguest_virtiofs_module=%s\n' \
+      "$GUEST_KERNEL" "$GUEST_VIRTIOFS" \
+      >>"$ASTERISM_TEST_ARTIFACTS/summary.txt"
+  fi
+fi
 
 # First boot: sshd can come up before cloud-init has mounted the volumes,
 # so give the marker a bounded retry instead of failing on the race.

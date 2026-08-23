@@ -1,16 +1,17 @@
-//! Swapping an instance's cpu part onto another device — the offline
+//! Moving an instance's compute onto another device — the offline
 //! migration of `docs/ROADMAP.md` Phase 6, in the vocabulary of
 //! `docs/MODEL.md`.
 //!
-//! An instance is a computer assembled from a pool of parts, and cpu/ram is
-//! one part of it. Which device supplies that part is a mutable attribute of
-//! the instance, not a relationship the device has to it, so
-//! `ast set dev cpu desktop` changes one line of a parts table. The
+//! An instance is a computer assembled from a pool of parts, and compute is
+//! one placement unit: CPU, physical RAM, and VM/container execution state.
+//! Which device supplies that unit is a mutable attribute of the instance,
+//! not a relationship the device has to it, so `ast set dev compute desktop`
+//! changes one line of a parts table. The
 //! instance's identity — its name, its id, its snapshots — is orbit-global
 //! and does not move, because it was never on a device to begin with.
 //!
 //! What *does* move is bytes. The disk defaults to the device supplying
-//! cpu/ram and follows it, one copy and one writer throughout.
+//! compute and follows it, one copy and one writer throughout.
 //!
 //! # What crosses the wire
 //!
@@ -51,7 +52,7 @@
 //! 3. **Commit, target.** The target checks what arrived against the manifest
 //!    — every file's length, every file's allocated byte count — renames the
 //!    staging directory into place and writes its shard row with itself
-//!    supplying cpu, at the new epoch. Only now does a second copy exist, and
+//!    supplying compute, at the new epoch. Only now does a second copy exist, and
 //!    the source's is already fenced.
 //! 4. **Commit, source.** The source drops its row and its bytes, and leaves
 //!    a note so that asking it directly gets "moved to desktop" rather than
@@ -944,7 +945,7 @@ pub fn moved_note(name: &str) -> Option<String> {
         return None;
     }
     Some(format!(
-        "instance {name:?} moved to {} — its cpu is sourced there now, and \
+        "instance {name:?} moved to {} — its compute is sourced there now, and \
          `ast status {name}` from anywhere in this orbit will find it",
         note.to_device
     ))
@@ -952,7 +953,7 @@ pub fn moved_note(name: &str) -> Option<String> {
 
 // ---- the orchestrator ------------------------------------------------------
 
-/// `ast set <instance> cpu <device>`, driven from the daemon in front of the
+/// `ast set <instance> compute <device>`, driven from the daemon in front of the
 /// user.
 ///
 /// This daemon is neither end of the transfer unless it happens to be: the
@@ -977,7 +978,7 @@ pub async fn run(
     let here = node.device_name().await;
     let source = locate(name, node, mesh).await?;
     if source == device {
-        bail!("instance {name:?} already sources its cpu and ram from {device}");
+        bail!("instance {name:?} already sources its compute from {device}");
     }
     // Refuse a device nobody has heard of, and one that is not answering,
     // before anything has been fenced. A device does not list itself among
@@ -989,7 +990,7 @@ pub async fn run(
         if !mesh.online(device).await {
             bail!(
                 "device {device} is not answering, so it cannot take {name:?} — the move \
-                 has not started and {source} still supplies its cpu"
+                 has not started and {source} still supplies its compute"
             );
         }
     }
@@ -998,7 +999,7 @@ pub async fn run(
     if manifest.instance.status == Status::Running {
         if !down {
             bail!(
-                "instance {name:?} is running on {source}. Moving cpu/ram is an offline \
+                "instance {name:?} is running on {source}. Moving compute is an offline \
                  operation on every backend Asterism has — pass --down to shut the guest \
                  down first"
             );
@@ -1118,7 +1119,7 @@ pub async fn run(
         )
         .await;
         io.send(&line(format!(
-            "the move did not happen — {source} still supplies {name}'s cpu"
+            "the move did not happen — {source} still supplies {name}'s compute"
         )))
         .await?;
         return Err(e);
@@ -1126,7 +1127,7 @@ pub async fn run(
 
     io.send(&Response::Move {
         text: format!(
-            "{name}: cpu/ram now sourced from {device} (move epoch {epoch}) — \
+            "{name}: compute now sourced from {device} (move epoch {epoch}) — \
              `ast up {name}` boots it there"
         ),
         done: true,
@@ -1225,8 +1226,8 @@ async fn offer_of(name: &str, source: &str, node: &Node, mesh: &Arc<Mesh>) -> Re
 
 /// One frame, aimed at one device — this one included.
 ///
-/// The local short-circuit is not an optimisation: `ast move dev desktop`
-/// typed on the device that currently supplies `dev`'s cpu must reach its own
+/// The local short-circuit is not an optimisation: `ast set dev compute desktop`
+/// typed on the device that currently supplies `dev`'s compute must reach its own
 /// shard, and putting that through the mesh would mean dialling ourselves.
 pub(crate) async fn ask(
     device: &str,
@@ -1409,7 +1410,7 @@ mod tests {
         ] {
             assert!(is_step(&req), "{req:?}");
         }
-        // `set cpu` is the move, not a step of it: it reports as it goes, on
+        // `set compute` is the move, not a step of it: it reports as it goes, on
         // the connection that asked, and a shard has nowhere to send that.
         assert!(!is_step(&Request::SetCpu {
             name: "dev".into(),
