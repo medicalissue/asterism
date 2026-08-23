@@ -10,6 +10,7 @@
 #[cfg(any(test, target_os = "linux"))]
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+#[cfg(any(test, not(windows)))]
 use std::process::Command;
 
 use anyhow::{bail, Result};

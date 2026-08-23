@@ -908,7 +908,9 @@ mod imp_sleep {
 /// implementation. Secret bytes never enter `$ASTERISM_HOME`.
 pub mod cred {
     use super::CRED_SERVICE;
-    use anyhow::{bail, Result};
+    #[cfg(not(windows))]
+    use anyhow::bail;
+    use anyhow::Result;
 
     pub fn put(target: &str, value: &[u8]) -> Result<()> {
         #[cfg(windows)]
@@ -1283,7 +1285,10 @@ mod scm {
     }
 
     static WORKER: Mutex<Option<Box<dyn FnOnce() -> Result<()> + Send>>> = Mutex::new(None);
-    static STATUS: Mutex<Option<Handle>> = Mutex::new(None);
+    // Raw Win32 handles are process-local opaque values. Store the value as
+    // an integer so the synchronized static does not claim the pointee itself
+    // crosses threads; it is cast back only at the FFI call boundary.
+    static STATUS: Mutex<Option<usize>> = Mutex::new(None);
     static NAME: Mutex<Option<Vec<u16>>> = Mutex::new(None);
 
     fn wide(s: &str) -> Vec<u16> {
@@ -1317,7 +1322,7 @@ mod scm {
 
     fn set_state(state: Dword, accept_stop: bool) {
         let handle = match *STATUS.lock().unwrap() {
-            Some(h) => h,
+            Some(h) => h as Handle,
             None => return,
         };
         let mut status = ServiceStatus {
@@ -1354,7 +1359,7 @@ mod scm {
         if handle.is_null() {
             return;
         }
-        *STATUS.lock().unwrap() = Some(handle);
+        *STATUS.lock().unwrap() = Some(handle as usize);
         set_state(SERVICE_START_PENDING, false);
         set_state(SERVICE_RUNNING, true);
         let worker = WORKER.lock().unwrap().take();

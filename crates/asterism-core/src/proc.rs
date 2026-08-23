@@ -462,20 +462,20 @@ impl ProcId {
                 }
                 bail!("sending {sig} to pid {}: {err}", self.pid);
             }
-        }
-        // The window this closes is not the one it opens: if the identity
-        // changed between the check and the kill, the signal has already
-        // gone. Saying so turns an invisible misfire into something a human
-        // can find in the log.
-        if let Ownership::Foreign(why) = self.check() {
-            if sig == Signal::Kill {
-                eprintln!(
-                    "astd: {sig} to pid {} may have reached another process — {why}",
-                    self.pid
-                );
+            // The window this closes is not the one it opens: if the identity
+            // changed between the check and the kill, the signal has already
+            // gone. Saying so turns an invisible misfire into something a human
+            // can find in the log.
+            if let Ownership::Foreign(why) = self.check() {
+                if sig == Signal::Kill {
+                    eprintln!(
+                        "astd: {sig} to pid {} may have reached another process — {why}",
+                        self.pid
+                    );
+                }
             }
+            Ok(true)
         }
-        Ok(true)
     }
 
     /// Poll until this process is gone, or the budget runs out.
