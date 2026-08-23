@@ -1664,15 +1664,25 @@ fn attach_nbd(
         None => free_nbd_device_from(preferred_nbd_index(dir, index))?,
     };
     attach_nbd_at(
-        dir,
-        index,
-        readonly,
-        device,
-        source,
+        NbdAttachIntent {
+            dir,
+            index,
+            readonly,
+            device,
+            source,
+        },
         args_for,
         run_nbd_client,
         nbd_kernel_pid,
     )
+}
+
+struct NbdAttachIntent<'a> {
+    dir: &'a Path,
+    index: usize,
+    readonly: bool,
+    device: PathBuf,
+    source: &'a str,
 }
 
 /// Claiming and owner capture happen inside the root-only helper. The durable
@@ -1681,15 +1691,18 @@ fn attach_nbd(
 /// kernel accepted an attach, so the pre-attach intent makes that ambiguous
 /// side effect retryable during cleanup.
 fn attach_nbd_at(
-    dir: &Path,
-    index: usize,
-    readonly: bool,
-    device: PathBuf,
-    source: &str,
+    intent: NbdAttachIntent<'_>,
     args_for: impl FnOnce(&Path) -> Result<Vec<String>>,
     run: impl FnOnce(&[String]) -> Result<()>,
     kernel_pid: impl Fn(&Path) -> Option<String>,
 ) -> Result<PathBuf> {
+    let NbdAttachIntent {
+        dir,
+        index,
+        readonly,
+        device,
+        source,
+    } = intent;
     let mut args = args_for(&device)?;
     if readonly {
         args.push("-readonly".to_owned());
@@ -1885,10 +1898,8 @@ fn ensure_recovered_resources(req: &BootReq, deterministic_nbd: bool) -> Result<
         .extra_disks
         .iter()
         .enumerate()
-        .filter_map(|(index, disk)| {
-            matches!(disk, DiskSpec::Nbd { .. } | DiskSpec::NbdUnix { .. })
-                .then(|| remote_disk_identity(disk).map(|source| (index, source)))
-        })
+        .filter(|(_, disk)| matches!(disk, DiskSpec::Nbd { .. } | DiskSpec::NbdUnix { .. }))
+        .map(|(index, disk)| remote_disk_identity(disk).map(|source| (index, source)))
         .collect::<Result<_>>()?;
 
     let mut recorded_virtiofs = std::collections::BTreeSet::new();
@@ -2530,11 +2541,13 @@ mod tests {
         let device = PathBuf::from("/dev/nbd7");
 
         let error = attach_nbd_at(
-            dir.path(),
-            0,
-            false,
-            device.clone(),
-            "test-source",
+            NbdAttachIntent {
+                dir: dir.path(),
+                index: 0,
+                readonly: false,
+                device: device.clone(),
+                source: "test-source",
+            },
             |_| Ok(vec!["attach".to_owned()]),
             |_| {
                 let claimed = read_nbd_record(&record_path).unwrap();
@@ -2995,7 +3008,7 @@ mod tests {
             },
         )
         .unwrap();
-        if preferred != PathBuf::from("/dev/nbd63") {
+        if preferred != Path::new("/dev/nbd63") {
             let error = ensure_migration_resources_portable(&instance)
                 .unwrap_err()
                 .to_string();
