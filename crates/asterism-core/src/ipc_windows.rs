@@ -184,6 +184,6 @@ pub fn same_user(_ignored: u64) -> Result<u32> {
     Ok(own_uid())
 }
 
-pub fn admit_peer(_stream: &Stream) -> Result<u32> {
+pub fn admit_peer<T>(_stream: &T) -> Result<u32> {
     Ok(own_uid())
 }

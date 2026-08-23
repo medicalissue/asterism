@@ -3784,7 +3784,7 @@ fn print_version() -> Result<()> {
 /// report should do: "is astd running" is one of the facts being collected,
 /// and collecting it must not change it.
 fn running_daemon() -> Option<(String, Option<String>)> {
-    let stream = ipc::connect(paths::socket_path()).ok()?;
+    let stream = ipc::connect(&paths::socket_path()).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
     let mut writer = stream.try_clone().ok()?;
     // Serialized from the type rather than written out by hand: the wire
@@ -3819,7 +3819,7 @@ fn running_daemon() -> Option<(String, Option<String>)> {
 /// `Client::open`: a bug report observes whether a daemon exists and must not
 /// make one exist while collecting that answer.
 fn send_to_running(request: &Request) -> Option<Response> {
-    let mut stream = ipc::connect(paths::socket_path()).ok()?;
+    let mut stream = ipc::connect(&paths::socket_path()).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
     stream
         .set_write_timeout(Some(Duration::from_secs(3)))
@@ -4409,7 +4409,7 @@ fn update_command(cmd: UpdateCommand) -> Result<()> {
 /// evidence, which is the same live-guest-preserving replacement exercised by
 /// the version-skew suite.
 fn activate_update(want_build: &str) -> Result<()> {
-    if ipc::connect(paths::socket_path()).is_ok() {
+    if ipc::connect(&paths::socket_path()).is_ok() {
         retire_stale_daemon()?;
     } else {
         spawn_daemon()?;

@@ -19,6 +19,7 @@ use asterism_core::hv::{
     BootReq, Caps, ControlChannel, DiskFormat, DiskSpec, GuestEndpoint, Handle, Hypervisor,
     Prepared, Ready, RunState, SnapshotId,
 };
+use asterism_core::instance::Instance;
 use asterism_core::snapshot::{self, Snapshot};
 use asterism_core::{paths, tools};
 use asterism_hyperv::{
