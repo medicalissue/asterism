@@ -192,9 +192,59 @@ if command -v pwsh >/dev/null 2>&1; then
 		|| fail "install.ps1 parse"
 	pwsh -NoProfile -Command "& { \$null = [System.Management.Automation.Language.Parser]::ParseFile('${ROOT}/packaging/update.ps1', [ref]\$null, [ref]\$errs); if (\$errs) { \$errs | ForEach-Object { \$_.ToString() }; exit 1 } }" \
 		|| fail "update.ps1 parse"
-	ok "install.ps1 and update.ps1 parse"
+	pwsh -NoProfile -Command "& { \$null = [System.Management.Automation.Language.Parser]::ParseFile('${ROOT}/scripts/windows-host-fixtures.ps1', [ref]\$null, [ref]\$errs); if (\$errs) { \$errs | ForEach-Object { \$_.ToString() }; exit 1 } }" \
+		|| fail "windows-host-fixtures.ps1 parse"
+	ok "install.ps1, update.ps1 and windows-host-fixtures.ps1 parse"
+	pwsh -NoProfile -File "${ROOT}/scripts/windows-host-fixtures.ps1" \
+		|| fail "windows-host-fixtures.ps1"
+	ok "privilege, rollback, stop, helper probe and firewall fixtures"
 else
 	ok "install.ps1 parse skipped (no pwsh on this host)"
 fi
+
+# Helper Probe fixture speaks the protocol without Hyper-V.
+PROBE="${ROOT}/scripts/fixtures/windows-host/probe-helper"
+chmod +x "$PROBE"
+reply="$(printf '%s\n' '{"op":"probe"}' | "$PROBE")"
+printf '%s' "$reply" | grep -q '"result":"ready"' || fail "probe-helper did not speak Ready"
+printf '%s' "$reply" | grep -q '"protocol":1' || fail "probe-helper protocol is not 1"
+ok "helper probe fixture answers Probe"
+
+# Firewall fixture contains a Hyper-V decoy and the exact Asterism rule.
+DUMP="${ROOT}/scripts/fixtures/windows-host/firewall-show-rule.txt"
+grep -q 'Rule Name:                            Hyper-V' "$DUMP" || fail "firewall fixture missing Hyper-V decoy"
+grep -q 'Asterism device daemon' "$DUMP" || fail "firewall fixture missing Asterism rule"
+grep -q 'Program Files\\Asterism\\bin\\astd.exe' "$DUMP" || fail "firewall fixture program does not match created rule"
+ok "firewall fixture distinguishes Hyper-V substring from the Asterism rule"
+
+# Privilege: a user-writable ImagePath is not a LocalSystem service.
+grep -q 'refusing to install' "${ROOT}/crates/asterism-core/src/windows_host.rs" \
+	|| fail "privilege boundary missing from sc_create_args"
+ok "privilege boundary is in source"
+
+# Transactional update rollback (source fixture; same layout as update.ps1 / rust).
+TX="${WORK}/update-tx"
+mkdir -p "${TX}/bin" "${TX}/state/update-backup"
+printf 'old-ast\n' >"${TX}/bin/ast.exe"
+printf 'old-astd\n' >"${TX}/bin/astd.exe"
+printf 'owner=1\nid=tx-1\nphase=claimed\n' >"${TX}/state/update-transaction.claim"
+if [ -e "${TX}/state/update-transaction.claim.new" ]; then
+	fail "claim file already split"
+fi
+# Exclusive create of a second claim must fail.
+if (set -o noclobber; echo 'owner=2' >"${TX}/state/update-transaction.claim") 2>/dev/null; then
+	fail "a second updater stole the claim"
+fi
+cp "${TX}/bin/ast.exe" "${TX}/state/update-backup/ast.exe"
+cp "${TX}/bin/astd.exe" "${TX}/state/update-backup/astd.exe"
+printf 'broken\n' >"${TX}/bin/ast.exe"
+printf 'broken\n' >"${TX}/bin/astd.exe"
+cp "${TX}/state/update-backup/ast.exe" "${TX}/bin/ast.exe"
+cp "${TX}/state/update-backup/astd.exe" "${TX}/bin/astd.exe"
+grep -q '^old-ast$' "${TX}/bin/ast.exe" || fail "rollback did not restore ast.exe"
+grep -q '^old-astd$' "${TX}/bin/astd.exe" || fail "rollback did not restore astd.exe"
+rm -f "${TX}/state/update-transaction.claim"
+[ ! -e "${TX}/state/update-transaction.claim" ] || fail "claim survived rollback"
+ok "update claim, backup and rollback restore the previous unit"
 
 echo "WINDOWS-HOST-TEST GREEN (${pass} checks)"

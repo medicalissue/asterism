@@ -342,7 +342,8 @@ fn print_early_exit() -> bool {
                  Usage: astd\n\n\
                  Options:\n\
                    --help     Print help\n\
-                   --version  Print version"
+                   --version  Print version\n\
+                   --service  Windows Service dispatcher (SCM ImagePath)"
             );
             true
         }
@@ -470,9 +471,19 @@ impl Stop {
         }
     }
 
-    /// Wait for either. A signal this process could not register for never
-    /// arrives here, which is correct: it was never ours to catch.
+    /// Wait for a unix signal or the SCM stop latch. The latch is what
+    /// `astd --service` actually shuts down on: a flag nobody waits on
+    /// leaves SCM STOP as TerminateProcess.
     async fn next(&mut self) {
+        tokio::select! {
+            _ = self.unix_signal() => {}
+            _ = tokio::task::spawn_blocking(asterism_core::windows_host::wait_service_stop) => {}
+        }
+    }
+
+    /// Wait for either unix signal. A signal this process could not register
+    /// for never arrives here, which is correct: it was never ours to catch.
+    async fn unix_signal(&mut self) {
         match (&mut self.term, &mut self.int) {
             (Some(term), Some(int)) => {
                 tokio::select! {

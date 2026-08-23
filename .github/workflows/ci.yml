@@ -238,7 +238,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          foreach ($file in @('packaging/install.ps1', 'packaging/update.ps1')) {
+          foreach ($file in @('packaging/install.ps1', 'packaging/update.ps1', 'scripts/windows-host-fixtures.ps1')) {
             $errs = $null
             [void][System.Management.Automation.Language.Parser]::ParseFile((Join-Path $pwd $file), [ref]$null, [ref]$errs)
             if ($errs) {
@@ -246,6 +246,10 @@ jobs:
               throw "$file parse failed"
             }
           }
+
+      - name: Privilege, rollback, stop, helper probe and firewall fixtures
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/windows-host-fixtures.ps1
 
       - name: Authenticode-ready signing recipe is present
         shell: bash
