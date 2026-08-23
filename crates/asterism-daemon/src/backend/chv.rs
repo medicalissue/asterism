@@ -264,18 +264,20 @@ impl Chv {
     }
 }
 
-/// Cloud-init's earliest stage loads the modules that make its own guest
-/// agent reachable. CHV direct-boots Asterism's pinned Ubuntu kernel even
-/// when the root disk is Debian, so loading from the root's `/lib/modules`
-/// would mix kernel releases. These bytes came from the package pinned next
-/// to that kernel and are folded into the seed fingerprint verbatim.
+/// Cloud-init's earliest stage installs and loads the modules that make its
+/// own guest agent and shared directories reachable. CHV direct-boots
+/// Asterism's pinned Ubuntu kernel even when the root disk is Debian, so the
+/// root's original `/lib/modules` cannot supply them. The modules are kept in
+/// that kernel release's `updates` directory and registered with depmod: the
+/// first boot loads them here, and later boots load them from
+/// `systemd-modules-load` before an enabled mount unit is attempted.
 fn direct_boot_module_config(modules: &[oci::KernelModule]) -> String {
     let mut out = String::from(
-        "bootcmd:\n - |\n   # Asterism: load modules paired with the direct-boot kernel.\n   (\n   set -e\n   umask 077\n",
+        "bootcmd:\n - |\n   # Asterism: install modules paired with the direct-boot kernel.\n   (\n   set -e\n   umask 077\n   release=$(uname -r)\n   module_dir=/lib/modules/$release/updates/asterism\n   mkdir -p \"$module_dir\" /etc/modules-load.d\n",
     );
     for module in modules {
         out.push_str(&format!(
-            "   base64 -d > /run/asterism-{}.ko <<'ASTERISM_MODULE_{}'\n",
+            "   base64 -d > \"$module_dir/{}.ko\" <<'ASTERISM_MODULE_{}'\n",
             module.name,
             module.name.to_ascii_uppercase()
         ));
@@ -290,13 +292,20 @@ fn direct_boot_module_config(modules: &[oci::KernelModule]) -> String {
             module.name.to_ascii_uppercase()
         ));
     }
+    out.push_str("   cat > /etc/modules-load.d/asterism-direct.conf <<'ASTERISM_DIRECT_MODULES'\n");
+    for module in modules {
+        out.push_str("   ");
+        out.push_str(module.name);
+        out.push('\n');
+    }
+    out.push_str("   ASTERISM_DIRECT_MODULES\n   depmod -a \"$release\"\n");
     for module in modules {
         out.push_str(&format!(
-            "   [ -d /sys/module/{0} ] || insmod /run/asterism-{0}.ko\n",
+            "   [ -d /sys/module/{0} ] || modprobe {0}\n",
             module.name
         ));
     }
-    out.push_str("   rm -f /run/asterism-*.ko\n   ) || echo 'asterism: the direct-boot kernel modules could not be loaded' >&2\n");
+    out.push_str("   sync\n   ) || echo 'asterism: the direct-boot kernel modules could not be installed' >&2\n");
     out
 }
 
@@ -2546,16 +2555,25 @@ mod tests {
         config.push_str(" - |\n   echo agent-ready\n");
         asterism_core::seed::mergeable(&config).expect("the seed can carry module payloads");
 
-        let virtiofs = config.find("insmod /run/asterism-virtiofs.ko").unwrap();
-        let core = config.find("insmod /run/asterism-vsock.ko").unwrap();
+        let virtiofs = config.find("modprobe virtiofs\n").unwrap();
+        let core = config.find("modprobe vsock\n").unwrap();
         let common = config
-            .find("insmod /run/asterism-vmw_vsock_virtio_transport_common.ko")
+            .find("modprobe vmw_vsock_virtio_transport_common\n")
             .unwrap();
         let transport = config
-            .find("insmod /run/asterism-vmw_vsock_virtio_transport.ko")
+            .find("modprobe vmw_vsock_virtio_transport\n")
             .unwrap();
         let agent = config.find("agent-ready").unwrap();
         assert!(virtiofs < core && core < common && common < transport && transport < agent);
+        assert!(
+            config.contains("/etc/modules-load.d/asterism-direct.conf"),
+            "the next boot needs systemd-modules-load before enabled mounts: {config}"
+        );
+        assert!(
+            config.contains("/lib/modules/$release/updates/asterism"),
+            "the module cannot disappear with /run after first boot: {config}"
+        );
+        assert!(config.contains("depmod -a \"$release\""), "{config}");
         assert_eq!(config.matches("bootcmd:").count(), 1);
     }
 
