@@ -97,6 +97,7 @@ chmod 0777 "$FAIL_RUN/share"
 printf '#!/bin/sh\nif [ "${1-}" = --version ]; then echo "cloud-hypervisor v53.0"; exit 0; fi\nexit 86\n' >"$BAD_CHV"
 chmod 0755 "$BAD_CHV"
 harness_own_home "$FAIL_HOME"
+harness_seed_images "$FAIL_HOME"
 
 ASTERISM_HOME="$FAIL_HOME" ASTERISM_MESH=local \
 ASTERISM_CLOUD_HYPERVISOR="$BAD_CHV" ASTERISM_VIRTIOFSD="$VIRTIOFSD" \

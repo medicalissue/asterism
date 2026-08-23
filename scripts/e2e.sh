@@ -78,6 +78,15 @@ expect() {
   echo "ok: $desc"
 }
 
+# CHV direct-boots disk images with Asterism's separately pinned kernel. A
+# catalog disk pull intentionally fetches only that disk, while an OCI pull
+# also fills the kernel/initrd/module cache. Prime it explicitly for the CHV
+# lane; the QEMU default remains unchanged.
+if [ "$BACKEND" = chv ]; then
+  harness_cache_image "$AST" "${E2E_KERNEL_IMAGE:-busybox:musl}" \
+    || fail "could not cache the pinned CHV guest kernel payload"
+fi
+
 # The image comes from the harness cache, filled once by the binary under
 # test if it is not there yet, so only a first run downloads anything. The
 # pull afterwards is what registers the copied file in this home's store; it
