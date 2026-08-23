@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 asterism-core.workspace = true
+asterism-hyperv.workspace = true
 asterism-mesh.workspace = true
 asterism-vz.workspace = true
 anyhow.workspace = true

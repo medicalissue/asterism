@@ -33,12 +33,18 @@ use crate::snapshot::Snapshot;
 ///   directly; also a local file a user points at. VZ never reads it.
 /// * `Asif` is Apple's own sparse format (macOS 26+), an opportunistic
 ///   upgrade for VZ hosts and not created yet.
+/// * `Vhdx` is Hyper-V's native virtual disk container. The common image
+///   store stays raw; only the Windows helper materialises instance-local
+///   VHDX files through VirtDisk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiskFormat {
     Raw,
     Qcow2,
     Asif,
+    /// Native Hyper-V virtual disk container. Instance-local prepared disks
+    /// use this; the common image store remains raw.
+    Vhdx,
 }
 
 impl DiskFormat {
@@ -48,6 +54,7 @@ impl DiskFormat {
             DiskFormat::Raw => "raw",
             DiskFormat::Qcow2 => "qcow2",
             DiskFormat::Asif => "asif",
+            DiskFormat::Vhdx => "vhdx",
         }
     }
 }
@@ -201,9 +208,20 @@ impl Prepared {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ControlChannel {
-    Qmp { path: PathBuf },
-    HttpApi { path: PathBuf },
-    Rpc { path: PathBuf },
+    Qmp {
+        path: PathBuf,
+    },
+    HttpApi {
+        path: PathBuf,
+    },
+    Rpc {
+        path: PathBuf,
+    },
+    /// A durable one-shot helper config. The VM itself is owned by the host
+    /// service and a later helper reopens the stable system id in this file.
+    Helper {
+        path: PathBuf,
+    },
 }
 
 impl ControlChannel {
@@ -211,7 +229,8 @@ impl ControlChannel {
         match self {
             ControlChannel::Qmp { path }
             | ControlChannel::HttpApi { path }
-            | ControlChannel::Rpc { path } => path,
+            | ControlChannel::Rpc { path }
+            | ControlChannel::Helper { path } => path,
         }
     }
 }
@@ -517,7 +536,7 @@ impl Caps {
 pub struct Ready {
     /// Hypervisor version, e.g. `11.0.0`.
     pub version: String,
-    /// Accelerator in use: `hvf`, `kvm`, `whpx`.
+    /// Accelerator in use: `hvf`, `kvm`, `hyperv`. WHPX is not a product path.
     pub accel: String,
     pub machine_type: String,
     pub cpu: String,
@@ -625,7 +644,7 @@ pub fn unsupported<T>(backend: &str, what: &str) -> Result<T> {
 // ---- the trait -------------------------------------------------------------
 
 pub trait Hypervisor: Send + Sync {
-    /// Stable id persisted on the instance: "qemu", "vz", "chv", "whpx".
+    /// Stable id persisted on the instance, such as "qemu", "vz", or "hyperv".
     fn id(&self) -> &'static str;
 
     /// Tooling present, accelerator usable, entitlements in place.

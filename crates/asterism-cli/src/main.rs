@@ -96,9 +96,9 @@ enum Command {
         #[arg(long, default_value = "20G")]
         disk: String,
         /// Hypervisor to run this instance on: `chv` (Cloud Hypervisor/KVM),
-        /// `vz` (Apple Virtualization.framework), or `qemu` (compatibility).
-        /// Omit it to select this device's native capable backend. Recorded
-        /// on the instance and used for every later boot.
+        /// `vz` (Apple Virtualization.framework), native `hyperv` on Windows,
+        /// or `qemu` (compatibility). Omit it to select this device's first
+        /// capable native backend. Recorded and used for every later boot.
         #[arg(long, value_name = "NAME")]
         backend: Option<String>,
         /// Bootstrap profile to apply at first boot (`ast profiles` lists

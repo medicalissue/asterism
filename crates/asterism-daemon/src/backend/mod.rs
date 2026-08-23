@@ -8,7 +8,7 @@
 //!
 //! Which backend runs an instance is decided **once, at create**, and
 //! recorded on the instance ([`asterism_core::hv::Machine`]). Two things
-//! follow: a device can run qemu and vz instances side by side, and an
+//! follow: a device can run qemu, vz, and hyperv instances side by side, and an
 //! instance never silently changes hypervisor underneath its disks.
 
 use std::path::Path;
@@ -22,6 +22,7 @@ use asterism_core::proc::{Evidence, Ownership, ProcId};
 use asterism_core::{image, paths, profile, seed};
 
 pub mod chv;
+pub mod hyperv;
 pub mod qemu;
 pub mod qmp;
 pub mod vz;
@@ -41,6 +42,7 @@ fn backends() -> &'static [Arc<dyn Hypervisor>] {
             vec![
                 Arc::new(vz::Vz::new()),
                 Arc::new(chv::Chv::new()),
+                Arc::new(hyperv::HyperV::new()),
                 Arc::new(qemu::Qemu::new()),
             ]
         })
@@ -49,11 +51,11 @@ fn backends() -> &'static [Arc<dyn Hypervisor>] {
 
 /// Default create order: native product backend first, QEMU last.
 ///
-/// VZ is the Mac path. Cloud Hypervisor is the Linux path. QEMU is the
-/// explicit compatibility backend on both and is never selected ahead of a
-/// native backend that can run the request.
+/// Hyper-V is the Windows path, VZ is the Mac path, and Cloud Hypervisor is
+/// the Linux path. QEMU is the explicit compatibility backend and is never
+/// selected ahead of a native backend that can run the request.
 fn default_backend_ids() -> &'static [&'static str] {
-    &[vz::ID, chv::ID, qemu::ID]
+    &[hyperv::ID, vz::ID, chv::ID, qemu::ID]
 }
 
 /// A backend by its stable id, or the list of the ones that exist.
@@ -169,7 +171,7 @@ fn select_with(
 
     // Native product backends first. Capability or probe mismatches fall
     // through: OCI direct boot, loopback publishing and qcow2 base images
-    // all need facilities VZ does not currently expose, and CHV is Linux-only.
+    // need facilities some native backends do not expose.
     let mut refusals = Vec::new();
     for &id in default_backend_ids() {
         match resolve(id).and_then(|hv| runnable(hv, requirements)) {
@@ -186,8 +188,8 @@ fn select_with(
 /// Select and probe the backend for a create request.
 ///
 /// An explicit `--backend` is forced: its own probe or capability refusal is
-/// returned. The default tries the fastest/lightest capable backend now — VZ,
-/// then Cloud Hypervisor, then QEMU — and returns every reason if none can
+/// returned. The default tries Hyper-V, VZ, then Cloud Hypervisor before the
+/// portable QEMU path, and returns every refusal if none can
 /// run the request.
 pub fn select_for(requested: Option<&str>, requirements: CreateRequirements) -> Result<Machine> {
     select_with(requested, requirements, by_id)
@@ -1244,15 +1246,26 @@ mod tests {
         assert_eq!(by_id("qemu").unwrap().id(), "qemu");
         assert_eq!(by_id("vz").unwrap().id(), "vz");
         assert_eq!(by_id(chv::ID).unwrap().id(), chv::ID);
-        assert_eq!(default_backend_ids(), &[vz::ID, chv::ID, qemu::ID]);
+        assert_eq!(by_id(hyperv::ID).unwrap().id(), hyperv::ID);
+        assert_eq!(
+            default_backend_ids(),
+            &[hyperv::ID, vz::ID, chv::ID, qemu::ID]
+        );
         assert!(
             backends().iter().any(|backend| backend.id() == chv::ID),
             "Linux default cannot resolve CHV unless it is registered"
         );
+        assert!(
+            backends().iter().any(|backend| backend.id() == hyperv::ID),
+            "Windows default cannot resolve Hyper-V unless it is registered"
+        );
         let err = format!("{:#}", by_id("xen").err().expect("no xen backend"));
         assert!(err.contains("xen"), "{err}");
         assert!(
-            err.contains("qemu") && err.contains("vz") && err.contains(chv::ID),
+            err.contains("qemu")
+                && err.contains("vz")
+                && err.contains(chv::ID)
+                && err.contains(hyperv::ID),
             "{err}"
         );
     }

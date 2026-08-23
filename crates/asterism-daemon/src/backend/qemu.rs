@@ -176,11 +176,13 @@ impl Qemu {
                     readonly: false,
                 })
             }
-            DiskFormat::Asif => bail!(
-                "{} is an ASIF image, which qemu cannot read — it is a \
-                 Virtualization.framework format (macOS 26+)",
-                base.name
-            ),
+            DiskFormat::Asif | DiskFormat::Vhdx => {
+                bail!(
+                    "{} is a native {} image, which qemu cannot read",
+                    base.name,
+                    base.format
+                )
+            }
         }
     }
 }
