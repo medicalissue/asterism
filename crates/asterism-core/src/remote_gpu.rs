@@ -491,6 +491,7 @@ pub enum ControlErrorCode {
     Revoked,
     StaleGeneration,
     Conflict,
+    UnsupportedVersion,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1117,7 +1118,13 @@ impl ProductionProvider {
             .abi
             .handle(Request::Hello { versions, consumer })
             .into_result()
-            .map_err(|error| ControlError::new(ControlErrorCode::Unavailable, error.message))?;
+            .map_err(|error| {
+                let code = match error.code {
+                    ErrorCode::UnsupportedVersion => ControlErrorCode::UnsupportedVersion,
+                    _ => ControlErrorCode::Unavailable,
+                };
+                ControlError::new(code, error.message)
+            })?;
         let Response::SessionOpened { session, .. } = &response else {
             unreachable!("hello has one success response")
         };

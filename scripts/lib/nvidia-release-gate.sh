@@ -1,0 +1,168 @@
+# NVIDIA release-gate helpers. Sourced by the hardware wrapper and its
+# source-only fixture suite. A hardware PASS is decided here, never by the
+# CPU reference harness or a host-direct nvcc kernel.
+
+nvidia_gate_is_oid() {
+  local value="$1"
+  [[ "$value" =~ ^[0-9a-f]{40}$ ]]
+}
+
+nvidia_gate_require_kv() {
+  local file="$1" key="$2"
+  local value
+  value="$(awk -F= -v k="$key" '$1==k {print substr($0, length(k)+2); found=1; exit} END{if(!found) exit 1}' "$file")" || {
+    echo "NVIDIA GATE FAIL: missing $key" >&2
+    return 1
+  }
+  printf '%s\n' "$value"
+}
+
+nvidia_gate_require_true() {
+  local file="$1" key="$2"
+  local value
+  value="$(nvidia_gate_require_kv "$file" "$key")" || return 1
+  if [ "$value" != "true" ]; then
+    echo "NVIDIA GATE FAIL: $key=$value (require true)" >&2
+    return 1
+  fi
+}
+
+# Judge a key=value evidence file. Exit 0 only for the exact guest →
+# projected /dev/nvidia0/libcuda → two named mesh devices → real NVIDIA
+# helper path. Reference, mock, and local-direct records fail closed.
+nvidia_gate_judge() {
+  local file="$1"
+  local path executor helper guest_path libcuda guest_name provider_name
+  local sha tree guest_digest provider_digest first_uuid second_uuid
+
+  path="$(nvidia_gate_require_kv "$file" path)" || return 1
+  case "$path" in
+    direct|relay) ;;
+    local-direct|reference-loopback|mock)
+      echo "NVIDIA GATE FAIL: path=$path cannot hardware-PASS" >&2
+      return 1
+      ;;
+    *)
+      echo "NVIDIA GATE FAIL: unknown path $path" >&2
+      return 1
+      ;;
+  esac
+
+  executor="$(nvidia_gate_require_kv "$file" executor)" || return 1
+  if [ "$executor" != "cuda" ]; then
+    echo "NVIDIA GATE FAIL: executor=$executor cannot hardware-PASS" >&2
+    return 1
+  fi
+
+  helper="$(nvidia_gate_require_kv "$file" provider_helper_kind)" || return 1
+  if [ "$helper" != "process" ]; then
+    echo "NVIDIA GATE FAIL: provider_helper_kind=$helper cannot hardware-PASS" >&2
+    return 1
+  fi
+
+  guest_path="$(nvidia_gate_require_kv "$file" guest_path)" || return 1
+  if [ "$guest_path" != "/dev/nvidia0" ]; then
+    echo "NVIDIA GATE FAIL: guest_path=$guest_path; require /dev/nvidia0" >&2
+    return 1
+  fi
+
+  libcuda="$(nvidia_gate_require_kv "$file" libcuda_path)" || return 1
+  case "$libcuda" in
+    ''|mock*|/dev/null)
+      echo "NVIDIA GATE FAIL: libcuda_path is missing or mock" >&2
+      return 1
+      ;;
+  esac
+
+  guest_name="$(nvidia_gate_require_kv "$file" guest_device_name)" || return 1
+  provider_name="$(nvidia_gate_require_kv "$file" provider_device_name)" || return 1
+  if [ -z "$guest_name" ] || [ -z "$provider_name" ] || [ "$guest_name" = "$provider_name" ]; then
+    echo "NVIDIA GATE FAIL: need two distinct named mesh devices" >&2
+    return 1
+  fi
+  case "$guest_name,$provider_name" in
+    local,*|*,local|loopback,*|*,loopback|mock,*|*,mock)
+      echo "NVIDIA GATE FAIL: mesh device name is a stand-in" >&2
+      return 1
+      ;;
+  esac
+
+  sha="$(nvidia_gate_require_kv "$file" candidate_sha)" || return 1
+  tree="$(nvidia_gate_require_kv "$file" tree_digest)" || return 1
+  nvidia_gate_is_oid "$sha" || { echo "NVIDIA GATE FAIL: candidate_sha is not a git oid" >&2; return 1; }
+  nvidia_gate_is_oid "$tree" || { echo "NVIDIA GATE FAIL: tree_digest is not a git oid" >&2; return 1; }
+
+  guest_digest="$(nvidia_gate_require_kv "$file" guest_image_digest)" || return 1
+  provider_digest="$(nvidia_gate_require_kv "$file" provider_image_digest)" || return 1
+  [ -n "$guest_digest" ] && [ -n "$provider_digest" ] || {
+    echo "NVIDIA GATE FAIL: image digests required" >&2
+    return 1
+  }
+
+  first_uuid="$(nvidia_gate_require_kv "$file" first_gpu_uuid)" || return 1
+  second_uuid="$(nvidia_gate_require_kv "$file" second_gpu_uuid)" || return 1
+  case "$first_uuid" in GPU-*) ;; *) echo "NVIDIA GATE FAIL: first_gpu_uuid" >&2; return 1 ;; esac
+  case "$second_uuid" in GPU-*) ;; *) echo "NVIDIA GATE FAIL: second_gpu_uuid" >&2; return 1 ;; esac
+  if [ "$first_uuid" = "$second_uuid" ]; then
+    echo "NVIDIA GATE FAIL: GPU UUIDs must be distinct" >&2
+    return 1
+  fi
+
+  nvidia_gate_require_kv "$file" guest_device_id >/dev/null || return 1
+  nvidia_gate_require_kv "$file" provider_device_id >/dev/null || return 1
+  nvidia_gate_require_kv "$file" driver_version >/dev/null || return 1
+  nvidia_gate_require_kv "$file" cuda_runtime_version >/dev/null || return 1
+  nvidia_gate_require_kv "$file" guest_output >/dev/null || return 1
+
+  nvidia_gate_require_true "$file" direct_path || return 1
+  nvidia_gate_require_true "$file" relay_path || return 1
+  nvidia_gate_require_true "$file" provider_astd_restarted || return 1
+  nvidia_gate_require_true "$file" provider_helper_restarted || return 1
+  nvidia_gate_require_true "$file" guest_restarted || return 1
+  nvidia_gate_require_true "$file" revoke || return 1
+  nvidia_gate_require_true "$file" contention || return 1
+  nvidia_gate_require_true "$file" loss || return 1
+  nvidia_gate_require_true "$file" version_skew_fresh_session || return 1
+  nvidia_gate_require_true "$file" hardware_cuda_executed || return 1
+
+  echo "nvidia_gate=pass"
+  return 0
+}
+
+# Official dstack task schema (https://dstack.ai/docs/reference/dstack.yml/task.md).
+# python and nvcc are mutually exclusive with image. repos.hash is the commit pin.
+nvidia_gate_validate_dstack() {
+  local yml="$1"
+  local hash
+  grep -q '^type: task$' "$yml" || { echo "dstack: type must be task" >&2; return 1; }
+  grep -q '^name: asterism-remote-gpu-nvidia-gate$' "$yml" || {
+    echo "dstack: name must be asterism-remote-gpu-nvidia-gate" >&2
+    return 1
+  }
+  grep -q '^python:' "$yml" || { echo "dstack: python is required" >&2; return 1; }
+  grep -q '^nvcc: true$' "$yml" || { echo "dstack: nvcc: true is required" >&2; return 1; }
+  if grep -q '^image:' "$yml"; then
+    echo "dstack: image is mutually exclusive with python/nvcc" >&2
+    return 1
+  fi
+  grep -q '^spot_policy: on-demand$' "$yml" || { echo "dstack: spot_policy on-demand" >&2; return 1; }
+  grep -q '^retry: false$' "$yml" || { echo "dstack: retry must be false" >&2; return 1; }
+  grep -q 'vendor: nvidia' "$yml" || { echo "dstack: gpu vendor nvidia" >&2; return 1; }
+  grep -q 'count: 2' "$yml" || { echo "dstack: gpu count 2" >&2; return 1; }
+  grep -q 'compute_capability: 7.5' "$yml" || { echo "dstack: compute_capability 7.5" >&2; return 1; }
+  grep -q 'scripts/harness-remote-gpu-nvidia.sh' "$yml" || {
+    echo "dstack: commands must run the release gate" >&2
+    return 1
+  }
+  grep -q 'url: https://github.com/medicalissue/asterism.git' "$yml" || {
+    echo "dstack: repos.url must pin the asterism repo" >&2
+    return 1
+  }
+  hash="$(awk '/^[[:space:]]*hash:/{gsub(/["'\'']/, "", $2); print $2; exit}' "$yml")"
+  nvidia_gate_is_oid "$hash" || {
+    echo "dstack: repos.hash must be a 40-character git oid (got ${hash:-empty})" >&2
+    return 1
+  }
+  echo "dstack_schema=valid"
+  echo "dstack_pinned_sha=$hash"
+}
