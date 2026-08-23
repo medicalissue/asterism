@@ -1,0 +1,112 @@
+name: Cloud Hypervisor exact KVM gate
+
+on:
+  push:
+    branches:
+      - "polecat/**/as-lvf.23+exact-*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chv-kvm-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TARGET_SHA: 6e043bef5f58dfd14d4c53876f4dca5ccf76408b
+  TARGET_TREE: b258de950e54f033eb6b2d8a009eab5509d18fc4
+  CARGO_TERM_COLOR: always
+
+jobs:
+  exact-kvm-lifecycle:
+    name: exact v53.0 lifecycle on real KVM
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      # This checkout supplies only the observer workflow and harness. Product
+      # binaries are built in the detached exact-source worktree below.
+      - name: Check out observer harness
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable, 2026-08-05
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: chv-kvm-exact
+
+      - name: Install Linux gate prerequisites
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cloud-image-utils e2fsprogs iproute2 libcap2-bin nbd-client \
+            openssh-client qemu-utils
+
+      - name: Require real KVM and materialize the exact source
+        run: |
+          set -eux
+          test -c /dev/kvm
+          sudo chgrp "$(id -gn)" /dev/kvm
+          sudo chmod 0660 /dev/kvm
+          test -r /dev/kvm
+          test -w /dev/kvm
+          exact="${RUNNER_TEMP}/exact-source"
+          git worktree add --detach "$exact" "$TARGET_SHA"
+          test "$(git -C "$exact" rev-parse HEAD)" = "$TARGET_SHA"
+          test "$(git -C "$exact" rev-parse 'HEAD^{tree}')" = "$TARGET_TREE"
+          echo "EXACT_SOURCE=$exact" >>"$GITHUB_ENV"
+
+      - name: Build the shipped Linux payload from only the exact source
+        env:
+          ASTERISM_BUILD_ID: ${{ env.TARGET_SHA }}
+          CARGO_TARGET_DIR: ${{ runner.temp }}/exact-target
+        run: |
+          set -eux
+          cd "$EXACT_SOURCE"
+          cargo build --release --locked \
+            --package asterism-cli --package asterism-daemon
+          version="v$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          dist="${RUNNER_TEMP}/dist/${version}"
+          scripts/package-linux.sh "$version" "$dist"
+          echo "GATE_VERSION=$version" >>"$GITHUB_ENV"
+          echo "GATE_DIST=${RUNNER_TEMP}/dist" >>"$GITHUB_ENV"
+
+      - name: Install the exact archive through the shipped installer
+        run: |
+          set -eux
+          prefix="${RUNNER_TEMP}/prefix"
+          ASTERISM_VERSION="$GATE_VERSION" \
+          ASTERISM_PREFIX="$prefix" \
+          ASTERISM_BASE_URL="file://${GATE_DIST}" \
+          ASTERISM_YES=1 \
+            sh "$EXACT_SOURCE/packaging/install.sh"
+          echo "GATE_PREFIX=$prefix" >>"$GITHUB_ENV"
+
+      - name: Run the fail-closed Cloud Hypervisor lifecycle gate
+        env:
+          ASTERISM_GATE_SOURCE_DIR: ${{ env.EXACT_SOURCE }}
+          ASTERISM_GATE_EXPECTED_SHA: ${{ env.TARGET_SHA }}
+          ASTERISM_GATE_EXPECTED_TREE: ${{ env.TARGET_TREE }}
+          ASTERISM_GATE_OBSERVER_SHA: ${{ github.sha }}
+          AST_BIN: ${{ env.GATE_PREFIX }}/bin/ast
+          ASTD_BIN: ${{ env.GATE_PREFIX }}/bin/astd
+          ASTERISM_TEST_ARTIFACTS: ${{ runner.temp }}/chv-kvm-evidence
+        run: bash scripts/gate-chv-kvm.sh
+
+      - name: Upload exact-run evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: chv-kvm-${{ env.TARGET_SHA }}
+          path: ${{ runner.temp }}/chv-kvm-evidence
+          if-no-files-found: error
+
+      - name: Remove installed host integration
+        if: always()
+        run: |
+          if [ -n "${GATE_PREFIX:-}" ] && [ -x "${GATE_PREFIX}/bin/ast" ]; then
+            ASTERISM_PREFIX="$GATE_PREFIX" ASTERISM_YES=1 \
+              sh "$EXACT_SOURCE/packaging/install.sh" --uninstall
+          fi

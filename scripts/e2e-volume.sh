@@ -36,7 +36,7 @@ if [ -z "${E2E_VOLUME_BACKEND:-}" ]; then
 fi
 BACKEND="$E2E_VOLUME_BACKEND"
 case "$BACKEND" in
-  qemu|vz) ;;
+  qemu|vz|chv) ;;
   *) echo "VOLUME E2E FAIL: unknown backend: $BACKEND" >&2; exit 2 ;;
 esac
 
@@ -74,15 +74,15 @@ IMAGE="${E2E_IMAGE:-debian:13}"
 # Five GiB leaves room for the filesystem and a real four-GiB payload.  The
 # transfer is intentionally non-sparse and goes through the guest's virtio
 # disk, the consumer bridge, QUIC, NBD, and the provider's raw image.
-VOLUME_GIB=5
+VOLUME_GIB="${E2E_VOLUME_GIB:-5}"
 VOLUME_BYTES=$((VOLUME_GIB * 1024 * 1024 * 1024))
-TRANSFER_BYTES=$((4 * 1024 * 1024 * 1024))
+TRANSFER_BYTES="${E2E_VOLUME_TRANSFER_BYTES:-$((4 * 1024 * 1024 * 1024))}"
 
 # ---- the processes this test starts ----------------------------------------
 #
 # Everything started here writes down its own pid inside its own
-# ASTERISM_HOME: astd in $home/astd.pid, each guest's qemu in
-# $home/instances/<name>/qemu.pid or VZ helper in vz.pid, each storage daemon in
+# ASTERISM_HOME: astd in $home/astd.pid, each guest in its backend-specific
+# $home/instances/<name>/{qemu,vz,chv}.pid, each storage daemon in
 # $home/volumes/<name>/nbd-e<epoch>.pid. Those files are what cleanup acts
 # on, so it can only ever reach a process this run started.
 #
@@ -133,7 +133,8 @@ cleanup() {
   done
   # Then what they left running. Both outlive astd by design.
   for home in "$A" "$B"; do
-    for f in "$home"/instances/*/qemu.pid "$home"/instances/*/vz.pid; do kill_pidfile "$f"; done
+    for f in "$home"/instances/*/qemu.pid "$home"/instances/*/vz.pid \
+      "$home"/instances/*/chv.pid; do kill_pidfile "$f"; done
     for f in "$home"/volumes/*/nbd-e*.pid; do kill_pidfile "$f"; done
     # Covers older backends whose only record was state.json. New VZ helpers
     # were stopped above through their daemon-independent vz.pid.

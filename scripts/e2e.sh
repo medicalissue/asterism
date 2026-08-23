@@ -27,6 +27,7 @@ harness_own_home "$ASTERISM_HOME"
 # throwaway key and this machine's addresses to a public discovery service.
 export ASTERISM_MESH=local
 IMAGE="${E2E_IMAGE:-debian:13}"
+BACKEND="${E2E_BACKEND:-qemu}"
 INST=e2e
 VOL="$ASTERISM_HOME/e2e-vol"   # dash on purpose: covers systemd \x2d escaping
 MARKER="marker-$$"
@@ -55,6 +56,10 @@ echo "$MARKER" > "$VOL/MARKER.txt"
 harness_seed_images "$ASTERISM_HOME"
 
 fail() { echo "E2E FAIL: $*" >&2; exit 1; }
+case "$BACKEND" in
+  qemu|chv) ;;
+  *) fail "unsupported lifecycle backend: $BACKEND" ;;
+esac
 
 # expect <desc> <needle> <cmd...>: run cmd, require success AND the needle
 # in its combined output.
@@ -76,20 +81,36 @@ harness_seed_images "$ASTERISM_HOME"
 
 # The backend is named, not left to the daemon.
 #
-# This lane pins qemu because it exercises the 9p implementation and QEMU's
-# snapshot path together. The storage-parts lane covers the same directory
-# journey through VZ's virtiofs implementation.
+# The default lane pins QEMU for its 9p implementation. The Linux release gate
+# explicitly selects CHV, exercising the same product journey through the
+# shipped virtiofsd and Cloud Hypervisor snapshot path.
 expect "create"  "$INST  defined"  \
-  "$AST" create "$INST" --backend qemu --image "$IMAGE" --mem 2G --disk 10G
+  "$AST" create "$INST" --backend "$BACKEND" --image "$IMAGE" --mem 2G --disk 10G
 expect "attach"  "/mnt/ast/e2e-vol" "$AST" attach "$INST" --volume "$VOL"
 expect "up"      "$INST  running"  "$AST" up "$INST"
 
 # And what it actually booted on, asserted rather than assumed: `--backend
-# qemu` is a request, and this is the line that catches a daemon that honours
+# backend` is a request, and this is the line that catches a daemon that honours
 # it in its output and not in the guest.
-harness_assert_backend "$AST" "$INST" qemu \
+harness_assert_backend "$AST" "$INST" "$BACKEND" \
   || fail "the marker below would be proving something about a different backend"
-echo "ok: the guest is on qemu, exercising the 9p directory transport"
+echo "ok: the guest is on $BACKEND"
+
+if [ "$BACKEND" = chv ]; then
+  STATUS="$($AST status "$INST" 2>&1)"
+  VMM_PID="$(sed -n 's/^running: chv pid \([0-9][0-9]*\),.*/\1/p' <<<"$STATUS")"
+  [ -n "$VMM_PID" ] || fail "CHV status did not name its VMM pid:"$'\n'"$STATUS"
+  VMM_EXE="$(readlink -f "/proc/$VMM_PID/exe" 2>/dev/null || true)"
+  EXPECTED_CHV="$(readlink -f "$(dirname "$ASTD")/cloud-hypervisor")"
+  [ "$VMM_EXE" = "$EXPECTED_CHV" ] \
+    || fail "CHV pid $VMM_PID executes $VMM_EXE, not shipped $EXPECTED_CHV"
+  [ -s "$ASTERISM_HOME/instances/$INST/virtiofs-0.resource.json" ] \
+    || fail "CHV boot did not retain precise virtiofsd ownership"
+  if pgrep -f '(^|/)qemu-system-[^ ]*' >/dev/null 2>&1; then
+    fail "a qemu-system process exists during the CHV lifecycle"
+  fi
+  echo "ok: CHV pid $VMM_PID is the shipped helper; virtiofsd ownership is durable; no qemu-system exists"
+fi
 
 # First boot: sshd can come up before cloud-init has mounted the volumes,
 # so give the marker a bounded retry instead of failing on the race.
@@ -102,7 +123,7 @@ for _ in $(seq 1 30); do
   sleep 3
 done
 [ -n "$marker_seen" ] || fail "marker not visible in guest after first boot"
-echo "ok: marker via 9p"
+echo "ok: marker via the $BACKEND shared-directory transport"
 
 expect "down"     "$INST  stopped"          "$AST" down "$INST"
 expect "snapshot" "$INST  snapshot clean"   "$AST" snapshot "$INST" clean

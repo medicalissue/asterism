@@ -202,11 +202,12 @@ harness_reap_home() {
   local home="$1" pid f
   [ -d "$home" ] || return 0
   harness_stop "$(cat "$home/astd.pid" 2>/dev/null || true)"
-  # QEMU and the VZ helper both leave their guest alive when astd exits.
+  # Every VMM backend leaves its guest alive when astd exits.
   # Their pidfiles are independent of a daemon flush, so consume them before
   # the registry fallback below. The paths are inside this owned home: this
   # is precise ownership, never a process-table pattern match.
-  for f in "$home"/instances/*/qemu.pid "$home"/instances/*/vz.pid; do
+  for f in "$home"/instances/*/qemu.pid "$home"/instances/*/vz.pid \
+    "$home"/instances/*/chv.pid; do
     [ -f "$f" ] || continue
     harness_stop "$(cat "$f" 2>/dev/null || true)"
     rm -f "$f"
