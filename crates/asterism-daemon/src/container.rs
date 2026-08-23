@@ -7,6 +7,8 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(any(target_os = "linux", test))]
+use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -48,6 +50,10 @@ impl Adapter for LinuxRootless {
                 .context("the Linux rootless container adapter needs util-linux unshare")?;
             tools::tool("debugfs")
                 .context("the Linux rootless container adapter needs e2fsprogs debugfs")?;
+            tools::tool("slirp4netns").context(
+                "the Linux rootless container adapter needs slirp4netns for outbound networking",
+            )?;
+            tools::tool("ip").context("the Linux rootless container adapter needs iproute2 ip")?;
             tools::run(Command::new(unshare).args([
                 "--user",
                 "--map-root-user",
@@ -117,6 +123,16 @@ struct Spec {
     env: Vec<String>,
     workdir: Option<String>,
     binds: Vec<BindMount>,
+    network: Network,
+    bootstrap: Option<String>,
+}
+
+/// slirp4netns owns both the outbound NAT and loopback-only publishing.
+/// Its API socket is private instance state, never a TCP control endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Network {
+    api: PathBuf,
+    publish: Vec<asterism_core::instance::PortForward>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -171,17 +187,8 @@ pub fn prepare(inst: &Instance) -> Result<Prepared> {
     if inst.image_kind != ImageKind::OciRootfs {
         bail!("runtime=container requires an OCI image, not a bootable disk image");
     }
-    if !inst.publish.is_empty() {
-        bail!("rootless container port publishing is unsupported until the slirp control adapter is present; no port was published");
-    }
     if inst.volumes.iter().any(|v| v.is_block()) {
-        bail!("native container block volumes are unsupported; no NBD disk is exposed as a placeholder");
-    }
-    if !inst.profiles.is_empty() {
-        bail!("native container bootstrap profiles are unsupported; refusing to start an unconfigured container");
-    }
-    if !inst.secrets.is_empty() {
-        bail!("native container secret egress is unsupported; refusing to start without the requested bindings");
+        bail!("native container block volumes need a rootless block-device mapper; refusing to expose a regular-file placeholder as a disk");
     }
 
     let req = crate::backend::disk_req(inst)?;
@@ -234,6 +241,17 @@ pub fn prepare(inst: &Instance) -> Result<Prepared> {
     }
     let cgroup = delegated_cgroup(&inst.id, inst.shape.cpus, inst.shape.mem_mib)?;
     let control = dir.join("container-control.sock");
+    let egress = crate::egress::seed_config(inst)
+        .context("starting the container's secret-egress projection")?;
+    let bootstrap = asterism_core::profile::Bootstrap::resolve(&inst.profiles)
+        .context("resolving the container's bootstrap profiles")?;
+    install_bootstrap(&rootfs, &bootstrap)?;
+    let mut env = strings("Env");
+    env.extend(
+        asterism_core::seed::egress_environment(&egress)
+            .into_iter()
+            .map(|(name, value)| format!("{name}={value}")),
+    );
     let spec = dir.join("container.json");
     let binds = asterism_core::seed::shares(inst)
         .into_iter()
@@ -248,12 +266,79 @@ pub fn prepare(inst: &Instance) -> Result<Prepared> {
         cgroup,
         console: dir.join("console.log"),
         argv,
-        env: strings("Env"),
+        env,
         workdir: image["WorkingDir"].as_str().map(str::to_owned),
         binds,
+        network: Network {
+            api: dir.join("slirp4netns-api.sock"),
+            publish: inst.publish.clone(),
+        },
+        bootstrap: (!bootstrap.is_empty()).then(|| bootstrap.runcmd()),
     };
     fs::write(&spec, serde_json::to_vec_pretty(&value)?)?;
     Ok(Prepared { spec })
+}
+
+/// Place generated profile files in the extracted OCI root without ever
+/// resolving an image-controlled symlink.  Profile content is public guest
+/// configuration; secret handles remain in the process environment instead.
+fn install_bootstrap(rootfs: &Path, bootstrap: &asterism_core::profile::Bootstrap) -> Result<()> {
+    for (guest, mode, contents) in bootstrap.files() {
+        let target = safe_file_target(rootfs, Path::new(&guest))?;
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&target, contents)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = u32::from_str_radix(mode, 8)
+                .with_context(|| format!("parsing profile mode {mode:?}"))?;
+            fs::set_permissions(&target, fs::Permissions::from_mode(mode))?;
+        }
+    }
+    Ok(())
+}
+
+fn safe_file_target(rootfs: &Path, guest: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+    if !guest.is_absolute() {
+        bail!(
+            "container configuration file {} is not absolute",
+            guest.display()
+        );
+    }
+    let mut target = rootfs.to_path_buf();
+    let components: Vec<_> = guest.components().collect();
+    for (index, component) in components.iter().enumerate() {
+        match component {
+            Component::RootDir => continue,
+            Component::Normal(name) => target.push(name),
+            _ => bail!(
+                "container configuration file {} is not normalized",
+                guest.display()
+            ),
+        }
+        if index + 1 == components.len() {
+            match fs::symlink_metadata(&target) {
+                Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_dir() => {
+                    bail!(
+                        "container configuration target {} is not a regular file",
+                        guest.display()
+                    )
+                }
+                Ok(_) | Err(_) => {}
+            }
+        } else if let Ok(metadata) = fs::symlink_metadata(&target) {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                bail!(
+                    "container configuration file {} crosses an image symlink",
+                    guest.display()
+                );
+            }
+        }
+    }
+    Ok(target)
 }
 
 #[cfg(target_os = "linux")]
@@ -351,6 +436,24 @@ pub fn start(prepared: &Prepared) -> Result<Handle> {
             spec.cgroup.display()
         );
     }
+    if let Err(error) = start_slirp(host_pid, &spec.network) {
+        // No caller may receive a failed launch while the namespace holder is
+        // still alive: it would leave a cgroup and control socket that look
+        // like a boot the registry must fence forever.
+        let _ = call(
+            &spec.control,
+            &ControlRequest::Stop,
+            Some(Duration::from_secs(2)),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while cgroup_populated(&spec.cgroup).unwrap_or(true) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if !cgroup_populated(&spec.cgroup).unwrap_or(true) {
+            let _ = fs::remove_dir(&spec.cgroup);
+        }
+        return Err(error).context("configuring rootless container networking");
+    }
     let ns = |kind: &str| PathBuf::from(format!("/proc/{host_pid}/ns/{kind}"));
     Ok(Handle {
         backend: LINUX_ID.into(),
@@ -370,6 +473,92 @@ pub fn start(prepared: &Prepared) -> Result<Handle> {
         }),
         started_at: asterism_core::instance::now_unix(),
     })
+}
+
+/// Start slirp after the namespace holder exists, then ask its control API to
+/// install every published loopback forward. No shell command or host firewall
+/// rule can create a listener here; a successful API response is required.
+#[cfg(target_os = "linux")]
+fn start_slirp(host_pid: u32, network: &Network) -> Result<()> {
+    let _ = fs::remove_file(&network.api);
+    let slirp = tools::tool("slirp4netns")?;
+    let mut child = Command::new(slirp)
+        .args(["--configure", "--disable-host-loopback", "--api-socket"])
+        .arg(&network.api)
+        .arg(host_pid.to_string())
+        .arg("tap0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("starting slirp4netns for the rootless container")?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !network.api.exists() {
+        if let Some(status) = child.try_wait()? {
+            bail!("slirp4netns exited before its control API was ready ({status})");
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            bail!(
+                "slirp4netns did not create its control API at {}",
+                network.api.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    for forward in &network.publish {
+        let result = slirp_call(
+            &network.api,
+            serde_json::json!({
+                "execute": "add_hostfwd",
+                "arguments": {
+                    "proto": "tcp",
+                    "host_addr": "127.0.0.1",
+                    "host_port": forward.host,
+                    "guest_addr": "10.0.2.100",
+                    "guest_port": forward.guest,
+                }
+            }),
+        )
+        .with_context(|| format!("publishing {forward} through slirp4netns"));
+        if let Err(error) = result {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+    }
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn start_slirp(_host_pid: u32, _network: &Network) -> Result<()> {
+    bail!("slirp4netns is only available to the Linux rootless adapter")
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn slirp_call(socket: &Path, request: serde_json::Value) -> Result<()> {
+    let mut stream = UnixStream::connect(socket)
+        .with_context(|| format!("connecting to slirp4netns API {}", socket.display()))?;
+    serde_json::to_writer(&mut stream, &request)?;
+    stream.write_all(b"\n")?;
+    // slirp4netns processes one request per connection and waits for EOF on
+    // the write half before responding; retaining a duplex stream deadlocks
+    // a successful port publication.
+    stream.shutdown(Shutdown::Write)?;
+    let mut response = String::new();
+    BufReader::new(stream).read_line(&mut response)?;
+    let response: serde_json::Value =
+        serde_json::from_str(&response).context("parsing slirp4netns control response")?;
+    if let Some(error) = response.get("error") {
+        bail!("slirp4netns refused the request: {error}");
+    }
+    if response.get("return").is_none() {
+        bail!("slirp4netns returned no success value: {response}");
+    }
+    Ok(())
 }
 
 pub fn state(handle: &Handle) -> Result<RunState> {
@@ -489,6 +678,7 @@ pub fn helper_main(spec_path: &Path) -> Result<()> {
     let listener = UnixListener::bind(&spec.control)?;
     fs::write(spec.cgroup.join("cgroup.procs"), "0")
         .context("moving the namespace holder into its delegated cgroup")?;
+    bring_loopback_up()?;
     for bind in &spec.binds {
         let target = safe_mount_target(&spec.rootfs, &bind.target)?;
         bind_mount(&bind.source, &target)?;
@@ -505,6 +695,15 @@ pub fn helper_main(spec_path: &Path) -> Result<()> {
     let host_pid = host_pid()?;
     chroot(&spec.rootfs)?;
     mount_proc()?;
+    if let Some(bootstrap) = &spec.bootstrap {
+        Command::new("/bin/sh")
+            .args(["-c", bootstrap])
+            .status()
+            .context("starting the generated container bootstrap profile")?
+            .success()
+            .then_some(())
+            .context("the generated container bootstrap profile was refused")?;
+    }
     let mut child = spawn(
         &spec.argv,
         &spec.env,
@@ -559,6 +758,18 @@ pub fn helper_main(spec_path: &Path) -> Result<()> {
     }
     let _ = fs::remove_file(&spec.control);
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn bring_loopback_up() -> Result<()> {
+    let ip = tools::tool("ip")?;
+    tools::run(Command::new(ip).args(["link", "set", "lo", "up"]))
+        .context("bringing up the container loopback interface")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bring_loopback_up() -> Result<()> {
+    bail!("network namespaces are only available to the Linux rootless adapter")
 }
 
 fn spawn(
@@ -832,5 +1043,42 @@ mod tests {
         std::os::unix::fs::symlink("/tmp", root.path().join("data")).unwrap();
         assert!(safe_mount_target(root.path(), Path::new("/data/work")).is_err());
         assert!(safe_mount_target(root.path(), Path::new("/../escape")).is_err());
+    }
+
+    #[test]
+    fn bootstrap_files_cannot_escape_through_an_image_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/tmp", root.path().join("etc")).unwrap();
+        assert!(safe_file_target(root.path(), Path::new("/etc/profile.d/asterism.sh")).is_err());
+        assert!(safe_file_target(root.path(), Path::new("/../../escape")).is_err());
+    }
+
+    #[test]
+    fn slirp_network_spec_keeps_publishing_on_private_control_state() {
+        let network = Network {
+            api: "/run/user/1000/asterism/dev/slirp4netns-api.sock".into(),
+            publish: vec!["8080:80".parse().unwrap()],
+        };
+        let wire = serde_json::to_string(&network).unwrap();
+        assert!(wire.contains("slirp4netns-api.sock"));
+        assert!(wire.contains("8080"));
+        assert!(!wire.contains("0.0.0.0"));
+    }
+
+    #[test]
+    fn slirp_control_request_closes_its_write_half_before_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("slirp.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            stream.read_to_string(&mut request).unwrap();
+            assert!(request.contains("add_hostfwd"));
+            stream.write_all(b"{\"return\":{}}\n").unwrap();
+        });
+        slirp_call(&socket, serde_json::json!({ "execute": "add_hostfwd" })).unwrap();
+        server.join().unwrap();
     }
 }
