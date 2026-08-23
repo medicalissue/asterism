@@ -3108,11 +3108,21 @@ mod tests {
             .spawn()
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !socket.exists() {
-            assert!(Instant::now() < deadline, "export fixture did not bind");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let mut old_client = UnixStream::connect(&socket).unwrap();
+        let mut old_client = loop {
+            match UnixStream::connect(&socket) {
+                Ok(client) => break client,
+                Err(error) => {
+                    if let Some(status) = child.try_wait().unwrap() {
+                        panic!("export fixture exited before accepting a client: {status}");
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "export fixture did not accept a client: {error}"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
         old_client
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
