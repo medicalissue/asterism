@@ -167,3 +167,8 @@ finally {
     & sc.exe delete $service 2>$null | Out-Null
     Remove-Item Env:ASTERISM_TEST_SERVICE_LABEL -ErrorAction SilentlyContinue
 }
+
+# Expected idempotent cleanup failures above leave a non-zero native
+# LASTEXITCODE even after every asserted lifecycle step passed. A thrown
+# assertion never reaches this line; reaching it is the gate's success.
+exit 0
