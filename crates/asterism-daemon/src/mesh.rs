@@ -3129,6 +3129,7 @@ async fn import(
         from_device: from_device.to_owned(),
         bytes: 0,
         files: Default::default(),
+        instance_id: manifest.instance.id.clone(),
     };
     receive_into(&mut stream.recv, &staging, expected, &mut receipt, report).await?;
 

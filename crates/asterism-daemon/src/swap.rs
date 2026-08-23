@@ -324,6 +324,11 @@ pub struct Receipt {
     pub bytes: u64,
     /// Per file, relative path to bytes written.
     pub files: BTreeMap<String, u64>,
+    /// Exact instance identity this receipt belongs to.  Legacy receipts omit
+    /// the field; serde fills an empty string, which cannot authorize a
+    /// destructive abort on name and epoch alone.
+    #[serde(default)]
+    pub instance_id: String,
 }
 
 /// A target-side commit that has published the directory but has not yet
@@ -1323,6 +1328,98 @@ fn verify(staging: &Path, manifest: &MoveManifest, epoch: u64) -> Result<()> {
     Ok(())
 }
 
+fn exact_instance_id(id: &str) -> Option<&str> {
+    let id = id.trim();
+    (!id.is_empty()).then_some(id)
+}
+
+fn distinct_abort_identity(name: &str) -> anyhow::Error {
+    anyhow!(
+        "device already has a distinct instance ID for {name:?}; refusing to turn a name collision into move rollback"
+    )
+}
+
+fn missing_abort_identity(name: &str, epoch: u64) -> anyhow::Error {
+    anyhow!(
+        "abort of {name:?} at epoch {epoch} has no exact instance ID; refusing to revoke by name and epoch alone"
+    )
+}
+
+/// Drop the matching target row, or confirm it is already gone on disk.
+/// A failed `save` restores in-memory authority so a later retry still sees
+/// the exact identity instead of treating epoch-only proof as a claim.
+fn persist_target_row_revoke(
+    reg: &mut Shard,
+    name: &str,
+    epoch: u64,
+    instance_id: &str,
+) -> Result<()> {
+    match matching_target_row(reg, name, epoch, instance_id)? {
+        Some(instance) => revoke_loaded_target_row(reg, instance),
+        None => {
+            let durable = Shard::load(&paths::state_path())
+                .context("reloading target registry authority during move rollback")?;
+            match durable.get(name).cloned() {
+                Ok(instance) if instance.move_epoch == epoch && instance.id == instance_id => {
+                    if !reg.holds(name) {
+                        reg.adopt(instance.clone()).context(
+                            "restoring target registry authority after a failed durable revoke",
+                        )?;
+                    }
+                    revoke_loaded_target_row(reg, instance)
+                }
+                Ok(instance) => {
+                    if !reg.holds(name) {
+                        let _ = reg.adopt(instance.clone());
+                    }
+                    Err(anyhow!(
+                        "target row for {name:?} is {} at move epoch {}, not this move",
+                        instance.id,
+                        instance.move_epoch
+                    ))
+                }
+                Err(_) => reg.save().context("retrying target authority revocation"),
+            }
+        }
+    }
+}
+
+fn matching_target_row(
+    reg: &Shard,
+    name: &str,
+    epoch: u64,
+    instance_id: &str,
+) -> Result<Option<Instance>> {
+    match reg.get(name).cloned() {
+        Ok(instance) if instance.move_epoch == epoch && instance.id == instance_id => {
+            Ok(Some(instance))
+        }
+        Ok(instance) => Err(anyhow!(
+            "target row for {name:?} is {} at move epoch {}, not this move",
+            instance.id,
+            instance.move_epoch
+        )),
+        Err(_) => Ok(None),
+    }
+}
+
+fn revoke_loaded_target_row(reg: &mut Shard, instance: Instance) -> Result<()> {
+    let name = instance.name.clone();
+    let removed = reg
+        .remove(&name)
+        .context("removing target registry authority during move rollback")?;
+    if let Err(error) = reg.save() {
+        if let Err(restore) = reg.adopt(removed) {
+            return Err(error).context(format!(
+                "removing target registry authority during move rollback (could not restore in-memory authority: {restore:#})"
+            ));
+        }
+        return Err(error).context("removing target registry authority during move rollback");
+    }
+    crate::exit_point::update(&name, None);
+    Ok(())
+}
+
 /// Undo every target-side artifact of a move that did not reach source
 /// commit.  It deliberately handles both staging and a published live
 /// directory: after the rename, merely deleting staging and unfencing the
@@ -1375,25 +1472,24 @@ pub async fn abort_target(reg: &mut Shard, name: &str, epoch: u64, instance_id: 
                 transition.instance_id
             ));
         }
+        if exact_instance_id(&transition.instance_id).is_none() {
+            return error(missing_abort_identity(name, epoch));
+        }
         if let Some(adopted) = &transition.instance {
             if adopted.id != transition.instance_id
                 || (!requested_id.is_empty() && requested_id != adopted.id)
             {
-                return error(anyhow!(
-                    "device already has a distinct instance ID for {name:?}; refusing to turn a name collision into move rollback"
-                ));
+                return error(distinct_abort_identity(name));
             }
         }
     }
     // Name/epoch/token are not identity. Marker-cleared abort must carry the
     // exact durable instance ID; an empty or mismatched id fails closed.
-    let expected_id = (!requested_id.is_empty()).then(|| requested_id.to_owned());
+    let expected_id = exact_instance_id(requested_id).map(str::to_owned);
     let row = reg.get(name).cloned().ok();
     if let Some(instance) = &row {
         if expected_id.as_ref().is_some_and(|id| instance.id != *id) {
-            return error(anyhow!(
-                "device already has a distinct instance ID for {name:?}; refusing to turn a name collision into move rollback"
-            ));
+            return error(distinct_abort_identity(name));
         }
         if instance.move_epoch != epoch
             && (transition.is_some() || receipt.as_ref().is_some_and(|r| r.epoch == epoch))
@@ -1407,19 +1503,27 @@ pub async fn abort_target(reg: &mut Shard, name: &str, epoch: u64, instance_id: 
     let row_matches = row.as_ref().is_some_and(|instance| {
         instance.move_epoch == epoch && expected_id.as_ref().is_some_and(|id| instance.id == *id)
     });
+    let receipt_at_epoch = receipt.as_ref().filter(|r| r.epoch == epoch);
+    let receipt_id = receipt_at_epoch.and_then(|r| exact_instance_id(&r.instance_id));
     // A completed target commit clears its marker before the coordinator
     // is known to have the ack.  Abort must still observe the matching
     // row/receipt/id/epoch and revoke it, otherwise a lost ack reopens the
     // source beside a live target.
-    let claimed =
-        transition.is_some() || receipt.as_ref().is_some_and(|r| r.epoch == epoch) || row_matches;
+    let claimed = transition.is_some() || receipt_at_epoch.is_some() || row_matches;
 
     if claimed {
         let Some(instance_id) = expected_id.filter(|id| !id.is_empty()) else {
-            return error(anyhow!(
-                "abort of {name:?} at epoch {epoch} has no exact instance ID; refusing to revoke by name and epoch alone"
-            ));
+            return error(missing_abort_identity(name, epoch));
         };
+        if let Some(rid) = receipt_id {
+            if rid != instance_id {
+                return error(distinct_abort_identity(name));
+            }
+        } else if receipt_at_epoch.is_some() && transition.is_none() && !row_matches {
+            // Epoch-only receipts are not identity. Without a row or marker,
+            // a same-process retry after a failed save must fail closed.
+            return error(missing_abort_identity(name, epoch));
+        }
         let staged_exit =
             match crate::exit_point::abort_staged_move_transition(name, &instance_id).await {
                 Ok(staged) => staged,
@@ -1448,29 +1552,8 @@ pub async fn abort_target(reg: &mut Shard, name: &str, epoch: u64, instance_id: 
             }
         }
 
-        match reg.get(name).cloned() {
-            Ok(instance) if instance.move_epoch == epoch && instance.id == instance_id => {
-                if let Err(error) = reg.remove(name).and_then(|_| reg.save()) {
-                    return error(
-                        error.context("removing target registry authority during move rollback"),
-                    );
-                }
-                crate::exit_point::update(&instance.name, None);
-            }
-            Ok(instance) => {
-                return error(anyhow!(
-                    "target row for {name:?} is {} at move epoch {}, not this move",
-                    instance.id,
-                    instance.move_epoch
-                ))
-            }
-            Err(_) => {
-                // Same-process retry after a failed `save` already removed
-                // the row in memory.  Re-save before deleting proof.
-                if let Err(error) = reg.save() {
-                    return error(error.context("retrying target authority revocation"));
-                }
-            }
+        if let Err(error) = persist_target_row_revoke(reg, name, epoch, &instance_id) {
+            return error(error);
         }
         if let Err(error) = remove_tree(&live, "target directory") {
             return error(error);
@@ -2130,6 +2213,7 @@ mod tests {
             from_device: "laptop".into(),
             bytes: 0,
             files: BTreeMap::new(),
+            instance_id: "instance-id".into(),
         }
         .save(&staging)
         .unwrap();
@@ -2148,6 +2232,7 @@ mod tests {
         assert!(recovered.exit_point.is_none());
         assert!(TargetTransition::path(&live).exists());
         assert_eq!(Receipt::load(&live).unwrap().epoch, 9);
+        assert_eq!(Receipt::load(&live).unwrap().instance_id, "instance-id");
         assert!(
             Receipt::path(&live).exists(),
             "a retry needs the live receipt"
@@ -2378,6 +2463,7 @@ mod tests {
             from_device: "laptop".into(),
             bytes: 4096,
             files: [("disk.raw".to_owned(), 4096u64)].into_iter().collect(),
+            instance_id: "instance-id".into(),
         }
         .save(&staging)
         .unwrap();
@@ -2390,6 +2476,7 @@ mod tests {
             from_device: "laptop".into(),
             bytes: 4096,
             files: [("disk.raw".to_owned(), 4096u64)].into_iter().collect(),
+            instance_id: "instance-id".into(),
         }
         .save(&staging)
         .unwrap();
@@ -2454,6 +2541,7 @@ mod tests {
             from_device: from.into(),
             bytes: 0,
             files: BTreeMap::new(),
+            instance_id: "instance-id".into(),
         }
         .save(&staging)
         .unwrap();
@@ -2595,6 +2683,7 @@ mod tests {
                     from_device: "laptop".into(),
                     bytes: 0,
                     files: BTreeMap::new(),
+                    instance_id: "instance-id".into(),
                 }
                 .save(&live)
                 .unwrap();
@@ -2712,7 +2801,15 @@ mod tests {
                         || err.contains("committing"),
                     "{err}"
                 );
-                assert!(!shard.holds("dev"), "in-memory remove happens before save");
+                assert!(
+                    shard.holds("dev"),
+                    "save failure must restore in-memory authority"
+                );
+                assert_eq!(shard.get("dev").unwrap().id, "instance-id");
+                assert!(
+                    load_shard().holds("dev"),
+                    "durable row must survive a failed save"
+                );
                 assert!(
                     paths::instance_dir("dev").exists(),
                     "live directory must survive a failed durable revoke"
@@ -2721,6 +2818,117 @@ mod tests {
                 unwrap_ok(abort_target(&mut shard, "dev", 3, "instance-id").await);
                 assert!(!shard.holds("dev"));
                 assert!(!paths::instance_dir("dev").exists());
+            });
+        });
+    }
+
+    #[test]
+    fn abort_target_save_failure_preserves_identity_across_wrong_id_retry() {
+        with_home(|| {
+            block_on(async {
+                let manifest = named_manifest("instance-id");
+                stage_empty("dev", 3, "laptop");
+                let mut shard = load_shard();
+                unwrap_instance(commit_target(&mut shard, &manifest, 3, "desktop").await);
+                assert!(!TargetTransition::path(&paths::instance_dir("dev")).exists());
+                assert_eq!(
+                    Receipt::load(&paths::instance_dir("dev"))
+                        .unwrap()
+                        .instance_id,
+                    "instance-id"
+                );
+
+                let needle = paths::state_path().to_string_lossy().into_owned();
+                let _armed = durable::faults::arm_once(
+                    "abort-save",
+                    durable::faults::Point::Rename,
+                    needle,
+                    std::io::ErrorKind::Other,
+                );
+                let err = unwrap_err(abort_target(&mut shard, "dev", 3, "instance-id").await);
+                assert!(
+                    err.contains("removing target registry")
+                        || err.contains("injected")
+                        || err.contains("committing"),
+                    "{err}"
+                );
+                assert!(
+                    shard.holds("dev"),
+                    "injected shard-save failure must restore in-memory identity"
+                );
+                assert_eq!(shard.get("dev").unwrap().id, "instance-id");
+                assert!(load_shard().holds("dev"));
+                assert_eq!(load_shard().get("dev").unwrap().id, "instance-id");
+                assert!(paths::instance_dir("dev").exists());
+
+                let err = unwrap_err(abort_target(&mut shard, "dev", 3, "other-id").await);
+                assert!(
+                    err.contains("distinct instance ID")
+                        || err.contains("name collision")
+                        || err.contains("exact instance ID"),
+                    "{err}"
+                );
+                assert!(shard.holds("dev"));
+                assert_eq!(shard.get("dev").unwrap().id, "instance-id");
+                assert!(load_shard().holds("dev"));
+                assert_eq!(load_shard().get("dev").unwrap().id, "instance-id");
+                assert!(
+                    paths::instance_dir("dev").exists(),
+                    "wrong-ID retry must not delete the live directory after a failed save"
+                );
+
+                unwrap_ok(abort_target(&mut shard, "dev", 3, "instance-id").await);
+                assert!(!shard.holds("dev"));
+                assert!(!load_shard().holds("dev"));
+                assert!(!paths::instance_dir("dev").exists());
+
+                unwrap_ok(abort_target(&mut shard, "dev", 3, "instance-id").await);
+                assert!(!shard.holds("dev"));
+                assert!(!paths::instance_dir("dev").exists());
+            });
+        });
+    }
+
+    #[test]
+    fn a_legacy_receipt_without_instance_id_fails_closed_once_the_row_is_gone() {
+        with_home(|| {
+            block_on(async {
+                let manifest = named_manifest("instance-id");
+                stage_empty("dev", 3, "laptop");
+                let mut shard = load_shard();
+                unwrap_instance(commit_target(&mut shard, &manifest, 3, "desktop").await);
+                let live = paths::instance_dir("dev");
+                let legacy = r#"{"epoch":3,"from_device":"laptop","bytes":0,"files":{}}"#;
+                let parsed: Receipt = serde_json::from_str(legacy).unwrap();
+                assert!(
+                    parsed.instance_id.is_empty(),
+                    "absent identity must deserialize empty"
+                );
+                std::fs::write(Receipt::path(&live), legacy).unwrap();
+                shard.remove("dev").unwrap();
+                shard.save().unwrap();
+                assert!(!shard.holds("dev"));
+                assert!(live.exists());
+
+                let err = unwrap_err(abort_target(&mut shard, "dev", 3, "other-id").await);
+                assert!(
+                    err.contains("exact instance ID")
+                        || err.contains("name and epoch")
+                        || err.contains("distinct instance ID"),
+                    "{err}"
+                );
+                assert!(
+                    live.exists(),
+                    "legacy epoch-only receipt cannot authorize deletion"
+                );
+                assert!(Receipt::path(&live).exists());
+
+                let err = unwrap_err(abort_target(&mut shard, "dev", 3, "instance-id").await);
+                assert!(
+                    err.contains("exact instance ID") || err.contains("name and epoch"),
+                    "{err}"
+                );
+                assert!(live.exists());
             });
         });
     }
