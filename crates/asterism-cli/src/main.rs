@@ -5136,9 +5136,10 @@ mod tests {
             help.contains("`vz` (Apple Virtualization.framework)"),
             "{help}"
         );
+        assert!(help.contains("native `hyperv` on Windows"), "{help}");
         assert!(help.contains("`qemu` (compatibility)"), "{help}");
         assert!(
-            help.contains("select this device's native capable backend"),
+            help.contains("select this device's first capable native backend"),
             "{help}"
         );
     }
