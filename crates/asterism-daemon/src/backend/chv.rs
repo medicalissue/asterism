@@ -5,6 +5,7 @@
 //! already uses for every other backend.
 
 use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -1260,6 +1261,7 @@ fn wait_for_guest(
     timeout: Duration,
 ) -> Result<GuestEndpoint> {
     let start = Instant::now();
+    let fallback_addr: IpAddr = Network::for_instance(&instance.name).guest.parse()?;
     let handle = Handle {
         backend: ID.to_owned(),
         pid: Some(proc.pid),
@@ -1287,6 +1289,16 @@ fn wait_for_guest(
                 }
             }
         }
+        if let Some(banner) = ssh_banner(fallback_addr, Duration::from_millis(250)) {
+            eprintln!(
+                "astd: {} was found at {fallback_addr} by an ssh banner rather than by asking it over vsock port {} — {banner}",
+                instance.name,
+                guest::PORT
+            );
+            return Ok(GuestEndpoint::GuestAddr {
+                addr: fallback_addr,
+            });
+        }
         if start.elapsed() >= timeout {
             bail!(
                 "guest {:?} did not answer on vsock port {} with a reachable ssh address within {timeout:?}",
@@ -1296,6 +1308,27 @@ fn wait_for_guest(
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Connect to `ip:22` and require SSH's server-first identification string.
+///
+/// This is the same fail-closed readiness fallback as the native VZ backend:
+/// a TCP accept alone is not enough, and the deterministic CHV address is only
+/// returned after an SSH server proves it is serving there.
+fn ssh_banner(ip: IpAddr, timeout: Duration) -> Option<String> {
+    let mut stream = TcpStream::connect_timeout(&SocketAddr::new(ip, 22), timeout).ok()?;
+    stream.set_read_timeout(Some(timeout)).ok()?;
+    let mut buf = [0u8; 256];
+    let n = stream.read(&mut buf).ok()?;
+    if n == 0 {
+        return None;
+    }
+    let banner = String::from_utf8_lossy(&buf[..n]).trim().to_owned();
+    if !banner.starts_with("SSH-") {
+        return None;
+    }
+    let _ = stream.write_all(b"SSH-2.0-Asterism\r\n");
+    Some(banner)
 }
 
 fn guest_session(
