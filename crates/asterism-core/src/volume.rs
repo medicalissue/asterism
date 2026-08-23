@@ -1843,6 +1843,8 @@ mod tests {
             Some(ProcId {
                 pid: 4242,
                 started_us: 7,
+                boot_id: None,
+                started_ticks: None,
                 exec: None,
             }),
         )

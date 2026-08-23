@@ -93,9 +93,9 @@ enum Command {
         /// Disk size, e.g. 20G.
         #[arg(long, default_value = "20G")]
         disk: String,
-        /// Hypervisor to run this instance on: `qemu` (default) or `vz`,
-        /// Apple's Virtualization.framework — faster to boot and needing no
-        /// `brew install qemu`, on macOS 14+ with a signed helper. Recorded
+        /// Hypervisor to run this instance on: `chv` (Cloud Hypervisor/KVM),
+        /// `vz` (Apple Virtualization.framework), or `qemu` (compatibility).
+        /// Omit it to select this device's native capable backend. Recorded
         /// on the instance and used for every later boot.
         #[arg(long, value_name = "NAME")]
         backend: Option<String>,
@@ -4519,6 +4519,7 @@ fn service_command(cmd: ServiceCommand) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use std::cell::Cell;
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -4955,6 +4956,26 @@ mod tests {
             assert_eq!(image_path(Some("nas"), spoken), ImagePath::DeviceProtocol);
         }
         assert_eq!(image_path(None, 6), ImagePath::DeviceProtocol);
+    }
+
+    #[test]
+    fn create_help_names_every_backend_and_native_default_selection() {
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("create")
+            .expect("create is a public command")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("`chv` (Cloud Hypervisor/KVM)"), "{help}");
+        assert!(
+            help.contains("`vz` (Apple Virtualization.framework)"),
+            "{help}"
+        );
+        assert!(help.contains("`qemu` (compatibility)"), "{help}");
+        assert!(
+            help.contains("select this device's native capable backend"),
+            "{help}"
+        );
     }
 
     #[test]

@@ -68,6 +68,15 @@ pub struct ProcId {
     /// would compare equal across a reboot, which is exactly the case a
     /// resurrecting daemon is in.
     pub started_us: u64,
+    /// Linux's stable boot identity. Paired with `started_ticks` because
+    /// `/proc/stat`'s wall-clock `btime` can move when the host clock steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
+    /// Linux clock ticks since boot at process start. This, plus `boot_id`,
+    /// is authoritative when present; `started_us` remains for compatibility
+    /// and the adoption time-window check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_ticks: Option<u64>,
     /// Absolute path of the executable the process was running when this was
     /// captured. `None` where the platform would not say.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -241,6 +250,8 @@ impl ProcId {
         Ok(ProcId {
             pid,
             started_us: probe.started_us,
+            boot_id: probe.boot_id,
+            started_ticks: probe.started_ticks,
             exec: probe.exec,
         })
     }
@@ -298,20 +309,6 @@ impl ProcId {
                 started_secs.saturating_sub(started_at)
             ));
         }
-        let Some(exec) = &probe.exec else {
-            return Err(format!(
-                "this platform will not say what process {pid} is running, so it cannot \
-                 be adopted"
-            ));
-        };
-        if !matches_any(exec, evidence.exec) {
-            return Err(format!(
-                "process {pid} is running {}, not {}",
-                exec.display(),
-                evidence.exec.join(" or ")
-            ));
-        }
-
         // The evidence itself, and the only line here that can answer yes.
         let Some(argv) = argv(pid) else {
             return Err(format!(
@@ -319,11 +316,30 @@ impl ProcId {
                  ties it to this instance"
             ));
         };
+        // Linux deliberately hides /proc/<pid>/exe for a file-capability
+        // process from its unprivileged parent. In that case argv[0] still
+        // has to name the expected executable family, and adoption still
+        // rests on the instance-exclusive path below. An argv name alone is
+        // never authority.
+        let argv_exec = argv.first().map(PathBuf::from);
+        let Some(described_exec) = probe.exec.as_ref().or(argv_exec.as_ref()) else {
+            return Err(format!(
+                "this host will not say what process {pid} is running, so it cannot be adopted"
+            ));
+        };
+        if !matches_any(described_exec, evidence.exec) {
+            return Err(format!(
+                "process {pid} is running {}, not {}",
+                described_exec.display(),
+                evidence.exec.join(" or ")
+            ));
+        }
         if evidence.found_in(&argv).is_none() {
             return Err(format!(
                 "pid {pid} is a {} that was not started for this instance — its command \
                  line names none of {}",
-                exec.file_name()
+                described_exec
+                    .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("process"),
                 evidence.describe()
@@ -333,6 +349,8 @@ impl ProcId {
         Ok(ProcId {
             pid,
             started_us: probe.started_us,
+            boot_id: probe.boot_id,
+            started_ticks: probe.started_ticks,
             exec: probe.exec,
         })
     }
@@ -354,11 +372,33 @@ impl ProcId {
         if probe.zombie {
             return Ownership::Gone;
         }
-        if probe.started_us != self.started_us {
-            return Ownership::Foreign(format!(
-                "pid {} started at {}, not at {} — the number was recycled",
-                self.pid, probe.started_us, self.started_us
-            ));
+        match (
+            self.boot_id.as_deref(),
+            self.started_ticks,
+            probe.boot_id.as_deref(),
+            probe.started_ticks,
+        ) {
+            (Some(was_boot), Some(was_ticks), Some(now_boot), Some(now_ticks)) => {
+                if was_boot != now_boot || was_ticks != now_ticks {
+                    return Ownership::Foreign(format!(
+                        "pid {} began at boot {now_boot} tick {now_ticks}, not boot {was_boot} tick {was_ticks} — the number was recycled",
+                        self.pid
+                    ));
+                }
+            }
+            (Some(_), _, _, _) | (_, Some(_), _, _) => {
+                return Ownership::Unknown(format!(
+                    "the kernel did not return the Linux boot identity recorded for pid {}",
+                    self.pid
+                ));
+            }
+            _ if probe.started_us != self.started_us => {
+                return Ownership::Foreign(format!(
+                    "pid {} started at {}, not at {} — the number was recycled",
+                    self.pid, probe.started_us, self.started_us
+                ));
+            }
+            _ => {}
         }
         // Start time survives exec, so a process that swapped its own binary
         // still matches on the stamp above. Only the path catches it.
@@ -479,6 +519,8 @@ enum Look {
 struct Probe {
     /// Process start, microseconds since the unix epoch.
     started_us: u64,
+    boot_id: Option<String>,
+    started_ticks: Option<u64>,
     /// Exited and not yet reaped: a slot in the process table, not a program.
     zombie: bool,
     exec: Option<PathBuf>,
@@ -616,6 +658,8 @@ fn look(pid: u32) -> Look {
         if why.raw_os_error() == Some(libc::ESRCH) {
             return Look::Found(Probe {
                 started_us: 0,
+                boot_id: None,
+                started_ticks: None,
                 zombie: true,
                 exec: None,
             });
@@ -647,6 +691,8 @@ fn look(pid: u32) -> Look {
 
     Look::Found(Probe {
         started_us,
+        boot_id: None,
+        started_ticks: None,
         zombie: info.pbi_status == libc::SZOMB,
         exec,
     })
@@ -686,14 +732,28 @@ fn look(pid: u32) -> Look {
     let (Some(state), Some(ticks)) = (fields.first(), fields.get(19)) else {
         return unreadable();
     };
-    let (Ok(started_ticks), Some(boot_us)) = (ticks.parse::<u64>(), boot_time_us()) else {
+    let (Ok(started_ticks), Some(boot_us), Some(boot_id)) =
+        (ticks.parse::<u64>(), boot_time_us(), linux_boot_id())
+    else {
         return unreadable();
     };
     Look::Found(Probe {
         started_us: boot_us.saturating_add(started_ticks.saturating_mul(1_000_000) / hz()),
+        boot_id: Some(boot_id),
+        started_ticks: Some(started_ticks),
         zombie: *state == "Z",
         exec: std::fs::read_link(format!("/proc/{pid}/exe")).ok(),
     })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn linux_boot_id() -> Option<String> {
+    Some(
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .ok()?
+            .trim()
+            .to_owned(),
+    )
 }
 
 /// Clock ticks per second, which is what `/proc/<pid>/stat` counts start
@@ -817,6 +877,8 @@ mod tests {
         let nobody = ProcId {
             pid: 0,
             started_us: 1,
+            boot_id: None,
+            started_ticks: None,
             exec: None,
         };
         assert_eq!(nobody.check(), Ownership::Gone);
@@ -833,10 +895,12 @@ mod tests {
 
         // Same pid, a start instant it never had: what a stale handle looks
         // like once the number has been handed out again.
-        let stale = ProcId {
-            started_us: real.started_us - 1,
-            ..real.clone()
-        };
+        let mut stale = real.clone();
+        if let Some(ticks) = stale.started_ticks.as_mut() {
+            *ticks -= 1;
+        } else {
+            stale.started_us -= 1;
+        }
         assert!(matches!(stale.check(), Ownership::Foreign(_)));
         assert!(!stale.alive());
 
@@ -916,6 +980,8 @@ mod tests {
     fn found(started_us: u64) -> Look {
         Look::Found(Probe {
             started_us,
+            boot_id: None,
+            started_ticks: None,
             zombie: false,
             exec: None,
         })
@@ -926,6 +992,8 @@ mod tests {
         let id = ProcId {
             pid: 4242,
             started_us: 7,
+            boot_id: None,
+            started_ticks: None,
             exec: None,
         };
         let unknown = id.against(Look::Unreadable("no answer".into()));
@@ -944,6 +1012,8 @@ mod tests {
         let id = ProcId {
             pid: 4242,
             started_us: 7,
+            boot_id: None,
+            started_ticks: None,
             exec: None,
         };
 
@@ -962,10 +1032,42 @@ mod tests {
         // A zombie is an exit status, not a running program.
         let zombie = id.against(Look::Found(Probe {
             started_us: 7,
+            boot_id: None,
+            started_ticks: None,
             zombie: true,
             exec: None,
         }));
         assert_eq!(zombie, Ownership::Gone);
+    }
+
+    #[test]
+    fn linux_identity_does_not_move_when_the_wall_clock_steps() {
+        let id = ProcId {
+            pid: 4242,
+            started_us: 100,
+            boot_id: Some("this-boot".into()),
+            started_ticks: Some(700),
+            exec: None,
+        };
+        let after_clock_step = Look::Found(Probe {
+            started_us: 3_000_100,
+            boot_id: Some("this-boot".into()),
+            started_ticks: Some(700),
+            zombie: false,
+            exec: None,
+        });
+
+        assert_eq!(id.against(after_clock_step), Ownership::Ours);
+        assert!(matches!(
+            id.against(Look::Found(Probe {
+                started_us: 100,
+                boot_id: Some("another-boot".into()),
+                started_ticks: Some(700),
+                zombie: false,
+                exec: None,
+            })),
+            Ownership::Foreign(_)
+        ));
     }
 
     /// An identity that names no executable matches whatever is running —
@@ -975,10 +1077,14 @@ mod tests {
         let bare = ProcId {
             pid: 1,
             started_us: 7,
+            boot_id: None,
+            started_ticks: None,
             exec: None,
         };
         let running = Look::Found(Probe {
             started_us: 7,
+            boot_id: None,
+            started_ticks: None,
             zombie: false,
             exec: Some(PathBuf::from("/usr/bin/anything")),
         });
@@ -991,6 +1097,8 @@ mod tests {
         assert!(matches!(
             named.against(Look::Found(Probe {
                 started_us: 7,
+                boot_id: None,
+                started_ticks: None,
                 zombie: false,
                 exec: Some(PathBuf::from("/bin/something-else")),
             })),
@@ -1143,10 +1251,12 @@ mod tests {
         // Even a hand-built identity naming that pid does not help if it is
         // not the process that was recorded: the number is the only thing it
         // shares, and that is not what `signal` checks.
-        let forged = ProcId {
-            started_us: real.started_us - 1,
-            ..real.clone()
-        };
+        let mut forged = real.clone();
+        if let Some(ticks) = forged.started_ticks.as_mut() {
+            *ticks -= 1;
+        } else {
+            forged.started_us -= 1;
+        }
         assert!(forged.signal(Signal::Kill).is_err());
         assert!(real.alive(), "still untouched");
 
@@ -1293,6 +1403,8 @@ mod tests {
         let id = ProcId {
             pid: 4242,
             started_us: 1_700_000_000_123_456,
+            boot_id: Some("boot-a".into()),
+            started_ticks: Some(1234),
             exec: Some(PathBuf::from("/opt/homebrew/bin/qemu-system-aarch64")),
         };
         let json = serde_json::to_string(&id).unwrap();
