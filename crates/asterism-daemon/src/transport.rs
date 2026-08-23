@@ -28,7 +28,9 @@ use anyhow::{Context, Result};
 use asterism_core::ipc::{Listener as LocalListener, ServerStream as LocalStream};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[cfg(windows)]
-use tokio::io::{ReadHalf as OwnedReadHalf, WriteHalf as OwnedWriteHalf};
+type OwnedReadHalf = tokio::io::ReadHalf<LocalStream>;
+#[cfg(windows)]
+type OwnedWriteHalf = tokio::io::WriteHalf<LocalStream>;
 #[cfg(unix)]
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 #[cfg(unix)]
