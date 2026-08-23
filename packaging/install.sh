@@ -165,7 +165,9 @@ drain_own_nbd_claims() {
 	for claim in "$state"/nbd*; do
 		[ -d "$claim" ] || continue
 		case "$claim" in *.new.*) continue ;; esac
-		[ -f "$claim/owner" ] && [ -f "$claim/helper-pid" ] || continue
+		if [ ! -f "$claim/owner" ] || [ ! -f "$claim/helper-pid" ]; then
+			continue
+		fi
 		owner=$(cat "$claim/owner" 2>/dev/null || true)
 		name=$(basename "$claim")
 		case "$name" in
@@ -959,9 +961,9 @@ configure_chv_linux() {
 		fi
 	fi
 	run_root setcap cap_net_admin+ep "${PREFIX}/bin/cloud-hypervisor"
-	[ -r /dev/kvm ] && [ -w /dev/kvm ] || {
+	if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
 		err "/dev/kvm is not read-write for this user. Add the user to the kvm group and log in again before starting an instance."
-	}
+	fi
 }
 
 remove_chv_linux_policy() {

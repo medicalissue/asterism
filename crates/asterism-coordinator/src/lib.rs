@@ -1349,6 +1349,15 @@ pub struct PersistentCoordinator {
     _writer_lock: File,
 }
 
+impl Drop for PersistentCoordinator {
+    fn drop(&mut self) {
+        // Closing a lock file normally releases its advisory lock. Explicitly
+        // unlock first as well so a concurrently spawned child cannot prolong
+        // the writer lifetime with an inherited copy of the descriptor.
+        let _ = self._writer_lock.unlock();
+    }
+}
+
 impl PersistentCoordinator {
     /// Opens existing encrypted state or creates an empty coordinator.
     pub fn open(
@@ -2228,6 +2237,9 @@ mod tests {
             let binding = service.sign_in_identity(claims.clone()).unwrap();
             assert_eq!(binding.account_id, expected);
             assert!(service.export_account(&binding).is_ok());
+            // Model a descriptor inherited by a concurrently spawned test
+            // helper: coordinator teardown must still end this writer's lock.
+            let inherited_writer = service._writer_lock.try_clone().unwrap();
             drop(service);
             let restarted = PersistentCoordinator::open(&path, keys, [6; 32]).unwrap();
             assert!(
@@ -2242,6 +2254,7 @@ mod tests {
                     .starts_with("state.tmp-")),
                 "restart must remove the stale temporary file after {point:?}"
             );
+            drop(inherited_writer);
         }
     }
 
