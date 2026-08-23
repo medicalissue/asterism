@@ -15,12 +15,11 @@
 //! behind a projected guest GPU device. [`remote_gpu_guest`] is the
 //! guest-local `/dev/nvidia0` CUSE + generated libcuda projection.
 //! [`remote_gpu_path`] carries CUDA-semantic frames over the authenticated
-//! mesh. [`remote_gpu_nvidia`] is the fail-closed NVIDIA inventory/matrix
-//! and two-device harness around that ABI. [`remote_gpu_release_gate`] is the
-//! exact hardware PASS record consuming the projection and real-provider
-//! candidates; reference and host-direct CUDA cannot satisfy it. [`verify`]
-//! gates boot inputs on their way into and out of the store, and [`profile`]
-//! is what a guest becomes after boot.
+//! mesh, and [`remote_gpu_cuda`] is the production NVIDIA driver executor.
+//! [`remote_gpu_nvidia`] provides fail-closed admission; the exact hardware
+//! verdict lives in [`remote_gpu_release_gate`]. Reference and host-direct
+//! CUDA cannot satisfy that verdict. [`verify`] gates boot inputs and
+//! [`profile`] is what a guest becomes after boot.
 
 pub mod backup;
 pub mod compat;
@@ -42,6 +41,7 @@ pub mod profile;
 pub mod protocol;
 pub mod registry;
 pub mod remote_gpu;
+pub mod remote_gpu_cuda;
 pub mod remote_gpu_guest;
 pub mod remote_gpu_nvidia;
 pub mod remote_gpu_release_gate;
