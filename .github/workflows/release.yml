@@ -360,6 +360,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 peeled commit
+      - name: Install pinned Linux runtime build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libseccomp-dev libcap-ng-dev
       - name: Build Linux CLI and daemon
         env:
           ASTERISM_BUILD_ID: ${{ github.sha }}

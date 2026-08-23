@@ -918,6 +918,25 @@ prepare_chv_source() {
 	# This is data from the checked-out tag/ref, not code from the network.
 	# shellcheck disable=SC1090,SC1091
 	. "${source_root}/packaging/linux-components.env"
+	# Building the pinned virtiofsd source needs only these two native
+	# development libraries. Install them before spending time compiling so
+	# the source lane either has its complete declared toolchain or refuses
+	# without leaving a half-built runtime.
+	if ! have pkg-config || ! pkg-config --exists libseccomp libcap-ng; then
+		if have apt-get; then
+			run_root apt-get update
+			run_root apt-get install -y pkg-config libseccomp-dev libcap-ng-dev
+		elif have dnf; then
+			run_root dnf install -y pkgconf-pkg-config libseccomp-devel libcap-ng-devel
+		elif have zypper; then
+			run_root zypper --non-interactive install pkg-config libseccomp-devel libcap-ng-devel
+		else
+			die "building the pinned virtiofsd needs pkg-config, libseccomp, and libcap-ng development files"
+		fi
+	fi
+	if ! have pkg-config || ! pkg-config --exists libseccomp libcap-ng; then
+		die "the package manager completed but virtiofsd's libseccomp/libcap-ng build inputs are unavailable"
+	fi
 	case "$(uname -m)" in
 	x86_64 | amd64)
 		chv_url="$CLOUD_HYPERVISOR_X86_64_URL"
