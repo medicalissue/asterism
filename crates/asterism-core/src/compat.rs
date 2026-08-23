@@ -111,9 +111,9 @@ use crate::VERSION;
 /// * **6** — device-local structured image catalog and pull results.
 /// * **7** — orbit storage catalog, placement, leases, and fenced NBD splices.
 /// * **8** — guest NVIDIA projection control frames (`gpu_guest_*`) and the
-///   dedicated GPU mesh stream. The guest contract is a local `/dev/nvidia0`
-///   endpoint plus generated libcuda; the mesh opening frame is
-///   instance-bound and token-free.
+///   dedicated GPU mesh stream plus CUDA provider status. The guest contract
+///   is a local `/dev/nvidia0` endpoint plus generated libcuda; mesh opening
+///   metadata is instance-bound and token-free.
 pub const PROTOCOL_VERSION: u32 = 8;
 
 /// The wire as it was before it carried a version.

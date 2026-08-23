@@ -32,6 +32,12 @@ pub fn socket_path() -> PathBuf {
     short_socket(home_dir().join("astd.sock"))
 }
 
+/// Unix socket of the GPU provider helper. Never a TCP listener: the helper
+/// is local to this home, mode 0600, and does not persist lease tokens.
+pub fn gpu_helper_socket_path() -> PathBuf {
+    short_socket(home_dir().join("gpu.sock"))
+}
+
 /// Pid of the running daemon, written at startup and removed on a clean
 /// shutdown. The CLI needs it to retire a daemon left over from an older
 /// version — unlike the socket, a pid is something it can act on.

@@ -57,8 +57,8 @@ use transport::{Admitted, Framing};
 
 mod backend;
 mod device_shell;
-mod gpu;
 mod egress;
+mod gpu;
 mod images;
 mod instance;
 mod mesh;
@@ -197,6 +197,19 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Install only a live CUDA executor. Source fixtures can construct a
+    // reference provider explicitly, but production never advertises it.
+    if std::env::var_os("ASTERISM_DISABLE_GPU_PROVIDER").is_none() {
+        let gpu_name = node.device_name().await;
+        let gpu_id = mesh
+            .as_ref()
+            .map(|mesh| mesh.device_id().to_string())
+            .unwrap_or_else(|| "0".repeat(64));
+        if let Err(error) = node.gpu.install_live(gpu_name, gpu_id) {
+            eprintln!("astd: GPU provider unavailable: {error:#}");
+        }
+    }
+
     // Metadata lives in ASTERISM_HOME; values live behind the platform store
     // (the macOS login Keychain). There is intentionally no file fallback.
     if let Err(e) = secret::init() {
@@ -298,8 +311,8 @@ fn print_early_exit() -> bool {
                 "astd — the Asterism device daemon\n\n\
                  Usage: astd\n\n\
                  Options:\n\
-                   --help     Print help\n\
-                   --version  Print version"
+                   --help        Print help\n\
+                   --version     Print version"
             );
             true
         }
@@ -809,6 +822,9 @@ pub(crate) async fn handle(req: Request, node: &Node) -> Response {
     // a lease and wait forever on its own lock.
     if volume::is_plane_request(&req) {
         return volume::serve(req).await;
+    }
+    if gpu::claims(&req) {
+        return gpu::serve(req, node);
     }
     if images::is_plane_request(&req) {
         return images::serve(req).await;
