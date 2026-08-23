@@ -237,15 +237,11 @@ infrastructure can be selected with `ASTERISM_RELAY_URL`,
 
 ## Updates
 
-The CLI and menu-bar app use one signed update channel. An update verifies the
-manifest and matching app, CLI, daemon, and helper before activation, and
-rolls the unit back if activation fails. Homebrew installations remain owned
-by Homebrew.
-
-For a first desktop install on Apple silicon, download
-`Asterism-<version>-darwin-arm64.dmg` from the matching GitHub release, open it,
-and drag Asterism to Applications. The `.app.tar.gz` beside it is the updater
-payload, not the manual installer.
+The CLI uses a signed update channel. Its updater retains the authenticated
+Desktop-manifest boundary: when a private Desktop release supplies matching
+app metadata, it verifies the app, CLI, daemon, and helper before atomically
+activating them. Public Asterism releases contain only the CLI, daemon, and VZ
+helper; Homebrew installations remain owned by Homebrew.
 
 ```console
 $ ast update status
