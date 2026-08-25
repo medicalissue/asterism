@@ -269,17 +269,29 @@ fn shutdown(system_id: &str, timeout_ms: u32) -> Result<()> {
     // terminable. `ast down` is an outcome contract, so fall back to the
     // same bounded termination used after a graceful-shutdown timeout.
     const HCS_SHUTDOWN_NOT_SUPPORTED: HRESULT = 0x8007_0032u32 as i32;
-    if hr == HCS_SHUTDOWN_NOT_SUPPORTED {
-        return hcs_action(
+    let terminate = || {
+        hcs_action(
             &system,
             "terminating HCS compute system",
             |operation| unsafe { HcsTerminateComputeSystem(system.0, operation, null()) },
-        );
+        )
+    };
+    if hr == HCS_SHUTDOWN_NOT_SUPPORTED {
+        return terminate();
     }
     if failed(hr) {
         bail!("requesting HCS shutdown: {}", hresult(hr, null_mut()));
     }
-    operation.wait("requesting HCS shutdown")?;
+    let mut document: PWSTR = null_mut();
+    let wait_hr = unsafe { HcsWaitForOperationResult(operation.0, HCS_TIMEOUT_MS, &mut document) };
+    let text = pwstr(document);
+    free_local(document);
+    if wait_hr == HCS_SHUTDOWN_NOT_SUPPORTED {
+        return terminate();
+    }
+    if failed(wait_hr) {
+        bail!("requesting HCS shutdown: {}", hresult_text(wait_hr, &text));
+    }
     let mut result: PWSTR = null_mut();
     let hr = unsafe { HcsWaitForComputeSystemExit(system.0, timeout_ms, &mut result) };
     if failed(hr) {
