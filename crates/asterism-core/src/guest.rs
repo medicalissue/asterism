@@ -1052,19 +1052,18 @@ if __name__ == "__main__":
 const AGENT_UNIT: &str = "\
 [Unit]
 Description=Asterism guest agent (the host's control channel, over vsock)
-After=local-fs.target
-# Before ssh, so that by the time the host can see this guest's sshd it can
-# already ask the guest about it. The same ordering the host-key unit takes,
-# and for the same reason: what runs after sshd cannot answer for it.
-Before=ssh.service sshd.service ssh.socket sshd.socket
+After=local-fs.target systemd-modules-load.service
 Documentation=https://asterism.run
 
 [Service]
 Type=simple
-ExecStartPre=-/bin/sh -c 'modprobe hv_sock 2>/dev/null || true; modprobe vmw_vsock_virtio_transport 2>/dev/null || true'
+ExecStartPre=-/sbin/modprobe hv_sock
+ExecStartPre=-/sbin/modprobe vmw_vsock_virtio_transport
 ExecStart=/usr/local/sbin/asterism-guest
 Restart=always
 RestartSec=1
+StandardOutput=append:/var/log/asterism-guest.log
+StandardError=append:/var/log/asterism-guest.log
 # Never the reason a guest cannot shut down.
 TimeoutStopSec=5
 
@@ -1802,6 +1801,10 @@ mod tests {
         assert!(
             unit.contains("modprobe vmw_vsock_virtio_transport"),
             "{unit}"
+        );
+        assert!(
+            !unit.contains("Before=ssh"),
+            "guest readiness must not block the guest's SSH boot transaction: {unit}"
         );
         // The path in the unit is the one the rewrite above moved, so what
         // is checked here is that the unit runs the agent it just wrote.
