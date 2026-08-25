@@ -1042,11 +1042,13 @@ if __name__ == "__main__":
 
 /// The systemd unit that keeps the agent running.
 ///
-/// `modprobe` first because the virtio vsock transport is a module in most
-/// distributions and nothing else in a guest ever asks for it; the `-`
-/// prefix means a guest that has it built in is not a failure. `Restart`
-/// because the agent is the host's only deterministic way in, and the guest
-/// is unattended by definition.
+/// `modprobe` first because the host-specific vsock transport is a module in
+/// most distributions and nothing else in a guest ever asks for it. Hyper-V
+/// uses `hv_sock`; VZ, Cloud Hypervisor and QEMU use the virtio transport.
+/// Loading a transport that has no matching device is harmless, and failures
+/// are ignored for guests that build their one applicable transport in.
+/// `Restart` because the agent is the host's only deterministic way in, and
+/// the guest is unattended by definition.
 const AGENT_UNIT: &str = "\
 [Unit]
 Description=Asterism guest agent (the host's control channel, over vsock)
@@ -1059,7 +1061,7 @@ Documentation=https://asterism.run
 
 [Service]
 Type=simple
-ExecStartPre=-/bin/sh -c 'modprobe vmw_vsock_virtio_transport 2>/dev/null || true'
+ExecStartPre=-/bin/sh -c 'modprobe hv_sock 2>/dev/null || true; modprobe vmw_vsock_virtio_transport 2>/dev/null || true'
 ExecStart=/usr/local/sbin/asterism-guest
 Restart=always
 RestartSec=1
@@ -1796,6 +1798,11 @@ mod tests {
             std::fs::read_to_string(dir.path().join("etc/systemd/system/asterism-guest.service"))
                 .unwrap();
         assert!(unit.contains("Restart=always"), "{unit}");
+        assert!(unit.contains("modprobe hv_sock"), "{unit}");
+        assert!(
+            unit.contains("modprobe vmw_vsock_virtio_transport"),
+            "{unit}"
+        );
         // The path in the unit is the one the rewrite above moved, so what
         // is checked here is that the unit runs the agent it just wrote.
         assert!(
