@@ -274,7 +274,7 @@ impl VmConfig {
                 "NetworkAdapters": {
                     "asterism": {
                         "EndpointId": self.endpoint_id,
-                        "MacAddress": self.mac.replace(':', "")
+                        "MacAddress": self.mac.replace(':', "-")
                     }
                 },
                 "HvSocket": {
@@ -665,6 +665,10 @@ mod tests {
         assert_eq!(
             doc["VirtualMachine"]["Devices"]["Scsi"]["root"]["Attachments"]["2"]["ReadOnly"],
             true
+        );
+        assert_eq!(
+            doc["VirtualMachine"]["Devices"]["NetworkAdapters"]["asterism"]["MacAddress"],
+            "02-15-5d-01-02-03"
         );
         let text = doc.to_string().to_ascii_lowercase();
         assert!(!text.contains("qemu"));
