@@ -158,9 +158,9 @@ function Invoke-Ast([string[]]$CommandArgs) {
     }
 }
 
-$home = if ($env:ASTERISM_HOME) { $env:ASTERISM_HOME } elseif ($env:USERPROFILE) { Join-Path $env:USERPROFILE ".asterism" } else { Join-Path $env:HOME ".asterism" }
-$configPath = Join-Path $home "instances\$Instance\hyperv.json"
-$daemonPidPath = Join-Path $home "astd.pid"
+$asterismHome = if ($env:ASTERISM_HOME) { $env:ASTERISM_HOME } elseif ($env:USERPROFILE) { Join-Path $env:USERPROFILE ".asterism" } else { Join-Path $env:HOME ".asterism" }
+$configPath = Join-Path $asterismHome "instances\$Instance\hyperv.json"
+$daemonPidPath = Join-Path $asterismHome "astd.pid"
 $systemId = $null
 $networkId = $null
 $endpointId = $null
