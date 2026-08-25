@@ -510,6 +510,12 @@ pub(crate) async fn revoke_for_remove(
     node: &Node,
     mesh: Option<&Arc<Mesh>>,
 ) -> Result<()> {
+    // A failed create leaves no local row. With no mesh there cannot be a
+    // remote GPU lease to revoke either; let ordinary Remove return its own
+    // truthful "no instance" result instead of manufacturing a GPU error.
+    if mesh.is_none() && !node.shard.lock().await.holds(name) {
+        return Ok(());
+    }
     let instance = control_instance(name, node, mesh).await?;
     if instance.gpu.is_none() {
         return Ok(());

@@ -73,6 +73,14 @@ raw images, and OCI references such as `nginx` or
 SSH keys with cloud-init, and applies optional bootstrap profiles for tools
 such as git, tmux, Node, Claude Code, and Codex.
 
+OCI is an image format, not a second kind of Instance. Asterism selects the
+host architecture's verified manifest and keeps VM versus native-namespace
+isolation behind the same Instance lifecycle. The selected adapter is
+persisted for deterministic recovery; architecture-specific mutations and
+snapshots do not become cross-architecture portable merely because their
+source was OCI. Automatic adapter policy is still pending, so ordinary create
+currently retains the VM default.
+
 On macOS, Asterism uses Virtualization.framework when it satisfies the
 instance's requirements. QEMU is an optional compatibility backend, not an
 install dependency. Pass `--backend vz` or install QEMU separately and pass
@@ -156,8 +164,9 @@ operations across the mesh.
 See [Compute placement](docs/compute-placement.md) for the architecture and
 compatibility contract.
 
-- **Compute** comes from one device: CPU, physical RAM, and VM/container
-  execution state move together. `--cpus` and `--mem` are quotas on that
+- **Compute** comes from one device: CPU, physical RAM, and execution state
+  move together. Hypervisor and namespace adapters are internal placement
+  details; both appear and behave as an Instance. `--cpus` and `--mem` are quotas on that
   selected compute device, not separately placeable resources. Move compute
   offline without changing the instance's name or identity; its root disk and
   snapshots transfer peer-to-peer as part of the move.
@@ -245,15 +254,11 @@ infrastructure can be selected with `ASTERISM_RELAY_URL`,
 
 ## Updates
 
-The CLI and menu-bar app use one signed update channel. An update verifies the
-manifest and matching app, CLI, daemon, and helper before activation, and
-rolls the unit back if activation fails. Homebrew installations remain owned
-by Homebrew.
-
-For a first desktop install on Apple silicon, download
-`Asterism-<version>-darwin-arm64.dmg` from the matching GitHub release, open it,
-and drag Asterism to Applications. The `.app.tar.gz` beside it is the updater
-payload, not the manual installer.
+The CLI uses a signed update channel. Its updater retains the authenticated
+Desktop-manifest boundary: when a private Desktop release supplies matching
+app metadata, it verifies the app, CLI, daemon, and helper before atomically
+activating them. Public Asterism releases contain only the CLI, daemon, and VZ
+helper; Homebrew installations remain owned by Homebrew.
 
 ```console
 $ ast update status

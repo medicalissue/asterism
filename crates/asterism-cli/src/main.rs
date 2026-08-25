@@ -77,12 +77,12 @@ enum Command {
         /// Image to boot: an alias (`ast images`), an https:// url, a path to
         /// a qcow2 or raw disk image, or an OCI/Docker reference such as
         /// `nginx` or `ghcr.io/owner/app:v1`. OCI image format is independent
-        /// of `--runtime`: it may boot as a VM or enter native namespaces.
+        /// of the internal isolation adapter used by the selected device.
         #[arg(long, default_value = "ubuntu:24.04")]
         image: String,
-        /// Isolation runtime. `vm` keeps the existing hypervisor path;
-        /// `container` requires a native OCI-capable host adapter.
-        #[arg(long, value_enum, default_value_t = CliRuntime::Vm)]
+        /// Internal compatibility override. Instances are one public product
+        /// model; this legacy switch stays parseable but is hidden from help.
+        #[arg(long, value_enum, default_value_t = CliRuntime::Vm, hide = true)]
         runtime: CliRuntime,
         /// Publish a guest port on this device's loopback: `-p 8080:80`.
         ///
@@ -416,7 +416,7 @@ enum Command {
     /// Change one of an instance's parts.
     ///
     /// Canonical today: `compute`, the orbit device supplying CPU, physical
-    /// RAM, and VM/container execution state as one placement unit. `cpu`
+    /// RAM, and execution state as one placement unit. `cpu`
     /// remains a compatibility alias. The instance's name, id, and snapshots
     /// do not move, because they were never on a device.
     Set {
@@ -4156,8 +4156,8 @@ fn print_table(rows: &[OrbitRow]) {
         return;
     }
     println!(
-        "{:<14} {:<9} {:<10} {:<14} {:<16} {:<12} {:<6} ACCESS",
-        "NAME", "STATUS", "RUNTIME", "IMAGE", "SHAPE", "COMPUTE", "AGE"
+        "{:<14} {:<9} {:<14} {:<16} {:<12} {:<6} ACCESS",
+        "NAME", "STATUS", "IMAGE", "SHAPE", "COMPUTE", "AGE"
     );
     let mut stale = false;
     let mut conflicts = Vec::new();
@@ -4194,10 +4194,9 @@ fn print_table(rows: &[OrbitRow]) {
             _ => "-".into(),
         };
         println!(
-            "{:<14} {:<9} {:<10} {:<14} {:<16} {:<12} {:<6} {}",
+            "{:<14} {:<9} {:<14} {:<16} {:<12} {:<6} {}",
             inst.name,
             status,
-            inst.runtime,
             short_image(inst.image.as_deref().unwrap_or("-")),
             shape,
             inst.compute_device(),
@@ -4219,7 +4218,6 @@ fn print_detail(inst: &Instance, guest_health: Option<&GuestHealth>) {
     println!("name:    {}", inst.name);
     println!("id:      {}", inst.id);
     println!("status:  {}", inst.status);
-    println!("runtime: {}", inst.runtime);
     // What happens when the guest dies, which is half of what "never
     // sleeps" means. Printed always, because the answer matters most for
     // the instance nobody has thought about since they created it.

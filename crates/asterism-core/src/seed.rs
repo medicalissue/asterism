@@ -13,13 +13,17 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use hadris_iso::read::PathSeparator;
+use hadris_iso::write::options::{CreationFeatures, IsoFormatOptions};
+use hadris_iso::write::{File as IsoFile, InputFiles, IsoImageWriter};
 
 use crate::hv::ShareKind;
 use crate::instance::{Instance, Volume};
 use crate::profile::Bootstrap;
-use crate::tools::{run, tool};
+use crate::tools::run;
 use crate::{instance, paths};
 
 /// Bumped when the seed template changes, so an upgraded daemon reissues
@@ -304,32 +308,69 @@ fn build(name: &str, seed: &Path, input: &Input<'_>) -> Result<()> {
     std::fs::create_dir_all(&stage)?;
     write_nocloud_files(&stage, &user_data, &meta_data, input.network_config)?;
 
-    let _ = std::fs::remove_file(seed);
-    if cfg!(target_os = "macos") {
-        run(Command::new("hdiutil")
-            .args([
-                "makehybrid",
-                "-iso",
-                "-joliet",
-                "-default-volume-name",
-                "cidata",
-                "-o",
-            ])
-            .arg(seed)
-            .arg(&stage))?;
-    } else {
-        let mkiso = tool("xorriso")
-            .map(|p| (p, vec!["-as", "mkisofs"]))
-            .or_else(|_| tool("genisoimage").map(|p| (p, vec![])))?;
-        let mut cmd = Command::new(mkiso.0);
-        cmd.args(mkiso.1)
-            .args(["-output"])
-            .arg(seed)
-            .args(["-volid", "cidata", "-joliet", "-rock"])
-            .arg(&stage);
-        run(&mut cmd)?;
-    }
+    build_iso(&stage, seed)?;
     let _ = std::fs::remove_dir_all(&stage);
+    Ok(())
+}
+
+/// Build the NoCloud ISO with one audited implementation on every OS.
+///
+/// Seed files are small text documents, so reading them into memory avoids a
+/// platform toolchain and keeps the resulting image deterministic. Joliet and
+/// Rock Ridge match the previous hdiutil/genisoimage contract; the base ISO
+/// namespace remains available to firmware and minimal guests.
+fn build_iso(stage: &Path, seed: &Path) -> Result<()> {
+    let mut paths = std::fs::read_dir(stage)
+        .with_context(|| format!("reading NoCloud seed stage {}", stage.display()))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    paths.sort_by_key(|entry| entry.file_name());
+    let files = paths
+        .into_iter()
+        .map(|entry| {
+            let path = entry.path();
+            if !path.is_file() {
+                bail!("NoCloud seed stage contains a non-file: {}", path.display());
+            }
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("NoCloud seed filename is not UTF-8"))?;
+            let contents = std::fs::read(&path)
+                .with_context(|| format!("reading NoCloud seed file {}", path.display()))?;
+            Ok(IsoFile::File {
+                name: Arc::new(name),
+                contents,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let input = InputFiles {
+        path_separator: PathSeparator::ForwardSlash,
+        files,
+    };
+    let options = IsoFormatOptions {
+        volume_name: "cidata".to_owned(),
+        system_id: None,
+        volume_set_id: None,
+        publisher_id: None,
+        preparer_id: Some("Asterism".to_owned()),
+        application_id: Some("Asterism NoCloud".to_owned()),
+        sector_size: 2048,
+        features: CreationFeatures::extensions(),
+        path_separator: PathSeparator::ForwardSlash,
+        strict_charset: false,
+    };
+    let _ = std::fs::remove_file(seed);
+    let mut output = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(seed)
+        .with_context(|| format!("creating NoCloud ISO {}", seed.display()))?;
+    IsoImageWriter::create(&mut output, input, options)
+        .with_context(|| format!("writing NoCloud ISO {}", seed.display()))?;
+    output
+        .sync_all()
+        .with_context(|| format!("flushing NoCloud ISO {}", seed.display()))?;
     Ok(())
 }
 
@@ -973,6 +1014,34 @@ pub fn ensure_asterism_key() -> Result<String> {
 mod tests {
     use super::*;
     use crate::instance::local_host;
+
+    #[test]
+    fn pure_rust_nocloud_iso_has_the_expected_volume_and_files() {
+        use hadris_iso::read::IsoImage;
+        use std::io::BufReader;
+
+        let temp = tempfile::tempdir().unwrap();
+        let stage = temp.path().join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("user-data"), b"#cloud-config\n").unwrap();
+        std::fs::write(stage.join("meta-data"), b"instance-id: test\n").unwrap();
+        std::fs::write(stage.join("network-config"), b"version: 2\n").unwrap();
+        let seed = temp.path().join("seed.iso");
+
+        build_iso(&stage, &seed).unwrap();
+        let bytes = std::fs::read(&seed).unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&bytes[16 * 2048 + 40..16 * 2048 + 72]).trim(),
+            "cidata"
+        );
+        let image = IsoImage::open(BufReader::new(std::fs::File::open(seed).unwrap())).unwrap();
+        for name in ["meta-data", "network-config", "user-data"] {
+            assert!(
+                image.find_path(name).unwrap().is_some(),
+                "NoCloud ISO is missing {name}"
+            );
+        }
+    }
 
     fn share(host_path: &str, guest_path: &str) -> Share {
         Share::new(&Volume::dir(

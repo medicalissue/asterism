@@ -274,7 +274,7 @@ impl VmConfig {
                 "NetworkAdapters": {
                     "asterism": {
                         "EndpointId": self.endpoint_id,
-                        "MacAddress": self.mac.replace(':', "")
+                        "MacAddress": self.mac.replace(':', "-")
                     }
                 },
                 "HvSocket": {
@@ -305,6 +305,8 @@ impl VmConfig {
         self.validate()?;
         Ok(serde_json::to_string(&serde_json::json!({
             "SchemaVersion": { "Major": 2, "Minor": 0 },
+            "Owner": self.owner,
+            "Flags": 0,
             "Name": "asterism-private",
             "Type": "NAT",
             "Ipams": [{
@@ -324,8 +326,13 @@ impl VmConfig {
         self.validate()?;
         Ok(serde_json::to_string(&serde_json::json!({
             "SchemaVersion": { "Major": 2, "Minor": 0 },
+            "Owner": self.owner,
+            "Flags": 0,
+            "HostComputeNetwork": self.network_id,
             "Name": format!("asterism-{}", self.instance),
-            "MacAddress": self.mac.replace(':', ""),
+            // HCN's endpoint schema accepts the canonical Windows form; a
+            // compact 12-hex string is rejected with E_INVALIDARG.
+            "MacAddress": self.mac.replace(':', "-"),
             "IpConfigurations": [{
                 "IpAddress": self.guest_ip,
                 "PrefixLength": 20
@@ -407,12 +414,10 @@ impl HostReady {
                 expected_build
             );
         }
-        if !self.edition.contains("Pro") && !self.edition.contains("Enterprise") {
-            bail!(
-                "the native Hyper-V backend needs Windows 11 Pro or Enterprise; this is {}",
-                self.edition
-            );
-        }
+        // Edition is diagnostic metadata, not a capability. Microsoft ships
+        // the supported Hyper-V host role on Pro/Enterprise; an experimental
+        // Home installation is accepted only when the same HCS/HCN service
+        // probes below actually pass.
         let build = self
             .windows
             .rsplit('.')
@@ -560,7 +565,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_host_is_rejected_before_mutation() {
+    fn a_home_sku_with_real_hcs_capabilities_is_accepted() {
         let host = HostReady {
             protocol: PROTOCOL_VERSION,
             build: build_id(),
@@ -570,11 +575,7 @@ mod tests {
             hcs_running: true,
             hcn_running: true,
         };
-        assert!(host
-            .require_supported()
-            .unwrap_err()
-            .to_string()
-            .contains("Pro or Enterprise"));
+        host.require_supported().unwrap();
     }
 
     #[test]
@@ -665,6 +666,10 @@ mod tests {
             doc["VirtualMachine"]["Devices"]["Scsi"]["root"]["Attachments"]["2"]["ReadOnly"],
             true
         );
+        assert_eq!(
+            doc["VirtualMachine"]["Devices"]["NetworkAdapters"]["asterism"]["MacAddress"],
+            "02-15-5d-01-02-03"
+        );
         let text = doc.to_string().to_ascii_lowercase();
         assert!(!text.contains("qemu"));
         assert!(!text.contains("whpx"));
@@ -678,6 +683,9 @@ mod tests {
             serde_json::from_str(&config().hcn_endpoint_document().unwrap()).unwrap();
         assert_eq!(network["Type"], "NAT");
         assert_eq!(network["SchemaVersion"]["Major"], 2);
+        assert_eq!(network["Owner"], OWNER);
+        assert_eq!(endpoint["HostComputeNetwork"], config().network_id);
+        assert_eq!(endpoint["MacAddress"], "02-15-5d-01-02-03");
         assert_eq!(endpoint["IpConfigurations"][0]["IpAddress"], "172.29.64.19");
     }
 

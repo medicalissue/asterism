@@ -35,7 +35,7 @@ use windows_sys::Win32::Storage::Vhd::{
     ATTACH_VIRTUAL_DISK_PARAMETERS_0, ATTACH_VIRTUAL_DISK_PARAMETERS_0_0,
     ATTACH_VIRTUAL_DISK_VERSION_1, CREATE_VIRTUAL_DISK_FLAG_NONE, CREATE_VIRTUAL_DISK_PARAMETERS,
     CREATE_VIRTUAL_DISK_PARAMETERS_0, CREATE_VIRTUAL_DISK_PARAMETERS_0_1,
-    CREATE_VIRTUAL_DISK_VERSION_2, VIRTUAL_DISK_ACCESS_ALL, VIRTUAL_STORAGE_TYPE,
+    CREATE_VIRTUAL_DISK_VERSION_2, VIRTUAL_DISK_ACCESS_NONE, VIRTUAL_STORAGE_TYPE,
     VIRTUAL_STORAGE_TYPE_DEVICE_VHDX, VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
@@ -56,7 +56,8 @@ use windows_sys::Win32::System::Services::{
     SC_STATUS_PROCESS_INFO, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATUS_PROCESS,
 };
 use windows_sys::Win32::System::SystemInformation::{
-    GetProductInfo, OSVERSIONINFOW, PRODUCT_ENTERPRISE, PRODUCT_ENTERPRISE_E,
+    GetProductInfo, OSVERSIONINFOW, PRODUCT_CORE, PRODUCT_CORE_COUNTRYSPECIFIC, PRODUCT_CORE_N,
+    PRODUCT_CORE_SINGLELANGUAGE, PRODUCT_ENTERPRISE, PRODUCT_ENTERPRISE_E,
     PRODUCT_ENTERPRISE_EVALUATION, PRODUCT_ENTERPRISE_N, PRODUCT_ENTERPRISE_N_EVALUATION,
     PRODUCT_ENTERPRISE_S, PRODUCT_ENTERPRISE_S_EVALUATION, PRODUCT_ENTERPRISE_S_N,
     PRODUCT_ENTERPRISE_S_N_EVALUATION, PRODUCT_PROFESSIONAL, PRODUCT_PROFESSIONAL_E,
@@ -174,9 +175,17 @@ fn boot(config: &VmConfig) -> Result<Reply> {
             return wait_for_guest(config);
         }
         drop(system);
+        // A stopped or saved HCS object can still own its network adapter.
+        // Finish removing it before recycling the durable identity.
+        terminate(&config.system_id)?;
     }
 
     let (_network, _) = ensure_network(config)?;
+    // HCN endpoints retain attachment state from the compute system that
+    // consumed them. Reusing that object makes the next HCS NetworkAdapter
+    // construction fail even after the old VM exited. The endpoint UUID and
+    // guest address remain durable; only the host-side HCN object is fresh.
+    delete_endpoint(&config.endpoint_id)?;
     let (_endpoint, endpoint_created) = ensure_endpoint(config)?;
     for path in std::iter::once(&config.root_vhdx)
         .chain(std::iter::once(&config.seed_iso))
@@ -260,9 +269,37 @@ fn shutdown(system_id: &str, timeout_ms: u32) -> Result<()> {
     let Some(system) = ComputeSystem::open(system_id)? else {
         return Ok(());
     };
-    hcs_action(&system, "requesting HCS shutdown", |operation| unsafe {
-        HcsShutDownComputeSystem(system.0, operation, null())
-    })?;
+    let operation = Operation::new()?;
+    let hr = unsafe { HcsShutDownComputeSystem(system.0, operation.0, null()) };
+    // Stock Linux cloud images do not always expose the Hyper-V graceful
+    // shutdown integration service. HCS reports that as Win32
+    // ERROR_NOT_SUPPORTED, but the compute system is still fully
+    // terminable. `ast down` is an outcome contract, so fall back to the
+    // same bounded termination used after a graceful-shutdown timeout.
+    const HCS_SHUTDOWN_NOT_SUPPORTED: HRESULT = 0x8007_0032u32 as i32;
+    let terminate = || {
+        hcs_action(
+            &system,
+            "terminating HCS compute system",
+            |operation| unsafe { HcsTerminateComputeSystem(system.0, operation, null()) },
+        )
+    };
+    if hr == HCS_SHUTDOWN_NOT_SUPPORTED {
+        return terminate();
+    }
+    if failed(hr) {
+        bail!("requesting HCS shutdown: {}", hresult(hr, null_mut()));
+    }
+    let mut document: PWSTR = null_mut();
+    let wait_hr = unsafe { HcsWaitForOperationResult(operation.0, HCS_TIMEOUT_MS, &mut document) };
+    let text = pwstr(document);
+    free_local(document);
+    if wait_hr == HCS_SHUTDOWN_NOT_SUPPORTED {
+        return terminate();
+    }
+    if failed(wait_hr) {
+        bail!("requesting HCS shutdown: {}", hresult_text(wait_hr, &text));
+    }
     let mut result: PWSTR = null_mut();
     let hr = unsafe { HcsWaitForComputeSystemExit(system.0, timeout_ms, &mut result) };
     if failed(hr) {
@@ -459,6 +496,11 @@ fn materialize_vhdx(source: &Path, dest: &Path, size_bytes: u64) -> Result<()> {
         Anonymous: CREATE_VIRTUAL_DISK_PARAMETERS_0 {
             Version2: CREATE_VIRTUAL_DISK_PARAMETERS_0_1 {
                 MaximumSize: maximum,
+                // VirtDisk's version-2 VHDX contract requires an explicit
+                // logical sector size. Keep the common 4K physical / 512e
+                // layout so raw cloud images retain their 512-byte sectors.
+                SectorSizeInBytes: 512,
+                PhysicalSectorSizeInBytes: 4096,
                 ..Default::default()
             },
         },
@@ -469,7 +511,9 @@ fn materialize_vhdx(source: &Path, dest: &Path, size_bytes: u64) -> Result<()> {
         CreateVirtualDisk(
             &storage,
             path.as_ptr(),
-            VIRTUAL_DISK_ACCESS_ALL,
+            // Version 2 requires ACCESS_NONE at creation; VirtDisk returns a
+            // handle with the rights needed by the later attach operation.
+            VIRTUAL_DISK_ACCESS_NONE,
             null_mut(),
             CREATE_VIRTUAL_DISK_FLAG_NONE,
             0,
@@ -523,18 +567,28 @@ fn materialize_vhdx(source: &Path, dest: &Path, size_bytes: u64) -> Result<()> {
             .position(|unit| *unit == 0)
             .unwrap_or((size as usize).min(buffer.len()));
         let physical = String::from_utf16(&buffer[..end])?;
-        let mut source_file = std::fs::File::open(source)?;
+        let mut source_file = std::fs::File::open(source)
+            .with_context(|| format!("opening raw image {}", source.display()))?;
         let mut target = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&physical)
             .with_context(|| format!("opening attached VHDX device {physical}"))?;
-        target.seek(SeekFrom::Start(0))?;
-        let copied = io::copy(&mut source_file, &mut target)?;
+        target
+            .seek(SeekFrom::Start(0))
+            .with_context(|| format!("seeking attached VHDX device {physical}"))?;
+        let copied = io::copy(&mut source_file, &mut target).with_context(|| {
+            format!(
+                "copying raw image {} into attached VHDX device {physical}",
+                source.display()
+            )
+        })?;
         if copied != source_len {
             bail!("raw-to-VHDX copy stopped at {copied} of {source_len} bytes");
         }
-        target.sync_all()?;
+        target
+            .sync_all()
+            .with_context(|| format!("flushing attached VHDX device {physical}"))?;
         Ok(())
     })();
     let detach = unsafe { DetachVirtualDisk(disk.0, 0, 0) };
@@ -1068,7 +1122,11 @@ fn edition(major: u32, minor: u32) -> Result<String> {
         | PRODUCT_ENTERPRISE_S_EVALUATION
         | PRODUCT_ENTERPRISE_S_N
         | PRODUCT_ENTERPRISE_S_N_EVALUATION => "Enterprise",
-        _ => "Unsupported",
+        PRODUCT_CORE
+        | PRODUCT_CORE_COUNTRYSPECIFIC
+        | PRODUCT_CORE_N
+        | PRODUCT_CORE_SINGLELANGUAGE => "Home",
+        _ => "Unknown",
     };
     Ok(format!("Windows 11 {family} (product {product})"))
 }

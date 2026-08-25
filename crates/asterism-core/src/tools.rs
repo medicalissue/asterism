@@ -41,7 +41,7 @@ pub fn tool(name: &str) -> Result<PathBuf> {
             return Ok(c.clone());
         }
     }
-    bail!("{name} not found — is it installed? (brew install qemu)");
+    bail!("{name} not found — is it installed and on PATH?");
 }
 
 pub fn run(cmd: &mut Command) -> Result<()> {

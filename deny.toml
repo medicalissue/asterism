@@ -32,7 +32,7 @@ multiple-versions = "warn"
 wildcards = "deny"
 # Workspace path dependencies are exact local source edges, not mutable
 # registry requirements. cargo-deny otherwise treats their omitted version as
-# a wildcard, including the GUI's private dependency on asterism-core.
+# a wildcard.
 allow-wildcard-paths = true
 
 [sources]

@@ -12,7 +12,7 @@ of those seams.
 | Secrets | login Keychain `dev.asterism.secret` | Secret Service (when available); otherwise refused, no plaintext fallback | Credential Manager generic credential `dev.asterism.secret/<device>/<name>` |
 | Native helper | `astd-vz` next to `astd`, code-signed with `com.apple.security.virtualization` | Cloud Hypervisor / Firecracker as decided by the Linux backend | `astd-hyperv.exe` next to `astd.exe` (`ASTERISM_HYPERV_HELPER` override). `ast doctor` **Probes** the helper over the 510d330 protocol; a file on disk is not readiness. |
 | Install / update / uninstall | `install.sh`, signed `RELEASE.json`, Homebrew | `install.sh` source path until a native package lands | `install.ps1` (native) and `install.sh` (Git Bash); SHA-256; optional Authenticode thumbprint; receipt uninstall. The updater (`asterism-update.ps1`) is claimed, backed up, and rolled back on failure. |
-| Capability doctor | `ast doctor` / `ast bugreport` | `ast doctor` / `ast bugreport` | `ast doctor`: Windows 11 Pro/Enterprise build 22000+, elevated token, `vmcompute`/`hns`/`vmms`, exact inbound firewall rule `Asterism device daemon` matching `astd.exe` (a Hyper-V group substring is not a pass), helper Probe, SCM, Credential Manager, sleep assertion |
+| Capability doctor | `ast doctor` / `ast bugreport` | `ast doctor` / `ast bugreport` | `ast doctor`: Windows build 22000+, elevated token, `vmcompute`/`hns`/`vmms`, exact inbound firewall rule `Asterism device daemon` matching `astd.exe` (a Hyper-V group substring is not a pass), helper Probe, SCM, Credential Manager, sleep assertion. Home is reported as experimental and passes only on real HCS/HCN capability, never on SKU alone. |
 
 Windows product virtualization is native Hyper-V behind the helper protocol
 preserved from `510d3304e648ae884b125a2eb4dc8d4b92f7475d`. HCS/HCN/VirtDisk
@@ -30,7 +30,7 @@ in rustc dep-info because they are the same files. The unix daemon door
 `windows-host` is source-and-script only and does not invoke Cargo.
 
 Guest lifecycle (create / boot / snapshot / restart / adoption / stop) on a
-real Windows 11 Pro/Enterprise host is **unverified** in this tree. Do not
+real Windows host is **unverified** until the real-host harness records it. Do not
 read the decided rows above as a proof that a clean machine already ran
 guests. What host integration claims, with executable fixtures:
 

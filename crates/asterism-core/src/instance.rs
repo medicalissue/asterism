@@ -13,7 +13,12 @@ use crate::hv::{ControlChannel, GuestEndpoint, Handle, ImageKind, Machine};
 use crate::remote_gpu::GpuAttachment;
 use crate::secret::Binding;
 
-/// The isolation contract of an instance, independent of its image format.
+/// Internal isolation adapter, independent of identity and image format.
+///
+/// This is persisted so the daemon can resume an existing instance through
+/// the same implementation. It is not a second public resource type: CLI,
+/// protocol responses and product copy always present both variants as an
+/// Instance.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeKind {
