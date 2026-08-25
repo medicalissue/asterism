@@ -544,6 +544,14 @@ fn rename_write_through(from: &Path, to: &Path) -> io::Result<()> {
 fn open_no_follow(path: &Path) -> io::Result<File> {
     let mut open = OpenOptions::new();
     open.read(true);
+    #[cfg(windows)]
+    {
+        // File::sync_all maps to FlushFileBuffers, which Windows refuses on
+        // a GENERIC_READ-only handle. These are our closed staging bytes and
+        // publish_file immediately renames them, so request write access for
+        // the durability barrier without changing their contents.
+        open.write(true);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
