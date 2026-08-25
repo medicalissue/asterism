@@ -18,6 +18,9 @@ anyhow.workspace = true
 # adoption, which blake3 does in about a second.
 blake3.workspace = true
 hostname.workspace = true
+# NoCloud needs a tiny ISO9660 seed on every host. A pure-Rust writer keeps
+# Windows native and removes hdiutil/xorriso/genisoimage from the boot path.
+hadris-iso = "2.2.0"
 # Bodies crossing the mesh are base64 in the frame rather than a JSON array
 # of numbers, which is a 4x expansion against a transport with a hard frame
 # cap. Already in the tree behind asterism-mesh.
