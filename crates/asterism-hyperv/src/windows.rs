@@ -175,9 +175,17 @@ fn boot(config: &VmConfig) -> Result<Reply> {
             return wait_for_guest(config);
         }
         drop(system);
+        // A stopped or saved HCS object can still own its network adapter.
+        // Finish removing it before recycling the durable identity.
+        terminate(&config.system_id)?;
     }
 
     let (_network, _) = ensure_network(config)?;
+    // HCN endpoints retain attachment state from the compute system that
+    // consumed them. Reusing that object makes the next HCS NetworkAdapter
+    // construction fail even after the old VM exited. The endpoint UUID and
+    // guest address remain durable; only the host-side HCN object is fresh.
+    delete_endpoint(&config.endpoint_id)?;
     let (_endpoint, endpoint_created) = ensure_endpoint(config)?;
     for path in std::iter::once(&config.root_vhdx)
         .chain(std::iter::once(&config.seed_iso))
