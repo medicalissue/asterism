@@ -35,7 +35,7 @@ use windows_sys::Win32::Storage::Vhd::{
     ATTACH_VIRTUAL_DISK_PARAMETERS_0, ATTACH_VIRTUAL_DISK_PARAMETERS_0_0,
     ATTACH_VIRTUAL_DISK_VERSION_1, CREATE_VIRTUAL_DISK_FLAG_NONE, CREATE_VIRTUAL_DISK_PARAMETERS,
     CREATE_VIRTUAL_DISK_PARAMETERS_0, CREATE_VIRTUAL_DISK_PARAMETERS_0_1,
-    CREATE_VIRTUAL_DISK_VERSION_2, VIRTUAL_DISK_ACCESS_ALL, VIRTUAL_STORAGE_TYPE,
+    CREATE_VIRTUAL_DISK_VERSION_2, VIRTUAL_DISK_ACCESS_NONE, VIRTUAL_STORAGE_TYPE,
     VIRTUAL_STORAGE_TYPE_DEVICE_VHDX, VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
@@ -460,6 +460,11 @@ fn materialize_vhdx(source: &Path, dest: &Path, size_bytes: u64) -> Result<()> {
         Anonymous: CREATE_VIRTUAL_DISK_PARAMETERS_0 {
             Version2: CREATE_VIRTUAL_DISK_PARAMETERS_0_1 {
                 MaximumSize: maximum,
+                // VirtDisk's version-2 VHDX contract requires an explicit
+                // logical sector size. Keep the common 4K physical / 512e
+                // layout so raw cloud images retain their 512-byte sectors.
+                SectorSizeInBytes: 512,
+                PhysicalSectorSizeInBytes: 4096,
                 ..Default::default()
             },
         },
@@ -470,7 +475,9 @@ fn materialize_vhdx(source: &Path, dest: &Path, size_bytes: u64) -> Result<()> {
         CreateVirtualDisk(
             &storage,
             path.as_ptr(),
-            VIRTUAL_DISK_ACCESS_ALL,
+            // Version 2 requires ACCESS_NONE at creation; VirtDisk returns a
+            // handle with the rights needed by the later attach operation.
+            VIRTUAL_DISK_ACCESS_NONE,
             null_mut(),
             CREATE_VIRTUAL_DISK_FLAG_NONE,
             0,
