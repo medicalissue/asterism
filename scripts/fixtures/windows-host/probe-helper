@@ -1,0 +1,7 @@
+#!/bin/sh
+# Fixture astd-hyperv: speaks the 510d330 Probe protocol and nothing else.
+# Used by doctor/helper-probe tests. Does not touch Hyper-V.
+set -eu
+# Consume the one-line request (or ignore a missing stdin in a dry run).
+IFS= read -r _line || true
+printf '%s\n' '{"result":"ready","host":{"protocol":1,"build":"fixture","windows":"11.0.26100","edition":"Windows 11 Pro","elevated":true,"hcs_running":true,"hcn_running":true}}'

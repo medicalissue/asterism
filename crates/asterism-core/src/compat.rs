@@ -59,7 +59,7 @@
 //! ### The window
 //!
 //! A build serves its own version and the [`SUPPORTED_BACK`] before it:
-//! currently N-3 through N. That is a floor on how far back it will *serve*, not a
+//! currently N-7 through N. That is a floor on how far back it will *serve*, not a
 //! ceiling on how far forward it will speak — the ceiling is the other side's
 //! range, which is why a newer peer is usable.
 //!
@@ -110,7 +110,12 @@ use crate::VERSION;
 /// * **5** — mesh-safe, read-only device-shell policy status.
 /// * **6** — device-local structured image catalog and pull results.
 /// * **7** — orbit storage catalog, placement, leases, and fenced NBD splices.
-pub const PROTOCOL_VERSION: u32 = 7;
+/// * **8** — explicit VM/container runtime frames plus guest NVIDIA
+///   projection control frames (`gpu_guest_*`) and the dedicated GPU mesh
+///   stream. The guest contract is a local `/dev/nvidia0` endpoint plus
+///   generated libcuda; the mesh opening frame is instance-bound and
+///   token-free.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// The wire as it was before it carried a version.
 ///
@@ -121,10 +126,10 @@ pub const PROTOCOL_VERSION: u32 = 7;
 /// into a thing to be spoken to.
 pub const FIRST_PROTOCOL: u32 = 1;
 
-/// How many versions back this build still serves. Protocol 7 is the first
-/// storage-capable wire, but it must not evict the unnumbered protocol-1
-/// release: a rolling orbit can still have that release on a peer.
-pub const SUPPORTED_BACK: u32 = 6;
+/// How many versions back this build still serves. Protocol 8 adds runtime
+/// and GPU guest frames; keep the unnumbered protocol-1 release reachable in
+/// a rolling orbit.
+pub const SUPPORTED_BACK: u32 = 7;
 
 /// Format version of the home stamp document itself.
 pub const STAMP_VERSION: u32 = 1;

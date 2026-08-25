@@ -22,9 +22,10 @@ use crate::device_shell::{
 };
 use crate::hv::GuestHealth;
 use crate::image::{ImagePullResult, ImageRow};
-use crate::instance::{Instance, PortForward, Restart, Shape};
+use crate::instance::{Instance, PortForward, Restart, RuntimeKind, Shape};
 use crate::orbit::{Device, DeviceStatus, WakeFacts};
 use crate::registry::OrbitRow;
+use crate::remote_gpu_guest::{GuestFrame, GuestReply};
 use crate::secret::Secret;
 use crate::snapshot::Snapshot;
 
@@ -101,13 +102,28 @@ pub enum Request {
         #[serde(default)]
         backend: Option<String>,
         /// Guest ports to publish on the loopback of the device supplying
-        /// cpu/ram (`ast create -p 8080:80`). Empty from a CLI that predates
+        /// compute (`ast create -p 8080:80`). Empty from a CLI that predates
         /// them, which is every `ast create` of a cloud image.
         #[serde(default)]
         publish: Vec<PortForward>,
         /// Bootstrap profiles to apply at first boot (`ast create --profile
         /// claude`). Empty from a CLI that predates them, and empty from
         /// every `ast create` that did not ask for one.
+        #[serde(default)]
+        profiles: Vec<String>,
+    },
+    /// Runtime-aware create. Kept as a distinct versioned frame so a daemon
+    /// that predates native containers cannot ignore an added field and boot
+    /// the requested image as a VM instead.
+    CreateRuntime {
+        name: String,
+        image: String,
+        shape: Shape,
+        runtime: RuntimeKind,
+        #[serde(default)]
+        backend: Option<String>,
+        #[serde(default)]
+        publish: Vec<PortForward>,
         #[serde(default)]
         profiles: Vec<String>,
     },
@@ -133,7 +149,7 @@ pub enum Request {
     Remove {
         name: String,
     },
-    /// One device's shard of the orbit registry — the instances whose cpu/ram
+    /// One device's shard of the orbit registry — the instances whose compute
     /// it supplies. What one daemon asks another for while assembling
     /// [`Request::ListOrbit`], and what `ast ls --local` prints.
     List,
@@ -155,6 +171,7 @@ pub enum Request {
     /// rule that decides which of the two is told.
     MarkConflicted {
         name: String,
+        #[serde(alias = "other_compute_device")]
         other_cpu_device: String,
     },
     AttachVolume {
@@ -188,6 +205,39 @@ pub enum Request {
         owner_device: Option<String>,
         #[serde(default)]
         max_latency_ms: Option<u64>,
+    },
+    /// Attach one hardware GPU provider to a stopped instance. The initiating
+    /// daemon resolves this into token-free durable metadata before routing
+    /// it to the shard that owns the instance.
+    AttachGpu {
+        name: String,
+        #[serde(default)]
+        provider_device: Option<String>,
+        #[serde(default)]
+        gpu_uuid: Option<String>,
+        memory_bytes: u64,
+    },
+    /// Internal resolved form. It contains no lease bearer and is safe to
+    /// persist verbatim in the instance registry.
+    AttachGpuResolved {
+        name: String,
+        attachment: crate::remote_gpu::GpuAttachment,
+    },
+    DetachGpu {
+        name: String,
+    },
+    /// Provider-plane inventory and revoke frames. They are accepted only by
+    /// a local daemon or an authenticated orbit RPC.
+    GpuProviderList,
+    GpuProviderAttach {
+        gpu_uuid: String,
+        consumer_device_id: String,
+        instance_id: String,
+        memory_bytes: u64,
+    },
+    GpuProviderRevoke {
+        gpu_uuid: String,
+        instance_id: String,
     },
     /// Bind an orbit secret to one authority an instance may reach.
     ///
@@ -280,11 +330,16 @@ pub enum Request {
         name: String,
         lines: u32,
     },
+    /// Execute inside a native container through its private control socket.
+    ContainerExec {
+        name: String,
+        command: Vec<String>,
+    },
     /// Where to point `ssh` at to reach this instance's guest.
     ///
-    /// Answered with a loopback address every time. When the guest's cpu/ram
-    /// are on this device that is the hypervisor's own forwarded port; when
-    /// they are elsewhere the daemon binds an ephemeral listener and splices
+    /// Answered with a loopback address every time. When the guest's compute
+    /// is on this device that is the hypervisor's own forwarded port; when
+    /// it is elsewhere the daemon binds an ephemeral listener and splices
     /// it to the far daemon over the mesh, so `ast ssh dev` is one command
     /// from anywhere and never mentions a device.
     SshEndpoint {
@@ -311,6 +366,19 @@ pub enum Request {
         signal: i32,
     },
     DeviceShellClose,
+    /// Open the guest NVIDIA projection for one instance. The hypervisor
+    /// helper (or a source fixture) carries framed CUDA-semantic calls from
+    /// the projected `/dev/nvidia0` onto this unix socket. It is
+    /// instance-bound and never a LAN listener.
+    GpuGuestOpen {
+        name: String,
+    },
+    /// Frames sent after [`Request::GpuGuestOpen`] on the same local
+    /// connection. Invalid as standalone RPC.
+    GpuGuestFrame {
+        frame: GuestFrame,
+    },
+    GpuGuestClose,
 
     // ---- the mesh ----------------------------------------------------------
     //
@@ -454,7 +522,7 @@ pub enum Request {
         /// Immutable identity of that instance.
         #[serde(default)]
         holder_id: String,
-        /// The device supplying that instance's cpu and ram.
+        /// The device supplying that instance's compute.
         holder_device: String,
         /// Immutable identity of the consumer device.
         #[serde(default)]
@@ -567,20 +635,21 @@ pub enum Request {
         value: SecretValue,
     },
 
-    // ---- swapping the cpu part ----------------------------------------------
+    // ---- moving compute placement -------------------------------------------
     //
-    // `ast set <instance> cpu <device>` — an offline migration, and in the
+    // `ast set <instance> compute <device>` — an offline migration, and in the
     // model's own words a change to one line of an instance's parts table.
     // The daemon in front of the user drives it; the frames below are the
     // steps it drives, each aimed at one named device and therefore each
     // reporting no subject (see [`Request::subject`]).
-    /// Swap the device supplying an instance's cpu and ram.
+    /// Move the device supplying an instance's compute.
     ///
     /// Answered with a stream of [`Response::Move`] lines, because it is a
     /// job and not a question: bytes crossing a network are worth watching.
+    #[serde(rename = "set_cpu", alias = "set_compute")]
     SetCpu {
         name: String,
-        /// The device that will supply cpu and ram from here on.
+        /// The device that will supply compute from here on.
         device: String,
         /// Shut the guest down first, rather than refusing to move a
         /// running instance. Offline migration is the only kind that works
@@ -616,7 +685,7 @@ pub enum Request {
     },
     /// The bytes are all here and verified: adopt them. The staging
     /// directory becomes the instance directory and the row is written with
-    /// this device supplying cpu, at `epoch`.
+    /// this device supplying compute, at `epoch`.
     MoveCommitTarget {
         manifest: Box<MoveManifest>,
         epoch: u64,
@@ -671,25 +740,31 @@ impl Request {
             | Request::AttachVolume { name, .. }
             | Request::AttachBlock { name, .. }
             | Request::AttachStorage { name, .. }
+            | Request::AttachGpu { name, .. }
+            | Request::AttachGpuResolved { name, .. }
+            | Request::DetachGpu { name }
             | Request::Detach { name, .. }
             | Request::Snapshot { name, .. }
             | Request::SnapshotList { name }
             | Request::SnapshotRestore { name, .. }
             | Request::SnapshotRemove { name, .. }
             | Request::Logs { name, .. }
+            | Request::GpuGuestOpen { name }
             // Binding a secret is an instance command: `ast attach dev
             // --secret anthropic` resolves `dev` across the orbit like every
             // other, and the binding is written on whichever device holds it.
             | Request::AttachSecret { name, .. }
             | Request::DetachSecret { name, .. }
             | Request::BackupExport { name, .. }
-            | Request::SshEndpoint { name } => Some(name),
+            | Request::SshEndpoint { name }
+            | Request::ContainerExec { name, .. } => Some(name),
 
             // The handshake, and the two views of the registry. A list is
             // about every instance, which is not one instance.
             Request::Ping { .. }
             | Request::Compat
             | Request::Create { .. }
+            | Request::CreateRuntime { .. }
             | Request::BackupImport { .. }
             | Request::List
             | Request::ListOrbit => None,
@@ -709,7 +784,12 @@ impl Request {
             | Request::DeviceShellEof
             | Request::DeviceShellResize { .. }
             | Request::DeviceShellSignal { .. }
-            | Request::DeviceShellClose => None,
+            | Request::DeviceShellClose
+            | Request::GpuGuestFrame { .. }
+            | Request::GpuGuestClose => None,
+            Request::GpuProviderList
+            | Request::GpuProviderAttach { .. }
+            | Request::GpuProviderRevoke { .. } => None,
 
             // About devices, not instances. `ast device wake desktop` names a
             // device on purpose — it is the one command whose subject really
@@ -748,11 +828,11 @@ impl Request {
             | Request::SecretSourceRotate { .. }
             | Request::SecretSourceEgress { .. } => None,
 
-            // Every step of a cpu-part swap names one device on purpose and
+            // Every step of a compute move names one device on purpose and
             // is aimed at it. Half of them go to a device that does *not*
             // hold the row — that is what a move is — so resolving them by
             // instance name would send them back to the wrong end of the
-            // transfer, and `set cpu` itself names the destination.
+            // transfer, and `set compute` itself names the destination.
             Request::SetCpu { .. }
             | Request::MoveOffer { .. }
             | Request::MoveProbe { .. }
@@ -797,6 +877,17 @@ impl Request {
             | Request::VolumeRelease { .. } => 7,
             Request::DeviceShellStatus => 5,
             Request::ImageList | Request::ImagePull { .. } => 6,
+            Request::CreateRuntime { .. }
+            | Request::ContainerExec { .. }
+            | Request::GpuGuestOpen { .. }
+            | Request::GpuGuestFrame { .. }
+            | Request::GpuGuestClose
+            | Request::AttachGpu { .. }
+            | Request::AttachGpuResolved { .. }
+            | Request::DetachGpu { .. }
+            | Request::GpuProviderList
+            | Request::GpuProviderAttach { .. }
+            | Request::GpuProviderRevoke { .. } => 8,
             Request::DeviceShellPolicy { .. }
             | Request::DeviceShellOpen { .. }
             | Request::DeviceShellInput { .. }
@@ -838,6 +929,17 @@ impl Request {
             | Request::DeviceShellClose => Some("device shell"),
             Request::ImageList => Some("image_list"),
             Request::ImagePull { .. } => Some("image_pull"),
+            Request::CreateRuntime { .. } => Some("create_runtime"),
+            Request::ContainerExec { .. } => Some("container_exec"),
+            Request::GpuGuestOpen { .. }
+            | Request::GpuGuestFrame { .. }
+            | Request::GpuGuestClose => Some("gpu_guest"),
+            Request::AttachGpu { .. }
+            | Request::AttachGpuResolved { .. }
+            | Request::DetachGpu { .. }
+            | Request::GpuProviderList
+            | Request::GpuProviderAttach { .. }
+            | Request::GpuProviderRevoke { .. } => Some("gpu_control"),
             _ => None,
         }
     }
@@ -971,6 +1073,12 @@ pub enum Response {
         text: String,
         truncated: bool,
     },
+    /// Bounded result from a command run through [`Request::ContainerExec`].
+    ContainerExec {
+        status: i32,
+        stdout: String,
+        stderr: String,
+    },
     /// Reply to [`Request::SshEndpoint`]: a loopback address `ssh` can be
     /// pointed at right now, and the key file that opens the guest. Whose cpu
     /// is running the guest changes neither field's meaning, which is the
@@ -1004,6 +1112,23 @@ pub enum Response {
     /// Exactly one terminal result for an accepted session.
     DeviceShellExit {
         exit: ShellExit,
+    },
+    GpuGuestAccepted {
+        session_id: String,
+        projection_kind: String,
+    },
+    GpuGuestRefused {
+        code: String,
+        message: String,
+    },
+    GpuGuestReply {
+        reply: GuestReply,
+    },
+    GpuProviders {
+        providers: Vec<crate::remote_gpu::ProviderAdvertisement>,
+    },
+    GpuProviderAttached {
+        attachment: crate::remote_gpu::GpuAttachment,
     },
 
     // ---- the mesh ----------------------------------------------------------
@@ -1101,7 +1226,7 @@ pub enum Response {
         response: Box<EgressResponse>,
     },
 
-    // ---- swapping the cpu part ----------------------------------------------
+    // ---- moving compute ------------------------------------------------------
     /// One line of a move in progress, and whether it was the last one.
     ///
     /// Same shape and same reason as [`Response::Wake`]: a move is minutes
@@ -1197,11 +1322,32 @@ impl Response {
             Response::BackupExported { .. } | Response::BackupRestored { .. } => 3,
             Response::Images { .. } | Response::ImagePulled { .. } => 6,
             Response::VolumeCatalog { .. } | Response::VolumeLease { .. } => 7,
+            Response::ContainerExec { .. } => 8,
+            Response::Instance { instance, .. } if instance.runtime == RuntimeKind::Container => 8,
+            Response::Instances { instances }
+                if instances
+                    .iter()
+                    .any(|instance| instance.runtime == RuntimeKind::Container) =>
+            {
+                8
+            }
+            Response::Orbit { rows }
+                if rows
+                    .iter()
+                    .any(|row| row.instance.runtime == RuntimeKind::Container) =>
+            {
+                8
+            }
             Response::DeviceShellStatus { .. }
             | Response::DeviceShellAccepted { .. }
             | Response::DeviceShellRefused { .. }
             | Response::DeviceShellOutput { .. }
             | Response::DeviceShellExit { .. } => 4,
+            Response::GpuGuestAccepted { .. }
+            | Response::GpuGuestRefused { .. }
+            | Response::GpuGuestReply { .. }
+            | Response::GpuProviders { .. }
+            | Response::GpuProviderAttached { .. } => 8,
             _ => crate::compat::FIRST_PROTOCOL,
         }
     }
@@ -1245,11 +1391,40 @@ pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
             .since(),
         ),
         ("device_shell_status", Request::DeviceShellStatus.since()),
+        (
+            "gpu_guest",
+            Request::GpuGuestOpen {
+                name: String::new(),
+            }
+            .since(),
+        ),
+        ("gpu_control", Request::GpuProviderList.since()),
         ("image_list", Request::ImageList.since()),
         (
             "image_pull",
             Request::ImagePull {
                 reference: String::new(),
+            }
+            .since(),
+        ),
+        (
+            "create_runtime",
+            Request::CreateRuntime {
+                name: String::new(),
+                image: String::new(),
+                shape: Shape::default(),
+                runtime: RuntimeKind::Container,
+                backend: None,
+                publish: Vec::new(),
+                profiles: Vec::new(),
+            }
+            .since(),
+        ),
+        (
+            "container_exec",
+            Request::ContainerExec {
+                name: String::new(),
+                command: Vec::new(),
             }
             .since(),
         ),
@@ -1541,6 +1716,8 @@ mod tests {
         assert_eq!(table.get("volume_lease"), Some(&7));
         assert_eq!(table.get("volume_reconnect"), Some(&7));
         assert_eq!(table.get("volume_release"), Some(&7));
+        assert_eq!(table.get("create_runtime"), Some(&8));
+        assert_eq!(table.get("container_exec"), Some(&8));
         assert_eq!(
             table.get("device-shell"),
             Some(&4),
@@ -1603,7 +1780,7 @@ mod tests {
         assert!(sync.subject().is_none());
 
         // The existing mesh proxy envelope preserves the source operation.
-        // It does not consult an instance/cpu device or a global exit.
+        // It does not consult an instance compute device or a global exit.
         let routed = Request::Proxy {
             device: source.device.clone(),
             inner: Box::new(sync),
@@ -1966,5 +2143,75 @@ mod tests {
             "bad request: unknown variant `snapshot_restore`, expected one of `ping`, `create`"
         ));
         assert!(!is_unknown_variant_error("no instance named \"dev\""));
+    }
+
+    #[test]
+    fn conflict_migration_aliases_do_not_change_written_wire_keys() {
+        let request: Request = serde_json::from_str(
+            r#"{"cmd":"mark_conflicted","name":"dev","other_compute_device":"desktop"}"#,
+        )
+        .unwrap();
+        let Request::MarkConflicted {
+            other_cpu_device, ..
+        } = request
+        else {
+            panic!("alias did not parse as mark_conflicted");
+        };
+        assert_eq!(other_cpu_device, "desktop");
+
+        let written = serde_json::to_value(&Request::MarkConflicted {
+            name: "dev".into(),
+            other_cpu_device: "desktop".into(),
+        })
+        .unwrap();
+        assert_eq!(written["other_cpu_device"], "desktop");
+        assert!(written.get("other_compute_device").is_none(), "{written}");
+    }
+
+    #[test]
+    fn container_runtime_uses_versioned_fail_closed_frames() {
+        let create = Request::CreateRuntime {
+            name: "web".into(),
+            image: "docker.io/library/nginx:latest".into(),
+            shape: Shape::default(),
+            runtime: RuntimeKind::Container,
+            backend: None,
+            publish: Vec::new(),
+            profiles: Vec::new(),
+        };
+        let wire = serde_json::to_string(&create).unwrap();
+        assert!(wire.contains("\"runtime\":\"container\""));
+        assert_eq!(create.since(), 8);
+        assert_eq!(create.versioned_name(), Some("create_runtime"));
+
+        let exec = Request::ContainerExec {
+            name: "web".into(),
+            command: vec!["/bin/true".into()],
+        };
+        assert_eq!(exec.subject(), Some("web"));
+        assert_eq!(exec.since(), 8);
+
+        let mut instance = Instance::new(
+            "web",
+            "laptop",
+            "docker.io/library/nginx:latest",
+            Shape::default(),
+            crate::hv::Machine {
+                backend: "linux-rootless".into(),
+                machine_type: "linux-userns-cgroup-v2".into(),
+                cpu: "x86_64".into(),
+                hv_version: "native".into(),
+            },
+        );
+        instance.runtime = RuntimeKind::Container;
+        assert_eq!(
+            Response::Instance {
+                instance,
+                guest_health: None,
+            }
+            .since(),
+            8,
+            "an old client must not receive a handle with no SSH endpoint"
+        );
     }
 }

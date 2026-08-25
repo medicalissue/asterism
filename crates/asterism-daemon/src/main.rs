@@ -2,7 +2,7 @@
 //!
 //! The orbit is a pool of parts; an instance is a computer assembled from
 //! them. This daemon is one device's contribution to that pool: it holds this
-//! device's shard of the orbit registry, boots the guests whose cpu and ram it
+//! device's shard of the orbit registry, boots the guests whose compute it
 //! supplies, and serves the `ast` CLI over a unix socket (one JSON request per
 //! line, one JSON response per line). Guests are booted through the
 //! [`Hypervisor`] boundary: nothing in this daemon names a hypervisor concept
@@ -47,6 +47,7 @@ use anyhow::{Context, Result};
 use tokio::sync::Mutex;
 
 use asterism_core::compat;
+use asterism_core::instance::now_unix;
 use asterism_core::ipc;
 use asterism_core::orbit::Orbit;
 use asterism_core::protocol::{Request, Response};
@@ -56,11 +57,18 @@ use asterism_core::{paths, VERSION};
 use transport::{Admitted, Framing};
 
 mod backend;
+mod container;
 mod device_shell;
 mod egress;
+mod gpu;
 mod images;
 mod instance;
 mod mesh;
+#[cfg(unix)]
+mod nbd;
+#[cfg(windows)]
+#[path = "nbd_windows.rs"]
+mod nbd;
 mod orbit;
 mod persist;
 mod secret;
@@ -73,11 +81,58 @@ mod wake;
 
 use mesh::{ClientIo, Mesh, Splice};
 
+#[cfg(windows)]
+fn apply_service_home_from_args() {
+    // ImagePath is `astd.exe --service --home <dir>`. SCM starts with almost
+    // no environment, so the home has to be on the command line rather than
+    // inherited from the installing shell.
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--home" {
+            if let Some(home) = args.next() {
+                std::env::set_var("ASTERISM_HOME", home);
+            }
+            return;
+        }
+        if let Some(home) = arg.strip_prefix("--home=") {
+            std::env::set_var("ASTERISM_HOME", home);
+            return;
+        }
+    }
+}
+
+#[cfg(windows)]
+fn service_name_from_args() -> Result<String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        let value = if arg == "--service-name" {
+            args.next()
+        } else {
+            arg.strip_prefix("--service-name=").map(str::to_owned)
+        };
+        if let Some(value) = value {
+            const TEST_PREFIX: &str = "com.asterism.astd.test.";
+            if value.len() > 120
+                || !value.starts_with(TEST_PREFIX)
+                || value.ends_with('.')
+                || value.contains("..")
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+            {
+                anyhow::bail!("invalid temporary Windows service name {value:?}");
+            }
+            return Ok(value);
+        }
+    }
+    Ok(asterism_core::windows_host::SERVICE_NAME.to_owned())
+}
+
 /// This device's own state: its shard of the orbit registry, and the name the
 /// orbit knows it by.
 ///
 /// The two travel together because almost everything needs both — a row is
-/// written with the device that supplies its cpu, and that device is named by
+/// written with the device that supplies its compute, and that device is named by
 /// the orbit, not by its hostname. Two daemons on one machine with different
 /// orbit names are two distinct suppliers of parts, and the tests depend on
 /// that being true.
@@ -86,6 +141,7 @@ pub(crate) struct Node {
     pub shard: Arc<Mutex<Shard>>,
     pub orbit: Arc<Mutex<Orbit>>,
     pub shell: Arc<device_shell::Manager>,
+    pub gpu: Arc<gpu::Manager>,
 }
 
 impl Node {
@@ -95,8 +151,16 @@ impl Node {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    if matches!(
+        std::env::args().nth(1).as_deref(),
+        Some("__container-helper")
+    ) {
+        let spec = std::env::args_os()
+            .nth(2)
+            .context("container helper needs its spec path")?;
+        return container::helper_main(std::path::Path::new(&spec));
+    }
     // Release activation has to prove the staged daemon before it replaces a
     // running one. This path touches no state and binds no socket, so a
     // downgrade refusal remains a refusal before mutation.
@@ -108,7 +172,57 @@ async fn main() -> Result<()> {
     if print_early_exit() {
         return Ok(());
     }
+    if std::env::args().any(|arg| arg == "--service") {
+        #[cfg(windows)]
+        {
+            apply_service_home_from_args();
+            let service_name = service_name_from_args()?;
+            return asterism_core::windows_host::dispatch_service(
+                &service_name,
+                run_service_daemon,
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            anyhow::bail!(
+                "astd --service is the Windows Service dispatcher; this build is {}",
+                std::env::consts::OS
+            );
+        }
+    }
+    runtime().block_on(run_daemon(StopSource::Console))
+}
 
+#[cfg(windows)]
+fn run_service_daemon() -> Result<()> {
+    let result = runtime().block_on(run_daemon(StopSource::Service));
+    if let Err(error) = &result {
+        // SCM owns the process stdio handles, so an early worker failure would
+        // otherwise disappear while the service merely returns to Stopped.
+        // The installer already names this file as the service log; make that
+        // promise true for the failure path needed to repair the host.
+        use std::io::Write as _;
+
+        let log = paths::home_dir().join("astd.log");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+        {
+            let _ = writeln!(file, "astd: service startup failed: {error:#}");
+        }
+    }
+    result
+}
+
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+}
+
+async fn run_daemon(stop_source: StopSource) -> Result<()> {
     // Before anything: the signals that mean "stop". Registering one is what
     // makes it ours — until then the default disposition applies, and for
     // both of these that is death with nothing tidied up. The socket is
@@ -118,7 +232,7 @@ async fn main() -> Result<()> {
     // for the next daemon to trip over. `ast` sends exactly that `SIGTERM`
     // when it retires a daemon across an upgrade, and it sends it as soon as
     // the socket answers — which is inside the window.
-    let mut stop = Stop::listen();
+    let mut stop = Stop::listen(stop_source);
 
     let home = paths::home_dir();
     // Everything this daemon remembers is in here, and until now it was
@@ -139,7 +253,7 @@ async fn main() -> Result<()> {
     }
 
     // Now that this build has been established as one that may touch this
-    // home: a cpu-part swap this device was receiving when it died left a
+    // home: a compute move this device was receiving when it died left a
     // staging directory, and this is the "next contact" that clears it. It
     // was never bootable and no shard row ever pointed at it, so there is
     // nothing to consult first.
@@ -149,6 +263,7 @@ async fn main() -> Result<()> {
         shard: Arc::new(Mutex::new(Shard::load(&paths::state_path())?)),
         orbit: Arc::new(Mutex::new(Orbit::load(&paths::orbit_path())?)),
         shell: device_shell::Manager::load(),
+        gpu: gpu::Manager::new(),
     };
 
     // The election, the stale-socket sweep and the bind, in that order and
@@ -186,6 +301,92 @@ async fn main() -> Result<()> {
                 mesh.device_id().short(),
                 mesh.self_name().await
             );
+            let name = node.device_name().await;
+            let instances = node.shard.lock().await.list();
+            let mut device_ids =
+                std::collections::HashMap::from([(name.clone(), mesh.device_id().to_string())]);
+            {
+                let orbit = node.orbit.lock().await;
+                device_ids.extend(
+                    orbit
+                        .devices()
+                        .iter()
+                        .map(|device| (device.name.clone(), device.device_id.clone())),
+                );
+            }
+            match node
+                .gpu
+                .register_hardware(
+                    &name,
+                    &mesh.device_id().to_string(),
+                    &instances,
+                    &device_ids,
+                )
+                .await
+            {
+                Ok(0) => {}
+                Ok(count) => {
+                    eprintln!("astd: registered {count} NVIDIA GPU provider(s)");
+                    let gpu = node.gpu.clone();
+                    let reconciliation_node = node.clone();
+                    let reconciliation_mesh = mesh.clone();
+                    tokio::spawn(async move {
+                        let mut interval =
+                            tokio::time::interval(std::time::Duration::from_secs(60));
+                        loop {
+                            interval.tick().await;
+                            // Rebuild both views every pass. Reusing startup
+                            // snapshots can resurrect a detached lease and
+                            // cannot remove authority for a deleted instance.
+                            let mut fresh_device_ids = std::collections::HashMap::from([(
+                                reconciliation_node.device_name().await,
+                                reconciliation_mesh.device_id().to_string(),
+                            )]);
+                            {
+                                let orbit = reconciliation_node.orbit.lock().await;
+                                fresh_device_ids.extend(
+                                    orbit.devices().iter().map(|device| {
+                                        (device.name.clone(), device.device_id.clone())
+                                    }),
+                                );
+                            }
+                            match reconciliation_mesh
+                                .orbit_registry(&reconciliation_node)
+                                .await
+                            {
+                                Ok(Response::Orbit { rows }) => {
+                                    let fresh_catalog = rows
+                                        .into_iter()
+                                        .map(|row| row.instance)
+                                        .collect::<Vec<_>>();
+                                    match gpu.reconcile_durable_attachments(
+                                        &fresh_catalog,
+                                        &fresh_device_ids,
+                                    ) {
+                                        Ok(changed) if changed > 0 => eprintln!(
+                                            "astd: reconciled {changed} durable remote GPU authority change(s)"
+                                        ),
+                                        Ok(_) => {}
+                                        Err(error) => eprintln!(
+                                            "astd: durable GPU attachment reconciliation failed: {error:#}"
+                                        ),
+                                    }
+                                }
+                                Ok(other) => eprintln!(
+                                    "astd: orbit GPU reconciliation received unexpected reply: {other:?}"
+                                ),
+                                Err(error) => eprintln!(
+                                    "astd: orbit GPU attachment catalog is unavailable: {error:#}"
+                                ),
+                            }
+                            if let Err(error) = gpu.renew_durable_leases(now_unix()) {
+                                eprintln!("astd: durable GPU lease renewal failed: {error:#}");
+                            }
+                        }
+                    });
+                }
+                Err(err) => eprintln!("astd: NVIDIA GPU inventory refused: {err:#}"),
+            }
             Some(mesh)
         }
         Err(e) => {
@@ -219,7 +420,7 @@ async fn main() -> Result<()> {
         eprintln!("astd: secret egress is unavailable: {e:#}");
     }
 
-    // Moving an instance's cpu part needs the mesh, and the target's half of
+    // Moving an instance's compute needs the mesh, and the target's half of
     // a move is reached from a mesh stream — so, like the volume plane, it
     // holds a process-wide handle rather than taking one as an argument.
     swap::init(mesh.clone());
@@ -296,7 +497,8 @@ fn print_early_exit() -> bool {
                  Usage: astd\n\n\
                  Options:\n\
                    --help     Print help\n\
-                   --version  Print version"
+                   --version  Print version\n\
+                   --service  Windows Service dispatcher (SCM ImagePath)"
             );
             true
         }
@@ -311,13 +513,14 @@ fn print_early_exit() -> bool {
 /// that is not is a question somebody has to answer later.
 fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
     file.write_all(bytes)
 }
 
@@ -410,23 +613,79 @@ fn sweep_interrupted_commits() {
 /// of `main`, before the socket exists, because a signal that arrives before
 /// its handler does is not a shutdown — it is the default disposition, which
 /// is death, and a daemon killed that way leaves both files behind.
+#[derive(Clone, Copy)]
+enum StopSource {
+    Console,
+    #[cfg(windows)]
+    Service,
+}
+
 struct Stop {
+    #[cfg(windows)]
+    source: WindowsStop,
+    #[cfg(unix)]
     term: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
     int: Option<tokio::signal::unix::Signal>,
 }
 
+#[cfg(windows)]
+enum WindowsStop {
+    Console(Option<tokio::signal::windows::CtrlC>),
+    Service,
+}
+
 impl Stop {
-    fn listen() -> Stop {
-        use tokio::signal::unix::{signal, SignalKind};
-        Stop {
-            term: signal(SignalKind::terminate()).ok(),
-            int: signal(SignalKind::interrupt()).ok(),
+    fn listen(source: StopSource) -> Stop {
+        #[cfg(unix)]
+        {
+            let StopSource::Console = source;
+            use tokio::signal::unix::{signal, SignalKind};
+            Stop {
+                term: signal(SignalKind::terminate()).ok(),
+                int: signal(SignalKind::interrupt()).ok(),
+            }
+        }
+        #[cfg(windows)]
+        {
+            let source = match source {
+                // Constructing the listener here registers the console handler
+                // before startup mutates state, matching the Unix contract.
+                StopSource::Console => WindowsStop::Console(tokio::signal::windows::ctrl_c().ok()),
+                StopSource::Service => WindowsStop::Service,
+            };
+            Stop { source }
         }
     }
 
-    /// Wait for either. A signal this process could not register for never
-    /// arrives here, which is correct: it was never ours to catch.
+    /// Wait only for the source that owns this process. A console daemon must
+    /// never start the blocking SCM waiter: dropping its join handle after
+    /// Ctrl-C does not cancel it, and Tokio waits for blocking tasks while
+    /// dropping the runtime. Conversely, an SCM worker has no console signal
+    /// to race and waits only for STOP/SHUTDOWN.
     async fn next(&mut self) {
+        #[cfg(unix)]
+        {
+            self.unix_signal().await;
+        }
+
+        #[cfg(windows)]
+        match &mut self.source {
+            WindowsStop::Console(Some(ctrl_c)) => {
+                let _ = ctrl_c.recv().await;
+            }
+            WindowsStop::Console(None) => std::future::pending().await,
+            WindowsStop::Service => {
+                let _ = tokio::task::spawn_blocking(asterism_core::windows_host::wait_service_stop)
+                    .await;
+            }
+        }
+    }
+
+    /// Wait for either unix signal. A signal this process could not register
+    /// for never arrives here, which is correct: it was never ours to catch.
+    #[cfg(unix)]
+    async fn unix_signal(&mut self) {
         match (&mut self.term, &mut self.int) {
             (Some(term), Some(int)) => {
                 tokio::select! {
@@ -561,6 +820,25 @@ async fn serve(conn: Admitted, node: Node, mesh: Option<Arc<Mesh>>) -> Result<()
         // process. It borrows this private unix-socket connection and either
         // enters the local target through the same policy path or bridges it
         // to one dedicated authenticated mesh stream.
+        if let Request::GpuGuestOpen { name } = &request {
+            let mut io = ClientIo {
+                frames: &mut frames,
+                write: &mut write,
+            };
+            if let Err(e) = gpu::serve_local(name, &node, mesh.as_ref(), &mut io).await {
+                io.send(&Response::GpuGuestRefused {
+                    code: "unreachable".into(),
+                    message: format!("{e:#}"),
+                })
+                .await?;
+                // This unix connection is the local counterpart of one GPU
+                // data path. Once the remote side is gone, retaining it in
+                // the ordinary RPC loop leaves the guest/CUSE pump blocked.
+                break;
+            }
+            continue;
+        }
+
         if let Request::DeviceShellOpen { device, open } = &request {
             let mut io = ClientIo {
                 frames: &mut frames,
@@ -622,7 +900,7 @@ async fn serve(conn: Admitted, node: Node, mesh: Option<Arc<Mesh>>) -> Result<()
             continue;
         }
 
-        // A cpu-part swap is a job rather than a question — a preflight, a
+        // A compute move is a job rather than a question — a preflight, a
         // fence, a disk crossing a network, two commits — so it reports as it
         // goes, on the connection that asked, exactly as a wake does.
         if let Request::SetCpu { name, device, down } = &request {
@@ -684,6 +962,45 @@ fn at_most(response: Response, spoken: u32) -> Response {
 /// resolved across the orbit and forwarded to whichever device holds that
 /// row — which is where `--device` stops being necessary.
 async fn dispatch(request: Request, node: &Node, mesh: Option<&Arc<Mesh>>) -> Response {
+    if let Request::AttachGpu {
+        name,
+        provider_device,
+        gpu_uuid,
+        memory_bytes,
+    } = &request
+    {
+        return match gpu::resolve_attach(
+            name.clone(),
+            provider_device.clone(),
+            gpu_uuid.clone(),
+            *memory_bytes,
+            node,
+            mesh,
+        )
+        .await
+        {
+            Ok(resolved) => route(resolved, node, mesh).await,
+            Err(err) => Response::Error {
+                message: format!("{err:#}"),
+            },
+        };
+    }
+    if let Request::DetachGpu { name } = &request {
+        if let Err(err) = gpu::revoke_for_detach(name, node, mesh).await {
+            return Response::Error {
+                message: format!("{err:#}"),
+            };
+        }
+    }
+    if let Request::Remove { name } = &request {
+        if let Err(err) = gpu::revoke_for_remove(name, node, mesh).await {
+            return Response::Error {
+                message: format!(
+                    "instance removal refused until its GPU lease is revoked: {err:#}"
+                ),
+            };
+        }
+    }
     if secret::is_orbit_request(&request) {
         return secret::serve(request, node, mesh).await;
     }
@@ -795,6 +1112,16 @@ pub(crate) async fn handle(req: Request, node: &Node) -> Response {
     if images::is_plane_request(&req) {
         return images::serve(req).await;
     }
+    // Exec is the one instance command whose useful work may be unbounded.
+    // Clone its immutable authority while holding the shard, then release the
+    // global mutex before touching the runtime.  Down/remove/reconcile can
+    // consequently proceed even when the command or its control peer stalls.
+    if matches!(&req, Request::ContainerExec { .. }) {
+        return container_exec(node, req).await;
+    }
+    if gpu::is_plane_request(&req) {
+        return gpu::serve_plane(req, node);
+    }
 
     // Catalog fan-out can wait on every peer. Resolve it before taking the
     // shard lock so one partitioned storage device cannot stall unrelated
@@ -857,6 +1184,69 @@ pub(crate) async fn handle(req: Request, node: &Node) -> Response {
     instance::serve(req, &mut reg, &cpu_device).await
 }
 
+async fn container_exec(node: &Node, request: Request) -> Response {
+    let handle = {
+        let reg = node.shard.lock().await;
+        if let Some(refusal) = instance::refusal(&request, &reg) {
+            return refusal;
+        }
+        let Request::ContainerExec { name, .. } = &request else {
+            return Response::Error {
+                message: "non-container request reached container exec dispatcher".into(),
+            };
+        };
+        let inst = match reg.get(name) {
+            Ok(inst) => inst,
+            Err(error) => {
+                return Response::Error {
+                    message: format!("{error:#}"),
+                }
+            }
+        };
+        if inst.runtime != asterism_core::instance::RuntimeKind::Container {
+            return Response::Error {
+                message: format!("instance {name:?} uses runtime=vm; use `ast ssh {name}`"),
+            };
+        }
+        match inst.handle.clone() {
+            Some(handle) => handle,
+            None => {
+                return Response::Error {
+                    message: "container is not running".into(),
+                }
+            }
+        }
+    };
+    let Request::ContainerExec { command, .. } = request else {
+        unreachable!("request was checked while selecting the container handle")
+    };
+
+    let task = tokio::task::spawn_blocking(move || {
+        container::exec(&handle, command, container::EXEC_DEADLINE)
+    });
+    let result = tokio::time::timeout(
+        container::EXEC_DEADLINE + std::time::Duration::from_secs(3),
+        task,
+    )
+    .await;
+    match result {
+        Ok(Ok(Ok((status, stdout, stderr)))) => Response::ContainerExec {
+            status,
+            stdout,
+            stderr,
+        },
+        Ok(Ok(Err(error))) => Response::Error {
+            message: format!("{error:#}"),
+        },
+        Ok(Err(error)) => Response::Error {
+            message: format!("container exec worker failed: {error}"),
+        },
+        Err(_) => Response::Error {
+            message: "container exec exceeded its daemon deadline".into(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -866,6 +1256,7 @@ mod tests {
             shard: Arc::new(Mutex::new(Shard::load(&home.join("state.json")).unwrap())),
             orbit: Arc::new(Mutex::new(Orbit::load(&home.join("orbit.json")).unwrap())),
             shell: device_shell::Manager::load_at(home),
+            gpu: gpu::Manager::new(),
         }
     }
 
@@ -932,5 +1323,137 @@ mod tests {
             node.shard.try_lock().is_ok(),
             "the handshake kept the registry after answering"
         );
+    }
+
+    /// A runtime exec may wait on arbitrary guest code, but it must release
+    /// the one shard mutex before it sends the control request.  This is the
+    /// race that keeps down/remove/reconcile live during a stuck exec.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(target_os = "linux")]
+    async fn container_exec_releases_the_registry_before_waiting() {
+        use std::io::{BufRead, Write};
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::net::UnixListener;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        use asterism_core::hv::{
+            ContainerControlEndpoint, ContainerRuntimeIdentity, ControlChannel, Handle,
+            KernelObjectIdentity, Machine,
+        };
+        use asterism_core::instance::{RuntimeKind, Shape};
+        use asterism_core::proc::ProcId;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let node = node_on(tmp.path());
+        let runtime = tmp.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        let cgroup = runtime.join("cgroup");
+        std::fs::create_dir(&cgroup).unwrap();
+        let proc = ProcId::capture(std::process::id()).unwrap();
+        std::fs::write(cgroup.join("cgroup.procs"), format!("{}\n", proc.pid)).unwrap();
+        std::fs::write(cgroup.join("cgroup.events"), "populated 1\n").unwrap();
+        let namespace = |name: &str| {
+            let path = runtime.join(name);
+            std::fs::write(&path, name).unwrap();
+            path
+        };
+        let user_namespace = namespace("user.ns");
+        let mount_namespace = namespace("mount.ns");
+        let pid_namespace = namespace("pid.ns");
+        let network_namespace = namespace("network.ns");
+        let kernel_id = |path: &std::path::Path| {
+            let metadata = std::fs::metadata(path).unwrap();
+            KernelObjectIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }
+        };
+        let socket = runtime.join("control.sock");
+        let control = ContainerControlEndpoint {
+            socket: socket.clone(),
+            user_namespace: user_namespace.clone(),
+            mount_namespace: mount_namespace.clone(),
+            pid_namespace: pid_namespace.clone(),
+            network_namespace: network_namespace.clone(),
+            cgroup: cgroup.clone(),
+            identity: Some(ContainerRuntimeIdentity {
+                user_namespace: kernel_id(&user_namespace),
+                mount_namespace: kernel_id(&mount_namespace),
+                pid_namespace: kernel_id(&pid_namespace),
+                network_namespace: kernel_id(&network_namespace),
+                cgroup: kernel_id(&cgroup),
+            }),
+            network: None,
+        };
+        let handle = Handle {
+            backend: container::LINUX_ID.into(),
+            pid: Some(proc.pid),
+            proc: Some(proc),
+            ctl: ControlChannel::Rpc {
+                path: socket.clone(),
+            },
+            endpoint: None,
+            container_control: Some(control),
+            started_at: 1,
+        };
+        {
+            let mut reg = node.shard.lock().await;
+            reg.create_runtime(
+                "dev",
+                "cpu",
+                "image",
+                Shape::default(),
+                Machine {
+                    backend: container::LINUX_ID.into(),
+                    machine_type: "test".into(),
+                    cpu: "test".into(),
+                    hv_version: "test".into(),
+                },
+                RuntimeKind::Container,
+            )
+            .unwrap();
+            reg.set_running("dev", handle).unwrap();
+        }
+
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            std::io::BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            assert!(request.contains("exec"));
+            waiting_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            stream
+                .write_all(b"{\"result\":\"error\",\"message\":\"released\"}\n")
+                .unwrap();
+        });
+
+        let exec_node = node.clone();
+        let exec = tokio::spawn(async move {
+            container_exec(
+                &exec_node,
+                Request::ContainerExec {
+                    name: "dev".into(),
+                    command: vec!["true".into()],
+                },
+            )
+            .await
+        });
+        tokio::task::spawn_blocking(move || waiting_rx.recv_timeout(Duration::from_secs(5)))
+            .await
+            .unwrap()
+            .expect("exec never reached its runtime control socket");
+        assert!(
+            node.shard.try_lock().is_ok(),
+            "container exec held the registry while waiting on guest code"
+        );
+        release_tx.send(()).unwrap();
+        assert!(matches!(exec.await.unwrap(), Response::Error { .. }));
+        server.join().unwrap();
     }
 }

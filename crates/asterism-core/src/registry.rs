@@ -3,12 +3,12 @@
 //!
 //! The orbit is a pool of parts; an instance is a computer assembled from
 //! them. There is exactly **one** instance registry per orbit, and it is flat:
-//! `dev` names one instance, wherever in the pool its cpu and ram are being
+//! `dev` names one instance, wherever in the pool its compute is being
 //! sourced from today. "The laptop's dev" is not a thing that can be said.
 //!
 //! That one registry is never stored in one piece, because storing it in one
 //! piece would need a device that is always up to store it on. Instead each
-//! device persists a [`Shard`] — the rows for the instances whose cpu/ram it
+//! device persists a [`Shard`] — the rows for the instances whose compute it
 //! supplies — at `$ASTERISM_HOME/state.json`, and the whole registry is
 //! assembled at read time by asking every reachable device in the orbit for
 //! its shard. `astd`'s mesh module does the assembling; this module is one
@@ -20,7 +20,7 @@
 //!   only refuse a name it already holds; refusing a name held elsewhere needs
 //!   the other shards, so `ast create` asks them before it gets here.
 //! * **A device is not privileged.** It supplies parts. Which device supplies
-//!   an instance's cpu and ram is a mutable attribute of the instance, not a
+//!   an instance's compute is a mutable attribute of the instance, not a
 //!   relationship the device has to it.
 //!
 //! Writes go through [`crate::durable`], so a crash mid-save never leaves a
@@ -36,9 +36,11 @@ use serde::{Deserialize, Serialize};
 use crate::durable::{self, Loaded};
 use crate::hv::{Handle, ImageKind, Machine};
 use crate::instance::{
-    self, now_unix, Conflict, Instance, Moving, Policy, PortForward, Restart, Shape, Status, Volume,
+    self, now_unix, Conflict, Instance, Moving, Policy, PortForward, Restart, RuntimeKind, Shape,
+    Status, Volume,
 };
 use crate::proc::ProcId;
+use crate::remote_gpu::GpuAttachment;
 use crate::secret::Binding;
 
 /// Immutable authority carried by a durable block-volume row.
@@ -132,7 +134,7 @@ impl AnyShard {
 /// One row of the assembled orbit registry, as `ast ls` prints it.
 ///
 /// Separate from [`Instance`] because it carries something the record itself
-/// cannot know: whether the device supplying this instance's cpu/ram answered
+/// cannot know: whether the device supplying this instance's compute answered
 /// while the view was being assembled. A row that came out of the last-seen
 /// cache instead of a live shard says so, and prints its status as `unknown` —
 /// the instance is real, its state is merely stale.
@@ -287,7 +289,7 @@ impl Shard {
         }
     }
 
-    /// Define an instance in this shard, sourcing its cpu and ram from
+    /// Define an instance in this shard, sourcing its compute from
     /// `cpu_device`. `machine` records the runnable backend that was probed
     /// before this row was created.
     ///
@@ -302,11 +304,25 @@ impl Shard {
         shape: Shape,
         machine: Machine,
     ) -> Result<Instance> {
+        self.create_runtime(name, cpu_device, image, shape, machine, RuntimeKind::Vm)
+    }
+
+    /// Define an instance with an explicit isolation contract.
+    pub fn create_runtime(
+        &mut self,
+        name: &str,
+        cpu_device: &str,
+        image: &str,
+        shape: Shape,
+        machine: Machine,
+        runtime: RuntimeKind,
+    ) -> Result<Instance> {
         check_name(name)?;
         if let Some(existing) = self.instances.get(name) {
             bail!("{}", taken(existing));
         }
-        let inst = Instance::new(name, cpu_device, image, shape, machine);
+        let mut inst = Instance::new(name, cpu_device, image, shape, machine);
+        inst.runtime = runtime;
         self.instances.insert(name.to_owned(), inst.clone());
         Ok(inst)
     }
@@ -675,6 +691,39 @@ impl Shard {
         Ok(inst.clone())
     }
 
+    /// Record a provider-admitted GPU lease as an instance part.
+    ///
+    /// The caller must already hold the live lease returned by the provider;
+    /// only its token-free metadata reaches this durable shard. Existing
+    /// backends cannot hotplug the guest projection, so a running instance is
+    /// refused before the row changes. Revocation is different: detach may
+    /// remove a running instance's authority immediately.
+    pub fn attach_gpu(&mut self, name: &str, attachment: GpuAttachment) -> Result<Instance> {
+        let inst = self.get_mut(name)?;
+        if inst.status == Status::Running {
+            bail!("instance {name:?} is running — `ast down {name}` before attaching a GPU");
+        }
+        if let Some(existing) = &inst.gpu {
+            bail!(
+                "instance {name:?} already has {} from {} — detach it before attaching another GPU",
+                existing.provider_gpu_uuid,
+                existing.provider_device
+            );
+        }
+        inst.gpu = Some(attachment);
+        Ok(inst.clone())
+    }
+
+    /// Remove the durable GPU part after its provider lease has been revoked.
+    pub fn detach_gpu(&mut self, name: &str) -> Result<(Instance, GpuAttachment)> {
+        let inst = self.get_mut(name)?;
+        let attachment = inst
+            .gpu
+            .take()
+            .with_context(|| format!("instance {name:?} has no GPU attached"))?;
+        Ok((inst.clone(), attachment))
+    }
+
     /// Take a secret off an instance, by its orbit name.
     ///
     /// Returns the binding, because revoking one is more than forgetting a
@@ -709,7 +758,7 @@ impl Shard {
         Ok((inst.clone(), removed))
     }
 
-    /// Put the fence up (or take it down) on an instance whose cpu part is
+    /// Put the fence up (or take it down) on an instance whose compute is
     /// being swapped onto another device.
     ///
     /// While it is up this device holds the only bootable copy and refuses to
@@ -732,7 +781,7 @@ impl Shard {
         Ok(inst.clone())
     }
 
-    /// Take on an instance whose cpu part has just been moved here.
+    /// Take on an instance whose compute has just been moved here.
     ///
     /// Not [`Shard::create`]: the name was claimed long ago and the id, the
     /// creation time and the snapshots are the ones the instance has always
@@ -767,8 +816,9 @@ impl Shard {
 /// the instance, not a claim by the device.
 pub fn taken(existing: &Instance) -> String {
     format!(
-        "instance {:?} already exists in this orbit (cpu/ram on {})",
-        existing.name, existing.cpu_device
+        "instance {:?} already exists in this orbit (compute on {})",
+        existing.name,
+        existing.compute_device()
     )
 }
 
@@ -776,7 +826,7 @@ pub fn taken(existing: &Instance) -> String {
 pub fn conflicted(inst: &Instance, conflict: &Conflict) -> String {
     format!(
         "instance {:?} shares its name with another instance in this orbit \
-         (cpu/ram on {}) — rename this one first: ast rename {} <new-name>",
+         (compute on {}) — rename this one first: ast rename {} <new-name>",
         inst.name, conflict.other_cpu_device, inst.name
     )
 }
@@ -809,7 +859,8 @@ mod tests {
             ctl: ControlChannel::Qmp {
                 path: "/tmp/qmp.sock".into(),
             },
-            endpoint: GuestEndpoint::HostForward { ssh_port },
+            endpoint: Some(GuestEndpoint::HostForward { ssh_port }),
+            container_control: None,
             started_at: 1_700_000_000,
         }
     }
@@ -951,6 +1002,61 @@ mod tests {
             .is_err());
     }
 
+    #[test]
+    fn gpu_attachment_is_token_free_durable_and_refuses_hotplug_before_mutation() {
+        let path = scratch();
+        let mut shard = Shard::load(&path).unwrap();
+        shard
+            .create("dev", "laptop", "ubuntu:24.04", Shape::default(), machine())
+            .unwrap();
+        let attachment = GpuAttachment {
+            provider_device: "desktop".into(),
+            provider_device_id: "a".repeat(64),
+            provider_gpu_uuid: "GPU-01234567".into(),
+            memory_bytes: 8 << 30,
+            provider_generation: 3,
+            attached_at: 100,
+        };
+
+        shard.set_running("dev", handle(11, 2222)).unwrap();
+        let before = serde_json::to_string(shard.get("dev").unwrap()).unwrap();
+        let error = shard.attach_gpu("dev", attachment.clone()).unwrap_err();
+        assert!(error.to_string().contains("before attaching a GPU"));
+        assert_eq!(
+            serde_json::to_string(shard.get("dev").unwrap()).unwrap(),
+            before
+        );
+
+        shard.set_stopped("dev").unwrap();
+        shard.attach_gpu("dev", attachment.clone()).unwrap();
+        let attached = serde_json::to_string(shard.get("dev").unwrap()).unwrap();
+        assert!(!attached.contains("capability"));
+        assert!(shard.attach_gpu("dev", attachment).is_err());
+        assert_eq!(
+            serde_json::to_string(shard.get("dev").unwrap()).unwrap(),
+            attached
+        );
+        shard.save().unwrap();
+        assert_eq!(
+            Shard::load(&path)
+                .unwrap()
+                .get("dev")
+                .unwrap()
+                .gpu
+                .as_ref()
+                .unwrap()
+                .provider_gpu_uuid,
+            "GPU-01234567"
+        );
+
+        // Revocation must not wait for a guest shutdown: once the provider
+        // cuts the live lease, the durable row can be removed immediately.
+        shard.set_running("dev", handle(12, 2223)).unwrap();
+        let (_, removed) = shard.detach_gpu("dev").unwrap();
+        assert_eq!(removed.provider_device, "desktop");
+        assert!(shard.get("dev").unwrap().gpu.is_none());
+    }
+
     /// A block volume is a disk, so it has no mount point to collide on, and
     /// re-attaching it is a renewal rather than a second disk.
     #[test]
@@ -1003,11 +1109,11 @@ mod tests {
         assert!(err.contains("as a directory"), "{err}");
     }
 
-    /// A cpu-part swap changes one line of an instance's parts table. The
+    /// A compute move changes one line of an instance's parts table. The
     /// rest of it — the id, the creation time, the snapshots — is the
     /// instance's own and does not move, because it was never on a device.
     #[test]
-    fn adopting_a_moved_instance_keeps_everything_but_the_cpu_device() {
+    fn adopting_a_moved_instance_keeps_everything_but_compute() {
         let mut source = Shard::load(&scratch()).unwrap();
         let mut inst = source
             .create("dev", "laptop", "debian:13", Shape::default(), machine())
@@ -1040,12 +1146,12 @@ mod tests {
             "one instance, one id"
         );
         assert_eq!(adopted.created_at, source.get("dev").unwrap().created_at);
-        assert_eq!(adopted.cpu_device, "desktop", "only the part moved");
+        assert_eq!(adopted.compute_device(), "desktop", "only the part moved");
         assert_eq!(adopted.move_epoch, 1);
         assert_eq!(
             adopted.seeded_by(),
             "laptop",
-            "the seed did not move with the cpu"
+            "the seed did not move with compute"
         );
 
         // A shard that already holds the name refuses, in the orbit's words.
@@ -1069,8 +1175,9 @@ mod tests {
             .to_string();
         assert_eq!(
             err,
-            "instance \"dev\" already exists in this orbit (cpu/ram on laptop)"
+            "instance \"dev\" already exists in this orbit (compute on laptop)"
         );
+        assert!(!err.contains("cpu/ram"), "{err}");
         assert!(shard
             .create("has space", "laptop", "u", Shape::default(), machine())
             .is_err());
@@ -1169,7 +1276,8 @@ mod tests {
             text.contains("shares its name with another instance in this orbit"),
             "{text}"
         );
-        assert!(text.contains("cpu/ram on desktop"), "{text}");
+        assert!(text.contains("compute on desktop"), "{text}");
+        assert!(!text.contains("cpu/ram"), "{text}");
         assert!(text.contains("ast rename dev <new-name>"), "{text}");
     }
 
@@ -1195,15 +1303,18 @@ mod tests {
         let inst = shard.get("dev").unwrap();
         assert_eq!(inst.status, Status::Running);
         // The device that was called this instance's anchor is the device
-        // supplying its cpu and ram; only the framing changed.
-        assert_eq!(inst.cpu_device, "laptop");
+        // supplying its compute; only the framing changed.
+        assert_eq!(inst.compute_device(), "laptop");
         let h = inst
             .handle
             .as_ref()
             .expect("the running guest survived the upgrade");
         assert_eq!(h.backend, "qemu", "old entries were all QEMU");
         assert_eq!(h.pid, Some(4242));
-        assert_eq!(h.endpoint, GuestEndpoint::HostForward { ssh_port: 22022 });
+        assert_eq!(
+            h.endpoint,
+            Some(GuestEndpoint::HostForward { ssh_port: 22022 })
+        );
         // The control path is the one the old backend derived from the name.
         assert_eq!(
             h.ctl,

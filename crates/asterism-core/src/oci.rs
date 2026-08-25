@@ -1,13 +1,10 @@
 //! OCI/Docker images as an instance image source.
 //!
-//! MODEL.md is the decision this file implements: *"OCI/Docker images are an
-//! image SOURCE, booted as microVMs (OCI rootfs + guest kernel), so users get
-//! the container ecosystem with VM isolation. No instance ever shares a host
-//! kernel."* There is no container runtime here and there never will be. A
-//! reference like `nginx` is pulled from a registry, its layers are unpacked,
-//! and the result is turned into an ext4 disk that an ordinary microVM boots.
-//! From `prepare()` onwards it is a raw disk like any other: it clones,
-//! snapshots and takes volumes exactly as a cloud image does.
+//! OCI/Docker is an image format, independent of the instance runtime. A
+//! reference like `nginx` is pulled, verified, unpacked, and represented as
+//! an ext4 filesystem image. `runtime=vm` boots that filesystem with a guest
+//! kernel; `runtime=container` extracts the same verified bytes into a
+//! rootless native namespace. Runtime selection never changes image identity.
 //!
 //! Three things a container image does not come with, and where each comes
 //! from:
@@ -49,7 +46,7 @@
 //! kernel/<arch>-vmlinuz       guest kernel, shared by every OCI instance
 //! kernel/<arch>-vmlinux       verified, uncompressed derivative for VZ
 //! kernel/<arch>-initrd
-//! kernel/<arch>-virtiofs.ko   verified module paired with that kernel
+//! kernel/<arch>-<module>.ko   verified modules paired with that kernel
 //! ```
 //! The `.raw` is content-addressed, so two references to the same digest are
 //! one image on disk and a moved tag is a different file rather than a
@@ -151,13 +148,14 @@ pub const KERNELS: &[GuestKernel] = &[
     },
 ];
 
-/// The one loadable driver the cloud-image initrd does not carry.
+/// Loadable drivers the cloud-image initrd does not carry.
 ///
-/// Ubuntu builds virtiofs as a module. Its cloud initrd omits that module
-/// because ordinary cloud images load it from their root filesystem later;
-/// an OCI rootfs has no distro module tree. Keep the exact matching Ubuntu
-/// package pinned beside the kernel pair and retain only its small verified
-/// `virtiofs.ko` derivative on the device.
+/// Ubuntu builds virtiofs and the virtio-vsock transport as modules. Its
+/// cloud initrd omits them because ordinary cloud images load matching
+/// modules from their root filesystem later. Asterism may direct-boot a
+/// Debian disk with this Ubuntu kernel, so the root module tree is not a
+/// valid fallback. Keep the exact matching Ubuntu package pinned beside the
+/// kernel pair and retain only the small verified derivatives we load.
 pub struct GuestModule {
     pub arch: &'static str,
     pub package: Pinned,
@@ -179,6 +177,28 @@ pub const VIRTIOFS_MODULES: &[GuestModule] = &[
         },
     },
 ];
+
+const KERNEL_MODULE_NAMES: &[&str] = &[
+    "virtiofs",
+    "vsock",
+    "vmw_vsock_virtio_transport_common",
+    "vmw_vsock_virtio_transport",
+];
+
+/// One verified loadable module paired with [`kernel`].
+pub struct KernelModule {
+    /// Linux module name, without the `.ko` suffix.
+    pub name: &'static str,
+    /// Uncompressed ELF module bytes.
+    pub bytes: Vec<u8>,
+}
+
+impl KernelModule {
+    /// RFC 4648 base64 for carrying the module through a NoCloud seed.
+    pub fn base64(&self) -> String {
+        BASE64.encode(&self.bytes)
+    }
+}
 
 /// The platform an image has to offer, in registry vocabulary.
 fn platform_arch() -> &'static str {
@@ -1101,9 +1121,18 @@ fn remove(path: &Path) -> std::io::Result<()> {
     }
 }
 
+#[cfg(unix)]
 fn set_mode(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o7777))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
+    // Windows ACLs do not have a Unix mode equivalent. The containing
+    // Asterism home is the Windows privacy boundary; keep recording the
+    // image's mode in the tree so a later Unix consumer does not lose it.
     Ok(())
 }
 
@@ -1221,6 +1250,7 @@ pub fn init_script(config: &Config) -> String {
         &Egress::default(),
         &Bootstrap::default(),
         None,
+        None,
     )
 }
 
@@ -1236,6 +1266,7 @@ fn init_script_with_parts(
     share_kind: Option<ShareKind>,
     egress: &Egress,
     bootstrap: &Bootstrap,
+    gpu_boot: Option<&str>,
     virtiofs_module: Option<&[u8]>,
 ) -> String {
     let mut s = String::new();
@@ -1454,6 +1485,10 @@ fn init_script_with_parts(
                > /var/log/asterism-bootstrap.log 2>&1) &\n",
         );
     }
+    if let Some(gpu_boot) = gpu_boot {
+        s.push_str("# Materialize the attached guest-local GPU projection.\n");
+        s.push_str(gpu_boot);
+    }
     if let Some(dir) = &config.workdir {
         s.push_str(&format!(
             "$BB mkdir -p {0} 2>/dev/null\ncd {0} || exit 1\n",
@@ -1504,6 +1539,7 @@ pub fn configure_instance(
     share_kind: Option<ShareKind>,
     egress: &Egress,
     bootstrap: &Bootstrap,
+    gpu_boot: Option<&str>,
 ) -> Result<()> {
     if shares.is_empty() != share_kind.is_none() {
         bail!("an OCI directory share needs exactly one guest transport");
@@ -1549,6 +1585,7 @@ pub fn configure_instance(
         share_kind,
         egress,
         bootstrap,
+        gpu_boot,
         module.as_deref(),
     );
     rewrite_guest_files(root, &init)
@@ -1789,9 +1826,13 @@ pub fn kernel_paths() -> (PathBuf, PathBuf) {
 }
 
 fn virtiofs_module_path() -> PathBuf {
+    kernel_module_path("virtiofs")
+}
+
+fn kernel_module_path(name: &str) -> PathBuf {
     paths::images_dir()
         .join("kernel")
-        .join(format!("{}-virtiofs.ko", host_arch()))
+        .join(format!("{}-{name}.ko", host_arch()))
 }
 
 /// The verified module paired with the OCI guest kernel.
@@ -1808,6 +1849,34 @@ fn virtiofs_module() -> Result<Vec<u8>> {
     }
     verify::check(&module, Depth::from_env()).context("the virtiofs module this device fetched")?;
     std::fs::read(&module).with_context(|| format!("reading {}", module.display()))
+}
+
+/// Verified loadable modules paired with the direct-boot kernel.
+///
+/// Returned in load order: virtiofs first, then core socket support, the
+/// common virtio transport, and finally the concrete transport Cloud
+/// Hypervisor exposes. Direct boot cannot fall back to the root disk's module
+/// tree: that disk may be Debian while the running kernel is Ubuntu's pinned
+/// cloud kernel.
+pub fn direct_boot_modules() -> Result<Vec<KernelModule>> {
+    KERNEL_MODULE_NAMES
+        .iter()
+        .map(|&name| {
+            let path = kernel_module_path(name);
+            if !path.exists() {
+                bail!(
+                    "no {name} module on this device — refresh the native Linux boot inputs: ast pull <image>"
+                );
+            }
+            verify::check(&path, Depth::from_env())
+                .with_context(|| format!("the {name} module this device fetched"))?;
+            Ok(KernelModule {
+                name,
+                bytes: std::fs::read(&path)
+                    .with_context(|| format!("reading {}", path.display()))?,
+            })
+        })
+        .collect()
 }
 
 /// The kernel an OCI instance boots, or why this device has not got one.
@@ -1906,8 +1975,12 @@ pub fn ensure_kernel(fetch: impl Fn(&str, &Path) -> Result<()>) -> Result<bool> 
     let pinned_module = VIRTIOFS_MODULES
         .iter()
         .find(|module| module.arch == arch)
-        .with_context(|| format!("no virtiofs module published for {arch}"))?;
-    let fetched_module = ensure_virtiofs_module_at(pinned_module, &virtiofs_module_path(), &fetch)?;
+        .with_context(|| format!("no guest kernel modules published for {arch}"))?;
+    let modules: Vec<_> = KERNEL_MODULE_NAMES
+        .iter()
+        .map(|&name| (name, kernel_module_path(name)))
+        .collect();
+    let fetched_module = ensure_kernel_modules_at(pinned_module, &modules, &fetch)?;
     Ok(fetched_kernel || fetched_module)
 }
 
@@ -1956,30 +2029,39 @@ fn ensure_kernel_at(
     Ok(fetched)
 }
 
-/// Fetch, verify and retain only the matching `virtiofs.ko` from Ubuntu's
-/// kernel module package.
-fn ensure_virtiofs_module_at(
+/// Fetch one pinned Ubuntu module package and retain the matching drivers.
+fn ensure_kernel_modules_at(
     pinned: &GuestModule,
-    module: &Path,
+    modules: &[(&str, PathBuf)],
     fetch: impl Fn(&str, &Path) -> Result<()>,
 ) -> Result<bool> {
     let expected = pinned.package.expected("the guest kernel module package")?;
     let parent = expected.to_string();
-    if module.exists()
-        && verify::check(module, Depth::from_env()).is_ok()
-        && verify::provenance(module).is_some_and(|record| record.derived_from == [parent.as_str()])
-    {
+    if modules.iter().all(|(_, module)| {
+        module.exists()
+            && verify::check(module, Depth::from_env()).is_ok()
+            && verify::provenance(module)
+                .is_some_and(|record| record.derived_from == [parent.as_str()])
+    }) {
         return Ok(false);
     }
 
-    std::fs::create_dir_all(module.parent().expect("the module has a directory"))?;
-    let _ = std::fs::remove_file(module);
-    let _ = std::fs::remove_file(verify::provenance_path(module));
-    let package = module.with_extension("deb.part");
-    let part = module.with_extension("ko.part");
-    for path in [&package, &part] {
-        let _ = std::fs::remove_file(path);
+    let directory = modules
+        .first()
+        .and_then(|(_, module)| module.parent())
+        .context("the guest module set is empty")?;
+    std::fs::create_dir_all(directory)?;
+    let package = directory.join(format!("{}-modules.deb.part", pinned.arch));
+    let parts: Vec<_> = modules
+        .iter()
+        .map(|(name, module)| (*name, module.clone(), module.with_extension("ko.part")))
+        .collect();
+    for (_, module, part) in &parts {
+        let _ = std::fs::remove_file(module);
+        let _ = std::fs::remove_file(verify::provenance_path(module));
+        let _ = std::fs::remove_file(part);
     }
+    let _ = std::fs::remove_file(&package);
 
     let result = (|| -> Result<()> {
         fetch(pinned.package.url, &package).with_context(|| {
@@ -1991,22 +2073,29 @@ fn ensure_virtiofs_module_at(
         expected
             .verify_file(&package, "the downloaded guest kernel module package")
             .context("Ubuntu's kernel module package was discarded")?;
-        extract_virtiofs_module(&package, &part)?;
-        let mut magic = [0u8; 4];
-        std::fs::File::open(&part)?.read_exact(&mut magic)?;
-        if magic != *b"\x7fELF" {
-            bail!("Ubuntu's virtiofs module is not an ELF object");
+        let outputs: Vec<_> = parts
+            .iter()
+            .map(|(name, _, part)| (*name, part.clone()))
+            .collect();
+        extract_kernel_modules(&package, &outputs)?;
+        for (name, module, part) in &parts {
+            let mut magic = [0u8; 4];
+            std::fs::File::open(part)?.read_exact(&mut magic)?;
+            if magic != *b"\x7fELF" {
+                bail!("Ubuntu's {name} module is not an ELF object");
+            }
+            verify::adopt(
+                part,
+                module,
+                None,
+                Source::new("kernel-module", pinned.package.url).derived_from([parent.clone()]),
+            )?;
         }
-        verify::adopt(
-            &part,
-            module,
-            None,
-            Source::new("kernel-module", pinned.package.url).derived_from([parent.clone()]),
-        )?;
         Ok(())
     })();
-    for path in [&package, &part] {
-        let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(&package);
+    for (_, _, part) in &parts {
+        let _ = std::fs::remove_file(part);
     }
     result?;
     Ok(true)
@@ -2015,7 +2104,7 @@ fn ensure_virtiofs_module_at(
 /// A Debian package is a small ar archive. The Ubuntu packages pinned above
 /// carry an uncompressed `data.tar` and a zstd-compressed module inside it.
 /// Parse the container here instead of requiring `dpkg` or GNU `ar` on macOS.
-fn extract_virtiofs_module(package: &Path, dest: &Path) -> Result<()> {
+fn extract_kernel_modules(package: &Path, outputs: &[(&str, PathBuf)]) -> Result<()> {
     let mut package = std::fs::File::open(package)?;
     let mut magic = [0u8; 8];
     package.read_exact(&mut magic)?;
@@ -2040,35 +2129,77 @@ fn extract_virtiofs_module(package: &Path, dest: &Path) -> Result<()> {
         let data_at = package.stream_position()?;
         if name == "data.tar" {
             let data = (&mut package).take(size);
-            return extract_virtiofs_from_tar(data, dest);
+            return extract_modules_from_tar(data, outputs);
         }
         package.seek(SeekFrom::Start(data_at + size + size % 2))?;
     }
     bail!("the guest kernel module package has no data.tar member")
 }
 
-fn extract_virtiofs_from_tar(reader: impl Read, dest: &Path) -> Result<()> {
+fn extract_modules_from_tar(reader: impl Read, outputs: &[(&str, PathBuf)]) -> Result<()> {
     let mut archive = tar::Archive::new(reader);
+    let mut found = vec![false; outputs.len()];
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?;
-        if path.file_name().and_then(|name| name.to_str()) != Some("virtiofs.ko.zst") {
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(index) = outputs
+            .iter()
+            .position(|(name, _)| file_name == format!("{name}.ko.zst"))
+        else {
+            continue;
+        };
+        if found[index] {
             continue;
         }
+        let (name, dest) = &outputs[index];
         let mut decoder = ruzstd::decoding::StreamingDecoder::new(&mut entry)
-            .map_err(|error| anyhow::anyhow!("opening virtiofs.ko.zst: {error}"))?;
+            .map_err(|error| anyhow::anyhow!("opening {name}.ko.zst: {error}"))?;
         let mut output = std::fs::File::create(dest)?;
-        std::io::copy(&mut decoder, &mut output).context("decompressing virtiofs.ko")?;
+        std::io::copy(&mut decoder, &mut output)
+            .with_context(|| format!("decompressing {name}.ko"))?;
         output.flush()?;
         output.sync_all()?;
-        return Ok(());
+        found[index] = true;
     }
-    bail!("Ubuntu's kernel module package has no virtiofs.ko.zst")
+    let missing: Vec<_> = outputs
+        .iter()
+        .zip(found)
+        .filter_map(|((name, _), found)| (!found).then_some(*name))
+        .collect();
+    if !missing.is_empty() {
+        bail!(
+            "Ubuntu's kernel module package is missing: {}",
+            missing.join(", ")
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_kernel_package_missing_any_direct_boot_module_is_refused_as_a_set() {
+        let mut archive = Vec::new();
+        tar::Builder::new(&mut archive).finish().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let outputs = [
+            ("vsock", root.path().join("vsock.ko")),
+            (
+                "vmw_vsock_virtio_transport",
+                root.path().join("transport.ko"),
+            ),
+        ];
+        let error = extract_modules_from_tar(archive.as_slice(), &outputs)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("vsock"), "{error}");
+        assert!(error.contains("vmw_vsock_virtio_transport"), "{error}");
+    }
 
     fn r(s: &str) -> Reference {
         parse(s).unwrap_or_else(|| panic!("{s:?} should parse"))
@@ -2259,12 +2390,15 @@ mod tests {
             handles: vec![("EXAMPLE_TOKEN".into(), "ast-handle-opaque".into())],
         };
         let bootstrap = Bootstrap::resolve(&["base".to_owned()]).unwrap();
+        let gpu_boot = "$BB mkdir -p /usr/local/sbin\n\
+                        echo gpu-service > /usr/local/sbin/asterism-gpu-guest\n";
         let script = init_script_with_parts(
             &config,
             &shares,
             Some(ShareKind::NinePfs),
             &egress,
             &bootstrap,
+            Some(gpu_boot),
             None,
         );
         let dir = tempfile::tempdir().unwrap();
@@ -2282,6 +2416,14 @@ mod tests {
         assert!(script.contains("export EXAMPLE_TOKEN='ast-handle-opaque'"));
         assert!(script.contains("export HTTPS_PROXY='http://10.0.2.2:38123'"));
         assert!(script.contains("SSL_CERT_FILE='/.asterism/ca-bundle.pem'"));
+        assert!(script.contains("Materialize the attached guest-local GPU projection"));
+        assert!(script.contains("/usr/local/sbin/asterism-gpu-guest"));
+        assert!(
+            script.find("asterism-gpu-guest").unwrap()
+                < script
+                    .find("asterism: starting the image entrypoint")
+                    .unwrap()
+        );
         assert!(
             script.contains("udhcpc -n -q") && script.contains("-s /asterism-init"),
             "the same init can DHCP on vz"
@@ -2328,6 +2470,7 @@ mod tests {
             None,
             &Egress::default(),
             &Bootstrap::default(),
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -2381,10 +2524,10 @@ mod tests {
             handles: vec![("EXAMPLE_TOKEN".into(), "ast-handle-opaque".into())],
         };
         let bootstrap = Bootstrap::resolve(&["base".to_owned()]).unwrap();
-        configure_instance(&source, &root, &[], None, &egress, &bootstrap).unwrap();
+        configure_instance(&source, &root, &[], None, &egress, &bootstrap, None).unwrap();
         assert!(dir.path().join("oci-config.json").exists());
         std::fs::remove_file(source.with_extension("json")).unwrap();
-        configure_instance(&source, &root, &[], None, &egress, &bootstrap)
+        configure_instance(&source, &root, &[], None, &egress, &bootstrap, None)
             .expect("a moved instance carries its private OCI config");
         let init = output(
             Command::new(&debugfs)

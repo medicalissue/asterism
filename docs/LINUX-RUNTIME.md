@@ -15,20 +15,25 @@ by `/dev/kvm` ownership. Its executable payload is flat (the layout consumed
 by `packaging/install.sh`) and carries the Asterism `LICENSE-*` and `NOTICE`
 files alongside the component notices.
 
-Catalog cloud images remain in their publisher-verified qcow2 form on disk and
-Cloud Hypervisor consumes them directly. The backend validates the qcow2
-virtual size without rewriting its metadata: an image whose size does not
-exactly match `disk_gib` is refused, rather than silently grown or shrunk. The
-Linux installer never adds a runtime converter to make an unsafe format
-transition appear to work; choose QEMU when a conversion is required.
+Catalog cloud images are retained as publisher-verified qcow2 until a native
+backend first uses them. Asterism's read-only Rust qcow2 v2/v3 materializer
+preflights the active mapping and refcounts, writes sparse raw under a staging
+name, and durably adopts it before Cloud Hypervisor sees it. That raw base can
+then be cloned and grown to `disk_gib`. No QEMU binary or runtime converter is
+installed on the Linux product path; QEMU is a separately installed explicit
+compatibility backend.
 
 Remote volumes use the kernel NBD client below the backend seam. On a clean
 host the installer adds `nbd-client` plus `kmod` (`nbd` plus `kmod` on
 Fedora-family systems), loads `nbd` with 64 devices, and records the same
 setting under `modules-load.d` and `modprobe.d` for reboot. The daemon has no
 general root or `nbd-client` permission: sudoers allows the installing account
-to run only `/usr/local/libexec/asterism/asterism-nbd` without a prompt. That
-root-owned wrapper accepts only attach/detach forms used by Asterism and only
+to run `/usr/local/libexec/asterism/asterism-nbd` and the exact
+`setcap cap_net_admin+ep <installed-cloud-hypervisor>` updater command without
+a prompt. The latter restores the one capability lost when a verified update
+replaces the VMM inode; rollback restores the old capable inode and explicitly
+reapplies the same capability. The root-owned NBD wrapper accepts only
+attach/detach and diagnostic probe forms used by Asterism and only
 for `/dev/nbd0` through `/dev/nbd63`; after attach it grants the invoking
 unprivileged account access to that selected device only, then restores root
 ownership on detach. The wrapper owns a `flock` on

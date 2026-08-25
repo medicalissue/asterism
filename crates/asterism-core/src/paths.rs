@@ -6,11 +6,15 @@ pub fn home_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("ASTERISM_HOME") {
         return PathBuf::from(dir);
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    // Windows native shells do not set HOME; USERPROFILE is the documented
+    // user-profile root and is what Credential Manager / SCM should agree on.
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".into());
     PathBuf::from(home).join(".asterism")
 }
 
-/// This device's shard of the orbit registry: the instances whose cpu and ram
+/// This device's shard of the orbit registry: the instances whose compute
 /// it supplies.
 pub fn state_path() -> PathBuf {
     home_dir().join("state.json")
@@ -22,7 +26,7 @@ pub fn state_path() -> PathBuf {
 /// a device that is asleep would otherwise take its instances out of `ast ls`
 /// entirely — which would read as "deleted" rather than "out of touch". This
 /// file is what lets those rows still be listed, marked `unknown`, with the
-/// device supplying their cpu named. It is a cache and nothing depends on it
+/// device supplying their compute named. It is a cache and nothing depends on it
 /// being present or fresh.
 pub fn shard_cache_path() -> PathBuf {
     home_dir().join("orbit-shards.json")
@@ -142,7 +146,7 @@ pub fn volume_image_path(name: &str) -> PathBuf {
     volume_dir(name).join("disk.raw")
 }
 
-/// Where `qemu-storage-daemon` serves one epoch's NBD export.
+/// Where `astd`'s native exporter serves one epoch's NBD export.
 ///
 /// The epoch is in the filename on purpose: a new lease is a new socket, so
 /// revoking the old one is an unlink and a stale consumer's reconnect finds
@@ -151,16 +155,18 @@ pub fn volume_export_socket(name: &str, epoch: u64) -> PathBuf {
     short_socket(volume_dir(name).join(format!("nbd-e{epoch}.sock")))
 }
 
-/// Pidfile of that storage daemon, written by `--pidfile`.
+/// Legacy qemu-storage-daemon pidfile. Native exporters deliberately do not
+/// create this; the path remains only for safe migration cleanup.
 pub fn volume_export_pid(name: &str, epoch: u64) -> PathBuf {
     volume_dir(name).join(format!("nbd-e{epoch}.pid"))
 }
 
-/// The local unix socket QEMU connects to for a volume attached to `instance`.
+/// The local unix socket the selected backend connects to for a volume
+/// attached to `instance`.
 ///
 /// This end of the splice is always local — that is the local illusion doing
-/// its work. QEMU sees a unix socket on the machine it is running on and
-/// never learns that the daemon behind it is forwarding to another device.
+/// its work. The backend sees a unix socket on the machine it is running on
+/// and never learns that the daemon behind it is forwarding to another device.
 pub fn volume_bridge_socket(instance: &str, host: &str, volume: &str) -> PathBuf {
     let safe = |s: &str| -> String {
         s.chars()
@@ -191,7 +197,18 @@ pub fn volume_bridge_socket(instance: &str, host: &str, volume: &str) -> PathBuf
 /// hypervisor. Nothing here creates it, because a path function that touches
 /// the filesystem is a path function a refusal path cannot call.
 pub fn runtime_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("asterism-{}", crate::ipc::own_uid()))
+    std::env::temp_dir().join(format!("asterism-{}", runtime_uid()))
+}
+
+fn runtime_uid() -> String {
+    #[cfg(windows)]
+    {
+        std::env::var("USERNAME").unwrap_or_else(|_| "user".into())
+    }
+    #[cfg(not(windows))]
+    {
+        crate::ipc::own_uid().to_string()
+    }
 }
 
 /// The longest preferred socket path that is bound where it belongs.

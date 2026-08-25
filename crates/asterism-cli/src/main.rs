@@ -5,7 +5,7 @@
 //! the daemon reports bounded phase progress after the store is durable.
 //!
 //! It talks to *that* daemon and no other, ever. `ast up dev` does not know or
-//! care which device in the orbit is supplying `dev`'s cpu and ram: the
+//! care which device in the orbit is supplying `dev`'s compute: the
 //! instance namespace is flat and orbit-wide, so the name is enough, and the
 //! daemon in front of you resolves it and forwards the request if the row
 //! lives elsewhere. The CLI holds no device key, opens no mesh connection, and
@@ -16,9 +16,9 @@
 //! question about itself, and as the address for the commands that really are
 //! about devices: pairing, and the orbit's own membership.
 
+use asterism_core::ipc::Stream;
 use std::fs::File;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Seek, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -36,12 +36,14 @@ use asterism_core::hosted_auth::{
     PollAction, PollFailure, PollPolicy, ProtocolError, Provider, Session,
 };
 use asterism_core::hv::{GuestHealth, ImageKind};
-use asterism_core::instance::{now_unix, Instance, PortForward, Restart, Shape};
+use asterism_core::instance::{now_unix, Instance, PortForward, Restart, RuntimeKind, Shape};
 use asterism_core::ipc;
 use asterism_core::proc::{ProcId, Signal};
 use asterism_core::protocol::{self, Request, Response};
 use asterism_core::registry::OrbitRow;
-use asterism_core::{cow, doctor, image, oci, paths, service, snapshot, verify, VERSION};
+use asterism_core::{
+    cow, doctor, image, oci, paths, service, snapshot, verify, windows_host, VERSION,
+};
 
 #[derive(Parser)]
 #[command(
@@ -64,7 +66,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Define a new instance, sourcing its cpu and ram from this device.
+    /// Define a new instance, sourcing its compute from this device.
     ///
     /// The name is claimed across the whole orbit, so it means one instance
     /// everywhere.
@@ -74,10 +76,14 @@ enum Command {
         name: String,
         /// Image to boot: an alias (`ast images`), an https:// url, a path to
         /// a qcow2 or raw disk image, or an OCI/Docker reference such as
-        /// `nginx` or `ghcr.io/owner/app:v1` — which is pulled, unpacked and
-        /// booted as a microVM of its own.
+        /// `nginx` or `ghcr.io/owner/app:v1`. OCI image format is independent
+        /// of `--runtime`: it may boot as a VM or enter native namespaces.
         #[arg(long, default_value = "ubuntu:24.04")]
         image: String,
+        /// Isolation runtime. `vm` keeps the existing hypervisor path;
+        /// `container` requires a native OCI-capable host adapter.
+        #[arg(long, value_enum, default_value_t = CliRuntime::Vm)]
+        runtime: CliRuntime,
         /// Publish a guest port on this device's loopback: `-p 8080:80`.
         ///
         /// How an OCI instance is reached: a container image has no ssh
@@ -94,9 +100,9 @@ enum Command {
         #[arg(long, default_value = "20G")]
         disk: String,
         /// Hypervisor to run this instance on: `chv` (Cloud Hypervisor/KVM),
-        /// `vz` (Apple Virtualization.framework), or `qemu` (compatibility).
-        /// Omit it to select this device's native capable backend. Recorded
-        /// on the instance and used for every later boot.
+        /// `vz` (Apple Virtualization.framework), native `hyperv` on Windows,
+        /// or `qemu` (compatibility). Omit it to select this device's first
+        /// capable native backend. Recorded and used for every later boot.
         #[arg(long, value_name = "NAME")]
         backend: Option<String>,
         /// Bootstrap profile to apply at first boot (`ast profiles` lists
@@ -112,9 +118,9 @@ enum Command {
     },
     /// Boot an instance.
     ///
-    /// Where its cpu and ram come from is the instance's business, not the
+    /// Where its compute comes from is the instance's business, not the
     /// command's: the name resolves across the orbit and the boot happens on
-    /// whichever device supplies them.
+    /// whichever device supplies it.
     Up {
         /// The instance to boot.
         name: String,
@@ -160,7 +166,7 @@ enum Command {
     /// device that did not answer is still listed, with its status
     /// `unknown` — the instance is real, its state is merely stale.
     Ls {
-        /// Only the instances this device supplies cpu for (debugging).
+        /// Only the instances this device supplies compute for (debugging).
         #[arg(long)]
         local: bool,
     },
@@ -186,6 +192,13 @@ enum Command {
         #[arg(short = 't', long)]
         tty: bool,
         /// A command to run instead of opening a shell, and its arguments.
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+    /// Run a command inside a native container through its private control
+    /// channel. With no command, runs the image's shell.
+    Shell {
+        name: String,
         #[arg(last = true)]
         command: Vec<String>,
     },
@@ -293,14 +306,14 @@ enum Command {
         /// A path may carry one too.
         image: String,
     },
-    /// Attach a part to an instance: a volume, or a secret.
+    /// Attach a part to an instance: a volume, secret, or hardware GPU.
     ///
     /// Two kinds of volume, and they reach the guest differently.
     ///
     /// A DIRECTORY (`--volume /tank/media`) is shared with the guest and
     /// mounted at a path. Three things have to be true, and each of them is
     /// refused in words rather than discovered later: the directory is on
-    /// the same device as the instance's cpu and ram (directory sharing has
+    /// the same device as the instance's compute (directory sharing has
     /// no network transport), the backend offers a share transport (9p on
     /// qemu or virtiofs on vz), and the guest kernel supports that transport.
     /// Cloud images receive a mount unit in their seed; OCI images receive
@@ -363,6 +376,13 @@ enum Command {
         /// than one source. Not `--host`, for the same reason as `--to`.
         #[arg(long, value_name = "DEVICE", requires = "secret")]
         from: Option<String>,
+        /// Hardware GPU provider device, optionally followed by its UUID:
+        /// `desktop` or `desktop:GPU-...`.
+        #[arg(long, value_name = "DEVICE[:GPU-UUID]", conflicts_with_all = ["volume", "secret"])]
+        gpu: Option<String>,
+        /// GPU memory reservation (default 1G).
+        #[arg(long, value_name = "SIZE", requires = "gpu")]
+        gpu_memory: Option<String>,
     },
     /// Take a volume or a secret off an instance.
     ///
@@ -389,18 +409,20 @@ enum Command {
         /// The secret to revoke, by its orbit name.
         #[arg(long, value_name = "NAME")]
         secret: Option<String>,
+        /// Revoke and detach the instance's GPU part.
+        #[arg(long, conflicts_with_all = ["volume", "secret"])]
+        gpu: bool,
     },
     /// Change one of an instance's parts.
     ///
-    /// Today there is one: `cpu`, which is the device supplying cpu and ram.
-    /// The orbit is a pool of parts and an instance is a computer assembled
-    /// from them, so this really is one line of a parts table — the
-    /// instance's name, its id and its snapshots do not move, because they
-    /// were never on a device.
+    /// Canonical today: `compute`, the orbit device supplying CPU, physical
+    /// RAM, and VM/container execution state as one placement unit. `cpu`
+    /// remains a compatibility alias. The instance's name, id, and snapshots
+    /// do not move, because they were never on a device.
     Set {
         /// The instance whose part is changing.
         name: String,
-        /// The part to change. `cpu` is the only one today.
+        /// The part to change. `compute` is canonical; `cpu` is an alias.
         #[arg(value_name = "PART")]
         part: String,
         /// The device to source it from.
@@ -409,19 +431,18 @@ enum Command {
         // clap would hand this positional's value to it.
         #[arg(value_name = "DEVICE")]
         to: String,
-        /// Shut the guest down first. Moving cpu/ram is offline on every
+        /// Shut the guest down first. Moving compute is offline on every
         /// backend Asterism has, so a running instance is refused without it.
         #[arg(long)]
         down: bool,
     },
-    /// Move an instance's cpu and ram to another device.
+    /// Move an instance's compute to another device.
     ///
-    /// The same thing as `ast set <instance> cpu <device>`, spelled the way
-    /// people ask for it.
+    /// Alias of `ast set <instance> compute <device>`.
     Move {
         /// The instance to move.
         name: String,
-        /// The device that will supply its cpu and ram from here on.
+        /// The device that will supply its compute from here on.
         #[arg(value_name = "DEVICE")]
         to: String,
         /// Shut the guest down first.
@@ -505,9 +526,18 @@ enum Command {
     /// where this device keeps its state and what is running. Nothing here
     /// contacts another device and nothing here prints a secret.
     Bugreport,
-    /// Check whether this host can run Asterism: service, linger, sleep
-    /// inhibition, secret storage, and (on Linux) the pinned VMM helpers.
+    /// Read-only host capability report: service, sleep, secrets, native VMM
+    /// helpers, and the Windows Hyper-V/firewall gate.
+    ///
+    /// Refuses nothing and changes nothing. A machine that cannot run
+    /// Asterism still gets a report saying exactly which check failed.
     Doctor,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliRuntime {
+    Vm,
+    Container,
 }
 
 /// `ast snapshot ...` — taking one, and deleting one.
@@ -751,6 +781,7 @@ fn main() -> Result<()> {
         Command::Create {
             name,
             image,
+            runtime,
             publish,
             cpus,
             mem,
@@ -762,25 +793,39 @@ fn main() -> Result<()> {
             // always pulled by the device that will own the instance.
             asterism_core::profile::resolve(&profiles)?;
             let resolved = ensure_image_on_device(device.as_deref(), &image)?;
-            Request::Create {
-                name,
-                image: resolved,
-                shape: Shape {
-                    cpus,
-                    mem_mib: parse_mem_mib(&mem)?,
-                    disk_gib: parse_disk_gib(&disk)?,
+            let shape = Shape {
+                cpus,
+                mem_mib: parse_mem_mib(&mem)?,
+                disk_gib: parse_disk_gib(&disk)?,
+            };
+            let publish = publish
+                .iter()
+                .map(|p| p.parse::<PortForward>())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| anyhow::anyhow!(e))?;
+            match runtime {
+                CliRuntime::Vm => Request::Create {
+                    name,
+                    image: resolved,
+                    shape,
+                    backend,
+                    profiles,
+                    publish,
                 },
-                backend,
-                profiles,
-                publish: publish
-                    .iter()
-                    .map(|p| p.parse::<PortForward>())
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| anyhow::anyhow!(e))?,
+                CliRuntime::Container => Request::CreateRuntime {
+                    name,
+                    image: resolved,
+                    shape,
+                    runtime: RuntimeKind::Container,
+                    backend,
+                    profiles,
+                    publish,
+                },
             }
         }
         Command::Up { name, restart } => Request::Up { name, restart },
         Command::Down { name } => Request::Down { name },
+        Command::Shell { name, command } => return container_shell(&name, command),
         Command::Rm { name } => Request::Remove { name },
         Command::Rename { name, new_name } => Request::Rename { name, new_name },
         // `ast ls` is the orbit's registry; `--local` is one device's shard of
@@ -805,7 +850,9 @@ fn main() -> Result<()> {
             placement,
             env,
             from,
-        } => match attaching(volume, secret)? {
+            gpu,
+            gpu_memory,
+        } => match attaching(volume, secret, gpu)? {
             Attaching::Secret(secret) => Request::AttachSecret {
                 name,
                 secret,
@@ -849,13 +896,28 @@ fn main() -> Result<()> {
                     }
                 }
             },
+            Attaching::Gpu(provider) => {
+                let (provider_device, gpu_uuid) = provider
+                    .split_once(':')
+                    .map(|(device, uuid)| (device.to_owned(), Some(uuid.to_owned())))
+                    .unwrap_or((provider, None));
+                Request::AttachGpu {
+                    name,
+                    provider_device: Some(provider_device),
+                    gpu_uuid,
+                    memory_bytes: asterism_core::volume::parse_size(
+                        gpu_memory.as_deref().unwrap_or("1G"),
+                    )?,
+                }
+            }
         },
         Command::Detach {
             name,
             volume,
             host,
             secret,
-        } => match attaching(volume, secret)? {
+            gpu,
+        } => match attaching(volume, secret, gpu.then(String::new))? {
             Attaching::Secret(secret) => Request::DetachSecret { name, secret },
             Attaching::Volume(volume) => match storage_ref(&volume, host.as_deref()) {
                 Some((device, volume)) => Request::Detach {
@@ -869,6 +931,7 @@ fn main() -> Result<()> {
                     host,
                 },
             },
+            Attaching::Gpu(_) => Request::DetachGpu { name },
         },
         // A move reports as it goes — a preflight, a fence, a disk crossing a
         // network — so it takes the connection the way pairing and wake do.
@@ -883,7 +946,7 @@ fn main() -> Result<()> {
         }
         Command::Move { name, to, down } => {
             local_only("move", device.as_deref())?;
-            return set_part(&name, "cpu", &to, down);
+            return set_part(&name, "compute", &to, down);
         }
         // A volume is a device's part of the pool, so these are about the
         // daemon in front of you unless `--device` aims them elsewhere.
@@ -1051,11 +1114,12 @@ fn main() -> Result<()> {
                 println!("{}  {}", instance.name, instance.status);
                 // An OCI guest has no ssh to offer, so it is told what it
                 // does have: its ports, and its console.
-                if instance.image_kind == ImageKind::OciRootfs {
+                if instance.runtime == RuntimeKind::Container {
                     for p in &instance.publish {
-                        println!("published: http://127.0.0.1:{}  ->  guest :{}", p.host, p.guest);
+                        println!("published: http://127.0.0.1:{}  ->  container :{}", p.host, p.guest);
                     }
-                    println!("the image's output is on the console — ast logs {}", instance.name);
+                    println!("control: ast shell {} -- /bin/sh", instance.name);
+                    println!("output:  ast logs {}", instance.name);
                 } else if let Some(endpoint) = instance.endpoint() {
                     println!(
                         "guest booting; ssh on {endpoint} — try: ast ssh {}",
@@ -1065,7 +1129,9 @@ fn main() -> Result<()> {
             }
             Request::AttachVolume { .. }
             | Request::AttachBlock { .. }
-            | Request::AttachStorage { .. } => {
+            | Request::AttachStorage { .. }
+            | Request::AttachGpu { .. }
+            | Request::AttachGpuResolved { .. } => {
                 print_attached(&instance)
             }
             Request::AttachSecret { ref secret, .. } => print_bound(&instance, secret),
@@ -1080,6 +1146,7 @@ fn main() -> Result<()> {
             Request::Detach { volume, .. } => {
                 println!("{}  {volume} detached", instance.name)
             }
+            Request::DetachGpu { .. } => println!("{}  GPU detached and revoked", instance.name),
             _ => println!("{}  {}", instance.name, instance.status),
         },
         Response::Volumes { volumes } => match request {
@@ -1111,7 +1178,10 @@ fn main() -> Result<()> {
         }
         Response::BackupRestored { report } => {
             println!("{}  restored ({})", report.instance, report.id);
-            if report.rebind.volumes.is_empty() && report.rebind.secrets.is_empty() {
+            if report.rebind.volumes.is_empty()
+                && report.rebind.secrets.is_empty()
+                && report.rebind.gpu.is_none()
+            {
                 println!("no external parts need rebinding");
             } else {
                 for volume in report.rebind.volumes {
@@ -1126,6 +1196,15 @@ fn main() -> Result<()> {
                         secret.secret, secret.authority, secret.source_device
                     );
                 }
+                if let Some(gpu) = report.rebind.gpu {
+                    println!(
+                        "rebind gpu: {} on {} ({} bytes; previous provider generation {})",
+                        gpu.provider_gpu_uuid,
+                        gpu.provider_device,
+                        gpu.memory_bytes,
+                        gpu.provider_generation
+                    );
+                }
             }
         }
         // The handshake owns Pong, `ast snapshots` owns Snapshots, `ast ssh`
@@ -1133,6 +1212,7 @@ fn main() -> Result<()> {
         // answering a different question.
         Response::Snapshots { .. }
         | Response::Log { .. }
+        | Response::ContainerExec { .. }
         | Response::SshEndpoint { .. }
         | Response::DeviceShellStatus { .. }
         | Response::DeviceShellAccepted { .. }
@@ -1164,6 +1244,25 @@ fn main() -> Result<()> {
             bail!("unexpected reply from astd: {request:?}")
         }
         Response::Error { message } => bail!(message),
+        Response::GpuProviders { providers } => {
+            for provider in providers {
+                println!(
+                    "{}  {}  {} bytes  {:?}",
+                    provider.device_name,
+                    provider.gpu_uuid,
+                    provider
+                        .total_memory_bytes
+                        .saturating_sub(provider.leased_memory_bytes),
+                    provider.health
+                );
+            }
+        }
+        Response::GpuGuestAccepted { .. }
+        | Response::GpuGuestRefused { .. }
+        | Response::GpuGuestReply { .. }
+        | Response::GpuProviderAttached { .. } => {
+            bail!("GPU guest session response reached the command RPC path")
+        }
     }
     Ok(())
 }
@@ -1725,9 +1824,10 @@ fn inspect_backup(source: &str, json: bool) -> Result<()> {
         println!("image: {}  {}", image.reference, image.content);
     }
     println!(
-        "external parts to rebind: {} volume(s), {} secret(s)",
+        "external parts to rebind: {} volume(s), {} secret(s), {} gpu(s)",
         manifest.rebind.volumes.len(),
-        manifest.rebind.secrets.len()
+        manifest.rebind.secrets.len(),
+        usize::from(manifest.rebind.gpu.is_some())
     );
     Ok(())
 }
@@ -2111,20 +2211,21 @@ fn device_shell_policy(action: Option<DeviceShellCommand>) -> Result<()> {
 
 // ---- parts -----------------------------------------------------------------
 
-/// `ast set <instance> cpu <device>`, and its alias `ast move`.
+/// `ast set <instance> compute <device>`, and its aliases `cpu` and `ast move`.
 ///
 /// The daemon does all of it — resolving the instance across the orbit,
 /// probing the target, fencing the source, moving the bytes and committing —
 /// and reports each step as it happens, because the middle one is a disk
 /// crossing a network and takes as long as it takes. All this end does is
-/// print.
+/// print. The wire command remains `set_cpu` so older daemons still parse it.
 fn set_part(name: &str, part: &str, device: &str, down: bool) -> Result<()> {
-    // One part today, and saying which one is better than a flag: the user
-    // has to be able to see, from the command, what is being changed.
-    if !matches!(part, "cpu" | "cpu/ram" | "ram") {
+    // Compute is one placement unit; CPU and physical RAM cannot be placed
+    // independently.
+    if !asterism_core::instance::is_compute_part(part) {
         bail!(
-            "there is no {part:?} part to set. Today `ast set <instance> cpu <device>` \
-             moves cpu and ram, which come as a pair; volumes are changed with \
+            "there is no {part:?} placement part. `ast set <instance> compute <device>` \
+             moves whole compute (CPU, physical RAM, and execution state); `cpu` and \
+             `ast move` remain aliases. Volumes are changed with \
              `ast attach` and `ast detach`"
         );
     }
@@ -2588,11 +2689,7 @@ fn device_shell(device: &str, words: &[String], force_pty: bool) -> Result<()> {
 
     let stdin_is_terminal = std::io::stdin().is_terminal();
     let pty = force_pty || (words.is_empty() && stdin_is_terminal);
-    let (cols, rows) = if pty {
-        terminal_size(libc::STDIN_FILENO)
-    } else {
-        (0, 0)
-    };
+    let (cols, rows) = if pty { terminal_size() } else { (0, 0) };
     let command = (!words.is_empty()).then(|| words.join(" "));
     let open = ShellOpen {
         command,
@@ -2613,7 +2710,7 @@ fn device_shell(device: &str, words: &[String], force_pty: bool) -> Result<()> {
     }
 
     let raw = if pty && stdin_is_terminal {
-        Some(RawTerminal::enter(libc::STDIN_FILENO)?)
+        Some(RawTerminal::enter()?)
     } else {
         None
     };
@@ -2662,10 +2759,10 @@ fn device_shell(device: &str, words: &[String], force_pty: bool) -> Result<()> {
         let resize_requests = requests.clone();
         let stop = stop_resize.clone();
         std::thread::spawn(move || {
-            let mut previous = terminal_size(libc::STDIN_FILENO);
+            let mut previous = terminal_size();
             while !stop.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(100));
-                let now = terminal_size(libc::STDIN_FILENO);
+                let now = terminal_size();
                 if now != previous {
                     previous = now;
                     let _ = resize_requests.try_send(Request::DeviceShellResize {
@@ -2755,7 +2852,9 @@ fn shell_environment() -> Vec<ShellEnv> {
     result
 }
 
-fn terminal_size(fd: libc::c_int) -> (u16, u16) {
+#[cfg(unix)]
+fn terminal_size() -> (u16, u16) {
+    let fd = libc::STDIN_FILENO;
     let mut size = libc::winsize {
         ws_row: 0,
         ws_col: 0,
@@ -2773,13 +2872,24 @@ fn terminal_size(fd: libc::c_int) -> (u16, u16) {
     }
 }
 
+#[cfg(windows)]
+fn terminal_size() -> (u16, u16) {
+    // The protocol still carries a bounded initial size on Windows. Raw
+    // console mode is intentionally left to a future native shell adapter;
+    // the current Windows daemon refuses device-shell sessions explicitly.
+    (80, 24)
+}
+
+#[cfg(unix)]
 struct RawTerminal {
     fd: libc::c_int,
     saved: libc::termios,
 }
 
+#[cfg(unix)]
 impl RawTerminal {
-    fn enter(fd: libc::c_int) -> Result<Self> {
+    fn enter() -> Result<Self> {
+        let fd = libc::STDIN_FILENO;
         let mut saved = std::mem::MaybeUninit::<libc::termios>::uninit();
         // SAFETY: saved points to valid storage and fd is the terminal already
         // identified by IsTerminal.
@@ -2798,12 +2908,23 @@ impl RawTerminal {
     }
 }
 
+#[cfg(unix)]
 impl Drop for RawTerminal {
     fn drop(&mut self) {
         // SAFETY: saved came from this descriptor and remains initialized.
         unsafe {
             libc::tcsetattr(self.fd, libc::TCSANOW, &self.saved);
         }
+    }
+}
+
+#[cfg(windows)]
+struct RawTerminal;
+
+#[cfg(windows)]
+impl RawTerminal {
+    fn enter() -> Result<Self> {
+        Ok(Self)
     }
 }
 
@@ -2880,6 +3001,11 @@ fn refuse_ssh_to_an_oci_guest(name: &str) -> Result<()> {
     };
     if instance.image_kind != ImageKind::OciRootfs {
         return Ok(());
+    }
+    if instance.runtime == RuntimeKind::Container {
+        bail!(
+            "{name} uses runtime=container and has no SSH endpoint — use `ast shell {name} -- /bin/sh`; output is on `ast logs {name}`"
+        );
     }
     let ports: Vec<String> = instance.publish.iter().map(|p| p.to_string()).collect();
     let reach = match ports.is_empty() {
@@ -3125,11 +3251,11 @@ fn check_profiles(name: &str) -> Result<()> {
 
 /// Print the guest's serial console, wherever the guest is.
 ///
-/// When this device is the one supplying the instance's cpu, the console is a
-/// file in the instance directory and is read straight off disk — which is
-/// also the only way `--follow` can work, since following is a file operation
-/// and there is no file here otherwise. When the cpu is elsewhere, the daemon
-/// reads it there and sends the tail back.
+/// When this device is the one supplying the instance's compute, the console
+/// is a file in the instance directory and is read straight off disk — which
+/// is also the only way `--follow` can work, since following is a file
+/// operation and there is no file here otherwise. When compute is elsewhere,
+/// the daemon reads it there and sends the tail back.
 fn logs(name: &str, follow: bool, lines: u32) -> Result<()> {
     if !on_this_device(name)? {
         if follow {
@@ -3154,6 +3280,34 @@ fn logs(name: &str, follow: bool, lines: u32) -> Result<()> {
         };
     }
     logs_here(name, follow)
+}
+
+/// Execute through a native container's namespace-bound Unix control
+/// endpoint. This deliberately shares none of the SSH path.
+fn container_shell(name: &str, mut command: Vec<String>) -> Result<()> {
+    if command.is_empty() {
+        command.push("/bin/sh".into());
+    }
+    match send(&Request::ContainerExec {
+        name: name.into(),
+        command,
+    })? {
+        Response::ContainerExec {
+            status,
+            stdout,
+            stderr,
+        } => {
+            print!("{stdout}");
+            eprint!("{stderr}");
+            if status == 0 {
+                Ok(())
+            } else {
+                bail!("container command exited with status {status}")
+            }
+        }
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected reply from astd: {other:?}"),
+    }
 }
 
 /// The console log as a file on this device's disk.
@@ -3225,7 +3379,7 @@ fn send(request: &Request) -> Result<Response> {
 /// One connection to this device's daemon, and the wire version it is being
 /// spoken at.
 struct Client {
-    stream: UnixStream,
+    stream: Stream,
     /// The version both ends settled on. Every frame sent on this connection
     /// is at or below it.
     spoken: u32,
@@ -3343,7 +3497,7 @@ impl Client {
 /// answer *this* is wedged rather than busy — and since it goes in front of
 /// every command, a hang here is a hang everywhere with nothing on the screen
 /// to say so.
-fn handshake() -> Result<(UnixStream, DaemonFacts)> {
+fn handshake() -> Result<(Stream, DaemonFacts)> {
     let stream = connect()?;
     stream.set_read_timeout(Some(ipc::HANDSHAKE_DEADLINE))?;
     let ours = compat::ours();
@@ -3410,10 +3564,10 @@ fn write_line<W: Write>(mut out: W, request: &Request) -> Result<()> {
 /// daemon, rather than something a second user on the machine put there, is a
 /// thing to establish rather than assume. See
 /// [`asterism_core::ipc::audit_socket`].
-fn connect() -> Result<UnixStream> {
+fn connect() -> Result<Stream> {
     let sock = paths::socket_path();
     if ipc::audit_socket(&sock)? == ipc::SocketState::Ready {
-        if let Ok(stream) = UnixStream::connect(&sock) {
+        if let Ok(stream) = ipc::connect(&sock) {
             return Ok(stream);
         }
         // A socket file with nobody behind it: a daemon died without tidying
@@ -3431,10 +3585,10 @@ fn connect() -> Result<UnixStream> {
 /// astd's own election closes that from its side; this closes it from ours,
 /// so the storm never leaves the ground. Whoever holds this lock starts the
 /// daemon and waits for it, and everyone behind them finds it already up.
-fn start_daemon(sock: &std::path::Path) -> Result<UnixStream> {
+fn start_daemon(sock: &std::path::Path) -> Result<Stream> {
     let _turn = spawn_turn();
     // Whoever held the lock before us has already started one.
-    if let Ok(stream) = UnixStream::connect(sock) {
+    if let Ok(stream) = ipc::connect(sock) {
         return Ok(stream);
     }
     spawn_daemon()?;
@@ -3532,8 +3686,8 @@ fn timed_out(e: &anyhow::Error) -> bool {
 /// line-delimited JSON in both directions already, so this is the same wire —
 /// just a conversation on it rather than a question.
 struct Conversation {
-    write: UnixStream,
-    read: BufReader<UnixStream>,
+    write: Stream,
+    read: BufReader<Stream>,
 }
 
 impl Conversation {
@@ -3565,10 +3719,10 @@ impl Conversation {
     }
 }
 
-fn wait_for_socket(sock: &std::path::Path) -> Result<UnixStream> {
+fn wait_for_socket(sock: &std::path::Path) -> Result<Stream> {
     let mut attempt = 0;
     loop {
-        match UnixStream::connect(sock) {
+        match ipc::connect(sock) {
             Ok(s) => return Ok(s),
             Err(e) if attempt >= 50 => return Err(e).context("astd did not come up"),
             Err(_) => {
@@ -3684,22 +3838,38 @@ fn spawn_daemon() -> Result<()> {
 
 /// astd normally sits next to the ast binary; fall back to PATH.
 fn daemon_path() -> Result<std::path::PathBuf> {
+    let names: &[&str] = if cfg!(windows) {
+        &["astd.exe", "astd"]
+    } else {
+        &["astd", "astd.exe"]
+    };
     if let Ok(me) = std::env::current_exe() {
-        let sibling = me.with_file_name("astd");
-        if sibling.exists() {
-            return Ok(sibling);
+        for name in names {
+            let sibling = me.with_file_name(name);
+            if sibling.exists() {
+                return Ok(sibling);
+            }
         }
     }
-    Ok(std::path::PathBuf::from("astd"))
+    Ok(std::path::PathBuf::from(names[0]))
 }
 
 fn exec_daemon() -> anyhow::Error {
-    use std::os::unix::process::CommandExt;
     let astd = match daemon_path() {
         Ok(p) => p,
         Err(e) => return e,
     };
-    std::process::Command::new(astd).exec().into()
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        std::process::Command::new(astd).exec().into()
+    }
+    #[cfg(windows)]
+    match std::process::Command::new(astd).status() {
+        Ok(status) if status.success() => anyhow::anyhow!("astd exited"),
+        Ok(status) => anyhow::anyhow!("astd exited with {status}"),
+        Err(e) => e.into(),
+    }
 }
 
 // ---- identity --------------------------------------------------------------
@@ -3762,7 +3932,7 @@ fn print_version() -> Result<()> {
 /// report should do: "is astd running" is one of the facts being collected,
 /// and collecting it must not change it.
 fn running_daemon() -> Option<(String, Option<String>)> {
-    let stream = UnixStream::connect(paths::socket_path()).ok()?;
+    let stream = ipc::connect(&paths::socket_path()).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
     let mut writer = stream.try_clone().ok()?;
     // Serialized from the type rather than written out by hand: the wire
@@ -3797,7 +3967,7 @@ fn running_daemon() -> Option<(String, Option<String>)> {
 /// `Client::open`: a bug report observes whether a daemon exists and must not
 /// make one exist while collecting that answer.
 fn send_to_running(request: &Request) -> Option<Response> {
-    let mut stream = UnixStream::connect(paths::socket_path()).ok()?;
+    let mut stream = ipc::connect(&paths::socket_path()).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
     stream
         .set_write_timeout(Some(Duration::from_secs(3)))
@@ -3812,7 +3982,16 @@ fn send_to_running(request: &Request) -> Option<Response> {
 /// macOS app bundle has one place; a report that guessed at several would
 /// have to explain which one it found.
 fn gui_binary() -> std::path::PathBuf {
-    std::path::PathBuf::from("/Applications/Asterism.app/Contents/MacOS/asterism-gui")
+    if cfg!(windows) {
+        let mut path = std::env::var_os("LOCALAPPDATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Program Files"));
+        path.push("Asterism");
+        path.push("Asterism.exe");
+        path
+    } else {
+        std::path::PathBuf::from("/Applications/Asterism.app/Contents/MacOS/asterism-gui")
+    }
 }
 
 /// `ast bugreport`: everything worth pasting, and nothing that needs the
@@ -3889,6 +4068,18 @@ fn print_bugreport() -> Result<()> {
     }
     println!();
 
+    println!("[helper]");
+    match asterism_core::hyperv::discover_helper() {
+        Ok(path) => println!("astd-hyperv    {}", path.display()),
+        Err(e) => println!("astd-hyperv    not found ({e:#})"),
+    }
+    println!();
+
+    for line in windows_host::doctor().lines() {
+        println!("{line}");
+    }
+    println!();
+
     println!("[instances]");
     // This device's own shard, not the orbit: a bug report that went out on
     // the mesh would hang on a device that is asleep, which is exactly when
@@ -3919,6 +4110,7 @@ fn print_bugreport() -> Result<()> {
 }
 
 /// `ast doctor` — pass/fail host integration, not a bug report.
+#[cfg(not(windows))]
 fn print_doctor() -> Result<()> {
     let checks = doctor::run();
     for check in &checks {
@@ -3954,9 +4146,9 @@ fn uname_line() -> String {
 
 /// `ast ls`: one table, one namespace.
 ///
-/// The CPU column says which device is supplying each instance's cpu and ram.
+/// The COMPUTE column says which device is supplying each instance's compute.
 /// It is a column and not a grouping on purpose — the rows are one flat list
-/// because the namespace is one flat namespace, and where the cpu comes from
+/// because the namespace is one flat namespace, and where compute comes from
 /// is a property of the instance, like its shape or its age.
 fn print_table(rows: &[OrbitRow]) {
     if rows.is_empty() {
@@ -3964,8 +4156,8 @@ fn print_table(rows: &[OrbitRow]) {
         return;
     }
     println!(
-        "{:<14} {:<9} {:<14} {:<16} {:<12} {:<6} SSH",
-        "NAME", "STATUS", "IMAGE", "SHAPE", "CPU", "AGE"
+        "{:<14} {:<9} {:<10} {:<14} {:<16} {:<12} {:<6} ACCESS",
+        "NAME", "STATUS", "RUNTIME", "IMAGE", "SHAPE", "COMPUTE", "AGE"
     );
     let mut stale = false;
     let mut conflicts = Vec::new();
@@ -3991,23 +4183,30 @@ fn print_table(rows: &[OrbitRow]) {
             stale = true;
             "unknown".to_owned()
         };
-        let ssh = match (row.live, inst.endpoint()) {
-            (true, Some(e)) => e.to_string(),
+        let access = match (row.live, inst.runtime, inst.handle.as_ref()) {
+            (true, RuntimeKind::Vm, _) => inst
+                .endpoint()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "-".into()),
+            (true, RuntimeKind::Container, Some(handle)) if handle.container_control.is_some() => {
+                "container-control".into()
+            }
             _ => "-".into(),
         };
         println!(
-            "{:<14} {:<9} {:<14} {:<16} {:<12} {:<6} {}",
+            "{:<14} {:<9} {:<10} {:<14} {:<16} {:<12} {:<6} {}",
             inst.name,
             status,
+            inst.runtime,
             short_image(inst.image.as_deref().unwrap_or("-")),
             shape,
-            inst.cpu_device,
+            inst.compute_device(),
             age(inst.created_at),
-            ssh,
+            access,
         );
     }
     if stale {
-        println!("\nunknown: the device supplying that instance's cpu is out of touch");
+        println!("\nunknown: the device supplying that instance's compute is out of touch");
     }
     for name in conflicts {
         println!("\nconflict: {name} shares its name — rename it: ast rename {name} <new-name>");
@@ -4020,6 +4219,7 @@ fn print_detail(inst: &Instance, guest_health: Option<&GuestHealth>) {
     println!("name:    {}", inst.name);
     println!("id:      {}", inst.id);
     println!("status:  {}", inst.status);
+    println!("runtime: {}", inst.runtime);
     // What happens when the guest dies, which is half of what "never
     // sleeps" means. Printed always, because the answer matters most for
     // the instance nobody has thought about since they created it.
@@ -4049,27 +4249,36 @@ fn print_detail(inst: &Instance, guest_health: Option<&GuestHealth>) {
     println!("machine: {}", inst.machine);
     if let Some(h) = &inst.handle {
         let pid = h.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
-        println!("running: {} pid {pid}, ssh {}", h.backend, h.endpoint);
+        match (&h.endpoint, &h.container_control) {
+            (Some(endpoint), _) => println!("running: {} pid {pid}, ssh {endpoint}", h.backend),
+            (None, Some(control)) => println!(
+                "running: {} pid {pid}, container control {}",
+                h.backend,
+                control.socket.display()
+            ),
+            (None, None) => println!("running: {} pid {pid}, no endpoint", h.backend),
+        }
         println!("control: {}", h.ctl.path().display());
     }
     if let Some(conflict) = &inst.conflict {
         println!(
             "conflict: another instance in this orbit is also called {:?} \
-             (cpu/ram on {}) — rename this one: ast rename {} <new-name>",
+             (compute on {}) — rename this one: ast rename {} <new-name>",
             inst.name, conflict.other_cpu_device, inst.name
         );
     }
     // Only worth a line once it has happened: an instance that has never had
-    // its cpu part swapped is the ordinary case and does not need telling.
+    // its compute placement moved is the ordinary case and does not need
+    // telling.
     if inst.move_epoch > 0 {
         println!(
-            "moves:   {} (cpu/ram has been re-sourced that many times)",
+            "moves:   {} (compute has been re-sourced that many times)",
             inst.move_epoch
         );
     }
     // Worth a line only when it is not the obvious answer: a guest trusts
     // the key in its seed, and after a move that is not the device running it.
-    if inst.seeded_by() != inst.cpu_device {
+    if inst.seeded_by() != inst.compute_device() {
         println!(
             "seed:    built on {} — its guest key is the one this guest trusts",
             inst.seeded_by()
@@ -4172,10 +4381,10 @@ fn kib(value: u64) -> String {
 /// are facts about the file: a disk cloned from a raw base occupies almost
 /// nothing until the guest writes to it, and a `disk.qcow2` says this
 /// instance predates raw disks and still takes the old snapshot path
-/// (BACKENDS.md §4). Only when this device supplies the cpu/ram; another
+/// (BACKENDS.md §4). Only when this device supplies compute; another
 /// device's disks are not ours to stat.
 fn local_disk(inst: &Instance) -> Option<String> {
-    if inst.cpu_device != asterism_core::instance::local_host() {
+    if inst.compute_device() != asterism_core::instance::local_host() {
         return None;
     }
     let dir = paths::instance_dir(&inst.name);
@@ -4202,20 +4411,26 @@ fn local_disk(inst: &Instance) -> Option<String> {
 enum Attaching {
     Volume(String),
     Secret(String),
+    Gpu(String),
 }
 
-fn attaching(volume: Option<String>, secret: Option<String>) -> Result<Attaching> {
-    match (volume, secret) {
-        (Some(volume), None) => Ok(Attaching::Volume(volume)),
-        (None, Some(secret)) => Ok(Attaching::Secret(secret)),
+fn attaching(
+    volume: Option<String>,
+    secret: Option<String>,
+    gpu: Option<String>,
+) -> Result<Attaching> {
+    match (volume, secret, gpu) {
+        (Some(volume), None, None) => Ok(Attaching::Volume(volume)),
+        (None, Some(secret), None) => Ok(Attaching::Secret(secret)),
+        (None, None, Some(gpu)) => Ok(Attaching::Gpu(gpu)),
         // clap refuses this one first; the arm exists so that adding a third
         // part later cannot make it fall through to "say which".
-        (Some(_), Some(_)) => bail!(
-            "--volume and --secret are two different parts — attach them one command at a time"
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) | (_, Some(_), Some(_)) => bail!(
+            "--volume, --secret, and --gpu are different parts — attach them one command at a time"
         ),
-        (None, None) => bail!(
+        (None, None, None) => bail!(
             "say which part: --volume /tank/media, --volume desktop:tank, or \
-             --secret anthropic --to api.anthropic.com"
+             --secret anthropic --to api.anthropic.com, or --gpu desktop"
         ),
     }
 }
@@ -4345,11 +4560,21 @@ fn update_command(cmd: UpdateCommand) -> Result<()> {
         .map(std::path::PathBuf::from)
         .or_else(|| {
             let prefix = ast.parent()?.parent()?;
+            // Prefer asterism-update.ps1 on Windows, then .exe, then the POSIX updater.
+            windows_host::update::first_reachable_updater(prefix)
+        })
+        .or_else(|| {
+            let prefix = ast.parent()?.parent()?;
             let path = prefix.join("libexec/asterism/asterism-update");
             path.is_file().then_some(path)
         })
         // A source checkout can exercise the same updater without installing
         // into the developer's prefix. Published binaries never need this.
+        .or_else(|| {
+            let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../packaging/update.ps1");
+            path.is_file().then_some(path)
+        })
         .or_else(|| {
             let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../packaging/update.sh");
@@ -4361,7 +4586,21 @@ fn update_command(cmd: UpdateCommand) -> Result<()> {
             )
         })?;
 
-    let mut process = std::process::Command::new(&updater);
+    let is_powershell = updater
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("ps1"));
+    let mut process = if is_powershell {
+        let mut shell = std::process::Command::new(if cfg!(windows) {
+            "powershell.exe"
+        } else {
+            "pwsh"
+        });
+        shell.arg("-NoProfile").arg("-File").arg(&updater);
+        shell
+    } else {
+        std::process::Command::new(&updater)
+    };
     process.env("ASTERISM_UPDATE_AST_PATH", &ast);
     if std::env::var_os("ASTERISM_UPDATE_PUBKEY").is_none() {
         if let Some(pubkey) = option_env!("ASTERISM_UPDATE_PUBKEY") {
@@ -4380,7 +4619,7 @@ fn update_command(cmd: UpdateCommand) -> Result<()> {
         UpdateCommand::Apply { yes } => {
             process.arg("apply");
             if yes {
-                process.arg("--yes");
+                process.arg(if is_powershell { "-Yes" } else { "--yes" });
             }
         }
         UpdateCommand::Channel { name } => {
@@ -4406,7 +4645,7 @@ fn update_command(cmd: UpdateCommand) -> Result<()> {
 /// evidence, which is the same live-guest-preserving replacement exercised by
 /// the version-skew suite.
 fn activate_update(want_build: &str) -> Result<()> {
-    if UnixStream::connect(paths::socket_path()).is_ok() {
+    if ipc::connect(&paths::socket_path()).is_ok() {
         retire_stale_daemon()?;
     } else {
         spawn_daemon()?;
@@ -4471,6 +4710,20 @@ fn sync_update_entry(path: &Path, recursive: bool) -> Result<()> {
         .with_context(|| format!("syncing updater path {}", path.display()))
 }
 
+#[cfg(windows)]
+fn print_doctor() -> Result<()> {
+    let report = windows_host::doctor();
+    for line in report.lines() {
+        println!("{line}");
+    }
+    println!();
+    println!("{}", report.summary());
+    if !report.supported {
+        bail!("{}", report.summary());
+    }
+    Ok(())
+}
+
 // ---- service ---------------------------------------------------------------
 
 /// `ast service install|uninstall|status`.
@@ -4523,6 +4776,70 @@ mod tests {
     use std::cell::Cell;
     use std::collections::VecDeque;
     use std::sync::Mutex;
+
+    fn parse_cli(args: &[&str]) -> Cli {
+        Cli::try_parse_from(std::iter::once("ast").chain(args.iter().copied())).unwrap()
+    }
+
+    #[test]
+    fn set_compute_is_canonical_and_compatibility_aliases_remain() {
+        let Command::Set {
+            name,
+            part,
+            to,
+            down,
+        } = parse_cli(&["set", "agent", "compute", "desktop"]).command
+        else {
+            panic!("set compute did not parse as set");
+        };
+        assert_eq!(
+            (name.as_str(), part.as_str(), to.as_str(), down),
+            ("agent", "compute", "desktop", false)
+        );
+        assert!(asterism_core::instance::is_compute_part(&part));
+
+        let Command::Set { part, down, .. } =
+            parse_cli(&["set", "agent", "cpu", "desktop", "--down"]).command
+        else {
+            panic!("set cpu did not parse as the compatibility alias");
+        };
+        assert_eq!(part, "cpu");
+        assert!(down);
+        assert!(asterism_core::instance::is_compute_part(&part));
+
+        assert!(matches!(
+            parse_cli(&["move", "agent", "desktop", "--down"]).command,
+            Command::Move { name, to, down }
+                if name == "agent" && to == "desktop" && down
+        ));
+    }
+
+    #[test]
+    fn set_help_uses_compute_as_the_placement_name() {
+        use clap::CommandFactory;
+
+        let help = Cli::command()
+            .find_subcommand("set")
+            .expect("set")
+            .clone()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("compute"), "{help}");
+        assert!(help.contains("compatibility alias"), "{help}");
+        assert!(!help.contains("cpu/ram"), "{help}");
+        assert!(!help.contains("anchor"), "{help}");
+    }
+
+    #[test]
+    fn ram_names_are_refused_as_separate_compute_placements() {
+        for part in ["ram", "cpu/ram"] {
+            let error = set_part("agent", part, "desktop", false).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("whole compute"), "{message}");
+            assert!(message.contains("CPU, physical RAM"), "{message}");
+            assert!(message.contains("compute <device>"), "{message}");
+        }
+    }
 
     struct MemoryStore(Mutex<Option<Session>>);
 
@@ -4950,6 +5267,38 @@ mod tests {
     }
 
     #[test]
+    fn gpu_attach_and_detach_are_unambiguous_parts() {
+        let parsed = Cli::try_parse_from([
+            "ast",
+            "attach",
+            "guest",
+            "--gpu",
+            "desktop:GPU-01234567",
+            "--gpu-memory",
+            "2G",
+        ])
+        .unwrap();
+        match parsed.command {
+            Command::Attach {
+                name,
+                gpu,
+                gpu_memory,
+                ..
+            } => {
+                assert_eq!(name, "guest");
+                assert_eq!(gpu.as_deref(), Some("desktop:GPU-01234567"));
+                assert_eq!(gpu_memory.as_deref(), Some("2G"));
+            }
+            _ => panic!("parsed the wrong GPU command"),
+        }
+        assert!(Cli::try_parse_from([
+            "ast", "attach", "guest", "--gpu", "desktop", "--volume", "tank"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from(["ast", "detach", "guest", "--gpu"]).is_ok());
+    }
+
+    #[test]
     fn local_image_path_preserves_protocol_one_through_five() {
         for spoken in 1..=5 {
             assert_eq!(image_path(None, spoken), ImagePath::LocalCore);
@@ -4971,9 +5320,10 @@ mod tests {
             help.contains("`vz` (Apple Virtualization.framework)"),
             "{help}"
         );
+        assert!(help.contains("native `hyperv` on Windows"), "{help}");
         assert!(help.contains("`qemu` (compatibility)"), "{help}");
         assert!(
-            help.contains("select this device's native capable backend"),
+            help.contains("select this device's first capable native backend"),
             "{help}"
         );
     }

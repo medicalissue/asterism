@@ -106,7 +106,7 @@ export interface InstanceRow {
       of touch. */
   status: string;
   live: boolean;
-  cpu_device: string;
+  compute_device: string;
   backend: string;
   shape: string;
   image: string;
@@ -372,13 +372,13 @@ const PREVIEW_FORM: Form = {
 
 const PREVIEW_INSTANCES: Instances = {fleet: {kind: 'rows', rows: [
   {
-    name: 'night-shift', status: 'running', live: true, cpu_device: 'desk-mini',
+    name: 'night-shift', status: 'running', live: true, compute_device: 'desk-mini',
     backend: 'vz', shape: '4 CPU · 8 GB', image: 'ubuntu-24.04',
     volumes: [{kind: 'block', name: 'agent-work', source_device: 'nas', guest_path: '/dev/vdb', size: '100 GB'}],
     can_start: false, can_stop: true, can_shell: true, can_snapshot: false,
   },
   {
-    name: 'build-cache', status: 'stopped', live: true, cpu_device: 'studio',
+    name: 'build-cache', status: 'stopped', live: true, compute_device: 'studio',
     backend: 'qemu', shape: '2 CPU · 4 GB', image: 'debian-13', volumes: [],
     can_start: true, can_stop: false, can_shell: false, can_snapshot: true,
   },

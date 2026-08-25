@@ -33,12 +33,18 @@ use crate::snapshot::Snapshot;
 ///   directly; also a local file a user points at. VZ never reads it.
 /// * `Asif` is Apple's own sparse format (macOS 26+), an opportunistic
 ///   upgrade for VZ hosts and not created yet.
+/// * `Vhdx` is Hyper-V's native virtual disk container. The common image
+///   store stays raw; only the Windows helper materialises instance-local
+///   VHDX files through VirtDisk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiskFormat {
     Raw,
     Qcow2,
     Asif,
+    /// Native Hyper-V virtual disk container. Instance-local prepared disks
+    /// use this; the common image store remains raw.
+    Vhdx,
 }
 
 impl DiskFormat {
@@ -48,6 +54,7 @@ impl DiskFormat {
             DiskFormat::Raw => "raw",
             DiskFormat::Qcow2 => "qcow2",
             DiskFormat::Asif => "asif",
+            DiskFormat::Vhdx => "vhdx",
         }
     }
 }
@@ -102,9 +109,8 @@ pub enum DiskSpec {
 ///
 /// A cloud image is a whole disk: partition table, bootloader, kernel, the
 /// firmware finds it and that is the end of the backend's involvement. An OCI
-/// image is a root filesystem and nothing else — MODEL.md makes container
-/// images an image *source*, not a second kind of instance — so a backend
-/// booting one has to supply the kernel itself ([`crate::oci`]).
+/// image is a root filesystem and nothing else. A VM runtime supplies a
+/// kernel; a native-container runtime supplies namespaces and a cgroup.
 ///
 /// Data on the image and recorded on the instance, rather than inferred from
 /// the reference: what a name meant when the instance was created is not
@@ -201,9 +207,20 @@ impl Prepared {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ControlChannel {
-    Qmp { path: PathBuf },
-    HttpApi { path: PathBuf },
-    Rpc { path: PathBuf },
+    Qmp {
+        path: PathBuf,
+    },
+    HttpApi {
+        path: PathBuf,
+    },
+    Rpc {
+        path: PathBuf,
+    },
+    /// A durable one-shot helper config. The VM itself is owned by the host
+    /// service and a later helper reopens the stable system id in this file.
+    Helper {
+        path: PathBuf,
+    },
 }
 
 impl ControlChannel {
@@ -211,7 +228,8 @@ impl ControlChannel {
         match self {
             ControlChannel::Qmp { path }
             | ControlChannel::HttpApi { path }
-            | ControlChannel::Rpc { path } => path,
+            | ControlChannel::Rpc { path }
+            | ControlChannel::Helper { path } => path,
         }
     }
 }
@@ -224,6 +242,60 @@ pub enum GuestEndpoint {
     HostForward { ssh_port: u16 },
     /// VZ NAT, bridged, or mesh-routed: the guest has its own address.
     GuestAddr { addr: IpAddr },
+}
+
+/// The private control plane for a native container.
+///
+/// This is intentionally not a [`GuestEndpoint`]. A container has no SSH
+/// listener to invent: readiness means this Unix socket answers from the
+/// process holding the recorded namespaces and delegated cgroup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerControlEndpoint {
+    pub socket: PathBuf,
+    pub user_namespace: PathBuf,
+    pub mount_namespace: PathBuf,
+    pub pid_namespace: PathBuf,
+    pub network_namespace: PathBuf,
+    pub cgroup: PathBuf,
+    /// Kernel identities captured with the namespace holder.
+    ///
+    /// Paths under `/proc/<pid>` and cgroup names are reusable.  Persisting
+    /// their device/inode pairs makes a later control connection prove it is
+    /// still attached to the exact namespaces and cgroup created at boot.
+    /// Old handles deserialize without this field and deliberately fail
+    /// closed in the native-container adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<ContainerRuntimeIdentity>,
+    /// The rootless network process and private API socket owned by this
+    /// container. It is separate from the namespace holder's cgroup, so the
+    /// exact process identity must travel with the durable handle for `down`
+    /// and daemon-restart cleanup to retire its host forwards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<ContainerNetworkEndpoint>,
+}
+
+/// Durable authority for one container's rootless network process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerNetworkEndpoint {
+    pub api: PathBuf,
+    pub process: ProcId,
+}
+
+/// A kernel object's stable identity for the lifetime of that object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KernelObjectIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
+/// Identity of every kernel boundary a native-container control socket owns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerRuntimeIdentity {
+    pub user_namespace: KernelObjectIdentity,
+    pub mount_namespace: KernelObjectIdentity,
+    pub pid_namespace: KernelObjectIdentity,
+    pub network_namespace: KernelObjectIdentity,
+    pub cgroup: KernelObjectIdentity,
 }
 
 impl GuestEndpoint {
@@ -272,7 +344,12 @@ pub struct Handle {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proc: Option<ProcId>,
     pub ctl: ControlChannel,
-    pub endpoint: GuestEndpoint,
+    /// SSH reachability for a VM. Native containers leave this absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<GuestEndpoint>,
+    /// Namespace-bound command/lifecycle channel for a native container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_control: Option<ContainerControlEndpoint>,
     /// Unix seconds, matching `Instance::created_at`.
     pub started_at: u64,
 }
@@ -291,7 +368,8 @@ impl Handle {
             pid: Some(proc.pid),
             proc: Some(proc),
             ctl,
-            endpoint,
+            endpoint: Some(endpoint),
+            container_control: None,
             started_at: crate::instance::now_unix(),
         }
     }
@@ -442,10 +520,11 @@ pub enum Capability {
     DirectKernelBoot,
     PortForward,
     GuestEgress,
+    GuestGpuProjection,
 }
 
 impl Capability {
-    pub const ALL: [Capability; 10] = [
+    pub const ALL: [Capability; 11] = [
         Capability::LiveSnapshot,
         Capability::DiskSnapshot,
         Capability::LiveMigration,
@@ -456,6 +535,7 @@ impl Capability {
         Capability::DirectKernelBoot,
         Capability::PortForward,
         Capability::GuestEgress,
+        Capability::GuestGpuProjection,
     ];
 }
 
@@ -485,6 +565,9 @@ pub struct Caps {
     /// LAN, or `None` where this backend has no such path. See
     /// [`GuestEgress`]; `None` is what the secrets data plane refuses on.
     pub guest_egress: Option<GuestEgress>,
+    /// Can attach an instance-bound virtio socket and carry the production
+    /// CUSE/libcuda payload into a Linux guest.
+    pub guest_gpu_projection: bool,
     pub disk_formats: &'static [DiskFormat],
 }
 
@@ -507,6 +590,7 @@ impl Caps {
             Capability::DirectKernelBoot => self.direct_kernel,
             Capability::PortForward => self.port_forward,
             Capability::GuestEgress => self.guest_egress.is_some(),
+            Capability::GuestGpuProjection => self.guest_gpu_projection,
         }
     }
 }
@@ -517,7 +601,7 @@ impl Caps {
 pub struct Ready {
     /// Hypervisor version, e.g. `11.0.0`.
     pub version: String,
-    /// Accelerator in use: `hvf`, `kvm`, `whpx`.
+    /// Accelerator in use: `hvf`, `kvm`, `hyperv`. WHPX is not a product path.
     pub accel: String,
     pub machine_type: String,
     pub cpu: String,
@@ -625,7 +709,7 @@ pub fn unsupported<T>(backend: &str, what: &str) -> Result<T> {
 // ---- the trait -------------------------------------------------------------
 
 pub trait Hypervisor: Send + Sync {
-    /// Stable id persisted on the instance: "qemu", "vz", "chv", "whpx".
+    /// Stable id persisted on the instance, such as "qemu", "vz", or "hyperv".
     fn id(&self) -> &'static str;
 
     /// Tooling present, accelerator usable, entitlements in place.
@@ -696,6 +780,17 @@ pub trait Hypervisor: Send + Sync {
 
     /// Immediate termination — for `ast down --force` and crash cleanup.
     fn kill(&self, h: &Handle) -> Result<()>;
+
+    /// Release backend-owned host resources before a stopped instance's
+    /// directory and authority row are removed.
+    ///
+    /// Most backends finish cleanup while stopping and need no extra work.
+    /// Persistent host services such as HCS/HCN outlive both the guest and
+    /// daemon, so their backend overrides this seam instead of leaking a
+    /// host-specific branch into instance removal.
+    fn remove_instance_resources(&self, _inst: &Instance) -> Result<()> {
+        Ok(())
+    }
 
     /// Liveness for a handle reloaded from the registry after an astd
     /// restart. Never assumes the handle is still valid.
@@ -797,7 +892,8 @@ mod tests {
             ctl: ControlChannel::Qmp {
                 path: "/tmp/qmp.sock".into(),
             },
-            endpoint: GuestEndpoint::HostForward { ssh_port: 22022 },
+            endpoint: Some(GuestEndpoint::HostForward { ssh_port: 22022 }),
+            container_control: None,
             started_at: 1_700_000_000,
         };
         let json = serde_json::to_string(&h).unwrap();
@@ -846,6 +942,7 @@ mod tests {
                     direct_kernel: false,
                     port_forward: false,
                     guest_egress: None,
+                    guest_gpu_projection: false,
                     disk_formats: &[DiskFormat::Raw],
                 }
             }

@@ -450,6 +450,10 @@ fn clear_stale_control(inst: &Instance) {
     if !path.exists() {
         return;
     }
+    if matches!(handle.ctl, asterism_core::hv::ControlChannel::Helper { .. }) {
+        return;
+    }
+    #[cfg(unix)]
     if std::os::unix::net::UnixStream::connect(path).is_ok() {
         eprintln!(
             "astd: {} is down but something is still listening on {} — leaving it, \
@@ -471,6 +475,9 @@ fn clear_stale_control(inst: &Instance) {
 /// than as a live one to keep supervising — and, later, to signal.
 fn alive(inst: &Instance) -> bool {
     inst.handle.as_ref().is_some_and(|handle| {
+        if handle.container_control.is_some() {
+            return !matches!(crate::container::state(handle), Ok(RunState::Stopped));
+        }
         backend::for_handle(&handle.backend)
             .is_ok_and(|hv| matches!(hv.state(handle), Ok(RunState::Running)))
     })
@@ -576,9 +583,10 @@ mod tests {
             ctl: asterism_core::hv::ControlChannel::Rpc {
                 path: ctl.to_owned(),
             },
-            endpoint: asterism_core::hv::GuestEndpoint::GuestAddr {
+            endpoint: Some(asterism_core::hv::GuestEndpoint::GuestAddr {
                 addr: "192.168.64.3".parse().unwrap(),
-            },
+            }),
+            container_control: None,
             started_at: 0,
         });
         inst

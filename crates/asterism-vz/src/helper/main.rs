@@ -51,6 +51,8 @@ mod agent;
 #[cfg(target_os = "macos")]
 mod ctl;
 #[cfg(target_os = "macos")]
+mod gpu;
+#[cfg(target_os = "macos")]
 mod net;
 #[cfg(target_os = "macos")]
 mod vm;
@@ -176,6 +178,8 @@ fn main() -> anyhow::Result<()> {
         },
     };
     let mut agent = agent::Agent::default();
+    let mut gpu = gpu::GpuHop::default();
+    let mut gpu_reconnect = Reconnect::new();
     let mut reconnect = Reconnect::new();
 
     // The guest's address, hunted on a thread of its own — the fallback for
@@ -288,6 +292,13 @@ fn main() -> anyhow::Result<()> {
                 &config.instance,
                 t0,
                 &mut reconnect,
+            );
+            keep_gpu_session(
+                &machine,
+                &mut gpu,
+                key,
+                &config.instance,
+                &mut gpu_reconnect,
             );
         }
 
@@ -508,6 +519,48 @@ fn keep_session(
             }
         }
         // Still in flight, or not time to ask again.
+        None => {}
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn keep_gpu_session(
+    machine: &vm::Machine,
+    hop: &mut gpu::GpuHop,
+    key: &asterism_vz::guest::Key,
+    instance: &str,
+    state: &mut Reconnect,
+) {
+    use std::time::Instant;
+
+    if hop.live() {
+        return;
+    }
+    if let Some(since) = state.attached.take() {
+        unsafe { machine.close_gpu() };
+        state.gap = match since.elapsed() >= STABLE_SESSION {
+            true => FIRST_CONNECT_GAP,
+            false => (state.gap * 2).min(SETTLED_CONNECT_GAP),
+        };
+        state.next = Instant::now() + state.gap;
+    }
+    match unsafe { machine.take_connect_gpu() } {
+        Some(Ok(fd)) => {
+            hop.attach(fd, *key.as_bytes(), instance.to_owned());
+            state.attached = Some(Instant::now());
+        }
+        Some(Err(_)) => {
+            state.next = Instant::now() + state.gap;
+        }
+        None if !machine.gpu_connect_in_flight() && Instant::now() >= state.next => {
+            if let Err(e) = unsafe { machine.start_connect_gpu() } {
+                if !state.said_no_vsock {
+                    state.said_no_vsock = true;
+                    eprintln!("astd-vz: {instance}: GPU vsock: {e:#}");
+                }
+                state.next = Instant::now() + SETTLED_CONNECT_GAP;
+            }
+        }
         None => {}
     }
 }

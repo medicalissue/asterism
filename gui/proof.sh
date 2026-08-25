@@ -156,9 +156,9 @@ INSTANCES="$(gui "$A" --dump-main instances)"
 echo "$INSTANCES"
 need "the orbit view has A's instance" "instance gui-a" "$INSTANCES"
 need "the orbit view has B's instance" "instance gui-b" "$INSTANCES"
-need "a row names the device supplying its cpu" "cpu=$A_NAME" "$INSTANCES"
-need "and the other device's" "cpu=$B_NAME" "$INSTANCES"
-[ "$(grep -o 'cpu=[a-z0-9-]*' <<<"$INSTANCES" | sort -u | wc -l | tr -d ' ')" = "2" ] \
+need "a row names the device supplying its compute" "compute=$A_NAME" "$INSTANCES"
+need "and the other device's" "compute=$B_NAME" "$INSTANCES"
+[ "$(grep -o 'compute=[a-z0-9-]*' <<<"$INSTANCES" | sort -u | wc -l | tr -d ' ')" = "2" ] \
   || fail "the two rows do not come from two devices:"$'\n'"$INSTANCES"
 need "a stopped row offers Up and a snapshot" \
   "actions up=enabled down=disabled terminal=disabled snapshots=enabled" "$INSTANCES"

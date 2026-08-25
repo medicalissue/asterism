@@ -159,21 +159,26 @@ harness_reap_home "$WORK/never" || fail "reaping a home that does not exist was 
 ok "a home that does not exist is nothing to reap"
 
 helper_home="$WORK/helper-home"
-mkdir -p "$helper_home/instances/vz-owned"
+mkdir -p "$helper_home/instances/vz-owned" "$helper_home/instances/chv-owned"
 helper="$(spawn)"
+chv="$(spawn)"
 STRAY="$(spawn)"
 # This is the post-astd record from the reported failure: it contains no
-# helper pid, even though the helper that belongs to this home is still live.
+# VMM pid, even though the VMMs that belong to this home are still live.
 printf '{"instances":[]}\n' >"$helper_home/state.json"
 printf '%s\n' "$helper" >"$helper_home/instances/vz-owned/vz.pid"
+printf '%s\n' "$chv" >"$helper_home/instances/chv-owned/chv.pid"
 harness_reap_home "$helper_home"
 alive "$helper" && fail "a VZ helper named by its pidfile survived the reaper"
-alive "$STRAY" || fail "the VZ pidfile reaper killed a process it did not own"
+alive "$chv" && fail "a Cloud Hypervisor VMM named by its pidfile survived the reaper"
+alive "$STRAY" || fail "the VMM pidfile reaper killed a process it did not own"
 [ ! -e "$helper_home/instances/vz-owned/vz.pid" ] \
   || fail "the consumed VZ pidfile was left behind"
+[ ! -e "$helper_home/instances/chv-owned/chv.pid" ] \
+  || fail "the consumed Cloud Hypervisor pidfile was left behind"
 kill -KILL "$STRAY" 2>/dev/null || true
 STRAY=""
-ok "a VZ pidfile reaps its helper after a stale daemon record, and no bystander"
+ok "VZ and CHV pidfiles reap their VMMs after a stale daemon record, and no bystander"
 
 # ---- 8. the image cache is the harness's own, never the user's ---------------
 

@@ -44,7 +44,18 @@ REPO_URL="https://github.com/${REPO}.git"
 
 VERSION="${ASTERISM_VERSION:-}"
 METHOD="${ASTERISM_METHOD:-release}"
-PREFIX="${ASTERISM_PREFIX:-${HOME}/.local}"
+if [ -n "${ASTERISM_PREFIX:-}" ]; then
+	PREFIX="$ASTERISM_PREFIX"
+else
+	case "$(uname -s 2>/dev/null || echo unknown)" in
+	MINGW* | MSYS* | CYGWIN* | Windows_NT)
+		PREFIX="${LOCALAPPDATA:-${HOME}/AppData/Local}/Asterism"
+		;;
+	*)
+		PREFIX="${HOME}/.local"
+		;;
+	esac
+fi
 # Test harnesses may stage host integration beneath a disposable root. Real
 # installs leave this empty and therefore use the fixed, root-owned paths that
 # the daemon and sudoers both name.
@@ -278,6 +289,35 @@ place_at() {
 	say "installed ${dest}"
 }
 
+linux_guest_files() {
+	printf '%s' 'bin/guest-gpu/bin/asterism-gpu-guest bin/guest-gpu/lib/libcuda.so.1.0.0 bin/guest-gpu/lib/libcuda.so.1 bin/guest-gpu/lib/libcuda.so'
+}
+
+validate_linux_guest_artifacts() {
+	source_dir="${1:-}"
+	[ -n "$source_dir" ] || die "guest GPU artifact root is empty. Refusing to copy from an ambient /bin path."
+	case "$source_dir" in
+	/*) ;;
+	*) die "guest GPU artifact root is not absolute: ${source_dir}" ;;
+	esac
+	[ -x "${source_dir}/bin/asterism-gpu-guest" ] ||
+		die "guest GPU artifact root has no executable service: ${source_dir}"
+	[ -f "${source_dir}/lib/libcuda.so.1.0.0" ] ||
+		die "guest GPU artifact root has no generated libcuda: ${source_dir}"
+	[ "$(readlink "${source_dir}/lib/libcuda.so.1" 2>/dev/null || true)" = libcuda.so.1.0.0 ] ||
+		die "guest GPU artifact root has no exact libcuda.so.1 link: ${source_dir}"
+	[ "$(readlink "${source_dir}/lib/libcuda.so" 2>/dev/null || true)" = libcuda.so.1 ] ||
+		die "guest GPU artifact root has no exact libcuda.so link: ${source_dir}"
+}
+
+place_linux_guest() {
+	source_dir="${1:-}"
+	validate_linux_guest_artifacts "$source_dir"
+	for rel in bin/asterism-gpu-guest lib/libcuda.so.1.0.0 lib/libcuda.so.1 lib/libcuda.so; do
+		place_at "${source_dir}/${rel}" "bin/guest-gpu/${rel}"
+	done
+}
+
 # macOS marks a file a *browser* downloaded with com.apple.quarantine, and
 # tar hands that mark to every file it extracts. Gatekeeper then assesses
 # what execs, and an ad-hoc signature does not pass an assessment — so the
@@ -322,6 +362,15 @@ detect_target() {
 	Darwin-arm64) printf 'darwin-arm64' ;;
 	Linux-x86_64) printf 'linux-x86_64' ;;
 	Linux-arm64) printf 'linux-arm64' ;;
+	Windows_NT-x86_64 | MINGW*-x86_64 | MSYS*-x86_64 | CYGWIN*-x86_64) printf 'windows-x86_64' ;;
+	Windows_NT-arm64 | MINGW*-arm64 | MSYS*-arm64 | CYGWIN*-arm64) printf 'windows-arm64' ;;
+	*) return 1 ;;
+	esac
+}
+
+is_windows_uname() {
+	case "$(uname -s)" in
+	MINGW* | MSYS* | CYGWIN* | Windows_NT) return 0 ;;
 	*) return 1 ;;
 	esac
 }
@@ -329,10 +378,12 @@ detect_target() {
 unsupported_target() {
 	err "no binary release for $(uname -s) $(uname -m)."
 	err ""
-	err "Asterism publishes binaries for macOS on Apple silicon and Linux on x86-64 or arm64."
+	err "Asterism publishes binaries for macOS on Apple silicon (darwin-arm64),"
+	err "Linux on x86-64 or arm64, and Windows 11 Pro/Enterprise."
 	err "Everything else builds from source, which needs Rust and a few minutes:"
 	err ""
 	err "    curl -fsSL https://asterism.run/install.sh | ASTERISM_METHOD=source sh"
+	err "    irm https://asterism.run/install.ps1 | iex   # native Windows"
 	err ""
 	exit 1
 }
@@ -437,13 +488,32 @@ remove_receipt_files() {
 	files="$(receipt_field files || true)"
 	for rel in $files; do
 		f="${PREFIX}/${rel}"
-		if [ -e "$f" ]; then
+		if [ -e "$f" ] || [ -L "$f" ]; then
 			rm -f "$f" || return 1
 			say "removed ${f}"
 		else
 			say "already gone: ${f}"
 		fi
 	done
+	# Releases predating the packaged guest projection do not name this unit
+	# in their receipt. The presence of the installer-owned Cloud Hypervisor
+	# entry identifies that Linux ownership lane; a signed update may then
+	# have added guest-gpu atomically without rewriting the bootstrap receipt.
+	if receipt_lists bin/cloud-hypervisor; then
+		for rel in bin/guest-gpu/bin/asterism-gpu-guest \
+			bin/guest-gpu/lib/libcuda.so.1.0.0 \
+			bin/guest-gpu/lib/libcuda.so.1 bin/guest-gpu/lib/libcuda.so; do
+			receipt_lists "$rel" && continue
+			f="${PREFIX}/${rel}"
+			if [ -e "$f" ] || [ -L "$f" ]; then
+				rm -f "$f" || return 1
+				say "removed ${f} — adopted from a signed Linux update"
+			fi
+		done
+	fi
+	rmdir "${PREFIX}/bin/guest-gpu/lib" 2>/dev/null || true
+	rmdir "${PREFIX}/bin/guest-gpu/bin" 2>/dev/null || true
+	rmdir "${PREFIX}/bin/guest-gpu" 2>/dev/null || true
 }
 
 remove_receipt_system_files() {
@@ -482,13 +552,10 @@ rollback_incomplete_install() {
 
 # Does the receipt name this file among the ones this script wrote?
 receipt_lists() {
-	files="$(receipt_field files || true)"
-	for rel in $files; do
-		if [ "$rel" = "$1" ]; then
-			return 0
-		fi
-	done
-	return 1
+	# Keep this predicate free of shell variables. POSIX sh has no portable
+	# function-local variables, and callers use it from deletion loops whose
+	# `rel` iterator must not be overwritten while deciding what to adopt.
+	receipt_field files 2>/dev/null | tr ' ' '\n' | grep -Fqx -- "$1"
 }
 
 # A move to a build with no helper must take the old helper with it: `astd`
@@ -505,6 +572,9 @@ drop_stale_helper() {
 
 drop_stale_linux_helpers() {
 	for rel in bin/cloud-hypervisor bin/virtiofsd \
+		bin/guest-gpu/bin/asterism-gpu-guest \
+		bin/guest-gpu/lib/libcuda.so.1.0.0 bin/guest-gpu/lib/libcuda.so.1 \
+		bin/guest-gpu/lib/libcuda.so \
 		share/asterism/linux-components.env \
 		share/asterism/asterism-nbd \
 		share/asterism/licenses/cloud-hypervisor-Apache-2.0.txt \
@@ -519,6 +589,9 @@ drop_stale_linux_helpers() {
 		say "removed ${PREFIX}/${rel} — this target ships no Linux helper"
 	done
 	rmdir "${PREFIX}/share/asterism/licenses" 2>/dev/null || true
+	rmdir "${PREFIX}/bin/guest-gpu/lib" 2>/dev/null || true
+	rmdir "${PREFIX}/bin/guest-gpu/bin" 2>/dev/null || true
+	rmdir "${PREFIX}/bin/guest-gpu" 2>/dev/null || true
 }
 
 # ---- resolving a version ---------------------------------------------------
@@ -644,8 +717,12 @@ install_release() {
 	unpack="${TMPDIR_SELF}/unpack"
 	mkdir -p "$unpack"
 	tar -xzf "$tarball" -C "$unpack" || die "could not unpack ${artifact}."
+	exe=""
+	case "$target" in
+	windows-*) exe=".exe" ;;
+	esac
 	for bin in ast astd; do
-		[ -f "${unpack}/${bin}" ] || die "${artifact} has no ${bin} in it. Refusing to install a partial release."
+		[ -f "${unpack}/${bin}${exe}" ] || die "${artifact} has no ${bin}${exe} in it. Refusing to install a partial release."
 	done
 	# `astd-vz` is the Virtualization.framework helper, and it is not
 	# required here the way `ast` and `astd` are: this script installs any
@@ -654,31 +731,59 @@ install_release() {
 	# unable to install half the releases it can name. So it is installed
 	# when the release has it, and its absence is said out loud rather than
 	# discovered later as "vz is unavailable on this machine".
+	#
+	# Windows releases instead ship `astd-hyperv`, and that helper *is*
+	# required: a Windows tarball without it is not a supported artifact.
 	if [ -f "${unpack}/astd-vz" ]; then
 		vz=1
 	else
 		vz=0
 	fi
-	if [ -f "${unpack}/asterism-update" ]; then updater=1; else updater=0; fi
+	hyperv=0
+	if [ -f "${unpack}/astd-hyperv${exe}" ]; then
+		hyperv=1
+	fi
+	if [ "$target" != "${target#windows-}" ] && [ "$hyperv" != "1" ]; then
+		die "${artifact} has no astd-hyperv${exe}. A Windows release without the helper is not installable."
+	fi
+	if [ -f "${unpack}/asterism-update${exe}" ]; then updater=1; else updater=0; fi
+	if [ -f "${unpack}/asterism-update" ]; then updater_sh=1; else updater_sh=0; fi
+	if [ -f "${unpack}/asterism-update.ps1" ]; then updater_ps1=1; else updater_ps1=0; fi
+	if [ -f "${unpack}/install.ps1" ]; then installer_ps1=1; else installer_ps1=0; fi
+	if [ "$target" != "${target#windows-}" ] && { [ "$updater_ps1" != "1" ] || [ "$installer_ps1" != "1" ]; }; then
+		die "${artifact} must package asterism-update.ps1 and install.ps1 together. Refusing a Windows updater that cannot apply."
+	fi
 	case "$target" in
 	linux-*)
 		for helper in cloud-hypervisor virtiofsd; do
 			[ -f "${unpack}/${helper}" ] || die "${artifact} has no ${helper}. Refusing to install a Linux release without its pinned native backend."
 		done
 		[ -f "${unpack}/share/asterism/asterism-nbd" ] || die "${artifact} has no checked NBD privilege wrapper. Refusing a partial Linux runtime."
+		[ -x "${unpack}/guest-gpu/bin/asterism-gpu-guest" ] || die "${artifact} has no Linux guest GPU service. Refusing an unprojectable GPU runtime."
+		[ -f "${unpack}/guest-gpu/lib/libcuda.so.1.0.0" ] || die "${artifact} has no generated guest libcuda. Refusing an unprojectable GPU runtime."
 		linux_helpers=1
 		;;
 	*) linux_helpers=0 ;;
 	esac
+	receipt_files="bin/ast${exe} bin/astd${exe}"
 	if [ "$vz" = "1" ]; then
-		intent_files="bin/ast bin/astd bin/astd-vz"
+		receipt_files="${receipt_files} bin/astd-vz"
 	elif [ "$linux_helpers" = "1" ]; then
-		intent_files="bin/ast bin/astd bin/cloud-hypervisor bin/virtiofsd share/asterism/linux-components.env share/asterism/asterism-nbd share/asterism/licenses/cloud-hypervisor-Apache-2.0.txt share/asterism/licenses/cloud-hypervisor-BSD-3-Clause.txt share/asterism/licenses/virtiofsd-Apache-2.0.txt share/asterism/licenses/virtiofsd-BSD-3-Clause.txt share/asterism/licenses/LICENSE-APACHE share/asterism/licenses/LICENSE-MIT share/asterism/licenses/NOTICE"
-	else
-		intent_files="bin/ast bin/astd"
+		receipt_files="${receipt_files} bin/cloud-hypervisor bin/virtiofsd $(linux_guest_files) share/asterism/linux-components.env share/asterism/asterism-nbd share/asterism/licenses/cloud-hypervisor-Apache-2.0.txt share/asterism/licenses/cloud-hypervisor-BSD-3-Clause.txt share/asterism/licenses/virtiofsd-Apache-2.0.txt share/asterism/licenses/virtiofsd-BSD-3-Clause.txt share/asterism/licenses/LICENSE-APACHE share/asterism/licenses/LICENSE-MIT share/asterism/licenses/NOTICE"
+	fi
+	if [ "$hyperv" = "1" ]; then
+		receipt_files="${receipt_files} bin/astd-hyperv${exe}"
 	fi
 	if [ "$updater" = "1" ]; then
-		intent_files="${intent_files} libexec/asterism/asterism-update"
+		receipt_files="${receipt_files} libexec/asterism/asterism-update${exe}"
+	elif [ "$updater_sh" = "1" ]; then
+		receipt_files="${receipt_files} libexec/asterism/asterism-update"
+	fi
+	if [ "$updater_ps1" = "1" ]; then
+		receipt_files="${receipt_files} libexec/asterism/asterism-update.ps1"
+	fi
+	if [ "$installer_ps1" = "1" ]; then
+		receipt_files="${receipt_files} libexec/asterism/install.ps1"
 	fi
 	if [ "$linux_helpers" = "1" ]; then
 		intent_system_files="$(linux_system_files)"
@@ -686,17 +791,15 @@ install_release() {
 		intent_system_files=""
 	fi
 	# This journal is durable before `place` or any root-side configuration.
-	write_install_intent "$version" "$target" release "$got" "$intent_system_files" "$intent_files"
+	write_install_intent "$version" "$target" release "$got" "$intent_system_files" "$receipt_files"
 
 	ensure_writable_prefix
-	place "${unpack}/ast" ast
-	place "${unpack}/astd" astd
-	if [ "$updater" = "1" ]; then
-		place_at "${unpack}/asterism-update" libexec/asterism/asterism-update
-	fi
+	place "${unpack}/ast${exe}" "ast${exe}"
+	place "${unpack}/astd${exe}" "astd${exe}"
 	if [ "$linux_helpers" = "1" ]; then
 		place "${unpack}/cloud-hypervisor" cloud-hypervisor
 		place "${unpack}/virtiofsd" virtiofsd
+		place_linux_guest "${unpack}/guest-gpu"
 		if [ -d "${unpack}/share/asterism" ]; then
 			mkdir -p "${PREFIX}/share/asterism"
 			cp -R "${unpack}/share/asterism/." "${PREFIX}/share/asterism/"
@@ -707,49 +810,30 @@ install_release() {
 		[ "$linux_helpers" = "1" ] || drop_stale_linux_helpers
 		place "${unpack}/astd-vz" astd-vz
 		unquarantine "${PREFIX}/bin/ast" "${PREFIX}/bin/astd" "${PREFIX}/bin/astd-vz"
-		if [ "$updater" = "1" ]; then
-			write_receipt "$version" "$target" release "$got" bin/ast bin/astd bin/astd-vz libexec/asterism/asterism-update
-		else
-			write_receipt "$version" "$target" release "$got" bin/ast bin/astd bin/astd-vz
-		fi
 	elif [ "$linux_helpers" = "1" ]; then
 		drop_stale_helper
-		if [ "$updater" = "1" ]; then
-			write_receipt "$version" "$target" release "$got" \
-				bin/ast bin/astd bin/cloud-hypervisor bin/virtiofsd \
-				libexec/asterism/asterism-update \
-				share/asterism/linux-components.env \
-				share/asterism/asterism-nbd \
-				share/asterism/licenses/cloud-hypervisor-Apache-2.0.txt \
-				share/asterism/licenses/cloud-hypervisor-BSD-3-Clause.txt \
-				share/asterism/licenses/virtiofsd-Apache-2.0.txt \
-				share/asterism/licenses/virtiofsd-BSD-3-Clause.txt \
-				share/asterism/licenses/LICENSE-APACHE \
-				share/asterism/licenses/LICENSE-MIT \
-				share/asterism/licenses/NOTICE
-		else
-			write_receipt "$version" "$target" release "$got" \
-				bin/ast bin/astd bin/cloud-hypervisor bin/virtiofsd \
-				share/asterism/linux-components.env \
-				share/asterism/asterism-nbd \
-				share/asterism/licenses/cloud-hypervisor-Apache-2.0.txt \
-				share/asterism/licenses/cloud-hypervisor-BSD-3-Clause.txt \
-				share/asterism/licenses/virtiofsd-Apache-2.0.txt \
-				share/asterism/licenses/virtiofsd-BSD-3-Clause.txt \
-				share/asterism/licenses/LICENSE-APACHE \
-				share/asterism/licenses/LICENSE-MIT \
-				share/asterism/licenses/NOTICE
-		fi
 	else
 		drop_stale_linux_helpers
-		unquarantine "${PREFIX}/bin/ast" "${PREFIX}/bin/astd"
+		unquarantine "${PREFIX}/bin/ast${exe}" "${PREFIX}/bin/astd${exe}"
 		drop_stale_helper
-		if [ "$updater" = "1" ]; then
-			write_receipt "$version" "$target" release "$got" bin/ast bin/astd libexec/asterism/asterism-update
-		else
-			write_receipt "$version" "$target" release "$got" bin/ast bin/astd
-		fi
 	fi
+	if [ "$hyperv" = "1" ]; then
+		place "${unpack}/astd-hyperv${exe}" "astd-hyperv${exe}"
+		verify_windows_authenticode "${PREFIX}/bin/ast${exe}" "${PREFIX}/bin/astd${exe}" "${PREFIX}/bin/astd-hyperv${exe}"
+	fi
+	if [ "$updater" = "1" ]; then
+		place_at "${unpack}/asterism-update${exe}" "libexec/asterism/asterism-update${exe}"
+	elif [ "$updater_sh" = "1" ]; then
+		place_at "${unpack}/asterism-update" libexec/asterism/asterism-update
+	fi
+	if [ "$updater_ps1" = "1" ]; then
+		place_at "${unpack}/asterism-update.ps1" libexec/asterism/asterism-update.ps1
+	fi
+	if [ "$installer_ps1" = "1" ]; then
+		place_at "${unpack}/install.ps1" libexec/asterism/install.ps1
+	fi
+	# shellcheck disable=SC2086
+	write_receipt "$version" "$target" release "$got" $receipt_files
 
 	if [ "$installed" != "" ] && [ "$installed" != "$version" ]; then
 		say "upgraded ${installed} -> ${version}"
@@ -801,6 +885,13 @@ install_source() {
 		--package asterism-cli --package asterism-daemon)
 	linux_helpers=0
 	if [ "$(uname -s)" = "Linux" ]; then
+		# The destination is installer-owned and absolute. Never derive a copy
+		# root from build output: an empty line would otherwise collapse the
+		# service source to /bin/asterism-gpu-guest. Build and validate the exact
+		# checked-out ref before prepare_chv_source performs any root mutation.
+		guest_artifacts="${TMPDIR_SELF}/guest-gpu"
+		"${src}/scripts/build-guest-gpu-artifacts.sh" "$guest_artifacts"
+		validate_linux_guest_artifacts "$guest_artifacts"
 		prepare_chv_source "$src"
 		linux_helpers=1
 	fi
@@ -824,7 +915,7 @@ install_source() {
 	if [ "$vz" = "1" ]; then
 		intent_files="bin/ast bin/astd bin/astd-vz libexec/asterism/asterism-update"
 	elif [ "$linux_helpers" = "1" ]; then
-		intent_files="bin/ast bin/astd bin/cloud-hypervisor bin/virtiofsd libexec/asterism/asterism-update"
+		intent_files="bin/ast bin/astd bin/cloud-hypervisor bin/virtiofsd libexec/asterism/asterism-update $(linux_guest_files)"
 	else
 		intent_files="bin/ast bin/astd libexec/asterism/asterism-update"
 	fi
@@ -844,6 +935,7 @@ install_source() {
 	if [ "$linux_helpers" = "1" ]; then
 		place "$CHV_SOURCE_BIN" cloud-hypervisor
 		place "$VIRTIOFSD_SOURCE_BIN" virtiofsd
+		place_linux_guest "$guest_artifacts"
 		configure_chv_linux "${src}/packaging/asterism-nbd"
 	fi
 	if [ "$vz" = "1" ]; then
@@ -851,7 +943,12 @@ install_source() {
 		write_receipt "$ref" "source" source "" bin/ast bin/astd bin/astd-vz libexec/asterism/asterism-update
 	elif [ "$linux_helpers" = "1" ]; then
 		drop_stale_helper
-		write_receipt "$ref" "source" source "" bin/ast bin/astd bin/cloud-hypervisor bin/virtiofsd libexec/asterism/asterism-update
+		write_receipt "$ref" "source" source "" \
+			bin/ast bin/astd bin/cloud-hypervisor bin/virtiofsd \
+			libexec/asterism/asterism-update \
+			bin/guest-gpu/bin/asterism-gpu-guest \
+			bin/guest-gpu/lib/libcuda.so.1.0.0 \
+			bin/guest-gpu/lib/libcuda.so.1 bin/guest-gpu/lib/libcuda.so
 	else
 		drop_stale_helper
 		write_receipt "$ref" "source" source "" bin/ast bin/astd libexec/asterism/asterism-update
@@ -866,6 +963,25 @@ prepare_chv_source() {
 	# This is data from the checked-out tag/ref, not code from the network.
 	# shellcheck disable=SC1090,SC1091
 	. "${source_root}/packaging/linux-components.env"
+	# Building the pinned virtiofsd source needs only these two native
+	# development libraries. Install them before spending time compiling so
+	# the source lane either has its complete declared toolchain or refuses
+	# without leaving a half-built runtime.
+	if ! have pkg-config || ! pkg-config --exists libseccomp libcap-ng; then
+		if have apt-get; then
+			run_root apt-get update
+			run_root apt-get install -y pkg-config libseccomp-dev libcap-ng-dev
+		elif have dnf; then
+			run_root dnf install -y pkgconf-pkg-config libseccomp-devel libcap-ng-devel
+		elif have zypper; then
+			run_root zypper --non-interactive install pkg-config libseccomp-devel libcap-ng-devel
+		else
+			die "building the pinned virtiofsd needs pkg-config, libseccomp, and libcap-ng development files"
+		fi
+	fi
+	if ! have pkg-config || ! pkg-config --exists libseccomp libcap-ng; then
+		die "the package manager completed but virtiofsd's libseccomp/libcap-ng build inputs are unavailable"
+	fi
 	case "$(uname -m)" in
 	x86_64 | amd64)
 		chv_url="$CLOUD_HYPERVISOR_X86_64_URL"
@@ -897,6 +1013,28 @@ prepare_chv_source() {
 configure_chv_linux() {
 	nbd_helper_source="$1"
 	[ "$(uname -s)" = "Linux" ] || return 0
+
+	# The native container adapter preserves the uid/gid model carried by an
+	# OCI image. `--map-root-user` alone maps one ID and breaks as soon as a
+	# service switches to (for example) nginx uid 101. Install the standard
+	# subordinate-ID helpers and the remaining namespace tools together; the
+	# daemon probe still fails closed when this account has no /etc/subuid or
+	# /etc/subgid range.
+	if ! have newuidmap || ! have newgidmap || ! have slirp4netns || \
+	   ! have debugfs || ! have ip || ! have unshare; then
+		if have apt-get; then
+			run_root apt-get install -y uidmap slirp4netns e2fsprogs iproute2 util-linux
+		elif have dnf; then
+			run_root dnf install -y shadow-utils slirp4netns e2fsprogs iproute util-linux
+		elif have zypper; then
+			run_root zypper --non-interactive install shadow slirp4netns e2fsprogs iproute2 util-linux
+		else
+			die "native containers need uidmap, slirp4netns, e2fsprogs, iproute2 and util-linux; install them, then re-run."
+		fi
+	fi
+	for command in newuidmap newgidmap slirp4netns debugfs ip unshare; do
+		have "$command" || die "the package manager completed but ${command} is still unavailable"
+	done
 
 	# nbd-client is named nbd-client on Debian/Ubuntu and nbd on Fedora/RHEL.
 	# kmod provides modprobe on both families. Install only when the host does
@@ -938,19 +1076,12 @@ configure_chv_linux() {
 
 	# The daemon never gets general nbd-client access. It may invoke only this
 	# root-owned argument-checking wrapper, and only without an environment-
-	# supplied command path. One policy is installed for the invoking account.
+	# supplied command path.
 	nbd_helper="${SYSTEM_ROOT}/usr/local/libexec/asterism/asterism-nbd"
 	run_root install -d -m 0755 "$(dirname "$nbd_helper")"
 	run_root install -m 0755 "$nbd_helper_source" "$nbd_helper"
 	nbd_user="$(id -un)"
 	case "$nbd_user" in *[!A-Za-z0-9_.-]*) die "cannot safely write sudoers policy for account ${nbd_user}" ;; esac
-	sudoers="${TMPDIR_SELF}/asterism-nbd.sudoers"
-	printf '%s ALL=(root) NOPASSWD: %s\n' "$nbd_user" "$nbd_helper" >"$sudoers"
-	have visudo || die "visudo is required to validate Asterism's least-privilege NBD policy"
-	run_root visudo -cf "$sudoers"
-	run_root install -d -m 0750 "${SYSTEM_ROOT}/etc/sudoers.d"
-	run_root install -m 0440 "$sudoers" "${SYSTEM_ROOT}/etc/sudoers.d/asterism-nbd-$(id -u)"
-
 	if ! have setcap; then
 		if have apt-get; then
 			run_root apt-get install -y libcap2-bin
@@ -961,6 +1092,19 @@ configure_chv_linux() {
 		fi
 	fi
 	run_root setcap cap_net_admin+ep "${PREFIX}/bin/cloud-hypervisor"
+	setcap_bin=$(command -v setcap) || die "setcap disappeared while configuring Cloud Hypervisor"
+	sudoers="${TMPDIR_SELF}/asterism-nbd.sudoers"
+	printf '%s ALL=(root) NOPASSWD: %s\n' "$nbd_user" "$nbd_helper" >"$sudoers"
+	# The updater replaces the CHV inode transactionally, so Linux drops the
+	# file capability with the old inode. Permit only restoring this one
+	# capability on this one installed path; rollback itself restores the old
+	# capable inode from the transaction backup.
+	printf '%s ALL=(root) NOPASSWD: %s cap_net_admin+ep %s\n' \
+		"$nbd_user" "$setcap_bin" "${PREFIX}/bin/cloud-hypervisor" >>"$sudoers"
+	have visudo || die "visudo is required to validate Asterism's least-privilege NBD policy"
+	run_root visudo -cf "$sudoers"
+	run_root install -d -m 0750 "${SYSTEM_ROOT}/etc/sudoers.d"
+	run_root install -m 0440 "$sudoers" "${SYSTEM_ROOT}/etc/sudoers.d/asterism-nbd-$(id -u)"
 	if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
 		err "/dev/kvm is not read-write for this user. Add the user to the kvm group and log in again before starting an instance."
 	fi
@@ -994,24 +1138,6 @@ note_linger() {
 	fi
 	say "astd is a systemd --user unit. It dies at logout unless lingering is on:"
 	say "    loginctl enable-linger ${user}"
-}
-
-# Explicit compatibility installs may still use this helper. It is not called
-# by either Linux product install path.
-ensure_qemu_linux() {
-	if have qemu-system-x86_64 || have qemu-system-aarch64; then
-		return 0
-	fi
-	say "QEMU is missing, and Asterism needs it to run virtual machines."
-	if have apt-get; then
-		run_root apt-get install -y qemu-system qemu-utils
-	elif have dnf; then
-		run_root dnf install -y qemu-kvm qemu-img
-	else
-		err "This script only knows apt and dnf."
-		err "Install QEMU with your package manager, then re-run this script."
-		exit 1
-	fi
 }
 
 # ---- Homebrew --------------------------------------------------------------
@@ -1283,8 +1409,37 @@ uninstall() {
 
 # What the machine can actually run, said at install time rather than left
 # for `ast create --backend vz` to discover.
+verify_windows_authenticode() {
+	# Optional: a pinned thumbprint turns "unsigned" into a refusal. A
+	# Windows Git Bash install without Authenticode tools still checksums.
+	[ -n "${ASTERISM_AUTHENTICODE_THUMBPRINT:-}" ] || return 0
+	have powershell.exe || have pwsh || die "ASTERISM_AUTHENTICODE_THUMBPRINT is set but PowerShell is not on PATH."
+	ps=powershell.exe
+	have pwsh && ps=pwsh
+	for f in "$@"; do
+		[ -f "$f" ] || continue
+		status="$($ps -NoProfile -Command "try { (Get-AuthenticodeSignature -FilePath '$f').Status.ToString() } catch { 'Missing' }")"
+		thumb="$($ps -NoProfile -Command "try { (Get-AuthenticodeSignature -FilePath '$f').SignerCertificate.Thumbprint } catch { '' }")"
+		case "$status" in
+		Valid) ;;
+		*) die "${f} Authenticode status is ${status}, not Valid. Refusing to install." ;;
+		esac
+		want="$(printf '%s' "$ASTERISM_AUTHENTICODE_THUMBPRINT" | tr '[:upper:]' '[:lower:]')"
+		got="$(printf '%s' "$thumb" | tr '[:upper:]' '[:lower:]')"
+		[ "$want" = "$got" ] || die "${f} is signed by ${thumb}, not the pinned thumbprint."
+		say "authenticode ok: ${f}"
+	done
+}
+
 note_vz() {
 	# $1: 1 if a helper was installed
+	if is_windows_uname 2>/dev/null; then
+		say ""
+		say "Windows persistence is a Windows Service. After install:"
+		say "    ast doctor"
+		say "    ast service install"
+		return 0
+	fi
 	[ "$(uname -s)" = "Darwin" ] || return 0
 	if [ "$1" != "1" ]; then
 		say ""

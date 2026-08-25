@@ -28,7 +28,7 @@ use anyhow::{Context, Result};
 
 use asterism_core::durable;
 use asterism_core::hv::{GuestHealth, ImageKind, RunState, STOP_DEADLINE};
-use asterism_core::instance::{local_host, Instance, Policy, Restart, Status};
+use asterism_core::instance::{local_host, Instance, Policy, Restart, RuntimeKind, Status};
 use asterism_core::profile;
 use asterism_core::protocol::{Request, Response};
 use asterism_core::registry::{self, Shard};
@@ -108,29 +108,28 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             backend: requested,
             publish,
             profiles,
-        } => {
-            // `_recording` rather than plain `image_ref`: a local file is
-            // never adopted into the store, so the moment the user names it
-            // is the only chance to write down what it was.
-            backend::image_ref_recording(&image).and_then(|r| {
-                let requirements = backend::CreateRequirements::new(&r, &publish);
-                let machine = backend::select_for(requested.as_deref(), requirements)?;
-                // Resolved before the row exists, so a mistyped profile is a
-                // refusal rather than an instance that cannot boot. Nothing
-                // is applied here: profiles reach a guest through its seed.
-                check_profiles(&profiles)?;
-                reg.create(&name, cpu_device, &r.name, shape, machine)?;
-                if r.kind == ImageKind::OciRootfs {
-                    // A container that has finished is not a crash; see
-                    // `Policy::never`.
-                    reg.set_policy(&name, Policy::never())?;
-                }
-                if !profiles.is_empty() {
-                    reg.set_profiles(&name, profiles)?;
-                }
-                reg.set_source(&name, r.kind, publish)
-            })
-        }
+        } => create_instance(
+            reg,
+            cpu_device,
+            &name,
+            &image,
+            shape,
+            RuntimeKind::Vm,
+            requested,
+            publish,
+            profiles,
+        ),
+        Request::CreateRuntime {
+            name,
+            image,
+            shape,
+            runtime,
+            backend: requested,
+            publish,
+            profiles,
+        } => create_instance(
+            reg, cpu_device, &name, &image, shape, runtime, requested, publish, profiles,
+        ),
         // Recorded now, applied at the next boot. Saying so is the CLI's
         // job; refusing a name the catalog does not know is this one's.
         Request::SetProfiles { name, profiles } => reg
@@ -138,6 +137,8 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             .map(|_| ())
             .and_then(|_| check_profiles(&profiles))
             .and_then(|_| reg.set_profiles(&name, profiles)),
+        Request::AttachGpuResolved { name, attachment } => reg.attach_gpu(&name, attachment),
+        Request::DetachGpu { name } => reg.detach_gpu(&name).map(|(instance, _)| instance),
         // `--restart` is recorded before the boot, so an instance that comes
         // up and immediately dies is already carrying the policy the user
         // asked for when the supervisor looks at the corpse.
@@ -177,6 +178,22 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
                     return attach_response(Err(e).context(
                         "instance removal refused until every block-volume lease is released",
                     ));
+                }
+                // Native containers have no hypervisor-owned resources. Their
+                // cgroup, namespaces, slirp process and control socket are
+                // retired by `container::down`; asking the VM backend selector
+                // to clean them up turns a successful container shutdown into
+                // a spurious "no backend" refusal at `ast rm`.
+                if inst.runtime == RuntimeKind::Vm {
+                    if let Err(e) = backend::for_instance(&inst)
+                        .and_then(|hv| hv.remove_instance_resources(&inst))
+                    {
+                        return attach_response(
+                            Err(e).context(
+                                "instance removal refused until backend cleanup completes",
+                            ),
+                        );
+                    }
                 }
                 // The instance directory goes below, and this instance's CA
                 // private key is in it.
@@ -221,7 +238,10 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             // not, so the capability is checked before the registry moves.
             reg.get(&name)
                 .cloned()
-                .and_then(|inst| backend::check_can_share(&inst))
+                .and_then(|inst| match inst.runtime {
+                    RuntimeKind::Vm => backend::check_can_share(&inst),
+                    RuntimeKind::Container => Ok(()),
+                })
                 .and_then(|()| resolve_volume_path(&path, &host))
                 .and_then(|path| reg.attach_volume(&name, &path, &host, mount_point.as_deref()))
         }
@@ -234,6 +254,14 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             volume: vol,
             device,
         } => {
+            if reg
+                .get(&name)
+                .is_ok_and(|inst| inst.runtime == RuntimeKind::Container)
+            {
+                return attach_response(Err(anyhow::anyhow!(
+                    "block volumes are not supported by the native container adapter"
+                )));
+            }
             let provider_id = match volume::provider_identity(&device).await {
                 Ok(id) => id,
                 Err(e) => return attach_response(Err(e)),
@@ -252,9 +280,17 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             owner_device,
             max_latency_ms,
         } => {
+            if reg
+                .get(&name)
+                .is_ok_and(|inst| inst.runtime == RuntimeKind::Container)
+            {
+                return attach_response(Err(anyhow::anyhow!(
+                    "block volumes are not supported by the native container adapter"
+                )));
+            }
             return attach_response(
                 attach_storage(reg, &name, &vol, owner_device.as_deref(), max_latency_ms).await,
-            )
+            );
         }
         Request::Detach {
             name,
@@ -322,6 +358,11 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
                 },
             }
         }
+        Request::ContainerExec { .. } => {
+            return Response::Error {
+                message: "container exec reached the shard-locked dispatcher".into(),
+            };
+        }
         _ => return not_a_shard_request(),
     };
     match mutation {
@@ -340,6 +381,47 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             message: format!("{e:#}"),
         },
     }
+}
+
+// Mirrors the two versioned create frames field-for-field; grouping these
+// arguments would introduce a third protocol-shaped type with no new invariant.
+#[allow(clippy::too_many_arguments)]
+fn create_instance(
+    reg: &mut Shard,
+    cpu_device: &str,
+    name: &str,
+    image: &str,
+    shape: asterism_core::instance::Shape,
+    runtime: RuntimeKind,
+    requested: Option<String>,
+    publish: Vec<asterism_core::instance::PortForward>,
+    profiles: Vec<String>,
+) -> Result<Instance> {
+    let image = backend::image_ref_recording(image)?;
+    check_profiles(&profiles)?;
+    let machine = match runtime {
+        RuntimeKind::Vm => {
+            let requirements = backend::CreateRequirements::new(&image, &publish);
+            backend::select_for(requested.as_deref(), requirements)?
+        }
+        RuntimeKind::Container => {
+            if requested.is_some() {
+                anyhow::bail!("--backend selects a hypervisor and cannot be combined with --runtime container");
+            }
+            if image.kind != ImageKind::OciRootfs {
+                anyhow::bail!("runtime=container requires an OCI image reference");
+            }
+            crate::container::machine()?
+        }
+    };
+    reg.create_runtime(name, cpu_device, &image.name, shape, machine, runtime)?;
+    if image.kind == ImageKind::OciRootfs {
+        reg.set_policy(name, Policy::never())?;
+    }
+    if !profiles.is_empty() {
+        reg.set_profiles(name, profiles)?;
+    }
+    reg.set_source(name, image.kind, publish)
 }
 
 /// Attach owns its persistence boundary instead of falling through the
@@ -387,7 +469,7 @@ fn guest_health(handle: &asterism_core::hv::Handle) -> Option<GuestHealth> {
 /// What a request that no area of this daemon claims is told.
 ///
 /// Four families end up here, and each of them was already answered
-/// somewhere else: `ssh` and `set cpu` on the connection that asked, because
+/// somewhere else: `ssh` and `set compute` on the connection that asked, because
 /// they report as they go; the orbit views and the pairing frames in
 /// [`crate::dispatch`], because they are about the orbit rather than about a
 /// shard; the wake frames in [`crate::wake`] and `mesh::serve_stream`,
@@ -488,7 +570,7 @@ pub(crate) async fn claim_name(
 /// taken by definition, and claiming that would refuse every rename there is.
 fn claimed_name(req: &Request) -> Option<&str> {
     match req {
-        Request::Create { name, .. } => Some(name),
+        Request::Create { name, .. } | Request::CreateRuntime { name, .. } => Some(name),
         Request::Rename { new_name, .. } => Some(new_name),
         Request::BackupImport { name, .. } => Some(name),
         _ => None,
@@ -653,12 +735,16 @@ pub(crate) fn up(reg: &mut Shard, name: &str, restart: Option<Restart>) -> Resul
     *reg = fenced;
     let inst = reg.get(name)?.clone();
 
+    if inst.runtime == RuntimeKind::Container {
+        return up_container(reg, &inst, &boot_intent_id);
+    }
+
     // A cloud-init seed bakes in the guest key of the device that builds it,
     // so whoever builds one is whose key opens that guest from then on.
     // Normally that is settled at the first boot and never moves again; it
     // moves when the seed is rebuilt, which is why the stamp is compared
     // rather than assumed. `up` only ever runs on the device holding the row,
-    // so that device is this instance's own cpu device.
+    // so that device is this instance's own compute device.
     let stamp = paths::instance_dir(name).join("seed.stamp");
     let before = std::fs::read(&stamp).ok();
     let raised = match tokio::task::block_in_place(|| -> Result<_> {
@@ -856,6 +942,34 @@ fn kill_and_prove(
     }
 }
 
+fn up_container(reg: &mut Shard, inst: &Instance, boot_intent_id: &str) -> Result<Instance> {
+    let prepared = match crate::container::prepare(inst) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            compensate_boot(reg, inst, boot_intent_id)
+                .with_context(|| format!("preparing the native container failed ({error:#})"))?;
+            return Err(error);
+        }
+    };
+    let handle = crate::container::start(&prepared).with_context(|| {
+        format!("container launch outcome is ambiguous; durable boot intent {boot_intent_id} remains fenced")
+    })?;
+    let mut running = reg.clone();
+    let answer = running.set_running(&inst.name, handle.clone())?;
+    if let Err(error) = running.save_confirmed() {
+        if let Err(stop) = crate::container::stop(&handle, Duration::from_secs(5)) {
+            return Err(error).context(format!(
+                "committing the running container handle; shutdown is not proven and the durable launch fence remains: {stop:#}"
+            ));
+        }
+        compensate_boot(reg, inst, boot_intent_id)?;
+        return Err(error)
+            .context("committing the running container handle; container was stopped");
+    }
+    *reg = running;
+    Ok(answer)
+}
+
 fn down(reg: &mut Shard, name: &str) -> Result<Instance> {
     let inst = reg.get(name)?.clone();
     let Some(handle) = inst.handle.clone() else {
@@ -868,7 +982,11 @@ fn down(reg: &mut Shard, name: &str) -> Result<Instance> {
         // backend is always stopped by that same one — even if the
         // instance has since been redefined, or the device's default has
         // moved on since it booted.
-        backend::for_handle(&handle.backend)?.stop(&handle, STOP_DEADLINE)
+        if handle.container_control.is_some() {
+            crate::container::stop(&handle, STOP_DEADLINE)
+        } else {
+            backend::for_handle(&handle.backend)?.stop(&handle, STOP_DEADLINE)
+        }
     })?;
     reg.set_stopped(name)
 }
@@ -900,6 +1018,9 @@ pub(crate) fn reconcile(reg: &mut Shard) {
 /// "is it alive" means something different for each.
 fn is_running(inst: &Instance) -> bool {
     let Some(h) = &inst.handle else { return false };
+    if h.container_control.is_some() {
+        return !matches!(crate::container::state(h), Ok(RunState::Stopped));
+    }
     let Ok(hv) = backend::for_handle(&h.backend) else {
         return false;
     };
@@ -1710,6 +1831,7 @@ mod tests {
                 asterism_core::orbit::Orbit::load(&dir.join("orbit.json")).unwrap(),
             )),
             shell: crate::device_shell::Manager::load_at(dir),
+            gpu: crate::gpu::Manager::new(),
         }
     }
 

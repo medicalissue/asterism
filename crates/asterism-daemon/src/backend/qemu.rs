@@ -176,19 +176,30 @@ impl Qemu {
                     readonly: false,
                 })
             }
-            DiskFormat::Asif => bail!(
-                "{} is an ASIF image, which qemu cannot read — it is a \
-                 Virtualization.framework format (macOS 26+)",
-                base.name
-            ),
+            DiskFormat::Asif | DiskFormat::Vhdx => {
+                bail!(
+                    "{} is a native {} image, which qemu cannot read",
+                    base.name,
+                    base.format
+                )
+            }
         }
     }
 }
 
 impl Probe {
     fn run() -> Result<Self> {
-        let system = tool(&format!("qemu-system-{}", image::host_arch()))?;
-        let img = tool("qemu-img")?;
+        let install = if cfg!(target_os = "macos") {
+            "install the optional compatibility backend with `brew install qemu`"
+        } else {
+            "install the optional QEMU system package and qemu-img/qemu-utils"
+        };
+        let system = tool(&format!("qemu-system-{}", image::host_arch())).with_context(|| {
+            format!("the optional qemu compatibility backend is unavailable; {install}")
+        })?;
+        let img = tool("qemu-img").with_context(|| {
+            format!("the optional qemu compatibility backend is unavailable; {install}")
+        })?;
         // The binaries, then the accelerator: a host with no KVM cannot run
         // a guest at all, whatever else it has, and each of these is asked
         // of the host in its own right rather than standing in for another.
@@ -273,6 +284,7 @@ impl Hypervisor for Qemu {
             guest_egress: Some(GuestEgress::LoopbackGateway {
                 gateway: GUEST_GATEWAY,
             }),
+            guest_gpu_projection: false,
             // Raw first: it is what new instances get, and what a VZ host
             // would be able to boot. qcow2 stays readable for the instances
             // and the hand-supplied images that are already in it.
@@ -376,6 +388,7 @@ impl Hypervisor for Qemu {
                 (!req.shares.is_empty()).then_some(ShareKind::NinePfs),
                 &req.egress,
                 &req.bootstrap,
+                None,
             )?;
         }
 
@@ -1906,7 +1919,8 @@ mod tests {
             ctl: ControlChannel::Qmp {
                 path: "/tmp/x.sock".into(),
             },
-            endpoint: GuestEndpoint::HostForward { ssh_port: 22 },
+            endpoint: Some(GuestEndpoint::HostForward { ssh_port: 22 }),
+            container_control: None,
             started_at: 0,
         }
     }

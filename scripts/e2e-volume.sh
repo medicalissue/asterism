@@ -12,8 +12,9 @@
 # the provider's daemon is killed and the consumer says something honest.
 #
 # Nothing here is proved against a mock. The guest really formats the volume,
-# the bytes really cross a QUIC stream to another daemon's qemu-storage-daemon,
-# and the assertions are on output CONTENT the way scripts/e2e.sh does it.
+# the bytes really cross a QUIC stream to another daemon's native Rust NBD
+# exporter, and the assertions are on output CONTENT the way scripts/e2e.sh
+# does it. qemu-storage-daemon and qemu-system are not acceptance dependencies.
 #
 # ASTERISM_MESH=local keeps both endpoints on loopback: no relays, no discovery
 # service, no packet that leaves the machine.
@@ -28,7 +29,15 @@ cd "$ROOT"
 # lane once per hypervisor so the backend that users get by default is covered
 # as well as the one whose attachment order happens to differ.
 if [ -z "${E2E_VOLUME_BACKEND:-}" ]; then
-  for backend in qemu vz; do
+  case "$(uname -s)" in
+    Darwin) backends="vz" ;;
+    Linux) backends="chv" ;;
+    *) echo "VOLUME E2E FAIL: no native volume backend on $(uname -s)" >&2; exit 2 ;;
+  esac
+  # QEMU remains an optional consumer-compatibility check, never a fallback
+  # or prerequisite of the native VZ/Cloud Hypervisor acceptance lanes.
+  if [ "${E2E_VOLUME_QEMU_COMPAT:-0}" = 1 ]; then backends="$backends qemu"; fi
+  for backend in $backends; do
     echo "== volume e2e backend: $backend =="
     E2E_VOLUME_BACKEND="$backend" "$SCRIPT" "$@"
   done
@@ -36,9 +45,15 @@ if [ -z "${E2E_VOLUME_BACKEND:-}" ]; then
 fi
 BACKEND="$E2E_VOLUME_BACKEND"
 case "$BACKEND" in
-  qemu|vz) ;;
+  qemu|vz|chv) ;;
   *) echo "VOLUME E2E FAIL: unknown backend: $BACKEND" >&2; exit 2 ;;
 esac
+
+# Cloud Hypervisor consumes the publisher-verified qcow2 directly and, by
+# design, refuses to rewrite its metadata. The pinned Debian 13 cloud image is
+# exactly 3 GiB; raw-backed VZ/QEMU instances retain the suite's 10 GiB grow.
+ROOT_DISK_GIB=10
+[ "$BACKEND" = chv ] && ROOT_DISK_GIB=3
 
 # shellcheck source-path=SCRIPTDIR source=lib/harness.sh
 . "$ROOT/scripts/lib/harness.sh"
@@ -61,7 +76,7 @@ else
   SHORT_TMP=/tmp
 fi
 RUN="$SHORT_TMP/ast-vol-$$"
-A="$RUN/a"            # supplies cpu/ram: the guest runs here
+A="$RUN/a"            # supplies compute: the guest runs here
 B="$RUN/b"            # supplies the bytes: the volume lives here
 A_NAME="vol-a-$$"
 B_NAME="vol-b-$$"
@@ -71,20 +86,22 @@ VOL="tank"
 SHARED="$A/host-share"
 SHARED_GUEST="/workspace"
 IMAGE="${E2E_IMAGE:-debian:13}"
+ROOT_DISK_GIB="${E2E_DISK_GIB:-10}"
 # Five GiB leaves room for the filesystem and a real four-GiB payload.  The
 # transfer is intentionally non-sparse and goes through the guest's virtio
 # disk, the consumer bridge, QUIC, NBD, and the provider's raw image.
-VOLUME_GIB=5
+VOLUME_GIB="${E2E_VOLUME_GIB:-5}"
 VOLUME_BYTES=$((VOLUME_GIB * 1024 * 1024 * 1024))
-TRANSFER_BYTES=$((4 * 1024 * 1024 * 1024))
+TRANSFER_BYTES="${E2E_VOLUME_TRANSFER_BYTES:-$((4 * 1024 * 1024 * 1024))}"
 
 # ---- the processes this test starts ----------------------------------------
 #
 # Everything started here writes down its own pid inside its own
-# ASTERISM_HOME: astd in $home/astd.pid, each guest's qemu in
-# $home/instances/<name>/qemu.pid or VZ helper in vz.pid, each storage daemon in
-# $home/volumes/<name>/nbd-e<epoch>.pid. Those files are what cleanup acts
-# on, so it can only ever reach a process this run started.
+# ASTERISM_HOME: astd in $home/astd.pid, each guest in its backend-specific
+# $home/instances/<name>/{qemu,vz,chv}.pid, and a legacy storage helper in
+# $home/volumes/<name>/nbd-e<epoch>.pid. The native exporter lives inside the
+# provider astd and has no separate pidfile. Cleanup can therefore reach only
+# processes this run started.
 #
 # The alternative — `pkill -f` on the astd path — reaches every astd built
 # from this tree: the one the developer running this test has open on their
@@ -107,8 +124,13 @@ kill_pid() {
 # kill_pidfile <path>: whatever a pidfile names, and then the file.
 kill_pidfile() {
   local f="$1"
+  local pid
   [ -f "$f" ] || return 0
-  kill_pid "$(cat "$f" 2>/dev/null || true)"
+  # A native exporter may retire a legacy pidfile between glob expansion and
+  # this read. Cleanup is idempotent; that race is already-clean state.
+  if pid="$(cat "$f" 2>/dev/null)"; then
+    kill_pid "$pid"
+  fi
   rm -f "$f"
 }
 
@@ -133,7 +155,8 @@ cleanup() {
   done
   # Then what they left running. Both outlive astd by design.
   for home in "$A" "$B"; do
-    for f in "$home"/instances/*/qemu.pid "$home"/instances/*/vz.pid; do kill_pidfile "$f"; done
+    for f in "$home"/instances/*/qemu.pid "$home"/instances/*/vz.pid \
+      "$home"/instances/*/chv.pid; do kill_pidfile "$f"; done
     for f in "$home"/volumes/*/nbd-e*.pid; do kill_pidfile "$f"; done
     # Covers older backends whose only record was state.json. New VZ helpers
     # were stopped above through their daemon-independent vz.pid.
@@ -368,6 +391,15 @@ expect "provider-local administration remains available" "$VOL" \
 # From the harness's own cache, never ~/.asterism: that one belongs to the
 # user's daemon and may be written to while this is reading it.
 harness_cache_image "$AST" "$IMAGE" || fail "could not cache $IMAGE"
+if [ "$BACKEND" = chv ]; then
+  # CHV directly boots Asterism's separately verified guest kernel. Catalog
+  # cloud disks carry their own bootloader but do not populate that shared
+  # kernel store, while the OCI pull path does. Seed it explicitly so this
+  # standalone native-backend lane starts from an honestly fresh cache.
+  KERNEL_SEED_IMAGE="${E2E_CHV_KERNEL_IMAGE:-docker.io/library/busybox:musl}"
+  harness_cache_image "$AST" "$KERNEL_SEED_IMAGE" \
+    || fail "could not cache the CHV guest kernel via $KERNEL_SEED_IMAGE"
+fi
 harness_seed_images "$A"
 ASTERISM_HOME="$A" "$AST" pull "$IMAGE" >/dev/null 2>&1 \
   || fail "no $IMAGE image available for A (pull it once: ast pull $IMAGE)"
@@ -377,14 +409,16 @@ ASTERISM_HOME="$A" "$AST" pull "$IMAGE" >/dev/null 2>&1 \
 # block device on both backends.
 expect "create the instance on A ($BACKEND)" "$INST  defined" \
   env ASTERISM_HOME="$A" "$AST" create "$INST" --backend "$BACKEND" --image "$IMAGE" \
-    --mem 2G --disk 10G
+    --mem 2G --disk "${ROOT_DISK_GIB}G"
 
-mkdir -p "$SHARED"
-chmod 0777 "$SHARED"
-HOST_MARKER="host-directory-$BACKEND-$(date +%s)"
-printf '%s\n' "$HOST_MARKER" >"$SHARED/host-marker"
-expect "attach a same-device directory ($BACKEND)" "$SHARED_GUEST" \
-  env ASTERISM_HOME="$A" "$AST" attach "$INST" --volume "$SHARED" --at "$SHARED_GUEST"
+if [ "$BACKEND" != chv ]; then
+  mkdir -p "$SHARED"
+  chmod 0777 "$SHARED"
+  HOST_MARKER="host-directory-$BACKEND-$(date +%s)"
+  printf '%s\n' "$HOST_MARKER" >"$SHARED/host-marker"
+  expect "attach a same-device directory ($BACKEND)" "$SHARED_GUEST" \
+    env ASTERISM_HOME="$A" "$AST" attach "$INST" --volume "$SHARED" --at "$SHARED_GUEST"
+fi
 
 ATTACH=""
 ATTACHED=0
@@ -410,7 +444,7 @@ grep -qF "the guest gets a plain disk" <<<"$ATTACH" \
 echo "ok: attach records a disk after $ATTEMPT measured attempt(s) and says the guest must format it"
 
 # The lease is on B, taken at attach time, and it names the instance and the
-# device supplying that instance's cpu.
+# device supplying that instance's compute.
 [ "$(holder_now)" = "$INST" ] || fail "B does not think $INST holds the lease"
 E1="$(epoch_now)"
 [ "$E1" = "1" ] || fail "the first lease should be epoch 1, got $E1"
@@ -422,11 +456,12 @@ echo "ok: the lease is on B at epoch 1, naming $INST on $A_NAME"
 # The export is a unix socket under the volume's own directory, and there is
 # no TCP port anywhere near it. That is the whole security posture.
 [ -S "$B/volumes/$VOL/nbd-e1.sock" ] || fail "no export socket for epoch 1"
-QSD_PID="$(cat "$B/volumes/$VOL/nbd-e1.pid")"
-kill -0 "$QSD_PID" || fail "the storage daemon for epoch 1 is not running"
-LISTENING="$( { lsof -a -p "$QSD_PID" -iTCP -sTCP:LISTEN -t 2>/dev/null || true; } | wc -l | tr -d ' ')"
-[ "$LISTENING" = "0" ] || fail "qemu-storage-daemon is listening on $LISTENING TCP port(s)"
-echo "ok: the export is a unix socket and the storage daemon holds no TCP port"
+[ ! -e "$B/volumes/$VOL/nbd-e1.pid" ] \
+  || fail "the native exporter unexpectedly created a child-process pidfile"
+B_PID="$(cat "$B/astd.pid")"
+LISTENING="$( { lsof -a -p "$B_PID" -iTCP -sTCP:LISTEN -t 2>/dev/null || true; } | wc -l | tr -d ' ')"
+[ "$LISTENING" = "0" ] || fail "the native exporter opened $LISTENING TCP listener(s)"
+echo "ok: the native export is only a private unix socket, with no child process or TCP listener"
 
 # ast status renders it as a part, sourced from the device with the bytes.
 PARTS="$(ASTERISM_HOME="$A" "$AST" status "$INST" 2>&1)"
@@ -455,16 +490,18 @@ grep -qE "nbd over the mesh .* healthy .* direct .* [0-9]+\.[0-9]ms RTT .* conne
   || fail "the live volume has no measured path and initial transition:"$'\n'"$PARTS"
 echo "ok: status exposes the live volume's path, RTT and initial transition"
 
-SHARED_READ="$(in_guest "cat $SHARED_GUEST/host-marker")" \
-  || fail "the guest could not read its same-device directory:"$'\n'"$SHARED_READ"
-grep -qF "$HOST_MARKER" <<<"$SHARED_READ" \
-  || fail "the host marker did not reach the guest:"$'\n'"$SHARED_READ"
-GUEST_MARKER="guest-directory-$BACKEND-$(date +%s)"
-in_guest "echo '$GUEST_MARKER' > $SHARED_GUEST/guest-marker && sync" >/dev/null \
-  || fail "the guest could not write its same-device directory"
-grep -qF "$GUEST_MARKER" "$SHARED/guest-marker" \
-  || fail "the guest's directory write did not reach the host"
-echo "ok: the guest and host see the same writable directory through $BACKEND"
+if [ "$BACKEND" != chv ]; then
+  SHARED_READ="$(in_guest "cat $SHARED_GUEST/host-marker")" \
+    || fail "the guest could not read its same-device directory:"$'\n'"$SHARED_READ"
+  grep -qF "$HOST_MARKER" <<<"$SHARED_READ" \
+    || fail "the host marker did not reach the guest:"$'\n'"$SHARED_READ"
+  GUEST_MARKER="guest-directory-$BACKEND-$(date +%s)"
+  in_guest "echo '$GUEST_MARKER' > $SHARED_GUEST/guest-marker && sync" >/dev/null \
+    || fail "the guest could not write its same-device directory"
+  grep -qF "$GUEST_MARKER" "$SHARED/guest-marker" \
+    || fail "the guest's directory write did not reach the host"
+  echo "ok: the guest and host see the same writable directory through $BACKEND"
+fi
 
 # Booting renews the lease at a higher epoch, and the old export is revoked.
 E2="$(epoch_now)"
@@ -472,12 +509,11 @@ E2="$(epoch_now)"
 [ ! -e "$B/volumes/$VOL/nbd-e1.sock" ] \
   || fail "the epoch-1 export socket outlived the lease it belonged to"
 [ -S "$B/volumes/$VOL/nbd-e2.sock" ] || fail "no export socket for epoch 2"
-kill -0 "$QSD_PID" 2>/dev/null \
-  && fail "the epoch-1 storage daemon is still running after the epoch bump"
-echo "ok: the boot renewed the lease to epoch 2 and revoked epoch 1's export"
+kill -0 "$B_PID" 2>/dev/null || fail "revoking one epoch killed the provider daemon"
+echo "ok: the boot renewed the lease to epoch 2 and disconnected epoch 1 without killing astd"
 
-# The bridge is a unix socket on A, next to the instance. QEMU connects to
-# that; it has no idea there is another machine behind it.
+# The bridge is a unix socket on A, next to the instance. The selected native
+# hypervisor connects to that; it has no idea there is another machine behind it.
 BRIDGE="$A/instances/$INST/vol-$B_NAME-$VOL.sock"
 [ -S "$BRIDGE" ] || fail "no bridge socket at $BRIDGE"
 A_PID="$(cat "$A/astd.pid")"
@@ -601,8 +637,10 @@ SURVIVED="$(in_guest "sudo mkdir -p /data && sudo mount $VOLUME_DEV /data && cat
 grep -qF "$MARKER" <<<"$SURVIVED" \
   || fail "the marker did not survive the reboot:"$'\n'"$SURVIVED"
 echo "ok: the filesystem and the marker survived down/up (now epoch $E3)"
-expect "the directory mount survives down/up too" "$HOST_MARKER" \
-  in_guest "cat $SHARED_GUEST/host-marker"
+if [ "$BACKEND" != chv ]; then
+  expect "the directory mount survives down/up too" "$HOST_MARKER" \
+    in_guest "cat $SHARED_GUEST/host-marker"
+fi
 
 # ---- 6. one writer, and the refusal names who has it -----------------------
 
@@ -614,7 +652,7 @@ expect "a second instance exists" "$OTHER  defined" \
 refute "a second instance cannot take a held volume" \
   "volume \"$VOL\" is held by instance \"$INST\"" \
   env ASTERISM_HOME="$A" "$AST" attach "$OTHER" --volume "$VOL"
-refute "and the refusal says which device is writing to it" "cpu/ram on $A_NAME" \
+refute "and the refusal says which device is writing to it" "compute on $A_NAME" \
   env ASTERISM_HOME="$A" "$AST" attach "$OTHER" --volume "$VOL"
 refute "and how to end it" "ast detach $INST --volume $VOL" \
   env ASTERISM_HOME="$A" "$AST" attach "$OTHER" --volume "$VOL"
@@ -706,41 +744,41 @@ expect "detach from the second instance" "$VOL detached" \
 expect "and back to the first" "a disk in the guest" \
   env ASTERISM_HOME="$A" "$AST" attach "$INST" --volume "$B_NAME:$VOL"
 
-# ---- 7b. cpu placement moves while storage ownership does not ---------------
+# ---- 7b. compute placement moves while storage ownership does not -----------
 #
 # The instance is stopped and both device endpoints still carry their paired
-# paths. Move cpu/ram onto the storage owner and back; each boot renews the
-# lease for the new cpu device while the part's owner never changes.
+# paths. Move compute onto the storage owner and back; each boot renews the
+# lease for the new compute device while the part's owner never changes.
 
-ASTERISM_HOME="$A" "$AST" move "$INST" "$B_NAME" >"$RUN/move-to-provider.out" 2>&1 \
-  || fail "moving cpu to the storage provider failed:"$'\n'"$(cat "$RUN/move-to-provider.out")"
+ASTERISM_HOME="$A" "$AST" set "$INST" compute "$B_NAME" >"$RUN/move-to-provider.out" 2>&1 \
+  || fail "moving compute to the storage provider failed:"$'\n'"$(cat "$RUN/move-to-provider.out")"
 expect "the moved instance boots with provider-local storage" "$INST  running" \
   env ASTERISM_HOME="$A" "$AST" up "$INST"
 [ "$(holder_device_now)" = "$B_NAME" ] \
-  || fail "the renewed lease did not follow cpu placement to $B_NAME"
+  || fail "the renewed lease did not follow compute placement to $B_NAME"
 VOLUME_DEV="$(find_volume_device)"
-expect "the volume bytes survive cpu placement on their owner" "$MARKER" \
+expect "the volume bytes survive compute placement on their owner" "$MARKER" \
   in_guest "sudo mkdir -p /data && sudo mount $VOLUME_DEV /data && cat /data/marker"
 
-expect "stop before moving cpu back" "$INST  stopped" \
+expect "stop before moving compute back" "$INST  stopped" \
   env ASTERISM_HOME="$A" "$AST" down "$INST"
-ASTERISM_HOME="$A" "$AST" move "$INST" "$A_NAME" >"$RUN/move-back.out" 2>&1 \
-  || fail "moving cpu back from the provider failed:"$'\n'"$(cat "$RUN/move-back.out")"
+ASTERISM_HOME="$A" "$AST" set "$INST" compute "$A_NAME" >"$RUN/move-back.out" 2>&1 \
+  || fail "moving compute back from the provider failed:"$'\n'"$(cat "$RUN/move-back.out")"
 expect "the instance boots after storage becomes remote again" "$INST  running" \
   env ASTERISM_HOME="$A" "$AST" up "$INST"
 [ "$(holder_device_now)" = "$A_NAME" ] \
-  || fail "the renewed lease did not follow cpu placement back to $A_NAME"
+  || fail "the renewed lease did not follow compute placement back to $A_NAME"
 VOLUME_DEV="$(find_volume_device)"
 expect "the guest still sees one local disk contract after both moves" "$MARKER" \
   in_guest "sudo mkdir -p /data && sudo mount $VOLUME_DEV /data && cat /data/marker"
-echo "ok: cpu moved to the storage owner and back; ownership stayed on B and the guest contract stayed local"
+echo "ok: compute moved to the storage owner and back; ownership stayed on B and the guest contract stayed local"
 
-# ---- 8. the export dies under a running guest, and comes back --------------
+# ---- 8. the provider restarts under a running guest, and comes back --------
 #
-# The storage daemon is a process, and processes die. QEMU is told to keep
-# retrying for a minute rather than fail the guest's I/O, and the next
-# reconnection finds the provider restarting the export at the *same* epoch —
-# same epoch because nothing about who may write has changed.
+# The exporter is intentionally part of astd, so provider restart is the
+# recovery boundary. The native VZ/CHV consumer keeps retrying, and the next
+# authenticated reconnection starts the export at the *same* epoch — same
+# epoch because nothing about who may write has changed.
 
 expect "the moved-back instance is still running" "status:  running" \
   env ASTERISM_HOME="$A" "$AST" status "$INST"
@@ -749,9 +787,12 @@ MOUNTED="$(in_guest "cat /data/marker")" \
   || fail "the guest could not mount its volume:"$'\n'"$MOUNTED"
 grep -qF "$MARKER" <<<"$MOUNTED" || fail "the marker is gone:"$'\n'"$MOUNTED"
 
-QSD_OLD="$(cat "$B/volumes/$VOL/nbd-e$E5.pid")"
-kill -KILL "$QSD_OLD"
-echo "ok: killed the storage daemon serving epoch $E5 under a live guest"
+EXPORT_INO="$(inode_of "$B/volumes/$VOL/nbd-e$E5.sock")"
+B_PID_OLD="$(cat "$B/astd.pid")"
+restart_daemon "$B"
+B_PID_NEW="$(cat "$B/astd.pid")"
+[ "$B_PID_NEW" != "$B_PID_OLD" ] || fail "the provider daemon did not restart"
+echo "ok: restarted the provider daemon serving epoch $E5 under a live guest"
 
 MARKER2="survived-a-dead-export-$(date +%s)"
 RECOVER="$(in_guest "echo '$MARKER2' | sudo tee /data/marker2 >/dev/null && sync && \
@@ -760,11 +801,14 @@ RECOVER="$(in_guest "echo '$MARKER2' | sudo tee /data/marker2 >/dev/null && sync
   || fail "the guest lost its disk when the export died:"$'\n'"$RECOVER"
 grep -qF "$MARKER" <<<"$RECOVER" || fail "the old marker is gone:"$'\n'"$RECOVER"
 grep -qF "$MARKER2" <<<"$RECOVER" || fail "the new marker did not stick:"$'\n'"$RECOVER"
-QSD_NEW="$(cat "$B/volumes/$VOL/nbd-e$E5.pid")"
-[ "$QSD_NEW" != "$QSD_OLD" ] || fail "the export was never restarted"
+[ -S "$B/volumes/$VOL/nbd-e$E5.sock" ] || fail "the provider did not restore its export socket"
+[ "$(inode_of "$B/volumes/$VOL/nbd-e$E5.sock")" != "$EXPORT_INO" ] \
+  || fail "the provider restart left the old export socket inode in place"
+[ ! -e "$B/volumes/$VOL/nbd-e$E5.pid" ] \
+  || fail "the restarted native exporter created a child-process pidfile"
 [ "$(epoch_now)" = "$E5" ] \
   || fail "restarting a dead export moved the epoch, which would fence the holder"
-echo "ok: the export was restarted at the same epoch and the guest never noticed"
+echo "ok: the provider restored its native export at the same epoch and the guest never noticed"
 
 PARTS="$(ASTERISM_HOME="$A" "$AST" status "$INST" 2>&1)"
 grep -qE "healthy .* direct .* [0-9]+\.[0-9]ms RTT .* MiB/s .* reconnected \(provider_returned\) .* recovery [0-9]+ms" <<<"$PARTS" \
@@ -785,7 +829,7 @@ echo "ok: status exposes provider recovery duration and current-session bridge t
 # failing the guest's I/O for real.
 #
 # So the next astd puts the bridges back. Not by leasing again: the running
-# QEMU has one export name on its command line, and a fresh lease would bump
+# the hypervisor has one export name in its boot configuration, and a fresh lease would bump
 # the epoch and rename that door out from under a guest doing nothing wrong.
 # It reconnects at the epoch it already holds.
 

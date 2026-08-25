@@ -27,27 +27,26 @@
 //! to, and "downloaded successfully" is not a check.
 //!
 //! **Catalog pulls keep the publisher-verified qcow2.** Cloud images ship as
-//! qcow2; a pull downloads one, adopts it, and stops. Cloud Hypervisor (and
-//! QEMU) read that file directly, so a Linux host never needs `qemu-img` to
-//! finish a pull. Raw-only backends still convert lazily on first use
+//! qcow2; a pull downloads one, adopts it, and stops. Raw-only native
+//! backends materialize it in pure Rust on first use; QEMU can read the
+//! verified source directly. No host needs `qemu-img` to finish a pull
 //! ([`Resolved::materialise`]): `<slug>.qcow2` is the verified source,
-//! `<slug>.raw` is the derivative. Conversion failure never deletes the
-//! verified source.
+//! `<slug>.raw` is the derivative. Native VZ and Cloud Hypervisor use this
+//! path; the read-only Rust materializer means neither needs QEMU installed.
+//! Conversion failure never deletes the verified source.
 //!
 //! Nothing is converted eagerly on upgrade: a store left full of qcow2 by an
 //! older Asterism keeps working, and each image is converted the first time
 //! a raw-only backend needs it.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use crate::hv::{DiskFormat, ImageKind};
 use crate::oci;
 use crate::paths;
-use crate::tools::{run, tool};
 use crate::verify::{self, Depth, Digest, Pinned, Source};
 
 /// The largest number of progress observations a pull result may carry.
@@ -347,7 +346,8 @@ impl Resolved {
     /// boot the verified staging file as it is.
     ///
     /// Conversion is lazy: pull never calls this, so a fresh catalog image
-    /// does not need `qemu-img`. Failure never deletes the verified source.
+    /// does not need an external converter. Failure never deletes the
+    /// verified source.
     ///
     /// Returns whether it converted anything, so a foreground caller can
     /// say so and a background one can stay quiet.
@@ -371,7 +371,7 @@ impl Resolved {
 
         // What the download was, before it is turned into something else.
         // A converted image has no upstream digest of its own — nobody
-        // publishes the raw that `qemu-img` will produce — so the only
+        // publishes the raw that the materializer will produce — so the only
         // honest answer to "where did these bytes come from" is the digest
         // of the ones they were converted out of, recorded here and carried
         // on the raw image's record for as long as it exists.
@@ -413,6 +413,18 @@ impl Resolved {
             let _ = std::fs::remove_file(&part);
             return Err(error);
         }
+        // Preflight makes malformed metadata fail before `part` is created,
+        // but the source is still an ordinary file that another process can
+        // replace while conversion runs. Rechecking its content address here
+        // prevents a raced source from acquiring the digest of the bytes that
+        // were present before conversion started.
+        if let Err(error) = parent
+            .verify_file(staging, &format!("the download for {}", self.name))
+            .context("the qcow2 source changed while it was being materialized")
+        {
+            let _ = std::fs::remove_file(&part);
+            return Err(error);
+        }
         if let Err(error) = verify::adopt(&part, &self.path, None, source) {
             let _ = std::fs::remove_file(&part);
             return Err(error);
@@ -428,30 +440,19 @@ impl Resolved {
     }
 }
 
-/// `qemu-img convert` into a sparse raw file at a staged name, which the
-/// caller then adopts — so an interrupted convert cannot be mistaken for a
-/// finished image, and a finished one arrives with a provenance record.
-///
-/// The convert runs in a subprocess, so its bytes are only as durable as the
-/// page cache when `qemu-img` exits. Forcing them down is [`verify::adopt`]'s
-/// job rather than this function's, because the same flush has to happen
-/// after the hash and before the rename, and that whole ordering lives in
-/// one place.
-///
-/// `-S 4k` is what keeps it sparse: a 20 GiB raw disk converted from a
-/// 400 MiB qcow2 occupies ~1 GiB of APFS blocks, not 20 GiB.
-///
-/// A pure-Rust qcow2 reader would remove the last QEMU dependency from this
-/// path (BACKENDS.md §4, LICENSING.md); until then this is the one place a
-/// raw-only backend still needs `qemu-img`, and it runs once per image on
-/// first use. qcow2-capable backends never take this path.
+/// Turn one staged disk into sparse raw at a staged name. Raw input is copied
+/// as-is; qcow2 v2/v3 is read in-process, after a complete metadata preflight.
+/// The caller adopts the result, which supplies hashing, durability and the
+/// atomic rename shared by every image-store producer.
 fn convert_to_raw(src: &Path, from: DiskFormat, part: &Path) -> Result<()> {
     let _ = std::fs::remove_file(part);
-    run(Command::new(tool("qemu-img")?)
-        .args(["convert", "-f", from.as_str(), "-O", "raw", "-S", "4k"])
-        .arg(src)
-        .arg(part))?;
-    Ok(())
+    match from {
+        DiskFormat::Qcow2 => crate::qcow2::materialize(src, part),
+        DiskFormat::Raw => crate::cow::copy_sparse(src, part)
+            .with_context(|| format!("copying raw image {}", src.display())),
+        DiskFormat::Asif => bail!("ASIF images cannot be materialized as raw"),
+        DiskFormat::Vhdx => bail!("VHDX images cannot be materialized as raw"),
+    }
 }
 
 /// What a file on disk actually is, from its first four bytes.
@@ -851,9 +852,9 @@ pub fn pull(reference: &str) -> Result<ImagePullResult> {
         push_progress(&mut progress, "verified", file_len(staging)?, None, false);
     }
 
-    // Publisher-verified qcow2 is the pulled artifact. Raw-only backends
-    // convert lazily later; a missing qemu-img must not fail a fresh pull
-    // and must not delete the verified source.
+    // Publisher-verified qcow2 is the pulled artifact. Native raw-only
+    // backends materialize it lazily later; pull itself never needs a VMM or
+    // converter package and never deletes the verified source.
     resolved.verify_bootable()?;
     let (path, _) = resolved.boot_path()?;
     let bytes = file_len(path)?;
@@ -1459,6 +1460,64 @@ mod tests {
         assert_eq!(overridden.expected.unwrap().to_string(), mine);
     }
 
+    /// Slow release evidence, kept out of the ordinary hermetic unit suite.
+    /// This downloads the exact two primary catalog artifacts for the host,
+    /// checks their publisher digests, and compares every raw byte with the
+    /// transitional reference converter.
+    #[test]
+    #[ignore = "downloads current catalog images; run scripts/qcow2-catalog-gate.sh"]
+    fn current_catalog_images_match_qemu_reference() {
+        use std::io::{Read, Write};
+
+        for reference in ["ubuntu:24.04", "debian:13"] {
+            let resolved = resolve(reference).unwrap();
+            let url = resolved.url.as_deref().unwrap();
+            let expected = resolved.expected.as_ref().unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("source.qcow2");
+            let native = dir.path().join("native.raw");
+            let qemu = dir.path().join("qemu.raw");
+
+            download(url, &source).unwrap();
+            expected.verify_file(&source, reference).unwrap();
+            crate::qcow2::materialize(&source, &native).unwrap();
+            let status = Command::new("qemu-img")
+                .args(["convert", "-f", "qcow2", "-O", "raw", "-S", "4k"])
+                .arg(&source)
+                .arg(&qemu)
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "qemu-img reference failed for {reference}"
+            );
+
+            let mut native_file = std::fs::File::open(&native).unwrap();
+            let mut qemu_file = std::fs::File::open(&qemu).unwrap();
+            assert_eq!(
+                native_file.metadata().unwrap().len(),
+                qemu_file.metadata().unwrap().len(),
+                "virtual size differs for {reference}"
+            );
+            let mut native_bytes = vec![0; 1024 * 1024];
+            let mut qemu_bytes = vec![0; 1024 * 1024];
+            loop {
+                let read = native_file.read(&mut native_bytes).unwrap();
+                qemu_file.read_exact(&mut qemu_bytes[..read]).unwrap();
+                assert_eq!(
+                    native_bytes[..read],
+                    qemu_bytes[..read],
+                    "raw bytes differ for {reference}"
+                );
+                if read == 0 {
+                    break;
+                }
+            }
+            std::io::stdout().flush().unwrap();
+            eprintln!("catalog reference green: {reference} ({expected})");
+        }
+    }
+
     /// A converted image is bytes nobody upstream ever published, so what
     /// makes it accountable is the digest of what it came out of. Raw bytes
     /// under the qcow2 name keep this free of `qemu-img`.
@@ -1740,7 +1799,7 @@ mod tests {
         assert!(text.contains("ast pull"), "{text}");
     }
 
-    /// What `ast move` leaves behind when it fetches a base image off an
+    /// What a compute move leaves behind when it fetches a base image off an
     /// orbit peer instead of the internet, and what the instance it moved
     /// needs in order to boot from it.
     ///
@@ -1938,7 +1997,7 @@ mod tests {
         assert!(!r.materialise().unwrap(), "and again is a no-op");
     }
 
-    /// qemu-img missing, a broken convert, or a digest mismatch must all
+    /// A malformed image, a broken conversion, or a digest mismatch must all
     /// leave the publisher-verified qcow2 on disk.
     #[test]
     fn conversion_failure_keeps_the_verified_source() {
@@ -1950,10 +2009,7 @@ mod tests {
         let err = r.materialise().unwrap_err();
         let text = format!("{err:#}");
         assert!(
-            text.contains("qemu-img")
-                || text.contains("not found")
-                || text.contains("converting")
-                || text.contains("failed"),
+            text.contains("qcow2") || text.contains("converting") || text.contains("failed"),
             "conversion of a stub qcow2 must fail closed: {text}"
         );
         assert!(!r.path.exists(), "no raw derivative was adopted");
@@ -1961,6 +2017,10 @@ mod tests {
         assert!(
             provenance.exists(),
             "and so is the record that makes it bootable"
+        );
+        assert!(
+            !r.path.with_extension("raw.part").exists(),
+            "a failed materialization leaves no crash-recovery staging file"
         );
         assert_eq!(std::fs::read(&staging).unwrap(), bytes);
         r.verify_bootable().unwrap();

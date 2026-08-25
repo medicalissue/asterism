@@ -24,9 +24,10 @@
 //! alongside the `ring` this tree already builds — and the provider it uses is
 //! the one [`init`] installs.
 //!
-//! The operational cost is one idle `TcpListener` on loopback per *bound*
-//! instance, one keypair generated once per instance, and one leaf certificate
-//! per bound authority held in memory for the life of the proxy.
+//! The operational cost is one idle listener per *bound* instance (TCP
+//! loopback for a VM, a private Unix socket for a container), one keypair
+//! generated once per instance, and one leaf certificate per bound authority
+//! held in memory for the life of the proxy.
 //!
 //! What is left — and it is the whole of what Asterism owns here — is: which
 //! authority a secret may be used against, which opaque handle stands in for
@@ -77,12 +78,15 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(target_os = "linux")]
+use tokio::net::UnixListener;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use zeroize::Zeroizing;
 
 use asterism_core::hv::GuestEgress;
-use asterism_core::instance::Instance;
+use asterism_core::instance::{Instance, RuntimeKind};
 use asterism_core::protocol::{EgressRequest, EgressResponse, Response};
 use asterism_core::rewrite::{
     self, Allowlist, Decision, Refusal, MAX_BODY_BYTES, MAX_HEADERS, MAX_RESPONSE_BYTES,
@@ -103,6 +107,13 @@ const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long a guest may take to get from a CONNECT to a request. Short: the
 /// TLS handshake and one request head is all that happens in here.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The proxy port inside each rootless container network namespace.
+///
+/// The host side is a per-instance Unix socket, not this TCP port. Keeping the
+/// TCP listener inside the namespace means `--disable-host-loopback` can stay
+/// enabled without making secret egress unreachable.
+pub(crate) const CONTAINER_EGRESS_PORT: u16 = 38123;
 
 /// A pinned future, so [`Source`] can be a trait object without pulling in a
 /// proc macro for one boundary.
@@ -193,6 +204,9 @@ struct Proxy {
     /// The accept loop. Dropping the plane's entry aborts it, which is what
     /// makes revoking a binding take effect without waiting for a reboot.
     task: tokio::task::JoinHandle<()>,
+    /// A container proxy's host endpoint. It is the only host object mounted
+    /// into the namespace, and removing it makes a stopped proxy unreachable.
+    transport: Option<PathBuf>,
 }
 
 impl Drop for Proxy {
@@ -202,6 +216,9 @@ impl Drop for Proxy {
         // further connection being accepted at all.
         self.revoked.store(true, Ordering::SeqCst);
         self.task.abort();
+        if let Some(path) = &self.transport {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -249,10 +266,16 @@ pub(crate) fn orbit() -> Result<(Node, Option<Arc<Mesh>>)> {
 ///   on their LAN. See [`GuestEgress`].
 ///
 /// There is deliberately no check that this is the device supplying the
-/// instance's cpu part. Reaching here means this device holds the row, which
+/// instance's compute. Reaching here means this device holds the row, which
 /// is the same fact — and writing it down a second time would mean comparing
 /// an orbit name against a hostname, which are not the same string.
 pub(crate) fn check_can_bind(inst: &Instance) -> Result<()> {
+    // A rootless container gets one namespace-local TCP bridge to its own
+    // read-only mounted Unix proxy. slirp host-loopback remains disabled, so
+    // no unrelated listener on this device becomes reachable with it.
+    if inst.runtime == RuntimeKind::Container {
+        return Ok(());
+    }
     let hv = backend::for_instance(inst)?;
     // Only a backend we could actually ask is allowed to refuse: on a device
     // where the hypervisor is not installed yet, `caps()` knows nothing, and
@@ -274,6 +297,11 @@ pub(crate) fn check_can_bind(inst: &Instance) -> Result<()> {
 
 /// Where the guest reaches this device, according to its backend.
 fn gateway(inst: &Instance) -> Result<&'static str> {
+    if inst.runtime == RuntimeKind::Container {
+        // The namespace helper owns this listener and forwards only to this
+        // instance's mounted Unix proxy. slirp's host gateway remains blocked.
+        return Ok("127.0.0.1");
+    }
     let hv = backend::for_instance(inst)?;
     match hv.caps().guest_egress {
         Some(GuestEgress::LoopbackGateway { gateway }) => Ok(gateway),
@@ -367,20 +395,6 @@ fn ensure_running(inst: &Instance) -> Result<(u16, String)> {
     let authority = Authority::load_or_create(&egress_dir(&inst.name), &inst.name)?;
     let ca_pem = authority.ca_pem.clone();
 
-    // Loopback only, and that is the whole security argument for this
-    // listener: QEMU's user-net proxies a guest's connection to `10.0.2.2:p`
-    // onto this device's `127.0.0.1:p`, so binding loopback is reachable from
-    // the guest and from nothing on the wire. The same door `ast create -p`
-    // and `ast ssh` already use.
-    let preferred = stable_port(&inst.name);
-    let (listener, port) = bind_loopback(preferred)?;
-    if preferred != Some(port) {
-        // Remembered so that a reboot does not move the proxy out from under
-        // a guest whose seed named a port — and if it has moved, the seed's
-        // fingerprint changes and the guest is told.
-        let _ = std::fs::write(port_path(&inst.name), port.to_string());
-    }
-
     let revoked = Arc::new(AtomicBool::new(false));
     let ctx = Arc::new(ProxyCtx {
         instance: inst.name.clone(),
@@ -392,7 +406,35 @@ fn ensure_running(inst: &Instance) -> Result<(u16, String)> {
         }),
         revoked: revoked.clone(),
     });
-    let task = tokio::runtime::Handle::current().spawn(accept_loop(listener, ctx));
+    let (port, task, transport) = if inst.runtime == RuntimeKind::Container {
+        #[cfg(target_os = "linux")]
+        {
+            let socket = container_transport_dir(&inst.name).join("proxy.sock");
+            std::fs::create_dir_all(socket.parent().expect("container transport parent"))?;
+            let _ = std::fs::remove_file(&socket);
+            let listener = UnixListener::bind(&socket)
+                .with_context(|| format!("binding container egress at {}", socket.display()))?;
+            (
+                CONTAINER_EGRESS_PORT,
+                tokio::runtime::Handle::current().spawn(accept_unix_loop(listener, ctx)),
+                Some(socket),
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        bail!("native-container secret egress is only available on Linux")
+    } else {
+        // VM user-mode networking maps its private gateway to host loopback.
+        let preferred = stable_port(&inst.name);
+        let (listener, port) = bind_loopback(preferred)?;
+        if preferred != Some(port) {
+            let _ = std::fs::write(port_path(&inst.name), port.to_string());
+        }
+        (
+            port,
+            tokio::runtime::Handle::current().spawn(accept_loop(listener, ctx)),
+            None,
+        )
+    };
     running.insert(
         inst.name.clone(),
         Proxy {
@@ -400,6 +442,7 @@ fn ensure_running(inst: &Instance) -> Result<(u16, String)> {
             ca_pem: ca_pem.clone(),
             task,
             revoked,
+            transport,
         },
     );
     Ok((port, ca_pem))
@@ -407,6 +450,12 @@ fn ensure_running(inst: &Instance) -> Result<(u16, String)> {
 
 fn egress_dir(instance: &str) -> PathBuf {
     paths::instance_dir(instance).join("egress")
+}
+
+/// Directory mounted read-only into a rootless container. It contains only
+/// the proxy socket: CA keys and every other egress artifact stay outside it.
+pub(crate) fn container_transport_dir(instance: &str) -> PathBuf {
+    egress_dir(instance).join("container-transport")
 }
 
 fn port_path(instance: &str) -> PathBuf {
@@ -469,27 +518,38 @@ async fn accept_loop(listener: TcpListener, ctx: Arc<ProxyCtx>) {
         let Ok((stream, _)) = listener.accept().await else {
             continue;
         };
-        let ctx = ctx.clone();
-        tokio::spawn(async move {
-            // The outer connection speaks plain HTTP and carries exactly one
-            // useful verb, CONNECT. hyper owns the framing, the header caps
-            // and every smuggling refusal that goes with them.
-            let served = http1::Builder::new()
-                .max_headers(MAX_HEADERS)
-                .serve_connection(
-                    TokioIo::new(stream),
-                    service_fn(move |req| connect_service(req, ctx.clone())),
-                )
-                .with_upgrades()
-                .await;
-            if let Err(e) = served {
-                // No address and no header: a proxy that logs both has
-                // written a map of who talks to whom next to the credentials.
-                if !e.is_incomplete_message() {
-                    eprintln!("astd: an egress connection ended early");
-                }
-            }
-        });
+        tokio::spawn(serve_connection(stream, ctx.clone()));
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn accept_unix_loop(listener: UnixListener, ctx: Arc<ProxyCtx>) {
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            continue;
+        };
+        tokio::spawn(serve_connection(stream, ctx.clone()));
+    }
+}
+
+async fn serve_connection<S>(stream: S, ctx: Arc<ProxyCtx>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    // The outer connection speaks plain HTTP and carries exactly one useful
+    // verb, CONNECT. Hyper owns the framing and every smuggling refusal.
+    let served = http1::Builder::new()
+        .max_headers(MAX_HEADERS)
+        .serve_connection(
+            TokioIo::new(stream),
+            service_fn(move |req| connect_service(req, ctx.clone())),
+        )
+        .with_upgrades()
+        .await;
+    if let Err(e) = served {
+        if !e.is_incomplete_message() {
+            eprintln!("astd: an egress connection ended early");
+        }
     }
 }
 
@@ -1507,7 +1567,26 @@ mod tests {
         );
     }
 
-    /// The proxy is on loopback, and that is the whole of why it is safe.
+    #[test]
+    fn a_rootless_container_uses_its_namespace_local_secret_egress_bridge() {
+        let mut instance = Instance::new(
+            "dev",
+            "laptop",
+            "oci",
+            asterism_core::instance::Shape::default(),
+            asterism_core::hv::Machine {
+                backend: crate::container::LINUX_ID.into(),
+                machine_type: "linux-userns-cgroup-v2".into(),
+                cpu: "x86_64".into(),
+                hv_version: "native".into(),
+            },
+        );
+        instance.runtime = RuntimeKind::Container;
+        assert!(check_can_bind(&instance).is_ok());
+        assert_eq!(gateway(&instance).unwrap(), "127.0.0.1");
+    }
+
+    /// A VM proxy is on loopback, and that is the whole of why it is safe.
     #[tokio::test]
     async fn the_listener_is_reachable_from_the_guest_and_from_nothing_on_the_wire() {
         let (listener, port) = bind_loopback(None).expect("a loopback port");
@@ -1516,6 +1595,62 @@ mod tests {
         assert!(addr.ip().is_loopback(), "{addr} is not loopback");
         assert!(!addr.ip().is_unspecified(), "{addr} is a wildcard bind");
         drop(listener);
+    }
+
+    /// The container path carries a real CONNECT over only the mounted Unix
+    /// endpoint. The TCP listener here stands in for the helper's loopback
+    /// listener inside the isolated network namespace.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn container_unix_transport_carries_bound_egress() {
+        use tokio::io::copy_bidirectional;
+        use tokio::net::UnixStream;
+
+        let _exclusive = exclusive().await;
+        ALLOW_LOOPBACK.store(true, Ordering::Relaxed);
+        let up = upstream().await;
+        *EXTRA_ROOT.lock().unwrap() = Some(up.ca_pem.clone());
+        let bound = binding(&format!("localhost:{}", up.port));
+        let handle_text = bound.guest_handle.as_str().to_owned();
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let authority = Authority::load_or_create(dir.path(), "container").unwrap();
+        let ca_pem = authority.ca_pem.clone();
+        let socket = dir.path().join("proxy.sock");
+        let unix = UnixListener::bind(&socket).unwrap();
+        let ctx = Arc::new(ProxyCtx {
+            instance: "container".into(),
+            bindings: vec![bound],
+            authority,
+            source: Arc::new(FakeSource { seen: seen.clone() }),
+            revoked: Arc::new(AtomicBool::new(false)),
+        });
+        let proxy_task = tokio::spawn(accept_unix_loop(unix, ctx));
+
+        let bridge = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = bridge.local_addr().unwrap().port();
+        let bridge_socket = socket.clone();
+        let bridge_task = tokio::spawn(async move {
+            let (mut guest, _) = bridge.accept().await.unwrap();
+            let mut host = UnixStream::connect(bridge_socket).await.unwrap();
+            copy_bidirectional(&mut guest, &mut host).await.unwrap();
+        });
+
+        let response = guest(port, &ca_pem)
+            .post(format!("https://localhost:{}/v1/messages", up.port))
+            .header("x-api-key", handle_text)
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+
+        bridge_task.abort();
+        proxy_task.abort();
+        *EXTRA_ROOT.lock().unwrap() = None;
+        ALLOW_LOOPBACK.store(false, Ordering::Relaxed);
     }
 
     /// An available remembered port wins without consulting the allocator.

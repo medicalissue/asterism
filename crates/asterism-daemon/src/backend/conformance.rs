@@ -19,13 +19,16 @@ use asterism_core::hv::{
 use asterism_core::instance::{Instance, Shape};
 use asterism_core::power::{Change, SleepGuard};
 
-use super::{backends, by_id, chv, qemu, vz};
+use super::{backends, by_id, hyperv};
+#[cfg(unix)]
+use super::{chv, qemu, vz};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ControlKind {
     Qmp,
     Rpc,
     HttpApi,
+    Helper,
 }
 
 impl ControlKind {
@@ -34,6 +37,7 @@ impl ControlKind {
             ControlKind::Qmp => ControlChannel::Qmp { path },
             ControlKind::Rpc => ControlChannel::Rpc { path },
             ControlKind::HttpApi => ControlChannel::HttpApi { path },
+            ControlKind::Helper => ControlChannel::Helper { path },
         }
     }
 
@@ -42,6 +46,7 @@ impl ControlKind {
             ControlKind::Qmp => "qmp",
             ControlKind::Rpc => "rpc",
             ControlKind::HttpApi => "http_api",
+            ControlKind::Helper => "helper",
         }
     }
 }
@@ -52,9 +57,13 @@ impl ControlKind {
 /// panic and cannot merge until its handles join the contract.
 fn control_kind(id: &str) -> ControlKind {
     match id {
+        #[cfg(unix)]
         qemu::ID => ControlKind::Qmp,
+        #[cfg(unix)]
         vz::ID => ControlKind::Rpc,
+        #[cfg(unix)]
         chv::ID => ControlKind::HttpApi,
+        id if id == hyperv::ID => ControlKind::Helper,
         other => panic!("registered backend {other:?} has no conformance profile"),
     }
 }
@@ -142,12 +151,15 @@ impl Fixture {
             pid: Some(pid),
             proc: None,
             ctl: kind.channel(self.control.clone()),
-            endpoint: match kind {
+            endpoint: Some(match kind {
                 ControlKind::Qmp => GuestEndpoint::HostForward { ssh_port: 22022 },
-                ControlKind::Rpc | ControlKind::HttpApi => GuestEndpoint::GuestAddr {
-                    addr: "192.0.2.1".parse().unwrap(),
-                },
-            },
+                ControlKind::Rpc | ControlKind::HttpApi | ControlKind::Helper => {
+                    GuestEndpoint::GuestAddr {
+                        addr: "192.0.2.1".parse().unwrap(),
+                    }
+                }
+            }),
+            container_control: None,
             started_at: 1,
         }
     }
@@ -180,6 +192,7 @@ fn expected_support(caps: &Caps, capability: Capability) -> bool {
         Capability::DirectKernelBoot => caps.direct_kernel,
         Capability::PortForward => caps.port_forward,
         Capability::GuestEgress => caps.guest_egress.is_some(),
+        Capability::GuestGpuProjection => caps.guest_gpu_projection,
     }
 }
 

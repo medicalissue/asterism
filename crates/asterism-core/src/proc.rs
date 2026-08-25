@@ -137,6 +137,7 @@ pub enum Signal {
 }
 
 impl Signal {
+    #[cfg(unix)]
     fn as_libc(self) -> i32 {
         match self {
             Signal::Term => libc::SIGTERM,
@@ -443,30 +444,38 @@ impl ProcId {
             }
             Ownership::Ours => {}
         }
-        // SAFETY: a plain kill(2) with a pid we have just proven is ours.
-        let rc = unsafe { libc::kill(self.pid as libc::pid_t, sig.as_libc()) };
-        if rc != 0 {
-            let err = std::io::Error::last_os_error();
-            // ESRCH between the check and the kill is the process exiting
-            // underneath us, which is not a failure of anything.
-            if err.raw_os_error() == Some(libc::ESRCH) {
-                return Ok(false);
-            }
-            bail!("sending {sig} to pid {}: {err}", self.pid);
+        #[cfg(windows)]
+        {
+            let _ = sig;
+            bail!("process signalling is not used by the Hyper-V backend");
         }
-        // The window this closes is not the one it opens: if the identity
-        // changed between the check and the kill, the signal has already
-        // gone. Saying so turns an invisible misfire into something a human
-        // can find in the log.
-        if let Ownership::Foreign(why) = self.check() {
-            if sig == Signal::Kill {
-                eprintln!(
-                    "astd: {sig} to pid {} may have reached another process — {why}",
-                    self.pid
-                );
+        #[cfg(unix)]
+        {
+            // SAFETY: a plain kill(2) with a pid we have just proven is ours.
+            let rc = unsafe { libc::kill(self.pid as libc::pid_t, sig.as_libc()) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                // ESRCH between the check and the kill is the process exiting
+                // underneath us, which is not a failure of anything.
+                if err.raw_os_error() == Some(libc::ESRCH) {
+                    return Ok(false);
+                }
+                bail!("sending {sig} to pid {}: {err}", self.pid);
             }
+            // The window this closes is not the one it opens: if the identity
+            // changed between the check and the kill, the signal has already
+            // gone. Saying so turns an invisible misfire into something a human
+            // can find in the log.
+            if let Ownership::Foreign(why) = self.check() {
+                if sig == Signal::Kill {
+                    eprintln!(
+                        "astd: {sig} to pid {} may have reached another process — {why}",
+                        self.pid
+                    );
+                }
+            }
+            Ok(true)
         }
-        Ok(true)
     }
 
     /// Poll until this process is gone, or the budget runs out.
@@ -699,7 +708,7 @@ fn look(pid: u32) -> Look {
 }
 
 /// The command line a process was started with. See the macOS twin.
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn argv(pid: u32) -> Option<Vec<String>> {
     let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     Some(
@@ -710,7 +719,7 @@ fn argv(pid: u32) -> Option<Vec<String>> {
     )
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn look(pid: u32) -> Look {
     if pid == 0 {
         return Look::NoSuchProcess;
@@ -758,7 +767,7 @@ fn linux_boot_id() -> Option<String> {
 
 /// Clock ticks per second, which is what `/proc/<pid>/stat` counts start
 /// times in.
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn hz() -> u64 {
     // SAFETY: a plain sysconf query with no arguments to get wrong.
     match unsafe { libc::sysconf(libc::_SC_CLK_TCK) } {
@@ -771,7 +780,7 @@ fn hz() -> u64 {
 
 /// When this host booted, in microseconds since the epoch, so a start time
 /// counted from boot can be turned into an absolute one.
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn boot_time_us() -> Option<u64> {
     let stat = std::fs::read_to_string("/proc/stat").ok()?;
     let btime: u64 = stat
@@ -781,6 +790,16 @@ fn boot_time_us() -> Option<u64> {
         .parse()
         .ok()?;
     Some(btime.saturating_mul(1_000_000))
+}
+
+#[cfg(windows)]
+fn argv(_pid: u32) -> Option<Vec<String>> {
+    None
+}
+
+#[cfg(windows)]
+fn look(_pid: u32) -> Look {
+    Look::Unreadable("Windows process identity is not used by the Hyper-V backend".into())
 }
 
 #[cfg(test)]
@@ -1143,13 +1162,16 @@ mod tests {
     /// not capture the fixture until the kernel reports both the resolved
     /// shell executable and the instance-owned marker in its argv.
     fn holder(path: &Path) -> (Child, String) {
-        let mut child = Command::new("/bin/sh")
+        // Use the concrete shell binary rather than /bin/sh: on macOS the
+        // latter can hand off to bash after the first process-table sample,
+        // which would correctly look like an executable replacement.
+        let mut child = Command::new("/bin/bash")
             .args(["-c", "while :; do sleep 1; done", "asterism-proc-fixture"])
             .arg(path)
             .spawn()
             .unwrap();
         let pid = child.id();
-        let shell = std::fs::canonicalize("/bin/sh")
+        let shell = std::fs::canonicalize("/bin/bash")
             .expect("the portable shell fixture should resolve its executable");
         let marker = path.to_string_lossy().into_owned();
         let deadline = Instant::now() + Duration::from_secs(5);

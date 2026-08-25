@@ -37,6 +37,7 @@ LAST_FILE="$STATE_DIR/update-state.env"
 TRANSACTION_CLAIM="$STATE_DIR/update-transaction.claim"
 TRANSACTION_DIR=""
 TRANSACTION_ID=""
+activation_failure=""
 
 tmp=""
 app_staged=""
@@ -53,6 +54,7 @@ cleanup() {
 	# A failed copy or activation may leave verified staging bytes beside an
 	# install destination. They are never active, but do not accumulate them.
 	for name in ast astd astd-vz cloud-hypervisor virtiofsd; do rm -f "$BIN/.${name}.update.$$"; done
+	rm -rf "$BIN/.guest-gpu.update.$$"
 	rm -f "$LIBEXEC/.asterism-update.update.$$"
 	[ -z "$app_staged" ] || rm -rf "$app_staged"
 }
@@ -220,6 +222,8 @@ load_manifest() {
 		Darwin-arm64 | Darwin-aarch64) host_target=darwin-arm64 ;;
 		Linux-x86_64 | Linux-amd64) host_target=linux-x86_64 ;;
 		Linux-aarch64 | Linux-arm64) host_target=linux-arm64 ;;
+		MINGW*-x86_64 | MSYS*-x86_64 | CYGWIN*-x86_64 | Windows_NT-x86_64) host_target=windows-x86_64 ;;
+		MINGW*-arm64 | MSYS*-arm64 | CYGWIN*-arm64 | Windows_NT-arm64) host_target=windows-arm64 ;;
 		*) host_target=unsupported ;;
 		esac
 	fi
@@ -313,6 +317,29 @@ durable_parent() {
 	"$AST" __sync-update-path --parent-only "$1"
 }
 
+restore_chv_capability() {
+	chv="$BIN/cloud-hypervisor"
+	[ -f "$chv" ] || return 1
+	if [ -n "${ASTERISM_UPDATE_SETCAP:-}" ]; then
+		"$ASTERISM_UPDATE_SETCAP" cap_net_admin+ep "$chv"
+	elif [ "$(id -u)" = 0 ]; then
+		setcap cap_net_admin+ep "$chv"
+	else
+		# install.sh grants this account exactly this fixed setcap invocation.
+		# `-n` keeps an unattended updater from hanging on a password prompt.
+		sudo -n setcap cap_net_admin+ep "$chv"
+	fi || return 1
+	durable_path "$chv"
+}
+
+activate_chv_capability() {
+	if restore_chv_capability; then
+		return 0
+	fi
+	activation_failure="could not apply cap_net_admin to the new Cloud Hypervisor"
+	return 1
+}
+
 atomic_record() {
 	path="$1" value="$2"
 	record_tmp="${path}.tmp.$$"
@@ -365,6 +392,7 @@ release_transaction() {
 component_destination() {
 	case "$1" in
 	ast | astd | astd-vz | cloud-hypervisor | virtiofsd) printf '%s/%s' "$BIN" "$1" ;;
+	guest-gpu) printf '%s' "$BIN/guest-gpu" ;;
 	asterism-update) printf '%s' "$LIBEXEC/asterism-update" ;;
 	Asterism.app) [ -n "$transaction_app_path" ] && printf '%s' "$transaction_app_path" ;;
 	*) return 1 ;;
@@ -375,6 +403,7 @@ cleanup_transaction_staging() {
 	owner=$(sed -n '1p' "$TRANSACTION_DIR/owner-pid" 2>/dev/null || true)
 	case "$owner" in *[!0-9]* | '') return ;; esac
 	for name in ast astd astd-vz cloud-hypervisor virtiofsd; do rm -f "$BIN/.${name}.update.${owner}"; done
+	rm -rf "$BIN/.guest-gpu.update.${owner}"
 	rm -f "$LIBEXEC/.asterism-update.update.${owner}"
 	[ -z "$transaction_app_path" ] || rm -rf "$(dirname "$transaction_app_path")/.Asterism.app.update.${owner}"
 	durable_parent "$BIN/.ast.update.${owner}"
@@ -390,7 +419,7 @@ last_build=${last_build}"
 }
 
 discard_transaction_backups() {
-	for name in astd-vz astd asterism-update ast Asterism.app cloud-hypervisor virtiofsd; do
+	for name in astd-vz astd asterism-update ast Asterism.app cloud-hypervisor virtiofsd guest-gpu; do
 		[ -f "$TRANSACTION_DIR/component-$name" ] || continue
 		dst=$(component_destination "$name") || continue
 		rm -rf "${dst}.previous.update" "${dst}.previous.update.absent"
@@ -402,7 +431,7 @@ rollback_transaction() {
 	err "recovering an interrupted update; restoring the previous compatible unit"
 	# Reverse activation order. A marker is durable before the first rename.
 	# If no backup exists, the destination was never moved and is left alone.
-	for name in Asterism.app ast asterism-update astd astd-vz cloud-hypervisor virtiofsd; do
+	for name in Asterism.app ast asterism-update astd astd-vz cloud-hypervisor virtiofsd guest-gpu; do
 		[ -f "$TRANSACTION_DIR/component-$name" ] || continue
 		dst=$(component_destination "$name") || continue
 		backup="${dst}.previous.update"
@@ -410,6 +439,9 @@ rollback_transaction() {
 			rm -rf "$dst"
 			mv "$backup" "$dst" || die "could not restore $name from interrupted update"
 			if [ -d "$dst" ]; then durable_tree "$dst"; else durable_path "$dst"; fi
+			# Cloud Hypervisor's backup is the original inode, including its
+			# capability xattr. Re-running setcap here can repeat the activation
+			# failure and strand the transaction before journal cleanup.
 		elif [ -e "${backup}.absent" ]; then
 			rm -rf "$dst"
 			durable_parent "$dst"
@@ -522,14 +554,19 @@ place_one() {
 		if [ -d "$dst" ]; then
 			mv "$dst" "$backup" || return 97
 			durable_tree "$backup" || return 97
-		elif ! ln "$dst" "$backup" 2>/dev/null; then
+		elif ln "$dst" "$backup" 2>/dev/null; then
+			durable_path "$backup" || return 97
+		elif [ "$name" = cloud-hypervisor ]; then
+			# If hard-link protection rejects a capable root-owned binary, move
+			# the old inode rather than copying it and losing its capability xattr.
+			mv "$dst" "$backup" || return 97
+			durable_path "$backup" || return 97
+		else
 			backup_tmp="${backup}.tmp.$$"
 			rm -f "$backup_tmp"
 			cp -p "$dst" "$backup_tmp" || return 97
 			durable_path "$backup_tmp" || return 97
 			mv "$backup_tmp" "$backup" || return 97
-			durable_path "$backup" || return 97
-		else
 			durable_path "$backup" || return 97
 		fi
 	else
@@ -552,6 +589,7 @@ on_signal() {
 }
 
 apply_update() {
+	activation_failure=""
 	managed_by_brew && die "this installation belongs to Homebrew; run: brew upgrade asterism"
 	acquire_artifact_lock
 	load_manifest
@@ -577,6 +615,8 @@ apply_update() {
 	if [ "$linux_payload" = 1 ]; then
 		[ -x "$tmp/stage/cloud-hypervisor" ] || die "the Linux update archive has no executable cloud-hypervisor"
 		[ -x "$tmp/stage/virtiofsd" ] || die "the Linux update archive has no executable virtiofsd"
+		[ -x "$tmp/stage/guest-gpu/bin/asterism-gpu-guest" ] || die "the Linux update archive has no guest GPU service"
+		[ -f "$tmp/stage/guest-gpu/lib/libcuda.so.1.0.0" ] || die "the Linux update archive has no guest libcuda"
 	else
 		verify_binary astd-vz "$tmp/stage/astd-vz"
 	fi
@@ -618,6 +658,10 @@ apply_update() {
 		chmod 755 "$BIN/.${name}.update.$$"
 		durable_path "$BIN/.${name}.update.$$"
 	done
+	if [ "$linux_payload" = 1 ]; then
+		cp -R "$tmp/stage/guest-gpu" "$BIN/.guest-gpu.update.$$"
+		durable_tree "$BIN/.guest-gpu.update.$$"
+	fi
 	cp "$tmp/stage/asterism-update" "$LIBEXEC/.asterism-update.update.$$"
 	chmod 755 "$LIBEXEC/.asterism-update.update.$$"
 	durable_path "$LIBEXEC/.asterism-update.update.$$"
@@ -630,7 +674,9 @@ apply_update() {
 	fi
 	if ! {
 		if [ "$linux_payload" = 1 ]; then
+			place_one guest-gpu "$BIN/.guest-gpu.update.$$" "$BIN/guest-gpu" &&
 			place_one cloud-hypervisor "$BIN/.cloud-hypervisor.update.$$" "$BIN/cloud-hypervisor" &&
+			activate_chv_capability &&
 			place_one virtiofsd "$BIN/.virtiofsd.update.$$" "$BIN/virtiofsd" &&
 			place_one astd "$BIN/.astd.update.$$" "$BIN/astd" &&
 			place_one asterism-update "$LIBEXEC/.asterism-update.update.$$" "$LIBEXEC/asterism-update" &&
@@ -647,7 +693,7 @@ apply_update() {
 		"$BIN/ast" __activate-update --build "$build"
 	}; then
 		recover_interrupted force
-		die "the new build did not activate; the previous compatible unit was restored"
+		die "${activation_failure:-the new build did not activate}; the previous compatible unit was restored"
 	fi
 	atomic_record "$TRANSACTION_DIR/phase" committed
 	inject_fault transaction committed

@@ -1,0 +1,43 @@
+[package]
+name = "asterism-hyperv"
+description = "The versioned astd/Hyper-V helper protocol and its native Windows implementation."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "asterism_hyperv"
+path = "src/lib.rs"
+
+[[bin]]
+name = "astd-hyperv"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+getrandom = "0.4"
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.11"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_Storage_Vhd",
+    "Win32_System_Com",
+    "Win32_System_HostComputeNetwork",
+    "Win32_System_HostComputeSystem",
+    "Win32_System_Hypervisor",
+    "Win32_System_IO",
+    "Win32_System_Services",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile = "3"

@@ -5,6 +5,7 @@
 //! already uses for every other backend.
 
 use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -85,6 +86,7 @@ impl Chv {
             DiskFormat::Raw => grow(path, u64::from(req.instance.shape.disk_gib)),
             DiskFormat::Qcow2 => check_qcow2_shape(path, u64::from(req.instance.shape.disk_gib)),
             DiskFormat::Asif => bail!("the chv backend cannot read an asif disk"),
+            DiskFormat::Vhdx => bail!("the chv backend cannot read a vhdx disk"),
         };
         if let Err(error) = resize {
             let _ = std::fs::remove_file(path);
@@ -262,6 +264,51 @@ impl Chv {
     }
 }
 
+/// Cloud-init's earliest stage installs and loads the modules that make its
+/// own guest agent and shared directories reachable. CHV direct-boots
+/// Asterism's pinned Ubuntu kernel even when the root disk is Debian, so the
+/// root's original `/lib/modules` cannot supply them. The modules are kept in
+/// that kernel release's `updates` directory and registered with depmod: the
+/// first boot loads them here, and later boots load them from
+/// `systemd-modules-load` before an enabled mount unit is attempted.
+fn direct_boot_module_config(modules: &[oci::KernelModule]) -> String {
+    let mut out = String::from(
+        "bootcmd:\n - |\n   # Asterism: install modules paired with the direct-boot kernel.\n   (\n   set -e\n   umask 077\n   release=$(uname -r)\n   module_dir=/lib/modules/$release/updates/asterism\n   mkdir -p \"$module_dir\" /etc/modules-load.d\n",
+    );
+    for module in modules {
+        out.push_str(&format!(
+            "   base64 -d > \"$module_dir/{}.ko\" <<'ASTERISM_MODULE_{}'\n",
+            module.name,
+            module.name.to_ascii_uppercase()
+        ));
+        let encoded = module.base64();
+        for line in encoded.as_bytes().chunks(76) {
+            out.push_str("   ");
+            out.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "   ASTERISM_MODULE_{}\n",
+            module.name.to_ascii_uppercase()
+        ));
+    }
+    out.push_str("   cat > /etc/modules-load.d/asterism-direct.conf <<'ASTERISM_DIRECT_MODULES'\n");
+    for module in modules {
+        out.push_str("   ");
+        out.push_str(module.name);
+        out.push('\n');
+    }
+    out.push_str("   ASTERISM_DIRECT_MODULES\n   depmod -a \"$release\"\n");
+    for module in modules {
+        out.push_str(&format!(
+            "   [ -d /sys/module/{0} ] || modprobe {0}\n",
+            module.name
+        ));
+    }
+    out.push_str("   sync\n   ) || echo 'asterism: the direct-boot kernel modules could not be installed' >&2\n");
+    out
+}
+
 /// Validate a qcow2 image without changing its metadata. Cloud Hypervisor can
 /// consume qcow2 directly, but growing it requires a format-aware metadata
 /// rewrite; the no-runtime-converter path therefore accepts only an image
@@ -363,13 +410,27 @@ impl Hypervisor for Chv {
             direct_kernel: true,
             port_forward: false,
             guest_egress: None,
-            disk_formats: &[DiskFormat::Raw, DiskFormat::Qcow2],
+            // New Cloud Hypervisor instances use the same sparse raw base
+            // seam as VZ. Existing `disk.qcow2` instances remain readable in
+            // `prepare`; qcow2 is omitted here so a catalog source is
+            // materialized once and can be grown safely to the requested
+            // shape without an external converter.
+            disk_formats: &[DiskFormat::Raw],
+            guest_gpu_projection: false,
         }
     }
 
     fn guest_config(&self, inst: &asterism_core::instance::Instance) -> Result<String> {
         let key = Key::ensure(&paths::guest_agent_key_path(&inst.name))?;
-        Ok(guest::cloud_config(&key))
+        let modules = oci::direct_boot_modules()?;
+        let mut config = direct_boot_module_config(&modules);
+        let agent = guest::cloud_config(&key);
+        config.push_str(
+            agent
+                .strip_prefix("bootcmd:\n")
+                .context("the guest agent cloud-config has no bootcmd sequence")?,
+        );
+        Ok(config)
     }
 
     fn guest_network_config(
@@ -405,6 +466,7 @@ impl Hypervisor for Chv {
                 DiskFormat::Raw => raw,
                 DiskFormat::Qcow2 => qcow,
                 DiskFormat::Asif => bail!("the chv backend cannot read an asif disk"),
+                DiskFormat::Vhdx => bail!("the chv backend cannot read a vhdx disk"),
             };
             self.create_root(req, &path)?
         };
@@ -712,8 +774,8 @@ fn disk_arg(disk: &DiskSpec, id: &str) -> Result<String> {
             bail!("the chv backend accepts remote volumes only after they are exposed as a host block device")
         }
     };
-    if format == DiskFormat::Asif {
-        bail!("Cloud Hypervisor cannot read an asif disk");
+    if matches!(format, DiskFormat::Asif | DiskFormat::Vhdx) {
+        bail!("Cloud Hypervisor cannot read a {format} disk");
     }
     Ok(format!(
         "path={},readonly={},image_type={},id={id}",
@@ -746,6 +808,7 @@ fn api_image_type(format: DiskFormat) -> Result<&'static str> {
         DiskFormat::Raw => Ok("Raw"),
         DiskFormat::Qcow2 => Ok("Qcow2"),
         DiskFormat::Asif => bail!("Cloud Hypervisor cannot read an asif disk"),
+        DiskFormat::Vhdx => bail!("Cloud Hypervisor cannot read a vhdx disk"),
     }
 }
 
@@ -1260,6 +1323,7 @@ fn wait_for_guest(
     timeout: Duration,
 ) -> Result<GuestEndpoint> {
     let start = Instant::now();
+    let fallback_addr: IpAddr = Network::for_instance(&instance.name).guest.parse()?;
     let handle = Handle {
         backend: ID.to_owned(),
         pid: Some(proc.pid),
@@ -1267,9 +1331,10 @@ fn wait_for_guest(
         ctl: ControlChannel::HttpApi {
             path: instance_dir.join(API_NAME),
         },
-        endpoint: GuestEndpoint::GuestAddr {
+        endpoint: Some(GuestEndpoint::GuestAddr {
             addr: "192.0.2.1".parse().unwrap(),
-        },
+        }),
+        container_control: None,
         started_at: 0,
     };
     loop {
@@ -1287,6 +1352,16 @@ fn wait_for_guest(
                 }
             }
         }
+        if let Some(banner) = ssh_banner(fallback_addr, Duration::from_millis(250)) {
+            eprintln!(
+                "astd: {} was found at {fallback_addr} by an ssh banner rather than by asking it over vsock port {} — {banner}",
+                instance.name,
+                guest::PORT
+            );
+            return Ok(GuestEndpoint::GuestAddr {
+                addr: fallback_addr,
+            });
+        }
         if start.elapsed() >= timeout {
             bail!(
                 "guest {:?} did not answer on vsock port {} with a reachable ssh address within {timeout:?}",
@@ -1296,6 +1371,27 @@ fn wait_for_guest(
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Connect to `ip:22` and require SSH's server-first identification string.
+///
+/// This is the same fail-closed readiness fallback as the native VZ backend:
+/// a TCP accept alone is not enough, and the deterministic CHV address is only
+/// returned after an SSH server proves it is serving there.
+fn ssh_banner(ip: IpAddr, timeout: Duration) -> Option<String> {
+    let mut stream = TcpStream::connect_timeout(&SocketAddr::new(ip, 22), timeout).ok()?;
+    stream.set_read_timeout(Some(timeout)).ok()?;
+    let mut buf = [0u8; 256];
+    let n = stream.read(&mut buf).ok()?;
+    if n == 0 {
+        return None;
+    }
+    let banner = String::from_utf8_lossy(&buf[..n]).trim().to_owned();
+    if !banner.starts_with("SSH-") {
+        return None;
+    }
+    let _ = stream.write_all(b"SSH-2.0-Asterism\r\n");
+    Some(banner)
 }
 
 fn guest_session(
@@ -2436,6 +2532,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn direct_boot_modules_include_virtiofs_and_load_before_the_agent() {
+        let modules = [
+            oci::KernelModule {
+                name: "virtiofs",
+                bytes: b"filesystem".to_vec(),
+            },
+            oci::KernelModule {
+                name: "vsock",
+                bytes: b"core".to_vec(),
+            },
+            oci::KernelModule {
+                name: "vmw_vsock_virtio_transport_common",
+                bytes: b"common".to_vec(),
+            },
+            oci::KernelModule {
+                name: "vmw_vsock_virtio_transport",
+                bytes: b"transport".to_vec(),
+            },
+        ];
+        let mut config = direct_boot_module_config(&modules);
+        config.push_str(" - |\n   echo agent-ready\n");
+        asterism_core::seed::mergeable(&config).expect("the seed can carry module payloads");
+
+        let virtiofs = config.find("modprobe virtiofs\n").unwrap();
+        let core = config.find("modprobe vsock\n").unwrap();
+        let common = config
+            .find("modprobe vmw_vsock_virtio_transport_common\n")
+            .unwrap();
+        let transport = config
+            .find("modprobe vmw_vsock_virtio_transport\n")
+            .unwrap();
+        let agent = config.find("agent-ready").unwrap();
+        assert!(virtiofs < core && core < common && common < transport && transport < agent);
+        assert!(
+            config.contains("/etc/modules-load.d/asterism-direct.conf"),
+            "the next boot needs systemd-modules-load before enabled mounts: {config}"
+        );
+        assert!(
+            config.contains("/lib/modules/$release/updates/asterism"),
+            "the module cannot disappear with /run after first boot: {config}"
+        );
+        assert!(config.contains("depmod -a \"$release\""), "{config}");
+        assert_eq!(config.matches("bootcmd:").count(), 1);
+    }
+
+    #[test]
     fn instance_networks_are_stable_private_and_locally_administered() {
         let a = Network::for_instance("agent-one");
         let again = Network::for_instance("agent-one");
@@ -3093,6 +3235,6 @@ mod tests {
         assert!(caps.disk_hotplug && caps.direct_kernel);
         assert!(caps.nbd_disks);
         assert!(!caps.port_forward && caps.guest_egress.is_none());
-        assert_eq!(caps.disk_formats, &[DiskFormat::Raw, DiskFormat::Qcow2]);
+        assert_eq!(caps.disk_formats, &[DiskFormat::Raw]);
     }
 }

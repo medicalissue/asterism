@@ -196,6 +196,15 @@ enum MeshRequest {
     /// Open the target daemon user's explicitly enabled shell. The opening
     /// frame is followed by bounded [`ShellFrame`]s, never a raw pipe.
     DeviceShell { open: ShellOpen },
+    /// Dedicated GPU ABI stream. Instance-bound and token-free: the provider
+    /// looks up the live lease from the authenticated peer plus instance id
+    /// and generation. Subsequent frames are [`GpuMeshFrame`]s.
+    Gpu {
+        instance_id: String,
+        provider_gpu_uuid: String,
+        provider_generation: u64,
+        memory_bytes: u64,
+    },
     /// Hand this stream to a block volume's NBD export and stop framing it.
     ///
     /// The other pipe, and the fenced one: the far side checks `holder` and
@@ -214,7 +223,7 @@ enum MeshRequest {
         epoch: u64,
     },
 
-    // ---- moving an instance's cpu part --------------------------------------
+    // ---- moving an instance's compute ---------------------------------------
     //
     // Three streams, and none of them is a request/reply. A move is bulk, so
     // past the opening frame these carry [`MoveFrame`]s — control frames with
@@ -261,6 +270,7 @@ impl MeshRequest {
             // and epoch are the provider-side writer fence, so an older peer
             // must refuse it rather than treating it as an ordinary splice.
             MeshRequest::VolumeSplice { .. } => 7,
+            MeshRequest::Gpu { .. } => asterism_core::remote_gpu_path::GPU_MESH_PROTOCOL,
             _ => compat::FIRST_PROTOCOL,
         }
     }
@@ -305,6 +315,7 @@ impl MeshRequest {
             MeshRequest::GuestKey => "a guest key",
             MeshRequest::SshSplice { .. } => "an ssh connection",
             MeshRequest::DeviceShell { .. } => "a device shell",
+            MeshRequest::Gpu { .. } => "a GPU session",
             MeshRequest::VolumeSplice { .. } => "a volume connection",
             MeshRequest::MoveExport { .. } => "an instance export",
             MeshRequest::MoveBase { .. } => "a base image",
@@ -932,6 +943,33 @@ impl Mesh {
         crate::device_shell::bridge_client(stream, io).await
     }
 
+    /// Open a dedicated GPU stream to a provider device. The opening frame
+    /// is instance-bound and token-free.
+    pub async fn gpu_session<'a, 'b>(
+        self: &Arc<Self>,
+        device: &str,
+        instance_id: &str,
+        provider_gpu_uuid: &str,
+        provider_generation: u64,
+        memory_bytes: u64,
+        io: &'a mut ClientIo<'b>,
+    ) -> Result<()> {
+        let peer = self.device(device).await?;
+        let connection = self.live_connection(&peer).await?;
+        let mut stream = connection.open_stream().await?;
+        open_stream_with(
+            &mut stream.send,
+            &MeshRequest::Gpu {
+                instance_id: instance_id.to_owned(),
+                provider_gpu_uuid: provider_gpu_uuid.to_owned(),
+                provider_generation,
+                memory_bytes,
+            },
+        )
+        .await?;
+        crate::gpu::bridge_client(stream, io).await
+    }
+
     // ---- wake ---------------------------------------------------------------
 
     /// Wakes a sleeping device: `ast device wake <name>`.
@@ -1193,7 +1231,7 @@ impl Mesh {
     /// A device that is asleep must not make its instances vanish from
     /// `ast ls` — that would read as "deleted" rather than "out of touch" —
     /// so its rows are listed from cache, marked not live, with the device
-    /// supplying their cpu still named. Assembling the view is also the moment
+    /// supplying their compute still named. Assembling the view is also the moment
     /// two shards are compared, so this is where a name collision that a
     /// partition hid comes to light.
     pub async fn orbit_registry(self: &Arc<Self>, node: &Node) -> Result<Response> {
@@ -1382,7 +1420,7 @@ impl Mesh {
     }
 
     /// A loopback port on *this* device that reaches the guest of an instance
-    /// whose cpu and ram come from another one.
+    /// whose compute comes from another one.
     ///
     /// This is `ast ssh dev` when `dev` is not here. The local daemon binds an
     /// ephemeral 127.0.0.1 listener and hands the CLI its port; every
@@ -1427,7 +1465,7 @@ impl Mesh {
         let port = listener.local_addr()?.port();
 
         // The guest only trusts the key of the device that *seeded* it, which
-        // is not always the device running it: a cpu-part swap carries the
+        // is not always the device running it: a compute move carries the
         // seed rather than rebuilding it. So the key comes from the seeding
         // device — which may well be this one.
         let seeder = instance.seeded_by().to_owned();
@@ -1510,7 +1548,7 @@ impl Mesh {
         Ok((stream, observation))
     }
 
-    // ---- moving an instance's cpu part --------------------------------------
+    // ---- moving an instance's compute ---------------------------------------
 
     /// Is `name` a device this orbit has heard of?
     pub async fn knows(&self, name: &str) -> bool {
@@ -2319,7 +2357,7 @@ impl Mesh {
 }
 
 /// Which rows in an assembled view lost a name collision, and which device
-/// supplies cpu for the instance that beat them.
+/// supplies compute for the instance that beat them.
 ///
 /// The rule is `Shard::mark_conflicted`'s: **the newer creation loses**. The
 /// tie-break after `created_at` is the instance id, and that detail is load
@@ -2420,7 +2458,7 @@ impl Drop for Splice {
 }
 
 /// One accepted loopback connection, carried to the guest's ssh port on
-/// whichever device is supplying that guest's cpu.
+/// whichever device is supplying that guest's compute.
 async fn splice_to_guest(
     mesh: &Arc<Mesh>,
     device: &str,
@@ -2934,6 +2972,7 @@ fn safe_join(root: &Path, relative: &str) -> Result<std::path::PathBuf> {
     Ok(out)
 }
 
+#[cfg(unix)]
 fn set_mode(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     // Whatever the sender says, never more than the owner. A disk image is
@@ -2943,10 +2982,25 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
         .with_context(|| format!("setting permissions on {}", path.display()))
 }
 
+#[cfg(windows)]
+fn set_mode(_path: &Path, _mode: u32) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn file_mode(meta: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o777
+}
+
+#[cfg(windows)]
+fn file_mode(_meta: &std::fs::Metadata) -> u32 {
+    0o600
+}
+
 /// Send one file's allocated ranges and nothing else.
 async fn send_file(send: &mut SendStream, path: &Path, wire_name: &str) -> Result<u64> {
     use std::io::{Read, Seek, SeekFrom};
-    use std::os::unix::fs::PermissionsExt;
 
     let meta = std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
     let extents = cow::extents(path)?;
@@ -2955,7 +3009,7 @@ async fn send_file(send: &mut SendStream, path: &Path, wire_name: &str) -> Resul
         &MoveFrame::File {
             path: wire_name.to_owned(),
             len: meta.len(),
-            mode: meta.permissions().mode() & 0o777,
+            mode: file_mode(&meta),
         },
     )
     .await?;
@@ -3129,10 +3183,16 @@ async fn fail(send: &mut SendStream, e: anyhow::Error) -> Result<()> {
 
 /// Locks a key file down to mode 0600. ssh refuses one that anyone else on the
 /// machine can read, and it is right to.
+#[cfg(unix)]
 fn set_private(path: &std::path::Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("securing {}", path.display()))
+}
+
+#[cfg(windows)]
+fn set_private(_path: &std::path::Path) -> Result<()> {
+    Ok(())
 }
 
 /// This device's guest key, for a peer that needs to open a guest we seeded.
@@ -3320,6 +3380,20 @@ async fn serve_stream(
                     },
                 )
                 .await?;
+            } else if matches!(arriving.request, MeshRequest::Gpu { .. }) {
+                let message = match &*refusal {
+                    MeshReply::Incompatible { message, .. } => message.clone(),
+                    _ => "the GPU stream is incompatible".to_owned(),
+                };
+                let bytes = asterism_core::remote_gpu_path::encode_frame(
+                    &asterism_core::remote_gpu_path::GpuMeshFrame::Refused {
+                        id: None,
+                        code: asterism_core::remote_gpu::ControlErrorCode::InvalidRequest,
+                        message,
+                    },
+                )
+                .map_err(|err| anyhow!(err))?;
+                stream.send.write_all(&bytes).await?;
             } else if !arriving.request.answered_in_bulk() {
                 write_frame(&mut stream.send, &*refusal).await?;
             } else if let MeshReply::Incompatible { message, .. } = &*refusal {
@@ -3364,6 +3438,23 @@ async fn serve_stream(
         MeshRequest::SshSplice { name } => return serve_splice(stream, &node, &name).await,
         MeshRequest::DeviceShell { open } => {
             return crate::device_shell::serve_mesh(stream, peer, &node, open).await
+        }
+        MeshRequest::Gpu {
+            instance_id,
+            provider_gpu_uuid,
+            provider_generation,
+            memory_bytes,
+        } => {
+            return crate::gpu::serve_mesh(
+                stream,
+                peer,
+                &node,
+                instance_id,
+                provider_gpu_uuid,
+                provider_generation,
+                memory_bytes,
+            )
+            .await
         }
         MeshRequest::VolumeSplice {
             volume,
@@ -3412,6 +3503,9 @@ async fn serve_stream(
                 },
                 request if crate::device_shell::local_only_request(&request) => Response::Error {
                     message: "device-shell policy and sessions are accepted only on the target's local control socket or a dedicated shell stream".into(),
+                },
+                request if crate::gpu::local_only_request(&request) => Response::Error {
+                    message: "GPU guest frames are accepted only on the instance's local control socket or a dedicated GPU stream".into(),
                 },
                 // About this device's NIC rather than about its shard, so
                 // they stop here instead of going on to `crate::handle`. The
@@ -4254,6 +4348,7 @@ mod tests {
                 Orbit::load(&dir.path().join("orbit.json")).unwrap(),
             )),
             shell: crate::device_shell::Manager::load_at(dir.path()),
+            gpu: crate::gpu::Manager::new(),
         };
 
         let server = MeshEndpoint::bind(&DeviceIdentity::generate(), MeshMode::LocalOnly)
@@ -4341,6 +4436,7 @@ mod tests {
                 Orbit::load(&dir.path().join("orbit.json")).unwrap(),
             )),
             shell: crate::device_shell::Manager::load_at(dir.path()),
+            gpu: crate::gpu::Manager::new(),
         };
         let server = MeshEndpoint::bind(&DeviceIdentity::generate(), MeshMode::LocalOnly)
             .await
@@ -4432,6 +4528,7 @@ mod tests {
             )),
             orbit: orbit.clone(),
             shell: crate::device_shell::Manager::load_at(dir.path()),
+            gpu: crate::gpu::Manager::new(),
         };
         let mesh = Arc::new(Mesh {
             endpoint: server,
