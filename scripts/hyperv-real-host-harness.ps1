@@ -1,7 +1,8 @@
-# Opt-in Windows 11 Pro/Enterprise real-host harness for the native Hyper-V
-# backend. GitHub hosted runners cannot satisfy this: they are Windows Server
-# images without nested Hyper-V and without a Windows 11 Pro/Enterprise
-# product edition.
+# Opt-in Windows real-host harness for the native Hyper-V backend. Pro and
+# Enterprise are the supported Microsoft path. Home is an explicitly labelled
+# experiment and reaches mutation only when the same real service/API probes
+# pass. GitHub hosted runners cannot satisfy this: they are Windows Server
+# images without nested Hyper-V.
 #
 # Usage:
 #   ./scripts/hyperv-real-host-harness.ps1 -ExplainOnly
@@ -27,7 +28,7 @@ function Write-Gap {
 }
 
 $GithubHostedGaps = @(
-    "GitHub hosted windows-latest is Windows Server Datacenter, not Windows 11 Pro or Enterprise",
+    "GitHub hosted windows-latest is Windows Server Datacenter, not a client Hyper-V host",
     "GitHub hosted runners do not expose nested Hyper-V / HCS compute-system mutation",
     "vmcompute/hns may exist as services without a usable HCS v2.1 VM partition",
     "VirtDisk VHDX create/attach against a real compute system cannot be proven",
@@ -39,7 +40,7 @@ $GithubHostedGaps = @(
 
 if ($ExplainOnly) {
     Write-Gap "Hyper-V real-host harness: EXPLAIN ONLY"
-    Write-Gap "Opt-in: set ASTERISM_HYPERV_REAL_HOST=1 on an elevated Windows 11 Pro/Enterprise host with Hyper-V enabled."
+    Write-Gap "Opt-in: set ASTERISM_HYPERV_REAL_HOST=1 on an elevated Windows host with Hyper-V enabled. Home is experimental and must be labelled in the evidence."
     Write-Gap "Lifecycle once opted in: probe, create, boot, control, stop, snapshot, restart, adoption, final-stop, independent HCS/HCN cleanup."
     Write-Gap "GitHub hosted runner gaps (impossible here):"
     foreach ($gap in $GithubHostedGaps) {
@@ -56,7 +57,7 @@ if ($env:ASTERISM_HYPERV_REAL_HOST -ne "1") {
 }
 
 if ($env:OS -ne "Windows_NT") {
-    throw "this harness runs only on Windows 11 Pro or Enterprise"
+    throw "this harness runs only on Windows"
 }
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -65,11 +66,11 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     throw "the native Hyper-V backend needs an elevated administrator token"
 }
 
-$product = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").ProductName
-$build = [int](Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").CurrentBuildNumber
-if ($product -notmatch "Pro|Enterprise") {
-    throw "the native Hyper-V backend needs Windows 11 Pro or Enterprise; this is $product"
-}
+$currentVersion = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+$product = $currentVersion.ProductName
+$edition = $currentVersion.EditionID
+$build = [int]$currentVersion.CurrentBuildNumber
+$support = if ($product -match "Pro|Enterprise") { "microsoft-supported" } else { "experimental-unsupported-sku" }
 if ($build -lt 22000) {
     throw "the native Hyper-V backend needs Windows 11 build 22000 or newer; this is $build"
 }
@@ -82,6 +83,7 @@ function Assert-ServiceRunning([string]$Name) {
 }
 Assert-ServiceRunning "vmcompute"
 Assert-ServiceRunning "hns"
+Assert-ServiceRunning "vmms"
 
 $ast = Get-Command ast -ErrorAction SilentlyContinue
 $helper = Get-Command astd-hyperv -ErrorAction SilentlyContinue
@@ -134,7 +136,7 @@ function Get-HcnEndpoints {
     }
 }
 
-Record "host" "$product build $build elevated=true vmcompute=running hns=running"
+Record "host" "$product edition=$edition build=$build support=$support elevated=true vmcompute=running hns=running vmms=running"
 
 if (-not $ast -or -not $helper) {
     Record "binaries" "MISSING ast=$([bool]$ast) astd-hyperv=$([bool]$helper)"
