@@ -209,7 +209,9 @@ impl VmConfig {
             "Flags": 0,
             "HostComputeNetwork": self.network_id,
             "Name": format!("asterism-{}", self.instance),
-            "MacAddress": self.mac.replace(':', ""),
+            // HCN's endpoint schema accepts the canonical Windows form; a
+            // compact 12-hex string is rejected with E_INVALIDARG.
+            "MacAddress": self.mac.replace(':', "-"),
             "IpConfigurations": [{
                 "IpAddress": self.guest_ip,
                 "PrefixLength": 20
@@ -589,6 +591,7 @@ mod tests {
         assert_eq!(network["SchemaVersion"]["Major"], 2);
         assert_eq!(network["Owner"], OWNER);
         assert_eq!(endpoint["HostComputeNetwork"], config().network_id);
+        assert_eq!(endpoint["MacAddress"], "02-15-5d-01-02-03");
         assert_eq!(endpoint["IpConfigurations"][0]["IpAddress"], "172.29.64.19");
     }
 }
