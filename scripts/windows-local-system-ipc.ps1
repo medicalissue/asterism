@@ -132,10 +132,14 @@ Set-Content -LiteralPath $config.ResultPath -Value $LASTEXITCODE -Encoding ascii
     $action = "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$probeScript`""
     & schtasks.exe /Create /TN $task /SC ONCE /ST 23:59 /RU 'NT AUTHORITY\LOCAL SERVICE' /RL LIMITED /TR $action /F | Out-Null
     & schtasks.exe /Run /TN $task | Out-Null
-    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    # Task Scheduler acknowledges Run before the LocalService process starts;
+    # hosted runners under load can legitimately take longer than 30 seconds.
+    $deadline = [DateTime]::UtcNow.AddSeconds(90)
     while (-not (Test-Path -LiteralPath $probeResult)) {
         if ([DateTime]::UtcNow -ge $deadline) {
-            throw 'LocalService refusal probe timed out'
+            $taskState = (& schtasks.exe /Query /TN $task /V /FO LIST 2>$null | Out-String).Trim()
+            $probeOutput = if (Test-Path -LiteralPath $probeLog) { (Get-Content -LiteralPath $probeLog -Raw).Trim() } else { '<none>' }
+            throw "LocalService refusal probe timed out; scheduled task: $taskState; probe output: $probeOutput"
         }
         Start-Sleep -Milliseconds 250
     }
