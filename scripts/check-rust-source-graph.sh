@@ -20,7 +20,8 @@ crates/asterism-daemon/src/backend/vz.rs'
 
 WINDOWS_ONLY_MODULES='crates/asterism-hyperv/src/windows.rs
 crates/asterism-core/src/ipc_windows.rs
-crates/asterism-daemon/src/device_shell_windows.rs'
+crates/asterism-daemon/src/device_shell_windows.rs
+crates/asterism-daemon/src/nbd_windows.rs'
 
 target_os() {
   local rustc_bin="${RUSTC:-rustc}"
@@ -33,15 +34,16 @@ target_os() {
 verify_cfg_modules() {
   local cfg="$1" parent="$2"
   shift 2
-  local path module
+  local path module file
   for path in "$@"; do
     [ -n "$path" ] || continue
     module="${path##*/}"
     module="${module%.rs}"
-    awk -v module="$module" -v cfg="$cfg" '
+    file="${path##*/}"
+    awk -v module="$module" -v file="$file" -v cfg="$cfg" '
       $0 == cfg { gated = 1; next }
-      gated && $0 ~ /^#\[path = "[^"]+"\]$/ { next }
-      gated && $0 ~ ("^(pub )?mod " module ";") {
+      gated && $0 ~ /^#\[path = "[^"]+"\]$/ { path_matches = ($0 == "#[path = \"" file "\"]"); next }
+      gated && ((path_matches && $0 ~ "^(pub )?mod [[:alnum:]_]+;") || (!path_matches && $0 ~ ("^(pub )?mod " module ";"))) {
         found = 1
       }
       { gated = 0 }
@@ -78,6 +80,8 @@ verify_windows_only_modules() {
     crates/asterism-core/src/ipc_windows.rs
   verify_cfg_modules '#[cfg(windows)]' crates/asterism-daemon/src/device_shell.rs \
     crates/asterism-daemon/src/device_shell_windows.rs
+  verify_cfg_modules '#[cfg(windows)]' crates/asterism-daemon/src/main.rs \
+    crates/asterism-daemon/src/nbd_windows.rs
 }
 
 write_audited_sources() {
