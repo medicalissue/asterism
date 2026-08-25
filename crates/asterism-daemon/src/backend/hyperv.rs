@@ -222,7 +222,7 @@ impl Hypervisor for HyperV {
         inst: &asterism_core::instance::Instance,
     ) -> Result<Option<String>> {
         // The private HCN NAT does not run DHCP. NoCloud has to configure the
-        // synthetic NIC before the guest agent can answer on AF_HYPERV or SSH.
+        // synthetic NIC before the guest agent can answer on its control channel or SSH.
         Ok(Some(network_config(
             guest_ip(&inst.id)?,
             &asterism_hyperv::mac_for(&inst.name),
