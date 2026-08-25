@@ -178,10 +178,12 @@ $daemonPidPath = Join-Path $asterismHome "astd.pid"
 $systemId = $null
 $networkId = $null
 $endpointId = $null
+$instanceCreated = $false
 
 Record "probe" "pre-mutation gates passed; mutating $Instance"
 try {
     Invoke-Ast @("create", $Instance, "--image", $Image, "--backend", "hyperv")
+    $instanceCreated = $true
     Record "create" "ok"
     Invoke-Ast @("up", $Instance)
     Record "boot" "ok"
@@ -223,9 +225,13 @@ try {
 }
 finally {
     $cleanupError = $null
-    try { Invoke-Ast @("rm", $Instance) } catch {
-        $cleanupError = $_.Exception.Message
-        Record "cleanup-ast" $cleanupError
+    if ($instanceCreated) {
+        try { Invoke-Ast @("rm", $Instance) } catch {
+            $cleanupError = $_.Exception.Message
+            Record "cleanup-ast" $cleanupError
+        }
+    } else {
+        Record "cleanup-ast" "not needed (create did not complete)"
     }
     Start-Sleep -Seconds 2
     $hcs = Get-HcsSystems

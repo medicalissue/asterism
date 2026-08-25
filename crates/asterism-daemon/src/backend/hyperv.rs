@@ -20,8 +20,8 @@ use asterism_core::hv::{
     Prepared, Ready, RunState, SnapshotId,
 };
 use asterism_core::instance::Instance;
+use asterism_core::paths;
 use asterism_core::snapshot::{self, Snapshot};
-use asterism_core::{paths, tools};
 use asterism_hyperv::{
     DiskAttachment, HostReady, Reply, Request, VmConfig, VmState, HELPER_BIN, OWNER,
     PROTOCOL_VERSION,
@@ -373,31 +373,7 @@ fn call(helper: &Path, request: &Request) -> Result<Reply> {
 }
 
 fn helper_path() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("ASTERISM_HYPERV_HELPER") {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return Ok(path);
-        }
-        bail!(
-            "$ASTERISM_HYPERV_HELPER points at {}, which is not a file",
-            path.display()
-        );
-    }
-    if let Ok(me) = std::env::current_exe() {
-        let sibling = me.with_file_name(HELPER_BIN);
-        if sibling.is_file() {
-            return Ok(sibling);
-        }
-        if let Some(profile) = me.parent().and_then(Path::parent) {
-            let sibling = profile.join(HELPER_BIN);
-            if sibling.is_file() {
-                return Ok(sibling);
-            }
-        }
-    }
-    tools::tool(HELPER_BIN).with_context(|| {
-        format!("{HELPER_BIN} is not installed next to astd; reinstall the Windows release")
-    })
+    asterism_core::hyperv::discover_helper()
 }
 
 fn config_path(dir: &Path) -> PathBuf {
