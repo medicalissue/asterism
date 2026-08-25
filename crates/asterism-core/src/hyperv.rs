@@ -305,6 +305,8 @@ impl VmConfig {
         self.validate()?;
         Ok(serde_json::to_string(&serde_json::json!({
             "SchemaVersion": { "Major": 2, "Minor": 0 },
+            "Owner": self.owner,
+            "Flags": 0,
             "Name": "asterism-private",
             "Type": "NAT",
             "Ipams": [{
@@ -324,6 +326,9 @@ impl VmConfig {
         self.validate()?;
         Ok(serde_json::to_string(&serde_json::json!({
             "SchemaVersion": { "Major": 2, "Minor": 0 },
+            "Owner": self.owner,
+            "Flags": 0,
+            "HostComputeNetwork": self.network_id,
             "Name": format!("asterism-{}", self.instance),
             "MacAddress": self.mac.replace(':', ""),
             "IpConfigurations": [{
@@ -672,6 +677,8 @@ mod tests {
             serde_json::from_str(&config().hcn_endpoint_document().unwrap()).unwrap();
         assert_eq!(network["Type"], "NAT");
         assert_eq!(network["SchemaVersion"]["Major"], 2);
+        assert_eq!(network["Owner"], OWNER);
+        assert_eq!(endpoint["HostComputeNetwork"], config().network_id);
         assert_eq!(endpoint["IpConfigurations"][0]["IpAddress"], "172.29.64.19");
     }
 
