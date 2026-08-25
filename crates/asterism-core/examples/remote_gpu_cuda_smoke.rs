@@ -63,7 +63,10 @@ fn main() -> Result<()> {
 
     println!("gpu_uuid={}", identity.uuid);
     println!("gpu_name={}", identity.name);
-    println!("driver_version={}", identity.driver_version);
+    // `cuDriverGetVersion` exposes CUDA compatibility, not the marketing
+    // driver string shown by nvidia-smi. The executor maps it to the
+    // conservative NVIDIA driver floor used by admission policy.
+    println!("admitted_driver_floor={}", identity.driver_version);
     println!("cuda_driver_api={}", identity.cuda_version);
     println!(
         "compute_capability={}.{}",
