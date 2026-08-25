@@ -112,7 +112,11 @@ impl HyperV {
             cpus: req.instance.shape.cpus,
             mem_mib: u64::from(req.instance.shape.mem_mib),
             network_id: NETWORK_ID.into(),
-            guest_ip: guest_ip(&endpoint_id)?,
+            // Network-config is built before the helper config exists, so
+            // the address follows the durable Instance id, not this freshly
+            // allocated endpoint id. Recreating an HCN endpoint cannot move
+            // the guest's address.
+            guest_ip: guest_ip(&req.instance.id)?,
             endpoint_id,
             mac: asterism_hyperv::mac_for(&req.instance.name),
             agent_key: paths::guest_agent_key_path(&req.instance.name),
@@ -211,6 +215,18 @@ impl Hypervisor for HyperV {
         let key = guest::Key::ensure(&paths::guest_agent_key_path(&inst.name))
             .with_context(|| format!("minting {:?}'s guest agent key", inst.name))?;
         Ok(guest::cloud_config(&key))
+    }
+
+    fn guest_network_config(
+        &self,
+        inst: &asterism_core::instance::Instance,
+    ) -> Result<Option<String>> {
+        // The private HCN NAT does not run DHCP. NoCloud has to configure the
+        // synthetic NIC before the guest agent can answer on AF_HYPERV or SSH.
+        Ok(Some(network_config(
+            guest_ip(&inst.id)?,
+            &asterism_hyperv::mac_for(&inst.name),
+        )))
     }
 
     fn prepare(&self, req: &BootReq) -> Result<Prepared> {
@@ -408,10 +424,30 @@ fn console_pipe(system_id: &str) -> String {
     format!(r"\\.\pipe\asterism-{system_id}-console")
 }
 
-fn guest_ip(endpoint_id: &str) -> Result<IpAddr> {
-    let bytes = asterism_hyperv::parse_guid(endpoint_id)?;
+fn guest_ip(identity_id: &str) -> Result<IpAddr> {
+    let bytes = asterism_hyperv::parse_guid(identity_id)?;
     let host = (u16::from_be_bytes([bytes[14], bytes[15]]) % 4093) + 2;
     Ok(Ipv4Addr::new(172, 29, 64 + (host >> 8) as u8, host as u8).into())
+}
+
+fn network_config(address: IpAddr, mac: &str) -> String {
+    format!(
+        "version: 2\n\
+         ethernets:\n\
+         \x20 eth0:\n\
+         \x20   match:\n\
+         \x20     macaddress: \"{mac}\"\n\
+         \x20   set-name: eth0\n\
+         \x20   addresses:\n\
+         \x20     - {address}/20\n\
+         \x20   routes:\n\
+         \x20     - to: default\n\
+         \x20       via: 172.29.64.1\n\
+         \x20   nameservers:\n\
+         \x20     addresses:\n\
+         \x20       - 1.1.1.1\n\
+         \x20       - 8.8.8.8\n"
+    )
 }
 
 fn instance_dir(disk: &Path) -> Result<&Path> {
@@ -432,6 +468,10 @@ mod tests {
         assert_eq!(address.octets()[..2], [172, 29]);
         assert!((64..=79).contains(&address.octets()[2]));
         assert_ne!(address, Ipv4Addr::new(172, 29, 64, 1));
+        let config = network_config(address.into(), "02:15:5d:01:02:03");
+        assert!(config.contains("macaddress: \"02:15:5d:01:02:03\""));
+        assert!(config.contains(&format!("- {address}/20")));
+        assert!(config.contains("via: 172.29.64.1"));
     }
 
     #[test]
