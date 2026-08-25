@@ -335,7 +335,13 @@ fn requirements(instance: &Instance) -> RebindRequirements {
 /// boundary: a future sidecar does not become portable merely by appearing.
 fn durable_files(instance_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    for name in ["disk.raw", "disk.qcow2", "efi-vars.fd", "efi-vars.bin"] {
+    for name in [
+        "disk.raw",
+        "disk.qcow2",
+        "disk.vhdx",
+        "efi-vars.fd",
+        "efi-vars.bin",
+    ] {
         let path = instance_dir.join(name);
         if path.is_file() {
             files.push(path);
@@ -346,7 +352,12 @@ fn durable_files(instance_dir: &Path) -> Result<Vec<PathBuf>> {
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
-            if path.is_file() && path.extension().is_some_and(|ext| ext == "raw") {
+            if path.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| matches!(ext, "raw" | "qcow2" | "vhdx"))
+            {
                 files.push(path);
             }
         }
@@ -695,6 +706,41 @@ mod tests {
             std::fs::read(restore.join("disk.raw")).unwrap()
         );
         assert!(!restore.join("seed.iso").exists());
+    }
+
+    #[test]
+    fn hyperv_disk_and_backend_formatted_snapshots_are_portable() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("instance");
+        let backup = temp.path().join("backup");
+        let restore = temp.path().join("restore");
+        std::fs::create_dir_all(source.join("snapshots")).unwrap();
+        std::fs::write(source.join("disk.vhdx"), b"hyper-v root").unwrap();
+        std::fs::write(source.join("snapshots/clean.vhdx"), b"hyper-v snapshot").unwrap();
+        std::fs::write(source.join("snapshots/legacy.raw"), b"legacy snapshot").unwrap();
+
+        let mut inst = instance("windows-dev");
+        inst.machine.backend = "hyperv".into();
+        export(&inst, &source, &backup, None).unwrap();
+        let manifest = verify(&backup).unwrap();
+        let paths: Vec<&str> = manifest
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert!(paths.contains(&"disk.vhdx"));
+        assert!(paths.contains(&"snapshots/clean.vhdx"));
+        assert!(paths.contains(&"snapshots/legacy.raw"));
+
+        restore_to(&backup, &restore, "windows-dev").unwrap();
+        assert_eq!(
+            std::fs::read(restore.join("disk.vhdx")).unwrap(),
+            b"hyper-v root"
+        );
+        assert_eq!(
+            std::fs::read(restore.join("snapshots/clean.vhdx")).unwrap(),
+            b"hyper-v snapshot"
+        );
     }
 
     #[test]

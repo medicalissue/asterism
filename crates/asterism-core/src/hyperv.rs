@@ -407,12 +407,10 @@ impl HostReady {
                 expected_build
             );
         }
-        if !self.edition.contains("Pro") && !self.edition.contains("Enterprise") {
-            bail!(
-                "the native Hyper-V backend needs Windows 11 Pro or Enterprise; this is {}",
-                self.edition
-            );
-        }
+        // Edition is diagnostic metadata, not a capability. Microsoft ships
+        // the supported Hyper-V host role on Pro/Enterprise; an experimental
+        // Home installation is accepted only when the same HCS/HCN service
+        // probes below actually pass.
         let build = self
             .windows
             .rsplit('.')
@@ -560,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_host_is_rejected_before_mutation() {
+    fn a_home_sku_with_real_hcs_capabilities_is_accepted() {
         let host = HostReady {
             protocol: PROTOCOL_VERSION,
             build: build_id(),
@@ -570,11 +568,7 @@ mod tests {
             hcs_running: true,
             hcn_running: true,
         };
-        assert!(host
-            .require_supported()
-            .unwrap_err()
-            .to_string()
-            .contains("Pro or Enterprise"));
+        host.require_supported().unwrap();
     }
 
     #[test]

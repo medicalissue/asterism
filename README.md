@@ -156,8 +156,9 @@ operations across the mesh.
 See [Compute placement](docs/compute-placement.md) for the architecture and
 compatibility contract.
 
-- **Compute** comes from one device: CPU, physical RAM, and VM/container
-  execution state move together. `--cpus` and `--mem` are quotas on that
+- **Compute** comes from one device: CPU, physical RAM, and execution state
+  move together. Hypervisor and namespace adapters are internal placement
+  details; both appear and behave as an Instance. `--cpus` and `--mem` are quotas on that
   selected compute device, not separately placeable resources. Move compute
   offline without changing the instance's name or identity; its root disk and
   snapshots transfer peer-to-peer as part of the move.

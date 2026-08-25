@@ -400,19 +400,17 @@ pub fn authenticode_ok(
 fn windows_checks() -> Vec<Check> {
     let mut checks = Vec::new();
     let info = host_info();
-    checks.push(
-        if info.edition.contains("Pro") || info.edition.contains("Enterprise") {
-            Check::pass("edition", format!("{} {}", info.edition, info.windows))
-        } else {
-            Check::fail(
-                "edition",
-                format!(
-                    "Windows 11 Pro or Enterprise is required; this is {}",
-                    info.edition
-                ),
-            )
-        },
-    );
+    checks.push(if info.edition.contains("Pro") || info.edition.contains("Enterprise") {
+        Check::pass("edition", format!("{} {}", info.edition, info.windows))
+    } else {
+        Check::pass(
+            "edition",
+            format!(
+                "{} {} — experimental host; Microsoft does not support the Hyper-V role on this SKU, so Asterism requires the real HCS/HCN probes below",
+                info.edition, info.windows
+            ),
+        )
+    });
     let build = info
         .windows
         .rsplit('.')
@@ -567,7 +565,8 @@ fn os_version() -> String {
 #[cfg(windows)]
 fn product_edition() -> String {
     // Registry is the documented product-name source and does not require
-    // GetProductInfo's SKU table. Home vs Pro vs Enterprise is the gate.
+    // GetProductInfo's SKU table. Edition is reported for support context;
+    // the HCS/HCN probes below are the actual execution gate.
     match read_reg_sz(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", "EditionID") {
         Some(id) => {
             let pretty = read_reg_sz(

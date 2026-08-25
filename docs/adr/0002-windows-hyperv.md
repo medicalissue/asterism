@@ -42,7 +42,7 @@ the helper does not stop or orphan the guest. HCS configuration sets
 
 | Concern | Owner | Pinned API/schema |
 |---|---|---|
-| availability and mutation gate | helper | Windows 11 Pro/Enterprise; `vmcompute` and `hns` services; elevation; HCS service properties |
+| availability and mutation gate | helper | Windows build 22000+; `vmcompute` and `hns` services; elevation; HCS service properties. Home is experimental and capability-gated, not advertised as Microsoft-supported. |
 | VM lifecycle and adoption | helper HCS adapter | ComputeCore/HCS v2.1: create, open, start, properties, shutdown, terminate, save |
 | network | helper HCN adapter | ComputeNetwork/HCN v2: create/open/delete one private NAT network per device and one endpoint per VM |
 | boot/storage devices | HCS configuration | Generation 2 UEFI, synthetic SCSI, synthetic NIC, serial console, built-in devices only |
@@ -111,16 +111,19 @@ to independently assert what the direct API created.
 
 The supported client floor is Windows 11 Pro or Enterprise, build 22000 or
 newer, x86-64 or arm64, with SLAT, VM monitor extensions, DEP, and firmware
-virtualization. Windows Home is unsupported. Hyper-V and Containers optional
-features must already be enabled and the host must have rebooted. The daemon
-must be elevated or run under an account delegated equivalent access; the
-initial implementation requires membership in local Administrators and emits
-that requirement rather than attempting elevation.
+virtualization. Windows Home is an experimental, user-enabled path because
+Microsoft does not support the Hyper-V host role on that SKU. Asterism does
+not treat the SKU string as proof either way: mutation is allowed only when
+the same HCS/HCN services and direct API probes required on supported editions
+really pass. Hyper-V must be enabled and the host must have rebooted. The
+daemon must be elevated or run under an account delegated equivalent access;
+the initial implementation requires membership in local Administrators and
+emits that requirement rather than attempting elevation.
 
 `probe` is read-only and ordered before every mutation:
 
 1. reject a non-Windows host;
-2. reject an unsupported product edition/build;
+2. reject an unsupported Windows build (record the edition for diagnostics);
 3. reject a non-elevated token;
 4. reject disabled or pending-reboot Hyper-V/HCS/HCN services;
 5. query HCS service properties and HCN API availability;
@@ -145,7 +148,7 @@ ordering. Windows CI compiles every Windows-only helper adapter against the
 pinned SDK bindings, while the host-neutral daemon seam remains in the common
 workspace/conformance lanes; a static gate (POSIX python3 or PowerShell,
 not `rg`) rejects QEMU/WHPX/PowerShell paths inside the helper and Windows
-API leakage into the daemon. A dedicated elevated Windows 11 Pro/Enterprise
+API leakage into the daemon. A dedicated elevated Windows host
 real-host harness (`scripts/hyperv-real-host-harness.ps1`, opt-in via
 `ASTERISM_HYPERV_REAL_HOST=1`) is the only evidence accepted for VM creation,
 Linux boot, Hyper-V Socket readiness, daemon-restart adoption, stop/restart,
@@ -156,9 +159,10 @@ Datacenter without nested Hyper-V, so create/boot/control/snapshot/restart/
 adoption/stop of a real Linux guest remain **unverified** even when the
 source, cross-compile, and protocol lanes are green.
 
-As of this decision's commit, no Windows host evidence has been recorded.
-Those real-host claims must remain marked **unverified**, even if cross-compile
-and mocked conformance are green. The harness writes an evidence directory
+Windows Home evidence must be labelled experimental, including the exact SKU,
+feature/service states, and whether installation used an unsupported
+servicing-package workaround. It cannot promote the Home path to Microsoft's
+supported matrix. The harness writes an evidence directory
 with OS edition/build, feature/service state, helper build ID, each operation's
 result, and the final absence of Asterism-owned HCS/HCN objects.
 

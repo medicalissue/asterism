@@ -1,7 +1,8 @@
 //! Disk snapshots.
 //!
 //! A snapshot is a copy-on-write clone of the instance's root disk, taken
-//! while it is stopped, living in `instances/<name>/snapshots/<tag>.raw`.
+//! while it is stopped, living in
+//! `instances/<name>/snapshots/<tag>.<disk-format>`.
 //! On APFS the clone costs nothing until the two diverge, so this is as
 //! cheap as the qcow2 internal snapshots it replaces and, unlike them, it
 //! works on a raw disk — which is what every instance now has, because
@@ -107,10 +108,9 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 
 // ---- file snapshots --------------------------------------------------------
 
-/// Suffix every snapshot file carries. They are disk images, and naming
-/// them as such is what lets anything else — another backend, `qemu-img`,
-/// a human — make sense of one.
-const SUFFIX: &str = ".raw";
+/// Formats used by Asterism backends. The extension is part of the portable
+/// contract: a Hyper-V VHDX must never be advertised as raw bytes.
+const DISK_EXTENSIONS: &[&str] = &["raw", "qcow2", "vhdx"];
 
 /// Where an instance's snapshots live, given its directory.
 pub fn dir(instance_dir: &Path) -> PathBuf {
@@ -121,7 +121,44 @@ pub fn dir(instance_dir: &Path) -> PathBuf {
 /// talked into pointing outside the snapshots directory.
 pub fn path(instance_dir: &Path, tag: &str) -> Result<PathBuf> {
     validate_tag(tag)?;
-    Ok(dir(instance_dir).join(format!("{tag}{SUFFIX}")))
+    Ok(dir(instance_dir).join(format!("{tag}.raw")))
+}
+
+/// The path for a new snapshot, preserving the root disk's actual format.
+pub fn path_for_disk(instance_dir: &Path, disk: &Path, tag: &str) -> Result<PathBuf> {
+    validate_tag(tag)?;
+    let extension = disk
+        .extension()
+        .and_then(|value| value.to_str())
+        .filter(|value| DISK_EXTENSIONS.contains(value))
+        .with_context(|| {
+            format!(
+                "cannot snapshot {}: its disk format is not raw, qcow2, or vhdx",
+                disk.display()
+            )
+        })?;
+    Ok(dir(instance_dir).join(format!("{tag}.{extension}")))
+}
+
+/// Locate an existing snapshot without guessing its byte format. Old raw
+/// snapshots remain readable, while a duplicate tag with different formats
+/// is rejected as ambiguous instead of selecting whichever directory entry
+/// happened to be returned first.
+fn existing_path(instance_dir: &Path, tag: &str) -> Result<Option<PathBuf>> {
+    validate_tag(tag)?;
+    let matches: Vec<PathBuf> = DISK_EXTENSIONS
+        .iter()
+        .map(|extension| dir(instance_dir).join(format!("{tag}.{extension}")))
+        .filter(|candidate| candidate.is_file())
+        .collect();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [only] => Ok(Some(only.clone())),
+        _ => bail!(
+            "snapshot {tag:?} is ambiguous: more than one disk format exists in {}",
+            dir(instance_dir).display()
+        ),
+    }
 }
 
 /// Clone the stopped root disk into a new snapshot.
@@ -130,8 +167,8 @@ pub fn path(instance_dir: &Path, tag: &str) -> Result<PathBuf> {
 /// otherwise): a clone taken under a running guest would capture a disk
 /// mid-write, exactly as `qemu-img snapshot -c` would have.
 pub fn take(instance_dir: &Path, disk: &Path, tag: &str) -> Result<SnapshotId> {
-    let target = path(instance_dir, tag)?;
-    if target.exists() {
+    let target = path_for_disk(instance_dir, disk, tag)?;
+    if existing_path(instance_dir, tag)?.is_some() {
         bail!("snapshot {tag:?} already exists");
     }
     let how = cow::clone_file(disk, &target).with_context(|| format!("taking snapshot {tag:?}"))?;
@@ -152,8 +189,14 @@ pub fn list(instance_dir: &Path) -> Result<Vec<Snapshot>> {
     };
     let mut rows: Vec<(u64, String, u64)> = Vec::new();
     for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(tag) = name.strip_suffix(SUFFIX) else {
+        let path = entry.path();
+        let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !DISK_EXTENSIONS.contains(&extension) {
+            continue;
+        }
+        let Some(tag) = path.file_stem().and_then(|value| value.to_str()) else {
             continue;
         };
         if validate_tag(tag).is_err() {
@@ -192,9 +235,15 @@ pub fn list(instance_dir: &Path) -> Result<Vec<Snapshot>> {
 /// snapshot itself survives the restore, so the same one can be rolled back
 /// to again.
 pub fn restore(instance_dir: &Path, disk: &Path, tag: &str) -> Result<()> {
-    let source = path(instance_dir, tag)?;
-    if !source.exists() {
-        bail!("no snapshot {tag:?}");
+    let source =
+        existing_path(instance_dir, tag)?.ok_or_else(|| anyhow::anyhow!("no snapshot {tag:?}"))?;
+    let source_extension = source.extension();
+    if source_extension != disk.extension() {
+        bail!(
+            "snapshot {tag:?} is {}, but the instance root disk is {}; refusing to relabel bytes during restore",
+            source_extension.and_then(|value| value.to_str()).unwrap_or("unknown"),
+            disk.extension().and_then(|value| value.to_str()).unwrap_or("unknown")
+        );
     }
     let staged = disk.with_extension("restoring");
     let _ = std::fs::remove_file(&staged);
@@ -227,10 +276,8 @@ pub fn restore(instance_dir: &Path, disk: &Path, tag: &str) -> Result<()> {
 /// restore is building is not finished, and the bytes it is copying from
 /// are the only copy of what it is building.
 pub fn remove(instance_dir: &Path, tag: &str) -> Result<()> {
-    let target = path(instance_dir, tag)?;
-    if !target.exists() {
-        bail!("no snapshot {tag:?}");
-    }
+    let target =
+        existing_path(instance_dir, tag)?.ok_or_else(|| anyhow::anyhow!("no snapshot {tag:?}"))?;
     if restoring(instance_dir).as_deref() == Some(tag) {
         bail!(
             "snapshot {tag:?} is being restored right now — the disk is halfway \
@@ -394,6 +441,36 @@ mod tests {
         let root = dir.path().to_owned();
         std::fs::remove_dir_all(&root).unwrap();
         assert!(!root.exists());
+    }
+
+    #[test]
+    fn a_snapshot_keeps_the_root_disks_real_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = dir.path().join("disk.vhdx");
+        std::fs::write(&disk, b"hyper-v bytes").unwrap();
+
+        take(dir.path(), &disk, "clean").unwrap();
+        assert!(dir.path().join("snapshots/clean.vhdx").exists());
+        assert!(!dir.path().join("snapshots/clean.raw").exists());
+        assert_eq!(list(dir.path()).unwrap()[0].tag, "clean");
+
+        std::fs::write(&disk, b"changed").unwrap();
+        restore(dir.path(), &disk, "clean").unwrap();
+        assert_eq!(std::fs::read(&disk).unwrap(), b"hyper-v bytes");
+    }
+
+    #[test]
+    fn restore_refuses_to_relabel_a_different_disk_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("disk.raw");
+        let vhdx = dir.path().join("disk.vhdx");
+        std::fs::write(&raw, b"raw bytes").unwrap();
+        std::fs::write(&vhdx, b"vhdx bytes").unwrap();
+        take(dir.path(), &raw, "clean").unwrap();
+
+        let error = restore(dir.path(), &vhdx, "clean").unwrap_err().to_string();
+        assert!(error.contains("refusing to relabel bytes"), "{error}");
+        assert_eq!(std::fs::read(&vhdx).unwrap(), b"vhdx bytes");
     }
 
     #[test]

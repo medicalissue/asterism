@@ -1,8 +1,9 @@
 # Compute placement
 
 Compute is one placement unit. At any moment an instance's compute comes from
-one orbit device. That device supplies CPU, physical RAM, and VM/container
-execution state together.
+one orbit device. That device supplies CPU, physical RAM, and execution state
+together. Hypervisor and namespace adapters are internal placement details;
+both appear and behave as an Instance.
 
 GPU, storage, network, and exit points are independent parts and may attach
 from other devices. Asterism does not present CPU and physical RAM from
