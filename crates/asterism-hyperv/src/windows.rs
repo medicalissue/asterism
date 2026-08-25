@@ -261,9 +261,25 @@ fn shutdown(system_id: &str, timeout_ms: u32) -> Result<()> {
     let Some(system) = ComputeSystem::open(system_id)? else {
         return Ok(());
     };
-    hcs_action(&system, "requesting HCS shutdown", |operation| unsafe {
-        HcsShutDownComputeSystem(system.0, operation, null())
-    })?;
+    let operation = Operation::new()?;
+    let hr = unsafe { HcsShutDownComputeSystem(system.0, operation.0, null()) };
+    // Stock Linux cloud images do not always expose the Hyper-V graceful
+    // shutdown integration service. HCS reports that as Win32
+    // ERROR_NOT_SUPPORTED, but the compute system is still fully
+    // terminable. `ast down` is an outcome contract, so fall back to the
+    // same bounded termination used after a graceful-shutdown timeout.
+    const HCS_SHUTDOWN_NOT_SUPPORTED: HRESULT = 0x8007_0032u32 as i32;
+    if hr == HCS_SHUTDOWN_NOT_SUPPORTED {
+        return hcs_action(
+            &system,
+            "terminating HCS compute system",
+            |operation| unsafe { HcsTerminateComputeSystem(system.0, operation, null()) },
+        );
+    }
+    if failed(hr) {
+        bail!("requesting HCS shutdown: {}", hresult(hr, null_mut()));
+    }
+    operation.wait("requesting HCS shutdown")?;
     let mut result: PWSTR = null_mut();
     let hr = unsafe { HcsWaitForComputeSystemExit(system.0, timeout_ms, &mut result) };
     if failed(hr) {
