@@ -159,6 +159,20 @@ function Invoke-Ast([string[]]$CommandArgs) {
 }
 
 $asterismHome = if ($env:ASTERISM_HOME) { $env:ASTERISM_HOME } elseif ($env:USERPROFILE) { Join-Path $env:USERPROFILE ".asterism" } else { Join-Path $env:HOME ".asterism" }
+$createdHarnessHome = -not (Test-Path -LiteralPath $asterismHome)
+if ($createdHarnessHome) {
+    New-Item -ItemType Directory -Path $asterismHome | Out-Null
+    # An elevated token defaults new directories to BUILTIN\Administrators as
+    # owner. The named-pipe contract intentionally admits the interactive
+    # account plus LocalSystem, so make that identity explicit just as the
+    # Windows installer and conformance fixture do.
+    $account = (& whoami.exe).Trim()
+    & icacls.exe $asterismHome /setowner $account /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "failed to set ASTERISM_HOME owner to $account" }
+    $accountAce = "${account}:(OI)(CI)(F)"
+    & icacls.exe $asterismHome /inheritance:r /grant:r $accountAce "*S-1-5-18:(OI)(CI)(F)" /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "failed to protect ASTERISM_HOME for $account and LocalSystem" }
+}
 $configPath = Join-Path $asterismHome "instances\$Instance\hyperv.json"
 $daemonPidPath = Join-Path $asterismHome "astd.pid"
 $systemId = $null
