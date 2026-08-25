@@ -49,9 +49,13 @@ fn main() -> Result<()> {
         .launch_vector_add(lhs, rhs, output, 3, 7)
         .map_err(gpu_error)?;
     let bytes = cuda.read(output, 0, 12, 8).map_err(gpu_error)?;
-    let values = bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four bytes")))
+    let (chunks, remainder) = bytes.as_chunks::<4>();
+    if !remainder.is_empty() {
+        bail!("CUDA vector-add returned a truncated f32 payload");
+    }
+    let values = chunks
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect::<Vec<_>>();
 
     cuda.zeroize_and_free(lhs, 12);
