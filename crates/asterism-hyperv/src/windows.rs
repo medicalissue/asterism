@@ -531,18 +531,28 @@ fn materialize_vhdx(source: &Path, dest: &Path, size_bytes: u64) -> Result<()> {
             .position(|unit| *unit == 0)
             .unwrap_or((size as usize).min(buffer.len()));
         let physical = String::from_utf16(&buffer[..end])?;
-        let mut source_file = std::fs::File::open(source)?;
+        let mut source_file = std::fs::File::open(source)
+            .with_context(|| format!("opening raw image {}", source.display()))?;
         let mut target = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&physical)
             .with_context(|| format!("opening attached VHDX device {physical}"))?;
-        target.seek(SeekFrom::Start(0))?;
-        let copied = io::copy(&mut source_file, &mut target)?;
+        target
+            .seek(SeekFrom::Start(0))
+            .with_context(|| format!("seeking attached VHDX device {physical}"))?;
+        let copied = io::copy(&mut source_file, &mut target).with_context(|| {
+            format!(
+                "copying raw image {} into attached VHDX device {physical}",
+                source.display()
+            )
+        })?;
         if copied != source_len {
             bail!("raw-to-VHDX copy stopped at {copied} of {source_len} bytes");
         }
-        target.sync_all()?;
+        target
+            .sync_all()
+            .with_context(|| format!("flushing attached VHDX device {physical}"))?;
         Ok(())
     })();
     let detach = unsafe { DetachVirtualDisk(disk.0, 0, 0) };
