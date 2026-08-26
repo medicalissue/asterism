@@ -1457,6 +1457,28 @@ pub fn bring_up(inst: &Instance, hv: &dyn Hypervisor, boot_intent_id: &str) -> R
     })
 }
 
+/// Refuse an impossible storage boot before the caller writes its durable
+/// guest-launch fence.
+///
+/// `bring_up` repeats these checks immediately before lease mutation because
+/// reachability can change. This earlier pass has a different job: an owner
+/// already known to be absent must leave the Instance byte-for-byte stopped,
+/// not create a boot intent whose compensation then needs that same absent
+/// owner to answer.
+pub fn preflight_boot(inst: &Instance, hv: &dyn Hypervisor) -> Result<()> {
+    let blocks: Vec<Volume> = inst
+        .volumes
+        .iter()
+        .filter(|volume| volume.is_block())
+        .cloned()
+        .collect();
+    if blocks.is_empty() {
+        return Ok(());
+    }
+    check_backend(hv)?;
+    tokio::runtime::Handle::current().block_on(preflight_all(&blocks))
+}
+
 /// Prove that every established remote block device still has a measurable
 /// direct path before any boot-side mutation begins.
 ///
@@ -2041,7 +2063,11 @@ async fn ask_authority(
 /// capability, never on which backend it is. VZ and Cloud Hypervisor both
 /// implement this seam; QEMU remains an optional compatibility consumer.
 pub fn check_backend(hv: &dyn Hypervisor) -> Result<()> {
-    if hv.probe().is_ok() && !hv.caps().nbd_disks {
+    // Capability belongs to the backend contract recorded on the Instance,
+    // not to whether that backend can be started on this particular host at
+    // this moment. Probe-gating this would persist an impossible disk on a
+    // machine without the helper and discover the lie only at boot.
+    if !hv.caps().nbd_disks {
         bail!(
             "the {} backend cannot attach a block volume because it has no Unix NBD disk \
              capability",
@@ -2228,22 +2254,44 @@ async fn splice_one(
         .as_ref()
         .context("this daemon has no mesh endpoint, so it cannot reach a remote volume")?;
     let vol = Volume::block(volume, device, epoch, 0);
-    let opened = mesh
-        .open_volume_splice(device, volume, holder, holder_id, epoch)
-        .await;
-    let (remote, observation) = match opened {
-        Ok(opened) => opened,
-        Err(e) => {
-            mark_degraded(
-                holder,
-                &vol,
-                "provider_loss",
-                format!("provider connection failed: {e:#}"),
-                None,
-                None,
-            )
-            .await;
-            return Err(e);
+    // QEMU reconnects its unix NBD client after a provider-side stream dies.
+    // Accepting that retry and immediately closing it because the peer daemon
+    // is still inside its sub-second startup race turns a recoverable pause
+    // into guest-visible EIO. Keep this one accepted connection open while a
+    // transport failure can still become true, but never retry an
+    // authoritative lease/holder refusal. The window stays below QEMU's
+    // 30-second NBD open timeout.
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let (remote, observation) = loop {
+        match mesh
+            .open_volume_splice(device, volume, holder, holder_id, epoch)
+            .await
+        {
+            Ok(opened) => break opened,
+            Err(e) if retryable_splice_transport(&e) && Instant::now() < deadline => {
+                mark_degraded(
+                    holder,
+                    &vol,
+                    "provider_loss",
+                    format!("provider connection is recovering: {e:#}"),
+                    None,
+                    None,
+                )
+                .await;
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(e) => {
+                mark_degraded(
+                    holder,
+                    &vol,
+                    "provider_loss",
+                    format!("provider connection failed: {e:#}"),
+                    None,
+                    None,
+                )
+                .await;
+                return Err(e);
+            }
         }
     };
     let session = mark_session_ready(holder, &vol, observation).await;
@@ -2273,6 +2321,26 @@ async fn splice_one(
             Err(e)
         }
     }
+}
+
+/// Only reachability failures may consume the bounded reconnect window.
+/// Provider replies about epochs, holders, protocol or authorization are
+/// decisions and must reach QEMU immediately rather than being retried as if
+/// another quarter-second could change them.
+fn retryable_splice_transport(error: &anyhow::Error) -> bool {
+    let report = format!("{error:#}").to_ascii_lowercase();
+    [
+        "timed out",
+        "connection lost",
+        "connection refused",
+        "no route",
+        "unreachable",
+        "failed to dial",
+        "could not reach",
+        "not answering",
+    ]
+    .iter()
+    .any(|needle| report.contains(needle))
 }
 
 async fn mark_session_ready(
@@ -2334,15 +2402,37 @@ mod tests {
     use std::io::Read;
     use std::os::unix::net::{UnixListener, UnixStream};
 
+    #[test]
+    fn reconnect_retries_transport_loss_but_not_storage_authority() {
+        assert!(retryable_splice_transport(&anyhow::anyhow!(
+            "connection lost: timed out"
+        )));
+        assert!(retryable_splice_transport(&anyhow::anyhow!(
+            "could not reach device: connection refused"
+        )));
+        assert!(!retryable_splice_transport(&anyhow::anyhow!(
+            "volume tank is held by another instance at epoch 9"
+        )));
+        assert!(!retryable_splice_transport(&anyhow::anyhow!(
+            "device answered with an incompatible storage protocol"
+        )));
+    }
+
     /// A backend that says what we tell it to about NBD, so the refusal can
     /// be tested without either real hypervisor being installed.
-    struct Fake(bool);
+    struct Fake {
+        nbd: bool,
+        probe: bool,
+    }
 
     impl Hypervisor for Fake {
         fn id(&self) -> &'static str {
             "vz"
         }
         fn probe(&self) -> Result<asterism_core::hv::Ready> {
+            if !self.probe {
+                anyhow::bail!("backend is absent on this test host");
+            }
             Ok(asterism_core::hv::Ready {
                 version: "15.6".into(),
                 accel: "vz".into(),
@@ -2357,7 +2447,7 @@ mod tests {
                 live_migration: false,
                 disk_hotplug: false,
                 shared_dir: None,
-                nbd_disks: self.0,
+                nbd_disks: self.nbd,
                 foreign_arch: false,
                 direct_kernel: false,
                 port_forward: false,
@@ -2391,10 +2481,29 @@ mod tests {
     /// sentence rather than through a backend-specific failure.
     #[test]
     fn a_backend_without_an_nbd_client_refuses_in_words() {
-        let err = check_backend(&Fake(false)).unwrap_err().to_string();
+        let err = check_backend(&Fake {
+            nbd: false,
+            probe: true,
+        })
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("has no Unix NBD disk capability"), "{err}");
         assert!(err.contains("vz"), "{err}");
-        assert!(check_backend(&Fake(true)).is_ok());
+        assert!(check_backend(&Fake {
+            nbd: true,
+            probe: true,
+        })
+        .is_ok());
+
+        let absent = Fake {
+            nbd: false,
+            probe: false,
+        };
+        assert!(absent.probe().is_err());
+        assert!(
+            check_backend(&absent).is_err(),
+            "an absent helper must not bypass the recorded capability"
+        );
     }
 
     #[test]

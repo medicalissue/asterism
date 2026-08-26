@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# End-to-end for OCI images as an instance source (MODEL.md: container
-# images are an image SOURCE, booted as microVMs).
+# End-to-end for OCI images as an instance source (MODEL.md: OCI is an image
+# source, and every resulting Instance boots as a VM/microVM).
 #
 # Two shapes of image, because they fail differently:
 #
@@ -32,6 +32,8 @@ WEB=oci-web
 ONESHOT=oci-once
 VOL="$ASTERISM_HOME/oci-volume"
 VOL_MARKER="oci-volume-$$"
+VOL_GUEST_MARKER="oci-guest-volume-$$"
+PROFILE_TIMEOUT="${E2E_PROFILE_TIMEOUT:-180}"
 
 mkdir -p "$ASTERISM_HOME/images"
 # Reuse an already-built store instead of re-pulling half of Docker Hub. The
@@ -96,7 +98,9 @@ refuse() {
 
 # `nginx` with no registry and no tag: docker.io/library/nginx:latest.
 expect "create from a bare docker hub name" "$WEB  defined" \
-  "$AST" create "$WEB" --image nginx -p "$PORT:80" --mem 1G --disk 10G
+  "$AST" create "$WEB" --image nginx -p "$PORT:80" --mem 1G --disk 10G --profile base
+
+expect "the OCI instance records its profile" "base" "$AST" profile "$WEB"
 
 expect "status names the source" "oci rootfs, direct kernel boot" \
   "$AST" status "$WEB"
@@ -135,6 +139,34 @@ echo "ok: curl 127.0.0.1:$PORT returned the nginx welcome page (${served}s after
 expect "the generated init mounted the directory" "$VOL_MARKER" \
   curl -sS --max-time 2 "http://127.0.0.1:$PORT/volume/marker.txt"
 
+expect "guest control writes through the mounted directory" "$VOL_GUEST_MARKER" \
+  "$AST" exec "$WEB" -- /bin/sh -c \
+    "printf '%s\\n' '$VOL_GUEST_MARKER' >/usr/share/nginx/html/volume/guest.txt && cat /usr/share/nginx/html/volume/guest.txt"
+grep -qF "$VOL_GUEST_MARKER" "$VOL/guest.txt" \
+  || fail "the guest write did not reach the host directory"
+echo "ok: the host sees the guest's directory-volume write"
+
+# OCI rootfs guests have no SSH server. Their verifier must therefore travel
+# over authenticated guest control, while the profile itself treats sshd's
+# keepalive as inapplicable rather than as a missing feature of the machine.
+echo "waiting up to ${PROFILE_TIMEOUT}s for the OCI base profile ..."
+deadline=$(( $(date +%s) + PROFILE_TIMEOUT ))
+profile_report=
+while :; do
+  if profile_report="$("$AST" profile "$WEB" --check 2>&1)"; then break; fi
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    echo "$profile_report"
+    fail "the OCI base profile did not become ready"
+  fi
+  sleep 5
+done
+for needle in "ok    git" "ok    tmux" "not applicable (guest control)" \
+              "this guest is ready"; do
+  grep -qF "$needle" <<<"$profile_report" \
+    || fail "the OCI profile verifier did not report '$needle':"$'\n'"$profile_report"
+done
+echo "ok: the OCI profile applies and verifies over guest control"
+
 # The console is the whole of an OCI instance's output, so it has to carry
 # the image's own startup as well as the kernel's.
 expect "logs show the entrypoint" "/docker-entrypoint.sh" "$AST" logs "$WEB" -n 400
@@ -163,6 +195,8 @@ for _ in $(seq 1 40); do
 done
 [ -n "$again" ] || fail "nginx did not come back after down/up"
 echo "ok: serving again after down/up"
+expect "the OCI profile still verifies after restart" "this guest is ready" \
+  "$AST" profile "$WEB" --check
 
 expect "down 2" "$WEB  stopped" "$AST" down "$WEB"
 expect "detach the directory" "oci-volume detached" \
@@ -196,8 +230,8 @@ echo "ok: the image's Cmd ran with no shell in the image"
 expect "it powers itself off" "exited with status 0" "$AST" logs "$ONESHOT" -n 400
 expect "and the kernel obeyed" "Power down" "$AST" logs "$ONESHOT" -n 400
 
-# Honest status: the machine is off, and it stays off — a container that
-# finished is not a crash to be restarted.
+# Honest status: the machine is off, and it stays off — a one-shot workload
+# that finished is not a crash to be restarted.
 stopped=
 for _ in $(seq 1 20); do
   out="$("$AST" status "$ONESHOT" 2>/dev/null || true)"

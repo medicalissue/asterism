@@ -136,12 +136,9 @@ pub fn image_provenance(instance: &Instance) -> Result<Option<ImageProvenance>> 
     };
     let resolved = crate::image::resolve(reference)
         .with_context(|| format!("resolving image provenance for {reference:?}"))?;
-    let record = crate::verify::verified_provenance(
-        &resolved.path,
-        &resolved.record,
-        crate::verify::Depth::Full,
-    )
-    .with_context(|| format!("verifying image provenance for {reference:?}"))?;
+    let record = resolved
+        .verified_provenance(crate::verify::Depth::Full)
+        .with_context(|| format!("verifying image provenance for {reference:?}"))?;
     Ok(Some(ImageProvenance {
         reference: reference.to_owned(),
         content: record.content.to_string(),
@@ -627,6 +624,7 @@ mod tests {
     use super::*;
     use crate::hv::Machine;
     use crate::instance::{Shape, Volume};
+    use crate::secret::{Binding, GuestHandle, HandleShape, SecretId};
 
     fn instance(name: &str) -> Instance {
         Instance::new(
@@ -663,6 +661,23 @@ mod tests {
         let mut inst = instance("dev");
         inst.volumes
             .push(Volume::dir("/private/data", "old-device", None));
+        let guest_handle = GuestHandle::mint(HandleShape::Opaque);
+        let guest_handle_text = guest_handle.as_str().to_owned();
+        inst.secrets.push(Binding {
+            id: "binding-1".into(),
+            secret_id: SecretId::from_name("api").unwrap(),
+            secret: "api".into(),
+            authority: "api.example.com:443".into(),
+            placement: Placement::Authorization {
+                scheme: "Bearer".into(),
+            },
+            guest_handle,
+            env: "API_TOKEN".into(),
+            source_device_id: "source-id".into(),
+            source_device: "source".into(),
+            version: 1,
+            bound_at: 1,
+        });
         inst.gpu = Some(GpuAttachment {
             provider_device: "gpu-box".into(),
             provider_device_id: "a".repeat(64),
@@ -685,8 +700,12 @@ mod tests {
         assert!(!text.contains("SECRET"));
         assert!(!text.contains("agent.key"));
         assert!(!text.contains("seed.iso"));
+        assert!(!text.contains(&guest_handle_text));
         assert!(manifest.instance.volumes.is_empty());
         assert_eq!(manifest.rebind.volumes.len(), 1);
+        assert!(manifest.instance.secrets.is_empty());
+        assert_eq!(manifest.rebind.secrets.len(), 1);
+        assert_eq!(manifest.rebind.secrets[0].secret, "api");
         assert!(manifest.instance.gpu.is_none());
         assert_eq!(
             manifest.rebind.gpu.as_ref().unwrap().provider_gpu_uuid,

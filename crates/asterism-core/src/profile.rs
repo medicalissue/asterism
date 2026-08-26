@@ -333,7 +333,7 @@ fn quote(value: &str) -> String {
 /// ever needs and nobody should have to remember its flags.
 const BASE: Profile = Profile {
     name: "base",
-    version: 1,
+    version: 2,
     summary: "git, tmux, curl, jq — and a session that survives a dropped connection",
     requires: &[],
     packages: &[Packages {
@@ -416,7 +416,8 @@ const BASE: Profile = Profile {
         },
         Check {
             what: "ssh keepalive",
-            probe: "sshd -T 2>/dev/null | grep '^clientaliveinterval'",
+            probe: "if command -v sshd >/dev/null 2>&1; then sshd -T 2>/dev/null | grep \
+                    '^clientaliveinterval'; else echo 'not applicable (guest control)'; fi",
             remedy: "sshd is not reading /etc/ssh/sshd_config.d — a dropped connection may \
                      take an hour to be noticed; add ClientAliveInterval 30 to \
                      /etc/ssh/sshd_config",
@@ -779,10 +780,10 @@ mod tests {
     #[test]
     fn the_stamp_names_every_profile_and_its_version() {
         let resolved = Bootstrap::resolve(&names(&["claude"])).unwrap();
-        assert_eq!(resolved.stamp(), "base@1 node@1 claude@1");
+        assert_eq!(resolved.stamp(), "base@2 node@1 claude@1");
         assert_eq!(
             Bootstrap::resolve(&names(&["base"])).unwrap().stamp(),
-            "base@1"
+            "base@2"
         );
         // Two sets that differ only in what was asked for still differ here.
         assert_ne!(
@@ -859,6 +860,23 @@ mod tests {
         assert!(PKG.contains("apk add"));
         // And an image with none of them says so instead of appearing to work.
         assert!(PKG.contains("has no apt-get, dnf or apk"));
+    }
+
+    #[test]
+    fn base_profile_treats_ssh_as_optional_for_guest_control_images() {
+        let script = Bootstrap::resolve(&names(&["base"]))
+            .unwrap()
+            .check_script();
+        assert!(script.contains("command -v sshd"), "{script}");
+        assert!(
+            script.contains("not applicable (guest control)"),
+            "{script}"
+        );
+        assert!(script.contains("sshd -T 2>/dev/null"), "{script}");
+        assert!(
+            script.contains("clientaliveinterval"),
+            "an image that does ship sshd must still verify its keepalive: {script}"
+        );
     }
 
     /// Prose in a remedy reaches a shell, and English prose has apostrophes

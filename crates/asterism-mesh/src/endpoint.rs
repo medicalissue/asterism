@@ -57,6 +57,7 @@
 //! an answer this daemon can give.
 
 use std::fmt;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use iroh::address_lookup::{DnsAddressLookup, PkarrPublisher, PkarrResolver};
@@ -249,6 +250,18 @@ impl MeshEndpoint {
         Self::bind_with(identity, mode, MeshInfra::from_env()).await
     }
 
+    /// Bind a local-only endpoint to an exact address.
+    ///
+    /// Asterism persists the first ephemeral loopback port and supplies it on
+    /// later daemon starts. With no discovery service in this mode, that
+    /// stable address is what lets paired peers find a restarted daemon.
+    pub async fn bind_local(
+        identity: &DeviceIdentity,
+        address: SocketAddr,
+    ) -> anyhow::Result<Self> {
+        Self::bind_local_with(identity, address, MeshInfra::default()).await
+    }
+
     /// Binds an endpoint to `identity` against explicitly chosen relay and
     /// discovery servers.
     ///
@@ -264,14 +277,12 @@ impl MeshEndpoint {
             // `presets::Minimal` sets only the mandatory crypto provider, so
             // the LocalOnly path adds nothing that talks to the network.
             MeshMode::LocalOnly => {
-                Endpoint::builder(presets::Minimal)
-                    .secret_key(identity.secret_key().clone())
-                    .alpns(vec![ALPN.to_vec()])
-                    .relay_mode(RelayMode::Disabled)
-                    .clear_ip_transports()
-                    .bind_addr("127.0.0.1:0")?
-                    .bind()
-                    .await?
+                return Self::bind_local_with(
+                    identity,
+                    "127.0.0.1:0".parse().expect("constant socket address"),
+                    infra,
+                )
+                .await;
             }
         };
 
@@ -283,6 +294,27 @@ impl MeshEndpoint {
                 MeshMode::Discovery => infra,
                 MeshMode::LocalOnly => MeshInfra::default(),
             },
+        })
+    }
+
+    async fn bind_local_with(
+        identity: &DeviceIdentity,
+        address: SocketAddr,
+        _infra: MeshInfra,
+    ) -> anyhow::Result<Self> {
+        let endpoint = Endpoint::builder(presets::Minimal)
+            .secret_key(identity.secret_key().clone())
+            .alpns(vec![ALPN.to_vec()])
+            .relay_mode(RelayMode::Disabled)
+            .clear_ip_transports()
+            .bind_addr(address)?
+            .bind()
+            .await?;
+        Ok(Self {
+            device_id: identity.device_id(),
+            endpoint,
+            mode: MeshMode::LocalOnly,
+            infra: MeshInfra::default(),
         })
     }
 
@@ -841,6 +873,33 @@ mod tests {
         assert!(endpoint.home_relays().is_empty());
         assert!(endpoint.online(Duration::from_millis(1)).await);
         endpoint.close().await;
+    }
+
+    #[tokio::test]
+    async fn local_mode_can_rebind_the_same_advertised_address_after_restart() {
+        let reservation = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = reservation.local_addr().unwrap();
+        drop(reservation);
+        let identity = DeviceIdentity::generate();
+
+        let first = MeshEndpoint::bind_local(&identity, address).await.unwrap();
+        assert!(first
+            .direct_addr()
+            .await
+            .unwrap()
+            .ip_addrs()
+            .any(|a| *a == address));
+        first.close().await;
+        drop(first);
+
+        let restarted = MeshEndpoint::bind_local(&identity, address).await.unwrap();
+        assert!(restarted
+            .direct_addr()
+            .await
+            .unwrap()
+            .ip_addrs()
+            .any(|a| *a == address));
+        restarted.close().await;
     }
 
     #[tokio::test]

@@ -347,13 +347,13 @@ pub fn for_handle(backend: &str) -> Result<Arc<dyn Hypervisor>> {
 /// then refuse to boot with leaves an instance that looks configured and is
 /// not. Gated on [`Caps::shared_dir`](asterism_core::hv::Caps::shared_dir)
 /// rather than on which backend it is.
-/// Only a backend we could actually ask is allowed to refuse: on a device
-/// where the hypervisor is not installed yet, `caps()` says "no sharing"
-/// because it knows nothing, and that must not turn into a refusal to
-/// record a volume the instance will be able to use once it is.
 pub fn check_can_share(inst: &Instance) -> Result<()> {
     let hv = for_instance(inst)?;
-    if hv.probe().is_ok() && hv.caps().shared_dir.is_none() {
+    // The recorded backend is the authority. A missing binary may make a
+    // supported dynamic capability temporarily unavailable, but it must not
+    // turn a backend whose contract has no share transport into permission
+    // to persist a part that can never reach the guest.
+    if hv.caps().shared_dir.is_none() {
         bail!(
             "the {} backend on this device cannot share host directories, so a \
              volume attached to {:?} could never reach the guest — the backend is \
@@ -1834,7 +1834,25 @@ mod tests {
             &asterism_core::instance::local_host(),
             None,
         ));
+        inst.machine = Machine {
+            backend: "vz".into(),
+            machine_type: "generic".into(),
+            cpu: "host".into(),
+            hv_version: "15.6.1".into(),
+        };
         assert!(check_can_share(&inst).is_ok());
+
+        // Hyper-V advertises no directory-share transport. Its native helper
+        // cannot be probed on this host, which must not make the impossible
+        // attachment look valid.
+        inst.machine = Machine {
+            backend: hyperv::ID.into(),
+            machine_type: "hcs".into(),
+            cpu: "host".into(),
+            hv_version: "test".into(),
+        };
+        let error = check_can_share(&inst).unwrap_err().to_string();
+        assert!(error.contains("cannot share host directories"), "{error}");
 
         inst.machine = Machine {
             backend: "qemu".into(),

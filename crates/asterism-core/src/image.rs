@@ -218,6 +218,20 @@ impl Resolved {
         self.pin_satisfied()
     }
 
+    /// Provenance for the artifact this device would actually boot.
+    ///
+    /// A fresh catalog pull may still be the publisher's verified qcow2;
+    /// `path` names its future raw derivative, so callers must follow the
+    /// same active-artifact choice as `boot_path` instead of assuming that
+    /// raw output already exists.
+    pub fn verified_provenance(&self, depth: Depth) -> Result<verify::Provenance> {
+        let (path, _) = self.boot_path()?;
+        let record = self.active_record();
+        let provenance = verify::verified_provenance(path, &record, depth)?;
+        self.pin_satisfied()?;
+        Ok(provenance)
+    }
+
     /// The store is holding the bytes *this reference* asked for, and not
     /// merely something that is internally consistent.
     ///
@@ -1906,6 +1920,9 @@ mod tests {
         assert_eq!(boot, staging);
         assert_eq!(format, DiskFormat::Qcow2);
         r.verify_bootable().unwrap();
+        let provenance = r.verified_provenance(Depth::Full).unwrap();
+        assert_eq!(provenance.kind, "download");
+        assert_eq!(provenance.source, "https://mirror.example/debian.qcow2");
         assert!(
             !r.path.exists(),
             "qcow2-capable callers do not need raw output"

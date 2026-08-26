@@ -152,7 +152,8 @@ pub const KERNELS: &[GuestKernel] = &[
 ///
 /// Ubuntu builds virtiofs and the virtio-vsock transport as modules. Its
 /// cloud initrd omits them because ordinary cloud images load matching
-/// modules from their root filesystem later. Asterism may direct-boot a
+/// modules from their root filesystem later. Its 9p client is modular too,
+/// which matters to QEMU directory shares. Asterism may direct-boot a
 /// Debian disk with this Ubuntu kernel, so the root module tree is not a
 /// valid fallback. Keep the exact matching Ubuntu package pinned beside the
 /// kernel pair and retain only the small verified derivatives we load.
@@ -178,11 +179,22 @@ pub const VIRTIOFS_MODULES: &[GuestModule] = &[
     },
 ];
 
+const DIRECT_BOOT_MODULE_NAMES: &[&str] = &[
+    "virtiofs",
+    "vsock",
+    "vmw_vsock_virtio_transport_common",
+    "vmw_vsock_virtio_transport",
+];
+const NINEP_MODULE_NAMES: &[&str] = &["netfs", "9pnet", "9pnet_virtio", "9p"];
 const KERNEL_MODULE_NAMES: &[&str] = &[
     "virtiofs",
     "vsock",
     "vmw_vsock_virtio_transport_common",
     "vmw_vsock_virtio_transport",
+    "netfs",
+    "9pnet",
+    "9pnet_virtio",
+    "9p",
 ];
 
 /// One verified loadable module paired with [`kernel`].
@@ -1255,7 +1267,7 @@ pub fn init_script(config: &Config) -> String {
             gpu_boot: None,
             guest_control_boot: None,
         },
-        None,
+        &[],
     )
 }
 
@@ -1279,7 +1291,7 @@ pub struct InstanceParts<'a> {
 fn init_script_with_parts(
     config: &Config,
     parts: &InstanceParts<'_>,
-    virtiofs_module: Option<&[u8]>,
+    share_modules: &[KernelModule],
 ) -> String {
     let shares = parts.shares;
     let share_kind = parts.share_kind;
@@ -1370,31 +1382,34 @@ fn init_script_with_parts(
          \n",
     );
 
-    if let Some(module) = virtiofs_module {
-        s.push_str(
-            "# The pinned cloud kernel builds virtiofs as a module, but its\n\
+    for module in share_modules {
+        let upper = module.name.to_ascii_uppercase();
+        s.push_str(&format!(
+            "# The pinned cloud kernel builds {name} as a module, but its\n\
              # cloud initrd omits it and an OCI rootfs has no matching module tree.\n\
-             if ! $BB grep -q virtiofs /proc/filesystems; then\n\
-             \x20 if ! $BB base64 -d > /run/asterism-virtiofs.ko <<'ASTERISM_VIRTIOFS_MODULE'\n",
-        );
-        let encoded = BASE64.encode(module);
+             if [ ! -d /sys/module/{name} ]; then\n\
+             \x20 if ! $BB base64 -d > /run/asterism-{name}.ko <<'ASTERISM_{upper}_MODULE'\n",
+            name = module.name,
+        ));
+        let encoded = BASE64.encode(&module.bytes);
         for line in encoded.as_bytes().chunks(76) {
             s.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
             s.push('\n');
         }
-        s.push_str(
-            "ASTERISM_VIRTIOFS_MODULE\n\
+        s.push_str(&format!(
+            "ASTERISM_{upper}_MODULE\n\
              \x20 then\n\
-             \x20   echo 'asterism: could not materialize the virtiofs kernel module'\n\
+             \x20   echo 'asterism: could not materialize the {name} kernel module'\n\
              \x20   halt\n\
              \x20 fi\n\
-             \x20 if ! $BB insmod /run/asterism-virtiofs.ko; then\n\
-             \x20   echo 'asterism: could not load the virtiofs kernel module'\n\
+             \x20 if ! $BB insmod /run/asterism-{name}.ko; then\n\
+             \x20   echo 'asterism: could not load the {name} kernel module'\n\
              \x20   halt\n\
              \x20 fi\n\
-             \x20 $BB rm -f /run/asterism-virtiofs.ko\n\
+             \x20 $BB rm -f /run/asterism-{name}.ko\n\
              fi\n",
-        );
+            name = module.name,
+        ));
     }
 
     if !shares.is_empty() {
@@ -1588,12 +1603,15 @@ pub fn configure_instance(source: &Path, root: &Path, parts: &InstanceParts<'_>)
     let doc: Value = serde_json::from_str(&text)
         .with_context(|| format!("reading OCI config at {}", sidecar.display()))?;
     let config = Config::from_json(&doc);
-    let module = if parts.share_kind == Some(ShareKind::Virtiofs) {
-        Some(virtiofs_module()?)
-    } else {
-        None
+    let modules = match parts.share_kind {
+        Some(ShareKind::Virtiofs) => vec![KernelModule {
+            name: "virtiofs",
+            bytes: virtiofs_module()?,
+        }],
+        Some(ShareKind::NinePfs) => ninep_modules()?,
+        None => Vec::new(),
     };
-    let init = init_script_with_parts(&config, parts, module.as_deref());
+    let init = init_script_with_parts(&config, parts, &modules);
     rewrite_guest_files(root, &init)
         .with_context(|| format!("configuring OCI guest disk {}", root.display()))
 }
@@ -1865,7 +1883,16 @@ fn virtiofs_module() -> Result<Vec<u8>> {
 /// tree: that disk may be Debian while the running kernel is Ubuntu's pinned
 /// cloud kernel.
 pub fn direct_boot_modules() -> Result<Vec<KernelModule>> {
-    KERNEL_MODULE_NAMES
+    kernel_modules(DIRECT_BOOT_MODULE_NAMES)
+}
+
+/// Verified 9p client stack for QEMU directory shares, in dependency order.
+fn ninep_modules() -> Result<Vec<KernelModule>> {
+    kernel_modules(NINEP_MODULE_NAMES)
+}
+
+fn kernel_modules(names: &[&'static str]) -> Result<Vec<KernelModule>> {
+    names
         .iter()
         .map(|&name| {
             let path = kernel_module_path(name);
@@ -2399,6 +2426,13 @@ mod tests {
         let gpu_boot = "$BB mkdir -p /usr/local/sbin\n\
                         echo gpu-service > /usr/local/sbin/asterism-gpu-guest\n";
         let guest_control_boot = "echo guest-control-ready\n";
+        let share_modules: Vec<_> = NINEP_MODULE_NAMES
+            .iter()
+            .map(|&name| KernelModule {
+                name,
+                bytes: format!("fixture-{name}").into_bytes(),
+            })
+            .collect();
         config.workdir = Some("/workspace".into());
         let script = init_script_with_parts(
             &config,
@@ -2410,7 +2444,7 @@ mod tests {
                 gpu_boot: Some(gpu_boot),
                 guest_control_boot: Some(guest_control_boot),
             },
-            None,
+            &share_modules,
         );
         let dir = tempfile::tempdir().unwrap();
         let init = dir.path().join("asterism-init");
@@ -2420,6 +2454,17 @@ mod tests {
             .expect("a non-address DHCP callback exits instead of re-entering pid 1");
 
         assert!(script.contains("mount -t 9p -o trans=virtio"), "{script}");
+        for name in NINEP_MODULE_NAMES {
+            assert!(
+                script.contains(&format!("insmod /run/asterism-{name}.ko")),
+                "{script}"
+            );
+        }
+        assert!(
+            script.find("insmod /run/asterism-netfs.ko").unwrap()
+                < script.find("mount -t 9p").unwrap(),
+            "the client stack must load before the share mount: {script}"
+        );
         assert!(
             script.contains("'ast-deadbeef' '/mnt/ast/data'"),
             "{script}"
@@ -2454,7 +2499,7 @@ mod tests {
             "the one generated inode materializes the public CA at boot"
         );
         assert!(script.contains("/usr/local/sbin/asterism-bootstrap"));
-        assert!(script.contains("base@1"));
+        assert!(script.contains("base@2"));
         assert!(
             script.rfind("export HTTPS_PROXY='http://10.0.2.2:38123'")
                 > script.rfind("export HTTPS_PROXY='http://image.invalid'"),

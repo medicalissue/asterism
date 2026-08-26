@@ -2,8 +2,9 @@
 
 Compute is one placement unit. At any moment an instance's compute comes from
 one orbit device. That device supplies CPU, physical RAM, and execution state
-together. Hypervisor and namespace adapters are internal placement details;
-both appear and behave as an Instance.
+together. The selected hypervisor is an internal placement detail recorded for
+deterministic restart and recovery. Every new Instance is a VM; compute
+placement never selects a host-namespace runtime.
 
 GPU, storage, network, and exit points are independent parts and may attach
 from other devices. Asterism does not present CPU and physical RAM from

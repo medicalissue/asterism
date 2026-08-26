@@ -717,9 +717,49 @@ impl Mesh {
     pub async fn start(node: Node) -> Result<Arc<Self>> {
         let has_peers = !node.orbit.lock().await.devices().is_empty();
         let identity = load_device_identity(&paths::device_key_path(), has_peers)?;
-        let endpoint = MeshEndpoint::bind(&identity, mesh_mode())
-            .await
-            .context("binding the mesh endpoint")?;
+        let mode = mesh_mode();
+        let endpoint = match mode {
+            MeshMode::Discovery => MeshEndpoint::bind(&identity, mode).await,
+            MeshMode::LocalOnly => {
+                let path = paths::local_mesh_addr_path();
+                let saved = match std::fs::read_to_string(&path) {
+                    Ok(value) => value.trim().parse().with_context(|| {
+                        format!("reading the saved local mesh address at {}", path.display())
+                    })?,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        "127.0.0.1:0".parse().expect("constant socket address")
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("reading the saved local mesh address at {}", path.display())
+                        })
+                    }
+                };
+                MeshEndpoint::bind_local(&identity, saved).await
+            }
+        }
+        .context("binding the mesh endpoint")?;
+
+        if mode == MeshMode::LocalOnly {
+            let path = paths::local_mesh_addr_path();
+            if !path.exists() {
+                let advertised = endpoint
+                    .direct_addr()
+                    .await
+                    .context("discovering the first local mesh address")?;
+                let address = advertised
+                    .ip_addrs()
+                    .find(|address| address.ip().is_loopback())
+                    .context("the local mesh endpoint did not report its loopback address")?;
+                asterism_core::durable::commit(&path, format!("{address}\n").as_bytes())
+                    .with_context(|| {
+                        format!(
+                            "recording the stable local mesh address at {}",
+                            path.display()
+                        )
+                    })?;
+            }
+        }
 
         let mesh = Arc::new(Self {
             endpoint,

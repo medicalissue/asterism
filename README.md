@@ -187,8 +187,8 @@ See [Compute placement](docs/compute-placement.md) for the architecture and
 compatibility contract.
 
 - **Compute** comes from one device: CPU, physical RAM, and execution state
-  move together. Hypervisor and namespace adapters are internal placement
-  details; both appear and behave as an Instance. `--cpus` and `--mem` are quotas on that
+  move together. The recorded hypervisor backend is an internal placement
+  detail; every new Instance is a VM. `--cpus` and `--mem` are quotas on that
   selected compute device, not separately placeable resources. Move compute
   offline without changing the instance's name or identity; its root disk and
   snapshots transfer peer-to-peer as part of the move.

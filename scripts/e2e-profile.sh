@@ -378,7 +378,22 @@ expect "create the bound-instance snapshot" "$INST  snapshot credential-bound" \
   "$AST" snapshot "$INST" credential-bound
 expect "inspect the snapshot through the CLI" "credential-bound" \
   "$AST" snapshots "$INST"
-SNAPSHOT="$ASTERISM_HOME/instances/$INST/snapshots/credential-bound.raw"
+SNAPSHOT_DIR="$ASTERISM_HOME/instances/$INST/snapshots"
+SNAPSHOT="$(find "$SNAPSHOT_DIR" -maxdepth 1 -type f \
+  \( -name 'credential-bound.raw' -o -name 'credential-bound.qcow2' -o -name 'credential-bound.vhdx' \) \
+  -print 2>/dev/null || true)"
+case "$SNAPSHOT" in
+  *$'\n'*) fail "snapshot credential-bound resolved to more than one disk image:"$'\n'"$SNAPSHOT" ;;
+  "")
+    # Pre-file-snapshot QEMU instances keep the snapshot table and its data
+    # inside disk.qcow2. The listing above proved the tag exists; scan the
+    # owning image in that case, because it is the snapshot's byte store.
+    SNAPSHOT="$ASTERISM_HOME/instances/$INST/disk.qcow2"
+    [ -f "$SNAPSHOT" ] || fail \
+      "snapshot listing exists but neither a portable snapshot image nor an internal qcow2 store exists"
+    ok "the legacy internal snapshot is stored in its qcow2 root image"
+    ;;
+esac
 [ -f "$SNAPSHOT" ] || fail "snapshot listing exists but $SNAPSHOT does not"
 absent_from_sparse "the raw sentinel is absent from the snapshot" "$SNAPSHOT" "$SENTINEL"
 "$ROOT/scripts/sparse-contains.py" "$SNAPSHOT" "$HANDLE" \
@@ -427,7 +442,7 @@ while :; do
   sleep 10
 done
 grep -qF "ok    codex" <<<"$report" || fail "codex did not arrive:"$'\n'"$report"
-grep -qF "base@1 node@1 claude@1 codex@1" <<<"$report" \
+grep -qF "base@2 node@1 claude@1 codex@1" <<<"$report" \
   || fail "the stamp did not move with the set:"$'\n'"$report"
 ok "a changed profile set reaches a guest that already exists"
 

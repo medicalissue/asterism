@@ -120,9 +120,17 @@ The adjacent lanes cover the cross-feature durability boundaries:
 
 ```console
 $ scripts/e2e-volume.sh
+$ E2E_VOLUME_BACKEND=qemu E2E_VOLUME_OCI=1 scripts/e2e-volume.sh
 $ scripts/e2e-move.sh
 $ scripts/e2e-durability.sh
 ```
+
+The OCI mode drives the same lane through authenticated `ast exec` instead of
+SSH. It proves a direct-kernel OCI VM sees and writes the remote part as an
+ordinary block disk. Provider loss is fail-closed: an operation already in
+flight may fail, and new I/O is asserted only after status declares the same
+epoch reconnected. See the
+[2026-08-26 real-host evidence](evidence/oci-parts-parity-2026-08-26/README.md).
 
 The move lane proves attached-part records survive compute relocation without
 turning a remote provider into guest-visible topology. The durability lane

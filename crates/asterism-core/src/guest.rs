@@ -94,6 +94,12 @@ pub const VERSIONS: &[u32] = &[1, 2];
 /// required before any command is accepted.
 pub const OCI_TCP_PORT: u16 = 1023;
 
+/// Written by the static OCI agent after the host has authenticated, read a
+/// status reply, and closed that readiness session. PID 1 waits for this
+/// before launching the image entrypoint, so a one-shot cannot finish in the
+/// gap between the agent listening and `ast up` learning that it is ready.
+pub const OCI_ADMITTED_PATH: &str = "/run/asterism-guest-admitted";
+
 /// Longest command the v2 guest-control wire accepts.
 pub const MAX_EXEC_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -189,9 +195,26 @@ impl Artifact {
              $BB chmod 0600 /etc/asterism/agent.key\n\
              printf '%s' '{}' | $BB base64 -d > /.asterism/guest\n\
              $BB chmod 0755 /.asterism/guest\n\
-             /.asterism/guest >>/var/log/asterism-guest.log 2>&1 &\n",
+             $BB rm -f '{ready}'\n\
+             /.asterism/guest >>/var/log/asterism-guest.log 2>&1 &\n\
+             guest_control_pid=$!\n\
+             i=0\n\
+             while [ ! -f '{ready}' ] && [ $i -lt 1000 ]; do\n\
+             \x20 if ! $BB kill -0 $guest_control_pid 2>/dev/null; then\n\
+             \x20   echo 'asterism: OCI guest control exited before host admission'\n\
+             \x20   $BB cat /var/log/asterism-guest.log 2>/dev/null\n\
+             \x20   halt\n\
+             \x20 fi\n\
+             \x20 $BB sleep 0.1\n\
+             \x20 i=$((i + 1))\n\
+             done\n\
+             if [ ! -f '{ready}' ]; then\n\
+             \x20 echo 'asterism: host did not admit OCI guest control before the deadline'\n\
+             \x20 halt\n\
+             fi\n",
             key.hex(),
             BASE64.encode(&self.bytes),
+            ready = OCI_ADMITTED_PATH,
         )
     }
 
@@ -1845,6 +1868,12 @@ mod tests {
         let script = artifact.oci_boot_script(&key());
         assert!(script.contains("chmod 0600 /etc/asterism/agent.key"));
         assert!(script.contains("/.asterism/guest >>/var/log/asterism-guest.log"));
+        assert!(script.contains(OCI_ADMITTED_PATH));
+        assert!(script.contains("while [ ! -f"));
+        assert!(
+            script.find("/.asterism/guest >>").unwrap() < script.find("while [ ! -f").unwrap(),
+            "pid 1 must start guest control before waiting for host admission: {script}"
+        );
         assert!(script.contains(&key().hex()));
     }
 

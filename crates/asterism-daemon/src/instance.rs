@@ -737,6 +737,18 @@ pub(crate) fn up(reg: &mut Shard, name: &str, restart: Option<Restart>) -> Resul
     }
     refuse_pending_release(&inst)?;
 
+    // Capability and known provider reachability are pre-mutation facts.
+    // Ask before writing the durable launch fence: if an owner is already
+    // absent, compensation would need the same absent owner and the Instance
+    // would be left looking ambiguously running even though no lease request
+    // and no guest launch ever happened.
+    if inst.runtime == RuntimeKind::Vm {
+        tokio::task::block_in_place(|| {
+            let hv = backend::for_instance(&inst)?;
+            volume::preflight_boot(&inst, &*hv)
+        })?;
+    }
+
     // Fence this launch before it can renew one provider epoch or create one
     // guest process. The marker survives every ambiguous save and makes a
     // daemon restart refuse a second guest even in the narrow window before
@@ -1492,9 +1504,44 @@ async fn attach_secret(
         mesh.as_ref(),
     )
     .await?;
-    let inst = reg.attach_secret(name, binding)?;
-    egress::refresh_bindings(&inst);
-    Ok(inst)
+    attach_secret_binding_with(reg, name, binding, egress::refresh_bindings)
+}
+
+/// Apply a binding only if a running guest's proxy can honour the proposed
+/// policy. The registry clone is not published until that succeeds. If the
+/// proposed proxy fails after stopping the old one, restore the old policy;
+/// either way a failed attach leaves no durable handle behind.
+fn attach_secret_binding_with(
+    reg: &mut Shard,
+    name: &str,
+    binding: asterism_core::secret::Binding,
+    mut refresh: impl FnMut(&Instance) -> Result<()>,
+) -> Result<Instance> {
+    let before = reg.get(name)?.clone();
+    let mut next = reg.clone();
+    let attached = next.attach_secret(name, binding)?;
+    if let Err(error) = refresh(&attached) {
+        return match refresh(&before) {
+            Ok(()) => Err(error).context(
+                "starting the proposed secret egress policy; the previous policy was restored",
+            ),
+            Err(rollback) => Err(error).context(format!(
+                "starting the proposed secret egress policy; restoring the previous fail-closed policy also failed: {rollback:#}"
+            )),
+        };
+    }
+    if let Err(error) = next.save_confirmed() {
+        return match refresh(&before) {
+            Ok(()) => Err(error).context(
+                "committing the proposed secret binding; the previous policy was restored",
+            ),
+            Err(rollback) => Err(error).context(format!(
+                "committing the proposed secret binding; restoring the previous fail-closed policy also failed: {rollback:#}"
+            )),
+        };
+    }
+    *reg = next;
+    Ok(attached)
 }
 
 /// Revoke a binding.
@@ -1507,8 +1554,33 @@ async fn attach_secret(
 /// honoured the moment this returns; the guest keeps a string that now means
 /// nothing, until its next boot reissues the seed without it.
 fn detach_secret(reg: &mut Shard, name: &str, secret: &str) -> Result<Instance> {
-    let (inst, _revoked) = reg.detach_secret(name, secret)?;
-    egress::refresh_bindings(&inst);
+    detach_secret_binding_with(reg, name, secret, egress::refresh_bindings)
+}
+
+fn detach_secret_binding_with(
+    reg: &mut Shard,
+    name: &str,
+    secret: &str,
+    mut refresh: impl FnMut(&Instance) -> Result<()>,
+) -> Result<Instance> {
+    // Commit revocation before stopping the old proxy. If the commit is
+    // refused, the old row and old policy remain together. Once the commit
+    // lands, no daemon restart can resurrect the handle, even if rebuilding
+    // the reduced runtime policy fails or this process dies immediately.
+    let mut next = reg.clone();
+    let (inst, _revoked) = next.detach_secret(name, secret)?;
+    next.save_confirmed()
+        .context("committing the secret revocation before changing its runtime policy")?;
+    *reg = next;
+    if let Err(error) = refresh(&inst) {
+        // The old proxy was stopped before this failure, so revocation is
+        // already fail-closed. Keep the removed row: rolling it back would
+        // let a later daemon restart honour the revoked handle again.
+        eprintln!(
+            "astd: {:?}'s reduced secret policy could not restart and remains fail-closed: {error:#}",
+            inst.name
+        );
+    }
     Ok(inst)
 }
 
@@ -1765,7 +1837,10 @@ pub(crate) async fn reconcile_pending_storage(node: &Node) {
 /// Volumes on other devices are taken on faith; we cannot see their disks.
 fn resolve_volume_path(path: &str, host: &str) -> Result<String> {
     if host != local_host() {
-        return Ok(path.to_owned());
+        anyhow::bail!(
+            "directory volume {host}:{path} is on another device, but directory sharing has no \
+             network transport — create an orbit block volume there and attach it by name"
+        );
     }
     let canonical =
         std::fs::canonicalize(path).with_context(|| format!("cannot use {path} as a volume"))?;
@@ -2144,6 +2219,112 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("no bootstrap profile called"), "{err}");
+    }
+
+    #[test]
+    fn a_remote_directory_is_refused_instead_of_becoming_an_invisible_part() {
+        let remote = format!("{}-remote", local_host());
+        let error = resolve_volume_path("/srv/data", &remote)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no network transport"), "{error}");
+        assert!(error.contains("orbit block volume"), "{error}");
+    }
+
+    #[test]
+    fn a_failed_running_secret_refresh_leaves_no_binding_and_restores_old_policy() {
+        use asterism_core::secret::{Binding, GuestHandle, HandleShape, Placement, SecretId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut reg = Shard::load(&dir.path().join("state.json")).unwrap();
+        reg.create(
+            "dev",
+            "laptop",
+            "docker.io/library/nginx:alpine",
+            asterism_core::instance::Shape::default(),
+            test_machine(),
+        )
+        .unwrap();
+        let binding = Binding {
+            id: "binding-1".into(),
+            secret_id: SecretId::from_name("api").unwrap(),
+            secret: "api".into(),
+            authority: "api.example.com:443".into(),
+            placement: Placement::Authorization {
+                scheme: "Bearer".into(),
+            },
+            guest_handle: GuestHandle::mint(HandleShape::Opaque),
+            env: "API_TOKEN".into(),
+            source_device_id: "source-id".into(),
+            source_device: "source".into(),
+            version: 1,
+            bound_at: 1,
+        };
+        let mut observed = Vec::new();
+        let error = attach_secret_binding_with(&mut reg, "dev", binding, |candidate| {
+            observed.push(candidate.secrets.len());
+            if candidate.secrets.is_empty() {
+                Ok(())
+            } else {
+                anyhow::bail!("proxy port unavailable")
+            }
+        })
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("previous policy was restored"), "{error}");
+        assert_eq!(observed, [1, 0]);
+        assert!(reg.get("dev").unwrap().secrets.is_empty());
+    }
+
+    #[test]
+    fn a_failed_secret_revoke_refresh_stays_revoked_on_disk() {
+        use asterism_core::secret::{Binding, GuestHandle, HandleShape, Placement, SecretId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut reg = Shard::load(&path).unwrap();
+        reg.create(
+            "dev",
+            "laptop",
+            "docker.io/library/nginx:alpine",
+            asterism_core::instance::Shape::default(),
+            test_machine(),
+        )
+        .unwrap();
+        reg.attach_secret(
+            "dev",
+            Binding {
+                id: "binding-1".into(),
+                secret_id: SecretId::from_name("api").unwrap(),
+                secret: "api".into(),
+                authority: "api.example.com:443".into(),
+                placement: Placement::Authorization {
+                    scheme: "Bearer".into(),
+                },
+                guest_handle: GuestHandle::mint(HandleShape::Opaque),
+                env: "API_TOKEN".into(),
+                source_device_id: "source-id".into(),
+                source_device: "source".into(),
+                version: 1,
+                bound_at: 1,
+            },
+        )
+        .unwrap();
+        reg.save_confirmed().unwrap();
+
+        let detached = detach_secret_binding_with(&mut reg, "dev", "api", |_| {
+            anyhow::bail!("proxy port unavailable")
+        })
+        .unwrap();
+        assert!(detached.secrets.is_empty());
+        assert!(reg.get("dev").unwrap().secrets.is_empty());
+
+        let reloaded = Shard::load(&path).unwrap();
+        assert!(
+            reloaded.get("dev").unwrap().secrets.is_empty(),
+            "a daemon restart must not resurrect a revoked handle"
+        );
     }
 
     /// Claiming and resolving are different questions, and a rename asks

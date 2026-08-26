@@ -2591,9 +2591,8 @@ fn print_image_pull(result: &asterism_core::image::ImagePullResult) -> Result<()
 /// Read `--volume` as an orbit storage part, or decide it is a directory.
 ///
 /// `<device>:<volume>` is the written form. A bare name plus `--host` is
-/// accepted too, because a directory on another device has always had to be
-/// an absolute path — so a relative-looking name with a device attached
-/// cannot have meant a directory.
+/// accepted too, while a path plus a remote `--host` reaches `volume_path`
+/// and is refused: directory sharing has no network transport.
 fn storage_ref(volume: &str, host: Option<&str>) -> Option<(Option<String>, String)> {
     if let Some((device, name)) = asterism_core::volume::parse_ref(volume) {
         return Some((Some(device), name));
@@ -2685,10 +2684,10 @@ fn print_volume_made(volumes: &[asterism_core::volume::BlockVolume]) {
 fn volume_path(volume: &str, host: Option<&str>) -> Result<String> {
     let remote = host.is_some_and(|h| h != asterism_core::instance::local_host());
     if remote {
-        if !volume.starts_with('/') {
-            bail!("a volume on another device must be given as an absolute path");
-        }
-        return Ok(volume.to_owned());
+        bail!(
+            "a directory on another device cannot be attached — create an orbit block volume \
+             there and attach it as <device>:<volume>"
+        );
     }
     let expanded = match (volume.strip_prefix("~/"), std::env::var("HOME")) {
         (Some(rest), Ok(home)) => format!("{home}/{rest}"),
@@ -3251,27 +3250,43 @@ fn print_profile_state(inst: &Instance) {
 /// reimplementing it here is the point: the host has opinions about what
 /// should be true, and only the guest has facts.
 fn check_profiles(name: &str) -> Result<()> {
-    // An instance with no profiles has no verifier inside it, and `ssh`
-    // would answer that with `command not found` and an exit status. Asking
-    // the record first turns that into the sentence it should have been.
-    if let Response::Instance { instance, .. } = send(&Request::Status { name: name.into() })? {
-        if instance.profiles.is_empty() {
-            bail!(
-                "{name} has no bootstrap profiles, so there is nothing in it to ask — \
-                 ast profile {name} claude, then ast down {name} && ast up {name}"
-            );
-        }
+    // An instance with no profiles has no verifier inside it. Asking the
+    // record first turns a later command-not-found into the sentence it
+    // should have been, and also selects the control door the image owns.
+    let instance = match send(&Request::Status { name: name.into() })? {
+        Response::Instance { instance, .. } => instance,
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected reply from astd: {other:?}"),
+    };
+    if instance.profiles.is_empty() {
+        bail!(
+            "{name} has no bootstrap profiles, so there is nothing in it to ask — \
+             ast profile {name} claude, then ast down {name} && ast up {name}"
+        );
     }
     // From here the guest answers for itself, and its exit status is this
-    // command's: a failed check is a failed command, which is what a script
-    // that runs this after a boot needs it to be.
-    ssh(
-        name,
-        &[
-            "sudo".to_owned(),
-            "/usr/local/sbin/asterism-check".to_owned(),
-        ],
-    )
+    // command's. OCI rootfs guests deliberately have no SSH server, so they
+    // use the same authenticated bounded guest-control path as `ast exec`;
+    // cloud images retain their ordinary SSH path.
+    if profile_check_uses_guest_control(instance.image_kind) {
+        guest_exec(
+            name,
+            vec!["/usr/local/sbin/asterism-check".to_owned()],
+            asterism_core::guest::MAX_EXEC_TIMEOUT.as_secs(),
+        )
+    } else {
+        ssh(
+            name,
+            &[
+                "sudo".to_owned(),
+                "/usr/local/sbin/asterism-check".to_owned(),
+            ],
+        )
+    }
+}
+
+fn profile_check_uses_guest_control(kind: ImageKind) -> bool {
+    kind == ImageKind::OciRootfs
 }
 
 // ---- logs ------------------------------------------------------------------
@@ -5466,6 +5481,19 @@ mod tests {
         ));
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("exec"), "{help}");
+    }
+
+    #[test]
+    fn oci_profile_checks_use_guest_control_and_remote_directories_refuse_locally() {
+        assert!(profile_check_uses_guest_control(ImageKind::OciRootfs));
+        assert!(!profile_check_uses_guest_control(ImageKind::Disk));
+
+        let remote = format!("{}-remote", asterism_core::instance::local_host());
+        let error = volume_path("/srv/data", Some(&remote))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot be attached"), "{error}");
+        assert!(error.contains("<device>:<volume>"), "{error}");
     }
 
     #[test]

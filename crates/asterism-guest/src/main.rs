@@ -29,7 +29,8 @@ mod linux {
     use anyhow::{bail, Context, Result};
     use asterism_core::guest::{
         Accept, Answer, ExecWireResult, Facts, Hello, Key, Request, Status, Welcome,
-        MAX_EXEC_OUTPUT_BYTES, MAX_EXEC_TIMEOUT, MAX_FRAME_BYTES, OCI_TCP_PORT, VERSIONS,
+        MAX_EXEC_OUTPUT_BYTES, MAX_EXEC_TIMEOUT, MAX_FRAME_BYTES, OCI_ADMITTED_PATH, OCI_TCP_PORT,
+        VERSIONS,
     };
     use data_encoding::BASE64;
 
@@ -104,19 +105,29 @@ mod linux {
         stream.set_read_timeout(None)?;
         stream.set_write_timeout(None)?;
 
+        let mut readiness_observed = false;
         loop {
             let request: Request = match read_frame(&mut reader) {
                 Ok(request) => request,
-                Err(error) if is_disconnect(&error) => return Ok(()),
+                Err(error) if is_disconnect(&error) => {
+                    if readiness_observed {
+                        std::fs::write(OCI_ADMITTED_PATH, b"admitted\n")
+                            .context("recording host admission for OCI pid 1")?;
+                    }
+                    return Ok(());
+                }
                 Err(error) => return Err(error),
             };
             let mut stop = false;
             let answer = match request.op.as_str() {
                 "ping" => ok(request.id),
-                "status" => Answer {
-                    status: Some(status(&stream)),
-                    ..ok(request.id)
-                },
+                "status" => {
+                    readiness_observed = true;
+                    Answer {
+                        status: Some(status(&stream)),
+                        ..ok(request.id)
+                    }
+                }
                 "sync" => {
                     let started = Instant::now();
                     unsafe { libc::sync() };

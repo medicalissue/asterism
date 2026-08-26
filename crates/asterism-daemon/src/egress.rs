@@ -363,22 +363,17 @@ pub(crate) fn stop(name: &str) {
 /// Attach and detach both land here. Restarting rather than mutating is the
 /// point: a proxy holds the binding list it was started with, so a revoked
 /// handle cannot be honoured by a connection that is already open.
-pub(crate) fn refresh_bindings(inst: &Instance) {
+pub(crate) fn refresh_bindings(inst: &Instance) -> Result<()> {
     stop(&inst.name);
     if inst.status != asterism_core::instance::Status::Running {
-        return;
+        return Ok(());
     }
     // Back up even when nothing is bound any more. A running guest was told
     // to send its traffic here, and it goes on doing that until its next boot
     // reissues the seed — so taking the listener away because the last
     // binding went would break every unbound connection that guest makes, for
     // as long as it stays up. What comes back honours nothing.
-    if let Err(e) = ensure_running(inst, false) {
-        eprintln!(
-            "astd: {}'s egress proxy did not come back: {e:#}",
-            inst.name
-        );
-    }
+    ensure_running(inst, false).map(|_| ())
 }
 
 /// The port and CA of this instance's proxy, starting it if it is not up.

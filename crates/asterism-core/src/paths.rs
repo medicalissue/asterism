@@ -261,6 +261,11 @@ pub fn orbit_path() -> PathBuf {
     home_dir().join("orbit.json")
 }
 
+/// Stable loopback address for `ASTERISM_MESH=local`.
+pub fn local_mesh_addr_path() -> PathBuf {
+    home_dir().join("mesh-local.addr")
+}
+
 /// Another device's guest key, cached here so `ast ssh` can open a guest that
 /// device seeded.
 ///

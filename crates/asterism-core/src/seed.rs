@@ -36,6 +36,9 @@ use crate::{instance, paths};
 /// 5: directory-share transport is part of the seed. A guest moving between
 /// capable backends must replace a 9p unit with a virtiofs unit (or back),
 /// even when the host paths and mount points did not change.
+/// 6: the share-module unit has early-boot dependencies. Its previous default
+/// service dependencies formed a cycle with the mount's implicit
+/// `Before=local-fs.target`, so systemd dropped the mount on later boots.
 ///
 /// What earns a bump is a change to what a seed says about an instance that
 /// already exists. Bootstrap profiles did not: an instance with none gets a
@@ -44,7 +47,7 @@ use crate::{instance, paths};
 /// a feature none of those guests use would have handed each of them a new
 /// `instance-id` — and with it a first boot it has already had, host keys
 /// included.
-pub const SEED_TEMPLATE_VERSION: u32 = 5;
+pub const SEED_TEMPLATE_VERSION: u32 = 6;
 
 /// One locally-hosted volume, resolved into everything the two sides of a
 /// directory share have to agree on.
@@ -571,7 +574,9 @@ fn mount_units(shares: &[Share], share_kind: Option<ShareKind>) -> String {
          \x20   content: |\n\
          \x20     [Unit]\n\
          \x20     Description=Load Asterism {kind} share modules\n\
+         \x20     DefaultDependencies=no\n\
          \x20     After=systemd-modules-load.service\n\
+         \x20     Before=local-fs.target\n\
          \x20     [Service]\n\
          \x20     Type=oneshot\n\
          \x20     RemainAfterExit=yes\n"
@@ -1134,6 +1139,8 @@ mod tests {
         assert!(config.contains(&format!("What={}", shares[0].tag)));
         assert!(config.contains("Type=9p"));
         assert!(config.contains("asterism-9p-modules.service"));
+        assert!(config.contains("DefaultDependencies=no"));
+        assert!(config.contains("Before=local-fs.target"));
         assert!(config.contains("Requires=asterism-9p-modules.service"));
         assert!(config.contains("After=asterism-9p-modules.service"));
         assert!(config.contains("for unit in 'mnt-ast-media.mount' 'srv-code.mount'; do"));
