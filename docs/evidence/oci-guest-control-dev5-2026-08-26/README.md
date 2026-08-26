@@ -4,7 +4,8 @@
 
 **PASS for the Linux/QEMU/KVM AST-110 vertical slice.** This evidence covers
 one x86_64 WSL2 Linux host with `/dev/kvm`; it is not evidence for native Cloud
-Hypervisor, VZ, Hyper-V, a host reboot, PTY support, or a release installation.
+Hypervisor, VZ, Hyper-V, a full operating-system reboot, PTY support, or a
+release installation.
 
 ## Host and build
 
@@ -36,6 +37,21 @@ branch before this run.
 6. `down -> up -> exec -> logs -> down -> rm` completed, and no QEMU process
    for the removed Instance remained.
 
+## Host-reboot-equivalent recovery
+
+A second `nginx:alpine` Instance was booted with `restart=always`. Before
+process loss it had Instance ID `b2c1eb07-cc22-45c4-9b54-942f1486031a`, daemon
+PID 29683, QEMU PID 29785, and machine `qemu 10.2.1 (q35, cpu host)`.
+
+The exact daemon and QEMU processes were then terminated, reproducing the
+process state Asterism observes after a host reboot without rebooting the
+shared dev5 machine. A new daemon (PID 29835) loaded the durable row and booted
+a new QEMU process (PID 29866). The Instance ID, restart policy, image and
+recorded machine were unchanged; the ephemeral host control forward was
+correctly replaced for the new VM. Authenticated readiness completed and the
+first exec returned `host-loss-recovered-ok`. The recovered Instance then
+completed a normal down/remove and no test QEMU remained.
+
 ## Proven failed-boot rollback
 
 `busybox:1.37` uses an entrypoint that exits before guest control becomes
@@ -51,7 +67,8 @@ path were added.
 
 ## Explicitly unproven
 
-- host-reboot resurrection;
+- an actual WSL/Windows operating-system reboot (the equivalent daemon+VMM
+  process-loss recovery path is proven above);
 - native CHV, VZ, or Hyper-V OCI lifecycle;
 - interactive stdin, terminal resize, or PTY semantics;
 - tagged release install/update on a clean host;
