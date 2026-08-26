@@ -112,6 +112,22 @@ pub enum Request {
         #[serde(default)]
         profiles: Vec<String>,
     },
+    /// A create frame whose published endpoints carry an explicit transport.
+    ///
+    /// Kept separate from [`Request::Create`] because an older daemon would
+    /// ignore the new `protocol` field and silently turn a UDP declaration
+    /// into TCP. TCP-only creates keep using the old frame across rolling
+    /// upgrades; a UDP create is refused by name until both ends speak 10.
+    CreateNetwork {
+        name: String,
+        image: String,
+        shape: Shape,
+        #[serde(default)]
+        backend: Option<String>,
+        publish: Vec<PortForward>,
+        #[serde(default)]
+        profiles: Vec<String>,
+    },
     /// Retired experimental runtime-aware create frame. Kept parseable so an
     /// older client gets an explicit refusal before registry mutation. New
     /// clients always send [`Request::Create`], and OCI images always boot as
@@ -772,6 +788,7 @@ impl Request {
             Request::Ping { .. }
             | Request::Compat
             | Request::Create { .. }
+            | Request::CreateNetwork { .. }
             | Request::CreateRuntime { .. }
             | Request::BackupImport { .. }
             | Request::List
@@ -897,6 +914,7 @@ impl Request {
             | Request::GpuProviderAttach { .. }
             | Request::GpuProviderRevoke { .. } => 8,
             Request::Exec { .. } => 9,
+            Request::CreateNetwork { .. } => 10,
             Request::DeviceShellPolicy { .. }
             | Request::DeviceShellOpen { .. }
             | Request::DeviceShellInput { .. }
@@ -939,6 +957,7 @@ impl Request {
             Request::ImageList => Some("image_list"),
             Request::ImagePull { .. } => Some("image_pull"),
             Request::CreateRuntime { .. } => Some("create_runtime"),
+            Request::CreateNetwork { .. } => Some("create_network"),
             Request::ContainerExec { .. } => Some("container_exec"),
             Request::Exec { .. } => Some("exec"),
             Request::GpuGuestOpen { .. }
@@ -1427,6 +1446,18 @@ pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
             .since(),
         ),
         (
+            "create_network",
+            Request::CreateNetwork {
+                name: String::new(),
+                image: String::new(),
+                shape: Shape::default(),
+                backend: None,
+                publish: Vec::new(),
+                profiles: Vec::new(),
+            }
+            .since(),
+        ),
+        (
             "create_runtime",
             Request::CreateRuntime {
                 name: String::new(),
@@ -1879,9 +1910,36 @@ mod tests {
             publish,
             &[PortForward {
                 host: 8080,
-                guest: 80
+                guest: 80,
+                protocol: crate::instance::PortProtocol::Tcp,
             }]
         );
+    }
+
+    #[test]
+    fn udp_create_is_a_versioned_frame_an_old_daemon_cannot_misread_as_tcp() {
+        let request = Request::CreateNetwork {
+            name: "dns".into(),
+            image: "dns:latest".into(),
+            shape: Shape::default(),
+            backend: Some("qemu".into()),
+            publish: vec![PortForward {
+                host: 5353,
+                guest: 53,
+                protocol: crate::instance::PortProtocol::Udp,
+            }],
+            profiles: Vec::new(),
+        };
+        assert_eq!(request.since(), 10);
+        assert_eq!(request.versioned_name(), Some("create_network"));
+        assert!(!request.speakable_at(9));
+        let wire = serde_json::to_string(&request).unwrap();
+        assert!(wire.contains(r#""protocol":"udp""#), "{wire}");
+        assert!(matches!(
+            serde_json::from_str::<Request>(&wire).unwrap(),
+            Request::CreateNetwork { publish, .. }
+                if publish[0].protocol == crate::instance::PortProtocol::Udp
+        ));
     }
 
     /// Banding the variants by area is a merge-conflict measure, and it is

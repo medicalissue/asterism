@@ -36,7 +36,9 @@ use asterism_core::hosted_auth::{
     PollAction, PollFailure, PollPolicy, ProtocolError, Provider, Session,
 };
 use asterism_core::hv::{GuestHealth, ImageKind};
-use asterism_core::instance::{now_unix, Instance, PortForward, Restart, RuntimeKind, Shape};
+use asterism_core::instance::{
+    now_unix, Instance, PortForward, PortProtocol, Restart, RuntimeKind, Shape,
+};
 use asterism_core::ipc;
 use asterism_core::proc::{ProcId, Signal};
 use asterism_core::protocol::{self, Request, Response};
@@ -84,7 +86,7 @@ enum Command {
         ///
         /// How an OCI instance is reached: a container image has no ssh
         /// server, so the port it listens on is the way in. Repeatable.
-        #[arg(short = 'p', long = "publish", value_name = "HOST:GUEST")]
+        #[arg(short = 'p', long = "publish", value_name = "HOST:GUEST[/tcp|/udp]")]
         publish: Vec<String>,
         /// How many cores the guest gets.
         #[arg(long, default_value_t = 2)]
@@ -803,13 +805,27 @@ fn main() -> Result<()> {
                 .map(|p| p.parse::<PortForward>())
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| anyhow::anyhow!(e))?;
-            Request::Create {
-                name,
-                image: resolved,
-                shape,
-                backend,
-                profiles,
-                publish,
+            if publish
+                .iter()
+                .any(|mapping| mapping.protocol == PortProtocol::Udp)
+            {
+                Request::CreateNetwork {
+                    name,
+                    image: resolved,
+                    shape,
+                    backend,
+                    profiles,
+                    publish,
+                }
+            } else {
+                Request::Create {
+                    name,
+                    image: resolved,
+                    shape,
+                    backend,
+                    profiles,
+                    publish,
+                }
             }
         }
         Command::Up { name, restart } => Request::Up { name, restart },
@@ -1115,7 +1131,10 @@ fn main() -> Result<()> {
                 // false promise even though disk-image guests do use SSH.
                 if instance.image_kind == ImageKind::OciRootfs {
                     for p in &instance.publish {
-                        println!("published: 127.0.0.1:{}  ->  guest :{}", p.host, p.guest);
+                        println!(
+                            "published: 127.0.0.1:{}  ->  guest :{}/{}",
+                            p.host, p.guest, p.protocol
+                        );
                     }
                     println!(
                         "guest control ready — try: ast exec {} -- /bin/sh -c 'uname -a'",

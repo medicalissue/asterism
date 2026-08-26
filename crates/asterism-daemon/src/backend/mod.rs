@@ -194,6 +194,25 @@ pub struct CreateRequirements {
     port_forward: bool,
 }
 
+/// Refuse a declaration QEMU could not bind before an instance row exists.
+///
+/// TCP and UDP have separate host-port spaces, so the same number may be
+/// published once for each. Repeating a protocol+host pair would make QEMU
+/// fail at boot after create had already promised a usable endpoint.
+pub(crate) fn validate_publish(publish: &[PortForward]) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for mapping in publish {
+        if !seen.insert((mapping.protocol, mapping.host)) {
+            bail!(
+                "host port {}/{} is published more than once — each protocol and host port may name only one guest endpoint",
+                mapping.host,
+                mapping.protocol
+            );
+        }
+    }
+    Ok(())
+}
+
 impl CreateRequirements {
     pub fn new(image: &ImageRef, publish: &[PortForward]) -> Self {
         Self {
@@ -1455,6 +1474,7 @@ mod tests {
         let port = [PortForward {
             host: 8080,
             guest: 80,
+            protocol: asterism_core::instance::PortProtocol::Tcp,
         }];
 
         let qemu = by_id("qemu").unwrap();
@@ -1469,6 +1489,45 @@ mod tests {
         // Publishing to loopback needs a guest that is reached that way.
         assert!(check_can_boot(&*vz, &disk, &port).is_err());
         assert!(check_can_boot(&*vz, &oci, &port).is_err());
+    }
+
+    #[test]
+    fn duplicate_host_ports_are_refused_per_protocol_before_create() {
+        use asterism_core::instance::PortProtocol;
+
+        let tcp = PortForward {
+            host: 8080,
+            guest: 80,
+            protocol: PortProtocol::Tcp,
+        };
+        let another_tcp = PortForward { guest: 8081, ..tcp };
+        let udp = PortForward {
+            guest: 53,
+            protocol: PortProtocol::Udp,
+            ..tcp
+        };
+
+        let error = validate_publish(&[tcp, another_tcp])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("8080/tcp"), "{error}");
+        validate_publish(&[tcp, udp]).expect("TCP and UDP have separate host-port spaces");
+    }
+
+    #[test]
+    fn backends_advertise_only_the_network_doors_they_implement() {
+        let qemu = by_id(qemu::ID).unwrap().caps();
+        assert!(qemu.port_forward);
+        assert!(qemu.guest_egress.is_some());
+
+        for id in [vz::ID, chv::ID, hyperv::ID] {
+            let caps = by_id(id).unwrap().caps();
+            assert!(!caps.port_forward, "{id} falsely advertises publication");
+            assert!(
+                caps.guest_egress.is_none(),
+                "{id} falsely advertises a guest-only egress door"
+            );
+        }
     }
 
     #[test]
@@ -1501,6 +1560,7 @@ mod tests {
         let port = [PortForward {
             host: 8080,
             guest: 80,
+            protocol: asterism_core::instance::PortProtocol::Tcp,
         }];
         let selected = select_with(None, CreateRequirements::new(&disk, &port), |id| match id {
             "vz" => Ok(vz.clone()),

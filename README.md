@@ -95,6 +95,12 @@ $ ast logs web -n 20
 `ast exec ... -- /bin/sh -c ...` covers non-interactive shell work. A PTY and
 interactive stdin are not part of this command.
 
+Published endpoints are loopback-only on the device supplying compute. TCP is
+the default; append `/udp` when the service uses UDP, for example
+`-p 5353:53/udp`. QEMU currently supplies this endpoint door. A native backend
+without it refuses the create before an Instance row is written. See
+[Instance networking and egress](docs/instance-network.md).
+
 On macOS, Asterism uses Virtualization.framework when it satisfies the
 instance's requirements. QEMU is an optional compatibility backend, not an
 install dependency. Pass `--backend vz` or install QEMU separately and pass
@@ -168,8 +174,10 @@ not for reaching an instance.
 
 A device contributes parts. An orbit is the trusted pool of those devices. An
 instance keeps the durable identity assembled from those parts, without a
-special source device. Compute, root disk, and remote block volumes work today;
-GPU and custom egress remain planned.
+special source device. Compute, root disk, remote block volumes, GPU provider
+placement, and orbit-scoped secret egress are represented as parts today;
+backend capability gates keep unavailable guest projections from being
+recorded as if they worked.
 
 `ast status` shows where an instance's parts come from. Software inside the
 guest sees ordinary local resources even when Asterism carries their

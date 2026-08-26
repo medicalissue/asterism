@@ -119,6 +119,24 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             publish,
             profiles,
         ),
+        Request::CreateNetwork {
+            name,
+            image,
+            shape,
+            backend: requested,
+            publish,
+            profiles,
+        } => create_instance(
+            reg,
+            cpu_device,
+            &name,
+            &image,
+            shape,
+            RuntimeKind::Vm,
+            requested,
+            publish,
+            profiles,
+        ),
         Request::CreateRuntime {
             name,
             image,
@@ -383,7 +401,7 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
     }
 }
 
-// Mirrors the two versioned create frames field-for-field. `CreateRuntime`
+// Mirrors the create frames field-for-field. `CreateRuntime`
 // remains parseable only so an older experimental client receives an explicit
 // refusal instead of accidentally creating a different machine.
 #[allow(clippy::too_many_arguments)]
@@ -399,6 +417,7 @@ fn create_instance(
     profiles: Vec<String>,
 ) -> Result<Instance> {
     ensure_new_runtime_is_vm(runtime)?;
+    backend::validate_publish(&publish)?;
     let image = backend::image_ref_recording(image)?;
     check_profiles(&profiles)?;
     let requirements = backend::CreateRequirements::new(&image, &publish);
@@ -569,6 +588,7 @@ pub(crate) async fn claim_name(
 fn claimed_name(req: &Request) -> Option<&str> {
     match req {
         Request::Create { name, .. }
+        | Request::CreateNetwork { name, .. }
         | Request::CreateRuntime {
             name,
             runtime: RuntimeKind::Vm,

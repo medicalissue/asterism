@@ -277,11 +277,11 @@ pub(crate) fn check_can_bind(inst: &Instance) -> Result<()> {
         return Ok(());
     }
     let hv = backend::for_instance(inst)?;
-    // Only a backend we could actually ask is allowed to refuse: on a device
-    // where the hypervisor is not installed yet, `caps()` knows nothing, and
-    // that must not become a refusal to record a binding the instance will be
-    // able to use once it is.
-    if hv.probe().is_ok() && hv.caps().guest_egress.is_none() {
+    // Capability belongs to the backend recorded on the instance, not to
+    // whether its executable happens to be installed on this host today.
+    // Probe-gating this check used to let an impossible binding mutate the
+    // registry on a machine without that backend, only to fail at boot.
+    if hv.caps().guest_egress.is_none() {
         bail!(
             "the {} backend gives each guest an address on a shared network, so there is \
              no listener this device could put up that only {:?} can reach — a bound \
@@ -327,7 +327,7 @@ pub(crate) fn seed_config(inst: &Instance) -> Result<seed::Egress> {
     }
     check_can_bind(inst)?;
     let gateway = gateway(inst)?;
-    let (port, ca_pem) = ensure_running(inst)?;
+    let (port, ca_pem) = ensure_running(inst, true)?;
     Ok(seed::Egress {
         proxy: format!("http://{gateway}:{port}"),
         ca_pem,
@@ -373,7 +373,7 @@ pub(crate) fn refresh_bindings(inst: &Instance) {
     // reissues the seed — so taking the listener away because the last
     // binding went would break every unbound connection that guest makes, for
     // as long as it stays up. What comes back honours nothing.
-    if let Err(e) = ensure_running(inst) {
+    if let Err(e) = ensure_running(inst, false) {
         eprintln!(
             "astd: {}'s egress proxy did not come back: {e:#}",
             inst.name
@@ -382,7 +382,7 @@ pub(crate) fn refresh_bindings(inst: &Instance) {
 }
 
 /// The port and CA of this instance's proxy, starting it if it is not up.
-fn ensure_running(inst: &Instance) -> Result<(u16, String)> {
+fn ensure_running(inst: &Instance, may_move_port: bool) -> Result<(u16, String)> {
     let plane = plane()?;
     let mut running = plane.running.lock().expect("egress plane poisoned");
     if let Some(proxy) = running.get(&inst.name) {
@@ -425,7 +425,15 @@ fn ensure_running(inst: &Instance) -> Result<(u16, String)> {
     } else {
         // VM user-mode networking maps its private gateway to host loopback.
         let preferred = stable_port(&inst.name);
-        let (listener, port) = bind_loopback(preferred)?;
+        let (listener, port) = match (preferred, may_move_port) {
+            (Some(port), false) => bind_loopback_exact(port).with_context(|| {
+                format!(
+                    "restoring {:?}'s egress proxy on its guest-configured port {port}",
+                    inst.name
+                )
+            })?,
+            _ => bind_loopback(preferred)?,
+        };
         if preferred != Some(port) {
             let _ = std::fs::write(port_path(&inst.name), port.to_string());
         }
@@ -446,6 +454,18 @@ fn ensure_running(inst: &Instance) -> Result<(u16, String)> {
         },
     );
     Ok((port, ca_pem))
+}
+
+/// Restore the process-local half of a running guest's egress after a daemon
+/// restart. The port is part of that guest's already-booted configuration, so
+/// restoration must reclaim it exactly; silently selecting another port
+/// would report success while leaving the guest pointed at nothing.
+pub(crate) fn restore_running(inst: &Instance) -> Result<()> {
+    if inst.secrets.is_empty() {
+        return Ok(());
+    }
+    check_can_bind(inst)?;
+    ensure_running(inst, false).map(|_| ())
 }
 
 fn egress_dir(instance: &str) -> PathBuf {
@@ -482,6 +502,20 @@ fn bind_loopback(preferred: Option<u16>) -> Result<(TcpListener, u16)> {
     std_listener.set_nonblocking(true)?;
     let port = std_listener.local_addr()?.port();
     Ok((TcpListener::from_std(std_listener)?, port))
+}
+
+/// Bind exactly the endpoint an already-running guest was configured to use.
+fn bind_loopback_exact(port: u16) -> Result<(TcpListener, u16)> {
+    let std_listener = bind_loopback_exact_with(port, std::net::TcpListener::bind)?;
+    std_listener.set_nonblocking(true)?;
+    Ok((TcpListener::from_std(std_listener)?, port))
+}
+
+fn bind_loopback_exact_with<T>(
+    port: u16,
+    bind: impl FnOnce(SocketAddr) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    bind(SocketAddr::from(([127, 0, 0, 1], port)))
 }
 
 /// Try the remembered loopback address before asking the OS for a free one.
@@ -1586,6 +1620,24 @@ mod tests {
         assert_eq!(gateway(&instance).unwrap(), "127.0.0.1");
     }
 
+    #[test]
+    fn an_incapable_recorded_backend_refuses_before_probe_or_mutation() {
+        let instance = Instance::new(
+            "dev",
+            "laptop",
+            "oci",
+            asterism_core::instance::Shape::default(),
+            asterism_core::hv::Machine {
+                backend: crate::backend::vz::ID.into(),
+                machine_type: "vz-linux".into(),
+                cpu: "aarch64".into(),
+                hv_version: "native".into(),
+            },
+        );
+        let error = check_can_bind(&instance).unwrap_err().to_string();
+        assert!(error.contains("guest-only door"), "{error}");
+    }
+
     /// A VM proxy is on loopback, and that is the whole of why it is safe.
     #[tokio::test]
     async fn the_listener_is_reachable_from_the_guest_and_from_nothing_on_the_wire() {
@@ -1688,6 +1740,22 @@ mod tests {
 
         drop(fallback);
         drop(occupied);
+    }
+
+    #[test]
+    fn a_running_guest_restore_never_silently_moves_its_egress_port() {
+        let port = 39000;
+        let mut attempts = Vec::new();
+        let error = bind_loopback_exact_with(port, |addr| {
+            attempts.push(addr);
+            Err::<(), _>(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                "occupied",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert_eq!(attempts, [SocketAddr::from(([127, 0, 0, 1], port))]);
     }
 
     /// A per-instance CA, and its private half stays here.

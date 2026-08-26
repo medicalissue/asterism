@@ -116,7 +116,8 @@ use crate::VERSION;
 ///   generated libcuda; the mesh opening frame is instance-bound and
 ///   token-free.
 /// * **9** — authenticated, bounded VM guest exec.
-pub const PROTOCOL_VERSION: u32 = 9;
+/// * **10** — transport-aware TCP/UDP guest port publication.
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// The wire as it was before it carried a version.
 ///
@@ -130,7 +131,7 @@ pub const FIRST_PROTOCOL: u32 = 1;
 /// How many versions back this build still serves. Protocol 8 adds runtime
 /// and GPU guest frames; keep the unnumbered protocol-1 release reachable in
 /// a rolling orbit.
-pub const SUPPORTED_BACK: u32 = 7;
+pub const SUPPORTED_BACK: u32 = 9;
 
 /// Format version of the home stamp document itself.
 pub const STAMP_VERSION: u32 = 1;

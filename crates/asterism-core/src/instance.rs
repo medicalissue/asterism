@@ -320,30 +320,66 @@ pub fn fnv1a(s: &str) -> u64 {
 /// and it exists because an OCI image's whole point is the port it listens on.
 /// A cloud image gets there over ssh; a container image has no ssh to get
 /// there over.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortProtocol {
+    #[default]
+    Tcp,
+    Udp,
+}
+
+impl std::fmt::Display for PortProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            PortProtocol::Tcp => "tcp",
+            PortProtocol::Udp => "udp",
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PortForward {
     pub host: u16,
     pub guest: u16,
+    /// Defaulted so registry rows and create frames written before UDP
+    /// publishing continue to mean exactly the TCP mapping they meant then.
+    #[serde(default)]
+    pub protocol: PortProtocol,
 }
 
 impl std::str::FromStr for PortForward {
     type Err = String;
 
-    /// `8080:80`, or `8080` for both.
+    /// `8080:80`, `5353:53/udp`, or one port for both sides.
     fn from_str(s: &str) -> Result<Self, String> {
-        let bad = || format!("{s:?} is not a port mapping — write it as HOST:GUEST, e.g. 8080:80");
-        let (host, guest) = s.split_once(':').unwrap_or((s, s));
+        let bad = || {
+            format!(
+                "{s:?} is not a port mapping — write HOST:GUEST[/tcp|/udp], e.g. 8080:80 or 5353:53/udp"
+            )
+        };
+        let (ports, protocol) = match s.rsplit_once('/') {
+            Some((ports, "tcp")) => (ports, PortProtocol::Tcp),
+            Some((ports, "udp")) => (ports, PortProtocol::Udp),
+            Some(_) => return Err(bad()),
+            None => (s, PortProtocol::Tcp),
+        };
+        let (host, guest) = ports.split_once(':').unwrap_or((ports, ports));
         let port = |p: &str| p.parse::<u16>().ok().filter(|p| *p != 0).ok_or_else(bad);
         Ok(PortForward {
             host: port(host)?,
             guest: port(guest)?,
+            protocol,
         })
     }
 }
 
 impl std::fmt::Display for PortForward {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "127.0.0.1:{} -> :{}", self.host, self.guest)
+        write!(
+            f,
+            "127.0.0.1:{} -> :{}/{}",
+            self.host, self.guest, self.protocol
+        )
     }
 }
 
@@ -1093,6 +1129,7 @@ mod tests {
         inst.publish = vec![PortForward {
             host: 8080,
             guest: 80,
+            protocol: PortProtocol::Tcp,
         }];
 
         let parts = inst.parts();
@@ -1106,7 +1143,7 @@ mod tests {
         );
         assert_eq!(
             find("network").detail,
-            "user-mode NAT · 127.0.0.1:8080 -> :80"
+            "user-mode NAT · 127.0.0.1:8080 -> :80/tcp"
         );
 
         // ...and it survives the registry, kind and ports both.
@@ -1192,7 +1229,8 @@ mod tests {
             PortForward::from_str("8080:80").unwrap(),
             PortForward {
                 host: 8080,
-                guest: 80
+                guest: 80,
+                protocol: PortProtocol::Tcp,
             }
         );
         // One number is the same port on both sides.
@@ -1200,13 +1238,24 @@ mod tests {
             PortForward::from_str("5432").unwrap(),
             PortForward {
                 host: 5432,
-                guest: 5432
+                guest: 5432,
+                protocol: PortProtocol::Tcp,
+            }
+        );
+        assert_eq!(
+            PortForward::from_str("5353:53/udp").unwrap(),
+            PortForward {
+                host: 5353,
+                guest: 53,
+                protocol: PortProtocol::Udp,
             }
         );
         assert_eq!(
             PortForward::from_str("8080:80").unwrap().to_string(),
-            "127.0.0.1:8080 -> :80"
+            "127.0.0.1:8080 -> :80/tcp"
         );
+        let old: PortForward = serde_json::from_str(r#"{"host":8080,"guest":80}"#).unwrap();
+        assert_eq!(old.protocol, PortProtocol::Tcp);
         for junk in [
             "",
             "80:",
@@ -1216,6 +1265,8 @@ mod tests {
             "http:80",
             "99999:80",
             "8080:80:8080",
+            "8080:80/sctp",
+            "8080:80/UDP",
         ] {
             assert!(PortForward::from_str(junk).is_err(), "{junk:?}");
         }

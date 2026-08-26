@@ -219,6 +219,9 @@ pub async fn resurrect(registry: &Arc<Mutex<Shard>>) {
                     .unwrap_or_else(|| "no process of its own".into())
             );
             crate::volume::reattach(&inst).await;
+            if let Err(e) = crate::egress::restore_running(&inst) {
+                eprintln!("astd: {name}'s secret egress did not recover: {e:#}");
+            }
             continue;
         }
         if inst.policy.restart == Restart::Never {

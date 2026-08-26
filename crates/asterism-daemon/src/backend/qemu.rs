@@ -45,7 +45,7 @@ use asterism_core::hv::{
     BootReq, Caps, ControlChannel, DirectKernel, DiskFormat, DiskSpec, Firmware, GuestEgress,
     GuestEndpoint, Handle, Hypervisor, ImageKind, Prepared, Ready, RunState, ShareKind, SnapshotId,
 };
-use asterism_core::instance::{now_unix, PortForward};
+use asterism_core::instance::{now_unix, PortForward, PortProtocol};
 use asterism_core::proc::{ProcId, Signal};
 use asterism_core::snapshot::{self, Snapshot};
 use asterism_core::tools::{output, run, tool};
@@ -405,14 +405,17 @@ impl Hypervisor for Qemu {
             )?;
         }
 
-        let ssh_port = free_port()?;
+        let published_tcp: std::collections::HashSet<u16> = inst
+            .publish
+            .iter()
+            .filter(|mapping| mapping.protocol == PortProtocol::Tcp)
+            .map(|mapping| mapping.host)
+            .collect();
+        let ssh_port = free_port_avoiding(&published_tcp)?;
         let control_port = if req.base.kind == ImageKind::OciRootfs {
-            Some(loop {
-                let port = free_port()?;
-                if port != ssh_port {
-                    break port;
-                }
-            })
+            let mut unavailable = published_tcp;
+            unavailable.insert(ssh_port);
+            Some(free_port_avoiding(&unavailable)?)
         } else {
             None
         };
@@ -868,7 +871,10 @@ fn netdev_arg(ssh_port: u16, control_port: Option<u16>, publish: &[PortForward])
         ));
     }
     for p in publish {
-        arg.push_str(&format!(",hostfwd=tcp:127.0.0.1:{}-:{}", p.host, p.guest));
+        arg.push_str(&format!(
+            ",hostfwd={}:127.0.0.1:{}-:{}",
+            p.protocol, p.host, p.guest
+        ));
     }
     arg
 }
@@ -928,9 +934,24 @@ fn powerdown(sock: &Path) -> Result<()> {
 // out-of-process backend needs the same three, and the vz helper is a
 // process this daemon reasons about in exactly the same way.
 
-fn free_port() -> Result<u16> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-    Ok(listener.local_addr()?.port())
+fn free_port_avoiding(unavailable: &std::collections::HashSet<u16>) -> Result<u16> {
+    free_port_avoiding_with(unavailable, || {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        Ok(listener.local_addr()?.port())
+    })
+}
+
+fn free_port_avoiding_with(
+    unavailable: &std::collections::HashSet<u16>,
+    mut allocate: impl FnMut() -> Result<u16>,
+) -> Result<u16> {
+    for _ in 0..128 {
+        let port = allocate()?;
+        if !unavailable.contains(&port) {
+            return Ok(port);
+        }
+    }
+    bail!("could not allocate a private control port distinct from published TCP ports")
 }
 
 // ---- acceleration ----------------------------------------------------------
@@ -1585,21 +1606,34 @@ mod tests {
                 &[
                     PortForward {
                         host: 8080,
-                        guest: 80
+                        guest: 80,
+                        protocol: PortProtocol::Tcp,
                     },
                     PortForward {
                         host: 5432,
-                        guest: 5432
+                        guest: 5432,
+                        protocol: PortProtocol::Udp,
                     }
                 ]
             ),
             "user,id=n0,hostfwd=tcp:127.0.0.1:22022-:22,\
-             hostfwd=tcp:127.0.0.1:8080-:80,hostfwd=tcp:127.0.0.1:5432-:5432"
+             hostfwd=tcp:127.0.0.1:8080-:80,hostfwd=udp:127.0.0.1:5432-:5432"
         );
         assert_eq!(
             netdev_arg(22022, Some(22023), &[]),
             "user,id=n0,hostfwd=tcp:127.0.0.1:22022-:22,\
              hostfwd=tcp:127.0.0.1:22023-:1023"
+        );
+    }
+
+    #[test]
+    fn private_control_ports_never_take_a_declared_tcp_host_port() {
+        let declared = 8080;
+        let unavailable = std::collections::HashSet::from([declared]);
+        let mut candidates = [declared, 22022].into_iter();
+        assert_eq!(
+            free_port_avoiding_with(&unavailable, || Ok(candidates.next().unwrap())).unwrap(),
+            22022
         );
     }
 
