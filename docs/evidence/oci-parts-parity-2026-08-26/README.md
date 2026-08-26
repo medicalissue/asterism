@@ -61,6 +61,21 @@ on dev5 at `/tmp/asterism-harness-artifacts-68922/volume`.
    read the original marker without rebinding.
 8. The one-shot `hello-world` OCI image completed readiness admission before
    its entrypoint, printed, powered off, and was not treated as a crash.
+9. A separate persistent fixture then exercised a real Ubuntu WSL distro
+   restart. Two lingered systemd user services owned the compute and volume
+   devices. `wsl.exe --terminate Ubuntu` replaced both `astd` processes
+   (`70043/70071` to `883/884`) and QEMU (`70184` to `1026`). The `restart:
+   always` OCI VM returned without an `ast up` or reattach, `base@2` passed,
+   the host-directory marker and ext4 volume marker were intact, and the
+   volume lease stayed with the same Instance/device while its epoch advanced
+   from 2 to 4. Tailscale SSH and Docker also returned automatically; Docker
+   had zero running containers both before and after the test.
+
+WSL2 shares a Linux kernel between distro lifetimes, so its kernel `boot_id`
+did not change. This lane asserts the distro userspace boundary instead: PID 1
+had a new start time, the old daemon/VMM PIDs were gone, the enabled lingered
+units were active below `user@0.service`, and the guest accepted fresh
+authenticated control and I/O after recovery.
 
 ## Secret and refusal evidence
 
@@ -86,8 +101,9 @@ even when backend probing itself fails.
 - The macOS Keychain lane used a cloud-disk VM. It proves the common VM secret
   broker and snapshot boundary, not an OCI rootfs plus Keychain on the same
   boot.
-- Killing/restarting daemon and VMM processes exercises the durable recovery
-  path but is not an actual operating-system reboot.
+- The restart lane terminates and recreates the Ubuntu WSL distro userspace.
+  It is not a Windows host reboot, physical power cycle, or fresh WSL kernel
+  boot.
 - A write already in flight at provider death may fail. Asterism does not
   journal and replay NBD requests; it fails closed, declares degradation, and
   guarantees new I/O only after status declares the same epoch reconnected.
