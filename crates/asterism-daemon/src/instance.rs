@@ -652,6 +652,31 @@ fn backup_restore_plan(
         );
     };
 
+    // An ordinary import preserves the machine and disk bytes recorded by
+    // the exporter. It must be possible to land that stopped definition on a
+    // device before its backend is installed; `up` owns the eventual backend
+    // availability check. Explicit target selection and OCI
+    // re-materialization still probe below, before any restore state exists.
+    if requested_backend.is_none() && !rematerialize_oci {
+        let mut disk_formats = metadata
+            .root_disk
+            .iter()
+            .chain(metadata.snapshots.iter())
+            .map(|artifact| artifact.format)
+            .collect::<Vec<_>>();
+        disk_formats.sort_by_key(|format| format.as_str());
+        disk_formats.dedup();
+        return backup::plan_restore(
+            manifest,
+            backup::RestoreTarget {
+                architecture,
+                machine: metadata.machine.clone(),
+                disk_formats,
+                rematerialize_oci,
+            },
+        );
+    }
+
     // Give an architecture refusal before probing a backend from the source
     // OS. A VZ bundle imported on x86 Windows is an architecture mismatch,
     // not a mysteriously unavailable VZ installation.

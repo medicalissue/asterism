@@ -11,6 +11,10 @@ An ordinary import is byte-exact and keeps the recorded backend:
 ast backup import ~/Backups/agent
 ```
 
+It may register the stopped Instance before that backend is installed on the
+device; the backend is checked when the Instance is started. This does not
+convert its disks or change its recorded machine.
+
 To move a compatible disk to another backend on the same architecture, name
 the backend explicitly:
 
