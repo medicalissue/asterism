@@ -115,7 +115,8 @@ use crate::VERSION;
 ///   stream. The guest contract is a local `/dev/nvidia0` endpoint plus
 ///   generated libcuda; the mesh opening frame is instance-bound and
 ///   token-free.
-pub const PROTOCOL_VERSION: u32 = 8;
+/// * **9** — authenticated, bounded VM guest exec.
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// The wire as it was before it carried a version.
 ///

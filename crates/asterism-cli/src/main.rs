@@ -18,7 +18,7 @@
 
 use asterism_core::ipc::Stream;
 use std::fs::File;
-use std::io::{BufRead, BufReader, IsTerminal, Read, Seek, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -189,6 +189,17 @@ enum Command {
         tty: bool,
         /// A command to run instead of opening a shell, and its arguments.
         #[arg(last = true)]
+        command: Vec<String>,
+    },
+    /// Run a bounded command inside a running VM through its authenticated
+    /// guest-control agent.
+    Exec {
+        name: String,
+        /// Kill the whole command process group after this many seconds.
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+        /// Command and arguments; no host or guest shell quoting is inferred.
+        #[arg(last = true, required = true)]
         command: Vec<String>,
     },
     /// Compatibility command for a retired experimental native-container row.
@@ -1018,6 +1029,14 @@ fn main() -> Result<()> {
                 Some(host) => device_shell(&host, &command, tty),
             };
         }
+        Command::Exec {
+            name,
+            timeout,
+            command,
+        } => {
+            local_only("exec", device.as_deref())?;
+            return guest_exec(&name, command, timeout);
+        }
         Command::Devices | Command::Device(DeviceCommand::Ls) => {
             local_only("devices", device.as_deref())?;
             return print_devices();
@@ -1090,12 +1109,21 @@ fn main() -> Result<()> {
             Request::Rename { name, .. } => println!("{name}  renamed to {}", instance.name),
             Request::Up { .. } => {
                 println!("{}  {}", instance.name, instance.status);
-                // An OCI guest has no ssh to offer, so it is told what it
-                // does have: its ports, and its console.
-                if instance.runtime == RuntimeKind::Container {
+                // An OCI root filesystem always boots as a VM/microVM. It
+                // has authenticated guest control, but no implied SSH
+                // server; presenting its host-forward as SSH is therefore a
+                // false promise even though disk-image guests do use SSH.
+                if instance.image_kind == ImageKind::OciRootfs {
                     for p in &instance.publish {
-                        println!("published: http://127.0.0.1:{}  ->  container :{}", p.host, p.guest);
+                        println!("published: 127.0.0.1:{}  ->  guest :{}", p.host, p.guest);
                     }
+                    println!(
+                        "guest control ready — try: ast exec {} -- /bin/sh -c 'uname -a'",
+                        instance.name
+                    );
+                    println!("output:  ast logs {}", instance.name);
+                } else if instance.runtime == RuntimeKind::Container {
+                    // Retained only for old experimental registry rows.
                     println!("control: ast shell {} -- /bin/sh", instance.name);
                     println!("output:  ast logs {}", instance.name);
                 } else if let Some(endpoint) = instance.endpoint() {
@@ -1191,6 +1219,7 @@ fn main() -> Result<()> {
         Response::Snapshots { .. }
         | Response::Log { .. }
         | Response::ContainerExec { .. }
+        | Response::Exec { .. }
         | Response::SshEndpoint { .. }
         | Response::DeviceShellStatus { .. }
         | Response::DeviceShellAccepted { .. }
@@ -2970,8 +2999,8 @@ fn ssh(name: &str, command: &[String]) -> Result<()> {
 ///
 /// There is no ssh server in a container image and no cloud-init to install
 /// one, so the honest answer is this message rather than three minutes of
-/// waiting for a banner that is never coming. What the user wanted is one of
-/// the two things named here: the console, or the port.
+/// waiting for a banner that is never coming. The answer names the guest
+/// control command, console, and any published service ports instead.
 fn refuse_ssh_to_an_oci_guest(name: &str) -> Result<()> {
     let Ok(Response::Instance { instance, .. }) = send(&Request::Status { name: name.into() })
     else {
@@ -2996,7 +3025,8 @@ fn refuse_ssh_to_an_oci_guest(name: &str) -> Result<()> {
     };
     bail!(
         "{name} boots an OCI image, which has no ssh server in it — \
-         its output is the console (ast logs {name}), and {reach}"
+         run a command with `ast exec {name} -- /bin/sh -c '...'`; \
+         its console is `ast logs {name}`, and {reach}"
     )
 }
 
@@ -3257,7 +3287,7 @@ fn logs(name: &str, follow: bool, lines: u32) -> Result<()> {
             other => bail!("unexpected reply from astd: {other:?}"),
         };
     }
-    logs_here(name, follow)
+    logs_here(name, follow, lines)
 }
 
 /// Execute through a native container's namespace-bound Unix control
@@ -3288,8 +3318,48 @@ fn container_shell(name: &str, mut command: Vec<String>) -> Result<()> {
     }
 }
 
+/// Run a command through the VM guest-control protocol and preserve its exit
+/// status for scripts. Output was already bounded independently by the guest.
+fn guest_exec(name: &str, command: Vec<String>, timeout_secs: u64) -> Result<()> {
+    if timeout_secs == 0 || timeout_secs > asterism_core::guest::MAX_EXEC_TIMEOUT.as_secs() {
+        bail!(
+            "--timeout must be between 1 and {} seconds",
+            asterism_core::guest::MAX_EXEC_TIMEOUT.as_secs()
+        );
+    }
+    match send(&Request::Exec {
+        name: name.into(),
+        command,
+        timeout_ms: timeout_secs.saturating_mul(1000),
+    })? {
+        Response::Exec {
+            status,
+            stdout,
+            stderr,
+            stdout_truncated,
+            stderr_truncated,
+        } => {
+            print!("{stdout}");
+            eprint!("{stderr}");
+            if stdout_truncated {
+                eprintln!("ast: guest stdout was truncated at the protocol limit");
+            }
+            if stderr_truncated {
+                eprintln!("ast: guest stderr was truncated at the protocol limit");
+            }
+            if status == 0 {
+                Ok(())
+            } else {
+                std::process::exit(status.clamp(1, 255));
+            }
+        }
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected reply from astd: {other:?}"),
+    }
+}
+
 /// The console log as a file on this device's disk.
-fn logs_here(name: &str, follow: bool) -> Result<()> {
+fn logs_here(name: &str, follow: bool, lines: u32) -> Result<()> {
     let path = paths::instance_dir(name).join("console.log");
     let mut file = File::open(&path).map_err(|_| {
         anyhow::anyhow!(
@@ -3299,7 +3369,13 @@ fn logs_here(name: &str, follow: bool) -> Result<()> {
     })?;
 
     let mut out = std::io::stdout();
-    drain(&mut file, &mut out)?;
+    let (text, truncated) = local_console_tail(&mut file, lines)
+        .with_context(|| format!("reading {}", path.display()))?;
+    writeln!(out, "{text}")?;
+    out.flush()?;
+    if truncated {
+        eprintln!("(last {lines} lines — more with: ast logs {name} -n 0)");
+    }
     if !follow {
         return Ok(());
     }
@@ -3317,6 +3393,38 @@ fn logs_here(name: &str, follow: bool) -> Result<()> {
         }
         drain(&mut file, &mut out)?;
     }
+}
+
+/// Match the daemon's bounded console-tail contract while retaining the file
+/// cursor at EOF so `logs -f` can continue with only newly appended bytes.
+fn local_console_tail(file: &mut File, lines: u32) -> Result<(String, bool)> {
+    const CONSOLE_TAIL_BYTES: u64 = 4 * 1024 * 1024;
+
+    let size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let from = size.saturating_sub(CONSOLE_TAIL_BYTES);
+    let mut clipped = from > 0;
+    file.seek(SeekFrom::Start(from))?;
+
+    let mut bytes = Vec::new();
+    (&mut *file)
+        .take(CONSOLE_TAIL_BYTES)
+        .read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let text = if clipped {
+        text.split_once('\n')
+            .map(|(_, rest)| rest.to_owned())
+            .unwrap_or_default()
+    } else {
+        text
+    };
+    if lines == 0 {
+        return Ok((text, clipped));
+    }
+
+    let all: Vec<&str> = text.lines().collect();
+    let keep = all.len().min(lines as usize);
+    clipped |= keep < all.len();
+    Ok((all[all.len() - keep..].join("\n"), clipped))
 }
 
 /// Copy everything the file has left to stdout. A closed pipe
@@ -4226,6 +4334,18 @@ fn print_detail(inst: &Instance, guest_health: Option<&GuestHealth>) {
     if let Some(h) = &inst.handle {
         let pid = h.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
         match (&h.endpoint, &h.container_control) {
+            (Some(endpoint), _) if inst.image_kind == ImageKind::OciRootfs => {
+                match endpoint.control_target() {
+                    Some((host, port)) => println!(
+                        "running: {} pid {pid}, authenticated guest control {host}:{port}",
+                        h.backend
+                    ),
+                    None => println!(
+                        "running: {} pid {pid}, guest control endpoint unavailable",
+                        h.backend
+                    ),
+                }
+            }
             (Some(endpoint), _) => println!("running: {} pid {pid}, ssh {endpoint}", h.backend),
             (None, Some(control)) => println!(
                 "running: {} pid {pid}, container control {}",
@@ -5306,6 +5426,46 @@ mod tests {
             Cli::try_parse_from(["ast", "create", "box", "--runtime", "container"]).is_err(),
             "OCI instances no longer accept a host-namespace runtime override"
         );
+    }
+
+    #[test]
+    fn exec_is_public_argv_only_and_bounded_at_parse_time() {
+        let parsed = parse_cli(&[
+            "exec",
+            "box",
+            "--timeout",
+            "12",
+            "--",
+            "/bin/printf",
+            "%s",
+            "hello",
+        ]);
+        assert!(matches!(
+            parsed.command,
+            Command::Exec { name, timeout: 12, command }
+                if name == "box" && command == ["/bin/printf", "%s", "hello"]
+        ));
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("exec"), "{help}");
+    }
+
+    #[test]
+    fn local_console_tail_matches_remote_line_semantics_and_leaves_eof_cursor() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("console.log");
+        std::fs::write(&path, b"one\ntwo\nthree\n").unwrap();
+        let mut file = File::open(&path).unwrap();
+
+        let (tail, truncated) = local_console_tail(&mut file, 2).unwrap();
+        assert_eq!(tail, "two\nthree");
+        assert!(truncated);
+        assert_eq!(file.stream_position().unwrap(), 14);
+
+        let mut all = File::open(path).unwrap();
+        let (tail, truncated) = local_console_tail(&mut all, 0).unwrap();
+        assert_eq!(tail, "one\ntwo\nthree\n");
+        assert!(!truncated);
+        assert_eq!(all.stream_position().unwrap(), 14);
     }
 
     #[test]

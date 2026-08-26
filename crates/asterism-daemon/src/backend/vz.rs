@@ -61,7 +61,7 @@ use asterism_vz::{
     StopReason,
 };
 
-use super::{alive, grow, owned};
+use super::{alive, grow, owned, proven_stopped_boot, retire_failed_launch, wait_for_oci_control};
 
 pub const ID: &str = "vz";
 
@@ -501,14 +501,22 @@ impl Hypervisor for Vz {
             None
         };
         if req.base.kind == ImageKind::OciRootfs {
+            let key = guest::Key::ensure(&paths::guest_agent_key_path(&inst.name))
+                .with_context(|| format!("minting {:?}'s OCI guest-control key", inst.name))?;
+            let guest_agent = asterism_core::guest::Artifact::discover()
+                .context("finding the packaged Linux OCI guest-control agent")?;
+            let guest_control_boot = guest_agent.oci_boot_script(&key);
             oci::configure_instance(
                 &req.base.path,
                 prep.root_path()?,
-                &req.shares,
-                (!req.shares.is_empty()).then_some(ShareKind::Virtiofs),
-                &req.egress,
-                &req.bootstrap,
-                gpu_boot.as_deref(),
+                &oci::InstanceParts {
+                    shares: &req.shares,
+                    share_kind: (!req.shares.is_empty()).then_some(ShareKind::Virtiofs),
+                    egress: &req.egress,
+                    bootstrap: &req.bootstrap,
+                    gpu_boot: gpu_boot.as_deref(),
+                    guest_control_boot: Some(&guest_control_boot),
+                },
             )?;
         }
 
@@ -594,12 +602,29 @@ impl Hypervisor for Vz {
             &inst.name,
             config.dhcp_lease_is_endpoint,
         ) {
-            Ok(addr) => Ok(Handle::owning(
-                ID,
-                proc,
-                ControlChannel::Rpc { path: config.ctl },
-                GuestEndpoint::GuestAddr { addr },
-            )),
+            Ok(addr) => {
+                if req.base.kind == ImageKind::OciRootfs {
+                    let key = guest::Key::read(&paths::guest_agent_key_path(&inst.name))?
+                        .context("the OCI guest-control key disappeared during boot")?;
+                    let target =
+                        std::net::SocketAddr::new(addr, asterism_core::guest::OCI_TCP_PORT);
+                    if let Err(error) = wait_for_oci_control(&proc, target, &key, BOOT_TIMEOUT) {
+                        let error = error.context("waiting for VZ OCI guest readiness");
+                        if retire_failed_launch(&proc) {
+                            let _ = std::fs::remove_file(&config.ctl);
+                            return Err(proven_stopped_boot(error));
+                        }
+                        return Err(error)
+                            .context("VZ OCI readiness failed and shutdown could not be proven");
+                    }
+                }
+                Ok(Handle::owning(
+                    ID,
+                    proc,
+                    ControlChannel::Rpc { path: config.ctl },
+                    GuestEndpoint::GuestAddr { addr },
+                ))
+            }
             Err(e) => {
                 // A half-started guest is nobody's idea of running. Take
                 // the helper with us so the next `up` starts clean.

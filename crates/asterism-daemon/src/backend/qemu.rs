@@ -33,6 +33,7 @@
 //! after that point is identical: the same clone of the same raw base, the
 //! same snapshots, the same QMP socket, the same shutdown.
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -50,7 +51,10 @@ use asterism_core::snapshot::{self, Snapshot};
 use asterism_core::tools::{output, run, tool};
 use asterism_core::{cow, image, oci, paths};
 
-use super::{grow, observed_running, owned, qmp};
+use super::{
+    grow, observed_running, owned, proven_stopped_boot, qmp, retire_failed_launch,
+    wait_for_oci_control,
+};
 
 pub const ID: &str = "qemu";
 
@@ -381,18 +385,37 @@ impl Hypervisor for Qemu {
             bail!("no cloud-init seed at {}", req.seed.display());
         }
         if req.base.kind == ImageKind::OciRootfs {
+            let key =
+                asterism_core::guest::Key::ensure(&paths::guest_agent_key_path(&inst.name))
+                    .with_context(|| format!("minting {:?}'s OCI guest-control key", inst.name))?;
+            let guest_agent = asterism_core::guest::Artifact::discover()
+                .context("finding the packaged Linux OCI guest-control agent")?;
+            let guest_control_boot = guest_agent.oci_boot_script(&key);
             oci::configure_instance(
                 &req.base.path,
                 prep.root_path()?,
-                &req.shares,
-                (!req.shares.is_empty()).then_some(ShareKind::NinePfs),
-                &req.egress,
-                &req.bootstrap,
-                None,
+                &oci::InstanceParts {
+                    shares: &req.shares,
+                    share_kind: (!req.shares.is_empty()).then_some(ShareKind::NinePfs),
+                    egress: &req.egress,
+                    bootstrap: &req.bootstrap,
+                    gpu_boot: None,
+                    guest_control_boot: Some(&guest_control_boot),
+                },
             )?;
         }
 
         let ssh_port = free_port()?;
+        let control_port = if req.base.kind == ImageKind::OciRootfs {
+            Some(loop {
+                let port = free_port()?;
+                if port != ssh_port {
+                    break port;
+                }
+            })
+        } else {
+            None
+        };
         let pidfile = req.dir.join("qemu.pid");
         let _ = std::fs::remove_file(&pidfile);
         let qmp = paths::qmp_socket_path(&inst.name);
@@ -473,7 +496,7 @@ impl Hypervisor for Qemu {
         }
 
         cmd.arg("-netdev")
-            .arg(netdev_arg(ssh_port, &inst.publish))
+            .arg(netdev_arg(ssh_port, control_port, &inst.publish))
             .arg("-device")
             .arg("virtio-net-pci,netdev=n0")
             .arg("-device")
@@ -515,11 +538,35 @@ impl Hypervisor for Qemu {
             format!("qemu wrote pid {pid} to its pidfile and was gone before it could be recorded")
         })?;
 
+        let endpoint = match control_port {
+            Some(control_port) => {
+                let key =
+                    asterism_core::guest::Key::read(&paths::guest_agent_key_path(&inst.name))?
+                        .context("the OCI guest-control key disappeared during boot")?;
+                let target = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), control_port);
+                if let Err(error) =
+                    wait_for_oci_control(&proc, target, &key, Duration::from_secs(120))
+                {
+                    let error = error.context("waiting for QEMU OCI guest readiness");
+                    if retire_failed_launch(&proc) {
+                        let _ = std::fs::remove_file(&qmp);
+                        return Err(proven_stopped_boot(error));
+                    }
+                    return Err(error)
+                        .context("QEMU OCI readiness failed and shutdown could not be proven");
+                }
+                GuestEndpoint::HostForwardControl {
+                    ssh_port,
+                    control_port,
+                }
+            }
+            None => GuestEndpoint::HostForward { ssh_port },
+        };
         Ok(Handle::owning(
             ID,
             proc,
             ControlChannel::Qmp { path: qmp },
-            GuestEndpoint::HostForward { ssh_port },
+            endpoint,
         ))
     }
 
@@ -812,8 +859,14 @@ fn cmdline() -> String {
 /// into the guest — which is the point: an OCI instance's port is reached
 /// exactly where its ssh would have been, so nothing else in Asterism has to
 /// learn a second way in.
-fn netdev_arg(ssh_port: u16, publish: &[PortForward]) -> String {
+fn netdev_arg(ssh_port: u16, control_port: Option<u16>, publish: &[PortForward]) -> String {
     let mut arg = format!("user,id=n0,hostfwd=tcp:127.0.0.1:{ssh_port}-:22");
+    if let Some(control_port) = control_port {
+        arg.push_str(&format!(
+            ",hostfwd=tcp:127.0.0.1:{control_port}-:{}",
+            asterism_core::guest::OCI_TCP_PORT
+        ));
+    }
     for p in publish {
         arg.push_str(&format!(",hostfwd=tcp:127.0.0.1:{}-:{}", p.host, p.guest));
     }
@@ -1522,12 +1575,13 @@ mod tests {
     #[test]
     fn published_ports_are_forwards_on_the_same_netdev_as_ssh() {
         assert_eq!(
-            netdev_arg(22022, &[]),
+            netdev_arg(22022, None, &[]),
             "user,id=n0,hostfwd=tcp:127.0.0.1:22022-:22"
         );
         assert_eq!(
             netdev_arg(
                 22022,
+                None,
                 &[
                     PortForward {
                         host: 8080,
@@ -1541,6 +1595,11 @@ mod tests {
             ),
             "user,id=n0,hostfwd=tcp:127.0.0.1:22022-:22,\
              hostfwd=tcp:127.0.0.1:8080-:80,hostfwd=tcp:127.0.0.1:5432-:5432"
+        );
+        assert_eq!(
+            netdev_arg(22022, Some(22023), &[]),
+            "user,id=n0,hostfwd=tcp:127.0.0.1:22022-:22,\
+             hostfwd=tcp:127.0.0.1:22023-:1023"
         );
     }
 

@@ -25,7 +25,7 @@ use asterism_core::snapshot::{self, Snapshot};
 use asterism_core::{cow, durable, image, oci, paths};
 use asterism_vz::guest::{self, Key, Session};
 
-use super::{grow, observed_running, owned};
+use super::{grow, observed_running, owned, proven_stopped_boot, wait_for_oci_control};
 
 pub const ID: &str = "chv";
 pub const VERSION: &str = "v53.0";
@@ -137,6 +137,27 @@ impl Chv {
         let pidfile = req.dir.join(PID_NAME);
         for stale in [&api, &vsock, &pidfile] {
             let _ = std::fs::remove_file(stale);
+        }
+
+        if restore.is_none() && req.base.kind == ImageKind::OciRootfs {
+            let key = Key::ensure(&paths::guest_agent_key_path(&req.instance.name)).with_context(
+                || format!("minting {:?}'s OCI guest-control key", req.instance.name),
+            )?;
+            let guest_agent = asterism_core::guest::Artifact::discover()
+                .context("finding the packaged Linux OCI guest-control agent")?;
+            let guest_control_boot = guest_agent.oci_boot_script(&key);
+            oci::configure_instance(
+                &req.base.path,
+                prep.root_path()?,
+                &oci::InstanceParts {
+                    shares: &req.shares,
+                    share_kind: (!req.shares.is_empty()).then_some(ShareKind::Virtiofs),
+                    egress: &req.egress,
+                    bootstrap: &req.bootstrap,
+                    gpu_boot: None,
+                    guest_control_boot: Some(&guest_control_boot),
+                },
+            )?;
         }
 
         // Cloud Hypervisor deliberately consumes ordinary host files and
@@ -251,12 +272,24 @@ impl Chv {
         let endpoint = if req.base.kind == ImageKind::Disk {
             wait_for_guest(&vsock, &req.dir, req.instance, &proc, BOOT_TIMEOUT)?
         } else {
-            // OCI instances run their image entrypoint as pid 1 and do not
-            // carry cloud-init or sshd.  Their deterministic address is still
-            // recorded for status and future service routing.
-            GuestEndpoint::GuestAddr {
-                addr: Network::for_instance(&req.instance.name).guest.parse()?,
+            let addr: IpAddr = Network::for_instance(&req.instance.name).guest.parse()?;
+            let key = Key::read(&paths::guest_agent_key_path(&req.instance.name))?
+                .context("the OCI guest-control key disappeared during boot")?;
+            if let Err(error) = wait_for_oci_control(
+                &proc,
+                SocketAddr::new(addr, asterism_core::guest::OCI_TCP_PORT),
+                &key,
+                BOOT_TIMEOUT,
+            ) {
+                let error = error.context("waiting for Cloud Hypervisor OCI guest readiness");
+                if cleanup.retire() {
+                    return Err(proven_stopped_boot(error));
+                }
+                return Err(error).context(
+                    "Cloud Hypervisor OCI readiness failed and shutdown could not be proven",
+                );
             }
+            GuestEndpoint::GuestAddr { addr }
         };
         let handle = Handle::owning(ID, proc, ControlChannel::HttpApi { path: api }, endpoint);
         cleanup.disarm();
@@ -1451,6 +1484,23 @@ impl<'a> SpawnCleanup<'a> {
     fn disarm(&mut self) {
         self.armed = false;
     }
+
+    /// Run the rollback now so a caller can distinguish proven cleanup from
+    /// an ambiguous launch. `false` leaves the durable authority records for
+    /// a later recovery attempt.
+    fn retire(&mut self) -> bool {
+        if !self.armed {
+            return true;
+        }
+        let vmm_retired = self.vmm.as_ref().is_none_or(retire_owned_process);
+        if vmm_retired {
+            clear_vmm_authority(self.dir);
+            cleanup_fs_helpers(self.dir);
+            cleanup_remote_blocks(self.dir);
+            self.armed = false;
+        }
+        vmm_retired
+    }
 }
 
 impl Drop for SpawnCleanup<'_> {
@@ -1458,12 +1508,7 @@ impl Drop for SpawnCleanup<'_> {
         if !self.armed {
             return;
         }
-        let vmm_retired = self.vmm.as_ref().is_none_or(retire_owned_process);
-        if vmm_retired {
-            clear_vmm_authority(self.dir);
-            cleanup_fs_helpers(self.dir);
-            cleanup_remote_blocks(self.dir);
-        }
+        let _ = self.retire();
     }
 }
 

@@ -240,6 +240,10 @@ impl ControlChannel {
 pub enum GuestEndpoint {
     /// QEMU user-net / gvproxy: a loopback port on this host.
     HostForward { ssh_port: u16 },
+    /// QEMU user-net for a direct-kernel OCI guest. SSH remains recorded for
+    /// schema compatibility, while the authenticated static agent has its
+    /// own loopback forward and is the actual way into this guest.
+    HostForwardControl { ssh_port: u16, control_port: u16 },
     /// VZ NAT, bridged, or mesh-routed: the guest has its own address.
     GuestAddr { addr: IpAddr },
 }
@@ -303,7 +307,25 @@ impl GuestEndpoint {
     pub fn ssh_target(&self) -> (String, u16) {
         match self {
             GuestEndpoint::HostForward { ssh_port } => ("127.0.0.1".to_owned(), *ssh_port),
+            GuestEndpoint::HostForwardControl { ssh_port, .. } => {
+                ("127.0.0.1".to_owned(), *ssh_port)
+            }
             GuestEndpoint::GuestAddr { addr } => (addr.to_string(), 22),
+        }
+    }
+
+    /// Authenticated OCI guest-control target, where this endpoint carries
+    /// one. Direct-address native backends use the fixed private guest port;
+    /// QEMU records the loopback forward it allocated before boot.
+    pub fn control_target(&self) -> Option<(String, u16)> {
+        match self {
+            GuestEndpoint::HostForward { .. } => None,
+            GuestEndpoint::HostForwardControl { control_port, .. } => {
+                Some(("127.0.0.1".to_owned(), *control_port))
+            }
+            GuestEndpoint::GuestAddr { addr } => {
+                Some((addr.to_string(), crate::guest::OCI_TCP_PORT))
+            }
         }
     }
 }
@@ -875,6 +897,25 @@ mod tests {
         };
         assert_eq!(direct.ssh_target(), ("192.168.64.7".to_owned(), 22));
         assert_eq!(direct.to_string(), "192.168.64.7:22");
+
+        let controlled = GuestEndpoint::HostForwardControl {
+            ssh_port: 22022,
+            control_port: 22023,
+        };
+        assert_eq!(controlled.ssh_target(), ("127.0.0.1".to_owned(), 22022));
+        assert_eq!(
+            controlled.control_target(),
+            Some(("127.0.0.1".to_owned(), 22023))
+        );
+        assert_eq!(
+            direct.control_target(),
+            Some(("192.168.64.7".to_owned(), crate::guest::OCI_TCP_PORT))
+        );
+        assert_eq!(
+            fwd.control_target(),
+            None,
+            "old handles stay explicitly unready"
+        );
     }
 
     #[test]
@@ -903,6 +944,25 @@ mod tests {
         // The bare pid stays on the wire beside the identity, so a daemon or
         // CLI older than identities still reads a handle this one wrote.
         assert!(json.contains("\"pid\":4242"), "{json}");
+    }
+
+    #[test]
+    fn an_oci_control_endpoint_survives_daemon_restart_serialization() {
+        let endpoint = GuestEndpoint::HostForwardControl {
+            ssh_port: 22022,
+            control_port: 22023,
+        };
+        let json = serde_json::to_string(&endpoint).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"host_forward_control","ssh_port":22022,"control_port":22023}"#
+        );
+        let recovered: GuestEndpoint = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered, endpoint);
+        assert_eq!(
+            recovered.control_target(),
+            Some(("127.0.0.1".into(), 22023))
+        );
     }
 
     /// The compatibility direction that matters most: a registry written

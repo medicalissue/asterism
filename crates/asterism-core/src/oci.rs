@@ -1243,15 +1243,31 @@ fn busybox_binary() -> Result<PathBuf> {
 ///     button arrives, which is how `ast down` reaches a guest with no
 ///     init system to ask.
 pub fn init_script(config: &Config) -> String {
+    let egress = Egress::default();
+    let bootstrap = Bootstrap::default();
     init_script_with_parts(
         config,
-        &[],
-        None,
-        &Egress::default(),
-        &Bootstrap::default(),
-        None,
+        &InstanceParts {
+            shares: &[],
+            share_kind: None,
+            egress: &egress,
+            bootstrap: &bootstrap,
+            gpu_boot: None,
+            guest_control_boot: None,
+        },
         None,
     )
+}
+
+/// Instance-owned material folded into a private OCI root immediately before
+/// VM boot. The pulled image stays immutable and shared.
+pub struct InstanceParts<'a> {
+    pub shares: &'a [Share],
+    pub share_kind: Option<ShareKind>,
+    pub egress: &'a Egress,
+    pub bootstrap: &'a Bootstrap,
+    pub gpu_boot: Option<&'a str>,
+    pub guest_control_boot: Option<&'a str>,
 }
 
 /// Generate the per-instance init for an OCI rootfs.
@@ -1262,13 +1278,15 @@ pub fn init_script(config: &Config) -> String {
 /// before boot.
 fn init_script_with_parts(
     config: &Config,
-    shares: &[Share],
-    share_kind: Option<ShareKind>,
-    egress: &Egress,
-    bootstrap: &Bootstrap,
-    gpu_boot: Option<&str>,
+    parts: &InstanceParts<'_>,
     virtiofs_module: Option<&[u8]>,
 ) -> String {
+    let shares = parts.shares;
+    let share_kind = parts.share_kind;
+    let egress = parts.egress;
+    let bootstrap = parts.bootstrap;
+    let gpu_boot = parts.gpu_boot;
+    let guest_control_boot = parts.guest_control_boot;
     let mut s = String::new();
     s.push_str(&format!("#!/{GUEST_BUSYBOX} sh\n"));
     s.push_str(
@@ -1495,6 +1513,10 @@ fn init_script_with_parts(
             sh_quote(dir)
         ));
     }
+    if let Some(guest_control_boot) = guest_control_boot {
+        s.push_str("# Start the authenticated static OCI guest-control agent.\n");
+        s.push_str(guest_control_boot);
+    }
 
     let argv = config.argv();
     let command = if argv.is_empty() {
@@ -1532,16 +1554,8 @@ fn init_script_with_parts(
 /// writable clone that receives only this instance's parts. The operation is
 /// deliberately on the boot path, not `prepare`, because snapshot listing
 /// and other disk-only operations must remain read-only.
-pub fn configure_instance(
-    source: &Path,
-    root: &Path,
-    shares: &[Share],
-    share_kind: Option<ShareKind>,
-    egress: &Egress,
-    bootstrap: &Bootstrap,
-    gpu_boot: Option<&str>,
-) -> Result<()> {
-    if shares.is_empty() != share_kind.is_none() {
+pub fn configure_instance(source: &Path, root: &Path, parts: &InstanceParts<'_>) -> Result<()> {
+    if parts.shares.is_empty() != parts.share_kind.is_none() {
         bail!("an OCI directory share needs exactly one guest transport");
     }
     let sidecar = source.with_extension("json");
@@ -1574,20 +1588,12 @@ pub fn configure_instance(
     let doc: Value = serde_json::from_str(&text)
         .with_context(|| format!("reading OCI config at {}", sidecar.display()))?;
     let config = Config::from_json(&doc);
-    let module = if share_kind == Some(ShareKind::Virtiofs) {
+    let module = if parts.share_kind == Some(ShareKind::Virtiofs) {
         Some(virtiofs_module()?)
     } else {
         None
     };
-    let init = init_script_with_parts(
-        &config,
-        shares,
-        share_kind,
-        egress,
-        bootstrap,
-        gpu_boot,
-        module.as_deref(),
-    );
+    let init = init_script_with_parts(&config, parts, module.as_deref());
     rewrite_guest_files(root, &init)
         .with_context(|| format!("configuring OCI guest disk {}", root.display()))
 }
@@ -2368,7 +2374,7 @@ mod tests {
     /// and exports only opaque secret handles before starting the image.
     #[test]
     fn a_personalized_init_projects_volumes_and_secret_egress() {
-        let config = Config {
+        let mut config = Config {
             cmd: vec!["/app".into()],
             env: vec![
                 "HTTPS_PROXY=http://image.invalid".into(),
@@ -2392,13 +2398,18 @@ mod tests {
         let bootstrap = Bootstrap::resolve(&["base".to_owned()]).unwrap();
         let gpu_boot = "$BB mkdir -p /usr/local/sbin\n\
                         echo gpu-service > /usr/local/sbin/asterism-gpu-guest\n";
+        let guest_control_boot = "echo guest-control-ready\n";
+        config.workdir = Some("/workspace".into());
         let script = init_script_with_parts(
             &config,
-            &shares,
-            Some(ShareKind::NinePfs),
-            &egress,
-            &bootstrap,
-            Some(gpu_boot),
+            &InstanceParts {
+                shares: &shares,
+                share_kind: Some(ShareKind::NinePfs),
+                egress: &egress,
+                bootstrap: &bootstrap,
+                gpu_boot: Some(gpu_boot),
+                guest_control_boot: Some(guest_control_boot),
+            },
             None,
         );
         let dir = tempfile::tempdir().unwrap();
@@ -2424,6 +2435,12 @@ mod tests {
                     .find("asterism: starting the image entrypoint")
                     .unwrap()
         );
+        let workdir = script.find("cd '/workspace'").unwrap();
+        let control = script.find("guest-control-ready").unwrap();
+        let entrypoint = script
+            .find("asterism: starting the image entrypoint")
+            .unwrap();
+        assert!(workdir < control && control < entrypoint, "{script}");
         assert!(
             script.contains("udhcpc -n -q") && script.contains("-s /asterism-init"),
             "the same init can DHCP on vz"
@@ -2466,11 +2483,14 @@ mod tests {
         let err = configure_instance(
             &dir.path().join("source.raw"),
             &dir.path().join("root.raw"),
-            &[share],
-            None,
-            &Egress::default(),
-            &Bootstrap::default(),
-            None,
+            &InstanceParts {
+                shares: &[share],
+                share_kind: None,
+                egress: &Egress::default(),
+                bootstrap: &Bootstrap::default(),
+                gpu_boot: None,
+                guest_control_boot: None,
+            },
         )
         .unwrap_err()
         .to_string();
@@ -2524,10 +2544,18 @@ mod tests {
             handles: vec![("EXAMPLE_TOKEN".into(), "ast-handle-opaque".into())],
         };
         let bootstrap = Bootstrap::resolve(&["base".to_owned()]).unwrap();
-        configure_instance(&source, &root, &[], None, &egress, &bootstrap, None).unwrap();
+        let parts = InstanceParts {
+            shares: &[],
+            share_kind: None,
+            egress: &egress,
+            bootstrap: &bootstrap,
+            gpu_boot: None,
+            guest_control_boot: None,
+        };
+        configure_instance(&source, &root, &parts).unwrap();
         assert!(dir.path().join("oci-config.json").exists());
         std::fs::remove_file(source.with_extension("json")).unwrap();
-        configure_instance(&source, &root, &[], None, &egress, &bootstrap, None)
+        configure_instance(&source, &root, &parts)
             .expect("a moved instance carries its private OCI config");
         let init = output(
             Command::new(&debugfs)

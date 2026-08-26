@@ -1112,10 +1112,13 @@ pub(crate) async fn handle(req: Request, node: &Node) -> Response {
     if images::is_plane_request(&req) {
         return images::serve(req).await;
     }
-    // Exec is the one instance command whose useful work may be unbounded.
+    // Exec is the one instance command whose useful work may be long-lived.
     // Clone its immutable authority while holding the shard, then release the
     // global mutex before touching the runtime.  Down/remove/reconcile can
     // consequently proceed even when the command or its control peer stalls.
+    if matches!(&req, Request::Exec { .. }) {
+        return guest_exec(node, req).await;
+    }
     if matches!(&req, Request::ContainerExec { .. }) {
         return container_exec(node, req).await;
     }
@@ -1182,6 +1185,130 @@ pub(crate) async fn handle(req: Request, node: &Node) -> Response {
         return snapshot::serve(req, &reg);
     }
     instance::serve(req, &mut reg, &cpu_device).await
+}
+
+async fn guest_exec(node: &Node, request: Request) -> Response {
+    let (target, key, command, timeout) = {
+        let reg = node.shard.lock().await;
+        if let Some(refusal) = instance::refusal(&request, &reg) {
+            return refusal;
+        }
+        let Request::Exec {
+            name,
+            command,
+            timeout_ms,
+        } = &request
+        else {
+            return Response::Error {
+                message: "non-exec request reached VM guest exec dispatcher".into(),
+            };
+        };
+        if command.is_empty() {
+            return Response::Error {
+                message: "guest exec needs a command".into(),
+            };
+        }
+        let timeout = std::time::Duration::from_millis(*timeout_ms);
+        if timeout.is_zero() || timeout > asterism_core::guest::MAX_EXEC_TIMEOUT {
+            return Response::Error {
+                message: format!(
+                    "guest exec timeout must be between 1 ms and {} seconds",
+                    asterism_core::guest::MAX_EXEC_TIMEOUT.as_secs()
+                ),
+            };
+        }
+        let inst = match reg.get(name) {
+            Ok(inst) => inst,
+            Err(error) => {
+                return Response::Error {
+                    message: format!("{error:#}"),
+                }
+            }
+        };
+        if inst.runtime != asterism_core::instance::RuntimeKind::Vm {
+            return Response::Error {
+                message: format!(
+                    "instance {name:?} is a retired native-container row; only VM guest exec is supported"
+                ),
+            };
+        }
+        if inst.image_kind != asterism_core::hv::ImageKind::OciRootfs {
+            return Response::Error {
+                message: format!(
+                    "instance {name:?} uses a cloud disk; use `ast ssh {name} -- <command>`"
+                ),
+            };
+        }
+        let Some(handle) = inst.handle.as_ref() else {
+            return Response::Error {
+                message: format!("instance {name:?} is not running"),
+            };
+        };
+        let Some(endpoint) = handle.endpoint.as_ref() else {
+            return Response::Error {
+                message: format!("instance {name:?} has no VM guest endpoint"),
+            };
+        };
+        let Some(target) = endpoint.control_target() else {
+            return Response::Error {
+                message: format!(
+                    "instance {name:?} was booted without an OCI guest-control endpoint; restart it with this Asterism build"
+                ),
+            };
+        };
+        let key = match asterism_core::guest::Key::read(&paths::guest_agent_key_path(name)) {
+            Ok(Some(key)) => key,
+            Ok(None) => {
+                return Response::Error {
+                    message: format!("instance {name:?} has no guest-control key; refusing exec"),
+                }
+            }
+            Err(error) => {
+                return Response::Error {
+                    message: format!("reading {name:?}'s guest-control key: {error:#}"),
+                }
+            }
+        };
+        (target, key, command.clone(), timeout)
+    };
+
+    let task = tokio::task::spawn_blocking(move || -> Result<asterism_core::guest::ExecResult> {
+        use std::io::BufReader;
+        use std::net::{TcpStream, ToSocketAddrs};
+
+        let (host, port) = target;
+        let address = (host.as_str(), port)
+            .to_socket_addrs()
+            .context("resolving the OCI guest-control endpoint")?
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("the OCI guest-control endpoint has no address"))?;
+        let stream = TcpStream::connect_timeout(&address, std::time::Duration::from_secs(5))
+            .with_context(|| format!("connecting to OCI guest control at {host}:{port}"))?;
+        let wire_timeout = timeout + std::time::Duration::from_secs(5);
+        stream.set_read_timeout(Some(wire_timeout))?;
+        stream.set_write_timeout(Some(wire_timeout))?;
+        let reader = BufReader::new(stream.try_clone()?);
+        let mut session = asterism_core::guest::Session::open(reader, stream, &key)?;
+        session.exec(command, timeout)
+    });
+    match tokio::time::timeout(timeout + std::time::Duration::from_secs(10), task).await {
+        Ok(Ok(Ok(result))) => Response::Exec {
+            status: result.status,
+            stdout: String::from_utf8_lossy(&result.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&result.stderr).into_owned(),
+            stdout_truncated: result.stdout_truncated,
+            stderr_truncated: result.stderr_truncated,
+        },
+        Ok(Ok(Err(error))) => Response::Error {
+            message: format!("{error:#}"),
+        },
+        Ok(Err(error)) => Response::Error {
+            message: format!("VM guest exec worker failed: {error}"),
+        },
+        Err(_) => Response::Error {
+            message: "VM guest exec exceeded its daemon deadline".into(),
+        },
+    }
 }
 
 async fn container_exec(node: &Node, request: Request) -> Response {

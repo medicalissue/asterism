@@ -276,6 +276,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "asterism-guest"
+version = "0.0.2"
+dependencies = [
+ "anyhow",
+ "asterism-core",
+ "data-encoding",
+ "hostname",
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "asterism-hyperv"
 version = "0.0.2"
 dependencies = [

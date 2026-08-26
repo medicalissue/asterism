@@ -147,6 +147,18 @@ jobs:
       - name: Audit Linux guest libcuda ELF and exported Driver ABI (source-only; no NVIDIA claim)
         if: runner.os == 'Linux'
         run: bash scripts/build-guest-gpu-artifacts.sh "${RUNNER_TEMP}/asterism-gpu-guest"
+      - name: Build and audit the static OCI VM guest-control agent
+        if: runner.os == 'Linux'
+        run: |
+          set -eu
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          case "$(uname -m)" in
+            x86_64) target=x86_64-unknown-linux-musl ;;
+            aarch64) target=aarch64-unknown-linux-musl ;;
+          esac
+          rustup target add "$target"
+          bash scripts/build-guest-control-artifact.sh "${RUNNER_TEMP}/asterism-guest"
       - run: bash scripts/check-rust-source-graph.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
 

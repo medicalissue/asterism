@@ -80,6 +80,21 @@ recorded choice is the hypervisor backend, never a host-namespace runtime.
 Architecture-specific mutations and snapshots do not become
 cross-architecture portable merely because their source was OCI.
 
+Direct-kernel OCI guests also receive Asterism's static Linux guest-control
+agent. `ast up` returns only after that agent proves the per-Instance key; it
+does not pretend an arbitrary OCI image contains SSH. Commands are argv-only,
+bounded, and preserve their exit status and separate output streams:
+
+```console
+$ ast create web --image nginx:alpine -p 8080:80
+$ ast up web
+$ ast exec web -- /bin/sh -c 'nginx -t'
+$ ast logs web -n 20
+```
+
+`ast exec ... -- /bin/sh -c ...` covers non-interactive shell work. A PTY and
+interactive stdin are not part of this command.
+
 On macOS, Asterism uses Virtualization.framework when it satisfies the
 instance's requirements. QEMU is an optional compatibility backend, not an
 install dependency. Pass `--backend vz` or install QEMU separately and pass

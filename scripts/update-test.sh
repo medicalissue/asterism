@@ -322,13 +322,15 @@ make_linux_release() {
   printf '#!/bin/sh\necho "virtiofsd 1.14.0"\n' >"$stage/virtiofsd"
   chmod +x "$stage/cloud-hypervisor" "$stage/virtiofsd"
   mkdir -p "$stage/guest-gpu/bin" "$stage/guest-gpu/lib"
+  mkdir -p "$stage/guest/bin"
+  printf '#!/bin/sh\necho guest-control-%s\n' "$build" >"$stage/guest/bin/asterism-guest"
   printf '#!/bin/sh\necho guest-gpu-%s\n' "$build" >"$stage/guest-gpu/bin/asterism-gpu-guest"
   printf 'libcuda-%s\n' "$build" >"$stage/guest-gpu/lib/libcuda.so.1.0.0"
   ln -s libcuda.so.1.0.0 "$stage/guest-gpu/lib/libcuda.so.1"
   ln -s libcuda.so.1 "$stage/guest-gpu/lib/libcuda.so"
-  chmod +x "$stage/guest-gpu/bin/asterism-gpu-guest"
+  chmod +x "$stage/guest/bin/asterism-guest" "$stage/guest-gpu/bin/asterism-gpu-guest"
   make_updater "$stage/asterism-update"
-  tar -czf "$dir/unit.tar.gz" -C "$stage" ast astd cloud-hypervisor virtiofsd guest-gpu asterism-update
+  tar -czf "$dir/unit.tar.gz" -C "$stage" ast astd cloud-hypervisor virtiofsd guest guest-gpu asterism-update
   "$RENDER" stable "$version" "$build" linux-x86_64 \
     "file://$dir/unit.tar.gz" "$(sha "$dir/unit.tar.gz")" \
     "" "" >"$dir/RELEASE.json"
@@ -351,9 +353,11 @@ install_linux_old() {
   # it, and rollback must recover the old inode with it intact.
   chmod 0700 "$PREFIX/bin/cloud-hypervisor"
   mkdir -p "$PREFIX/bin/guest-gpu/bin" "$PREFIX/bin/guest-gpu/lib"
+  mkdir -p "$PREFIX/bin/guest/bin"
+  printf '#!/bin/sh\necho guest-control-old\n' >"$PREFIX/bin/guest/bin/asterism-guest"
   printf '#!/bin/sh\necho guest-gpu-old\n' >"$PREFIX/bin/guest-gpu/bin/asterism-gpu-guest"
   printf 'libcuda-old\n' >"$PREFIX/bin/guest-gpu/lib/libcuda.so.1.0.0"
-  chmod +x "$PREFIX/bin/guest-gpu/bin/asterism-gpu-guest"
+  chmod +x "$PREFIX/bin/guest/bin/asterism-guest" "$PREFIX/bin/guest-gpu/bin/asterism-gpu-guest"
   make_updater "$PREFIX/libexec/asterism/asterism-update"
 }
 
@@ -378,7 +382,8 @@ assert_linux_transaction_clean() {
     fail "$context: private transaction directory remains"
   for path in \
     "$PREFIX/bin/ast" "$PREFIX/bin/astd" "$PREFIX/bin/cloud-hypervisor" \
-    "$PREFIX/bin/virtiofsd" "$PREFIX/libexec/asterism/asterism-update"; do
+    "$PREFIX/bin/virtiofsd" "$PREFIX/bin/guest" "$PREFIX/bin/guest-gpu" \
+    "$PREFIX/libexec/asterism/asterism-update"; do
     [ ! -e "${path}.previous.update" ] || fail "$context: backup remains for $path"
     [ ! -e "${path}.previous.update.absent" ] || fail "$context: absence marker remains for $path"
   done
@@ -398,6 +403,8 @@ grep -qxF "$PREFIX/bin/cloud-hypervisor" "$WORK/setcap-calls" ||
   fail "linux update did not cross the capability restoration seam"
 [ "$(cat "$PREFIX/bin/guest-gpu/lib/libcuda.so.1.0.0")" = 'libcuda-0.0.2+new' ] \
   || fail "linux update did not activate the matching guest GPU unit"
+"$PREFIX/bin/guest/bin/asterism-guest" | grep -q 'guest-control-0.0.2+new' \
+  || fail "linux update did not activate the matching OCI guest-control agent"
 [ ! -e "$PREFIX/bin/astd-vz" ] || fail "linux update planted a vz helper"
 ok "Linux signed update activates ast, astd, CHV and virtiofsd as one unit"
 
@@ -450,6 +457,8 @@ if ASTERISM_UPDATE_FAIL_AFTER=cloud-hypervisor \
 fi
 [ "$(cat "$PREFIX/bin/guest-gpu/lib/libcuda.so.1.0.0")" = 'libcuda-old' ] \
   || fail "Linux rollback left the new guest GPU unit beside the old daemon"
+"$PREFIX/bin/guest/bin/asterism-guest" | grep -q 'guest-control-old' \
+  || fail "Linux rollback left the new OCI guest-control agent beside the old daemon"
 [ "$(build_of "$PREFIX/bin/astd")" = 0.0.1+old ] \
   || fail "Linux rollback did not restore the old daemon with its guest unit"
 ok "Linux update rollback restores guest GPU artifacts with the matching daemon"

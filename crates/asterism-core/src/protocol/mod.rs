@@ -331,6 +331,12 @@ pub enum Request {
         name: String,
         lines: u32,
     },
+    /// Run one bounded argv through the authenticated VM guest-control agent.
+    Exec {
+        name: String,
+        command: Vec<String>,
+        timeout_ms: u64,
+    },
     /// Execute inside a native container through its private control socket.
     ContainerExec {
         name: String,
@@ -750,6 +756,7 @@ impl Request {
             | Request::SnapshotRestore { name, .. }
             | Request::SnapshotRemove { name, .. }
             | Request::Logs { name, .. }
+            | Request::Exec { name, .. }
             | Request::GpuGuestOpen { name }
             // Binding a secret is an instance command: `ast attach dev
             // --secret anthropic` resolves `dev` across the orbit like every
@@ -889,6 +896,7 @@ impl Request {
             | Request::GpuProviderList
             | Request::GpuProviderAttach { .. }
             | Request::GpuProviderRevoke { .. } => 8,
+            Request::Exec { .. } => 9,
             Request::DeviceShellPolicy { .. }
             | Request::DeviceShellOpen { .. }
             | Request::DeviceShellInput { .. }
@@ -932,6 +940,7 @@ impl Request {
             Request::ImagePull { .. } => Some("image_pull"),
             Request::CreateRuntime { .. } => Some("create_runtime"),
             Request::ContainerExec { .. } => Some("container_exec"),
+            Request::Exec { .. } => Some("exec"),
             Request::GpuGuestOpen { .. }
             | Request::GpuGuestFrame { .. }
             | Request::GpuGuestClose => Some("gpu_guest"),
@@ -1079,6 +1088,14 @@ pub enum Response {
         status: i32,
         stdout: String,
         stderr: String,
+    },
+    /// Bounded result from [`Request::Exec`].
+    Exec {
+        status: i32,
+        stdout: String,
+        stderr: String,
+        stdout_truncated: bool,
+        stderr_truncated: bool,
     },
     /// Reply to [`Request::SshEndpoint`]: a loopback address `ssh` can be
     /// pointed at right now, and the key file that opens the guest. Whose cpu
@@ -1324,6 +1341,7 @@ impl Response {
             Response::Images { .. } | Response::ImagePulled { .. } => 6,
             Response::VolumeCatalog { .. } | Response::VolumeLease { .. } => 7,
             Response::ContainerExec { .. } => 8,
+            Response::Exec { .. } => 9,
             Response::Instance { instance, .. } if instance.runtime == RuntimeKind::Container => 8,
             Response::Instances { instances }
                 if instances
@@ -1426,6 +1444,15 @@ pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
             Request::ContainerExec {
                 name: String::new(),
                 command: Vec::new(),
+            }
+            .since(),
+        ),
+        (
+            "exec",
+            Request::Exec {
+                name: String::new(),
+                command: Vec::new(),
+                timeout_ms: 1,
             }
             .since(),
         ),
@@ -1719,6 +1746,7 @@ mod tests {
         assert_eq!(table.get("volume_release"), Some(&7));
         assert_eq!(table.get("create_runtime"), Some(&8));
         assert_eq!(table.get("container_exec"), Some(&8));
+        assert_eq!(table.get("exec"), Some(&9));
         assert_eq!(
             table.get("device-shell"),
             Some(&4),
@@ -1880,6 +1908,29 @@ mod tests {
             })
             .unwrap(),
             r#"{"result":"log","text":"boot","truncated":true}"#
+        );
+        let exec = Request::Exec {
+            name: "dev".into(),
+            command: vec!["/bin/echo".into(), "hello".into()],
+            timeout_ms: 30_000,
+        };
+        assert_eq!(exec.since(), 9);
+        assert_eq!(exec.versioned_name(), Some("exec"));
+        assert_eq!(
+            serde_json::to_string(&exec).unwrap(),
+            r#"{"cmd":"exec","name":"dev","command":["/bin/echo","hello"],"timeout_ms":30000}"#
+        );
+        let response = Response::Exec {
+            status: 7,
+            stdout: "out".into(),
+            stderr: "err".into(),
+            stdout_truncated: false,
+            stderr_truncated: true,
+        };
+        assert_eq!(response.since(), 9);
+        assert_eq!(
+            serde_json::to_string(&response).unwrap(),
+            r#"{"result":"exec","status":7,"stdout":"out","stderr":"err","stdout_truncated":false,"stderr_truncated":true}"#
         );
     }
 

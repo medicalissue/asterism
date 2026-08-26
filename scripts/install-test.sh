@@ -78,11 +78,13 @@ EOF
 		cp "${ROOT}/packaging/linux-components.env" "${stage}/share/asterism/"
 		cp "${ROOT}/packaging/asterism-nbd" "${stage}/share/asterism/"
 		mkdir -p "${stage}/guest-gpu/bin" "${stage}/guest-gpu/lib"
+		mkdir -p "${stage}/guest/bin"
+		printf '#!/bin/sh\nexit 1\n' >"${stage}/guest/bin/asterism-guest"
 		printf '#!/bin/sh\nexit 1\n' >"${stage}/guest-gpu/bin/asterism-gpu-guest"
 		printf 'ELF guest libcuda\n' >"${stage}/guest-gpu/lib/libcuda.so.1.0.0"
 		ln -s libcuda.so.1.0.0 "${stage}/guest-gpu/lib/libcuda.so.1"
 		ln -s libcuda.so.1 "${stage}/guest-gpu/lib/libcuda.so"
-		chmod +x "${stage}/guest-gpu/bin/asterism-gpu-guest"
+		chmod +x "${stage}/guest/bin/asterism-guest" "${stage}/guest-gpu/bin/asterism-gpu-guest"
 		for license in cloud-hypervisor-Apache-2.0 cloud-hypervisor-BSD-3-Clause \
 			virtiofsd-Apache-2.0 virtiofsd-BSD-3-Clause; do
 			printf 'test license\n' >"${stage}/share/asterism/licenses/${license}.txt"
@@ -94,7 +96,7 @@ EOF
 		else
 			printf 'NOTICE\n' >"${stage}/share/asterism/licenses/NOTICE"
 		fi
-		members=(ast astd cloud-hypervisor virtiofsd guest-gpu share)
+		members=(ast astd cloud-hypervisor virtiofsd guest guest-gpu share)
 	fi
 	# The first release predates self-update; current releases ship the updater
 	# that `ast update` keeps alive while replacing ast itself.
@@ -690,12 +692,16 @@ says "loginctl enable-linger"
 [ -x "${PREFIX}/bin/virtiofsd" ] || fail "virtiofsd was not installed"
 [ -f "${PREFIX}/share/asterism/linux-components.env" ] || fail "component lock was not installed"
 [ -x "${PREFIX}/libexec/asterism/asterism-update" ] || fail "the Linux updater was not installed"
+[ -x "${PREFIX}/bin/guest/bin/asterism-guest" ] \
+	|| fail "the static OCI guest-control agent was not installed beside astd"
 [ -x "${PREFIX}/bin/guest-gpu/bin/asterism-gpu-guest" ] \
 	|| fail "the Linux guest GPU service was not installed beside astd"
 [ -f "${PREFIX}/bin/guest-gpu/lib/libcuda.so.1.0.0" ] \
 	|| fail "the generated guest libcuda was not installed beside astd"
 grep -q 'bin/guest-gpu/bin/asterism-gpu-guest' <<<"$(receipt)" \
 	|| fail "the receipt does not own the shipped guest GPU unit"
+grep -q 'bin/guest/bin/asterism-guest' <<<"$(receipt)" \
+	|| fail "the receipt does not own the OCI guest-control agent"
 [ -x "${WORK}/system-root/usr/local/libexec/asterism/asterism-nbd" ] \
 	|| fail "the root-owned NBD argument boundary was not installed"
 grep -qxF 'nbd' "${WORK}/system-root/etc/modules-load.d/asterism-nbd.conf" \
@@ -729,6 +735,7 @@ rm -rf "${WORK}/system-root/run/asterism-nbd/nbd0"
 # Linux install. Cloud Hypervisor is the unambiguous ownership marker that
 # lets uninstall adopt and remove that exact internal unit.
 sed -E \
+	-e 's# bin/guest/bin/asterism-guest##' \
 	-e 's# bin/guest-gpu/bin/asterism-gpu-guest##' \
 	-e 's# bin/guest-gpu/lib/libcuda.so\.1\.0\.0##' \
 	-e 's# bin/guest-gpu/lib/libcuda\.so\.1##' \
@@ -741,6 +748,7 @@ run_install ok -- --uninstall
 [ ! -e "${PREFIX}/bin/cloud-hypervisor" ] || fail "uninstall left Cloud Hypervisor behind"
 [ ! -e "${PREFIX}/share/asterism/linux-components.env" ] || fail "uninstall left component metadata behind"
 [ ! -e "${PREFIX}/bin/guest-gpu" ] || fail "uninstall left guest GPU artifacts behind"
+[ ! -e "${PREFIX}/bin/guest" ] || fail "uninstall left OCI guest-control artifacts behind"
 [ ! -e "$policy" ] || fail "uninstall left the account's NBD sudo policy behind"
 
 # The shared artifact lock is exclusive across install/update/uninstall.
@@ -771,16 +779,24 @@ source_contract="$(sed -n '/^install_source()/,/^prepare_chv_source()/p' "$INSTA
 # shellcheck disable=SC2016
 grep -qF 'guest_artifacts="${TMPDIR_SELF}/guest-gpu"' <<<"$source_contract" \
 	|| fail "the Linux source build has no nonempty installer-owned guest artifact root"
+grep -qF 'guest_control_artifacts="${TMPDIR_SELF}/guest"' <<<"$source_contract" \
+	|| fail "the Linux source build has no nonempty OCI guest-control artifact root"
 # shellcheck disable=SC2016
 build_guest_line="$(grep -nF '"${src}/scripts/build-guest-gpu-artifacts.sh" "$guest_artifacts"' <<<"$source_contract" | cut -d: -f1)"
 # shellcheck disable=SC2016
 validate_guest_line="$(grep -nF 'validate_linux_guest_artifacts "$guest_artifacts"' <<<"$source_contract" | cut -d: -f1)"
+build_control_line="$(grep -nF 'build-guest-control-artifact.sh" "$guest_control_artifacts"' <<<"$source_contract" | cut -d: -f1)"
+validate_control_line="$(grep -nF 'validate_guest_control_artifact "$guest_control_artifacts"' <<<"$source_contract" | cut -d: -f1)"
 # shellcheck disable=SC2016
 prepare_chv_line="$(grep -nF 'prepare_chv_source "$src"' <<<"$source_contract" | cut -d: -f1)"
-if [ -z "$build_guest_line" ] || [ -z "$validate_guest_line" ] || [ -z "$prepare_chv_line" ]; then
+if [ -z "$build_guest_line" ] || [ -z "$validate_guest_line" ] || \
+	[ -z "$build_control_line" ] || [ -z "$validate_control_line" ] || [ -z "$prepare_chv_line" ]; then
 	fail "the Linux source guest artifact contract is incomplete"
 fi
-if [ "$build_guest_line" -ge "$validate_guest_line" ] || [ "$validate_guest_line" -ge "$prepare_chv_line" ]; then
+if [ "$build_guest_line" -ge "$validate_guest_line" ] || \
+	[ "$build_control_line" -ge "$validate_control_line" ] || \
+	[ "$validate_guest_line" -ge "$prepare_chv_line" ] || \
+	[ "$validate_control_line" -ge "$prepare_chv_line" ]; then
 	fail "Linux source artifacts are not validated before privileged preparation"
 fi
 # shellcheck disable=SC2016

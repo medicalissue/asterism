@@ -1,0 +1,20 @@
+[package]
+name = "asterism-guest"
+description = "Static authenticated guest-control agent for Asterism OCI VMs."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "asterism-guest"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+asterism-core.workspace = true
+data-encoding = "2"
+hostname.workspace = true
+libc = "0.2"
+serde.workspace = true
+serde_json.workspace = true

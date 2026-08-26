@@ -293,6 +293,19 @@ linux_guest_files() {
 	printf '%s' 'bin/guest-gpu/bin/asterism-gpu-guest bin/guest-gpu/lib/libcuda.so.1.0.0 bin/guest-gpu/lib/libcuda.so.1 bin/guest-gpu/lib/libcuda.so'
 }
 
+validate_guest_control_artifact() {
+	source_dir="${1:-}"
+	[ -n "$source_dir" ] || die "OCI guest-control artifact root is empty"
+	case "$source_dir" in /*) ;; *) die "OCI guest-control artifact root is not absolute: ${source_dir}" ;; esac
+	[ -x "${source_dir}/bin/asterism-guest" ] ||
+		die "OCI guest-control artifact root has no executable agent: ${source_dir}"
+}
+
+place_guest_control() {
+	validate_guest_control_artifact "${1:-}"
+	place_at "$1/bin/asterism-guest" "bin/guest/bin/asterism-guest"
+}
+
 validate_linux_guest_artifacts() {
 	source_dir="${1:-}"
 	[ -n "$source_dir" ] || die "guest GPU artifact root is empty. Refusing to copy from an ambient /bin path."
@@ -500,7 +513,8 @@ remove_receipt_files() {
 	# entry identifies that Linux ownership lane; a signed update may then
 	# have added guest-gpu atomically without rewriting the bootstrap receipt.
 	if receipt_lists bin/cloud-hypervisor; then
-		for rel in bin/guest-gpu/bin/asterism-gpu-guest \
+		for rel in bin/guest/bin/asterism-guest \
+			bin/guest-gpu/bin/asterism-gpu-guest \
 			bin/guest-gpu/lib/libcuda.so.1.0.0 \
 			bin/guest-gpu/lib/libcuda.so.1 bin/guest-gpu/lib/libcuda.so; do
 			receipt_lists "$rel" && continue
@@ -514,6 +528,8 @@ remove_receipt_files() {
 	rmdir "${PREFIX}/bin/guest-gpu/lib" 2>/dev/null || true
 	rmdir "${PREFIX}/bin/guest-gpu/bin" 2>/dev/null || true
 	rmdir "${PREFIX}/bin/guest-gpu" 2>/dev/null || true
+	rmdir "${PREFIX}/bin/guest/bin" 2>/dev/null || true
+	rmdir "${PREFIX}/bin/guest" 2>/dev/null || true
 }
 
 remove_receipt_system_files() {
@@ -592,6 +608,8 @@ drop_stale_linux_helpers() {
 	rmdir "${PREFIX}/bin/guest-gpu/lib" 2>/dev/null || true
 	rmdir "${PREFIX}/bin/guest-gpu/bin" 2>/dev/null || true
 	rmdir "${PREFIX}/bin/guest-gpu" 2>/dev/null || true
+	rmdir "${PREFIX}/bin/guest/bin" 2>/dev/null || true
+	rmdir "${PREFIX}/bin/guest" 2>/dev/null || true
 }
 
 # ---- resolving a version ---------------------------------------------------
@@ -759,13 +777,18 @@ install_release() {
 			[ -f "${unpack}/${helper}" ] || die "${artifact} has no ${helper}. Refusing to install a Linux release without its pinned native backend."
 		done
 		[ -f "${unpack}/share/asterism/asterism-nbd" ] || die "${artifact} has no checked NBD privilege wrapper. Refusing a partial Linux runtime."
+		[ -x "${unpack}/guest/bin/asterism-guest" ] || die "${artifact} has no static OCI guest-control agent. Refusing an uncontrollable OCI VM runtime."
 		[ -x "${unpack}/guest-gpu/bin/asterism-gpu-guest" ] || die "${artifact} has no Linux guest GPU service. Refusing an unprojectable GPU runtime."
 		[ -f "${unpack}/guest-gpu/lib/libcuda.so.1.0.0" ] || die "${artifact} has no generated guest libcuda. Refusing an unprojectable GPU runtime."
 		linux_helpers=1
 		;;
 	*) linux_helpers=0 ;;
 	esac
+	if [ -x "${unpack}/guest/bin/asterism-guest" ]; then guest_control=1; else guest_control=0; fi
 	receipt_files="bin/ast${exe} bin/astd${exe}"
+	if [ "$guest_control" = "1" ]; then
+		receipt_files="${receipt_files} bin/guest/bin/asterism-guest"
+	fi
 	if [ "$vz" = "1" ]; then
 		receipt_files="${receipt_files} bin/astd-vz"
 	elif [ "$linux_helpers" = "1" ]; then
@@ -796,6 +819,9 @@ install_release() {
 	ensure_writable_prefix
 	place "${unpack}/ast${exe}" "ast${exe}"
 	place "${unpack}/astd${exe}" "astd${exe}"
+	if [ "$guest_control" = "1" ]; then
+		place_guest_control "${unpack}/guest"
+	fi
 	if [ "$linux_helpers" = "1" ]; then
 		place "${unpack}/cloud-hypervisor" cloud-hypervisor
 		place "${unpack}/virtiofsd" virtiofsd
@@ -892,6 +918,9 @@ install_source() {
 		guest_artifacts="${TMPDIR_SELF}/guest-gpu"
 		"${src}/scripts/build-guest-gpu-artifacts.sh" "$guest_artifacts"
 		validate_linux_guest_artifacts "$guest_artifacts"
+		guest_control_artifacts="${TMPDIR_SELF}/guest"
+		"${src}/scripts/build-guest-control-artifact.sh" "$guest_control_artifacts"
+		validate_guest_control_artifact "$guest_control_artifacts"
 		prepare_chv_source "$src"
 		linux_helpers=1
 	fi
@@ -915,7 +944,7 @@ install_source() {
 	if [ "$vz" = "1" ]; then
 		intent_files="bin/ast bin/astd bin/astd-vz libexec/asterism/asterism-update"
 	elif [ "$linux_helpers" = "1" ]; then
-		intent_files="bin/ast bin/astd bin/cloud-hypervisor bin/virtiofsd libexec/asterism/asterism-update $(linux_guest_files)"
+		intent_files="bin/ast bin/astd bin/cloud-hypervisor bin/virtiofsd libexec/asterism/asterism-update bin/guest/bin/asterism-guest $(linux_guest_files)"
 	else
 		intent_files="bin/ast bin/astd libexec/asterism/asterism-update"
 	fi
@@ -935,6 +964,7 @@ install_source() {
 	if [ "$linux_helpers" = "1" ]; then
 		place "$CHV_SOURCE_BIN" cloud-hypervisor
 		place "$VIRTIOFSD_SOURCE_BIN" virtiofsd
+		place_guest_control "$guest_control_artifacts"
 		place_linux_guest "$guest_artifacts"
 		configure_chv_linux "${src}/packaging/asterism-nbd"
 	fi
@@ -946,6 +976,7 @@ install_source() {
 		write_receipt "$ref" "source" source "" \
 			bin/ast bin/astd bin/cloud-hypervisor bin/virtiofsd \
 			libexec/asterism/asterism-update \
+			bin/guest/bin/asterism-guest \
 			bin/guest-gpu/bin/asterism-gpu-guest \
 			bin/guest-gpu/lib/libcuda.so.1.0.0 \
 			bin/guest-gpu/lib/libcuda.so.1 bin/guest-gpu/lib/libcuda.so

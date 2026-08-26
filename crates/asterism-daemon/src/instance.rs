@@ -835,6 +835,14 @@ pub(crate) fn up(reg: &mut Shard, name: &str, restart: Option<Restart>) -> Resul
     };
     let handle = match tokio::task::block_in_place(|| hv.boot(&req, &prep)) {
         Ok(handle) => handle,
+        Err(error) if backend::boot_failure_is_proven_stopped(&error) => {
+            compensate_boot(reg, &boot_inst, &boot_intent_id).with_context(|| {
+                format!("backend launch failed after the guest was proven stopped ({error:#})")
+            })?;
+            return Err(error).context(
+                "backend launch failed; guest was stopped and boot state was rolled back",
+            );
+        }
         Err(error) => {
             // Crossing into `boot` crosses the process-creation boundary.
             // QEMU may daemonize successfully and then leave no readable

@@ -13,6 +13,8 @@
 
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
@@ -20,6 +22,87 @@ use asterism_core::hv::{BootReq, DiskFormat, Handle, Hypervisor, ImageKind, Imag
 use asterism_core::instance::{Instance, PortForward, RuntimeKind};
 use asterism_core::proc::{Evidence, Ownership, ProcId};
 use asterism_core::{image, paths, profile, seed};
+
+/// A backend crossed the process-creation boundary, then proved that exact
+/// process was gone before returning an error. The distinction matters to the
+/// durable boot fence: only this outcome is safe to compensate automatically.
+#[derive(Debug)]
+struct ProvenStoppedBoot {
+    detail: String,
+}
+
+impl std::fmt::Display for ProvenStoppedBoot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for ProvenStoppedBoot {}
+
+fn proven_stopped_boot(error: anyhow::Error) -> anyhow::Error {
+    ProvenStoppedBoot {
+        detail: format!("{error:#}"),
+    }
+    .into()
+}
+
+pub(crate) fn boot_failure_is_proven_stopped(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<ProvenStoppedBoot>())
+}
+
+/// Retire exactly the process a backend just created and prove it is gone.
+/// Failure retains the launch fence; a signal attempt is not death proof.
+#[cfg(unix)]
+fn retire_failed_launch(proc: &ProcId) -> bool {
+    match proc.check() {
+        Ownership::Gone | Ownership::Foreign(_) => true,
+        Ownership::Unknown(_) => false,
+        Ownership::Ours => {
+            proc.signal(asterism_core::proc::Signal::Kill).is_ok()
+                && proc.wait_gone(Duration::from_secs(5))
+        }
+    }
+}
+
+/// Wait until the static OCI guest agent both accepts TCP and proves the
+/// instance key.  Every VM backend calls this before publishing a running
+/// handle, so `ast up` has one backend-neutral readiness meaning.
+#[cfg(unix)]
+fn wait_for_oci_control(
+    proc: &ProcId,
+    target: std::net::SocketAddr,
+    key: &asterism_core::guest::Key,
+    timeout: Duration,
+) -> Result<asterism_core::guest::Status> {
+    use std::io::BufReader;
+    use std::net::TcpStream;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !proc.alive() {
+            bail!("the VMM exited before OCI guest control became ready at {target}");
+        }
+        let attempt = (|| -> Result<_> {
+            let stream = TcpStream::connect_timeout(&target, Duration::from_millis(500))?;
+            stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+            let reader = BufReader::new(stream.try_clone()?);
+            let mut session = asterism_core::guest::Session::open(reader, stream, key)?;
+            session.status()
+        })();
+        match attempt {
+            Ok(status) => return Ok(status),
+            Err(error) if Instant::now() >= deadline => {
+                bail!(
+                    "OCI guest control at {target} did not become ready within {}s: {error:#}",
+                    timeout.as_secs()
+                );
+            }
+            Err(_) => {}
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
 
 #[cfg(unix)]
 pub mod chv;
@@ -749,6 +832,17 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command};
     use std::time::Duration;
+
+    #[test]
+    fn proven_stopped_boot_marker_survives_error_context() {
+        let stopped = proven_stopped_boot(anyhow::anyhow!("readiness failed"))
+            .context("backend-specific context");
+        assert!(boot_failure_is_proven_stopped(&stopped));
+
+        let ambiguous = anyhow::anyhow!("process identity could not be verified")
+            .context("backend-specific context");
+        assert!(!boot_failure_is_proven_stopped(&ambiguous));
+    }
 
     // ---- the startup migration ---------------------------------------------
 

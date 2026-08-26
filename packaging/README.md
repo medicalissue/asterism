@@ -327,6 +327,25 @@ tampered formula is refused before Homebrew sees it.
 It also asserts the script still passes `sh -n` and `shellcheck`, still names
 no `master` branch, and still has exactly one `sudo` in it.
 
+## OCI VM guest-control artifact
+
+Direct-kernel OCI images cannot be assumed to contain Python, systemd, SSH, or
+even a shell. Release archives therefore carry an architecture-matched static
+Linux ELF at `guest/bin/asterism-guest`. The installer places it at
+`bin/guest/bin/asterism-guest` beside `astd`; the updater treats it as a
+transactional component and rolls it back with the CLI and daemon.
+
+Linux release packaging builds and audits the agent for the release
+architecture. The Apple arm64 release consumes the audited Linux arm64
+artifact from the matching Linux release job, because the binary runs inside
+the Linux guest rather than on macOS. A missing or wrong-architecture artifact
+is an OCI boot refusal, never a VM silently launched without control.
+
+Linux source installs build the artifact with the matching musl target. macOS
+source installs do not yet cross-build it; OCI/VZ source-tree testing there
+must provide an audited matching Linux ELF through
+`ASTERISM_GUEST_AGENT_ARTIFACT`. Tagged macOS releases include it.
+
 ## Licensing
 
 The Homebrew formula and release installer do not install QEMU. Native VZ and

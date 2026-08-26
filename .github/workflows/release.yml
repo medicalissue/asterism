@@ -34,6 +34,7 @@ env:
 
 jobs:
   build:
+    needs: linux
     # macos-14 is Apple silicon, which is the target these binaries are for.
     runs-on: macos-14
     outputs:
@@ -176,6 +177,11 @@ jobs:
             --wait
           rm -rf "${RUNNER_TEMP}/notary.p8" "${RUNNER_TEMP}/notarize.zip" "$staging"
 
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-linux-linux-arm64
+          path: ${{ runner.temp }}/linux-guest
+
       - name: Package
         run: |
           set -eu
@@ -183,6 +189,10 @@ jobs:
           target=darwin-arm64
           dist="dist/${version}"
           mkdir -p "$dist"
+          linux_archive="$(find "${RUNNER_TEMP}/linux-guest" -name 'asterism-*-linux-arm64.tar.gz' -print -quit)"
+          [ -n "$linux_archive" ] || { echo "no Linux arm64 guest artifact was downloaded" >&2; exit 1; }
+          mkdir -p "${RUNNER_TEMP}/darwin-guest"
+          tar -xzf "$linux_archive" -C "${RUNNER_TEMP}/darwin-guest" guest
           # COPYFILE_DISABLE keeps macOS tar from smuggling ._ AppleDouble
           # entries into the tarball, which would change the digest for no
           # reason anyone could see. The code signature is inside the Mach-O
@@ -191,7 +201,8 @@ jobs:
           cp packaging/update.sh target/release/asterism-update
           chmod 755 target/release/asterism-update
           COPYFILE_DISABLE=1 tar -czf "${dist}/asterism-${version}-${target}.tar.gz" \
-            -C target/release ast astd astd-vz asterism-update
+            -C target/release ast astd astd-vz asterism-update \
+            -C "${RUNNER_TEMP}/darwin-guest" guest
 
       - name: Render the tap formula for this tag
         run: |
@@ -289,7 +300,13 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 peeled commit
       - name: Install pinned Linux runtime build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libseccomp-dev libcap-ng-dev
+        run: sudo apt-get update && sudo apt-get install -y libseccomp-dev libcap-ng-dev musl-tools
+      - name: Install the static Linux guest target
+        run: |
+          case "$(uname -m)" in
+            x86_64) rustup target add x86_64-unknown-linux-musl ;;
+            aarch64) rustup target add aarch64-unknown-linux-musl ;;
+          esac
       - name: Build Linux CLI and daemon
         env:
           ASTERISM_BUILD_ID: ${{ github.sha }}
@@ -330,6 +347,7 @@ jobs:
           archive="dist/${version}/asterism-${version}-${{ matrix.target }}.tar.gz"
           [ -f "$archive" ]
           for member in ast astd cloud-hypervisor virtiofsd asterism-update \
+            guest/bin/asterism-guest \
             guest-gpu/bin/asterism-gpu-guest \
             guest-gpu/lib/libcuda.so.1.0.0 guest-gpu/lib/libcuda.so.1 \
             guest-gpu/lib/libcuda.so \
@@ -466,6 +484,10 @@ jobs:
           # the backend, made here against the installed artifact.
           [ -x "${prefix}/bin/astd-vz" ] || { echo "astd-vz was not installed" >&2; exit 1; }
           file "${prefix}/bin/astd-vz" | grep -q 'arm64' || { echo "astd-vz is not an arm64 binary" >&2; exit 1; }
+          [ -x "${prefix}/bin/guest/bin/asterism-guest" ] || \
+            { echo "the Linux arm64 OCI guest-control agent was not installed" >&2; exit 1; }
+          file "${prefix}/bin/guest/bin/asterism-guest" | grep -q 'ELF 64-bit.*ARM aarch64' || \
+            { echo "the OCI guest-control agent is not an arm64 Linux ELF" >&2; exit 1; }
 
           # One build, three binaries: a helper from another build would
           # speak a control protocol this astd does not.
@@ -503,6 +525,7 @@ jobs:
           for bin in ast astd astd-vz; do
             [ ! -e "${prefix}/bin/${bin}" ] || { echo "uninstall left ${bin} behind" >&2; exit 1; }
           done
+          [ ! -e "${prefix}/bin/guest" ] || { echo "uninstall left OCI guest control behind" >&2; exit 1; }
           [ ! -e "${prefix}/libexec/asterism/asterism-update" ] || \
             { echo "uninstall left asterism-update behind" >&2; exit 1; }
 

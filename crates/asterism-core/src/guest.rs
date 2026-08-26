@@ -65,7 +65,7 @@
 //! refusal that names both lists, on both sides, immediately — a guest and
 //! a helper a release apart find out in milliseconds instead of hanging.
 
-use std::io::{BufRead, Write};
+use std::io::{self, BufRead, Write};
 use std::net::IpAddr;
 use std::path::Path;
 use std::time::Duration;
@@ -84,7 +84,122 @@ use serde::{Deserialize, Serialize};
 pub const PORT: u32 = 1023;
 
 /// Protocol versions this build of the helper can speak, newest last.
-pub const VERSIONS: &[u32] = &[1];
+pub const VERSIONS: &[u32] = &[1, 2];
+
+/// TCP port used by the static agent injected into direct-kernel OCI guests.
+///
+/// Native cloud-image agents keep using AF_VSOCK on [`PORT`]. OCI images may
+/// contain no Python or init system, so their audited static agent listens on
+/// the guest's private NIC instead. The same per-instance HMAC handshake is
+/// required before any command is accepted.
+pub const OCI_TCP_PORT: u16 = 1023;
+
+/// Longest command the v2 guest-control wire accepts.
+pub const MAX_EXEC_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Bytes retained independently for stdout and stderr. Readers keep draining
+/// after this cap so a noisy child cannot deadlock on a full pipe.
+pub const MAX_EXEC_OUTPUT_BYTES: usize = 24 * 1024;
+
+const MAX_GUEST_AGENT_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Audited static Linux agent injected into every direct-kernel OCI guest.
+#[derive(Debug, Clone)]
+pub struct Artifact {
+    bytes: Vec<u8>,
+}
+
+impl Artifact {
+    pub fn from_path(path: &Path) -> io::Result<Self> {
+        let metadata = std::fs::metadata(path)?;
+        if metadata.len() == 0 || metadata.len() > MAX_GUEST_AGENT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "guest-control artifact {} has invalid size {}",
+                    path.display(),
+                    metadata.len()
+                ),
+            ));
+        }
+        let bytes = std::fs::read(path)?;
+        if !bytes.starts_with(b"\x7fELF") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("guest-control artifact {} is not ELF", path.display()),
+            ));
+        }
+        let expected_machine = if cfg!(target_arch = "x86_64") {
+            Some(62u16)
+        } else if cfg!(target_arch = "aarch64") {
+            Some(183u16)
+        } else {
+            None
+        };
+        if bytes.len() < 20 || bytes[4] != 2 || bytes[5] != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "guest-control artifact {} is not a 64-bit little-endian ELF",
+                    path.display()
+                ),
+            ));
+        }
+        let machine = u16::from_le_bytes([bytes[18], bytes[19]]);
+        if expected_machine.is_some_and(|expected| machine != expected) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "guest-control artifact {} has ELF machine {machine}, not this host's {expected}",
+                    path.display(),
+                    expected = expected_machine.unwrap()
+                ),
+            ));
+        }
+        Ok(Self { bytes })
+    }
+
+    /// Explicit packaging override, then the release layout beside `astd`,
+    /// then the system prefix. Absence is a boot refusal, never a guest that
+    /// silently starts without its control plane.
+    pub fn discover() -> io::Result<Self> {
+        if let Some(path) = std::env::var_os("ASTERISM_GUEST_AGENT_ARTIFACT") {
+            return Self::from_path(Path::new(&path));
+        }
+        let beside_daemon = std::env::current_exe()?
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("guest/bin/asterism-guest");
+        match Self::from_path(&beside_daemon) {
+            Ok(found) => Ok(found),
+            Err(first) if first.kind() == io::ErrorKind::NotFound => Self::from_path(Path::new(
+                "/usr/local/lib/asterism/guest/bin/asterism-guest",
+            )),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// BusyBox fragment used by the generated OCI init after it has entered
+    /// the image's configured working directory and exported its environment.
+    pub fn oci_boot_script(&self, key: &Key) -> String {
+        use data_encoding::BASE64;
+        format!(
+            "$BB mkdir -p /etc/asterism /.asterism /var/log\n\
+             printf '%s\\n' '{}' > /etc/asterism/agent.key\n\
+             $BB chmod 0600 /etc/asterism/agent.key\n\
+             printf '%s' '{}' | $BB base64 -d > /.asterism/guest\n\
+             $BB chmod 0755 /.asterism/guest\n\
+             /.asterism/guest >>/var/log/asterism-guest.log 2>&1 &\n",
+            key.hex(),
+            BASE64.encode(&self.bytes),
+        )
+    }
+
+    #[cfg(test)]
+    pub fn fixture(bytes: Vec<u8>) -> Self {
+        Self { bytes }
+    }
+}
 
 /// The most bytes either side will retain for one JSON frame, excluding its
 /// newline.
@@ -264,6 +379,14 @@ pub struct Request {
     /// an answer cannot carry a stop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_ms: Option<u64>,
+    /// Argument vector for protocol-v2 `exec`. There is deliberately no shell
+    /// string: quoting belongs to the caller and the guest executes exactly
+    /// the argv it authenticated.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub argv: Vec<String>,
+    /// Guest-side lifecycle deadline for protocol-v2 `exec`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
 }
 
 /// One answer.
@@ -279,6 +402,30 @@ pub struct Answer {
     /// How long the guest spent inside `sync(2)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<f64>,
+    /// Protocol-v2 command result. Output fields are base64 so arbitrary guest
+    /// bytes stay valid JSON without becoming arrays four times their size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec: Option<ExecWireResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ExecWireResult {
+    pub status: i32,
+    pub stdout_b64: String,
+    pub stderr_b64: String,
+    #[serde(default)]
+    pub stdout_truncated: bool,
+    #[serde(default)]
+    pub stderr_truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecResult {
+    pub status: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
 }
 
 /// What the guest reports about itself right now.
@@ -483,11 +630,61 @@ impl<R: BufRead, W: Write> Session<R, W> {
         self.call("stop").map(|_| ())
     }
 
+    /// Execute one argv through a protocol-v2 guest agent.
+    pub fn exec(&mut self, argv: Vec<String>, timeout: Duration) -> Result<ExecResult> {
+        if self.version < 2 {
+            bail!(
+                "the guest agent speaks protocol {}, which has no exec operation",
+                self.version
+            );
+        }
+        if argv.is_empty() {
+            bail!("guest exec needs a command");
+        }
+        if timeout.is_zero() || timeout > MAX_EXEC_TIMEOUT {
+            bail!(
+                "guest exec timeout must be between 1 ms and {} seconds",
+                MAX_EXEC_TIMEOUT.as_secs()
+            );
+        }
+        let answer = self.request_with("exec", None, argv, Some(timeout.as_millis() as u64))?;
+        let wire = answer
+            .exec
+            .ok_or_else(|| anyhow::anyhow!("the guest agent answered exec with no result"))?;
+        use data_encoding::BASE64;
+        let stdout = BASE64
+            .decode(wire.stdout_b64.as_bytes())
+            .context("the guest agent returned invalid base64 stdout")?;
+        let stderr = BASE64
+            .decode(wire.stderr_b64.as_bytes())
+            .context("the guest agent returned invalid base64 stderr")?;
+        if stdout.len() > MAX_EXEC_OUTPUT_BYTES || stderr.len() > MAX_EXEC_OUTPUT_BYTES {
+            bail!("the guest agent returned exec output above the negotiated cap");
+        }
+        Ok(ExecResult {
+            status: wire.status,
+            stdout,
+            stderr,
+            stdout_truncated: wire.stdout_truncated,
+            stderr_truncated: wire.stderr_truncated,
+        })
+    }
+
     fn call(&mut self, op: &str) -> Result<Answer> {
         self.request(op, None)
     }
 
     fn request(&mut self, op: &str, wait_ms: Option<u64>) -> Result<Answer> {
+        self.request_with(op, wait_ms, Vec::new(), None)
+    }
+
+    fn request_with(
+        &mut self,
+        op: &str,
+        wait_ms: Option<u64>,
+        argv: Vec<String>,
+        timeout_ms: Option<u64>,
+    ) -> Result<Answer> {
         let id = self.next_id;
         self.next_id += 1;
         write_line(
@@ -496,6 +693,8 @@ impl<R: BufRead, W: Write> Session<R, W> {
                 id,
                 op: op.to_owned(),
                 wait_ms,
+                argv,
+                timeout_ms,
             },
         )?;
         let answer: Answer = read_line(&mut self.reader)
@@ -1293,7 +1492,9 @@ mod tests {
             serde_json::to_string(&Request {
                 id: 7,
                 op: "status".into(),
-                wait_ms: None
+                wait_ms: None,
+                argv: Vec::new(),
+                timeout_ms: None,
             })
             .unwrap(),
             r#"{"id":7,"op":"status"}"#
@@ -1302,7 +1503,9 @@ mod tests {
             serde_json::to_string(&Request {
                 id: 8,
                 op: "status".into(),
-                wait_ms: Some(500)
+                wait_ms: Some(500),
+                argv: Vec::new(),
+                timeout_ms: None,
             })
             .unwrap(),
             r#"{"id":8,"op":"status","wait_ms":500}"#
@@ -1348,7 +1551,7 @@ mod tests {
     #[test]
     fn version_negotiation_takes_the_newest_in_common_and_refuses_none() {
         assert_eq!(pick_version(&[1]), Some(1));
-        assert_eq!(pick_version(&[1, 2, 3]), Some(1), "what we can both speak");
+        assert_eq!(pick_version(&[1, 2, 3]), Some(2), "what we can both speak");
         assert_eq!(pick_version(&[]), None);
         assert_eq!(pick_version(&[7, 9]), None, "a guest from another release");
     }
@@ -1558,18 +1761,25 @@ mod tests {
     /// A guest that answers exactly this, for the answers a real agent
     /// gives but this test host must not be made to act out.
     fn scripted(answers: &[&str]) -> Session<BufReader<std::io::Cursor<Vec<u8>>>, Vec<u8>> {
+        scripted_at(1, answers)
+    }
+
+    fn scripted_at(
+        version: u32,
+        answers: &[&str],
+    ) -> Session<BufReader<std::io::Cursor<Vec<u8>>>, Vec<u8>> {
         let (guest_nonce, host_nonce) = ("aaaa", "bbbb");
         let mut script = format!(
             "{}\n{}\n",
             serde_json::to_string(&Hello {
                 agent: "asterism".into(),
-                versions: vec![1],
+                versions: vec![version],
                 nonce: guest_nonce.into(),
             })
             .unwrap(),
             serde_json::to_string(&Welcome {
                 ok: true,
-                proof: key().proof(1, "guest", guest_nonce, host_nonce),
+                proof: key().proof(version, "guest", guest_nonce, host_nonce),
                 error: None,
                 facts: Some(Facts {
                     hostname: "dev".into(),
@@ -1591,6 +1801,76 @@ mod tests {
             host_nonce,
         )
         .expect("the handshake")
+    }
+
+    #[test]
+    fn protocol_two_exec_decodes_bounded_binary_output_and_exit_status() {
+        use data_encoding::BASE64;
+        let answer = serde_json::json!({
+            "id": 1,
+            "ok": true,
+            "exec": {
+                "status": 17,
+                "stdout_b64": BASE64.encode(b"out\0\n"),
+                "stderr_b64": BASE64.encode(b"err\n"),
+                "stdout_truncated": true,
+                "stderr_truncated": false
+            }
+        })
+        .to_string();
+        let mut session = scripted_at(2, &[&answer]);
+        let result = session
+            .exec(vec!["/bin/false".into()], Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(result.status, 17);
+        assert_eq!(result.stdout, b"out\0\n");
+        assert_eq!(result.stderr, b"err\n");
+        assert!(result.stdout_truncated);
+        assert!(!result.stderr_truncated);
+    }
+
+    #[test]
+    fn v1_agent_refuses_exec_before_writing_an_unknown_operation() {
+        let mut session = scripted(&[]);
+        let error = session
+            .exec(vec!["true".into()], Duration::from_secs(1))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("protocol 1"), "{error}");
+    }
+
+    #[test]
+    fn oci_artifact_fragment_is_keyed_and_starts_the_static_agent() {
+        let artifact = Artifact::fixture(b"\x7fELFfixture".to_vec());
+        let script = artifact.oci_boot_script(&key());
+        assert!(script.contains("chmod 0600 /etc/asterism/agent.key"));
+        assert!(script.contains("/.asterism/guest >>/var/log/asterism-guest.log"));
+        assert!(script.contains(&key().hex()));
+    }
+
+    #[test]
+    fn oci_artifact_refuses_non_elf_and_the_wrong_guest_architecture() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("asterism-guest");
+        std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+        assert_eq!(
+            Artifact::from_path(&path).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut elf = vec![0u8; 64];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2;
+        elf[5] = 1;
+        let wrong = if cfg!(target_arch = "x86_64") {
+            183u16
+        } else {
+            62u16
+        };
+        elf[18..20].copy_from_slice(&wrong.to_le_bytes());
+        std::fs::write(&path, elf).unwrap();
+        let error = Artifact::from_path(&path).unwrap_err().to_string();
+        assert!(error.contains("ELF machine"), "{error}");
     }
 
     /// The barrier's whole value is that the answer arrives *after* the
