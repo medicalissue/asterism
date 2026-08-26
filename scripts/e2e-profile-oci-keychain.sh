@@ -287,8 +287,10 @@ SNAPSHOT_DIR="$ASTERISM_HOME/instances/$INST/snapshots"
 SNAPSHOT="$(find "$SNAPSHOT_DIR" -maxdepth 1 -type f \
   \( -name 'credential-bound-oci.raw' -o -name 'credential-bound-oci.qcow2' \
      -o -name 'credential-bound-oci.vhdx' \) -print 2>/dev/null || true)"
-[ -n "$SNAPSHOT" ] && [ "$(printf '%s\n' "$SNAPSHOT" | wc -l | tr -d ' ')" = 1 ] \
-  || fail "the OCI snapshot did not resolve to one disk image: $SNAPSHOT"
+if [ -z "$SNAPSHOT" ] \
+  || [ "$(printf '%s\n' "$SNAPSHOT" | wc -l | tr -d ' ')" != 1 ]; then
+  fail "the OCI snapshot did not resolve to one disk image: $SNAPSHOT"
+fi
 absent_from_sparse "the raw sentinel is absent from the OCI snapshot" \
   "$SNAPSHOT" "$SENTINEL"
 "$ROOT/scripts/sparse-contains.py" "$SNAPSHOT" "$HANDLE" \

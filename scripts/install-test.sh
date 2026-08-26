@@ -779,13 +779,16 @@ source_contract="$(sed -n '/^install_source()/,/^prepare_chv_source()/p' "$INSTA
 # shellcheck disable=SC2016
 grep -qF 'guest_artifacts="${TMPDIR_SELF}/guest-gpu"' <<<"$source_contract" \
 	|| fail "the Linux source build has no nonempty installer-owned guest artifact root"
+# shellcheck disable=SC2016
 grep -qF 'guest_control_artifacts="${TMPDIR_SELF}/guest"' <<<"$source_contract" \
 	|| fail "the Linux source build has no nonempty OCI guest-control artifact root"
 # shellcheck disable=SC2016
 build_guest_line="$(grep -nF '"${src}/scripts/build-guest-gpu-artifacts.sh" "$guest_artifacts"' <<<"$source_contract" | cut -d: -f1)"
 # shellcheck disable=SC2016
 validate_guest_line="$(grep -nF 'validate_linux_guest_artifacts "$guest_artifacts"' <<<"$source_contract" | cut -d: -f1)"
+# shellcheck disable=SC2016
 build_control_line="$(grep -nF 'build-guest-control-artifact.sh" "$guest_control_artifacts"' <<<"$source_contract" | cut -d: -f1)"
+# shellcheck disable=SC2016
 validate_control_line="$(grep -nF 'validate_guest_control_artifact "$guest_control_artifacts"' <<<"$source_contract" | cut -d: -f1)"
 # shellcheck disable=SC2016
 prepare_chv_line="$(grep -nF 'prepare_chv_source "$src"' <<<"$source_contract" | cut -d: -f1)"
