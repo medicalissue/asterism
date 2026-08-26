@@ -741,6 +741,14 @@ pub trait Hypervisor: Send + Sync {
     /// What this backend can do — callers must gate on this, never on `id()`.
     fn caps(&self) -> Caps;
 
+    /// Instance-local disk formats this backend can reopen from a portable
+    /// backup. Usually identical to [`Caps::disk_formats`], which describes
+    /// accepted base images. Hyper-V is the exception: it consumes a raw
+    /// base, materializes a VHDX, and thereafter restores that VHDX.
+    fn restore_disk_formats(&self) -> &'static [DiskFormat] {
+        self.caps().disk_formats
+    }
+
     /// Cloud-config every guest of this backend needs, appended to the seed
     /// [`crate::seed`] builds.
     ///

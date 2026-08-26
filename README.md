@@ -135,9 +135,15 @@ $ ast snapshots agent
 $ ast restore agent clean
 $ ast backup export agent ~/Backups/agent
 $ ast backup inspect ~/Backups/agent
+$ ast backup import ~/Backups/agent
 $ ast logs agent --follow
 $ ast down agent
 ```
+
+Backup format 2 records guest architecture, backend, disk formats, and OCI
+provenance. Cross-backend import is explicit with `--backend`; a different CPU
+architecture requires an OCI source pinned to an immutable index and
+`--re-materialize`. See [target-aware backups](docs/backup-v2.md).
 
 ## Add devices to an orbit
 

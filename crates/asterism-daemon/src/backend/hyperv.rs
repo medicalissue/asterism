@@ -211,6 +211,10 @@ impl Hypervisor for HyperV {
         }
     }
 
+    fn restore_disk_formats(&self) -> &'static [DiskFormat] {
+        &[DiskFormat::Vhdx]
+    }
+
     fn guest_config(&self, inst: &asterism_core::instance::Instance) -> Result<String> {
         let key = guest::Key::ensure(&paths::guest_agent_key_path(&inst.name))
             .with_context(|| format!("minting {:?}'s guest agent key", inst.name))?;

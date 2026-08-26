@@ -591,6 +591,69 @@ fn a_portable_backup_restores_once_and_refuses_a_name_collision() {
     );
 }
 
+/// Target probing and complete chunk verification both sit before restore
+/// staging. Neither an unavailable backend nor corrupt content may leave a
+/// directory or registry row behind.
+#[test]
+fn target_and_corruption_refusals_leave_no_import_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    let export = dir.path().join("portable");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("disk.raw"), b"verified root bytes").unwrap();
+    let mut instance = Instance::new(
+        "refused",
+        "source-device",
+        "debian:13",
+        Shape::default(),
+        Machine {
+            backend: "qemu".into(),
+            machine_type: "virt".into(),
+            cpu: "host".into(),
+            hv_version: "test".into(),
+        },
+    );
+    instance.image = None;
+    backup::export(&instance, &source, &export, None).unwrap();
+
+    let home = dir.path().join("home");
+    let astd = Daemon::on(dir, home.clone());
+    let Response::Error { message } = astd.ask_current(&Request::BackupImportV2 {
+        source: export.display().to_string(),
+        name: "no-backend".into(),
+        backend: Some("not-a-backend".into()),
+        rematerialize_oci: false,
+    }) else {
+        panic!("an unavailable backend was accepted");
+    };
+    assert!(
+        message.contains("no \"not-a-backend\" backend"),
+        "{message}"
+    );
+    assert!(!home.join("instances/no-backend").exists());
+
+    let manifest = backup::inspect(&export).unwrap();
+    let digest = manifest.files[0]
+        .chunks
+        .iter()
+        .find_map(|chunk| match chunk {
+            backup::Chunk::Data { digest, .. } => Some(digest),
+            backup::Chunk::Zero { .. } => None,
+        })
+        .unwrap();
+    let chunk = export.join("chunks").join(&digest[..2]).join(&digest[2..]);
+    std::fs::write(chunk, b"corrupt").unwrap();
+    let Response::Error { message } = astd.ask_current(&Request::BackupImport {
+        source: export.display().to_string(),
+        name: "corrupt".into(),
+    }) else {
+        panic!("a corrupt backup was accepted");
+    };
+    assert!(message.contains("backup chunk"), "{message}");
+    assert!(!home.join("instances/corrupt").exists());
+    assert!(!home.join("state.json").exists());
+}
+
 /// The import's only cross-file crash window is publication before the shard
 /// commit. Its receipt makes that state distinguishable from somebody's
 /// orphan directory, so the same request can verify and finish it safely.

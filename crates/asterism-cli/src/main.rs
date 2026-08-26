@@ -589,6 +589,15 @@ enum BackupCommand {
         /// Restore under another orbit-global name. Identity is preserved.
         #[arg(long)]
         name: Option<String>,
+        /// Materialize the restored instance for this backend. Explicit
+        /// selection never falls back to another hypervisor.
+        #[arg(long, value_name = "NAME")]
+        backend: Option<String>,
+        /// Build a fresh OCI rootfs for this device's architecture and import
+        /// only explicitly portable parts. Mutable root and snapshot bytes
+        /// are not translated.
+        #[arg(long = "re-materialize")]
+        rematerialize_oci: bool,
     },
 }
 
@@ -990,12 +999,27 @@ fn main() -> Result<()> {
             local_only("backup inspect", device.as_deref())?;
             return inspect_backup(&source, json);
         }
-        Command::Backup(BackupCommand::Import { source, name }) => {
+        Command::Backup(BackupCommand::Import {
+            source,
+            name,
+            backend,
+            rematerialize_oci,
+        }) => {
             let source = absolute_path(&source)?;
             let manifest = asterism_core::backup::inspect(&source)?;
-            Request::BackupImport {
-                source: source.display().to_string(),
-                name: name.unwrap_or(manifest.instance.name),
+            let name = name.unwrap_or(manifest.instance.name);
+            if backend.is_some() || rematerialize_oci {
+                Request::BackupImportV2 {
+                    source: source.display().to_string(),
+                    name,
+                    backend,
+                    rematerialize_oci,
+                }
+            } else {
+                Request::BackupImport {
+                    source: source.display().to_string(),
+                    name,
+                }
             }
         }
         // The catalog is this binary's, not a device's: it is what this
@@ -1205,6 +1229,25 @@ fn main() -> Result<()> {
         }
         Response::BackupRestored { report } => {
             println!("{}  restored ({})", report.instance, report.id);
+            match report.materialization {
+                asterism_core::backup::RestoreDisposition::ByteExact => {
+                    if let (Some(architecture), Some(backend)) =
+                        (&report.target_architecture, &report.target_backend)
+                    {
+                        println!("materialized byte-exact for {architecture}/{backend}");
+                    }
+                }
+                asterism_core::backup::RestoreDisposition::Qcow2ToRaw => println!(
+                    "materialized qcow2 disks as raw for {}/{}",
+                    report.target_architecture.as_deref().unwrap_or("unknown"),
+                    report.target_backend.as_deref().unwrap_or("unknown")
+                ),
+                asterism_core::backup::RestoreDisposition::OciRematerialized => println!(
+                    "re-materialized OCI rootfs for {}/{}; mutable root and snapshots were not imported",
+                    report.target_architecture.as_deref().unwrap_or("unknown"),
+                    report.target_backend.as_deref().unwrap_or("unknown")
+                ),
+            }
             if report.rebind.volumes.is_empty()
                 && report.rebind.secrets.is_empty()
                 && report.rebind.gpu.is_none()
@@ -1850,6 +1893,25 @@ fn inspect_backup(source: &str, json: bool) -> Result<()> {
     );
     if let Some(image) = manifest.image {
         println!("image: {}  {}", image.reference, image.content);
+    }
+    if let Some(materialization) = manifest.materialization {
+        println!(
+            "guest: {}/{}  machine: {}",
+            materialization.platform.os,
+            materialization.platform.architecture,
+            materialization.machine
+        );
+        if let Some(root) = materialization.root_disk {
+            println!("root disk: {} ({})", root.path, root.format);
+        }
+        if let Some(oci) = materialization.oci {
+            println!(
+                "OCI manifest: {} for {}/{}",
+                oci.manifest_digest, oci.platform.os, oci.platform.architecture
+            );
+        }
+    } else {
+        println!("materialization: legacy byte-portable backup (architecture unknown)");
     }
     println!(
         "external parts to rebind: {} volume(s), {} secret(s), {} gpu(s)",
@@ -5396,6 +5458,31 @@ mod tests {
         assert!(Cli::try_parse_from(["ast", "auth", "logout"]).is_ok());
         assert!(Cli::try_parse_from(["ast", "create", "dev"]).is_ok());
         assert!(Cli::try_parse_from(["ast", "devices"]).is_ok());
+    }
+
+    #[test]
+    fn backup_import_makes_cross_machine_materialization_explicit() {
+        let parsed = Cli::try_parse_from([
+            "ast",
+            "backup",
+            "import",
+            "/tmp/bundle",
+            "--backend",
+            "vz",
+            "--re-materialize",
+        ])
+        .unwrap();
+        match parsed.command {
+            Command::Backup(BackupCommand::Import {
+                backend,
+                rematerialize_oci,
+                ..
+            }) => {
+                assert_eq!(backend.as_deref(), Some("vz"));
+                assert!(rematerialize_oci);
+            }
+            _ => panic!("parsed the wrong backup command"),
+        }
     }
 
     #[test]

@@ -117,7 +117,9 @@ use crate::VERSION;
 ///   token-free.
 /// * **9** — authenticated, bounded VM guest exec.
 /// * **10** — transport-aware TCP/UDP guest port publication.
-pub const PROTOCOL_VERSION: u32 = 10;
+/// * **11** — target-aware backup import with explicit OCI
+///   re-materialization and backend selection.
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// The wire as it was before it carried a version.
 ///
@@ -131,7 +133,7 @@ pub const FIRST_PROTOCOL: u32 = 1;
 /// How many versions back this build still serves. Protocol 8 adds runtime
 /// and GPU guest frames; keep the unnumbered protocol-1 release reachable in
 /// a rolling orbit.
-pub const SUPPORTED_BACK: u32 = 9;
+pub const SUPPORTED_BACK: u32 = 10;
 
 /// Format version of the home stamp document itself.
 pub const STAMP_VERSION: u32 = 1;
@@ -891,7 +893,10 @@ mod tests {
 
     #[test]
     fn the_window_reaches_its_configured_floor() {
-        let ours = Speaks::new(10u32.saturating_sub(SUPPORTED_BACK), 10);
+        let ours = Speaks::new(
+            PROTOCOL_VERSION.saturating_sub(SUPPORTED_BACK),
+            PROTOCOL_VERSION,
+        );
         for v in ours.min..=ours.max {
             assert_eq!(
                 select_between(ours, Speaks::new(v, v)).version(),

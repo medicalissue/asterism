@@ -358,7 +358,24 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
         }
         Request::BackupImport { source, name } => {
             return tokio::task::block_in_place(|| {
-                restore_backup(reg, Path::new(&source), &name, cpu_device)
+                restore_backup(reg, Path::new(&source), &name, cpu_device, None, false)
+            });
+        }
+        Request::BackupImportV2 {
+            source,
+            name,
+            backend,
+            rematerialize_oci,
+        } => {
+            return tokio::task::block_in_place(|| {
+                restore_backup(
+                    reg,
+                    Path::new(&source),
+                    &name,
+                    cpu_device,
+                    backend.as_deref(),
+                    rematerialize_oci,
+                )
             });
         }
         // A file on this device's disk, read here rather than by the CLI, so
@@ -599,14 +616,99 @@ fn claimed_name(req: &Request) -> Option<&str> {
             ..
         } => None,
         Request::Rename { new_name, .. } => Some(new_name),
-        Request::BackupImport { name, .. } => Some(name),
+        Request::BackupImport { name, .. } | Request::BackupImportV2 { name, .. } => Some(name),
         _ => None,
     }
 }
 
 /// Verify and stage the whole backup before one live path or registry row is
 /// touched, then publish the directory and row as one recoverable operation.
-fn restore_backup(reg: &mut Shard, source: &Path, name: &str, cpu_device: &str) -> Response {
+fn backup_restore_plan(
+    manifest: &backup::Manifest,
+    requested_backend: Option<&str>,
+    rematerialize_oci: bool,
+) -> Result<backup::RestorePlan> {
+    let architecture = backup::target_architecture().to_owned();
+    let Some(metadata) = manifest.materialization.as_ref() else {
+        if requested_backend.is_some_and(|backend| backend != manifest.instance.machine.backend) {
+            anyhow::bail!(
+                "backup format 1 has no architecture or disk materialization metadata; it can only be restored byte-for-byte to its recorded {} backend",
+                manifest.instance.machine.backend
+            );
+        }
+        return backup::plan_restore(
+            manifest,
+            backup::RestoreTarget {
+                architecture,
+                machine: manifest.instance.machine.clone(),
+                disk_formats: vec![
+                    asterism_core::hv::DiskFormat::Raw,
+                    asterism_core::hv::DiskFormat::Qcow2,
+                    asterism_core::hv::DiskFormat::Asif,
+                    asterism_core::hv::DiskFormat::Vhdx,
+                ],
+                rematerialize_oci,
+            },
+        );
+    };
+
+    // Give an architecture refusal before probing a backend from the source
+    // OS. A VZ bundle imported on x86 Windows is an architecture mismatch,
+    // not a mysteriously unavailable VZ installation.
+    if metadata.platform.architecture != architecture && !rematerialize_oci {
+        return backup::plan_restore(
+            manifest,
+            backup::RestoreTarget {
+                architecture,
+                machine: metadata.machine.clone(),
+                disk_formats: vec![
+                    asterism_core::hv::DiskFormat::Raw,
+                    asterism_core::hv::DiskFormat::Qcow2,
+                    asterism_core::hv::DiskFormat::Asif,
+                    asterism_core::hv::DiskFormat::Vhdx,
+                ],
+                rematerialize_oci,
+            },
+        );
+    }
+
+    let requested = requested_backend
+        .or_else(|| (!rematerialize_oci).then_some(metadata.machine.backend.as_str()));
+    let machine = if let Some(reference) = manifest.instance.image.as_deref() {
+        let image = backend::image_ref(reference)?;
+        let requirements = backend::CreateRequirements::new(&image, &manifest.instance.publish);
+        backend::select_for(requested, requirements)?
+    } else {
+        if rematerialize_oci {
+            anyhow::bail!("an OCI re-materialization has no source image reference");
+        }
+        let id = requested.context("a target backend was not selected")?;
+        let hypervisor = backend::by_id(id)?;
+        let ready = hypervisor
+            .probe()
+            .with_context(|| format!("the {id} backup target is unavailable on this device"))?;
+        asterism_core::hv::Machine::new(id, &ready)
+    };
+    let hypervisor = backend::by_id(&machine.backend)?;
+    backup::plan_restore(
+        manifest,
+        backup::RestoreTarget {
+            architecture,
+            machine,
+            disk_formats: hypervisor.restore_disk_formats().to_vec(),
+            rematerialize_oci,
+        },
+    )
+}
+
+fn restore_backup(
+    reg: &mut Shard,
+    source: &Path,
+    name: &str,
+    cpu_device: &str,
+    requested_backend: Option<&str>,
+    rematerialize_oci: bool,
+) -> Response {
     if let Ok(existing) = reg.get(name) {
         return Response::Error {
             message: registry::taken(existing),
@@ -616,7 +718,7 @@ fn restore_backup(reg: &mut Shard, source: &Path, name: &str, cpu_device: &str) 
     // The same backup gets the same staging directory and resumes there; a
     // different backup of the same name gets a different one, so files that
     // were present in an older export can never leak into this restore.
-    let preview = match backup::inspect(source) {
+    let preview = match backup::verify(source) {
         Ok(manifest) => manifest,
         Err(e) => {
             return Response::Error {
@@ -624,8 +726,26 @@ fn restore_backup(reg: &mut Shard, source: &Path, name: &str, cpu_device: &str) 
             }
         }
     };
-    let restore_key =
-        blake3::hash(format!("{}:{}", preview.instance.id, preview.created_at).as_bytes()).to_hex();
+    let plan = match backup_restore_plan(&preview, requested_backend, rematerialize_oci) {
+        Ok(plan) => plan,
+        Err(e) => {
+            return Response::Error {
+                message: format!("{e:#}"),
+            }
+        }
+    };
+    let restore_key = blake3::hash(
+        format!(
+            "{}:{}:{}:{}:{:?}",
+            preview.instance.id,
+            preview.created_at,
+            plan.target.architecture,
+            plan.target.machine.backend,
+            plan.disposition
+        )
+        .as_bytes(),
+    )
+    .to_hex();
     let staging = paths::home_dir()
         .join("instances")
         .join(format!(".{name}.restoring-{}", &restore_key[..12]));
@@ -640,7 +760,17 @@ fn restore_backup(reg: &mut Shard, source: &Path, name: &str, cpu_device: &str) 
             .ok()
             .and_then(|bytes| serde_json::from_slice::<backup::RestoreReport>(&bytes).ok())
         {
-            Some(report) if report.instance == name && report.id == preview.instance.id => true,
+            Some(report)
+                if report.instance == name
+                    && report.id == preview.instance.id
+                    && report
+                        .target_backend
+                        .as_deref()
+                        .is_none_or(|backend| backend == plan.target.machine.backend)
+                    && report.materialization == plan.disposition =>
+            {
+                true
+            }
             _ => {
                 return Response::Error {
                     message: format!(
@@ -653,12 +783,55 @@ fn restore_backup(reg: &mut Shard, source: &Path, name: &str, cpu_device: &str) 
     } else {
         false
     };
+    // Resolve or download OCI bytes only after every local collision check.
+    // A name collision must be a side-effect-free refusal, including for a
+    // re-materialized restore whose registry access could update a cache.
+    if plan.disposition == backup::RestoreDisposition::OciRematerialized {
+        let oci = preview
+            .materialization
+            .as_ref()
+            .and_then(|metadata| metadata.oci.as_ref())
+            .expect("restore plan requires OCI provenance");
+        let pulled = match asterism_core::image::pull(&oci.reference) {
+            Ok(pulled) => pulled,
+            Err(e) => {
+                return Response::Error {
+                    message: format!("re-materializing OCI source {:?}: {e:#}", oci.reference),
+                }
+            }
+        };
+        let same_architecture =
+            plan.source_architecture.as_deref() == Some(plan.target.architecture.as_str());
+        let manifest_matches = if same_architecture {
+            pulled.digest.as_deref() == Some(oci.manifest_digest.as_str())
+        } else {
+            pulled
+                .digest
+                .as_deref()
+                .is_some_and(|digest| digest != oci.manifest_digest)
+        };
+        if !manifest_matches {
+            return Response::Error {
+                message: if same_architecture {
+                    format!(
+                        "OCI source {:?} now resolves to {:?}, not the recorded manifest {}; refusing to rebase onto unrelated bytes",
+                        oci.reference, pulled.digest, oci.manifest_digest
+                    )
+                } else {
+                    format!(
+                        "OCI source {:?} resolved to the source architecture's manifest {}; it is not a multi-platform index for {}",
+                        oci.reference, oci.manifest_digest, plan.target.architecture
+                    )
+                },
+            };
+        }
+    }
     let restore_at = if recovering_publication {
         &live
     } else {
         &staging
     };
-    let (mut instance, report) = match backup::restore_to(source, restore_at, name) {
+    let (mut instance, report) = match backup::restore_to_target(source, restore_at, name, &plan) {
         Ok(restored) => restored,
         Err(e) => {
             return Response::Error {

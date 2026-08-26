@@ -314,6 +314,18 @@ pub enum Request {
         source: String,
         name: String,
     },
+    /// Restore with an explicitly selected target machine and, when CPU
+    /// architecture differs, an explicit OCI re-materialization request.
+    /// Kept separate from v1 so an older daemon can never ignore these
+    /// safety-critical fields as unknown serde members.
+    BackupImportV2 {
+        source: String,
+        name: String,
+        #[serde(default)]
+        backend: Option<String>,
+        #[serde(default)]
+        rematerialize_oci: bool,
+    },
 
     // ---- snapshots -----------------------------------------------------------
     //
@@ -791,6 +803,7 @@ impl Request {
             | Request::CreateNetwork { .. }
             | Request::CreateRuntime { .. }
             | Request::BackupImport { .. }
+            | Request::BackupImportV2 { .. }
             | Request::List
             | Request::ListOrbit => None,
 
@@ -894,6 +907,7 @@ impl Request {
             // envelope cannot be spoken at an earlier protocol than it.
             Request::Proxy { inner, .. } => inner.since(),
             Request::Compat => 2,
+            Request::BackupImportV2 { .. } => 11,
             Request::BackupExport { .. } | Request::BackupImport { .. } => 3,
             Request::AttachStorage { .. }
             | Request::VolumeCatalog
@@ -941,6 +955,7 @@ impl Request {
             Request::Compat => Some("compat"),
             Request::BackupExport { .. } => Some("backup_export"),
             Request::BackupImport { .. } => Some("backup_import"),
+            Request::BackupImportV2 { .. } => Some("backup_import_v2"),
             Request::AttachStorage { .. } => Some("attach_storage"),
             Request::VolumeCatalog => Some("volume_catalog"),
             Request::VolumeLease { .. } => Some("volume_lease"),
@@ -1418,6 +1433,16 @@ pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
             Request::BackupImport {
                 source: String::new(),
                 name: String::new(),
+            }
+            .since(),
+        ),
+        (
+            "backup_import_v2",
+            Request::BackupImportV2 {
+                source: String::new(),
+                name: String::new(),
+                backend: None,
+                rematerialize_oci: false,
             }
             .since(),
         ),

@@ -221,6 +221,43 @@ fn platform_arch() -> &'static str {
     }
 }
 
+/// Pick one ordinary Linux image from an OCI index for an explicit target.
+///
+/// Keeping the target architecture as an argument makes the portability
+/// contract testable on one machine: backup re-materialization must choose a
+/// different manifest for `arm64` and `amd64`, not merely whatever happens to
+/// match the host running the test.
+fn select_platform_manifest<'a>(
+    doc: &'a Value,
+    want: &str,
+    reference: &Reference,
+) -> Result<Option<&'a Value>> {
+    let Some(list) = doc["manifests"].as_array() else {
+        return Ok(None);
+    };
+    let picked = list
+        .iter()
+        .find(|manifest| {
+            manifest["platform"]["os"] == "linux"
+                && manifest["platform"]["architecture"] == want
+                // Attestations ride in the index under the same shape.
+                && manifest["annotations"]["vnd.docker.reference.type"].is_null()
+        })
+        .with_context(|| {
+            let have: Vec<String> = list
+                .iter()
+                .filter_map(|manifest| manifest["platform"]["architecture"].as_str())
+                .filter(|architecture| *architecture != "unknown")
+                .map(str::to_owned)
+                .collect();
+            format!(
+                "{reference} has no linux/{want} build — it publishes {}",
+                have.join(", ")
+            )
+        })?;
+    Ok(Some(picked))
+}
+
 // ---- references ------------------------------------------------------------
 
 /// A parsed registry reference: `docker.io/library/nginx:latest`.
@@ -597,9 +634,11 @@ pub fn pull(reference: &Reference, progress: bool) -> Result<Pulled> {
     let config_digest = manifest["config"]["digest"]
         .as_str()
         .context("image manifest names no config")?;
-    let config = Config::from_json(&serde_json::from_str::<Value>(&std::fs::read_to_string(
+    let config_doc = serde_json::from_str::<Value>(&std::fs::read_to_string(
         registry.blob(config_digest, progress)?,
-    )?)?);
+    )?)?;
+    validate_config_platform(&config_doc)?;
+    let config = Config::from_json(&config_doc);
 
     let layers: Vec<&Value> = manifest["layers"]
         .as_array()
@@ -645,6 +684,21 @@ pub fn pull(reference: &Reference, progress: bool) -> Result<Pulled> {
         config,
         built: true,
     })
+}
+
+fn validate_config_platform(config: &Value) -> Result<()> {
+    if let Some(os) = config["os"].as_str() {
+        if os != "linux" {
+            bail!("OCI image config targets {os}, not linux");
+        }
+    }
+    if let Some(architecture) = config["architecture"].as_str() {
+        let want = platform_arch();
+        if architecture != want {
+            bail!("OCI image config targets linux/{architecture}, not this device's linux/{want}");
+        }
+    }
+    Ok(())
 }
 
 fn write_pointer(reference: &Reference, digest: &str) -> Result<()> {
@@ -812,7 +866,7 @@ impl<'a> Registry<'a> {
         .with_context(|| format!("no image {} on {}", self.reference, self.reference.registry))?;
         let doc: Value = serde_json::from_str(&body).context("unreadable image manifest")?;
 
-        let Some(list) = doc["manifests"].as_array() else {
+        let Some(picked) = select_platform_manifest(&doc, platform_arch(), self.reference)? else {
             // A single-platform manifest: its digest is the one we asked by
             // (and just verified), or the content's own hash otherwise.
             let digest = match &self.reference.version {
@@ -822,28 +876,6 @@ impl<'a> Registry<'a> {
             return Ok((digest, doc));
         };
 
-        let want = platform_arch();
-        let picked = list
-            .iter()
-            .find(|m| {
-                m["platform"]["os"] == "linux"
-                    && m["platform"]["architecture"] == want
-                    // Attestations ride in the index under the same shape.
-                    && m["annotations"]["vnd.docker.reference.type"].is_null()
-            })
-            .with_context(|| {
-                let have: Vec<String> = list
-                    .iter()
-                    .filter_map(|m| m["platform"]["architecture"].as_str())
-                    .filter(|a| *a != "unknown")
-                    .map(str::to_owned)
-                    .collect();
-                format!(
-                    "{} has no linux/{want} build — it publishes {}",
-                    self.reference,
-                    have.join(", ")
-                )
-            })?;
         let digest = picked["digest"]
             .as_str()
             .context("index entry has no digest")?;
@@ -2955,6 +2987,42 @@ mod tests {
         assert!(text.contains("does not match its digest"), "{text}");
     }
 
+    #[test]
+    fn one_multi_platform_index_selects_distinct_arm64_and_amd64_manifests() {
+        let arm = format!("sha256:{}", "a".repeat(64));
+        let x86 = format!("sha256:{}", "b".repeat(64));
+        let index = serde_json::json!({
+            "manifests": [
+                {
+                    "digest": arm,
+                    "platform": { "os": "linux", "architecture": "arm64" }
+                },
+                {
+                    "digest": x86,
+                    "platform": { "os": "linux", "architecture": "amd64" }
+                },
+                {
+                    "digest": format!("sha256:{}", "c".repeat(64)),
+                    "platform": { "os": "unknown", "architecture": "unknown" },
+                    "annotations": { "vnd.docker.reference.type": "attestation-manifest" }
+                }
+            ]
+        });
+        let reference =
+            r("nginx@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd");
+
+        let selected_arm = select_platform_manifest(&index, "arm64", &reference)
+            .unwrap()
+            .unwrap();
+        let selected_x86 = select_platform_manifest(&index, "amd64", &reference)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(selected_arm["digest"], arm);
+        assert_eq!(selected_x86["digest"], x86);
+        assert_ne!(selected_arm["digest"], selected_x86["digest"]);
+    }
+
     /// An image with no build for this machine says so, and names what it
     /// does publish. Booting somebody else's architecture is a guest that
     /// sits at a blank console, which is the least diagnosable failure
@@ -2987,6 +3055,29 @@ mod tests {
             "the error has to say what it does publish: {text}"
         );
         assert!(text.contains("riscv64"), "{text}");
+    }
+
+    #[test]
+    fn a_digest_pinned_single_platform_config_cannot_bypass_architecture_selection() {
+        let other = if platform_arch() == "arm64" {
+            "amd64"
+        } else {
+            "arm64"
+        };
+        let error = validate_config_platform(&serde_json::json!({
+            "os": "linux",
+            "architecture": other,
+            "config": {}
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("not this device"), "{error}");
+        validate_config_platform(&serde_json::json!({
+            "os": "linux",
+            "architecture": platform_arch(),
+            "config": {}
+        }))
+        .unwrap();
     }
 
     /// A tagged single-platform manifest has no digest of its own to check
