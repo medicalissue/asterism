@@ -122,10 +122,12 @@ enum Command {
     Up {
         /// The instance to boot.
         name: String,
-        /// What to do when this guest dies: `always` (the default) brings it
-        /// back after a crash and after a host reboot, `never` leaves it
-        /// down. Recorded on the instance, so it holds for later boots too
-        /// and shows up in `ast status`.
+        /// What to do when this guest dies: `always` brings it back after a
+        /// crash and after a host reboot, `never` leaves it down. Omit this to
+        /// keep the instance's recorded policy: cloud-image VMs start as
+        /// `always`, while OCI images start as `never` because a completed
+        /// entrypoint is a normal exit. The choice persists and shows in
+        /// `ast status`.
         #[arg(long, value_name = "always|never")]
         restart: Option<Restart>,
     },

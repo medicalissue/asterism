@@ -42,6 +42,15 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export PATH="$HOME/.cargo/bin:$PATH"
 cd "$ROOT"
+
+# The cloud-image lane below deliberately tests cloud-init, sshd and a changed
+# multi-profile set. OCI guests have a different control and bootstrap path;
+# keep that proof readable instead of scattering mode checks through all nine
+# cloud-image assertions.
+if [ "${E2E_PROFILE_OCI:-0}" = 1 ]; then
+  exec "$ROOT/scripts/e2e-profile-oci-keychain.sh" "$@"
+fi
+
 cargo build -q
 
 # Fresh, SHORT and harness-owned: unix socket paths are capped near 104 bytes,

@@ -3,8 +3,9 @@
 **PASS for AST-112's implemented QEMU VM parts path, with explicit release
 boundaries below.** The real-host lanes cover an OCI service with a writable
 directory and profile, an OCI VM with a remote block disk and recovery, and a
-platform-store secret through snapshot/restore on a VM. Host-neutral tests
-cover capability refusal, rollback and plaintext exclusion.
+macOS Keychain secret through snapshot/restore on both cloud-image and OCI
+VMs. Host-neutral tests cover capability refusal, rollback and plaintext
+exclusion.
 
 ## Hosts and commands
 
@@ -26,11 +27,21 @@ Keychain:
 
 ```console
 $ E2E_BOOTSTRAP_TIMEOUT=1800 scripts/e2e-profile.sh
-$ cargo test --workspace
+$ E2E_PROFILE_OCI=1 ASTERISM_GUEST_AGENT_ARTIFACT=<arm64-static-agent> \
+    E2E_PROFILE_TIMEOUT=600 scripts/e2e-profile.sh
+$ ulimit -n 4096
+$ ASTERISM_HOME=/private/tmp/asterism-workspace-test-ast112-serial \
+    cargo test --workspace -- --test-threads=1
 ```
 
-All three scripts ended green. The final remote-volume artifact is retained
-on dev5 at `/tmp/asterism-harness-artifacts-68922/volume`.
+All four real-host lanes ended green. The final remote-volume artifact is
+retained on dev5 at `/tmp/asterism-harness-artifacts-68922/volume`; the final
+OCI-Keychain diagnostics are under the macOS temporary harness artifact
+`asterism-harness-artifacts-86955/profile-oci-keychain`.
+
+The workspace command used a newly created empty `ASTERISM_HOME` and a macOS
+open-file limit of 4096, then removed that scratch home. This keeps a stale
+developer image cache and parallel daemon-socket tests out of the result.
 
 ## Observed OCI parts behavior
 
@@ -79,13 +90,24 @@ authenticated control and I/O after recovery.
 
 ## Secret and refusal evidence
 
-The macOS lane put a sentinel into the login Keychain through stdin, attached
-only an opaque guest handle, and proved the egress proxy substituted the value
-only for the allowed authority. The handle survived daemon+VM resurrection
-and snapshot restore. The raw value was absent from the snapshot's allocated
-bytes and from `ast bugreport`; the handle was also absent from the bug report.
-The profile changed from `base@2 node@1 claude@1` to include `codex@1` only
-after the next boot.
+The original macOS cloud-image lane put a sentinel into the login Keychain
+through stdin, attached only an opaque guest handle, and proved the egress
+proxy substituted the value only for the allowed authority. The handle
+survived daemon+VM resurrection and snapshot restore. The raw value was absent
+from the snapshot's allocated bytes and from `ast bugreport`; the handle was
+also absent from the bug report. The profile changed from `base@2 node@1
+claude@1` to include `codex@1` only after the next boot.
+
+The added arm64 macOS lane repeated that contract on a QEMU OCI VM sourced
+from `nginx:alpine`. `base@2` verified over authenticated guest control, the
+guest saw only the opaque handle, and a real HTTPS request received the
+Keychain value only through the per-instance egress proxy. Launchd recreated
+`astd`, which recreated the killed QEMU guest without a new attachment. The
+live root disk, snapshot, content-addressed backup chunks, registry, metadata,
+logs and bug report contained no raw sentinel. Snapshot restore returned the
+disk marker, profile and working handle. The backup manifest and bug report
+contained neither the value nor the host-bound handle. The lane ended
+`PROFILE OCI KEYCHAIN E2E GREEN`.
 
 The workspace suite additionally proves that plaintext never enters the
 secret registry, backup manifests scrub binding rows and handles, a failed
@@ -96,11 +118,9 @@ even when backend probing itself fails.
 
 ## Boundaries
 
-- This is one x86_64 QEMU/KVM OCI host, not native VZ, Cloud Hypervisor or
-  Hyper-V parts evidence.
-- The macOS Keychain lane used a cloud-disk VM. It proves the common VM secret
-  broker and snapshot boundary, not an OCI rootfs plus Keychain on the same
-  boot.
+- The OCI parts evidence covers x86_64 QEMU/KVM on WSL2 and the arm64 macOS
+  QEMU compatibility path. It is not native VZ, Cloud Hypervisor or Hyper-V
+  parts evidence.
 - The restart lane terminates and recreates the Ubuntu WSL distro userspace.
   It is not a Windows host reboot, physical power cycle, or fresh WSL kernel
   boot.
