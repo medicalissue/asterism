@@ -109,8 +109,8 @@ pub enum DiskSpec {
 ///
 /// A cloud image is a whole disk: partition table, bootloader, kernel, the
 /// firmware finds it and that is the end of the backend's involvement. An OCI
-/// image is a root filesystem and nothing else. A VM runtime supplies a
-/// kernel; a native-container runtime supplies namespaces and a cgroup.
+/// image is a root filesystem and nothing else. Asterism supplies its guest
+/// kernel and initrd and boots it through the selected hypervisor backend.
 ///
 /// Data on the image and recorded on the instance, rather than inferred from
 /// the reference: what a name meant when the instance was created is not

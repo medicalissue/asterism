@@ -1,10 +1,10 @@
 //! OCI/Docker images as an instance image source.
 //!
-//! OCI/Docker is an image format, independent of the instance runtime. A
+//! OCI/Docker is an image format, not a host-container runtime choice. A
 //! reference like `nginx` is pulled, verified, unpacked, and represented as
-//! an ext4 filesystem image. `runtime=vm` boots that filesystem with a guest
-//! kernel; `runtime=container` extracts the same verified bytes into a
-//! rootless native namespace. Runtime selection never changes image identity.
+//! an ext4 filesystem image. Asterism adds its pinned guest kernel and initrd,
+//! then boots that filesystem as a VM/microVM through the recorded platform
+//! hypervisor. Image identity remains independent of the backend.
 //!
 //! Three things a container image does not come with, and where each comes
 //! from:

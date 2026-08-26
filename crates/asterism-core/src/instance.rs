@@ -1,8 +1,8 @@
 //! What an instance is made of.
 //!
 //! The orbit is a pool of parts; an instance is a computer assembled from
-//! them. Compute is one placement unit: CPU, physical RAM, and VM/container
-//! execution state come from one orbit device. A volume comes from whichever
+//! them. Compute is one placement unit: CPU, physical RAM, and VM execution
+//! state come from one orbit device. A volume comes from whichever
 //! device holds the bytes, while defaults may follow compute because that is
 //! the cheapest place to put them, not because that device has any claim on
 //! the instance.
@@ -13,12 +13,11 @@ use crate::hv::{ControlChannel, GuestEndpoint, Handle, ImageKind, Machine};
 use crate::remote_gpu::GpuAttachment;
 use crate::secret::Binding;
 
-/// Internal isolation adapter, independent of identity and image format.
+/// Persisted runtime discriminator for registry compatibility.
 ///
-/// This is persisted so the daemon can resume an existing instance through
-/// the same implementation. It is not a second public resource type: CLI,
-/// protocol responses and product copy always present both variants as an
-/// Instance.
+/// New Instances are always `Vm`. `Container` only permits deterministic
+/// recovery and removal of rows created by the retired experimental Linux
+/// namespace lane; it is not a selectable product adapter.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeKind {
@@ -498,7 +497,8 @@ pub struct Instance {
     #[serde(alias = "anchor", alias = "compute_device")]
     pub cpu_device: String,
     pub status: Status,
-    /// VM or native-container isolation. Older registries are VMs.
+    /// Runtime used by this row. New and older ordinary registries are VMs;
+    /// `container` is retained only for retired experimental rows.
     #[serde(default)]
     pub runtime: RuntimeKind,
     /// Unix seconds.
@@ -509,9 +509,9 @@ pub struct Instance {
     #[serde(default)]
     pub image: Option<String>,
     /// What that image turned out to be when the instance was created: a
-    /// bootable disk, or an OCI root filesystem. Runtime decides whether that
-    /// filesystem receives a guest kernel or native namespaces. `disk` on
-    /// records written before OCI images were a source.
+    /// bootable disk, or an OCI root filesystem. OCI root filesystems receive
+    /// an Asterism guest kernel and boot through the recorded hypervisor.
+    /// `disk` on records written before OCI images were a source.
     #[serde(default)]
     pub image_kind: ImageKind,
     /// Guest ports published on this device's loopback (`ast create -p`).

@@ -74,12 +74,11 @@ SSH keys with cloud-init, and applies optional bootstrap profiles for tools
 such as git, tmux, Node, Claude Code, and Codex.
 
 OCI is an image format, not a second kind of Instance. Asterism selects the
-host architecture's verified manifest and keeps VM versus native-namespace
-isolation behind the same Instance lifecycle. The selected adapter is
-persisted for deterministic recovery; architecture-specific mutations and
-snapshots do not become cross-architecture portable merely because their
-source was OCI. Automatic adapter policy is still pending, so ordinary create
-currently retains the VM default.
+guest architecture's verified manifest, materialises it as a Linux rootfs,
+adds a pinned guest kernel and initrd, and boots it as a VM/microVM. The
+recorded choice is the hypervisor backend, never a host-namespace runtime.
+Architecture-specific mutations and snapshots do not become
+cross-architecture portable merely because their source was OCI.
 
 On macOS, Asterism uses Virtualization.framework when it satisfies the
 instance's requirements. QEMU is an optional compatibility backend, not an

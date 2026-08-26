@@ -112,9 +112,10 @@ pub enum Request {
         #[serde(default)]
         profiles: Vec<String>,
     },
-    /// Runtime-aware create. Kept as a distinct versioned frame so a daemon
-    /// that predates native containers cannot ignore an added field and boot
-    /// the requested image as a VM instead.
+    /// Retired experimental runtime-aware create frame. Kept parseable so an
+    /// older client gets an explicit refusal before registry mutation. New
+    /// clients always send [`Request::Create`], and OCI images always boot as
+    /// VM/microVM guests.
     CreateRuntime {
         name: String,
         image: String,

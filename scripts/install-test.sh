@@ -33,6 +33,11 @@ ok() {
 	echo "ok: $*"
 }
 
+if grep -Eq 'newuidmap|newgidmap|slirp4netns|unshare|uidmap' "$INSTALL"; then
+	fail "the installer still carries retired host-namespace runtime dependencies"
+fi
+ok "OCI VM installs contain no host-namespace runtime dependency"
+
 # ---- a release that never existed ------------------------------------------
 
 # Two tiny scripts standing in for the real binaries: the installer never
@@ -216,7 +221,7 @@ cat >"${SHIMS}/chown" <<'EOF'
 #!/bin/sh
 exit 0
 EOF
-for command in newuidmap newgidmap slirp4netns debugfs ip unshare; do
+for command in debugfs ip; do
 	cat >"${SHIMS}/${command}" <<'EOF'
 #!/bin/sh
 exit 0
@@ -224,8 +229,7 @@ EOF
 done
 chmod +x "${SHIMS}/setcap" "${SHIMS}/nbd-client" "${SHIMS}/modprobe" \
 	"${SHIMS}/visudo" "${SHIMS}/sudo" "${SHIMS}/chown" \
-	"${SHIMS}/newuidmap" "${SHIMS}/newgidmap" "${SHIMS}/slirp4netns" \
-	"${SHIMS}/debugfs" "${SHIMS}/ip" "${SHIMS}/unshare"
+	"${SHIMS}/debugfs" "${SHIMS}/ip"
 
 # codesign, for the vz helper. Enough of one to answer the three questions
 # asked of it: sign this, does it carry the entitlement, does the signature

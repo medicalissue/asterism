@@ -1,9 +1,9 @@
-//! Native container runtime boundary.
+//! Retired experimental native-container compatibility boundary.
 //!
-//! Linux uses a rootless user/mount/pid/network namespace plus a delegated
-//! cgroup-v2 leaf. The namespace holder exposes one private Unix control
-//! socket for state, exec and stop. Other hosts have typed adapters that
-//! refuse until their managed utility-VM implementation exists.
+//! New Instances always boot through a hypervisor. This module remains only
+//! to inspect, stop, execute a final recovery command in, or remove rows made
+//! by the pre-release Linux rootless experiment. No CLI or daemon create path
+//! may select it.
 
 use std::fs;
 #[cfg(any(target_os = "linux", all(test, target_family = "unix")))]
@@ -202,10 +202,6 @@ enum ControlResponse {
 #[derive(Debug)]
 pub struct Prepared {
     spec: PathBuf,
-}
-
-pub fn machine() -> Result<Machine> {
-    host_adapter().probe()
 }
 
 pub fn prepare(inst: &Instance) -> Result<Prepared> {

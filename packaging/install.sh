@@ -1014,25 +1014,21 @@ configure_chv_linux() {
 	nbd_helper_source="$1"
 	[ "$(uname -s)" = "Linux" ] || return 0
 
-	# The native container adapter preserves the uid/gid model carried by an
-	# OCI image. `--map-root-user` alone maps one ID and breaks as soon as a
-	# service switches to (for example) nginx uid 101. Install the standard
-	# subordinate-ID helpers and the remaining namespace tools together; the
-	# daemon probe still fails closed when this account has no /etc/subuid or
-	# /etc/subgid range.
-	if ! have newuidmap || ! have newgidmap || ! have slirp4netns || \
-	   ! have debugfs || ! have ip || ! have unshare; then
+	# OCI images are materialised as VM root filesystems. Linux therefore needs
+	# the ext4 ownership tool and the networking utility used by the native VMM,
+	# but never host-container namespace or subordinate-ID helpers.
+	if ! have debugfs || ! have ip; then
 		if have apt-get; then
-			run_root apt-get install -y uidmap slirp4netns e2fsprogs iproute2 util-linux
+			run_root apt-get install -y e2fsprogs iproute2
 		elif have dnf; then
-			run_root dnf install -y shadow-utils slirp4netns e2fsprogs iproute util-linux
+			run_root dnf install -y e2fsprogs iproute
 		elif have zypper; then
-			run_root zypper --non-interactive install shadow slirp4netns e2fsprogs iproute2 util-linux
+			run_root zypper --non-interactive install e2fsprogs iproute2
 		else
-			die "native containers need uidmap, slirp4netns, e2fsprogs, iproute2 and util-linux; install them, then re-run."
+			die "OCI microVMs need e2fsprogs and iproute2; install them, then re-run."
 		fi
 	fi
-	for command in newuidmap newgidmap slirp4netns debugfs ip unshare; do
+	for command in debugfs ip; do
 		have "$command" || die "the package manager completed but ${command} is still unavailable"
 	done
 

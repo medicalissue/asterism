@@ -383,8 +383,9 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
     }
 }
 
-// Mirrors the two versioned create frames field-for-field; grouping these
-// arguments would introduce a third protocol-shaped type with no new invariant.
+// Mirrors the two versioned create frames field-for-field. `CreateRuntime`
+// remains parseable only so an older experimental client receives an explicit
+// refusal instead of accidentally creating a different machine.
 #[allow(clippy::too_many_arguments)]
 fn create_instance(
     reg: &mut Shard,
@@ -397,24 +398,12 @@ fn create_instance(
     publish: Vec<asterism_core::instance::PortForward>,
     profiles: Vec<String>,
 ) -> Result<Instance> {
+    ensure_new_runtime_is_vm(runtime)?;
     let image = backend::image_ref_recording(image)?;
     check_profiles(&profiles)?;
-    let machine = match runtime {
-        RuntimeKind::Vm => {
-            let requirements = backend::CreateRequirements::new(&image, &publish);
-            backend::select_for(requested.as_deref(), requirements)?
-        }
-        RuntimeKind::Container => {
-            if requested.is_some() {
-                anyhow::bail!("--backend selects a hypervisor and cannot be combined with --runtime container");
-            }
-            if image.kind != ImageKind::OciRootfs {
-                anyhow::bail!("runtime=container requires an OCI image reference");
-            }
-            crate::container::machine()?
-        }
-    };
-    reg.create_runtime(name, cpu_device, &image.name, shape, machine, runtime)?;
+    let requirements = backend::CreateRequirements::new(&image, &publish);
+    let machine = backend::select_for(requested.as_deref(), requirements)?;
+    reg.create(name, cpu_device, &image.name, shape, machine)?;
     if image.kind == ImageKind::OciRootfs {
         reg.set_policy(name, Policy::never())?;
     }
@@ -422,6 +411,15 @@ fn create_instance(
         reg.set_profiles(name, profiles)?;
     }
     reg.set_source(name, image.kind, publish)
+}
+
+fn ensure_new_runtime_is_vm(runtime: RuntimeKind) -> Result<()> {
+    if runtime == RuntimeKind::Container {
+        anyhow::bail!(
+            "native-container creation is retired; OCI images always boot as VM/microVM Instances through --backend"
+        );
+    }
+    Ok(())
 }
 
 /// Attach owns its persistence boundary instead of falling through the
@@ -570,7 +568,16 @@ pub(crate) async fn claim_name(
 /// taken by definition, and claiming that would refuse every rename there is.
 fn claimed_name(req: &Request) -> Option<&str> {
     match req {
-        Request::Create { name, .. } | Request::CreateRuntime { name, .. } => Some(name),
+        Request::Create { name, .. }
+        | Request::CreateRuntime {
+            name,
+            runtime: RuntimeKind::Vm,
+            ..
+        } => Some(name),
+        Request::CreateRuntime {
+            runtime: RuntimeKind::Container,
+            ..
+        } => None,
         Request::Rename { new_name, .. } => Some(new_name),
         Request::BackupImport { name, .. } => Some(name),
         _ => None,
@@ -1813,6 +1820,15 @@ fn tail_of(path: &Path, lines: u32) -> Result<(String, bool)> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn new_instances_refuse_the_retired_native_namespace_runtime() {
+        ensure_new_runtime_is_vm(RuntimeKind::Vm).unwrap();
+        let error = ensure_new_runtime_is_vm(RuntimeKind::Container).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("retired"), "{message}");
+        assert!(message.contains("VM/microVM"), "{message}");
+    }
+
     fn test_machine() -> asterism_core::hv::Machine {
         asterism_core::hv::Machine {
             backend: "qemu".into(),
@@ -2125,6 +2141,19 @@ mod tests {
                 profiles: Vec::new(),
             }),
             Some("dev")
+        );
+        assert_eq!(
+            claimed_name(&Request::CreateRuntime {
+                name: "retired".into(),
+                image: "nginx".into(),
+                shape: Default::default(),
+                runtime: RuntimeKind::Container,
+                backend: None,
+                publish: Vec::new(),
+                profiles: Vec::new(),
+            }),
+            None,
+            "the retired runtime must refuse without claiming an orbit name"
         );
         // Everything else resolves a name it did not invent, so it claims
         // nothing and must not be made to wait on every peer in the orbit.

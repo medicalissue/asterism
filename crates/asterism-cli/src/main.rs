@@ -76,14 +76,10 @@ enum Command {
         name: String,
         /// Image to boot: an alias (`ast images`), an https:// url, a path to
         /// a qcow2 or raw disk image, or an OCI/Docker reference such as
-        /// `nginx` or `ghcr.io/owner/app:v1`. OCI image format is independent
-        /// of the internal isolation adapter used by the selected device.
+        /// `nginx` or `ghcr.io/owner/app:v1`. OCI images boot as Linux
+        /// VM/microVM guests through the selected hypervisor backend.
         #[arg(long, default_value = "ubuntu:24.04")]
         image: String,
-        /// Internal compatibility override. Instances are one public product
-        /// model; this legacy switch stays parseable but is hidden from help.
-        #[arg(long, value_enum, default_value_t = CliRuntime::Vm, hide = true)]
-        runtime: CliRuntime,
         /// Publish a guest port on this device's loopback: `-p 8080:80`.
         ///
         /// How an OCI instance is reached: a container image has no ssh
@@ -195,8 +191,8 @@ enum Command {
         #[arg(last = true)]
         command: Vec<String>,
     },
-    /// Run a command inside a native container through its private control
-    /// channel. With no command, runs the image's shell.
+    /// Compatibility command for a retired experimental native-container row.
+    #[command(hide = true)]
     Shell {
         name: String,
         #[arg(last = true)]
@@ -534,12 +530,6 @@ enum Command {
     Doctor,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum CliRuntime {
-    Vm,
-    Container,
-}
-
 /// `ast snapshot ...` — taking one, and deleting one.
 ///
 /// Taking is the bare form (`ast snapshot dev nightly`), which is what
@@ -781,7 +771,6 @@ fn main() -> Result<()> {
         Command::Create {
             name,
             image,
-            runtime,
             publish,
             cpus,
             mem,
@@ -803,24 +792,13 @@ fn main() -> Result<()> {
                 .map(|p| p.parse::<PortForward>())
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| anyhow::anyhow!(e))?;
-            match runtime {
-                CliRuntime::Vm => Request::Create {
-                    name,
-                    image: resolved,
-                    shape,
-                    backend,
-                    profiles,
-                    publish,
-                },
-                CliRuntime::Container => Request::CreateRuntime {
-                    name,
-                    image: resolved,
-                    shape,
-                    runtime: RuntimeKind::Container,
-                    backend,
-                    profiles,
-                    publish,
-                },
+            Request::Create {
+                name,
+                image: resolved,
+                shape,
+                backend,
+                profiles,
+                publish,
             }
         }
         Command::Up { name, restart } => Request::Up { name, restart },
@@ -5323,6 +5301,10 @@ mod tests {
         assert!(
             help.contains("select this device's first capable native backend"),
             "{help}"
+        );
+        assert!(
+            Cli::try_parse_from(["ast", "create", "box", "--runtime", "container"]).is_err(),
+            "OCI instances no longer accept a host-namespace runtime override"
         );
     }
 
