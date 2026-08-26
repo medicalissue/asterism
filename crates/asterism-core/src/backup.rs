@@ -1380,13 +1380,16 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("instance");
         let backup = temp.path().join("backup");
-        let restore = temp.path().join("restore");
+        let restore_arm = temp.path().join("restore-arm64");
+        let restore_x86 = temp.path().join("restore-amd64");
         std::fs::create_dir_all(&source).unwrap();
         std::fs::write(source.join("disk.raw"), b"architecture-specific mutation").unwrap();
         let reference = format!("docker.io/example/app@sha256:{}", "9".repeat(64));
         let mut inst = instance("portable");
         inst.image = Some(reference.clone());
         inst.image_kind = crate::hv::ImageKind::OciRootfs;
+        inst.volumes
+            .push(Volume::dir("/portable/data", "old-device", None));
         export(&inst, &source, &backup, Some(oci_provenance(&reference))).unwrap();
         let manifest = verify(&backup).unwrap();
         let other_arch = if target_architecture() == "arm64" {
@@ -1404,22 +1407,46 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("cannot be restored directly"), "{error}");
-        assert!(!restore.exists(), "planning must not create staging state");
+        assert!(
+            !restore_arm.exists() && !restore_x86.exists(),
+            "planning must not create staging state"
+        );
 
         let mut explicit = target;
         explicit.rematerialize_oci = true;
-        let plan = plan_restore(&manifest, explicit).unwrap();
-        assert_eq!(plan.disposition, RestoreDisposition::OciRematerialized);
-        let (restored, report) = restore_to_target(&backup, &restore, "portable", &plan).unwrap();
-        assert_eq!(restored.status, Status::Defined);
-        assert_eq!(restored.machine.backend, "vz");
-        assert!(!restore.join("disk.raw").exists());
-        assert_eq!(report.files, 0);
-        assert_eq!(
-            report.materialization,
-            RestoreDisposition::OciRematerialized
-        );
-        assert_eq!(report.rebind, RebindRequirements::default());
+        let arm_plan = plan_restore(
+            &manifest,
+            RestoreTarget {
+                architecture: "arm64".into(),
+                ..explicit.clone()
+            },
+        )
+        .unwrap();
+        let x86_plan = plan_restore(
+            &manifest,
+            RestoreTarget {
+                architecture: "amd64".into(),
+                ..explicit
+            },
+        )
+        .unwrap();
+
+        for (restore, plan) in [(&restore_arm, arm_plan), (&restore_x86, x86_plan)] {
+            assert_eq!(plan.disposition, RestoreDisposition::OciRematerialized);
+            let (restored, report) =
+                restore_to_target(&backup, restore, "portable", &plan).unwrap();
+            assert_eq!(restored.status, Status::Defined);
+            assert_eq!(restored.machine.backend, "vz");
+            assert!(restored.volumes.is_empty());
+            assert!(!restore.join("disk.raw").exists());
+            assert_eq!(report.files, 0);
+            assert_eq!(
+                report.materialization,
+                RestoreDisposition::OciRematerialized
+            );
+            assert_eq!(report.rebind.volumes.len(), 1);
+            assert_eq!(report.rebind.volumes[0].path, "/portable/data");
+        }
     }
 
     #[test]
