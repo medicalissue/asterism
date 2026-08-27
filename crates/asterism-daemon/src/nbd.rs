@@ -722,7 +722,26 @@ fn transmission(
         let handle = read_u64(stream)?;
         let offset = read_u64(stream)?;
         let length = read_u32(stream)?;
-        if length > MAX_REQUEST {
+        // The maximum block size bounds what a client may ask this server to
+        // transfer, not what it may ask it to forget. TRIM, WRITE_ZEROES and
+        // BLOCK_STATUS carry no payload in either direction, and a guest's
+        // `mkfs` discards a whole volume in one request: refusing those by
+        // length closed the connection under a real VZ consumer and turned
+        // one discard into an unbounded reconnect loop.
+        let bounded = match command {
+            NBD_CMD_TRIM | NBD_CMD_WRITE_ZEROES | NBD_CMD_BLOCK_STATUS => true,
+            _ => length <= MAX_REQUEST,
+        };
+        if !bounded {
+            if command == NBD_CMD_READ {
+                // Nothing has been transferred yet, so the error the protocol
+                // prefers is framing-safe here.
+                command_error(stream, handle, NBD_EINVAL, command, negotiated.structured)?;
+                continue;
+            }
+            // A WRITE's payload is unbounded and cannot be consumed to stay
+            // in frame, and an unknown command's framing is unknown. Closing
+            // is the only honest refusal for either.
             bail!("NBD request exceeds {MAX_REQUEST} bytes");
         }
 
@@ -1606,11 +1625,30 @@ mod tests {
         request(&mut stream, NBD_CMD_READ, 0, 2, 0, 4, &[]);
         assert_eq!(simple(&mut stream, 2, 4), (0, vec![0; 4]));
 
+        // An oversize READ has transferred nothing, so it is refused in frame
+        // and the session survives to be used again.
         let mut oversize = client(&fixture.socket);
         go(&mut oversize, false);
         request(&mut oversize, NBD_CMD_READ, 0, 3, 0, MAX_REQUEST + 1, &[]);
+        assert_eq!(simple(&mut oversize, 3, 0).0, NBD_EINVAL);
+        request(&mut oversize, NBD_CMD_READ, 0, 4, 0, 4, &[]);
+        assert_eq!(simple(&mut oversize, 4, 4).0, 0);
+
+        // An oversize WRITE announces a payload this server will not read, so
+        // its framing can only be refused by closing.
+        let mut oversize_write = client(&fixture.socket);
+        go(&mut oversize_write, false);
+        request(
+            &mut oversize_write,
+            NBD_CMD_WRITE,
+            0,
+            5,
+            0,
+            MAX_REQUEST + 1,
+            &[],
+        );
         let mut byte = [0];
-        assert!(matches!(oversize.read(&mut byte), Ok(0) | Err(_)));
+        assert!(matches!(oversize_write.read(&mut byte), Ok(0) | Err(_)));
 
         let mut bad_flags = client(&fixture.socket);
         go(&mut bad_flags, false);
@@ -1766,6 +1804,40 @@ mod tests {
             b"neighbor".to_vec()
         );
 
+        fixture.stop();
+    }
+
+    /// A guest's `mkfs` discards the whole device in one request, which is
+    /// larger than the maximum block size and carries no payload. Refusing it
+    /// by length closed the connection under a real VZ consumer, which then
+    /// reconnected and reissued it: one `mkfs` became an unbounded loop.
+    #[test]
+    fn a_whole_volume_discard_is_served_rather_than_refused_by_length() {
+        const WIDE: u64 = 64 * 1024 * 1024;
+        assert!(
+            WIDE > u64::from(MAX_REQUEST),
+            "the request must be oversize"
+        );
+        let mut fixture = Fixture::start_with(WIDE);
+        let mut stream = client(&fixture.socket);
+        structured_and_allocation(&mut stream);
+        go_sized(&mut stream, true, WIDE);
+
+        let whole = u32::try_from(WIDE).unwrap();
+        request(&mut stream, NBD_CMD_TRIM, 0, 1, 0, whole, &[]);
+        assert_eq!(simple(&mut stream, 1, 0).0, 0);
+        request(&mut stream, NBD_CMD_WRITE_ZEROES, 0, 2, 0, whole, &[]);
+        assert_eq!(simple(&mut stream, 2, 0).0, 0);
+        assert_eq!(block_status(&mut stream, 3, 0, whole).0, whole);
+
+        // Past the end is still refused, and in frame rather than by closing.
+        request(&mut stream, NBD_CMD_TRIM, 0, 4, 4096, whole, &[]);
+        assert_eq!(simple(&mut stream, 4, 0).0, NBD_EINVAL);
+
+        // The session is still usable, which is the property the reconnect
+        // loop destroyed.
+        request(&mut stream, NBD_CMD_WRITE, 0, 5, 0, 4, b"live");
+        assert_eq!(simple(&mut stream, 5, 0).0, 0);
         fixture.stop();
     }
 
