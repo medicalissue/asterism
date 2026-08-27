@@ -46,8 +46,13 @@ homepage: https://asterism.run
 license: MIT OR Apache-2.0
 
 depends:
-  # Exactly what packaging/install.sh installs, plus the two things it
-  # assumes: `ast ssh` execs ssh, and the seed builder runs ssh-keygen.
+  # Exactly what packaging/install.sh installs, plus the three things it
+  # assumes rather than installs: the OCI transport execs `curl`, `ast ssh`
+  # execs `ssh`, and the seed builder runs `ssh-keygen`. install.sh never had
+  # to name curl because anyone who ran `curl -fsSL ... | sh` already had it;
+  # a package installed with `apt-get install ./asterism.deb` on a minimal
+  # image does not, and every pull fails at the first fetch.
+  - curl
   - nbd-client
   - kmod
   - e2fsprogs
@@ -67,6 +72,8 @@ overrides:
     depends:
       # The same packages, under the names the Fedora family gives them —
       # the split `packaging/install.sh` already makes when it installs them.
+      # curl is `curl` in both families.
+      - curl
       - nbd
       - kmod
       - e2fsprogs
