@@ -47,6 +47,8 @@ pub const REQUIRED_FEATURES: &[&str] = &[
     "Containers",
 ];
 
+use crate::fix::Fix;
+
 /// SCM / HCS services that must be running before a guest is created.
 pub const REQUIRED_SERVICES: &[&str] = &["vmcompute", "hns", "vmms"];
 
@@ -57,6 +59,10 @@ pub struct Check {
     pub key: String,
     pub ok: bool,
     pub detail: String,
+    /// What to run to clear this row, when the check knows. The same shape
+    /// [`crate::doctor::Check`] carries, for the same reason: a row that
+    /// names a remedy is the difference between a diagnosis and a bug report.
+    pub fix: Option<Fix>,
 }
 
 impl Check {
@@ -65,6 +71,7 @@ impl Check {
             key: key.to_owned(),
             ok: true,
             detail: detail.into(),
+            fix: None,
         }
     }
 
@@ -73,12 +80,23 @@ impl Check {
             key: key.to_owned(),
             ok: false,
             detail: detail.into(),
+            fix: None,
         }
+    }
+
+    /// Attach the remedy for this row.
+    pub fn with_fix(mut self, fix: Fix) -> Self {
+        self.fix = Some(fix);
+        self
     }
 
     pub fn line(&self) -> String {
         let mark = if self.ok { "ok" } else { "fail" };
-        format!("{:<16} {mark}  {}", self.key, self.detail)
+        let mut line = format!("{:<16} {mark}  {}", self.key, self.detail);
+        if let Some(fix) = &self.fix {
+            line.push_str(&format!("\n{:<16} fix   {fix}", ""));
+        }
+        line
     }
 }
 
@@ -400,17 +418,14 @@ pub fn authenticode_ok(
 fn windows_checks() -> Vec<Check> {
     let mut checks = Vec::new();
     let info = host_info();
-    checks.push(if info.edition.contains("Pro") || info.edition.contains("Enterprise") {
-        Check::pass("edition", format!("{} {}", info.edition, info.windows))
-    } else {
-        Check::pass(
-            "edition",
-            format!(
-                "{} {} — experimental host; Microsoft does not support the Hyper-V role on this SKU, so Asterism requires the real HCS/HCN probes below",
-                info.edition, info.windows
-            ),
-        )
-    });
+    // Diagnostics, not a gate, and not a caveat either. What decides whether
+    // this device can run a guest is whether Hyper-V is present and enabled —
+    // the HCS/HCN probes below — and that is judged the same way on every
+    // Windows edition.
+    checks.push(Check::pass(
+        "edition",
+        format!("{} {}", info.edition, info.windows),
+    ));
     let build = info
         .windows
         .rsplit('.')
@@ -490,6 +505,21 @@ fn windows_checks() -> Vec<Check> {
     checks
 }
 
+/// What a device is told to do when Hyper-V is not enabled.
+///
+/// The same command on every edition — the optional feature is what puts
+/// `vmcompute` and `hns` on the device, and it is what a person can copy and
+/// run. The `bcdedit` line rides in the note rather than the command because
+/// it is needed only where the hypervisor was explicitly turned off, and a
+/// remedy is one line or it is not copy-pasteable.
+pub fn enable_hyperv() -> Fix {
+    Fix::noted(
+        "Enable-WindowsOptionalFeature -Online -All -FeatureName Microsoft-Hyper-V",
+        "elevated PowerShell, then reboot; if the hypervisor itself was disabled, \
+         bcdedit /set hypervisorlaunchtype auto",
+    )
+}
+
 #[cfg(windows)]
 fn service_check(name: &str, running: bool) -> Check {
     if running {
@@ -497,8 +527,9 @@ fn service_check(name: &str, running: bool) -> Check {
     } else {
         Check::fail(
             name,
-            format!("{name} is not running — enable Hyper-V and reboot before creating a guest"),
+            format!("{name} is not running — Hyper-V is not enabled on this device"),
         )
+        .with_fix(enable_hyperv())
     }
 }
 
@@ -1400,6 +1431,31 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::time::Duration;
+
+    /// A device whose Hyper-V is off is told what to run, not what edition of
+    /// Windows to go and buy. The remedy is the same on every edition,
+    /// because the gate is the capability and never the SKU.
+    #[test]
+    fn the_hyper_v_remedy_is_a_command_and_not_a_sku() {
+        let fix = enable_hyperv();
+        assert!(fix.command.contains("Microsoft-Hyper-V"), "{fix}");
+        assert!(
+            !fix.to_string().contains("Pro") && !fix.to_string().contains("Home"),
+            "the remedy names no edition: {fix}"
+        );
+
+        let failed = Check::fail("vmcompute", "vmcompute is not running").with_fix(enable_hyperv());
+        let line = failed.line();
+        assert!(line.contains("fail"), "{line}");
+        assert!(line.contains("fix"), "{line}");
+        assert!(line.contains("Enable-WindowsOptionalFeature"), "{line}");
+
+        // A row with nothing to suggest still prints one line, as it did.
+        assert_eq!(
+            Check::pass("vmcompute", "running").line().lines().count(),
+            1
+        );
+    }
 
     fn spec() -> Spec {
         Spec {

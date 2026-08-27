@@ -191,6 +191,34 @@ const VSOCK_MODULE_NAMES: &[&str] = &[
     "vmw_vsock_virtio_transport",
 ];
 
+/// The Hyper-V socket client stack, in dependency order.
+///
+/// Linux presents `hv_sock` through the same AF_VSOCK ABI as the virtio
+/// transport, with the host fixed at CID 2, so nothing above the driver
+/// differs — the guest agent dials the same address on either. What differs
+/// is the module, and the pinned cloud kernel builds this one modular too.
+const HV_VSOCK_MODULE_NAMES: &[&str] = &["vsock", "hv_sock"];
+
+/// Which virtio-socket driver an OCI guest's init has to load for the
+/// egress door, since an OCI root filesystem has no module tree to find one
+/// in. Backend-declared: a guest never infers its own hypervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VsockTransport {
+    /// virtio-vsock. QEMU, Cloud Hypervisor and Virtualization.framework.
+    Virtio,
+    /// Hyper-V sockets, which the guest kernel calls `hv_sock`.
+    HyperV,
+}
+
+impl VsockTransport {
+    fn module_names(self) -> &'static [&'static str] {
+        match self {
+            VsockTransport::Virtio => VSOCK_MODULE_NAMES,
+            VsockTransport::HyperV => HV_VSOCK_MODULE_NAMES,
+        }
+    }
+}
+
 const DIRECT_BOOT_MODULE_NAMES: &[&str] = &[
     "virtiofs",
     "vsock",
@@ -203,6 +231,7 @@ const KERNEL_MODULE_NAMES: &[&str] = &[
     "vsock",
     "vmw_vsock_virtio_transport_common",
     "vmw_vsock_virtio_transport",
+    "hv_sock",
     "netfs",
     "9pnet",
     "9pnet_virtio",
@@ -1305,6 +1334,7 @@ pub fn init_script(config: &Config) -> String {
         config,
         &InstanceParts {
             egress_over_vsock: false,
+            vsock_transport: VsockTransport::Virtio,
             shares: &[],
             share_kind: None,
             egress: &egress,
@@ -1327,6 +1357,8 @@ pub struct InstanceParts<'a> {
     /// to load the vsock transport before the agent opens the door.
     /// Backend-declared, never inferred here.
     pub egress_over_vsock: bool,
+    /// Which socket driver that is. Only read when `egress_over_vsock`.
+    pub vsock_transport: VsockTransport,
     pub bootstrap: &'a Bootstrap,
     pub gpu_boot: Option<&'a str>,
     pub guest_control_boot: Option<&'a str>,
@@ -1674,7 +1706,7 @@ pub fn configure_instance(source: &Path, root: &Path, parts: &InstanceParts<'_>)
         None => Vec::new(),
     };
     if parts.needs_vsock() {
-        modules.extend(vsock_modules()?);
+        modules.extend(kernel_modules(parts.vsock_transport.module_names())?);
     }
     let init = init_script_with_parts(&config, parts, &modules);
     rewrite_guest_files(root, &init)
@@ -1954,11 +1986,6 @@ pub fn direct_boot_modules() -> Result<Vec<KernelModule>> {
 /// Verified 9p client stack for QEMU directory shares, in dependency order.
 fn ninep_modules() -> Result<Vec<KernelModule>> {
     kernel_modules(NINEP_MODULE_NAMES)
-}
-
-/// Verified virtio-vsock client stack, in dependency order.
-fn vsock_modules() -> Result<Vec<KernelModule>> {
-    kernel_modules(VSOCK_MODULE_NAMES)
 }
 
 fn kernel_modules(names: &[&'static str]) -> Result<Vec<KernelModule>> {
@@ -2488,6 +2515,7 @@ mod tests {
         ));
         let parts = InstanceParts {
             egress_over_vsock: true,
+            vsock_transport: VsockTransport::Virtio,
             shares: &[],
             share_kind: None,
             egress: &egress,
@@ -2531,6 +2559,76 @@ mod tests {
         );
     }
 
+    /// The same door on a Hyper-V host, where the transport is `hv_sock`.
+    ///
+    /// The guest side of the hop is byte-identical — Linux presents Hyper-V
+    /// sockets through AF_VSOCK with the host at CID 2 — so the only thing
+    /// that changes is which driver the init has to load, and an OCI rootfs
+    /// has no module tree of its own to find either one in.
+    #[test]
+    fn a_hyper_v_guest_loads_hv_sock_rather_than_the_virtio_transport() {
+        let egress = bound_egress(&format!(
+            "http://{}:{}",
+            crate::egress_door::EGRESS_GUEST_GATEWAY,
+            crate::egress_door::EGRESS_GUEST_PORT
+        ));
+        let parts = InstanceParts {
+            egress_over_vsock: true,
+            vsock_transport: VsockTransport::HyperV,
+            shares: &[],
+            share_kind: None,
+            egress: &egress,
+            bootstrap: &Bootstrap::default(),
+            gpu_boot: None,
+            guest_control_boot: Some("/.asterism/asterism-guest &\n"),
+        };
+        assert!(parts.needs_vsock());
+        assert_eq!(
+            parts.vsock_transport.module_names(),
+            &["vsock", "hv_sock"],
+            "the virtio transport is not what a Hyper-V guest loads"
+        );
+        let modules: Vec<_> = HV_VSOCK_MODULE_NAMES
+            .iter()
+            .map(|&name| KernelModule {
+                name,
+                bytes: format!("fixture-{name}").into_bytes(),
+            })
+            .collect();
+        let script = init_script_with_parts(&Config::default(), &parts, &modules);
+        let dir = tempfile::tempdir().unwrap();
+        let init = dir.path().join("asterism-init");
+        std::fs::write(&init, &script).unwrap();
+        run(Command::new("sh").arg("-n").arg(&init)).expect("the hv_sock init is valid shell");
+
+        let mut previous = 0;
+        for name in HV_VSOCK_MODULE_NAMES {
+            let at = script
+                .find(&format!("insmod /run/asterism-{name}.ko"))
+                .unwrap_or_else(|| panic!("{name} is not loaded: {script}"));
+            assert!(at > previous, "{name} loads out of dependency order");
+            previous = at;
+        }
+        assert!(
+            previous < script.find("/.asterism/asterism-guest").unwrap(),
+            "the transport must be up before the agent opens the door: {script}"
+        );
+        // And the guest is pointed at the same address as on every other
+        // backend that builds the door inside the guest.
+        assert!(
+            script.contains(&format!(
+                "export HTTPS_PROXY='http://{}:{}'",
+                crate::egress_door::EGRESS_GUEST_GATEWAY,
+                crate::egress_door::EGRESS_GUEST_PORT
+            )),
+            "{script}"
+        );
+        assert!(
+            !script.contains("vmw_vsock_virtio_transport"),
+            "a Hyper-V guest pays for no virtio transport: {script}"
+        );
+    }
+
     /// And nothing else pays for it. An unbound guest on the same backend,
     /// and every QEMU guest bound or not, gets no vsock modules at all.
     #[test]
@@ -2547,6 +2645,7 @@ mod tests {
         for (over_vsock, is_bound, expected) in cases {
             let parts = InstanceParts {
                 egress_over_vsock: over_vsock,
+                vsock_transport: VsockTransport::Virtio,
                 shares: &[],
                 share_kind: None,
                 egress: match is_bound {
@@ -2574,6 +2673,7 @@ mod tests {
         let egress = bound_egress("http://127.0.0.1:1021");
         let parts = InstanceParts {
             egress_over_vsock: true,
+            vsock_transport: VsockTransport::Virtio,
             shares: &[],
             share_kind: None,
             egress: &egress,
@@ -2631,6 +2731,7 @@ mod tests {
             &config,
             &InstanceParts {
                 egress_over_vsock: false,
+                vsock_transport: VsockTransport::Virtio,
                 shares: &shares,
                 share_kind: Some(ShareKind::NinePfs),
                 egress: &egress,
@@ -2724,6 +2825,7 @@ mod tests {
             &dir.path().join("root.raw"),
             &InstanceParts {
                 egress_over_vsock: false,
+                vsock_transport: VsockTransport::Virtio,
                 shares: &[share],
                 share_kind: None,
                 egress: &Egress::default(),
@@ -2786,6 +2888,7 @@ mod tests {
         let bootstrap = Bootstrap::resolve(&["base".to_owned()]).unwrap();
         let parts = InstanceParts {
             egress_over_vsock: false,
+            vsock_transport: VsockTransport::Virtio,
             shares: &[],
             share_kind: None,
             egress: &egress,

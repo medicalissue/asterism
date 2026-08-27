@@ -56,6 +56,14 @@ grep -q 'pub const PROTOCOL_VERSION: u32 = 1' crates/asterism-core/src/hyperv.rs
 	|| fail "helper contract is missing protocol 1"
 grep -q '000003ff-facb-11e6-bd58-64006a7986d3' crates/asterism-core/src/hyperv.rs \
 	|| fail "helper contract is missing the AF_HYPERV service GUID"
+grep -q '000003fd-facb-11e6-bd58-64006a7986d3' crates/asterism-core/src/hyperv.rs \
+	|| fail "helper contract is missing the AF_HYPERV egress door service GUID"
+grep -q 'AllowWildcardBinds' crates/asterism-core/src/hyperv.rs \
+	|| fail "Hyper-V Socket services are not pinned to one VM in the protocol document"
+grep -q 'LinuxKernelDirect' crates/asterism-core/src/hyperv.rs \
+	|| fail "the OCI boot document has no direct kernel entry point"
+grep -q 'KernelCmdLine' crates/asterism-core/src/hyperv.rs \
+	|| fail "the OCI boot document carries no kernel command line"
 grep -q 'ShouldTerminateOnLastHandleClosed' crates/asterism-core/src/hyperv.rs \
 	|| fail "durable HCS ownership flag is not pinned in the protocol document"
 grep -q 'SetThreadExecutionState' crates/asterism-core/src/power.rs \

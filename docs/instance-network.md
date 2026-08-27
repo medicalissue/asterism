@@ -52,7 +52,7 @@ Current capability boundary:
 | QEMU + HVF/KVM | yes | loopback `hostfwd` in the VMM | yes, `10.0.2.2` to host loopback |
 | Virtualization.framework | yes | `astd` listener to the guest's NAT address | yes, guest loopback over the instance's virtio socket (OCI guests) |
 | Cloud Hypervisor/KVM | yes | `astd` listener to the guest's TAP address | yes, guest loopback over the instance's virtio socket (OCI guests) |
-| native Hyper-V | no | — | no |
+| native Hyper-V | no | — | yes, guest loopback over this VM's Hyper-V Socket (OCI guests) |
 
 An explicit incapable backend refuses before registry mutation, and automatic
 selection never silently drops a mapping. Publication is no longer a reason to
@@ -93,32 +93,50 @@ credential position empty, and the source device inserts the real value into
 the upstream request on its way out.
 
 The proxy is reachable from one guest and from nothing on the wire, and the
-three backends that offer that reach it two different ways. On QEMU it is a
+four backends that offer that reach it two different ways. On QEMU it is a
 loopback listener the guest reaches through its user-mode NAT gateway.
 
-Neither Virtualization.framework nor Cloud Hypervisor has such a gateway — a
-VZ guest holds an address on a shared NAT bridge, and a CHV guest holds one on
-a per-instance TAP that is a real interface on this device — so on both of
-them the door is the guest's own loopback: the injected guest agent listens
-there and carries what it accepts over this instance's virtio socket. The
-per-Instance key is proved on that hop and the stream is spliced onto a
-private unix socket the egress plane owns. Nothing binds a host interface on
-either path.
+None of the other three has such a gateway — a VZ guest holds an address on a
+shared NAT bridge, a CHV guest holds one on a per-instance TAP that is a real
+interface on this device, and a Hyper-V guest holds one on an HCN NAT whose
+gateway every guest on it shares — so on all three the door is the guest's own
+loopback: the injected guest agent listens there and carries what it accepts
+over this instance's socket. The per-Instance key is proved on that hop and
+the stream is spliced onto a private endpoint the egress plane owns. Nothing
+binds a host interface on any of these paths.
 
-The two differ only in who answers the virtio socket. VZ needs the signed
-`astd-vz` helper, because a `VZVirtioSocketListener` can only be installed by
-the process that owns the VM. Cloud Hypervisor's virtio socket is a hybrid one
-— the VMM dials `<socket>_<port>` on the host for a guest-initiated connection
-— so `astd` binds that path itself and the hop has one fewer participant. See
-`docs/adr/0003-vz-egress-door.md` and `docs/adr/0004-chv-egress-door.md`.
+They differ only in who answers that socket, and the guest cannot tell:
 
-Because both doors are opened by the agent Asterism injects into an OCI root
-filesystem, a VZ or CHV instance created from a cloud image still refuses a
-secret binding before the row changes, and so does Hyper-V. Detach revokes the
-old proxy context, including already-open connections, before restarting
-against the remaining policy.
+* **VZ** needs the signed `astd-vz` helper, because a
+  `VZVirtioSocketListener` can only be installed by the process that owns the
+  VM.
+* **Cloud Hypervisor**'s virtio socket is a hybrid one — the VMM dials
+  `<socket>_<port>` on the host for a guest-initiated connection — so `astd`
+  binds that path itself and the hop has one fewer participant.
+* **Hyper-V** has no virtio socket at all. The guest's `hv_sock` driver
+  presents Hyper-V Sockets through the same AF_VSOCK ABI with the host at
+  CID 2, so the agent dials the same address; on the host,
+  `astd-hyperv.exe` binds an `AF_HYPERV` listener against *that one compute
+  system* and the door's service GUID
+  (`000003fd-facb-11e6-bd58-64006a7986d3`, the `hv_sock` template with the
+  vsock port in the first double word). The VM's own `HvSocketConfig` service
+  table admits that bind with `AllowWildcardBinds: false`, so a listener
+  bound to any other VM never sees this guest and there is no machine-wide
+  registry key to add or clean up. The private endpoint on the host end is a
+  named pipe whose security descriptor names only `astd`'s own SID, because
+  Windows has no socket file under `$ASTERISM_HOME` to keep private with
+  permissions.
 
-The proxy port and CA persist with the Instance. Both agent doors' guest-side
+See `docs/adr/0003-vz-egress-door.md`, `docs/adr/0004-chv-egress-door.md` and
+`docs/adr/0005-hyperv-oci-boot-and-door.md`.
+
+Because every agent door is opened by the agent Asterism injects into an OCI
+root filesystem, an instance created from a cloud image still refuses a secret
+binding before the row changes on all three. Detach revokes the old proxy
+context, including already-open connections, before restarting against the
+remaining policy.
+
+The proxy port and CA persist with the Instance. Every agent door's guest-side
 port is fixed rather than allocated: it is in the guest's own namespace, so
 two instances never collide and a daemon restart reclaims it by construction.
 When `astd` restarts while a QEMU guest remains alive, it reclaims that exact

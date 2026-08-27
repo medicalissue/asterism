@@ -160,6 +160,7 @@ impl Chv {
                     // transport up before the agent that opens it starts.
                     // An unbound guest loads none of it.
                     egress_over_vsock: true,
+                    vsock_transport: oci::VsockTransport::Virtio,
                     shares: &req.shares,
                     share_kind: (!req.shares.is_empty()).then_some(ShareKind::Virtiofs),
                     egress: &req.egress,

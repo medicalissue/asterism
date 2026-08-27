@@ -354,10 +354,67 @@ impl Listener {
     }
 }
 
+/// A named pipe only this process's own identity may open, for something
+/// that is not the control plane.
+///
+/// The control plane's [`Listener`] admits the owner of `$ASTERISM_HOME`
+/// alongside the service, because a person's `ast` has to reach their
+/// daemon. This one admits nobody but `astd` itself: its only client is a
+/// helper `astd` spawned, and the thing on the other side of that helper is
+/// a guest's secret egress. See `asterism_daemon::egress`.
+#[derive(Debug)]
+pub struct ServicePipe {
+    name: String,
+    next: Mutex<Option<NamedPipeServer>>,
+}
+
+impl ServicePipe {
+    pub fn bind(name: &str) -> Result<ServicePipe> {
+        let sid = current_process_sid().context("reading the astd service SID")?;
+        let next = create_server(name, &sid, &sid, true)
+            .with_context(|| format!("binding Windows named pipe {name}"))?;
+        Ok(ServicePipe {
+            name: name.to_owned(),
+            next: Mutex::new(Some(next)),
+        })
+    }
+
+    /// Windows accepts on an instance handle, so the replacement is created
+    /// before the connected one is handed upward — otherwise a client that
+    /// arrives between the two gets `ERROR_FILE_NOT_FOUND` on a pipe that
+    /// exists.
+    pub async fn accept(&self) -> io::Result<NamedPipeServer> {
+        let mut next = self.next.lock().await;
+        let connected = next
+            .take()
+            .expect("the named-pipe accept mutex always owns one instance");
+        let result = connected.connect().await;
+        let sid = current_process_sid()?;
+        *next = Some(create_server(&self.name, &sid, &sid, false)?);
+        result?;
+        Ok(connected)
+    }
+}
+
+/// Bind [`ServicePipe`] by name.
+pub fn service_pipe(name: &str) -> Result<ServicePipe> {
+    ServicePipe::bind(name)
+}
+
 pub fn connect(sock: &Path) -> io::Result<Stream> {
     let home = home_for_socket(sock);
     let (name, _) = pipe_identity(&home, sock)?;
     connect_name(&name)
+}
+
+/// A client stream on a named pipe this process already knows the name of.
+///
+/// The control plane's own pipe is found through [`connect`], which derives
+/// the name from the socket path and the owner's SID. This is for the pipes
+/// `astd` creates for something else and hands the name of to a helper it
+/// spawned — the Hyper-V secret-egress door being the one that exists.
+pub fn connect_pipe(name: &str) -> io::Result<Stream> {
+    connect_name(name)
 }
 
 fn connect_name(name: &str) -> io::Result<Stream> {
