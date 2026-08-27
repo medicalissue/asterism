@@ -277,14 +277,20 @@ the architecture and compatibility contract.
   and RAM from two devices as one machine, and there is no scheduler choosing
   a device for you.
 
-  Relocating an instance to another device does exist, as an offline
-  migration, and it is parked rather than part of the core story:
+  Which device it runs on can change. Moving the whole instance to another
+  orbit device is a shipped offline move — the guest is shut down, only the
+  bytes it wrote are transferred, the cut-over is fenced, and the name, disk,
+  snapshots, and parts arrive intact:
 
   ```console
-  $ ast set agent compute desktop --down
+  $ ast move agent desktop --down
   ```
 
-  `ast set agent cpu desktop` and `ast move agent desktop` remain aliases.
+  `ast set agent compute desktop` is the canonical form and `ast set agent
+  cpu desktop` is an alias. Because names resolve orbit-wide, `ast ssh agent`
+  is the same command before and after. Live migration of a *running* guest
+  is not implemented and is not planned. See
+  [Compute is the device an instance runs on](docs/compute-device.md).
 
 - **GPU** is the GPU of the device the instance runs on. Projecting another
   device's NVIDIA GPU into a guest over the mesh is an **experimental
@@ -445,10 +451,15 @@ boundary.
 
 ### Parked
 
-- **Moving an instance between devices** (`ast move`, `ast set … compute`)
-  works as an offline migration and stays in the tree, but it is parked as a
-  product direction. Reason: product focus. Compute is the device an instance
-  runs on.
+- **Live migration** — moving a *running* instance with the RAM it is
+  holding — is not implemented and is not planned. On macOS it is not
+  possible on either backend. The offline move (`ast move`,
+  `ast set … compute`) is the shipped answer everywhere, and it is not
+  parked.
+- **Placement and scheduling** — anything that picks a device for an instance
+  on your behalf. You choose the device at `ast create`, and you choose it
+  again if you move the instance.
+- **Cross-device GPU** as a product promise, for the physics reason above.
 
 ## Build from source
 
