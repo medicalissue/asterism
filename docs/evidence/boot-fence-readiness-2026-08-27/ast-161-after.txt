@@ -1,0 +1,46 @@
+=== host
+ProductName:		macOS
+ProductVersion:		26.5.2
+BuildVersion:		25F84
+arm64
+ast 0.0.2
+
+=== AST-161: a boot that fails leaves no VMM
+
+$ ast create bot --backend vz --image docker.io/library/alpine:3.20
+resolved
+kernel
+layers
+stored (281018368 bytes)
+bot  defined
+
+$ ast up bot
+error: no VMM for "bot" was left running, so it is recorded stopped (boot failed): finding the packaged Linux OCI guest-control agent: No such file or directory (os error 2)
+
+$ ast status bot
+name:    bot
+id:      f08bbf5c-5e0d-490f-a2f5-40a928be41b9
+status:  stopped (boot failed: finding the packaged Linux OCI guest-control agent: No such file or directory (os error 2))
+restart: never
+age:     0s
+disk:    raw, 26.73 MiB of 20 GiB used
+machine: vz 26.5.2 (generic, cpu host)
+
+parts:
+  compute  macbook-pro.tail0de304.ts.net  2 cores · 2048 MiB
+  disk     macbook-pro.tail0de304.ts.net  20 GiB · docker.io/library/alpine:3.20  (follows compute · oci rootfs, direct kernel boot)
+  network  macbook-pro.tail0de304.ts.net  private guest network  (exit default: same as compute)
+  gpu      -                              none
+
+$ ast ls
+NAME           STATUS    IMAGE          SHAPE            DEVICE       AGE    TODAY    ACCESS
+bot            stopped   alpine:3.20    2c/2048M/20G     macbook-pro.tail0de304.ts.net 0s     -        -
+
+$ ast down bot
+error: instance "bot" is not running
+
+$ ast rm bot
+bot  removed
+
+$ ast ls
+no instances — start with: ast create <name>

@@ -64,6 +64,48 @@ fn retire_failed_launch(proc: &ProcId) -> bool {
     }
 }
 
+/// What a backend that recorded a pid can still say about a launch that left
+/// no handle.
+///
+/// The evidence rule is [`ProcId::adopt`]'s, unchanged: a pid alone is never
+/// authority, and only a command line carrying a path that belongs to this
+/// one instance lets a candidate in. What is added here is the third answer.
+/// Adopt refuses a vacant pid and a recycled one identically, and the
+/// difference does not matter to it — neither may be signalled. It matters
+/// enormously to a launch fence, where "nothing of ours is running" releases
+/// the fence and "I could not look" must not.
+#[cfg(unix)]
+fn recorded_pid_presence(
+    pid: u32,
+    what: &str,
+    execs: &[&str],
+    names: &[&std::path::Path],
+) -> asterism_core::hv::VmmPresence {
+    use asterism_core::hv::VmmPresence;
+    use asterism_core::proc::Presence;
+
+    // No start-time bound: the handle that would have carried one is exactly
+    // what this launch never produced. The instance-exclusive path below is
+    // the whole of the proof, which is what adopt is built to require.
+    match ProcId::adopt(pid, u64::MAX, &Evidence { exec: execs, names }) {
+        Ok(proc) => match proc.check() {
+            Ownership::Ours => VmmPresence::Alive(format!("{what} is still running as {proc}")),
+            Ownership::Gone | Ownership::Foreign(_) => VmmPresence::Gone,
+            Ownership::Unknown(why) => VmmPresence::Unknown(why),
+        },
+        // Adopt said this pid is not this instance's VMM. Vacant or somebody
+        // else's, our launch left nothing running either way; only a host
+        // that would not answer leaves the question open.
+        Err(_) => match asterism_core::proc::presence(pid) {
+            Presence::Vacant | Presence::Occupied => VmmPresence::Gone,
+            Presence::Unreadable(why) => VmmPresence::Unknown(format!(
+                "this host will not say what pid {pid} is ({why}), so a {what} for this \
+                 instance cannot be ruled out"
+            )),
+        },
+    }
+}
+
 /// Wait until the static OCI guest agent both accepts TCP and proves the
 /// instance key.  Every VM backend calls this before publishing a running
 /// handle, so `ast up` has one backend-neutral readiness meaning.

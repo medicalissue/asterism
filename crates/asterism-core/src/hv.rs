@@ -444,6 +444,49 @@ pub struct GuestHealth {
     pub mem_available_kib: Option<u64>,
 }
 
+/// What is known about a VMM whose launch left no handle.
+///
+/// Deliberately three-valued. `Unknown` is not a failure to answer — it is
+/// the answer that keeps a launch fence up, and it is the common case on a
+/// backend that spawns through a helper it cannot re-identify.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VmmPresence {
+    /// Proven gone: no process identity survives, and nothing holds the
+    /// instance-bound resources a live VMM would.
+    Gone,
+    /// Something is still there, and this is what it is.
+    Alive(String),
+    /// It cannot be told either way, and this is why.
+    Unknown(String),
+}
+
+/// Whether a guest can actually be reached right now, and by what proof.
+///
+/// One source of truth, on purpose. `ast status` used to print the guest's
+/// own account of itself — "ssh listening", "cloud-init done", read inside
+/// the guest from `/proc` — beside a running handle, and a user reasonably
+/// read that as "you can reach this". It is not the same claim, and for a
+/// guest whose host-side networking is broken the two disagree (AST-162).
+/// So readiness is measured the way `ast ssh` and `ast exec` measure it -
+/// from this host, end to end — and everything else on the status page is
+/// context for it rather than a second opinion.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Readiness {
+    /// Did a probe succeed just now?
+    pub ready: bool,
+    /// What proved it, for the reader who wants to know which door was
+    /// tried: "ssh banner from 192.168.64.3:22".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<String>,
+    /// Why it did not, when it did not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The last probe that did succeed, Unix seconds. `None` means this
+    /// daemon has never seen this guest answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_ready_unix: Option<u64>,
+}
+
 // ---- capability and identity ----------------------------------------------
 
 /// Kind of host-directory sharing a backend offers.
@@ -854,6 +897,25 @@ pub trait Hypervisor: Send + Sync {
     /// state intact and returns no guest health.
     fn guest_health(&self, _h: &Handle) -> Result<Option<GuestHealth>> {
         Ok(None)
+    }
+
+    /// Is a VMM this backend may have created for `inst` still around?
+    ///
+    /// Asked of exactly one situation: a launch that returned no handle, so
+    /// there is nothing to call [`Hypervisor::state`] on and the durable boot
+    /// fence has nobody to ask (AST-161). A backend answers from the records
+    /// it writes *before* it spawns — a process identity, a start intent, an
+    /// instance-bound control socket — and from nothing else.
+    ///
+    /// The default is [`VmmPresence::Unknown`], which keeps the fence up. A
+    /// backend that has no such record must not answer `Gone`: "I kept no
+    /// evidence" and "there is no VMM" are different claims, and only the
+    /// second one is safe to act on.
+    fn vmm_presence(&self, _inst: &Instance) -> VmmPresence {
+        VmmPresence::Unknown(format!(
+            "the {} backend keeps no record a lost launch could be checked against",
+            self.id()
+        ))
     }
 
     // ---- capability-gated; default impls refuse ----------------------------

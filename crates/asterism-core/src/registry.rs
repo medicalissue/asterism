@@ -36,8 +36,8 @@ use serde::{Deserialize, Serialize};
 use crate::durable::{self, Loaded};
 use crate::hv::{Handle, ImageKind, Machine};
 use crate::instance::{
-    self, now_unix, Conflict, Instance, Moving, Policy, PortForward, Restart, RestartReason,
-    RuntimeKind, Shape, Status, Volume,
+    self, now_unix, BootFailure, Conflict, Instance, Moving, Policy, PortForward, Restart,
+    RestartReason, RuntimeKind, Shape, Status, Volume,
 };
 use crate::proc::ProcId;
 use crate::remote_gpu::GpuAttachment;
@@ -398,6 +398,8 @@ impl Shard {
         inst.status = Status::Running;
         inst.handle = Some(handle);
         inst.boot_intent_id = None;
+        // A boot that worked is the answer to the last one that did not.
+        inst.boot_failure = None;
         Ok(inst.clone())
     }
 
@@ -415,6 +417,37 @@ impl Shard {
         inst.status = Status::Running;
         inst.boot_intent_id = Some(intent.clone());
         Ok((inst.clone(), intent))
+    }
+
+    /// Resolve a launch fence whose guest was proven never to have survived.
+    ///
+    /// The counterpart of [`Self::begin_boot`] for the boot that failed:
+    /// exactly one call clears the fence, publishes the stopped row, and
+    /// records *why* it is stopped, so the three cannot drift apart. The
+    /// intent id is checked for the same reason [`Self::clear_boot`] checks
+    /// it - only the launch that raised this fence may lower it.
+    ///
+    /// Proving the guest is gone is the caller's job and is not something
+    /// this can check; it is the whole precondition of the fence.
+    pub fn resolve_failed_boot(
+        &mut self,
+        name: &str,
+        intent_id: &str,
+        reason: &str,
+    ) -> Result<Instance> {
+        let inst = self.get_mut(name)?;
+        match inst.boot_intent_id.as_deref() {
+            Some(actual) if actual == intent_id => {}
+            Some(actual) => {
+                bail!("instance {name:?} has boot intent {actual}, not failed launch {intent_id}")
+            }
+            None => {}
+        }
+        inst.boot_intent_id = None;
+        inst.status = Status::Stopped;
+        inst.handle = None;
+        inst.boot_failure = Some(BootFailure::new(reason));
+        Ok(inst.clone())
     }
 
     /// Clear a launch fence only after every pre-launch side effect was
@@ -521,13 +554,14 @@ impl Shard {
     }
 
     pub fn remove(&mut self, name: &str) -> Result<Instance> {
+        // The fence first: a fenced row is *recorded* running as part of the
+        // fence, and telling its owner to `ast down` it would send them to a
+        // command that refuses for the opposite reason (AST-161).
+        if self.get(name)?.boot_intent_id.is_some() {
+            bail!("{}", crate::instance::fenced_boot_sentence(name));
+        }
         if self.get(name)?.status == Status::Running {
             bail!("instance {name:?} is running — `ast down {name}` first");
-        }
-        if let Some(intent) = &self.get(name)?.boot_intent_id {
-            bail!(
-                "instance {name:?} has unresolved boot intent {intent}; refusing to remove its authority row"
-            );
         }
         Ok(self.instances.remove(name).expect("checked above"))
     }
@@ -1574,6 +1608,77 @@ mod tests {
             recovered.get("dev").unwrap().boot_intent_id.as_deref(),
             Some(intent.as_str())
         );
+    }
+
+    /// AST-161. A boot that failed used to leave a row that refused every
+    /// command there is: `down` said it was not running, `rm` said it was,
+    /// and `up` said something was already booting it. Resolving the launch
+    /// is what ends that - and resolving is not the same as clearing, which
+    /// is why the reason survives into the stopped row.
+    #[test]
+    fn a_proven_dead_launch_becomes_stopped_with_its_reason_and_frees_the_row() {
+        let path = scratch();
+        let mut shard = shard_with(&path, &["dev"]);
+        let (_, intent) = shard.begin_boot("dev").unwrap();
+
+        // Before: the row is fenced, and every way out of it says the same
+        // thing - including how to get out of it deliberately.
+        let refusal = shard.clone().remove("dev").unwrap_err().to_string();
+        assert_eq!(refusal, instance::fenced_boot_sentence("dev"));
+        // The phrase `ast` recognises, so it can put the command that ends
+        // the fence on its own `fix:` line.
+        assert!(instance::is_fenced_boot_refusal(&refusal), "{refusal}");
+
+        let resolved = shard
+            .resolve_failed_boot("dev", &intent, "boot failed: the vz helper exited at once")
+            .unwrap();
+        assert_eq!(resolved.status, Status::Stopped);
+        assert!(resolved.boot_intent_id.is_none());
+        assert!(resolved.handle.is_none());
+        assert_eq!(
+            resolved.boot_failure.as_ref().unwrap().reason,
+            "boot failed: the vz helper exited at once"
+        );
+        assert!(resolved.boot_failure.as_ref().unwrap().at > 0);
+
+        // After: the row answers again. `rm` is the strictest of the three,
+        // so it is the one worth proving.
+        shard.remove("dev").unwrap();
+    }
+
+    /// Only the launch that raised a fence may lower it. A stale intent id
+    /// is a caller resolving somebody else's boot, which would release a
+    /// fence that is still doing its job.
+    #[test]
+    fn resolving_a_failed_boot_checks_which_launch_it_belongs_to() {
+        let path = scratch();
+        let mut shard = shard_with(&path, &["dev"]);
+        let (_, intent) = shard.begin_boot("dev").unwrap();
+
+        let error = shard
+            .resolve_failed_boot("dev", "some-other-launch", "boot failed")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not failed launch"), "{error}");
+        let preserved = shard.get("dev").unwrap();
+        assert_eq!(preserved.boot_intent_id.as_deref(), Some(intent.as_str()));
+        assert!(preserved.boot_failure.is_none());
+    }
+
+    /// A boot that works is the answer to the one that did not, so the
+    /// recorded failure does not outlive it and haunt `ast status`.
+    #[test]
+    fn a_successful_boot_clears_a_recorded_failure() {
+        let path = scratch();
+        let mut shard = shard_with(&path, &["dev"]);
+        let (_, intent) = shard.begin_boot("dev").unwrap();
+        shard
+            .resolve_failed_boot("dev", &intent, "boot failed: no kernel")
+            .unwrap();
+        assert!(shard.get("dev").unwrap().boot_failure.is_some());
+
+        shard.set_running("dev", handle(4242, 22022)).unwrap();
+        assert!(shard.get("dev").unwrap().boot_failure.is_none());
     }
 
     /// `set_stopped` is widely used crash bookkeeping. It must not double as

@@ -20,7 +20,7 @@ use crate::backup::{ExportReport, RestoreReport};
 use crate::device_shell::{
     ShellData, ShellExit, ShellOpen, ShellOutput, ShellPolicyAction, ShellPolicyStatus,
 };
-use crate::hv::GuestHealth;
+use crate::hv::{GuestHealth, Readiness};
 use crate::image::{ImagePullResult, ImageRow};
 use crate::instance::{Instance, PortForward, Restart, RuntimeKind, Shape};
 use crate::orbit::{Device, DeviceStatus, WakeFacts};
@@ -157,6 +157,13 @@ pub enum Request {
     },
     Down {
         name: String,
+        /// Take an instance down whose launch fence could not be resolved on
+        /// evidence - the escape hatch from AST-161. Kills whatever VMM the
+        /// backend can still find, then releases the fence and records the
+        /// instance stopped. Absent on every `ast down` before the flag
+        /// existed, which is exactly the ordinary stop.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        force: bool,
     },
     /// Change which bootstrap profiles an instance has (`ast profile dev
     /// claude`). Recorded now, applied by the next boot: the seed is what
@@ -984,7 +991,7 @@ impl Request {
     pub fn subject(&self) -> Option<&str> {
         match self {
             Request::Up { name, .. }
-            | Request::Down { name }
+            | Request::Down { name, .. }
             | Request::Remove { name }
             | Request::Status { name }
             | Request::SetProfiles { name, .. }
@@ -1339,6 +1346,11 @@ pub enum Response {
         /// persisted in the registry: every status request asks again.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         guest_health: Option<Box<GuestHealth>>,
+        /// Whether this host can reach the guest right now, probed the way
+        /// `ast ssh` and `ast exec` reach it. Populated for `Status`; the
+        /// one thing on the reply that means "ready" (AST-162).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        readiness: Option<Box<Readiness>>,
     },
     /// Reply to [`Request::List`]: one device's shard.
     Instances {
@@ -2065,11 +2077,18 @@ mod tests {
                 load1: Some(0.42),
                 mem_available_kib: Some(1_572_864),
             })),
+            readiness: Some(Box::new(Readiness {
+                ready: false,
+                proof: None,
+                reason: Some("ssh to 192.168.64.7:22: connection refused".into()),
+                last_ready_unix: Some(1_700_000_000),
+            })),
         };
         let wire = serde_json::to_string(&response).unwrap();
         assert!(wire.contains("guest_health"), "{wire}");
         let Response::Instance {
             guest_health: Some(health),
+            readiness: Some(readiness),
             ..
         } = serde_json::from_str::<Response>(&wire).unwrap()
         else {
@@ -2077,6 +2096,11 @@ mod tests {
         };
         assert_eq!(health.cloud_init, "done");
         assert_eq!(health.mem_available_kib, Some(1_572_864));
+        // The two travel together and disagree on purpose: the guest's own
+        // account of its sshd is not this host's ability to reach it.
+        assert!(health.ssh);
+        assert!(!readiness.ready);
+        assert_eq!(readiness.last_ready_unix, Some(1_700_000_000));
     }
 
     #[test]
@@ -2445,7 +2469,11 @@ mod tests {
     #[test]
     fn a_frames_tag_is_its_name_and_not_its_position() {
         assert_eq!(
-            serde_json::to_string(&Request::Down { name: "dev".into() }).unwrap(),
+            serde_json::to_string(&Request::Down {
+                name: "dev".into(),
+                force: false
+            })
+            .unwrap(),
             r#"{"cmd":"down","name":"dev"}"#
         );
         assert_eq!(
@@ -2521,7 +2549,10 @@ mod tests {
                 name: "dev".into(),
                 restart: None,
             },
-            Request::Down { name: "dev".into() },
+            Request::Down {
+                name: "dev".into(),
+                force: false,
+            },
             Request::Remove { name: "dev".into() },
             Request::Status { name: "dev".into() },
             Request::Rename {
@@ -2727,7 +2758,11 @@ mod tests {
             lines: 10
         }
         .survives_a_conflict());
-        assert!(Request::Down { name: "d".into() }.survives_a_conflict());
+        assert!(Request::Down {
+            name: "d".into(),
+            force: false
+        }
+        .survives_a_conflict());
         assert!(!Request::Up {
             name: "d".into(),
             restart: None
@@ -2824,6 +2859,7 @@ mod tests {
             Response::Instance {
                 instance,
                 guest_health: None,
+                readiness: None,
             }
             .since(),
             8,

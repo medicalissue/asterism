@@ -51,6 +51,7 @@ use asterism_core::egress_door;
 use asterism_core::hv::{
     BootReq, Caps, ControlChannel, DirectKernel, DiskFormat, DiskSpec, GuestEgress, GuestEndpoint,
     GuestHealth, Handle, Hypervisor, ImageKind, Prepared, Ready, RunState, ShareKind, SnapshotId,
+    VmmPresence,
 };
 use asterism_core::instance::{now_unix, Instance};
 use asterism_core::proc::{ProcId, Signal};
@@ -665,10 +666,20 @@ impl Hypervisor for Vz {
             }
             Err(e) => {
                 // A half-started guest is nobody's idea of running. Take
-                // the helper with us so the next `up` starts clean.
-                let _ = proc.signal(Signal::Kill);
-                let _ = std::fs::remove_file(&config.ctl);
-                Err(e)
+                // the helper with us so the next `up` starts clean — and
+                // *prove* it went, because the difference decides whether
+                // the caller may release this launch's durable fence or has
+                // to leave it up (AST-161). A best-effort signal was not
+                // proof, and a boot that timed out used to leave a fenced
+                // row nothing could clear.
+                if retire_failed_launch(&proc) {
+                    let _ = std::fs::remove_file(&config.ctl);
+                    return Err(proven_stopped_boot(e));
+                }
+                Err(e).context(
+                    "the vz helper could not be proven stopped after the boot failed, so \
+                     its socket and launch fence are left in place",
+                )
             }
         }
     }
@@ -854,6 +865,28 @@ impl Hypervisor for Vz {
                     false => RunState::Running,
                 })
             }
+        }
+    }
+
+    /// The vz helper binds this instance's own control socket for the whole
+    /// of its life and unlinks nothing on the way out, so the socket answers
+    /// exactly while a helper is there. That is the same rule
+    /// `persist::clear_stale_control` already relies on to decide whether a
+    /// leftover socket file is crash litter, used here for the other
+    /// question: whether a launch that returned no handle left a VMM behind.
+    ///
+    /// Nothing is inferred from the file merely existing. A refused
+    /// connection is a socket that outlived its process; a helper that was
+    /// spawned and has not bound yet cannot be one of these, because this is
+    /// only ever asked after a launch has already spent its boot budget and
+    /// failed.
+    fn vmm_presence(&self, inst: &Instance) -> VmmPresence {
+        let sock = paths::vz_socket_path(&inst.name);
+        match std::os::unix::net::UnixStream::connect(&sock) {
+            Ok(_) => {
+                VmmPresence::Alive(format!("a vz helper is still bound to {}", sock.display()))
+            }
+            Err(_) => VmmPresence::Gone,
         }
     }
 

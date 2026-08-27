@@ -43,9 +43,10 @@ use asterism_core::hosted_auth::{
     self, BrowserOpener, CredentialStore, DeviceAuthorization, DeviceAuthorizationRequest,
     PollAction, PollFailure, PollPolicy, ProtocolError, Provider, Session,
 };
-use asterism_core::hv::{GuestHealth, ImageKind};
+use asterism_core::hv::{GuestHealth, ImageKind, Readiness};
 use asterism_core::instance::{
     now_unix, Instance, PortForward, PortProtocol, Restart, Restarts, RuntimeKind, Shape,
+    Status as InstanceStatus,
 };
 use asterism_core::ipc;
 use asterism_core::names::{self, NameKind};
@@ -183,6 +184,15 @@ enum Command {
     Down {
         /// The instance to shut down.
         name: String,
+        /// Take down an instance whose boot never finished and whose launch
+        /// fence could not be resolved on evidence.
+        ///
+        /// Kills whatever VMM the backend can still find, releases the
+        /// fence, and records the instance stopped with the boot failure
+        /// kept. Only for the instance `ast status` shows holding a fence:
+        /// check no VMM for it is running first.
+        #[arg(long)]
+        force: bool,
     },
     /// Delete a stopped instance: its disk, its snapshots and its record.
     ///
@@ -1472,7 +1482,7 @@ fn run() -> Result<()> {
             }
         }
         Command::Up { name, restart } => Request::Up { name, restart },
-        Command::Down { name } => Request::Down { name },
+        Command::Down { name, force } => Request::Down { name, force },
         Command::Shell { name, command } => return container_shell(&name, command),
         Command::Rm { name } => Request::Remove { name },
         Command::Rename { name, new_name } => Request::Rename { name, new_name },
@@ -1931,8 +1941,10 @@ fn run() -> Result<()> {
 
     match send(&aimed(request.clone(), device.as_deref()))? {
         Response::Ok => {}
-        Response::Instance { instance, guest_health } => match request {
-            Request::Status { .. } => print_detail(&instance, guest_health.as_deref()),
+        Response::Instance { instance, guest_health, readiness } => match request {
+            Request::Status { .. } => {
+                print_detail(&instance, guest_health.as_deref(), readiness.as_deref())
+            }
             Request::SetProfiles { .. } => print_profile_state(&instance),
             Request::Remove { .. } => println!("{}  removed", instance.name),
             Request::Rename { name, .. } => println!("{name}  renamed to {}", instance.name),
@@ -2129,7 +2141,11 @@ fn run() -> Result<()> {
         Response::Secrets { .. } | Response::Egress { .. } => {
             bail!("unexpected reply from astd: {request:?}")
         }
-        Response::Error { message } => bail!(message),
+        // A launch fence is the one refusal these three commands share, and
+        // the command that ends it is the same one for all of them. The
+        // daemon writes the explanation; this puts the line to type under it
+        // (AST-161).
+        Response::Error { message } => return Err(refusal(&request, message)),
         Response::GpuProviders { providers } => {
             for provider in providers {
                 println!(
@@ -6397,10 +6413,14 @@ fn print_table(rows: &[OrbitRow]) {
 
 /// `ast status`: the instance, then the parts it is assembled from and where
 /// in the pool each of them is sourced.
-fn print_detail(inst: &Instance, guest_health: Option<&GuestHealth>) {
+fn print_detail(
+    inst: &Instance,
+    guest_health: Option<&GuestHealth>,
+    readiness: Option<&Readiness>,
+) {
     println!("name:    {}", inst.name);
     println!("id:      {}", inst.id);
-    println!("status:  {}", inst.status);
+    println!("status:  {}", status_line(inst));
     // What happens when the guest dies, which is half of what "never
     // sleeps" means. Printed always, because the answer matters most for
     // the instance nobody has thought about since they created it.
@@ -6490,6 +6510,12 @@ fn print_detail(inst: &Instance, guest_health: Option<&GuestHealth>) {
         );
     }
 
+    // Before the guest's own account of itself, because it is the line that
+    // answers the question the reader actually has.
+    if let Some(line) = readiness_line(readiness) {
+        println!("{line}");
+    }
+
     for line in guest_health_lines(guest_health) {
         println!("{line}");
     }
@@ -6514,6 +6540,64 @@ fn print_detail(inst: &Instance, guest_health: Option<&GuestHealth>) {
     }
 }
 
+/// What `status:` says, which for a stopped instance is not always the whole
+/// of it.
+///
+/// An instance nobody asked to stop is stopped for a reason, and until
+/// AST-161 that reason was thrown away with the launch fence it was resolved
+/// out of. The user typed `ast up`, it failed, and this is the next thing
+/// they read.
+fn status_line(inst: &Instance) -> String {
+    match &inst.boot_failure {
+        Some(failure) if inst.status == InstanceStatus::Stopped => {
+            format!("{} ({})", inst.status, failure.reason)
+        }
+        _ => inst.status.to_string(),
+    }
+}
+
+/// Whether this host can reach the guest, and — when it cannot — the two
+/// things that make that actionable: why not, and when it last could.
+///
+/// One line, printed for a running instance only: "not ready because it is
+/// not running" is what the `status:` line above already said.
+fn readiness_line(readiness: Option<&Readiness>) -> Option<String> {
+    let readiness = readiness?;
+    if readiness.ready {
+        return Some(format!(
+            "ready:   yes ({})",
+            readiness.proof.as_deref().unwrap_or("probed")
+        ));
+    }
+    let reason = readiness.reason.as_deref()?;
+    // A guest that is not running is not a readiness failure worth a line.
+    if reason.contains("is not running") {
+        return None;
+    }
+    let last = match readiness.last_ready_unix {
+        Some(at) => format!("last reachable {} ago", age(at)),
+        None => "never reachable since this daemon started".to_owned(),
+    };
+    Some(format!("ready:   no — {reason} ({last})"))
+}
+
+/// A refusal from the daemon, with the remedy attached when there is one.
+fn refusal(request: &Request, message: String) -> anyhow::Error {
+    let name = match request {
+        Request::Up { name, .. } | Request::Down { name, .. } | Request::Remove { name } => {
+            Some(name)
+        }
+        _ => None,
+    };
+    match name.filter(|_| asterism_core::instance::is_fenced_boot_refusal(&message)) {
+        Some(name) => anyhow::Error::new(fix::Fixable::new(
+            message,
+            fix::Fix::new(format!("ast down --force {name}")),
+        )),
+        None => anyhow::anyhow!(message),
+    }
+}
+
 /// Fresh agent observations belong between the durable instance facts and its
 /// assembled parts. They are absent for a guest that has not reported yet.
 fn guest_health_lines(health: Option<&GuestHealth>) -> Vec<String> {
@@ -6533,9 +6617,13 @@ fn guest_health_lines(health: Option<&GuestHealth>) -> Vec<String> {
         );
     }
     guest.push(format!("up {}", duration(health.uptime_secs)));
+    // Said as the guest's own view on purpose. This is read from inside the
+    // guest and is true of the guest's sshd; whether anything out here can
+    // reach it is the `ready:` line above, and conflating the two is what
+    // made a status page claim a guest nobody could open (AST-162).
     guest.push(match health.ssh {
-        true => "ssh listening".into(),
-        false => "ssh not listening".into(),
+        true => "guest says sshd listening".into(),
+        false => "guest says sshd not listening".into(),
     });
     if !health.cloud_init.is_empty() {
         guest.push(format!("cloud-init {}", health.cloud_init));
@@ -8039,10 +8127,132 @@ DAwMDAwMDAsImV4cCI6MTcwMDA0MzIwMCwic2NvcGUiOiJvcGVuaWQifQ.c2lnbmF0dXJl";
                 mem_available_kib: Some(1_572_864),
             })),
             vec![
-                "guest:   192.168.64.7 · up 2m · ssh listening · cloud-init done",
+                "guest:   192.168.64.7 · up 2m · guest says sshd listening · cloud-init done",
                 "health:  load 0.42 · memory 1536 MiB available",
             ]
         );
+    }
+
+    /// AST-162, on the printing side. The guest's own report is the thing
+    /// that used to be read as readiness, so the two are asserted together:
+    /// the guest may say its sshd is up while this host cannot reach it, and
+    /// the page has to say both without either sounding like the other.
+    #[test]
+    fn readiness_is_its_own_line_and_the_guests_view_never_speaks_for_it() {
+        let health = GuestHealth {
+            addrs: vec!["192.168.64.7".parse().unwrap()],
+            uptime_secs: 125.9,
+            ssh: true,
+            cloud_init: "done".into(),
+            load1: None,
+            mem_available_kib: None,
+        };
+        let guest = guest_health_lines(Some(&health)).remove(0);
+        assert!(guest.contains("guest says sshd listening"), "{guest}");
+
+        let unreachable = readiness_line(Some(&Readiness {
+            ready: false,
+            proof: None,
+            reason: Some("ssh to 192.168.64.7:22: Connection refused".into()),
+            last_ready_unix: Some(now_unix().saturating_sub(180)),
+        }))
+        .unwrap();
+        assert!(unreachable.starts_with("ready:   no — "), "{unreachable}");
+        assert!(unreachable.contains("Connection refused"), "{unreachable}");
+        assert!(
+            unreachable.contains("last reachable 3m ago"),
+            "{unreachable}"
+        );
+
+        let never = readiness_line(Some(&Readiness {
+            ready: false,
+            proof: None,
+            reason: Some("ssh to 192.168.64.7:22: timed out".into()),
+            last_ready_unix: None,
+        }))
+        .unwrap();
+        assert!(never.contains("never reachable"), "{never}");
+
+        let ready = readiness_line(Some(&Readiness {
+            ready: true,
+            proof: Some("ssh banner from 192.168.64.7:22".into()),
+            reason: None,
+            last_ready_unix: Some(now_unix()),
+        }))
+        .unwrap();
+        assert_eq!(ready, "ready:   yes (ssh banner from 192.168.64.7:22)");
+
+        // A stopped instance already said so on the status line above.
+        assert!(readiness_line(Some(&Readiness {
+            ready: false,
+            proof: None,
+            reason: Some("dev is not running".into()),
+            last_ready_unix: None,
+        }))
+        .is_none());
+        assert!(readiness_line(None).is_none());
+    }
+
+    /// The other half of AST-161 on the printing side: `down`, `rm` and `up`
+    /// all meet the same fence, so all three put the same one line under it.
+    #[test]
+    fn a_fenced_boot_refusal_carries_the_command_that_ends_it() {
+        let message = asterism_core::instance::fenced_boot_sentence("bot");
+        for request in [
+            Request::Remove { name: "bot".into() },
+            Request::Down {
+                name: "bot".into(),
+                force: false,
+            },
+            Request::Up {
+                name: "bot".into(),
+                restart: None,
+            },
+        ] {
+            let lines = error_lines(&refusal(&request, message.clone()));
+            assert_eq!(lines[0], format!("error: {message}"));
+            assert_eq!(lines.last().unwrap(), "  fix: ast down --force bot");
+        }
+
+        // Every other refusal arrives as it was written. A remedy invented
+        // for a message that is not about a fence would be a wrong command
+        // printed with authority.
+        let plain = refusal(
+            &Request::Remove { name: "bot".into() },
+            "instance \"bot\" is running".into(),
+        );
+        assert!(asterism_core::fix::of(&plain).is_none());
+    }
+
+    /// AST-161, on the printing side: a boot that failed is not the same
+    /// stopped as a boot nobody asked for, and the status line says which.
+    #[test]
+    fn a_failed_boot_says_so_on_the_status_line() {
+        let mut inst = Instance::new(
+            "dev",
+            "laptop",
+            "debian:13",
+            Shape::default(),
+            asterism_core::hv::Machine {
+                backend: "vz".into(),
+                machine_type: "generic".into(),
+                cpu: "host".into(),
+                hv_version: "15.6".into(),
+            },
+        );
+        inst.status = InstanceStatus::Stopped;
+        assert_eq!(status_line(&inst), "stopped");
+        inst.boot_failure = Some(asterism_core::instance::BootFailure::new(
+            "boot failed: the guest kernel panicked",
+        ));
+        assert_eq!(
+            status_line(&inst),
+            "stopped (boot failed: the guest kernel panicked)"
+        );
+        // A guest that came back up is not still reporting last week's
+        // failure; the running row wins.
+        inst.status = InstanceStatus::Running;
+        assert_eq!(status_line(&inst), "running");
     }
 
     /// The bug this exists to prevent: a missing `curl` reaching the terminal

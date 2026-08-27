@@ -126,6 +126,33 @@ impl Ownership {
     }
 }
 
+/// Whether a pid is occupied at all, before anyone claims it.
+///
+/// The question [`ProcId::adopt`] cannot answer on its own: adopt refuses a
+/// pid that is vacant and a pid that is somebody else's with the same
+/// `Err`, and the caller resolving a lost launch has to tell those apart
+/// from the host simply declining to say. Three-valued for the same reason
+/// [`Ownership`] is — "I could not look" is not "there is nothing there".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Presence {
+    /// No process, or a zombie: an exit status rather than a program.
+    Vacant,
+    /// Something is running under this number. Whose it is, this does not say.
+    Occupied,
+    /// The kernel would not answer, and this is what it said.
+    Unreadable(String),
+}
+
+/// What is running at `pid`, whoever it belongs to.
+pub fn presence(pid: u32) -> Presence {
+    match look(pid) {
+        Look::Found(probe) if probe.zombie => Presence::Vacant,
+        Look::Found(_) => Presence::Occupied,
+        Look::NoSuchProcess => Presence::Vacant,
+        Look::Unreadable(why) => Presence::Unreadable(why),
+    }
+}
+
 /// The signals Asterism sends. A closed set because every one of them is a
 /// decision someone has to be able to find in the source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -737,7 +764,7 @@ fn look(pid: u32) -> Look {
         return unreadable();
     };
     let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
-    // `fields[0]` is field 3 (state), so field N is `fields[N - 3]`.
+    // `fields[0]` is field 3 (state), so field N is `fields[N — 3]`.
     let (Some(state), Some(ticks)) = (fields.first(), fields.get(19)) else {
         return unreadable();
     };

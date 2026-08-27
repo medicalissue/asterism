@@ -19,7 +19,7 @@ use asterism_core::egress_door;
 use asterism_core::hv::{
     BootReq, Caps, ControlChannel, DirectKernel, DiskFormat, DiskSpec, GuestEgress, GuestEndpoint,
     Handle, Hypervisor, ImageKind, MigrationSource, MigrationTarget, Prepared, Ready, RunState,
-    ShareKind, SnapshotId,
+    ShareKind, SnapshotId, VmmPresence,
 };
 use asterism_core::proc::{ProcId, Signal};
 use asterism_core::snapshot::{self, Snapshot};
@@ -625,6 +625,56 @@ impl Hypervisor for Chv {
         }
         cleanup_stopped(instance_dir_from_api(handle.ctl.path()));
         Ok(())
+    }
+
+    /// Cloud Hypervisor commits a start intent before it spawns and a
+    /// process identity as soon as it can, which is exactly what a launch
+    /// that left no handle can still be checked against. Read-only: unlike
+    /// [`recover_interrupted_spawn`] this repairs nothing and adopts
+    /// nothing, it only answers whether a VMM may still be there.
+    fn vmm_presence(&self, inst: &asterism_core::instance::Instance) -> VmmPresence {
+        let dir = paths::instance_dir(&inst.name);
+        match load_process_record(
+            &dir.join(VMM_RECORD_NAME),
+            "Cloud Hypervisor process identity",
+        ) {
+            Ok(Some(proc)) => {
+                return match proc.check() {
+                    asterism_core::proc::Ownership::Ours => {
+                        VmmPresence::Alive(format!("Cloud Hypervisor is still running as {proc}"))
+                    }
+                    asterism_core::proc::Ownership::Gone
+                    | asterism_core::proc::Ownership::Foreign(_) => VmmPresence::Gone,
+                    asterism_core::proc::Ownership::Unknown(why) => VmmPresence::Unknown(why),
+                }
+            }
+            Ok(None) => {}
+            Err(error) => return VmmPresence::Unknown(format!("{error:#}")),
+        }
+        // No identity was committed. The start intent names an API socket
+        // path only this instance's VMM can be carrying, which is the one
+        // thing left that can find a spawn whose record never landed.
+        let intent = match load_start_intent(&dir.join(START_INTENT_NAME)) {
+            Ok(Some(intent)) => intent,
+            // Nothing was ever committed for a launch: no spawn happened.
+            Ok(None) => return VmmPresence::Gone,
+            Err(error) => return VmmPresence::Unknown(format!("{error:#}")),
+        };
+        if !cfg!(target_os = "linux") {
+            return VmmPresence::Unknown(format!(
+                "a Cloud Hypervisor spawn for {:?} was committed and this host cannot scan \
+                 for it, so a VMM on {} cannot be ruled out",
+                inst.name,
+                intent.api.display()
+            ));
+        }
+        match scan_start_intent(&intent) {
+            Ok(Some(found)) => {
+                VmmPresence::Alive(format!("Cloud Hypervisor is still running as {found}"))
+            }
+            Ok(None) => VmmPresence::Gone,
+            Err(error) => VmmPresence::Unknown(format!("{error:#}")),
+        }
     }
 
     fn state(&self, handle: &Handle) -> Result<RunState> {

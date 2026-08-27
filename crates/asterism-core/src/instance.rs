@@ -644,6 +644,58 @@ pub struct Moving {
     pub started_at: u64,
 }
 
+/// What became of a boot that never produced a running guest.
+///
+/// Recorded rather than merely logged, because "stopped" on its own is a
+/// lie of omission for an instance nobody asked to stop: the user typed
+/// `ast up`, it failed, and the next thing they read is `ast status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BootFailure {
+    /// The backend's own account of it, one line.
+    pub reason: String,
+    /// When it failed, Unix seconds.
+    #[serde(default)]
+    pub at: u64,
+}
+
+impl BootFailure {
+    pub fn new(reason: impl Into<String>) -> Self {
+        BootFailure {
+            reason: reason.into(),
+            at: now_unix(),
+        }
+    }
+}
+
+/// What everything that meets an unresolved launch fence says, in one place.
+///
+/// Three commands run into this row — `ast down`, `ast rm` and `ast up` —
+/// and before AST-161 each of them refused in its own words, none of which
+/// told the user what to do next. The fence is real and must not be cleared
+/// on a guess, so the sentence names the one command that can clear it and
+/// says exactly what that command will do first.
+pub fn fenced_boot_sentence(name: &str) -> String {
+    format!(
+        "instance {name:?} {FENCED_BOOT}: its last launch left no handle and the backend \
+         cannot prove whether a VMM for it is still running, so releasing it here could \
+         put a second guest on one disk. `ast down {name}` lowers the fence the moment \
+         the backend can prove there is nothing left; while it cannot, check yourself \
+         that no VMM for {name:?} is running"
+    )
+}
+
+/// The phrase every fenced-boot refusal carries.
+///
+/// The command that ends the fence is not in the sentence: it belongs on the
+/// CLI's own `fix:` line, where a reader looks for the next thing to type.
+/// This is what lets `ast` recognise the refusal it came back with.
+pub const FENCED_BOOT: &str = "is holding a boot fence";
+
+/// Is this refusal the one `ast down --force` answers?
+pub fn is_fenced_boot_refusal(message: &str) -> bool {
+    message.contains(FENCED_BOOT)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Instance {
     pub id: String,
@@ -808,6 +860,16 @@ pub struct Instance {
     /// written before `ast fork` existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_of: Option<crate::fork::Origin>,
+    /// Why this instance is stopped, when the answer is a boot that failed.
+    ///
+    /// A launch that never produced a running guest used to leave nothing
+    /// behind but a fence nobody could clear (AST-161). The fence is only
+    /// half of the fix: releasing it silently would make a failed boot
+    /// indistinguishable from a deliberate `ast down`, so the outcome is
+    /// *recorded* instead — `ast status` reads it back as
+    /// `stopped (boot failed: ...)`. Cleared by the next boot that works.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_failure: Option<BootFailure>,
 
     // ---- legacy, read once and folded into `handle` ------------------------
     //
@@ -851,6 +913,7 @@ impl Instance {
             gpu: None,
             rewind: None,
             fork_of: None,
+            boot_failure: None,
             legacy_pid: None,
             legacy_ssh_port: None,
         }
