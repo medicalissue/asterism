@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
 pub const PROTOCOL: &str = "asterism-device-authorization/1";
-pub const DEFAULT_AUTHORITY: &str = "https://auth.asterism.run";
+pub const DEFAULT_AUTHORITY: &str = "https://asterism.run";
 pub const CREDENTIAL_SERVICE: &str = "run.asterism.auth";
 /// The pre-issuer credential slot. New clients only remove this entry: a
 /// bearer read from it has no trustworthy destination and must never leave
@@ -345,9 +345,8 @@ mod tests {
         DeviceAuthorization {
             device_code: "device-secret".into(),
             user_code: "ABCD-EFGH".into(),
-            verification_uri: "https://auth.asterism.run/oauth/device".into(),
-            verification_uri_complete: "https://auth.asterism.run/oauth/device?user_code=ABCD-EFGH"
-                .into(),
+            verification_uri: "https://asterism.run/device".into(),
+            verification_uri_complete: "https://asterism.run/device?user_code=ABCD-EFGH".into(),
             expires_in: 60,
             interval: 2,
         }
@@ -383,14 +382,11 @@ mod tests {
 
     #[test]
     fn credential_namespaces_are_bound_to_the_exact_canonical_issuer() {
-        let production = credential_account("https://auth.asterism.run");
-        assert_eq!(production, credential_account("https://auth.asterism.run"));
-        assert_ne!(
-            production,
-            credential_account("https://auth.asterism.run:443")
-        );
+        let production = credential_account("https://asterism.run");
+        assert_eq!(production, credential_account("https://asterism.run"));
+        assert_ne!(production, credential_account("https://asterism.run:443"));
         assert_ne!(production, credential_account("https://other.example"));
-        assert!(!production.contains("auth.asterism.run"));
+        assert!(!production.contains("asterism.run"));
     }
 
     #[test]
@@ -398,11 +394,9 @@ mod tests {
         let authorization = DeviceAuthorization {
             device_code: "device-grant-secret-7fba".into(),
             user_code: "USER-CODE-9C21".into(),
-            verification_uri:
-                "https://auth.asterism.run/oauth/device?query-secret=base-uri-marker".into(),
+            verification_uri: "https://asterism.run/device?query-secret=base-uri-marker".into(),
             verification_uri_complete:
-                "https://auth.asterism.run/oauth/device?user_code=USER-CODE-9C21&complete-secret=marker"
-                    .into(),
+                "https://asterism.run/device?user_code=USER-CODE-9C21&complete-secret=marker".into(),
             expires_in: 60,
             interval: 2,
         };

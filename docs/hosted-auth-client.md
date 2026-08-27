@@ -1,7 +1,7 @@
 # Hosted authentication client contract
 
 Asterism's hosted identity authority is an external coordinator at
-`https://auth.asterism.run`. This public repository contains clients and the
+`https://asterism.run`. This public repository contains clients and the
 protocol seam only. It does not contain provider secrets, OAuth callbacks,
 session authority, or hosted server code.
 
@@ -10,7 +10,7 @@ session authority, or hosted server code.
 `POST /oauth/device/code`, prints the returned verification URL and user code,
 and then attempts to open the complete URL in the system browser. Browser-open
 failure is non-fatal: the printed URL and code remain the recovery path. The
-client polls `POST /oauth/device/token` with the RFC 8628 device grant, obeys
+client polls `POST /oauth/token` with the RFC 8628 device grant, obeys
 the server interval and `slow_down`, retries transient offline failures with a
 capped backoff, and never polls beyond the server-issued expiry.
 

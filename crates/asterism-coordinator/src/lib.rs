@@ -1688,7 +1688,7 @@ mod tests {
     }
 
     fn google() -> Edge {
-        Edge("https://auth.asterism.run/google", "opaque-subject", true)
+        Edge("https://asterism.run/google", "opaque-subject", true)
     }
 
     fn missing_binding(account_id: AccountId) -> AccountBinding {
@@ -1704,7 +1704,7 @@ mod tests {
         let google_binding = service.sign_in(&google(), "opaque-session").unwrap();
         let github_binding = service
             .sign_in(
-                &Edge("https://auth.asterism.run/github", "42", true),
+                &Edge("https://asterism.run/github", "42", true),
                 "opaque-session",
             )
             .unwrap();
@@ -1766,8 +1766,8 @@ mod tests {
         let response: DeviceAuthorization = serde_json::from_value(serde_json::json!({
             "device_code": "opaque-device-secret",
             "user_code": "ABCD-EFGH",
-            "verification_uri": "https://auth.asterism.run/oauth/device",
-            "verification_uri_complete": "https://auth.asterism.run/oauth/device?user_code=ABCD-EFGH",
+            "verification_uri": "https://asterism.run/device",
+            "verification_uri_complete": "https://asterism.run/device?user_code=ABCD-EFGH",
             "expires_in": 600,
             "interval": 5
         }))
@@ -1819,9 +1819,8 @@ mod tests {
         let authorization = DeviceAuthorization {
             device_code: "device-code-secret".into(),
             user_code: "ABCD-EFGH".into(),
-            verification_uri: "https://auth.asterism.run/oauth/device".into(),
-            verification_uri_complete: "https://auth.asterism.run/oauth/device?user_code=ABCD-EFGH"
-                .into(),
+            verification_uri: "https://asterism.run/device".into(),
+            verification_uri_complete: "https://asterism.run/device?user_code=ABCD-EFGH".into(),
             expires_in: 600,
             interval: 5,
         };
@@ -1833,7 +1832,7 @@ mod tests {
         assert!(!debug.contains("device-code-secret"));
         assert!(!debug.contains("ABCD-EFGH"));
         assert!(!debug.contains("user_code="));
-        assert!(!debug.contains("https://auth.asterism.run/oauth/device"));
+        assert!(!debug.contains("https://asterism.run/device"));
         assert!(!debug.contains(&format!("{:?}", [7_u8; 32])));
     }
 

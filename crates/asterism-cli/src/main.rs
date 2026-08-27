@@ -1652,7 +1652,7 @@ impl CoordinatorClient for AuthHttp {
 
     fn poll(&self, device_code: &str) -> Result<AuthReply<Session>> {
         let reply: AuthReply<Session> = self.post(
-            "/oauth/device/token",
+            "/oauth/token",
             &serde_json::json!({
                 "device_code": device_code,
                 "grant_type": "urn:ietf:params:oauth:grant-type:device_code"
@@ -1674,7 +1674,7 @@ impl CoordinatorClient for AuthHttp {
 
     fn revoke(&self, access_token: &str) -> Result<()> {
         match self.post::<serde_json::Value>(
-            "/oauth/revoke",
+            "/api/v1/account/sessions/revoke",
             &serde_json::json!({}),
             Some(access_token),
         )? {
@@ -5394,7 +5394,7 @@ mod tests {
 
         logout_with(&store, None, &mut output, &mut errors).unwrap();
         let issuer_request = received.recv().unwrap().to_ascii_lowercase();
-        assert!(issuer_request.starts_with("post /oauth/revoke http/1.1"));
+        assert!(issuer_request.starts_with("post /api/v1/account/sessions/revoke http/1.1"));
         assert!(issuer_request.contains("authorization: bearer token-not-for-logs"));
         assert_eq!(
             other_listener.accept().unwrap_err().kind(),
