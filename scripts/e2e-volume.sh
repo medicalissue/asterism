@@ -14,7 +14,8 @@
 # Nothing here is proved against a mock. The guest really formats the volume,
 # the bytes really cross a QUIC stream to another daemon's native Rust NBD
 # exporter, and the assertions are on output CONTENT the way scripts/e2e.sh
-# does it. qemu-storage-daemon and qemu-system are not acceptance dependencies.
+# does it. No QEMU binary is an acceptance dependency of this lane — not
+# qemu-storage-daemon, not qemu-system, and not qemu-img.
 #
 # ASTERISM_MESH=local keeps both endpoints on loopback: no relays, no discovery
 # service, no packet that leaves the machine.
@@ -663,8 +664,13 @@ fi
 
 # ---- 6. one writer, and the refusal names who has it -----------------------
 
-DISK="$A/tiny.qcow2"
-qemu-img create -f qcow2 "$DISK" 1M >/dev/null 2>&1 || fail "qemu-img create failed"
+# A decoy image for a second instance which is only ever created, never
+# booted. `dd` rather than `qemu-img create` because this lane must run on a
+# host with no QEMU binary of any kind: the format is sniffed from the file's
+# magic, so raw is as acceptable here as qcow2 was.
+DISK="$A/tiny.raw"
+dd if=/dev/zero of="$DISK" bs=1024 count=1024 >/dev/null 2>&1 \
+  || fail "could not create the decoy disk image"
 expect "a second instance exists" "$OTHER  defined" \
   env ASTERISM_HOME="$A" "$AST" create "$OTHER" --image "$DISK" --mem 512M --disk 1G
 
