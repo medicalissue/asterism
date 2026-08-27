@@ -27,6 +27,18 @@ pub const OWNER: &str = "asterism";
 pub const GUEST_PORT: u32 = 1023;
 pub const GUEST_SERVICE_ID: &str = "000003ff-facb-11e6-bd58-64006a7986d3";
 
+/// The secret-egress door's Hyper-V Socket port and service GUID.
+///
+/// `hv_sock` gives every AF_VSOCK port a service GUID by substituting the
+/// port into the first double word of the VSOCK template GUID
+/// `00000000-facb-11e6-bd58-64006a7986d3` (Linux
+/// `Documentation/virt/hyperv/vmbus.rst`, and the same derivation
+/// `GUEST_SERVICE_ID` above uses for port 1023). So the guest agent dialling
+/// AF_VSOCK port 1021 towards CID 2 arrives here, and nothing above the
+/// driver has to know which hypervisor it is on.
+pub const EGRESS_PORT: u32 = 1021;
+pub const EGRESS_SERVICE_ID: &str = "000003fd-facb-11e6-bd58-64006a7986d3";
+
 /// Override used by tests and by a developer running a helper from elsewhere.
 pub const HELPER_ENV: &str = "ASTERISM_HYPERV_HELPER";
 
@@ -149,6 +161,46 @@ pub fn probe_helper_within(path: &Path, timeout: Duration) -> Result<HostReady> 
     }
 }
 
+/// How this guest's firmware finds something to execute.
+///
+/// Hyper-V's compute service has two entry points, and which one a guest uses
+/// is decided by what is on its disk.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BootSource {
+    /// A cloud image: a whole disk carrying its own bootloader, started by the
+    /// Generation 2 UEFI firmware, with the NoCloud seed attached beside it as
+    /// an ISO.
+    #[default]
+    Uefi,
+    /// An OCI root filesystem, which has no bootloader at all. HCS loads the
+    /// kernel and initrd from host files and passes the command line straight
+    /// to it — `Chipset.LinuxKernelDirect`, the same entry point Linux
+    /// containers on Windows boot through. No firmware is involved, so no
+    /// Secure Boot policy applies to it. See ADR 0005.
+    LinuxKernel {
+        kernel: PathBuf,
+        initrd: PathBuf,
+        cmdline: String,
+    },
+}
+
+/// What `astd` needs the helper to do for this instance's egress door.
+///
+/// The helper binds the door's service GUID against this VM alone and
+/// splices what it accepts into `pipe`, a named pipe `astd` created with a
+/// descriptor naming only its own identity. Nothing is published on a host
+/// interface at either end.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgressDoor {
+    pub system_id: String,
+    pub instance: String,
+    /// Full `\\.\pipe\...` name of the door's host end.
+    pub pipe: String,
+    /// This instance's guest agent key, which both ends of the door prove.
+    pub key: PathBuf,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VmConfig {
     pub protocol: u32,
@@ -159,6 +211,10 @@ pub struct VmConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub data_vhdx: Vec<DiskAttachment>,
     pub seed_iso: PathBuf,
+    /// What the firmware boots. Absent in a config written before OCI guests
+    /// existed on this backend, which is exactly the cloud-image arm.
+    #[serde(default)]
+    pub boot: BootSource,
     pub console: PathBuf,
     pub cpus: u32,
     pub mem_mib: u64,
@@ -226,25 +282,52 @@ impl VmConfig {
             .with_context(|| format!("writing the Hyper-V config at {}", path.display()))
     }
 
+    /// Every host file this VM's document names, in the order it names them.
+    ///
+    /// The VM has to be granted access to each of them before HCS is asked to
+    /// create it, and "each of them" is decided by the boot source: an OCI
+    /// guest is handed a kernel and an initrd and has no NoCloud seed, and
+    /// granting a seed that was never built fails the create with
+    /// `ERROR_FILE_NOT_FOUND` rather than being ignored. Derived here, beside
+    /// `hcs_document`, so the two cannot drift.
+    pub fn backing_files(&self) -> Vec<&std::path::Path> {
+        let mut files: Vec<&std::path::Path> = vec![self.root_vhdx.as_path()];
+        match &self.boot {
+            BootSource::Uefi => files.push(self.seed_iso.as_path()),
+            BootSource::LinuxKernel { kernel, initrd, .. } => {
+                files.push(kernel.as_path());
+                files.push(initrd.as_path());
+            }
+        }
+        files.extend(self.data_vhdx.iter().map(|disk| disk.path.as_path()));
+        files
+    }
+
     /// HCS schema 2.1 document. Kept on the protocol side so every platform's
     /// unit tests can inspect the exact Windows configuration without linking
     /// ComputeCore. Only the helper submits it.
     pub fn hcs_document(&self) -> Result<String> {
         self.validate()?;
         let mut attachments = serde_json::json!({
-            "0": { "Type": "VirtualDisk", "Path": self.root_vhdx },
-            "1": { "Type": "Iso", "Path": self.seed_iso, "ReadOnly": true }
+            "0": { "Type": "VirtualDisk", "Path": self.root_vhdx }
         });
+        let mut next = 1;
+        if matches!(self.boot, BootSource::Uefi) {
+            // Only a cloud image has a NoCloud seed to read. Attaching one an
+            // OCI guest never had would fail the create with a missing file.
+            attachments["1"] =
+                serde_json::json!({ "Type": "Iso", "Path": self.seed_iso, "ReadOnly": true });
+            next = 2;
+        }
         for (index, disk) in self.data_vhdx.iter().enumerate() {
-            attachments[(index + 2).to_string()] = serde_json::json!({
+            attachments[(index + next).to_string()] = serde_json::json!({
                 "Type": "VirtualDisk",
                 "Path": disk.path,
                 "ReadOnly": disk.readonly
             });
         }
-        let mut vm = serde_json::json!({
-            "StopOnReset": true,
-            "Chipset": {
+        let chipset = match &self.boot {
+            BootSource::Uefi => serde_json::json!({
                 "Uefi": {
                     "BootThis": {
                         "DeviceType": "ScsiDrive",
@@ -253,7 +336,22 @@ impl VmConfig {
                     },
                     "Console": "ComPort1"
                 }
-            },
+            }),
+            BootSource::LinuxKernel {
+                kernel,
+                initrd,
+                cmdline,
+            } => serde_json::json!({
+                "LinuxKernelDirect": {
+                    "KernelFilePath": kernel,
+                    "InitRdPath": initrd,
+                    "KernelCmdLine": cmdline
+                }
+            }),
+        };
+        let mut vm = serde_json::json!({
+            "StopOnReset": true,
+            "Chipset": chipset,
             "ComputeTopology": {
                 "Memory": {
                     "Backing": "Virtual",
@@ -280,11 +378,15 @@ impl VmConfig {
                 "HvSocket": {
                     "HvSocketConfig": {
                         "ServiceTable": {
-                            GUEST_SERVICE_ID: {
-                                "AllowWildcardBinds": false,
-                                "BindSecurityDescriptor": "D:P(A;;FA;;;SY)(A;;FA;;;BA)",
-                                "ConnectSecurityDescriptor": "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
-                            }
+                            GUEST_SERVICE_ID: service_entry(),
+                            // The guest-only secret-egress door. A per-VM
+                            // service table entry is what lets a host process
+                            // bind this GUID for this VM, which is why there
+                            // is no machine-wide registry key to add or clean
+                            // up. `AllowWildcardBinds: false` is the load-
+                            // bearing half: a listener bound to any other VM
+                            // id, or to the wildcard, never sees this guest.
+                            EGRESS_SERVICE_ID: service_entry()
                         }
                     }
                 }
@@ -373,6 +475,15 @@ pub enum Request {
         system_id: String,
         state_path: PathBuf,
     },
+    /// Hold this instance's secret-egress door open until killed.
+    ///
+    /// The one request that does not return: the helper binds the door's
+    /// service GUID against this VM, answers `Serving`, and then serves
+    /// accepted connections for as long as the guest runs. Every other
+    /// request is one round trip over stdio.
+    ServeEgress {
+        door: Box<EgressDoor>,
+    },
 }
 
 impl Request {
@@ -414,10 +525,10 @@ impl HostReady {
                 expected_build
             );
         }
-        // Edition is diagnostic metadata, not a capability. Microsoft ships
-        // the supported Hyper-V host role on Pro/Enterprise; an experimental
-        // Home installation is accepted only when the same HCS/HCN service
-        // probes below actually pass.
+        // Edition is diagnostic metadata and nothing else. What decides
+        // whether this device can run a guest is whether Hyper-V is present
+        // and enabled, which the service probes below ask directly. Every
+        // edition that answers those probes runs the same native contract.
         let build = self
             .windows
             .rsplit('.')
@@ -435,7 +546,9 @@ impl HostReady {
         }
         if !self.hcs_running || !self.hcn_running {
             bail!(
-                "Hyper-V is disabled or awaiting a reboot (vmcompute running: {}, hns running: {})",
+                "Hyper-V is not enabled on this device (vmcompute running: {}, hns running: {}). \
+                 To enable it: DISM /Online /Enable-Feature /All /FeatureName:Microsoft-Hyper-V, \
+                 then bcdedit /set hypervisorlaunchtype auto, then reboot",
                 self.hcs_running,
                 self.hcn_running
             );
@@ -467,6 +580,7 @@ pub enum Reply {
     State { state: VmState },
     Stopped,
     Saved,
+    Serving,
     Error { message: String },
 }
 
@@ -495,6 +609,19 @@ pub fn serve_once(
     output.write_all(b"\n")?;
     output.flush()?;
     Ok(())
+}
+
+/// One `HvSocketConfig` service-table entry.
+///
+/// SYSTEM and the administrators group, and nobody else, may bind or connect
+/// this service for this VM. `astd` and its helper run elevated; nothing else
+/// on the device does.
+fn service_entry() -> serde_json::Value {
+    serde_json::json!({
+        "AllowWildcardBinds": false,
+        "BindSecurityDescriptor": "D:P(A;;FA;;;SY)(A;;FA;;;BA)",
+        "ConnectSecurityDescriptor": "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
+    })
 }
 
 pub fn parse_guid(text: &str) -> Result<[u8; 16]> {
@@ -564,8 +691,10 @@ mod tests {
         assert!(!Request::Probe.mutates());
     }
 
+    /// The gate is capability, not edition: a device whose Hyper-V is
+    /// present and enabled passes on whichever Windows it is running.
     #[test]
-    fn a_home_sku_with_real_hcs_capabilities_is_accepted() {
+    fn the_gate_is_hyper_v_being_enabled_not_the_windows_edition() {
         let host = HostReady {
             protocol: PROTOCOL_VERSION,
             build: build_id(),
@@ -576,6 +705,16 @@ mod tests {
             hcn_running: true,
         };
         host.require_supported().unwrap();
+
+        // And the refusal names how to enable it rather than an edition.
+        let disabled = HostReady {
+            hcs_running: false,
+            ..host
+        };
+        let error = disabled.require_supported().unwrap_err().to_string();
+        assert!(error.contains("Hyper-V is not enabled"), "{error}");
+        assert!(error.contains("Microsoft-Hyper-V"), "{error}");
+        assert!(!error.contains("Pro"), "{error}");
     }
 
     #[test]
@@ -630,6 +769,7 @@ mod tests {
                 readonly: true,
             }],
             seed_iso: r"C:\Users\me\.asterism\instances\dev\seed.iso".into(),
+            boot: BootSource::Uefi,
             console: r"\\.\pipe\asterism-dev-console".into(),
             cpus: 2,
             mem_mib: 2048,

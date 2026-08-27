@@ -297,6 +297,7 @@ name = "asterism-hyperv"
 version = "0.0.2"
 dependencies = [
  "anyhow",
+ "asterism-core",
  "getrandom 0.4.3",
  "serde",
  "serde_json",

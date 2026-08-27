@@ -22,8 +22,9 @@ use windows_sys::Win32::Foundation::{
     HCN_E_ENDPOINT_NOT_FOUND, HCN_E_NETWORK_NOT_FOUND, HCS_E_SYSTEM_NOT_FOUND,
 };
 use windows_sys::Win32::Networking::WinSock::{
-    closesocket, connect, recv, send, setsockopt, socket, WSACleanup, WSAGetLastError, WSAStartup,
-    AF_HYPERV, INVALID_SOCKET, SOCKADDR, SOCKET, SOCKET_ERROR, SOCK_STREAM, SOL_SOCKET,
+    accept, bind, closesocket, connect, listen, recv, send, setsockopt,
+    shutdown as socket_shutdown, socket, WSACleanup, WSAGetLastError, WSAStartup, AF_HYPERV,
+    INVALID_SOCKET, SD_BOTH, SOCKADDR, SOCKET, SOCKET_ERROR, SOCK_STREAM, SOL_SOCKET, SOMAXCONN,
     SO_RCVTIMEO, SO_SNDTIMEO, WSADATA,
 };
 use windows_sys::Win32::Security::{
@@ -65,12 +66,30 @@ use windows_sys::Win32::System::SystemInformation::{
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
+use asterism_core::egress_door::{door_host_handshake, pump};
+use asterism_core::ipc;
 use asterism_hyperv::{
-    build_id, HostReady, Reply, Request, VmConfig, VmState, GUEST_PORT, PROTOCOL_VERSION,
+    build_id, EgressDoor, HostReady, Reply, Request, VmConfig, VmState, EGRESS_PORT, GUEST_PORT,
+    PROTOCOL_VERSION,
 };
 
 const HCS_TIMEOUT_MS: u32 = 120_000;
 const GUEST_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// How long either half of the door handshake may take. It is three small
+/// JSON lines; anything slower is not a guest agent.
+const DOOR_HANDSHAKE: Duration = Duration::from_secs(20);
+
+/// How long the helper waits for the compute system its door binds against
+/// to exist. `astd` starts it first on purpose; this covers HCS creating the
+/// VM, which is the only thing between the two.
+const DOOR_BIND_DEADLINE: Duration = Duration::from_secs(120);
+
+/// How long a read from `astd`'s end of the door blocks before the splice
+/// looks at whether the other direction has already finished. The named pipe
+/// carrying the host end has no half-close, so this is what ends a session
+/// whose guest hung up first.
+const DOOR_POLL: Duration = Duration::from_millis(500);
 
 #[link(name = "ntdll")]
 extern "system" {
@@ -116,6 +135,9 @@ pub fn dispatch(request: Request) -> Result<Reply> {
                 delete_network(&network_id)?;
             }
             Ok(Reply::Stopped)
+        }
+        Request::ServeEgress { .. } => {
+            bail!("the egress door is served by the helper's long-running path, not by dispatch")
         }
         Request::Save {
             system_id,
@@ -187,10 +209,7 @@ fn boot(config: &VmConfig) -> Result<Reply> {
     // guest address remain durable; only the host-side HCN object is fresh.
     delete_endpoint(&config.endpoint_id)?;
     let (_endpoint, endpoint_created) = ensure_endpoint(config)?;
-    for path in std::iter::once(&config.root_vhdx)
-        .chain(std::iter::once(&config.seed_iso))
-        .chain(config.data_vhdx.iter().map(|disk| &disk.path))
-    {
+    for path in config.backing_files() {
         grant_vm_access(&config.system_id, path)?;
     }
 
@@ -235,6 +254,187 @@ fn boot(config: &VmConfig) -> Result<Reply> {
             Err(error)
         }
     }
+}
+
+/// Bind and listen on this VM's egress door, waiting for the VM to exist.
+///
+/// `astd` starts this helper *before* it asks HCS to create the compute
+/// system, so that a guest can never come up before the door its handles
+/// depend on. Until that system exists there is no service table admitting
+/// this bind, and Windows says so with `WSAEADDRNOTAVAIL` — so the wait is
+/// here rather than in a sleep on the daemon side, where it would be a guess
+/// about how long HCS takes.
+fn bind_egress_listener(system_id: &str) -> Result<HvSocket> {
+    let vm_id = guid(system_id)?;
+    let deadline = Instant::now() + DOOR_BIND_DEADLINE;
+    loop {
+        let winsock = Winsock::start()?;
+        let raw = unsafe { socket(AF_HYPERV as i32, SOCK_STREAM, HV_PROTOCOL_RAW as i32) };
+        if raw == INVALID_SOCKET {
+            bail!(
+                "creating the AF_HYPERV egress listener: WSA error {}",
+                unsafe { WSAGetLastError() }
+            );
+        }
+        let listener = HvSocket {
+            socket: raw,
+            _winsock: winsock,
+        };
+        let address = SOCKADDR_HV {
+            Family: AF_HYPERV,
+            Reserved: 0,
+            VmId: vm_id,
+            ServiceId: service_guid(EGRESS_PORT),
+        };
+        let bound = unsafe {
+            bind(
+                listener.socket,
+                &address as *const SOCKADDR_HV as *const SOCKADDR,
+                std::mem::size_of::<SOCKADDR_HV>() as i32,
+            )
+        };
+        if bound != SOCKET_ERROR
+            && unsafe { listen(listener.socket, SOMAXCONN as i32) } != SOCKET_ERROR
+        {
+            return Ok(listener);
+        }
+        let last = unsafe { WSAGetLastError() };
+        // A fresh socket each attempt: a bind that failed leaves this one in a
+        // state Winsock will not let a second bind through.
+        drop(listener);
+        if Instant::now() >= deadline {
+            bail!(
+                "the egress door did not bind against compute system {system_id} within {}s: \
+                 WSA error {last}",
+                DOOR_BIND_DEADLINE.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Hold this instance's secret-egress door open for as long as this process
+/// lives.
+///
+/// Nothing new is published on this device. The listener is an `AF_HYPERV`
+/// socket bound to *this VM's* id and the door's service GUID, which the VM's
+/// own `HvSocketConfig` service table admits with `AllowWildcardBinds: false`
+/// — so a listener bound to any other VM, or to the wildcard, never sees this
+/// guest, and there is no machine-wide `GuestCommunicationServices` registry
+/// key to add or to clean up afterwards.
+///
+/// What is accepted proves the per-instance key over the same transcript the
+/// virtio backends use (`asterism-guest-egress`) and is then spliced, byte
+/// for byte, into the named pipe `astd` created for this instance with a
+/// descriptor naming only its own identity. Nothing on this side reads what
+/// it carries.
+pub fn serve_egress(door: &EgressDoor, ready: impl FnOnce() -> Result<()>) -> Result<()> {
+    let key = AgentKey::read(&door.key)?.0;
+    let listener = bind_egress_listener(&door.system_id)?;
+    ready()?;
+    eprintln!(
+        "astd-hyperv: {}: egress door open on hv_sock port {EGRESS_PORT} -> {}",
+        door.instance, door.pipe
+    );
+    loop {
+        let accepted = unsafe { accept(listener.socket, null_mut(), null_mut()) };
+        if accepted == INVALID_SOCKET {
+            let error = unsafe { WSAGetLastError() };
+            eprintln!(
+                "astd-hyperv: {}: egress door accept failed: WSA error {error}",
+                door.instance
+            );
+            std::thread::sleep(Duration::from_millis(200));
+            continue;
+        }
+        let session = HvSocket {
+            socket: accepted,
+            _winsock: Winsock::start()?,
+        };
+        let pipe = door.pipe.clone();
+        let instance = door.instance.clone();
+        std::thread::spawn(move || {
+            if let Err(error) = carry_egress(session, key, &pipe) {
+                eprintln!("astd-hyperv: {instance}: egress door session ended: {error:#}");
+            }
+        });
+    }
+}
+
+/// One proxied connection: prove the key, then splice.
+fn carry_egress(session: HvSocket, key: [u8; 32], pipe: &str) -> Result<()> {
+    let socket = session.socket;
+    set_socket_timeout(socket, DOOR_HANDSHAKE)?;
+    let mut nonce_bytes = [0u8; 16];
+    getrandom::fill(&mut nonce_bytes).context("minting the egress door nonce")?;
+    let mut reader = BufReader::new(SocketReader(socket));
+    let mut writer = SocketWriter(socket);
+    door_host_handshake(&mut reader, &mut writer, &key, &hex(&nonce_bytes))
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    // No deadline on the splice itself: a CONNECT tunnel is idle for as long
+    // as whatever is inside it is idle.
+    set_socket_timeout(socket, Duration::ZERO)?;
+
+    let host = ipc::connect_pipe(pipe)
+        .with_context(|| format!("connecting this instance's egress proxy at {pipe}"))?;
+    host.set_read_timeout(Some(DOOR_POLL))?;
+    let mut to_host = host.try_clone()?;
+
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let upward = {
+        let done = std::sync::Arc::clone(&done);
+        // `reader`, not a fresh one: the handshake's BufReader may already
+        // hold the guest's first proxy bytes, and they are the CONNECT line.
+        std::thread::spawn(move || {
+            let _ = pump(reader, &mut to_host);
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+            unsafe { socket_shutdown(socket, SD_BOTH) };
+        })
+    };
+
+    let mut host = host;
+    let mut buffer = vec![0u8; 32 * 1024];
+    loop {
+        match host.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                if writer.write_all(&buffer[..read]).is_err() {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                if done.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    unsafe { socket_shutdown(socket, SD_BOTH) };
+    let _ = upward.join();
+    Ok(())
+}
+
+fn set_socket_timeout(socket: SOCKET, timeout: Duration) -> Result<()> {
+    let milliseconds = timeout.as_millis().min(u32::MAX as u128) as u32;
+    for option in [SO_RCVTIMEO, SO_SNDTIMEO] {
+        let rc = unsafe {
+            setsockopt(
+                socket,
+                SOL_SOCKET,
+                option,
+                &milliseconds as *const u32 as *const u8,
+                std::mem::size_of_val(&milliseconds) as i32,
+            )
+        };
+        if rc == SOCKET_ERROR {
+            bail!("setting the egress door timeout: WSA error {}", unsafe {
+                WSAGetLastError()
+            });
+        }
+    }
+    Ok(())
 }
 
 fn state(system_id: &str) -> Result<VmState> {

@@ -1564,17 +1564,24 @@ mod tests {
             );
         }
 
-        // Native Hyper-V attaches Hyper-V sockets and could carry the same
-        // protocol; until it does, it declares neither door nor publication
-        // and refuses a bound secret before the registry changes.
+        // Native Hyper-V carries the same door over a Hyper-V Socket bound to
+        // one compute system. The guest cannot tell the difference: `hv_sock`
+        // is AF_VSOCK with the host at CID 2, so the address its agent dials
+        // is the one every other agent door uses. It still does not publish —
+        // `astd` has no proxy for an HCN NAT address yet — and a `-p` mapping
+        // is refused before the registry changes.
         let hyperv_caps = by_id(hyperv::ID).unwrap().caps();
         assert!(
             !hyperv_caps.port_forward,
             "hyperv falsely advertises publication"
         );
-        assert!(
-            hyperv_caps.guest_egress.is_none(),
-            "hyperv falsely advertises a guest-only egress door"
+        assert_eq!(
+            hyperv_caps.guest_egress,
+            Some(GuestEgress::AgentVsock {
+                gateway: EGRESS_GUEST_GATEWAY,
+                vsock_port: EGRESS_VSOCK_PORT,
+            }),
+            "hyperv does not declare the agent-vsock door",
         );
     }
 

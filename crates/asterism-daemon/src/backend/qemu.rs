@@ -392,6 +392,7 @@ impl Hypervisor for Qemu {
                 prep.root_path()?,
                 &oci::InstanceParts {
                     egress_over_vsock: false,
+                    vsock_transport: oci::VsockTransport::Virtio,
                     shares: &req.shares,
                     share_kind: (!req.shares.is_empty()).then_some(ShareKind::NinePfs),
                     egress: &req.egress,

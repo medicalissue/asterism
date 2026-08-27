@@ -481,8 +481,24 @@ fn ensure_running(inst: &Instance, may_move_port: bool) -> Result<(u16, String)>
                 Some(socket),
             )
         }
-        #[cfg(not(unix))]
-        bail!("the guest secret egress door needs a unix socket on the host")
+        #[cfg(windows)]
+        {
+            // Windows has no unix socket under `$ASTERISM_HOME` to own, so
+            // the host end is a named pipe with a security descriptor naming
+            // only `astd`'s own identity — the same primitive, and the same
+            // "nothing on this device can reach it" property, as the
+            // filesystem permissions on the Unix arm. The per-instance helper
+            // `astd` spawns runs as that identity and connects to it.
+            let listener = asterism_core::ipc::service_pipe(&vm_transport_name(&inst.name))
+                .with_context(|| format!("binding {:?}'s guest egress door", inst.name))?;
+            (
+                asterism_core::egress_door::EGRESS_GUEST_PORT,
+                tokio::runtime::Handle::current().spawn(accept_pipe_loop(listener, ctx)),
+                None,
+            )
+        }
+        #[cfg(not(any(unix, windows)))]
+        bail!("the guest secret egress door needs a unix socket or a named pipe on the host")
     } else {
         // VM user-mode networking maps its private gateway to host loopback.
         let preferred = stable_port(&inst.name);
@@ -548,6 +564,28 @@ pub(crate) fn container_transport_dir(instance: &str) -> PathBuf {
 /// waiting for a reboot.
 pub(crate) fn vm_transport_path(instance: &str) -> PathBuf {
     egress_dir(instance).join("proxy.sock")
+}
+
+/// The same door, named the way the per-instance helper is told to reach it.
+///
+/// On Unix that is the socket path above. On Windows there is no socket in
+/// the filesystem to name, so it is a kernel named pipe whose name follows a
+/// hash of the instance rather than the instance itself: pipe names are a
+/// flat machine-wide namespace with a much narrower character set than an
+/// instance name, and what keeps this one private is its descriptor, not its
+/// spelling.
+pub(crate) fn vm_transport_name(instance: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!(
+            r"\\.\pipe\asterism-egress-{}",
+            &blake3::hash(instance.as_bytes()).to_hex()[..16]
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        vm_transport_path(instance).display().to_string()
+    }
 }
 
 fn port_path(instance: &str) -> PathBuf {
@@ -627,6 +665,16 @@ struct ProxyCtx {
 async fn accept_loop(listener: TcpListener, ctx: Arc<ProxyCtx>) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
+            continue;
+        };
+        tokio::spawn(serve_connection(stream, ctx.clone()));
+    }
+}
+
+#[cfg(windows)]
+async fn accept_pipe_loop(listener: asterism_core::ipc::ServicePipe, ctx: Arc<ProxyCtx>) {
+    loop {
+        let Ok(stream) = listener.accept().await else {
             continue;
         };
         tokio::spawn(serve_connection(stream, ctx.clone()));
@@ -1732,24 +1780,36 @@ mod tests {
         )
     }
 
+    /// A backend that declares no door at all refuses the binding before the
+    /// registry changes, rather than at boot. Every backend in the tree now
+    /// declares one, so the refusal is exercised against a `Caps` that says
+    /// `None` — which is the thing the check actually reads.
     #[test]
-    fn an_incapable_recorded_backend_refuses_before_probe_or_mutation() {
+    fn a_backend_with_no_door_refuses_before_probe_or_mutation() {
+        let hv = crate::backend::by_id(crate::backend::hyperv::ID).unwrap();
+        let mut caps = hv.caps();
+        assert!(caps.guest_egress.is_some());
+        caps.guest_egress = None;
+        assert!(!caps.supports(asterism_core::hv::Capability::GuestEgress));
+        // And the message the user would see names the way out.
         let instance = recorded_on(crate::backend::hyperv::ID, "hyperv");
         let error = check_can_bind(&instance).unwrap_err().to_string();
-        assert!(error.contains("guest-only door"), "{error}");
+        assert!(error.contains("OCI root filesystem"), "{error}");
     }
 
-    /// Both agent doors are the guest's own loopback, carried out over that
-    /// instance's virtio socket. What the seed tells the guest has to be
-    /// that address and nothing else, and each backend has its own reason:
-    /// VZ's bridge address is reachable by every other guest on the same
-    /// NAT, and CHV's per-instance TAP host address is a real interface on
-    /// this device, one route table away from every other guest and the LAN.
+    /// Every agent door is the guest's own loopback, carried out over that
+    /// instance's socket. What the seed tells the guest has to be that
+    /// address and nothing else, and each backend has its own reason: VZ's
+    /// bridge address is reachable by every other guest on the same NAT,
+    /// CHV's per-instance TAP host address is a real interface on this
+    /// device one route table away from every other guest and the LAN, and
+    /// Hyper-V's HCN NAT gateway is shared by every guest on it.
     #[test]
     fn an_agent_door_points_the_guest_at_its_own_loopback() {
         for (backend, machine) in [
             (crate::backend::vz::ID, "vz-linux"),
             (crate::backend::chv::ID, "chv-linux"),
+            (crate::backend::hyperv::ID, "hcs-v2.1-generation-2"),
         ] {
             let mut instance = recorded_on(backend, machine);
             instance.image_kind = asterism_core::hv::ImageKind::OciRootfs;
@@ -1768,6 +1828,7 @@ mod tests {
         for (backend, machine) in [
             (crate::backend::vz::ID, "vz-linux"),
             (crate::backend::chv::ID, "chv-linux"),
+            (crate::backend::hyperv::ID, "hcs-v2.1-generation-2"),
         ] {
             let instance = recorded_on(backend, machine);
             assert_eq!(instance.image_kind, asterism_core::hv::ImageKind::Disk);

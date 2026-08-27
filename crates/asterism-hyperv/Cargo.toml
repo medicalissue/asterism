@@ -16,6 +16,13 @@ name = "astd-hyperv"
 path = "src/main.rs"
 
 [dependencies]
+# For the secret-egress door only: the handshake transcript and the splice
+# are shared with every other backend's door, so the one place they are
+# written is `asterism_core::egress_door`, and the Windows named-pipe client
+# `astd` puts the host end on is the same one `ast` already speaks. Nothing
+# native leaks the other way — this crate remains what links HCS, HCN,
+# VirtDisk and WinSock, and `asterism-core` links none of them (ADR 0002).
+asterism-core.workspace = true
 anyhow.workspace = true
 getrandom = "0.4"
 serde.workspace = true

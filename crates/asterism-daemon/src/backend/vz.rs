@@ -522,6 +522,7 @@ impl Hypervisor for Vz {
                     // VZ's door is this guest's own virtio socket, so its
                     // init has to bring the vsock transport up.
                     egress_over_vsock: true,
+                    vsock_transport: oci::VsockTransport::Virtio,
                     shares: &req.shares,
                     share_kind: (!req.shares.is_empty()).then_some(ShareKind::Virtiofs),
                     egress: &req.egress,
