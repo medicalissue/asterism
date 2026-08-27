@@ -341,7 +341,11 @@ pub fn run() -> Vec<Check> {
 
     if let Some(prefix) = prefix_dir() {
         let receipt = receipt_path(&prefix);
-        checks.push(receipt_row(&receipt, receipt.is_file()));
+        checks.push(receipt_row(
+            &receipt,
+            receipt.is_file(),
+            crate::package::owner_of_current_exe().as_ref(),
+        ));
     }
 
     checks
@@ -375,8 +379,24 @@ fn service_row(mechanism: &str, state: Result<&crate::service::State, String>) -
     }
 }
 
-/// The install receipt: present when `install.sh` put this tree here.
-fn receipt_row(receipt: &Path, present: bool) -> Check {
+/// Where this tree came from: the installer's receipt, or the package
+/// manager's own record of it.
+///
+/// A native `.deb` or `.rpm` writes no receipt and never will — dpkg and rpm
+/// already record every path they placed, with its digest, which is a
+/// stronger claim than a file the installer wrote about itself. Reporting a
+/// packaged install as "not installed by install.sh" told a user with a
+/// perfectly good installation to reinstall it (AST-140), so the packaging
+/// database is asked first and its answer is the `ok` one.
+fn receipt_row(receipt: &Path, present: bool, owner: Option<&crate::package::Owner>) -> Check {
+    if let Some(owner) = owner {
+        return Check {
+            name: "receipt",
+            status: Status::Ok,
+            detail: owner.describe(),
+            fix: None,
+        };
+    }
     if present {
         return Check {
             name: "receipt",
@@ -389,7 +409,7 @@ fn receipt_row(receipt: &Path, present: bool) -> Check {
         name: "receipt",
         status: Status::Warn,
         detail: format!(
-            "{} is missing — this tree was not installed by install.sh",
+            "{} is missing — this tree was not installed by install.sh or a native package",
             receipt.display()
         ),
         fix: Some(Fix::noted(
@@ -1329,6 +1349,15 @@ mod tests {
         Path::new("/nonexistent/asterism/doctor-fixture")
     }
 
+    /// The answer dpkg gives on a host that installed the `.deb`.
+    fn packaged() -> crate::package::Owner {
+        crate::package::Owner {
+            format: crate::package::Format::Dpkg,
+            package: "asterism".into(),
+            version: "0.0.2-1".into(),
+        }
+    }
+
     /// Every not-ok row this module can produce, driven through the pure
     /// half of each probe with the machine's answer injected.
     ///
@@ -1344,7 +1373,7 @@ mod tests {
             service_row("launchd", Ok(&service_state(false, false))),
             service_row("systemd (user)", Ok(&service_state(true, false))),
             curl_row(None),
-            receipt_row(absent(), false),
+            receipt_row(absent(), false, None),
             // Linux rows. Compiled everywhere in test builds precisely so
             // that a macOS laptop still holds the Linux rows to this.
             probe_kvm(absent()),
@@ -1504,12 +1533,38 @@ mod tests {
             receipt_row(
                 Path::new("/opt/asterism/share/asterism/install-receipt.env"),
                 true,
+                None,
             ),
+            receipt_row(absent(), false, Some(&packaged())),
             service_row("launchd", Ok(&service_state(true, true))),
         ] {
             assert_eq!(ok.status, Status::Ok, "{}", ok.detail);
             assert!(ok.fix.is_none(), "{} offers a needless command", ok.name);
         }
+    }
+
+    /// AST-140: a packaged install has no receipt file and needs none. The
+    /// row says who owns the tree instead of telling a healthy installation
+    /// to reinstall itself.
+    #[test]
+    fn a_package_managed_tree_reports_its_package_instead_of_a_missing_receipt() {
+        let row = receipt_row(absent(), false, Some(&packaged()));
+        assert_eq!(row.status, Status::Ok);
+        assert_eq!(row.detail, "installed by package asterism 0.0.2-1 (dpkg)");
+        assert!(
+            row.fix.is_none(),
+            "a packaged install has nothing to repair"
+        );
+
+        // Without an owner the same absent receipt is still a warning, and
+        // it now says which two things could have written one.
+        let unowned = receipt_row(absent(), false, None);
+        assert_eq!(unowned.status, Status::Warn);
+        assert!(
+            unowned.detail.contains("native package"),
+            "{}",
+            unowned.detail
+        );
     }
 
     #[test]

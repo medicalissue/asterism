@@ -1093,7 +1093,7 @@ enum ServiceCommand {
 }
 
 /// `ast update ...` — both CLI and desktop app reach this exact surface.
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 enum UpdateCommand {
     /// Show this device's channel, installed version/build, and package owner.
     Status,
@@ -6930,6 +6930,34 @@ fn parse_disk_gib(s: &str) -> Result<u32> {
 
 // ---- signed updates -------------------------------------------------------
 
+/// Whether this subcommand would replace the files on disk.
+///
+/// `status`, `check` and `channel` read and record; only `apply` writes, and
+/// only writing is what a package manager's ownership forbids. A packaged
+/// install may still ask what the signed channel is offering — being told
+/// that an upgrade exists is exactly how a user learns to run `apt-get`.
+fn rewrites_this_installation(cmd: &UpdateCommand) -> bool {
+    match cmd {
+        UpdateCommand::Apply { .. } => true,
+        UpdateCommand::Status | UpdateCommand::Check | UpdateCommand::Channel { .. } => false,
+    }
+}
+
+/// The refusal to self-update over a `.deb` or `.rpm`, when there is one.
+///
+/// `packaging/update.sh` refuses this too, and must keep doing so: it is the
+/// executable a desktop app or a cron job may call directly. Answering here
+/// as well means the refusal reaches the user through the CLI's own error
+/// printer, so the distribution command arrives on the `fix:` line beside
+/// every other remedy Asterism prints, rather than buried in a shell script's
+/// last line of output.
+fn package_managed_refusal(cmd: &UpdateCommand, ast: &Path) -> Option<asterism_core::fix::Fixable> {
+    rewrites_this_installation(cmd)
+        .then(|| asterism_core::package::owner_of(ast))
+        .flatten()
+        .map(|owner| owner.refusal())
+}
+
 /// Hand update policy to the updater shipped by this exact build.
 ///
 /// It is a separate executable because it must remain alive while `ast`
@@ -6937,6 +6965,9 @@ fn parse_disk_gib(s: &str) -> Result<u32> {
 /// the same implementation rather than acquiring a second update backend.
 fn update_command(cmd: UpdateCommand) -> Result<()> {
     let ast = std::env::current_exe().context("finding the installed ast binary")?;
+    if let Some(refusal) = package_managed_refusal(&cmd, &ast) {
+        return Err(anyhow::Error::new(refusal));
+    }
     let updater = std::env::var_os("ASTERISM_UPDATER")
         .map(std::path::PathBuf::from)
         .or_else(|| {
@@ -8014,6 +8045,56 @@ DAwMDAwMDAsImV4cCI6MTcwMDA0MzIwMCwic2NvcGUiOiJvcGVuaWQifQ.c2lnbmF0dXJl";
         // A name is required: `ast ssh` with nothing after it is a question
         // with no subject, not a shell somewhere.
         assert!(Cli::try_parse_from(["ast", "ssh"]).is_err());
+    }
+
+    /// AST-149: only `apply` writes, so only `apply` is refused over a
+    /// package-managed tree. A packaged install still gets to ask what the
+    /// signed channel is offering.
+    #[test]
+    fn only_apply_is_refused_over_a_package_managed_tree() {
+        assert!(rewrites_this_installation(&UpdateCommand::Apply {
+            yes: true
+        }));
+        assert!(rewrites_this_installation(&UpdateCommand::Apply {
+            yes: false
+        }));
+        for readonly in [
+            UpdateCommand::Status,
+            UpdateCommand::Check,
+            UpdateCommand::Channel { name: None },
+            UpdateCommand::Channel {
+                name: Some("stable".into()),
+            },
+        ] {
+            assert!(
+                !rewrites_this_installation(&readonly),
+                "{readonly:?} does not rewrite anything"
+            );
+        }
+
+        // This test binary belongs to no package, so even `apply` has
+        // nothing to refuse — which is what a source checkout and an
+        // install.sh tree both look like.
+        let me = std::env::current_exe().expect("a test binary has a path");
+        assert!(package_managed_refusal(&UpdateCommand::Apply { yes: true }, &me).is_none());
+    }
+
+    /// The refusal has to survive being turned into the error the CLI
+    /// prints, or the distribution command never reaches the `fix:` line.
+    #[test]
+    fn a_refused_update_prints_the_distribution_command_as_its_fix() {
+        let owner = asterism_core::package::Owner {
+            format: asterism_core::package::Format::Rpm,
+            package: "asterism".into(),
+            version: "0.0.2-1".into(),
+        };
+        let error = anyhow::Error::new(owner.refusal()).context("ast update apply");
+        let printed = error_lines(&error).join("\n");
+        assert!(printed.contains("belongs to rpm"), "{printed}");
+        assert!(
+            printed.contains("fix: sudo dnf upgrade asterism"),
+            "{printed}"
+        );
     }
 
     #[test]
