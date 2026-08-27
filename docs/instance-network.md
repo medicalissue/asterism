@@ -8,8 +8,8 @@ implementation details behind it.
 
 `ast create NAME -p HOST:GUEST` publishes TCP by default. The explicit forms
 are `HOST:GUEST/tcp` and `HOST:GUEST/udp`; one number uses the same port on both
-sides. Every host endpoint binds only on `127.0.0.1` of the device supplying
-compute. It is not LAN or Internet ingress.
+sides. Every host endpoint binds only on `127.0.0.1` of the device the
+instance runs on. It is not LAN or Internet ingress.
 
 The declaration is durable, and the same declaration means the same endpoint on
 every backend that can serve it. `down`/`up`, a VMM restart and a daemon
@@ -20,8 +20,8 @@ port (1023) on an OCI Instance — that is where `ast exec`, `ast logs` and boot
 readiness go, and no service of the user's is behind it.
 
 There is no flag that widens the bind address. Every host endpoint is
-`127.0.0.1` on the device supplying compute; `0.0.0.0` is not reachable through
-any declaration Asterism accepts today.
+`127.0.0.1` on the device the instance runs on; `0.0.0.0` is not reachable
+through any declaration Asterism accepts today.
 
 ### Two mechanisms behind one declaration
 
@@ -85,11 +85,12 @@ to a process that happens to be alive:
 
 ## Orbit-scoped secret egress
 
-A bound guest receives an opaque per-Instance handle, a per-Instance CA, and a
-proxy endpoint. The plaintext credential stays in its source device's platform
+This is what lets you hand an always-on agent the keys you actually use. A
+bound guest receives an opaque per-Instance handle, a per-Instance CA, and a
+proxy endpoint; the plaintext credential stays in its source device's platform
 secret store. Bound HTTPS requests cross the authenticated orbit seam with the
-credential position empty; the source device inserts the value only into the
-upstream request.
+credential position empty, and the source device inserts the real value into
+the upstream request on its way out.
 
 The proxy is reachable from one guest and from nothing on the wire, and the
 three backends that offer that reach it two different ways. On QEMU it is a

@@ -1,8 +1,8 @@
 //! What an instance is made of.
 //!
 //! The orbit is a pool of parts; an instance is a computer assembled from
-//! them. Compute is one placement unit: CPU, physical RAM, and VM execution
-//! state come from one orbit device. A volume comes from whichever
+//! them. Compute is the one orbit device an instance runs on: CPU, physical
+//! RAM, and VM execution state are that device's. A volume comes from whichever
 //! device holds the bytes, while defaults may follow compute because that is
 //! the cheapest place to put them, not because that device has any claim on
 //! the instance.
@@ -747,7 +747,7 @@ impl Instance {
         self.seed_device.as_deref().unwrap_or(self.compute_device())
     }
 
-    /// The orbit device supplying this instance's compute placement.
+    /// The orbit device this instance runs on, and takes its compute from.
     pub fn compute_device(&self) -> &str {
         &self.cpu_device
     }
@@ -934,10 +934,10 @@ pub struct Part {
     pub note: Option<String>,
 }
 
-/// Names that select an instance's whole compute placement on the CLI.
+/// Names that select an instance's whole compute part on the CLI.
 ///
-/// CPU and physical RAM are supplied together. `cpu` remains an alias for
-/// compatibility, but neither resource can be placed independently.
+/// CPU and physical RAM are the device's, together. `cpu` remains an alias for
+/// compatibility, but neither resource is sourced independently.
 pub fn is_compute_part(part: &str) -> bool {
     matches!(part, "compute" | "cpu")
 }
@@ -1020,7 +1020,7 @@ mod tests {
         assert_eq!(v.guest_path(), "/srv/media");
     }
 
-    /// Legacy placement keys must load, or an upgrade loses every instance on
+    /// Legacy registry keys must load, or an upgrade loses every instance on
     /// the device. They remain serialization details and are never rendered.
     #[test]
     fn legacy_registry_keys_migrate_without_becoming_product_labels() {
@@ -1050,7 +1050,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_is_canonical_and_ram_is_not_a_placement_part() {
+    fn compute_is_canonical_and_ram_is_not_a_separate_part() {
         assert!(is_compute_part("compute"));
         assert!(is_compute_part("cpu"));
         assert!(!is_compute_part("ram"));

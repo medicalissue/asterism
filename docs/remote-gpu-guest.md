@@ -1,5 +1,13 @@
 # Guest NVIDIA projection and mesh data path
 
+> **Status: experimental appendix.** Projecting another device's GPU into an
+> instance is not a shipped product promise and is not part of Asterism's core
+> story. The reason is physics, not effort: one CUDA kernel launch becomes one
+> round trip over the mesh, against sub-microsecond PCIe on a local bus. No
+> amount of protocol work removes that. The GPU an instance can depend on is
+> the one in the device it runs on; everything below documents the experiment.
+
+
 Unmodified CUDA applications inside an attached Linux instance resolve an
 Asterism-injected driver shim and a local device node. `/dev/nvidia0` is a
 projected local endpoint, not a string in instance status.

@@ -1,5 +1,13 @@
 # Two-device NVIDIA hardware gate
 
+> **Status: experimental appendix.** Projecting another device's GPU into an
+> instance is not a shipped product promise and is not part of Asterism's core
+> story. The reason is physics, not effort: one CUDA kernel launch becomes one
+> round trip over the mesh, against sub-microsecond PCIe on a local bus. No
+> amount of protocol work removes that. The GPU an instance can depend on is
+> the one in the device it runs on; everything below documents the experiment.
+
+
 The production GPU part presents `/dev/nvidia0` inside an attached instance.
 Transport, authentication, leases, revocation, device loss and ABI version
 skew stay behind that part seam. This document is the paid NVIDIA evidence

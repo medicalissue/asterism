@@ -3,8 +3,8 @@
 //! `docs/MODEL.md`.
 //!
 //! An instance is a computer assembled from a pool of parts, and compute is
-//! one placement unit: CPU, physical RAM, and VM/container execution state.
-//! Which device supplies that unit is a mutable attribute of the instance,
+//! the one device it runs on: CPU, physical RAM, and VM/container execution
+//! state. Which device that is remains a mutable attribute of the instance,
 //! not a relationship the device has to it, so `ast set dev compute desktop`
 //! changes one line of a parts table. The
 //! instance's identity — its name, its id, its snapshots — is orbit-global

@@ -5,7 +5,7 @@
 //! the daemon reports bounded phase progress after the store is durable.
 //!
 //! It talks to *that* daemon and no other, ever. `ast up dev` does not know or
-//! care which device in the orbit is supplying `dev`'s compute: the
+//! care which device in the orbit `dev` runs on: the
 //! instance namespace is flat and orbit-wide, so the name is enough, and the
 //! daemon in front of you resolves it and forwards the request if the row
 //! lives elsewhere. The CLI holds no device key, opens no mesh connection, and
@@ -52,7 +52,7 @@ use asterism_core::{
 #[command(
     name = "ast",
     version,
-    about = "Asterism — assemble one computer from your scattered machines."
+    about = "Asterism — everything your agent needs. Made local. Always on."
 )]
 struct Cli {
     /// Ask one specific device's daemon, instead of the orbit (debugging).
@@ -177,7 +177,7 @@ enum Command {
     /// device that did not answer is still listed, with its status
     /// `unknown` — the instance is real, its state is merely stale.
     Ls {
-        /// Only the instances this device supplies compute for (debugging).
+        /// Only the instances that run on this device (debugging).
         #[arg(long)]
         local: bool,
     },
@@ -335,7 +335,7 @@ enum Command {
     /// A DIRECTORY (`--volume /tank/media`) is shared with the guest and
     /// mounted at a path. Three things have to be true, and each of them is
     /// refused in words rather than discovered later: the directory is on
-    /// the same device as the instance's compute (directory sharing has
+    /// the device the instance runs on (directory sharing has
     /// no network transport), the backend offers a share transport (9p on
     /// qemu or virtiofs on vz), and the guest kernel supports that transport.
     /// Cloud images receive a mount unit in their seed; OCI images receive
@@ -361,14 +361,14 @@ enum Command {
         /// The instance to attach it to.
         name: String,
         /// A directory path, or an orbit block-volume name. `<device>:<name>`
-        /// constrains placement to one provider.
+        /// pins the volume to one provider device.
         #[arg(long, conflicts_with = "secret")]
         volume: Option<String>,
         /// Device that provides the volume (default: this device).
         #[arg(long, requires = "volume")]
         host: Option<String>,
-        /// Refuse a block placement whose measured round trip is slower than
-        /// this. A provider without a live measurement is also refused.
+        /// Refuse a block-volume provider whose measured round trip is slower
+        /// than this. A provider without a live measurement is also refused.
         #[arg(long, value_name = "MS", requires = "volume")]
         max_latency_ms: Option<u64>,
         /// Where a directory volume mounts in the guest (default:
@@ -398,8 +398,11 @@ enum Command {
         /// than one source. Not `--host`, for the same reason as `--to`.
         #[arg(long, value_name = "DEVICE", requires = "secret")]
         from: Option<String>,
-        /// Hardware GPU provider device, optionally followed by its UUID:
-        /// `desktop` or `desktop:GPU-...`.
+        /// EXPERIMENTAL. Another device's NVIDIA GPU, optionally followed by
+        /// its UUID: `desktop` or `desktop:GPU-...`. One kernel launch costs
+        /// one mesh round trip, so this is an appendix, not a shipped part:
+        /// the GPU an instance can depend on is the one in the device it runs
+        /// on.
         #[arg(long, value_name = "DEVICE[:GPU-UUID]", conflicts_with_all = ["volume", "secret"])]
         gpu: Option<String>,
         /// GPU memory reservation (default 1G).
@@ -437,8 +440,8 @@ enum Command {
     },
     /// Change one of an instance's parts.
     ///
-    /// Canonical today: `compute`, the orbit device supplying CPU, physical
-    /// RAM, and execution state as one placement unit. `cpu`
+    /// Canonical today: `compute`, the orbit device an instance runs on and
+    /// therefore takes its CPU, physical RAM, and execution state from. `cpu`
     /// remains a compatibility alias. The instance's name, id, and snapshots
     /// do not move, because they were never on a device.
     Set {
@@ -460,7 +463,8 @@ enum Command {
     },
     /// Move an instance's compute to another device.
     ///
-    /// Alias of `ast set <instance> compute <device>`.
+    /// Alias of `ast set <instance> compute <device>`. Offline, and parked
+    /// rather than central: compute is the device an instance runs on.
     Move {
         /// The instance to move.
         name: String,
@@ -2725,11 +2729,11 @@ fn device_shell_policy(action: Option<DeviceShellCommand>) -> Result<()> {
 /// crossing a network and takes as long as it takes. All this end does is
 /// print. The wire command remains `set_cpu` so older daemons still parse it.
 fn set_part(name: &str, part: &str, device: &str, down: bool) -> Result<()> {
-    // Compute is one placement unit; CPU and physical RAM cannot be placed
-    // independently.
+    // Compute is the device an instance runs on; CPU and physical RAM are not
+    // separately sourced.
     if !asterism_core::instance::is_compute_part(part) {
         bail!(
-            "there is no {part:?} placement part. `ast set <instance> compute <device>` \
+            "there is no {part:?} part. `ast set <instance> compute <device>` \
              moves whole compute (CPU, physical RAM, and execution state); `cpu` and \
              `ast move` remain aliases. Volumes are changed with \
              `ast attach` and `ast detach`"
@@ -4877,8 +4881,8 @@ fn print_detail(inst: &Instance, guest_health: Option<&GuestHealth>) {
             inst.name, conflict.other_cpu_device, inst.name
         );
     }
-    // Only worth a line once it has happened: an instance that has never had
-    // its compute placement moved is the ordinary case and does not need
+    // Only worth a line once it has happened: an instance that has never
+    // changed the device it runs on is the ordinary case and does not need
     // telling.
     if inst.move_epoch > 0 {
         println!(
@@ -5425,7 +5429,7 @@ mod tests {
     }
 
     #[test]
-    fn set_help_uses_compute_as_the_placement_name() {
+    fn set_help_uses_compute_as_the_part_name() {
         use clap::CommandFactory;
 
         let help = Cli::command()
@@ -5441,7 +5445,7 @@ mod tests {
     }
 
     #[test]
-    fn ram_names_are_refused_as_separate_compute_placements() {
+    fn ram_names_are_refused_as_separate_compute_parts() {
         for part in ["ram", "cpu/ram"] {
             let error = set_part("agent", part, "desktop", false).unwrap_err();
             let message = format!("{error:#}");

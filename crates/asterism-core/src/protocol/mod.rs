@@ -698,7 +698,7 @@ pub enum Request {
         value: SecretValue,
     },
 
-    // ---- moving compute placement -------------------------------------------
+    // ---- moving an instance to another device -------------------------------
     //
     // `ast set <instance> compute <device>` — an offline migration, and in the
     // model's own words a change to one line of an instance's parts table.

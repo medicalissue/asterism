@@ -1,5 +1,13 @@
 # Remote GPU production control plane
 
+> **Status: experimental appendix.** Projecting another device's GPU into an
+> instance is not a shipped product promise and is not part of Asterism's core
+> story. The reason is physics, not effort: one CUDA kernel launch becomes one
+> round trip over the mesh, against sub-microsecond PCIe on a local bus. No
+> amount of protocol work removes that. The GPU an instance can depend on is
+> the one in the device it runs on; everything below documents the experiment.
+
+
 The remote GPU ABI now has a production control-plane seam in
 `asterism_core::remote_gpu`. It makes a GPU an orbit part while preserving the
 guest contract: software inside an attached Linux instance sees
