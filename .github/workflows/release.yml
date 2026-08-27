@@ -439,15 +439,42 @@ jobs:
           New-Item -ItemType Directory -Force -Path $unpack | Out-Null
           tar -xzf "$dist/$archive" -C $unpack
 
+          # Every invocation goes through Start-Process with a deadline, not
+          # through `&`. Two reasons, both learned here: PowerShell's call
+          # operator waits for the inherited stdout pipe to close, so any
+          # child process outliving the command hangs the job instead of the
+          # command; and a hang with no deadline burns the runner's whole
+          # budget and reports nothing. This fails in two minutes with the
+          # name of what stalled.
+          function Invoke-Bounded([string]$Exe, [string[]]$Argv, [int]$Seconds = 120) {
+            $out = [IO.Path]::GetTempFileName()
+            $err = [IO.Path]::GetTempFileName()
+            $proc = Start-Process -FilePath $Exe -ArgumentList $Argv -NoNewWindow -PassThru `
+              -RedirectStandardOutput $out -RedirectStandardError $err
+            if (-not $proc.WaitForExit($Seconds * 1000)) {
+              $proc.Kill()
+              throw "$Exe $($Argv -join ' ') did not exit within ${Seconds}s"
+            }
+            $text = (Get-Content -Raw $out)
+            if ($proc.ExitCode -ne 0) {
+              Write-Host (Get-Content -Raw $err)
+              throw "$Exe $($Argv -join ' ') exited with $($proc.ExitCode)"
+            }
+            Remove-Item -Force $out, $err
+            if ($null -eq $text) { return '' }
+            return $text.Trim()
+          }
+
           # The version the binary reports is the version that was tagged, or
           # the artifact and the tag have come apart.
-          $reported = & (Join-Path $unpack 'ast.exe') --version
+          $ast = Join-Path $unpack 'ast.exe'
+          $reported = Invoke-Bounded $ast @('--version')
           Write-Host "ast --version: $reported"
           if ($reported -ne "ast $($version.TrimStart('v'))") { throw "expected 'ast $($version.TrimStart('v'))'" }
 
           # The catalog is compiled in: no daemon, no network, no state, and
           # the cheapest proof the binary actually runs on this host.
-          $images = & (Join-Path $unpack 'ast.exe') images
+          $images = Invoke-Bounded $ast @('images')
           if (-not ($images -match 'debian:13')) { throw 'ast images did not list debian:13' }
 
           # astd-hyperv is the only product virtualization path on Windows,
