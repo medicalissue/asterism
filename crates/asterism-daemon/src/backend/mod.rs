@@ -1570,14 +1570,18 @@ mod tests {
             );
         }
 
-        for id in [hyperv::ID] {
-            let caps = by_id(id).unwrap().caps();
-            assert!(!caps.port_forward, "{id} falsely advertises publication");
-            assert!(
-                caps.guest_egress.is_none(),
-                "{id} falsely advertises a guest-only egress door"
-            );
-        }
+        // Native Hyper-V attaches Hyper-V sockets and could carry the same
+        // protocol; until it does, it declares neither door nor publication
+        // and refuses a bound secret before the registry changes.
+        let hyperv_caps = by_id(hyperv::ID).unwrap().caps();
+        assert!(
+            !hyperv_caps.port_forward,
+            "hyperv falsely advertises publication"
+        );
+        assert!(
+            hyperv_caps.guest_egress.is_none(),
+            "hyperv falsely advertises a guest-only egress door"
+        );
     }
 
     /// The door a backend declares has to be one a guest could actually

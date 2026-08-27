@@ -287,8 +287,8 @@ pub(crate) fn check_can_bind(inst: &Instance) -> Result<()> {
              door of its own into this device, so there is no listener only {:?} could \
              reach — a bound secret needs a guest-only door, and binding a wildcard \
              address instead would publish a proxy for this secret on your LAN. Run this \
-             instance on a backend that declares one (qemu's user-mode gateway, or vz's \
-             per-instance virtio-socket door)",
+             instance on a backend that declares one (qemu's user-mode gateway, or the \
+             per-instance virtio-socket door vz and chv open inside the guest)",
             hv.id(),
             inst.name
         );
