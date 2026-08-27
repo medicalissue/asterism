@@ -319,6 +319,13 @@ jobs:
             bash -n "$f"
           done
           shellcheck -x scripts/*.sh scripts/lib/*.sh
+          # The agent images' own shell. It runs as pid 1's child inside a
+          # guest with no operator watching, so a quoting bug in it is an
+          # instance that boots and is silently not an agent workspace.
+          for f in images/*.sh; do
+            sh -n "$f"
+          done
+          shellcheck -x -s sh images/*.sh
 
       - name: The harness's own suite
         run: bash scripts/harness-test.sh

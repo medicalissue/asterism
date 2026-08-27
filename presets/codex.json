@@ -1,0 +1,27 @@
+{
+  "name": "codex",
+  "summary": "OpenAI's Codex CLI, in a tmux session that outlives your terminal.",
+  "image": "ghcr.io/medicalissue/agent-codex:0.1.0",
+  "digest": null,
+  "start": "codex",
+  "workdir": "/work",
+  "version_probe": "codex --version",
+  "docs": "https://developers.openai.com/codex/cli",
+  "experimental": false,
+  "secrets": [
+    {
+      "name": "OPENAI_API_KEY",
+      "authority": "api.openai.com",
+      "placement": "bearer",
+      "env": "OPENAI_API_KEY",
+      "required": true
+    },
+    {
+      "name": "GITHUB_TOKEN",
+      "authority": "github.com",
+      "placement": "bearer",
+      "env": "GITHUB_TOKEN",
+      "required": false
+    }
+  ]
+}

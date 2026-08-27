@@ -47,6 +47,7 @@ pub mod oci;
 pub mod orbit;
 pub mod paths;
 pub mod power;
+pub mod preset;
 pub mod pricing;
 pub mod proc;
 pub mod profile;
