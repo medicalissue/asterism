@@ -86,6 +86,15 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
                 instances: reg.list(),
             }
         }
+        // A read of files this device already wrote, and never a mutation.
+        // It does not consult the registry on purpose: an instance that was
+        // removed last week still has last week's spend on disk, and hiding
+        // that would make the ledger disagree with the bill.
+        Request::Cost {
+            name,
+            since,
+            window,
+        } => return crate::cost::serve(name.as_deref(), since, &window),
         Request::Status { name } => {
             return match reg.get(&name) {
                 Ok(instance) => {

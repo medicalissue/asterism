@@ -58,6 +58,7 @@ use transport::{Admitted, Framing};
 
 mod backend;
 mod container;
+mod cost;
 mod device_shell;
 mod egress;
 mod gpu;

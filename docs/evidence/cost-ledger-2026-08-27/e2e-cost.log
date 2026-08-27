@@ -1,0 +1,29 @@
+$CARGO_TARGET_DIR/debug/astd-vz: replacing existing signature
+signed $CARGO_TARGET_DIR/debug/astd-vz as - (com.apple.security.virtualization)
+== cost ledger e2e in $ASTERISM_HOME
+ok: an instance that has made no calls reports none
+ok: create the agent VM
+ok: the sentinel entered the login Keychain through stdin
+ok: bind the secret to the upstream the guest will call
+ok: boot the bound guest
+waiting up to 300s for the base profile ...
+ok: the guest is ready and reachable over authenticated guest control
+ok: the guest holds an opaque handle, not the Keychain value
+ok: an Anthropic Messages answer crosses the door
+ok: an Anthropic streaming answer crosses the door
+ok: an OpenAI Chat Completions answer crosses the door
+ok: an answer this device cannot read crosses the door
+ok: the ledger rotated into 2026-08-27.jsonl
+ok: one line per call, and only per call
+ok: no body byte, no handle and no Keychain value is in the ledger
+ok: the raw sentinel is absent from every file this lane wrote
+ok: ast cost --json reports the providers' own counters
+ok: ast cost prints today, this week, the busiest model and an honest caveat
+ok: ast cost --all lists every instance this device pays for
+ok: ast ls carries today's spend beside the instance
+ok: stop for a consistent export
+ok: export the instance
+ok: the ledger travels with a backup and the egress directory does not
+COST E2E GREEN (4 calls, httpbin.org, vz, vsock egress door)
+kept $ASTERISM_HOME for inspection
+kept: /var/folders/lr/v65fp3p92qlg5lhl05m_952m0000gn/T//asterism-harness-artifacts-78553/cost

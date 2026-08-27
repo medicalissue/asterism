@@ -1,0 +1,3 @@
+bot   $0.06
+
+bot: 1 call used a model this device has no rate for, so the figure above is a floor. Add a row to $ASTERISM_HOME/pricing.json — see docs/cost.md.

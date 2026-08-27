@@ -181,6 +181,38 @@ enum Command {
         #[arg(long)]
         local: bool,
     },
+    /// What an instance has spent on model APIs.
+    ///
+    /// Every call an agent makes through a bound secret already passes
+    /// through this device's egress door, and the answer carries the
+    /// provider's own token counters. This reads them back. It is
+    /// information and nothing else: no quota, no cap, and nothing here has
+    /// ever refused a call.
+    ///
+    /// With no window flag a named instance gets today in detail and this
+    /// week as a total, which is the pair of numbers somebody actually wants
+    /// when they ask what an agent is costing them.
+    Cost {
+        /// The instance to price. Omit it with --all for every instance on
+        /// the device in front of you.
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        name: Option<String>,
+        /// Every instance this device has recorded spend for.
+        #[arg(long)]
+        all: bool,
+        /// Since local midnight.
+        #[arg(long, conflicts_with_all = ["week", "since"])]
+        today: bool,
+        /// Since local midnight seven days ago.
+        #[arg(long, conflicts_with_all = ["today", "since"])]
+        week: bool,
+        /// A window ending now, written as 90s, 30m, 6h or 7d.
+        #[arg(long, value_name = "DURATION", conflicts_with_all = ["today", "week"])]
+        since: Option<String>,
+        /// The report as JSON, one object per instance.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show one instance and the parts it is assembled from.
     Status {
         /// The instance to look at.
@@ -921,6 +953,14 @@ fn main() -> Result<()> {
         // it, and `--device X ls` is X's shard. Only the first is the model.
         Command::Ls { local } if local || device.is_some() => Request::List,
         Command::Ls { .. } => Request::ListOrbit,
+        Command::Cost {
+            name,
+            all,
+            today,
+            week,
+            since,
+            json,
+        } => return print_cost(name, all, today, week, since.as_deref(), json),
         Command::Status { name } => Request::Status { name },
         // One flag, two parts. `--volume desktop:tank` names a block volume
         // on a device; anything that looks like a path is a directory share.
@@ -1286,6 +1326,14 @@ fn main() -> Result<()> {
             Request::VolumeRemove { name } => println!("{name}  removed"),
             _ => print_volumes(&volumes),
         },
+        // `ast cost` never arrives here — it prints its own report and
+        // returns — so this arm exists only so a stray cost reply is named
+        // rather than falling through as an unexpected frame.
+        Response::Cost { reports } => {
+            for report in &reports {
+                print_cost_line(report, &report.window, true);
+            }
+        }
         Response::VolumeCatalog { catalog } => print_volume_catalog(&catalog),
         Response::Orbit { rows } => print_table(&rows),
         // One device's shard, asked for by `--local` or `--device`. Rows from
@@ -4746,6 +4794,273 @@ fn uname_line() -> String {
         .unwrap_or_else(|| std::env::consts::OS.to_owned())
 }
 
+// ---- cost ------------------------------------------------------------------
+//
+// `ast cost` is the readout of the token ledger the egress door writes. It is
+// deliberately a *report* and not a control: there is no flag here that caps,
+// throttles, or refuses anything, and there never will be. The point of the
+// number is to make handing an agent a real key feel safe, and every limit
+// that could be added would make the agent less useful in exchange for a
+// reassurance the number already gives.
+
+/// `ast cost [NAME] [--all] [--today|--week|--since D] [--json]`.
+fn print_cost(
+    name: Option<String>,
+    all: bool,
+    today: bool,
+    week: bool,
+    since: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let now = now_unix();
+    let window = Window::choose(now, today, week, since)?;
+    // The default view answers two questions at once, because "what did it
+    // spend today" is almost never asked without "and is that normal".
+    let also_week = window.is_default && !json && !all;
+
+    let reports = ask_cost(name.clone(), &window)?;
+    if json {
+        for report in &reports {
+            println!("{}", serde_json::to_string(report)?);
+        }
+        return Ok(());
+    }
+    if all {
+        return print_cost_all(&reports, &window);
+    }
+    let report = reports
+        .first()
+        .context("the daemon answered with no cost report")?;
+    print_cost_line(report, &window.label, true);
+    if also_week {
+        let week_window = Window::week(now);
+        if let Ok(weekly) = ask_cost(name, &week_window) {
+            if let Some(weekly) = weekly.first() {
+                print_cost_line(weekly, &week_window.label, false);
+            }
+        }
+    }
+    print_cost_caveats(report);
+    Ok(())
+}
+
+/// `--all`: one line per instance, biggest spender first.
+fn print_cost_all(reports: &[asterism_core::ledger::Report], window: &Window) -> Result<()> {
+    let mut rows: Vec<_> = reports.iter().filter(|report| report.calls > 0).collect();
+    if rows.is_empty() {
+        println!(
+            "no model API calls recorded {} on this device",
+            window.label
+        );
+        return Ok(());
+    }
+    rows.sort_by(|left, right| {
+        right
+            .usd
+            .partial_cmp(&left.usd)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| right.calls.cmp(&left.calls))
+    });
+    let width = rows
+        .iter()
+        .map(|report| report.instance.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    for report in &rows {
+        println!(
+            "{:<width$}  {}",
+            report.instance,
+            money(report.usd),
+            width = width
+        );
+    }
+    for report in &rows {
+        print_cost_caveats(report);
+    }
+    Ok(())
+}
+
+/// One window's line: the money, and — for the leading line — what bought it.
+fn print_cost_line(report: &asterism_core::ledger::Report, label: &str, detail: bool) {
+    if !detail {
+        println!("{label:<10} {}", money(report.usd));
+        return;
+    }
+    if report.calls == 0 {
+        println!("{label:<10} {}   no calls", money(report.usd));
+        return;
+    }
+    let mut parts = vec![format!(
+        "{} in · {} out",
+        count(report.input_tokens),
+        count(report.output_tokens)
+    )];
+    let cached = report.cache_read_tokens + report.cache_write_tokens;
+    if cached > 0 {
+        parts.push(format!("cache {}", count(cached)));
+    }
+    // The busiest model, named. A list of eight would be a different command;
+    // what somebody wants on this line is which model this is.
+    let models = match report.models.first() {
+        Some(top) if report.models.len() == 1 => format!("{} ({})", top.model, calls(top.calls)),
+        Some(top) => format!(
+            "{} ({}) +{} more",
+            top.model,
+            calls(top.calls),
+            report.models.len() - 1
+        ),
+        None => calls(report.calls),
+    };
+    println!(
+        "{label:<10} {}   {}   {}",
+        money(report.usd),
+        parts.join(" · "),
+        models
+    );
+}
+
+/// What the figure does *not* cover, said once and only when it is true.
+fn print_cost_caveats(report: &asterism_core::ledger::Report) {
+    if report.unpriced_calls > 0 {
+        println!(
+            "\n{}: {} used a model this device has no rate for, so the figure above is a \
+             floor. Add a row to {} — see docs/cost.md.",
+            report.instance,
+            calls(report.unpriced_calls),
+            asterism_core::pricing::overlay_path().display()
+        );
+    }
+}
+
+/// The window a `cost` request asks about.
+struct Window {
+    since: u64,
+    /// What the answer calls it, and what `--json` reports.
+    label: String,
+    /// Whether the user named a window at all. No flags means "today, and
+    /// tell me the week too".
+    is_default: bool,
+}
+
+impl Window {
+    fn choose(now: u64, today: bool, week: bool, since: Option<&str>) -> Result<Self> {
+        if let Some(spec) = since {
+            let seconds = parse_duration(spec)?;
+            return Ok(Window {
+                since: now.saturating_sub(seconds),
+                label: format!("last {spec}"),
+                is_default: false,
+            });
+        }
+        if week {
+            return Ok(Window::week(now));
+        }
+        Ok(Window {
+            since: asterism_core::ledger::local_midnight(now),
+            label: "today".into(),
+            is_default: !today,
+        })
+    }
+
+    /// Seven local days, today included — so a Monday morning still has last
+    /// Tuesday in it and the number does not collapse at the week boundary.
+    fn week(now: u64) -> Self {
+        Window {
+            since: asterism_core::ledger::local_midnight_days_ago(now, 6),
+            label: "this week".into(),
+            is_default: false,
+        }
+    }
+}
+
+fn ask_cost(name: Option<String>, window: &Window) -> Result<Vec<asterism_core::ledger::Report>> {
+    match send(&Request::Cost {
+        name,
+        since: window.since,
+        window: window.label.clone(),
+    })? {
+        Response::Cost { reports } => Ok(reports),
+        Response::Error { message } => bail!("{message}"),
+        other => bail!("astd answered a cost request with {other:?}"),
+    }
+}
+
+/// `90s`, `30m`, `6h`, `7d` — and a bare number is seconds.
+fn parse_duration(spec: &str) -> Result<u64> {
+    let spec = spec.trim();
+    let (digits, unit) = if let Some(rest) = spec.strip_suffix(['s', 'S']) {
+        (rest, 1)
+    } else if let Some(rest) = spec.strip_suffix(['m', 'M']) {
+        (rest, 60)
+    } else if let Some(rest) = spec.strip_suffix(['h', 'H']) {
+        (rest, 3600)
+    } else if let Some(rest) = spec.strip_suffix(['d', 'D']) {
+        (rest, 86_400)
+    } else {
+        (spec, 1)
+    };
+    let value: u64 = digits
+        .trim()
+        .parse()
+        .with_context(|| format!("--since {spec:?} is not a duration (try 6h, 30m or 7d)"))?;
+    value
+        .checked_mul(unit)
+        .context("--since is longer than this program can count")
+}
+
+/// A dollar figure, or a dash when this device cannot price what it saw.
+///
+/// Two decimal places always: a column of `$4.1` and `$19.8` is harder to
+/// read down than one of `$4.12` and `$19.80`, and cents is the unit people
+/// hold these numbers in.
+fn money(usd: Option<f64>) -> String {
+    match usd {
+        Some(amount) => format!("${amount:.2}"),
+        None => "-".into(),
+    }
+}
+
+/// "1 call", "312 calls". A count in a sentence, not in a column.
+fn calls(count: u64) -> String {
+    match count {
+        1 => "1 call".into(),
+        other => format!("{other} calls"),
+    }
+}
+
+/// A token count at the precision anybody reads it at.
+fn count(tokens: u64) -> String {
+    match tokens {
+        0 => "0".into(),
+        1..=9_999 => tokens.to_string(),
+        10_000..=999_999 => format!("{}k", tokens / 1_000),
+        _ => format!("{:.2}M", tokens as f64 / 1_000_000.0),
+    }
+}
+
+/// Today's spend per instance, for the TODAY column of `ast ls`.
+///
+/// Best effort by construction: an older daemon does not know the frame, and
+/// a device that is out of touch cannot be asked. Either way the column shows
+/// `-`, which is honest — it says "not known here", and the instance's own
+/// device can always answer `ast cost`.
+fn today_by_instance() -> std::collections::BTreeMap<String, Option<f64>> {
+    let since = asterism_core::ledger::local_midnight(now_unix());
+    match send(&Request::Cost {
+        name: None,
+        since,
+        window: "today".into(),
+    }) {
+        Ok(Response::Cost { reports }) => reports
+            .into_iter()
+            .filter(|report| report.calls > 0)
+            .map(|report| (report.instance, report.usd))
+            .collect(),
+        _ => Default::default(),
+    }
+}
+
 // ---- output ----------------------------------------------------------------
 
 /// `ast ls`: one table, one namespace.
@@ -4759,9 +5074,13 @@ fn print_table(rows: &[OrbitRow]) {
         println!("no instances — start with: ast create <name>");
         return;
     }
+    // What each instance has spent since local midnight, asked for once for
+    // the whole table rather than once per row. A device that cannot answer
+    // leaves the column empty; see `today_by_instance`.
+    let today = today_by_instance();
     println!(
-        "{:<14} {:<9} {:<14} {:<16} {:<12} {:<6} ACCESS",
-        "NAME", "STATUS", "IMAGE", "SHAPE", "COMPUTE", "AGE"
+        "{:<14} {:<9} {:<14} {:<16} {:<12} {:<6} {:<8} ACCESS",
+        "NAME", "STATUS", "IMAGE", "SHAPE", "COMPUTE", "AGE", "TODAY"
     );
     let mut stale = false;
     let mut conflicts = Vec::new();
@@ -4797,14 +5116,22 @@ fn print_table(rows: &[OrbitRow]) {
             }
             _ => "-".into(),
         };
+        // `-` for an instance that has spent nothing today and for one whose
+        // ledger is on a device this one cannot reach. Both mean "no figure
+        // here"; `ast cost <name>` is where the difference is visible.
+        let spend = today
+            .get(&inst.name)
+            .map(|usd| money(*usd))
+            .unwrap_or_else(|| "-".into());
         println!(
-            "{:<14} {:<9} {:<14} {:<16} {:<12} {:<6} {}",
+            "{:<14} {:<9} {:<14} {:<16} {:<12} {:<6} {:<8} {}",
             inst.name,
             status,
             short_image(inst.image.as_deref().unwrap_or("-")),
             shape,
             inst.compute_device(),
             age(inst.created_at),
+            spend,
             access,
         );
     }

@@ -1,0 +1,2 @@
+NAME           STATUS    IMAGE          SHAPE            COMPUTE      AGE    TODAY    ACCESS
+bot            running   nginx:alpine   4c/2048M/4G      macbook-pro.tail0de304.ts.net 28s    $0.06    192.168.64.35:22

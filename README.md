@@ -302,6 +302,18 @@ the architecture and compatibility contract.
   $ ast attach agent --secret anthropic --to api.anthropic.com
   ```
 
+  Because those calls pass through the host, Asterism can also tell you what
+  they cost. `ast cost agent` reads the providers' own token counters out of
+  the answers that already came back, and `ast ls` carries today's figure in a
+  column. It is information, not a limit: nothing in that path caps, throttles
+  or refuses a call. [docs/cost.md](docs/cost.md) is the guide.
+
+  ```console
+  $ ast cost agent
+  today      $4.12   1.21M in · 83k out · cache 940k   claude-sonnet-5 (312 calls)
+  this week  $19.80
+  ```
+
 Remote block volumes need no QEMU on either device. The device holding the
 bytes serves them from a native NBD exporter inside `astd`, and the consumer
 side is VZ's own network block device on macOS or the kernel NBD client below
