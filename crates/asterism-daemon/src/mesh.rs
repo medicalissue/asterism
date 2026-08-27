@@ -798,6 +798,13 @@ impl Mesh {
         Ok(mesh)
     }
 
+    /// This device's mesh endpoint, for the hosted coordinator client's
+    /// address publication. Read-only: it hands out where this device says it
+    /// can be reached, and nothing that dials or trusts anyone.
+    pub(crate) fn endpoint(&self) -> &MeshEndpoint {
+        &self.endpoint
+    }
+
     /// This device's id — its public key.
     pub fn device_id(&self) -> DeviceId {
         self.endpoint.device_id()

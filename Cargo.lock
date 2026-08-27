@@ -206,6 +206,7 @@ dependencies = [
  "data-encoding",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "uuid",
@@ -240,12 +241,14 @@ name = "asterism-daemon"
 version = "0.0.2"
 dependencies = [
  "anyhow",
+ "asterism-coordinator",
  "asterism-core",
  "asterism-hyperv",
  "asterism-mesh",
  "asterism-vz",
  "blake3",
  "bytes",
+ "futures-util",
  "http",
  "http-body-util",
  "hyper",
@@ -262,6 +265,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls",
+ "tokio-websockets",
  "uuid",
  "zeroize",
 ]
@@ -4562,6 +4566,7 @@ dependencies = [
  "rand 0.10.2",
  "ring",
  "rustls-pki-types",
+ "rustls-platform-verifier",
  "sha1_smol",
  "simdutf8",
  "tokio",

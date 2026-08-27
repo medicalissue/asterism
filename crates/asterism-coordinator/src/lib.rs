@@ -32,6 +32,7 @@ use asterism_mesh::iroh_types::Signature;
 use asterism_mesh::{DeviceId, MeshInfra};
 use data_encoding::BASE64URL_NOPAD;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 const ENROLLMENT_DOMAIN: &[u8] = b"asterism.coordinator/enroll/1\0";
@@ -41,6 +42,8 @@ const ENROLLMENT_CHALLENGE_TTL_SECS: u64 = 10 * 60;
 const MAX_ENROLLMENT_CHALLENGES_PER_ACCOUNT: usize = 32;
 const MAX_DEVICES_PER_ACCOUNT: usize = 64;
 const MAX_DISCOVERY_BYTES: usize = 4 * 1024;
+const MAX_ENDPOINT_BYTES: usize = 4 * 1024;
+const MAX_ENDPOINT_ADDRS: usize = 24;
 const MAX_ACCOUNTS: usize = 4_096;
 const MAX_DURABLE_STATE_BYTES: usize = 16 * 1024 * 1024;
 const AES_GCM_TAG_BYTES: usize = 16;
@@ -429,14 +432,65 @@ impl DiscoveryConfig {
     }
 }
 
+/// The routing hints a device currently advertises to its own account.
+///
+/// This is what makes an enrolled account its own private directory: the
+/// account's other devices resolve these hints instead of a public one.  They
+/// are replaced wholesale on every publish, so a coordinator holds a current
+/// address and never an address history, and only the owning account can read
+/// them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointHints {
+    /// Literal `host:port` socket addresses this device answers on.
+    #[serde(default)]
+    pub addrs: Vec<String>,
+    /// The relay this device is currently reachable through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+}
+
+impl EndpointHints {
+    /// Whether there is anything at all to publish.
+    pub fn is_empty(&self) -> bool {
+        self.addrs.is_empty() && self.relay_url.is_none()
+    }
+
+    fn validate(&self) -> Result<()> {
+        if serde_json::to_vec(self)?.len() > MAX_ENDPOINT_BYTES {
+            bail!("endpoint hints exceed {MAX_ENDPOINT_BYTES} bytes");
+        }
+        if self.addrs.len() > MAX_ENDPOINT_ADDRS {
+            bail!("endpoint hints carry more than {MAX_ENDPOINT_ADDRS} addresses");
+        }
+        for addr in &self.addrs {
+            if addr.parse::<std::net::SocketAddr>().is_err() {
+                bail!("endpoint hint {addr:?} is not a literal socket address");
+            }
+        }
+        if let Some(relay) = &self.relay_url {
+            let relay = relay.trim();
+            if relay.is_empty()
+                || relay.contains(char::is_whitespace)
+                || !relay.starts_with("https://")
+            {
+                bail!("endpoint relay must be an https URL without whitespace");
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A public device key enrolled to an account.  There is deliberately no
 /// device name or arbitrary client metadata: those belong to the local orbit.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnrolledDevice {
     /// Asterism mesh public key.
     pub device_id: String,
     /// Account-selected routing configuration, which may be copied locally.
     pub discovery: DiscoveryConfig,
+    /// Where this device says it can currently be reached.
+    #[serde(default)]
+    pub endpoints: EndpointHints,
 }
 
 /// A challenge issued by the service before enrollment.  It is single-use and
@@ -720,14 +774,41 @@ impl Coordinator {
             bail!("account device capacity reached");
         }
         account.challenges.remove(&proof.challenge.bytes);
+        // Re-enrollment refreshes configuration and keeps whatever hints the
+        // device last published, exactly as the Worker's upsert does.
+        let endpoints = account
+            .devices
+            .get(&device_key)
+            .map(|existing| existing.endpoints.clone())
+            .unwrap_or_default();
         let device = EnrolledDevice {
             device_id: device_key,
             discovery,
+            endpoints,
         };
         account
             .devices
             .insert(device.device_id.clone(), device.clone());
         Ok(device)
+    }
+
+    /// Replaces the routing hints one enrolled device advertises to its own
+    /// account.  Replacement, not accumulation: the record holds where the
+    /// device is now, never where it has been.
+    pub fn publish_endpoints(
+        &mut self,
+        binding: &AccountBinding,
+        device_id: &DeviceId,
+        endpoints: EndpointHints,
+    ) -> Result<EnrolledDevice> {
+        endpoints.validate()?;
+        let device = self
+            .account_mut(binding)?
+            .devices
+            .get_mut(&device_id.to_string())
+            .ok_or_else(|| anyhow!("device is not enrolled to this account"))?;
+        device.endpoints = endpoints;
+        Ok(device.clone())
     }
 
     /// Revokes a device's hosted configuration and prevents future discovery
@@ -1679,6 +1760,26 @@ pub fn enrollment_proof(
     }
 }
 
+/// The exact bytes a device signs for a service-issued challenge token.
+///
+/// Clients that talk to a hosted coordinator over HTTP use this rather than
+/// re-deriving the framing, so one definition covers the crate and the wire.
+pub fn enrollment_signed_message(challenge: &str) -> Result<Vec<u8>> {
+    Ok(enrollment_message(&EnrollmentChallenge::from_token(
+        challenge,
+    )?))
+}
+
+/// Signs a service-issued challenge token, returning the base64url signature
+/// the JSON API carries.
+pub fn sign_enrollment_challenge(
+    identity: &asterism_mesh::DeviceIdentity,
+    challenge: &str,
+) -> Result<String> {
+    let signature = identity.sign(&enrollment_signed_message(challenge)?);
+    Ok(BASE64URL_NOPAD.encode(&signature.to_bytes()))
+}
+
 fn account_id(key: &[u8; 32], identity: &VerifiedIdentity) -> AccountId {
     let mut hash = blake3::Hasher::new_keyed(key);
     hash.update(IDENTITY_DOMAIN);
@@ -1714,11 +1815,15 @@ fn random_token() -> String {
     BASE64URL_NOPAD.encode(&random_32())
 }
 
+/// The domain-separated commitment a challenge carries instead of the account
+/// generation itself.  SHA-256 rather than BLAKE3 because the canonical Worker
+/// verifies these exact bytes with WebCrypto, which offers no BLAKE3; see
+/// `docs/hosted-coordination.md`, "Device enrollment and presence".
 fn enrollment_generation_binding(generation: &str) -> [u8; 32] {
-    let mut hash = blake3::Hasher::new();
+    let mut hash = Sha256::new();
     hash.update(ENROLLMENT_GENERATION_DOMAIN);
     hash.update(generation.as_bytes());
-    *hash.finalize().as_bytes()
+    hash.finalize().into()
 }
 
 const fn base64url_nopad_encoded_len(decoded_bytes: usize) -> usize {

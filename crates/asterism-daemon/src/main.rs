@@ -61,6 +61,7 @@ mod container;
 mod device_shell;
 mod egress;
 mod gpu;
+mod hosted;
 mod images;
 mod instance;
 mod mesh;
@@ -445,6 +446,12 @@ async fn run_daemon(stop_source: StopSource) -> Result<()> {
     // request is served, and then continuously (see `persist`).
     persist::resurrect(&node.shard).await;
     persist::supervise(node.shard.clone());
+
+    // Optional, and never on a critical path: a device with no account still
+    // pairs, boots, and serves. Signing in only adds a private directory.
+    if let Err(e) = hosted::init(node.clone(), mesh.clone()) {
+        eprintln!("astd: the hosted coordinator client is unavailable: {e:#}");
+    }
 
     let slots = door.slots();
     loop {
@@ -1016,6 +1023,12 @@ async fn dispatch(request: Request, node: &Node, mesh: Option<&Arc<Mesh>>) -> Re
     }
     if orbit::claims(&request) {
         return orbit::serve(request, node, mesh).await;
+    }
+    // The hosted band answers from the coordinator client's own state and
+    // needs neither the registry nor a peer, so it is routed before any name
+    // resolution and works on a device with no mesh endpoint at all.
+    if hosted::claims(&request) {
+        return hosted::serve(request).await;
     }
     // A name is claimed before anything is written down, and a claim that
     // fails ends the request here: an instance that could not have the name

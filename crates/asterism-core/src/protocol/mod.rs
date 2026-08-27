@@ -30,10 +30,12 @@ use crate::secret::Secret;
 use crate::snapshot::Snapshot;
 
 mod egress;
+mod hosted;
 mod swap;
 mod wake;
 
 pub use egress::{EgressRequest, EgressResponse, MESH_FRAME_LIMIT};
+pub use hosted::{HostedPeerStatus, HostedPresence, HostedStatus, RedactedBearer};
 pub use swap::{BaseImage, MoveFile, MoveManifest};
 pub use wake::{CheckRow, Verdict};
 
@@ -464,6 +466,22 @@ pub enum Request {
     DeviceRemove {
         name: String,
     },
+
+    // ---- the hosted coordinator ----------------------------------------
+    /// Hand the daemon a hosted session so it can enroll this device's public
+    /// mesh key and keep a presence socket. `ast` owns the credential store,
+    /// the daemon owns the device key, so the bearer crosses this socket in
+    /// memory and is never written to the daemon's disk.
+    HostedEnroll {
+        coordinator: String,
+        bearer: RedactedBearer,
+        #[serde(default)]
+        trust_account_devices: bool,
+    },
+    /// What the daemon knows about its enrollment, for `ast auth status`.
+    HostedStatus,
+    /// Drop the in-memory session and the local hosted record.
+    HostedForget,
     /// Read this device's shell offer. Unlike policy mutation, this is safe
     /// over authenticated mesh RPC and is the read contract used by remote
     /// and hosted management surfaces.
@@ -824,7 +842,10 @@ impl Request {
             | Request::DeviceShellSignal { .. }
             | Request::DeviceShellClose
             | Request::GpuGuestFrame { .. }
-            | Request::GpuGuestClose => None,
+            | Request::GpuGuestClose
+            | Request::HostedEnroll { .. }
+            | Request::HostedStatus
+            | Request::HostedForget => None,
             Request::GpuProviderList
             | Request::GpuProviderAttach { .. }
             | Request::GpuProviderRevoke { .. } => None,
@@ -929,6 +950,7 @@ impl Request {
             | Request::GpuProviderRevoke { .. } => 8,
             Request::Exec { .. } => 9,
             Request::CreateNetwork { .. } => 10,
+            Request::HostedEnroll { .. } | Request::HostedStatus | Request::HostedForget => 12,
             Request::DeviceShellPolicy { .. }
             | Request::DeviceShellOpen { .. }
             | Request::DeviceShellInput { .. }
@@ -973,6 +995,9 @@ impl Request {
             Request::ImagePull { .. } => Some("image_pull"),
             Request::CreateRuntime { .. } => Some("create_runtime"),
             Request::CreateNetwork { .. } => Some("create_network"),
+            Request::HostedEnroll { .. } => Some("hosted_enroll"),
+            Request::HostedStatus => Some("hosted_status"),
+            Request::HostedForget => Some("hosted_forget"),
             Request::ContainerExec { .. } => Some("container_exec"),
             Request::Exec { .. } => Some("exec"),
             Request::GpuGuestOpen { .. }
@@ -1188,6 +1213,11 @@ pub enum Response {
     Devices {
         devices: Vec<DeviceStatus>,
     },
+    /// What the daemon knows about its hosted enrollment and the account's
+    /// other devices. Public keys, chosen endpoints and presence only.
+    Hosted {
+        hosted: HostedStatus,
+    },
     /// The pasteable ticket minted by [`Request::DeviceInvite`], and how long
     /// it stays good for.
     Ticket {
@@ -1400,6 +1430,7 @@ impl Response {
             Response::VolumeCatalog { .. } | Response::VolumeLease { .. } => 7,
             Response::ContainerExec { .. } => 8,
             Response::Exec { .. } => 9,
+            Response::Hosted { .. } => 12,
             Response::Instance { instance, .. } if instance.runtime == RuntimeKind::Container => 8,
             Response::Instances { instances }
                 if instances
@@ -1444,6 +1475,17 @@ impl Response {
 pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
     [
         ("compat", Request::Compat.since()),
+        (
+            "hosted_enroll",
+            Request::HostedEnroll {
+                coordinator: String::new(),
+                bearer: RedactedBearer::new("placeholder").expect("a non-empty literal"),
+                trust_account_devices: false,
+            }
+            .since(),
+        ),
+        ("hosted_status", Request::HostedStatus.since()),
+        ("hosted_forget", Request::HostedForget.since()),
         (
             "backup_export",
             Request::BackupExport {
