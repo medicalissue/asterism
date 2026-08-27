@@ -192,6 +192,20 @@ unproven in CI. Giving `install.ps1` a local-source branch would close this;
 it was not done here because an untested change to the installer is worse than
 a known gap in its test.
 
+Two things about running Windows binaries from a workflow, both learned by
+hanging a job on them, are worth keeping:
+
+- **`astd-hyperv.exe` takes no arguments.** `main()` goes straight to
+  `serve_once(stdin, stdout, …)` and blocks for a protocol frame, so
+  `--help`, `--version` and every other flag hang forever rather than
+  printing anything. Check the file, never invoke it; the protocol has its own
+  suite in the `windows-hyperv` workflow.
+- **Invoke through `Start-Process` with a deadline, not through `&`.** The
+  call operator waits for the inherited stdout pipe to close, so a child that
+  outlives the command hangs the step, and with no deadline that consumes the
+  runner's entire budget while reporting nothing. `verify-windows` wraps every
+  invocation in a bounded helper that kills and names whatever stalled.
+
 ## What a release contains
 
 ```
