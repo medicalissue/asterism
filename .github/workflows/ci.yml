@@ -162,6 +162,120 @@ jobs:
       - run: bash scripts/check-rust-source-graph.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # The native Linux packages. A user on Ubuntu or Fedora should not have to
+  # pipe a script into a shell to get a hypervisor manager, so the release
+  # payload is also rendered into a .deb and an .rpm — from the payload, not
+  # from a second build, so the binary in the package is the binary in the
+  # tarball.
+  #
+  # ubuntu-22.04 rather than -latest on purpose: it is the oldest supported
+  # target, and a package built against a newer glibc would install there and
+  # then fail to exec. Building on the floor is the check.
+  linux-packages:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable branch commit, 2026-08-05
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 peeled commit
+
+      - name: Component and packaging shell is still shell
+        run: |
+          set -eu
+          shellcheck scripts/build-linux-packages.sh scripts/install-nfpm.sh
+          shellcheck -s sh packaging/linux/asterism-nbd-policy \
+            packaging/linux/postinstall.sh packaging/linux/preremove.sh \
+            packaging/linux/postremove.sh
+
+      - name: Build the release payload the packages are cut from
+        run: |
+          set -eu
+          sudo apt-get update
+          sudo apt-get install -y musl-tools pkg-config libseccomp-dev libcap-ng-dev
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --release --locked --bin ast --bin astd
+          scripts/package-linux.sh 0.0.0-ci "${RUNNER_TEMP}/dist"
+
+      - name: Render the .deb and the .rpm from that payload
+        run: |
+          set -eu
+          scripts/install-nfpm.sh "${RUNNER_TEMP}/tools"
+          mkdir -p "${RUNNER_TEMP}/payload"
+          tar -xzf "${RUNNER_TEMP}/dist/asterism-0.0.0-ci-linux-x86_64.tar.gz" \
+            -C "${RUNNER_TEMP}/payload"
+          NFPM="${RUNNER_TEMP}/tools/nfpm" \
+            scripts/build-linux-packages.sh \
+            "${RUNNER_TEMP}/payload" "${RUNNER_TEMP}/packages" 0.0.0-ci
+
+      # What the package claims to contain is the whole product claim here,
+      # so assert the layout rather than trusting the description that
+      # produced it — including that no `qemu` requirement crept into either
+      # dependency list.
+      - name: The package contains the packaged layout
+        run: |
+          set -eu
+          deb="$(find "${RUNNER_TEMP}/packages" -name '*.deb' -print -quit)"
+          rpm="$(find "${RUNNER_TEMP}/packages" -name '*.rpm' -print -quit)"
+          dpkg-deb -c "$deb" | awk '{print $6}' | sed 's|^\./|/|' | sort >/tmp/deb.list
+          for path in /usr/bin/ast /usr/bin/astd \
+            /usr/libexec/asterism/cloud-hypervisor \
+            /usr/libexec/asterism/virtiofsd \
+            /usr/libexec/asterism/asterism-nbd \
+            /usr/libexec/asterism/asterism-nbd-policy \
+            /usr/lib/asterism/guest/bin/asterism-guest \
+            /usr/lib/systemd/user/astd.service \
+            /usr/lib/modules-load.d/asterism-nbd.conf \
+            /usr/lib/modprobe.d/asterism-nbd.conf \
+            /usr/lib/tmpfiles.d/asterism-nbd.conf \
+            /usr/share/asterism/linux-components.env \
+            /usr/share/asterism/licenses/cloud-hypervisor-Apache-2.0.txt \
+            /usr/share/asterism/licenses/cloud-hypervisor-BSD-3-Clause.txt \
+            /usr/share/asterism/licenses/virtiofsd-Apache-2.0.txt \
+            /usr/share/asterism/licenses/virtiofsd-BSD-3-Clause.txt \
+            /usr/share/asterism/licenses/NOTICE \
+            /usr/share/doc/asterism/copyright; do
+            grep -qx "$path" /tmp/deb.list || {
+              echo "the .deb is missing ${path}" >&2; exit 1; }
+          done
+          dpkg-deb -I "$deb" | grep -q 'Depends:.*nbd-client'
+          dpkg-deb -I "$deb" | grep -q 'Depends:.*kmod'
+          if dpkg-deb -I "$deb" | grep -Eq '(Depends|Recommends):.*qemu'; then
+            echo "the .deb depends on qemu" >&2; exit 1
+          fi
+          rpm -qpR "$rpm" | grep -qx 'nbd'
+          rpm -qpR "$rpm" | grep -qx 'kmod'
+          if rpm -qpR "$rpm" | grep -q qemu; then
+            echo "the .rpm requires qemu" >&2; exit 1
+          fi
+          rpm -qpl "$rpm" | grep -qx /usr/libexec/asterism/cloud-hypervisor
+
+      # Cheap distribution lint. Both tools are loudly unhappy about a
+      # package that deliberately vendors two upstream binaries, and most of
+      # what they say about this one is a description of the design rather
+      # than a defect — so their full output is printed and the gate is a
+      # short list of tags that would each be a real bug here: a package
+      # writing into /usr/local, a setuid binary, a missing copyright file,
+      # or a binary dropped in /etc.
+      - name: lintian and rpmlint
+        run: |
+          set -eu
+          sudo apt-get install -y lintian rpmlint
+          deb="$(find "${RUNNER_TEMP}/packages" -name '*.deb' -print -quit)"
+          rpm="$(find "${RUNNER_TEMP}/packages" -name '*.rpm' -print -quit)"
+          lintian --no-tag-display-limit "$deb" | tee /tmp/lintian.txt || true
+          rpmlint "$rpm" | tee /tmp/rpmlint.txt || true
+          if grep -Eq 'file-in-usr-local|setuid-binary|setgid-binary|no-copyright-file|binary-in-etc' /tmp/lintian.txt; then
+            echo "lintian reported a tag this package must never carry" >&2
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-packages-x86_64
+          path: |
+            ${{ runner.temp }}/packages/*.deb
+            ${{ runner.temp }}/packages/*.rpm
+          if-no-files-found: error
+
   # The installer is the first thing a user runs and the one piece of this
   # project that is not Rust, so it gets the same treatment: a linter and a
   # test suite, on both a Linux and a macOS shell.

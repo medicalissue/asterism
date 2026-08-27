@@ -1,0 +1,30 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: asterism
+Upstream-Contact: https://github.com/medicalissue/asterism
+Source: https://github.com/medicalissue/asterism
+
+Files: *
+License: MIT OR Apache-2.0
+ Asterism is dual-licensed. The full texts are installed at
+ /usr/share/asterism/licenses/LICENSE-MIT and
+ /usr/share/asterism/licenses/LICENSE-APACHE.
+
+Files: usr/libexec/asterism/cloud-hypervisor
+License: Apache-2.0 AND BSD-3-Clause
+ The bundled Cloud Hypervisor binary is the exact static release published
+ upstream at the version pinned in
+ /usr/share/asterism/linux-components.env. Its license texts are installed at
+ /usr/share/asterism/licenses/cloud-hypervisor-Apache-2.0.txt and
+ /usr/share/asterism/licenses/cloud-hypervisor-BSD-3-Clause.txt.
+
+Files: usr/libexec/asterism/virtiofsd
+License: Apache-2.0 AND BSD-3-Clause
+ The bundled virtiofsd binary is built from the tagged upstream source
+ pinned in /usr/share/asterism/linux-components.env. Its license texts are
+ installed at /usr/share/asterism/licenses/virtiofsd-Apache-2.0.txt and
+ /usr/share/asterism/licenses/virtiofsd-BSD-3-Clause.txt.
+
+Files: usr/lib/asterism/*
+License: MIT OR Apache-2.0
+ The guest-control and GPU projection ELF payloads are built from this
+ source tree.

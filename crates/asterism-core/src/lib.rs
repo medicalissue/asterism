@@ -37,6 +37,7 @@ pub mod hyperv;
 pub mod image;
 pub mod instance;
 pub mod ipc;
+pub mod layout;
 pub mod oci;
 pub mod orbit;
 pub mod paths;

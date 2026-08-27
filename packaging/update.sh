@@ -173,6 +173,33 @@ managed_by_brew() {
 	return 1
 }
 
+# The native .deb and .rpm are a second ownership lane, exactly like
+# Homebrew: the files under /usr belong to dpkg or rpm, which record their
+# digests and will notice. Replacing them from here would leave the package
+# database describing bytes that are no longer on disk, and the next
+# distribution upgrade would silently overwrite the update. So the signed
+# channel is still checked and still reported — it just hands the operator
+# the command that owns those files instead of writing them itself.
+package_manager=""
+package_upgrade=""
+managed_by_package() {
+	if [ -n "$package_manager" ]; then
+		return 0
+	fi
+	if command -v dpkg-query >/dev/null 2>&1 &&
+		dpkg-query -S "$AST" >/dev/null 2>&1; then
+		package_manager=dpkg
+		package_upgrade="apt-get install --only-upgrade asterism"
+		return 0
+	fi
+	if command -v rpm >/dev/null 2>&1 && rpm -qf "$AST" >/dev/null 2>&1; then
+		package_manager=rpm
+		package_upgrade="dnf upgrade asterism"
+		return 0
+	fi
+	return 1
+}
+
 resolve_manifest_url() {
 	if [ -n "${ASTERISM_UPDATE_MANIFEST_URL:-}" ]; then
 		printf '%s' "$ASTERISM_UPDATE_MANIFEST_URL"
@@ -262,6 +289,8 @@ print_status() {
 	printf 'build     %s\n' "$ours_build"
 	if managed_by_brew; then
 		printf 'manager   homebrew\n'
+	elif managed_by_package; then
+		printf 'manager   %s\n' "$package_manager"
 	else
 		printf 'manager   asterism\n'
 	fi
@@ -286,6 +315,8 @@ check_update() {
 	fi
 	if managed_by_brew; then
 		say "update available; this installation belongs to Homebrew — run: brew upgrade asterism"
+	elif managed_by_package; then
+		say "update available; this installation belongs to ${package_manager} — run: ${package_upgrade}"
 	else
 		say "update available"
 	fi
@@ -594,6 +625,8 @@ on_signal() {
 apply_update() {
 	activation_failure=""
 	managed_by_brew && die "this installation belongs to Homebrew; run: brew upgrade asterism"
+	managed_by_package &&
+		die "this installation belongs to ${package_manager}; run: ${package_upgrade}"
 	acquire_artifact_lock
 	load_manifest
 	cmp=$(version_cmp "$ours" "$version")

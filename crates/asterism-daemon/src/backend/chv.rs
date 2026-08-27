@@ -42,7 +42,6 @@ const VIRTIOFS_RESOURCE_PREFIX: &str = "virtiofs-";
 const VIRTIOFS_RESOURCE_SUFFIX: &str = ".resource.json";
 const NBD_RECORD_PREFIX: &str = "chv-nbd-";
 const NBD_RECORD_SUFFIX: &str = ".device";
-const NBD_HELPER: &str = "/usr/local/libexec/asterism/asterism-nbd";
 const BOOT_TIMEOUT: Duration = Duration::from_secs(240);
 const API_TIMEOUT: Duration = Duration::from_secs(10);
 const API_START_TIMEOUT: Duration = Duration::from_secs(60);
@@ -1210,6 +1209,13 @@ fn network_config(net: &Network) -> String {
     )
 }
 
+/// The pinned helper this installation shipped.
+///
+/// A flat installation keeps it beside `astd`; a native package keeps it in
+/// `libexec/asterism`, because `/usr/bin/cloud-hypervisor` would be this
+/// package claiming a distribution-wide name for a version-pinned private
+/// copy. [`asterism_core::layout`] knows both, so neither shape needs an
+/// environment override to find what it installed.
 fn sibling_or_path(env: &str, name: &str) -> Result<PathBuf> {
     if let Some(path) = std::env::var_os(env) {
         let path = PathBuf::from(path);
@@ -1218,13 +1224,8 @@ fn sibling_or_path(env: &str, name: &str) -> Result<PathBuf> {
         }
         bail!("{env} names {}, which is not a file", path.display());
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let sibling = dir.join(name);
-            if sibling.is_file() {
-                return Ok(sibling);
-            }
-        }
+    if let Some(installed) = asterism_core::layout::helper(name) {
+        return Ok(installed);
     }
     asterism_core::tools::tool(name).with_context(|| format!("finding the pinned {name} helper"))
 }
@@ -2344,12 +2345,10 @@ fn ensure_migration_resources_portable(instance_dir: &Path) -> Result<()> {
 }
 
 fn run_nbd_client(args: &[String]) -> Result<()> {
-    let helper = std::env::var_os("ASTERISM_NBD_HELPER")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(NBD_HELPER));
+    let helper = asterism_core::layout::nbd_helper();
     if !helper.is_file() {
         bail!(
-            "remote block volumes need the installed Asterism NBD helper at {}; re-run the Linux installer",
+            "remote block volumes need the installed Asterism NBD helper at {}; re-run the Linux installer or `ast service install` from the package",
             helper.display()
         );
     }

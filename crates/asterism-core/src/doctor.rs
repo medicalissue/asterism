@@ -169,6 +169,14 @@ fn sibling(name: &str) -> Option<PathBuf> {
         .map(|me| me.with_file_name(name))
 }
 
+/// The pinned helper as this installation shipped it, falling back to the
+/// flat layout's path so an absent helper is still named in the report
+/// rather than dropping the check.
+#[cfg(target_os = "linux")]
+fn installed_helper(name: &str) -> Option<PathBuf> {
+    crate::layout::helper(name).or_else(|| sibling(name))
+}
+
 fn prefix_dir() -> Option<PathBuf> {
     std::env::current_exe().ok().and_then(|me| {
         me.parent()
@@ -508,20 +516,24 @@ fn linux_checks() -> Vec<Check> {
         .map(|p| p.virtiofsd_version.trim_start_matches('v'))
         .unwrap_or("1.14.0");
 
-    if let Some(chv) = sibling("cloud-hypervisor") {
+    // A flat install keeps the pinned helpers beside astd; a native package
+    // keeps them under libexec/asterism. Report against whichever this
+    // installation actually has, and against the flat path when it has
+    // neither, so an absent helper still fails by name.
+    if let Some(chv) = installed_helper("cloud-hypervisor") {
         checks.push(probe_version_binary(
             "cloud-hypervisor",
             &chv,
             chv_pin,
-            "pinned Cloud Hypervisor is not installed beside astd",
+            "pinned Cloud Hypervisor is not installed",
         ));
     }
-    if let Some(virtiofsd) = sibling("virtiofsd") {
+    if let Some(virtiofsd) = installed_helper("virtiofsd") {
         checks.push(probe_version_binary(
             "virtiofsd",
             &virtiofsd,
             virtio_pin,
-            "pinned virtiofsd is not installed beside astd",
+            "pinned virtiofsd is not installed",
         ));
     }
 
@@ -549,8 +561,7 @@ fn linux_checks() -> Vec<Check> {
                 detail: format!("{} is missing", lock.display()),
             }),
         }
-        let nbd = PathBuf::from("/usr/local/libexec/asterism/asterism-nbd");
-        checks.push(probe_nbd_helper(&nbd));
+        checks.push(probe_nbd_helper(&crate::layout::nbd_helper()));
     }
 
     checks.push(linger_check());
@@ -564,7 +575,7 @@ fn probe_nbd_helper(nbd: &Path) -> Check {
             name: "nbd-helper",
             status: Status::Warn,
             detail: format!(
-                "{} is missing; remote volumes cannot attach until install.sh configures NBD",
+                "{} is missing; remote volumes cannot attach until install.sh or `ast service install` configures NBD",
                 nbd.display()
             ),
         };

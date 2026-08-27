@@ -1,0 +1,119 @@
+#!/bin/sh
+# Grant, or withdraw, one account's least-privilege NBD authority.
+#
+# A .deb or .rpm is installed once, system-wide, by root. The sudoers rule
+# that lets the *daemon's* account invoke the root-owned NBD wrapper is not
+# system-wide: it names one account and one uid, and the package cannot know
+# which account will run astd — root installs it, a human runs it, and on a
+# shared host there may be several. So the package ships the wrapper and this
+# helper, and the rule is written later, by the account that wants it, from
+# `ast service install`.
+#
+# That is the same rule `packaging/install.sh` writes, with the same name
+# (`/etc/sudoers.d/asterism-nbd-<uid>`), the same two lines, and the same
+# `visudo -cf` validation before it is installed — so the two installation
+# shapes cannot leave two conflicting rules behind for one account, and
+# neither grants anything the other did not.
+#
+#   sudo /usr/libexec/asterism/asterism-nbd-policy install
+#   sudo /usr/libexec/asterism/asterism-nbd-policy remove
+#   /usr/libexec/asterism/asterism-nbd-policy show
+#
+# The account granted is the one that invoked sudo (SUDO_UID/SUDO_USER), not
+# root: running this as root through sudo must not authorise root.
+set -eu
+
+LIBEXEC=/usr/libexec/asterism
+WRAPPER="${LIBEXEC}/asterism-nbd"
+VMM="${LIBEXEC}/cloud-hypervisor"
+
+die() {
+	printf 'asterism-nbd-policy: %s\n' "$1" >&2
+	exit 1
+}
+
+# The account this rule is for. Under sudo that is the invoking account;
+# invoked directly as root (a provisioning script, a container build) it is
+# root itself, which is legal but says so out loud.
+target_user() {
+	if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER}" != root ]; then
+		printf '%s' "$SUDO_USER"
+		return
+	fi
+	id -un
+}
+
+target_uid() {
+	if [ -n "${SUDO_UID:-}" ] && [ "${SUDO_UID}" != 0 ]; then
+		printf '%s' "$SUDO_UID"
+		return
+	fi
+	id -u
+}
+
+policy_path() {
+	printf '/etc/sudoers.d/asterism-nbd-%s' "$(target_uid)"
+}
+
+need_root() {
+	[ "$(id -u)" = 0 ] ||
+		die "must run as root: sudo ${LIBEXEC}/asterism-nbd-policy $1"
+}
+
+case "${1:-}" in
+install)
+	need_root install
+	user="$(target_user)"
+	uid="$(target_uid)"
+	case "$user" in
+	*[!A-Za-z0-9_.-]*) die "cannot safely write sudoers policy for account ${user}" ;;
+	esac
+	case "$uid" in
+	'' | *[!0-9]*) die "refusing to write a sudoers policy for uid ${uid}" ;;
+	esac
+	[ -x "$WRAPPER" ] || die "${WRAPPER} is missing; reinstall the asterism package"
+	[ -x "$VMM" ] || die "${VMM} is missing; reinstall the asterism package"
+	command -v visudo >/dev/null 2>&1 ||
+		die "visudo is required to validate Asterism's least-privilege NBD policy"
+	setcap_bin="$(command -v setcap || true)"
+	[ -n "$setcap_bin" ] ||
+		die "setcap is required to configure Cloud Hypervisor networking (install libcap2-bin or libcap, then re-run)"
+
+	staged="$(mktemp "${TMPDIR:-/tmp}/asterism-nbd-policy.XXXXXX")"
+	trap 'rm -f "$staged"' EXIT INT HUP TERM
+	# One: the daemon may run the argument-checking wrapper, and nothing
+	# else. Two: the transactional updater replaces the VMM inode, which
+	# drops its file capability — so restoring exactly that one capability
+	# on exactly that one installed path is permitted, and nothing wider.
+	printf '%s ALL=(root) NOPASSWD: %s\n' "$user" "$WRAPPER" >"$staged"
+	printf '%s ALL=(root) NOPASSWD: %s cap_net_admin+ep %s\n' \
+		"$user" "$setcap_bin" "$VMM" >>"$staged"
+	visudo -cf "$staged" >/dev/null ||
+		die "the generated policy did not validate; nothing was installed"
+	install -d -m 0750 /etc/sudoers.d
+	install -m 0440 -o root -g root "$staged" "$(policy_path)"
+	printf 'wrote %s for %s\n' "$(policy_path)" "$user"
+	;;
+remove)
+	need_root remove
+	policy="$(policy_path)"
+	if [ -e "$policy" ]; then
+		rm -f "$policy"
+		printf 'removed %s\n' "$policy"
+	else
+		printf '%s was not there\n' "$policy"
+	fi
+	;;
+show)
+	policy="$(policy_path)"
+	if [ -e "$policy" ]; then
+		printf '%s\n' "$policy"
+		exit 0
+	fi
+	printf 'no NBD policy for uid %s\n' "$(target_uid)"
+	exit 1
+	;;
+*)
+	die "usage: asterism-nbd-policy install|remove|show"
+	;;
+esac

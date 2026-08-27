@@ -166,23 +166,27 @@ impl Artifact {
     }
 
     /// Explicit packaging override, then the release layout beside `astd`,
-    /// then the system prefix. Absence is a boot refusal, never a guest that
-    /// silently starts without its control plane.
+    /// then each installed system layout — `lib/asterism` under this
+    /// installation's prefix, `/usr/lib/asterism` for a native package,
+    /// `/usr/local/lib/asterism` for a system-wide flat install. Absence is
+    /// a boot refusal, never a guest that silently starts without its
+    /// control plane.
     pub fn discover() -> io::Result<Self> {
         if let Some(path) = std::env::var_os("ASTERISM_GUEST_AGENT_ARTIFACT") {
             return Self::from_path(Path::new(&path));
         }
-        let beside_daemon = std::env::current_exe()?
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("guest/bin/asterism-guest");
-        match Self::from_path(&beside_daemon) {
-            Ok(found) => Ok(found),
-            Err(first) if first.kind() == io::ErrorKind::NotFound => Self::from_path(Path::new(
-                "/usr/local/lib/asterism/guest/bin/asterism-guest",
-            )),
-            Err(error) => Err(error),
+        let mut last = io::Error::new(
+            io::ErrorKind::NotFound,
+            "no installed guest-control artifact",
+        );
+        for dir in crate::layout::data_dirs() {
+            match Self::from_path(&dir.join("guest/bin/asterism-guest")) {
+                Ok(found) => return Ok(found),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => last = error,
+                Err(error) => return Err(error),
+            }
         }
+        Err(last)
     }
 
     /// BusyBox fragment used by the generated OCI init after it has entered

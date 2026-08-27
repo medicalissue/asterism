@@ -253,6 +253,94 @@ absence is a fail-closed refusal. The Homebrew formula installs `minisign` as
 a runtime dependency, while other installation lanes must provide one of the
 two verifiers.
 
+## Native Linux packages
+
+Ubuntu and Fedora get a package, not a curl pipe. `scripts/build-linux-packages.sh`
+renders one description — `packaging/linux/nfpm.yaml` — into both a `.deb` and
+an `.rpm` with [nfpm](https://nfpm.goreleaser.com):
+
+```console
+$ scripts/install-nfpm.sh .tools/bin                    # pinned by digest
+$ tar -xzf asterism-v0.1.0-linux-x86_64.tar.gz -C payload
+$ NFPM=.tools/bin/nfpm scripts/build-linux-packages.sh payload dist v0.1.0
+$ sudo apt-get install ./dist/asterism_0.1.0_amd64.deb
+```
+
+**nfpm and not `cargo-deb` + `cargo-generate-rpm`.** The packages are built
+from the *released payload*, not from a fresh compile: the binary in the
+`.deb` has to be the binary in the tarball that `SHA256SUMS` covers, and half
+that payload — the pinned Cloud Hypervisor, virtiofsd, the guest ELFs — is
+not a Cargo build product at all. The Cargo packagers describe a crate; nfpm
+describes a directory, which is what a release is. And one description
+producing both families is the whole claim: a `.deb` and an `.rpm` written
+separately drift separately.
+
+### What is in it
+
+| path | contents |
+|---|---|
+| `/usr/bin` | `ast`, `astd` |
+| `/usr/libexec/asterism` | `cloud-hypervisor`, `virtiofsd`, the signed updater, the root-owned `asterism-nbd` wrapper, `asterism-nbd-policy` |
+| `/usr/lib/asterism` | `guest/`, `guest-gpu/` — the ELF payloads injected into guests |
+| `/usr/share/asterism` | `linux-components.env` and every license, Asterism's and the two bundled components' |
+| `/usr/lib/systemd/user` | `astd.service` |
+| `/usr/lib/modules-load.d`, `/usr/lib/modprobe.d` | `nbd`, with `nbds_max=64` |
+| `/usr/lib/tmpfiles.d` | the root-owned NBD lock file and claim directory |
+| `/usr/share/doc/asterism` | `copyright`, `NOTICE` |
+
+Dependencies are the packages `install.sh` installs, under each family's
+names: `nbd-client kmod e2fsprogs iproute2 libcap2-bin openssh-client sudo` on
+Debian, `nbd kmod e2fsprogs iproute libcap openssh-clients sudo` on Fedora —
+plus OpenSSH, which `install.sh` assumes rather than installs and which
+`ast ssh` and the seed builder both exec. `gnome-keyring` is a
+recommendation, because Secret Service is required for secrets and there is
+no plaintext fallback, but the rest of the product works without one. There
+is no `qemu` dependency in either family, and CI asserts its absence.
+
+### The permission model
+
+Post-install, as root: `setcap cap_net_admin+ep` on the bundled VMM,
+`systemd-tmpfiles --create` for the NBD lock and claim directory, and
+`modprobe nbd nbds_max=64`. None of the three may fail the installation —
+each one failing costs one feature, and `ast doctor` names it.
+
+The sudoers rule is **not** written at package-install time. It names one
+account and one uid; the only account present when root installs a package is
+root. `ast service install`, run by the account that will own the instances,
+invokes `/usr/libexec/asterism/asterism-nbd-policy install` through `sudo`,
+which writes the same `/etc/sudoers.d/asterism-nbd-<uid>` that `install.sh`
+writes — same two lines, same `visudo -cf` validation, same name — so the two
+installation shapes cannot leave two conflicting rules for one account.
+`ast service uninstall` withdraws it, and package removal removes every rule
+the helper wrote.
+
+Removal refuses while an NBD device is still attached, exactly as
+`install.sh --uninstall` does, because the wrapper and its rule are the only
+things left that could detach it. It leaves `~/.asterism` alone, does not
+unload a running `nbd` module, and cannot disable another account's user
+unit.
+
+`ast update` over a packaged install reports `manager dpkg` or `manager rpm`,
+still verifies the signed manifest on `check`, and refuses `apply` with
+`apt-get install --only-upgrade asterism` or `dnf upgrade asterism` — the
+same boundary Homebrew gets, for the same reason.
+
+### Where this runs
+
+CI builds both packages on `ubuntu-22.04` in the `linux-packages` job of
+`ci.yml` — the oldest supported target, so a package built against a newer
+glibc cannot ship — asserts the installed layout out of the built artifacts,
+prints `lintian` and `rpmlint` in full while gating on the handful of
+tags that would each be a real defect here, and uploads
+`linux-packages-x86_64`.
+
+The release lane must build them from the payload it already produced rather
+than from a second compile. The hook is a job in `release.yml` with
+`needs: linux` that downloads `release-linux-linux-<target>`, unpacks it, runs
+`scripts/build-linux-packages.sh` against that directory with the release
+version, and hands the two files to the publish job so they land in
+`SHA256SUMS` beside the archives.
+
 ## Homebrew
 
 The formula here is **HEAD-only on purpose**. `head` points at `main`, which

@@ -1,0 +1,13 @@
+[Unit]
+Description=Asterism device daemon
+Documentation=https://asterism.run
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/astd
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
