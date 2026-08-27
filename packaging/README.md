@@ -330,7 +330,8 @@ same boundary Homebrew gets, for the same reason.
 CI builds both packages on `ubuntu-22.04` in the `linux-packages` job of
 `ci.yml` — the oldest supported target, so a package built against a newer
 glibc cannot ship — asserts the installed layout out of the built artifacts,
-runs `lintian --fail-on error` and `rpmlint`, and uploads
+prints `lintian` and `rpmlint` in full while gating on the handful of
+tags that would each be a real defect here, and uploads
 `linux-packages-x86_64`.
 
 The release lane must build them from the payload it already produced rather

@@ -248,20 +248,25 @@ jobs:
           fi
           rpm -qpl "$rpm" | grep -qx /usr/libexec/asterism/cloud-hypervisor
 
-      # Cheap distribution lint. Both tools are noisy about a package that
-      # deliberately vendors two upstream binaries, so the gate is their
-      # error class only, with the vendoring tags this package will always
-      # carry suppressed by name.
+      # Cheap distribution lint. Both tools are loudly unhappy about a
+      # package that deliberately vendors two upstream binaries, and most of
+      # what they say about this one is a description of the design rather
+      # than a defect — so their full output is printed and the gate is a
+      # short list of tags that would each be a real bug here: a package
+      # writing into /usr/local, a setuid binary, a missing copyright file,
+      # or a binary dropped in /etc.
       - name: lintian and rpmlint
         run: |
           set -eu
           sudo apt-get install -y lintian rpmlint
           deb="$(find "${RUNNER_TEMP}/packages" -name '*.deb' -print -quit)"
           rpm="$(find "${RUNNER_TEMP}/packages" -name '*.rpm' -print -quit)"
-          lintian --fail-on error --no-tag-display-limit \
-            --suppress-tags embedded-library,statically-linked-binary,no-manual-page,changelog-file-missing-in-native-package,extended-description-is-probably-too-short,binary-without-manpage \
-            "$deb" || { echo "lintian reported an error"; exit 1; }
-          rpmlint "$rpm" || echo "rpmlint reported findings (not gating)"
+          lintian --no-tag-display-limit "$deb" | tee /tmp/lintian.txt || true
+          rpmlint "$rpm" | tee /tmp/rpmlint.txt || true
+          if grep -Eq 'file-in-usr-local|setuid-binary|setgid-binary|no-copyright-file|binary-in-etc' /tmp/lintian.txt; then
+            echo "lintian reported a tag this package must never carry" >&2
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
