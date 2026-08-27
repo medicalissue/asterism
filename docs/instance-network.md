@@ -245,5 +245,42 @@ port.
 
 UDP service publication is independent of secret interception. The secret
 plane currently handles HTTP/1.1 CONNECT and selective TLS termination; QUIC
-blocking/downgrade, audit logs, quotas, query/body injection and managed OAuth
-remain outside the built boundary.
+blocking/downgrade, audit logs, quotas and query/body injection remain outside
+the built boundary.
+
+## Credential parts at the door
+
+A bound secret is one value going into one header. That covers an API key and
+nothing else a person actually holds — so the same door carries two further
+rules, and which one applies rides on the egress frame beside the placement.
+The consumer device authorises the operation; the source device performs the
+one it was asked for, and not one of its own choosing.
+
+* **`substitute`** — the stored bytes are the credential. This is the original
+  rule and every plain `ast secret` still uses it.
+* **`refresh`** — the stored bytes are an OAuth grant. The source device
+  exchanges the refresh token for an access token at the provider's token
+  endpoint, seconds before the connection out, and substitutes that. The
+  access token is held in memory on the source device, keyed by the grant's
+  `ValueRevision`, and is never written to the store — a store that rewrote
+  itself every hour would falsify the revision commitment the whole orbit
+  relies on. The token endpoint is vetted by the same `is_public` rule the
+  guest's own destinations are, so a token endpoint that resolved to this
+  device's network is refused.
+* **`sign`** — the stored bytes are a key pair, and the credential is an HMAC
+  over the request. The blank the consumer left is discarded and the source
+  device signs (AWS SigV4 today), so the guest never holds anything that could
+  sign anything.
+
+Two further shapes come with them, and neither widens what the door will
+carry. A binding may `accept` the handle under extra placements — `gh` sends
+`Authorization: token …` to some GitHub endpoints and `Bearer …` to others —
+and every accepted placement must read the same *header* the door writes, so
+widening the set cannot widen what `rewrite::strip` removes. And one
+`ast attach --credential` records several bindings, one per authority the
+provider declares, sharing a single handle: they are committed together or not
+at all, and `ast detach --credential` removes all of them at once, because a
+handle that goes on being honoured for four of five hosts has not been revoked.
+
+Managed OAuth is therefore inside the boundary now, for the grant flows a
+device can complete on its own. See [credentials.md](credentials.md).

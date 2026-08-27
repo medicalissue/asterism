@@ -1,0 +1,24 @@
+# Linear — declared, not tested.
+#
+# A personal API key is a login part and needs no scheme at all: Linear reads
+# the key as the whole of the `Authorization` header, which is why the
+# placement here is a bare header and not `bearer`.
+name = "linear"
+kind = "login"
+summary = "Linear GraphQL API with a personal API key"
+experimental = true
+
+handle_prefix = "sk-ast-linear-"
+
+authorities = ["api.linear.app"]
+
+env = ["LINEAR_API_KEY"]
+
+[rule]
+type = "substitute"
+placement = "header:authorization"
+accept = ["raw"]
+
+[login]
+paste = true
+paste_hint = "a personal API key from linear.app/settings/api"

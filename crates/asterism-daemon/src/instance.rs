@@ -345,6 +345,15 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             )
             .await
         }
+        // A credential part is several bindings, and they are made together
+        // or not at all: a `gh` that reached `api.github.com` but not
+        // `codeload.github.com` because the second attach failed would be a
+        // guest whose `gh` works until it clones.
+        Request::AttachCredential {
+            name,
+            credential,
+            source_device,
+        } => attach_credential(reg, &name, &credential, source_device.as_deref()).await,
         Request::DetachSecret { name, secret } => detach_secret(reg, &name, &secret),
         Request::BackupExport { name, destination } => {
             let exported = reg.get(&name).cloned().and_then(|inst| {
@@ -1779,6 +1788,27 @@ async fn attach_secret(
     attach_secret_binding_with(reg, name, binding, egress::refresh_bindings)
 }
 
+/// Bind every authority a credential part's provider declares, under one
+/// handle.
+///
+/// All of them or none: the shard is cloned, every binding is recorded on the
+/// clone, and only then is the proposed policy started and committed. That is
+/// the same transaction `attach_secret` runs — it is written once, below, and
+/// takes a list.
+async fn attach_credential(
+    reg: &mut Shard,
+    name: &str,
+    credential: &str,
+    source_device: Option<&str>,
+) -> Result<Instance> {
+    let inst = reg.get(name)?.clone();
+    egress::check_can_bind(&inst)?;
+    let (node, mesh) = egress::orbit()?;
+    let bindings =
+        crate::secret::plan_credential(credential, source_device, &node, mesh.as_ref()).await?;
+    attach_secret_bindings_with(reg, name, bindings, egress::refresh_bindings)
+}
+
 /// Apply a binding only if a running guest's proxy can honour the proposed
 /// policy. The registry clone is not published until that succeeds. If the
 /// proposed proxy fails after stopping the old one, restore the old policy;
@@ -1787,11 +1817,29 @@ fn attach_secret_binding_with(
     reg: &mut Shard,
     name: &str,
     binding: asterism_core::secret::Binding,
+    refresh: impl FnMut(&Instance) -> Result<()>,
+) -> Result<Instance> {
+    attach_secret_bindings_with(reg, name, vec![binding], refresh)
+}
+
+/// The same transaction for a whole credential part.
+///
+/// A list rather than one, because a credential's bindings have to land
+/// together: recording three of five and then failing would leave a guest
+/// holding a handle that works for some of its provider's hosts and not
+/// others, which is worse than an attach that said no.
+fn attach_secret_bindings_with(
+    reg: &mut Shard,
+    name: &str,
+    bindings: Vec<asterism_core::secret::Binding>,
     mut refresh: impl FnMut(&Instance) -> Result<()>,
 ) -> Result<Instance> {
     let before = reg.get(name)?.clone();
     let mut next = reg.clone();
-    let attached = next.attach_secret(name, binding)?;
+    let mut attached = before.clone();
+    for binding in bindings {
+        attached = next.attach_secret(name, binding)?;
+    }
     if let Err(error) = refresh(&attached) {
         return match refresh(&before) {
             Ok(()) => Err(error).context(
@@ -2531,6 +2579,9 @@ mod tests {
             source_device: "source".into(),
             version: 1,
             bound_at: 1,
+            provider: None,
+            accept: Vec::new(),
+            rule: asterism_core::credential::CredentialRule::Substitute,
         };
         let mut observed = Vec::new();
         let error = attach_secret_binding_with(&mut reg, "dev", binding, |candidate| {
@@ -2580,6 +2631,9 @@ mod tests {
                 source_device: "source".into(),
                 version: 1,
                 bound_at: 1,
+                provider: None,
+                accept: Vec::new(),
+                rule: asterism_core::credential::CredentialRule::Substitute,
             },
         )
         .unwrap();

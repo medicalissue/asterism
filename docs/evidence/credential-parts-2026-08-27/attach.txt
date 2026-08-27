@@ -1,0 +1,6 @@
+bot  gh-e2e-10689-6227 -> api.github.com  (authorization: Bearer, from macbook-pro.tail0de304.ts.net)
+bot  gh-e2e-10689-6227 -> github.com  (authorization: Bearer, from macbook-pro.tail0de304.ts.net)
+bot  gh-e2e-10689-6227 -> uploads.github.com  (authorization: Bearer, from macbook-pro.tail0de304.ts.net)
+bot  gh-e2e-10689-6227 -> raw.githubusercontent.com  (authorization: Bearer, from macbook-pro.tail0de304.ts.net)
+bot  gh-e2e-10689-6227 -> codeload.github.com  (authorization: Bearer, from macbook-pro.tail0de304.ts.net)
+the guest gets $GH_TOKEN=sk-ast-gh-JHTY1PFV… and $GITHUB_TOKEN=sk-ast-gh-JHTY1PFV… — an opaque handle, honoured only by this instance's proxy and only for api.github.com and 4 more. The value stays on macbook-pro.tail0de304.ts.net.

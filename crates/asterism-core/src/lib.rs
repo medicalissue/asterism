@@ -29,6 +29,7 @@
 pub mod backup;
 pub mod compat;
 pub mod cow;
+pub mod credential;
 pub mod device_shell;
 pub mod doctor;
 pub mod durable;
@@ -67,6 +68,7 @@ pub mod rewrite;
 pub mod secret;
 pub mod seed;
 pub mod service;
+pub mod sigv4;
 pub mod snapshot;
 pub mod tools;
 pub mod usage;

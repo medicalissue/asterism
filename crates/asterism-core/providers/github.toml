@@ -1,0 +1,47 @@
+# GitHub — a login part: one long-lived token, swapped in at the door.
+#
+# `ast login gh` prefers the token the host's own `gh` CLI already holds,
+# because a device that is already signed in should not make a human sign in
+# again. When there is none, the device flow below is GitHub's published one
+# and the client id is the `gh` CLI's own public id: RFC 8628 public clients
+# are identified, not authenticated, so it is not a secret.
+name = "github"
+aliases = ["gh"]
+kind = "login"
+summary = "GitHub API, git over HTTPS, and the gh CLI"
+
+# The guest is handed `sk-ast-gh-…`. The shape is cosmetic and the entropy is
+# not — see `secret::GuestHandle`.
+handle_prefix = "sk-ast-gh-"
+
+# Exact hosts. A wildcard here would be an authority nobody read out loud.
+authorities = [
+  "api.github.com",
+  "github.com",
+  "uploads.github.com",
+  "raw.githubusercontent.com",
+  "codeload.github.com",
+]
+
+# What the guest exports. `gh` reads GH_TOKEN; git's credential helper and
+# most actions-shaped tooling read GITHUB_TOKEN. Both get the handle.
+env = ["GH_TOKEN", "GITHUB_TOKEN"]
+
+[rule]
+type = "substitute"
+# GitHub accepts `Authorization: Bearer` on every current endpoint and the
+# older `token` scheme on the rest. The door recognises a handle presented
+# under either and always writes this one upstream.
+placement = "bearer"
+accept = ["bearer", "token"]
+
+[login]
+# Tried first, and its absence is not a failure.
+import = ["gh", "auth", "token"]
+device_authorization_url = "https://github.com/login/device/code"
+token_url = "https://github.com/login/oauth/access_token"
+client_id = "178c6fc778ccc68e1d6a"
+scopes = ["repo", "read:org", "gist", "workflow"]
+# Who the token belongs to, so `ast login gh` can say so out loud.
+identity_url = "https://api.github.com/user"
+identity_field = "login"

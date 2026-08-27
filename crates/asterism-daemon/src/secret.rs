@@ -381,6 +381,11 @@ impl SecretPlane {
     }
 
     fn remove(&self, id: &SecretId) -> Result<Secret> {
+        // Any access token this device minted from this part's grant becomes
+        // unreachable the moment the grant goes, but unreachable is not gone:
+        // it would still be in this process's heap. This is where it stops
+        // being.
+        crate::credential::forget(id);
         let mut catalog = self.catalog.lock().expect("secret catalog poisoned");
         let index = catalog
             .secrets
@@ -426,6 +431,10 @@ impl SecretPlane {
         revision: &ValueRevision,
         value: &SecretValue,
     ) -> Result<Secret> {
+        // A rotated grant mints different access tokens; the cache key
+        // includes the revision, so the old ones are already unreachable — and
+        // this is where they stop occupying memory.
+        crate::credential::forget(id);
         let mut catalog = self.catalog.lock().expect("secret catalog poisoned");
         let index = catalog
             .secrets
@@ -593,7 +602,19 @@ pub(crate) async fn serve(req: Request, node: &Node, mesh: Option<&Arc<Mesh>>) -
             name,
             value,
             source_device,
-        } => create(&name, value, source_device.as_deref(), node, mesh).await,
+            kind,
+            provider,
+        } => {
+            create(
+                &name,
+                value,
+                source_device.as_deref(),
+                Part { kind, provider },
+                node,
+                mesh,
+            )
+            .await
+        }
         Request::SecretList => list(node, mesh)
             .await
             .map(|secrets| Response::Secrets { secrets }),
@@ -646,10 +667,18 @@ pub(crate) async fn serve_source(req: Request) -> Response {
     })
 }
 
+/// What kind of part a create is making, carried together because the two
+/// fields are one decision: a login is a login *of* something.
+pub(crate) struct Part {
+    pub kind: asterism_core::credential::PartKind,
+    pub provider: Option<String>,
+}
+
 async fn create(
     name: &str,
     value: SecretValue,
     target: Option<&str>,
+    part: Part,
     node: &Node,
     mesh: Option<&Arc<Mesh>>,
 ) -> Result<Response> {
@@ -661,7 +690,7 @@ async fn create(
     let now = now_unix();
     let source = source_identity(target, node).await?;
     let secret = match existing {
-        None => begin_lineage(id, name, &source, value, now, node, mesh).await?,
+        None => begin_lineage(id, name, &source, value, part, now, node, mesh).await?,
         Some(existing) => widen_by_rotation(existing, &source, value, now, node, mesh).await?,
     };
     sync_metadata(&secret, node, mesh).await;
@@ -671,11 +700,13 @@ async fn create(
 }
 
 /// Create a name nobody in the orbit has used, on one source device.
+#[allow(clippy::too_many_arguments)]
 async fn begin_lineage(
     id: SecretId,
     name: &str,
     source: &SourceRoute,
     value: SecretValue,
+    part: Part,
     now: u64,
     node: &Node,
     mesh: Option<&Arc<Mesh>>,
@@ -698,6 +729,8 @@ async fn begin_lineage(
         created_at: now,
         updated_at: now,
         sources: vec![target_source.clone()],
+        kind: part.kind,
+        provider: part.provider,
     };
     expect_source_ok(
         call_source(
@@ -1152,57 +1185,7 @@ pub(crate) async fn plan_binding(
     mesh: Option<&Arc<Mesh>>,
 ) -> Result<Binding> {
     let authority = secret::check_authority(authority)?;
-    let id = SecretId::from_name(secret)?;
-    let held = list(node, mesh)
-        .await?
-        .into_iter()
-        .find(|held| held.id == id)
-        .ok_or_else(|| anyhow!("no secret named {secret:?} in this orbit — see: ast secret ls"))?;
-    if let Some(conflict) = held.conflict() {
-        bail!(
-            "secret {secret:?} is in conflict — {conflict}; a binding has to name one value, \
-             so resolve it with `ast secret rm {secret}` and create it once before attaching it"
-        );
-    }
-    // A named device must be a source; an unnamed one picks a source that
-    // actually holds the current version, preferring this device because a
-    // local resolve is a function call and a remote one is a network.
-    let source = match source_device {
-        Some(name) => {
-            let route = source_identity(Some(name), node).await?;
-            held.sources
-                .iter()
-                .find(|held| held.device_id == route.device_id)
-                .cloned()
-                .ok_or_else(|| {
-                    anyhow!(
-                        "{name} is not a source for secret {secret:?} — it is held by {}",
-                        named(&held)
-                    )
-                })?
-        }
-        None => {
-            let here = plane()?.device_id.clone();
-            held.sources
-                .iter()
-                .find(|source| source.device_id == here && source.version == held.version)
-                .or_else(|| {
-                    held.sources
-                        .iter()
-                        .find(|source| source.version == held.version)
-                })
-                .cloned()
-                .ok_or_else(|| {
-                    anyhow!(
-                        "no source for secret {secret:?} holds its current version {} — \
-                         finish the rotation with `ast secret rotate {secret}`",
-                        held.version
-                    )
-                })?
-        }
-    };
-    // Proves now, at attach time, that this source can be asked at all.
-    held.handle(&source.device_id)?;
+    let (held, source) = resolve_part(secret, source_device, node, mesh).await?;
 
     let placement = placement.unwrap_or_else(|| Placement::for_authority(&authority));
     let env = match env {
@@ -1224,7 +1207,105 @@ pub(crate) async fn plan_binding(
         source_device: source.device.clone(),
         version: held.version,
         bound_at: now_unix(),
+        // `ast attach --secret` binds a value the user described on the
+        // command line, so there is no provider behind it, nothing else to
+        // accept it at, and nothing to do but substitute.
+        provider: None,
+        accept: Vec::new(),
+        rule: asterism_core::credential::CredentialRule::Substitute,
     })
+}
+
+/// The part a binding will name, and the one source device that will resolve
+/// it.
+///
+/// Shared by `ast attach --secret` and `ast attach --credential`, because the
+/// refusals are the same and they are the feature: a part nobody in the orbit
+/// has, a part in conflict, a source device that does not hold the current
+/// version. Each of them is a sentence here rather than a guest that boots
+/// with a handle nothing will ever honour.
+async fn resolve_part(
+    name: &str,
+    source_device: Option<&str>,
+    node: &Node,
+    mesh: Option<&Arc<Mesh>>,
+) -> Result<(Secret, SourceDevice)> {
+    let id = SecretId::from_name(name)?;
+    let held = list(node, mesh)
+        .await?
+        .into_iter()
+        .find(|held| held.id == id)
+        .ok_or_else(|| anyhow!("no secret named {name:?} in this orbit — see: ast secret ls"))?;
+    if let Some(conflict) = held.conflict() {
+        bail!(
+            "secret {name:?} is in conflict — {conflict}; a binding has to name one value, \
+             so resolve it with `ast secret rm {name}` and create it once before attaching it"
+        );
+    }
+    // A named device must be a source; an unnamed one picks a source that
+    // actually holds the current version, preferring this device because a
+    // local resolve is a function call and a remote one is a network.
+    let source = match source_device {
+        Some(device) => {
+            let route = source_identity(Some(device), node).await?;
+            held.sources
+                .iter()
+                .find(|held| held.device_id == route.device_id)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "{device} is not a source for secret {name:?} — it is held by {}",
+                        named(&held)
+                    )
+                })?
+        }
+        None => {
+            let here = plane()?.device_id.clone();
+            held.sources
+                .iter()
+                .find(|source| source.device_id == here && source.version == held.version)
+                .or_else(|| {
+                    held.sources
+                        .iter()
+                        .find(|source| source.version == held.version)
+                })
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "no source for secret {name:?} holds its current version {} — \
+                         finish the rotation with `ast secret rotate {name}`",
+                        held.version
+                    )
+                })?
+        }
+    };
+    // Proves now, at attach time, that this source can be asked at all.
+    held.handle(&source.device_id)?;
+    Ok((held, source))
+}
+
+/// Everything `ast attach --credential` has to decide.
+///
+/// The part has to be a credential part — a raw secret has no provider and
+/// therefore no authorities, no door rule and no environment to export — and
+/// the provider it names has to be one this build knows. Both are refused
+/// here, with the command that would fix them, rather than at the far end.
+pub(crate) async fn plan_credential(
+    credential: &str,
+    source_device: Option<&str>,
+    node: &Node,
+    mesh: Option<&Arc<Mesh>>,
+) -> Result<Vec<Binding>> {
+    let (held, source) = resolve_part(credential, source_device, node, mesh).await?;
+    let Some(name) = held.provider.clone() else {
+        bail!(
+            "{credential:?} is a secret, not a credential part — bind it to one authority with \
+             `ast attach <instance> --secret {credential} --to <host>`"
+        );
+    };
+    let provider = asterism_core::credential::require(&name)?;
+    crate::credential::check_can_serve(&provider.rule)?;
+    crate::credential::plan(provider, &held, &source, now_unix(), binding_id)
 }
 
 /// The devices a secret is held by, for a refusal that has to name them.
@@ -1397,6 +1478,8 @@ mod tests {
             created_at: 1,
             updated_at: version,
             sources,
+            kind: asterism_core::credential::PartKind::Secret,
+            provider: None,
         }
     }
 

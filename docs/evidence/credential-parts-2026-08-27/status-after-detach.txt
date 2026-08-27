@@ -1,0 +1,16 @@
+name:    bot
+id:      c05e7e9e-7020-4066-939b-efb5a8e8747c
+status:  running
+restart: never
+age:     1m
+profiles: base (what the guest has: ast profile bot --check)
+disk:    raw, 95.33 MiB of 4 GiB used
+machine: vz 26.5.2 (generic, cpu host)
+running: vz pid 11599, authenticated guest control 192.168.64.35:1023
+control: /private/tmp/ast-credentials-10689/instances/bot/vz.sock
+
+parts:
+  compute  macbook-pro.tail0de304.ts.net  4 cores · 2048 MiB
+  disk     macbook-pro.tail0de304.ts.net  4 GiB · docker.io/library/nginx:alpine  (follows compute · oci rootfs, direct kernel boot)
+  network  macbook-pro.tail0de304.ts.net  private guest network  (exit default: same as compute)
+  gpu      -                              none

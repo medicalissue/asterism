@@ -49,6 +49,13 @@ serde_json.workspace = true
 # and fell back to a non-cryptographic hash when it was missing.
 sha2 = "0.11"
 tar.workspace = true
+# The provider declarations in `providers/` are TOML because they are read by
+# people: the header a credential rides in and the hosts it may be used
+# against are decisions somebody has to be able to check against a vendor's
+# documentation, and a comment beside each one is how they do it. Parsing is
+# `include_str!` at compile time — see `credential::catalog` — so nothing on a
+# user's disk can change a door rule. Already in this workspace's lockfile.
+toml = { version = "1", default-features = false, features = ["parse", "serde"] }
 uuid.workspace = true
 # Secret material passes through this crate's types on its way to and from a
 # platform store; wiping the buffer on drop is cheap and the crate is already

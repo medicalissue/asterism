@@ -1,0 +1,27 @@
+# Docker Hub — declared, not tested. See `experimental`.
+#
+# The registry's own auth is a two-step: a pull presents nothing, is told
+# which realm to go to, fetches a short-lived Bearer from `auth.docker.io`
+# with the personal access token as Basic, and retries. The door substitutes
+# on the first hop only, which is enough for `docker login`-style tokens
+# presented directly and not enough for the realm dance. Until that is
+# tested against a real pull it stays experimental.
+name = "docker"
+kind = "login"
+summary = "Docker Hub registry pulls and pushes"
+experimental = true
+
+handle_prefix = "sk-ast-docker-"
+
+authorities = ["registry-1.docker.io", "auth.docker.io", "index.docker.io"]
+
+env = ["DOCKER_TOKEN"]
+
+[rule]
+type = "substitute"
+placement = "bearer"
+accept = ["bearer"]
+
+[login]
+paste = true
+paste_hint = "a Docker Hub personal access token"

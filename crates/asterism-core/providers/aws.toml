@@ -1,0 +1,61 @@
+# AWS — the third rule type, and the reason there is one.
+#
+# A GitHub token is a string an API compares. An AWS credential is not: what
+# goes on the request is a signature over the request, so a door that could
+# only substitute could not carry AWS at all, and the "hand it every key you
+# own" promise would have a hole in it exactly where the biggest keys are.
+#
+# So `sign` is a rule alongside `substitute` and `refresh`: the source device
+# holds the access key and the secret key, and the last thing it does before
+# the connection out is compute SigV4 over the request it is about to make.
+# The guest never holds anything that could sign anything.
+#
+# The service and region are per-binding rather than per-provider — `ast
+# attach bot --credential aws --to s3.eu-west-1.amazonaws.com` reads both out
+# of the host name — so what is written here is the default pair for a
+# binding whose host does not name them.
+name = "aws"
+kind = "login"
+summary = "AWS APIs, signed at the door with SigV4"
+experimental = true
+
+handle_prefix = "sk-ast-aws-"
+
+# Signing is per-service and the host set is effectively unbounded, so the
+# authorities here are the ones a binding gets by default; `--to` adds one.
+authorities = [
+  "sts.amazonaws.com",
+  "s3.amazonaws.com",
+  "bedrock-runtime.us-east-1.amazonaws.com",
+]
+
+# The AWS SDKs read these. The guest holds a handle in the key-id slot and
+# nothing at all in the secret-key slot: there is no secret to hold, because
+# the signature is not computed here.
+env = ["AWS_ACCESS_KEY_ID"]
+
+[rule]
+type = "sign"
+algorithm = "aws-sigv4"
+service = "sts"
+region = "us-east-1"
+# How the *guest* presents its handle, which is not how the credential goes
+# out: the door replaces this header wholesale with a signature.
+#
+# This is where the AWS support stops short, and it stops short on purpose
+# rather than by accident. An AWS SDK does not send a token — it signs, with
+# a secret key it thinks it has, and puts `Credential=<key id>/…` in the
+# Authorization header. Recognising *that* as a presentation of this
+# instance's handle means parsing a SigV4 header, which is a parser in front
+# of a credential and is not something to add without a lane that exercises
+# it. So until there is one, the guest presents the handle as a bearer token
+# — which is what `curl` does, what Bedrock's API-key mode does, and what any
+# tool pointed at `AWS_ACCESS_KEY_ID` through a plain header does — and an
+# unmodified SDK is not yet carried. See docs/credentials.md.
+placement = "bearer"
+accept = ["bearer"]
+
+[login]
+paste = true
+# Two lines on stdin, or a JSON object with the same three keys.
+paste_hint = "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, one per line"

@@ -307,8 +307,30 @@ pub enum Request {
         #[serde(default)]
         source_device: Option<String>,
     },
+    /// Bind a whole credential part: every authority its provider declares,
+    /// under one handle and one set of environment variables.
+    ///
+    /// A separate frame from [`Request::AttachSecret`] rather than a flag on
+    /// it, because it does something that frame cannot: one credential is
+    /// several bindings, and they have to be made together or not at all. A
+    /// `gh` that reached `api.github.com` but not `codeload.github.com`
+    /// because the second attach failed would be a guest whose `gh` works
+    /// until it clones.
+    AttachCredential {
+        name: String,
+        /// The part's orbit name, as `ast credential ls` prints it.
+        credential: String,
+        /// Which source device resolves the value. `None` picks one the part
+        /// says holds its current version.
+        #[serde(default)]
+        source_device: Option<String>,
+    },
     /// Revoke a binding: the row goes, the handle stops being honoured, and
     /// the seed that told the guest about it is reissued without it.
+    ///
+    /// One name, every binding made under it. A credential part is several
+    /// authorities under one handle, and revoking half of one is not a
+    /// revocation.
     DetachSecret {
         name: String,
         secret: String,
@@ -709,6 +731,15 @@ pub enum Request {
         value: SecretValue,
         #[serde(default)]
         source_device: Option<String>,
+        /// What the value is: a raw secret, a provider login, or an
+        /// authorization grant. Defaulted, so `ast secret create` sends what
+        /// it always sent and an older daemon reads what it always read.
+        #[serde(default)]
+        kind: crate::credential::PartKind,
+        /// The provider a credential part belongs to. Metadata about the
+        /// value's shape and never about the value.
+        #[serde(default)]
+        provider: Option<String>,
     },
     SecretList,
     SecretRemove {
@@ -889,6 +920,7 @@ impl Request {
             // --secret anthropic` resolves `dev` across the orbit like every
             // other, and the binding is written on whichever device holds it.
             | Request::AttachSecret { name, .. }
+            | Request::AttachCredential { name, .. }
             | Request::DetachSecret { name, .. }
             | Request::BackupExport { name, .. }
             | Request::SshEndpoint { name }
@@ -1048,6 +1080,9 @@ impl Request {
             Request::DeviceBench { .. } => 13,
             Request::Cost { .. } => 14,
             Request::OpenPort { .. } => 16,
+            // A daemon too old to know what a credential part is must refuse
+            // this by name rather than record half of it.
+            Request::AttachCredential { .. } => 17,
             Request::DeviceShellPolicy { .. }
             | Request::DeviceShellOpen { .. }
             | Request::DeviceShellInput { .. }
@@ -2099,6 +2134,8 @@ mod tests {
             name: "api".into(),
             value: SecretValue::new(b"literal-sensitive-value".to_vec()),
             source_device: None,
+            kind: crate::credential::PartKind::Secret,
+            provider: None,
         };
         assert!(!format!("{request:?}").contains("literal-sensitive-value"));
         let wire = serde_json::to_string(&request).unwrap();
@@ -2130,6 +2167,8 @@ mod tests {
             created_at: 1,
             updated_at: 3,
             sources: vec![source.clone()],
+            kind: crate::credential::PartKind::Secret,
+            provider: None,
         };
         assert!(Request::SecretSourceList.subject().is_none());
         let sync = Request::SecretSourceSync {

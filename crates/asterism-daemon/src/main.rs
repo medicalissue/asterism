@@ -60,6 +60,7 @@ mod autosnap;
 mod backend;
 mod container;
 mod cost;
+mod credential;
 mod device_shell;
 mod egress;
 mod gpu;

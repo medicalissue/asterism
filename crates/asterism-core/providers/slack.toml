@@ -1,0 +1,29 @@
+# Slack — declared, not tested.
+#
+# Slack's grant is a normal authorization-code flow against a workspace app
+# the user owns, and its tokens do not expire unless token rotation is
+# switched on for the app. Both halves of that are untestable here without a
+# workspace, so this stays experimental and `ast oauth add slack` takes the
+# client id and secret of an app the user registered.
+name = "slack"
+kind = "oauth"
+summary = "Slack Web API as a workspace app"
+experimental = true
+
+handle_prefix = "sk-ast-slack-"
+
+authorities = ["slack.com", "www.slack.com"]
+
+env = ["SLACK_TOKEN", "SLACK_BOT_TOKEN"]
+
+[rule]
+type = "substitute"
+placement = "bearer"
+accept = ["bearer"]
+
+[oauth]
+authorize_url = "https://slack.com/oauth/v2/authorize"
+token_url = "https://slack.com/api/oauth.v2.access"
+default_scopes = ["channels:read", "chat:write"]
+client_id_required = true
+client_secret_required = true

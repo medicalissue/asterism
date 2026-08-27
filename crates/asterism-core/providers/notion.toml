@@ -1,0 +1,24 @@
+# Notion — declared, not tested.
+#
+# Notion's integration tokens do not expire, so the useful shape is a login
+# part with a pasted internal-integration secret; the public OAuth flow is
+# for multi-workspace apps and is out of scope until somebody needs it.
+name = "notion"
+kind = "login"
+summary = "Notion API as an internal integration"
+experimental = true
+
+handle_prefix = "sk-ast-notion-"
+
+authorities = ["api.notion.com"]
+
+env = ["NOTION_TOKEN", "NOTION_API_KEY"]
+
+[rule]
+type = "substitute"
+placement = "bearer"
+accept = ["bearer"]
+
+[login]
+paste = true
+paste_hint = "an internal integration secret from notion.so/my-integrations"
