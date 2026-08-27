@@ -97,19 +97,22 @@ interactive stdin are not part of this command.
 
 Published endpoints are loopback-only on the device supplying compute. TCP is
 the default; append `/udp` when the service uses UDP, for example
-`-p 5353:53/udp`. QEMU currently supplies this endpoint door. A native backend
-without it refuses the create before an Instance row is written, and on a Mac
-with no QEMU installed the refusal names `brew install qemu` rather than
-picking something else. See
+`-p 5353:53/udp`. Every product backend supplies this endpoint: QEMU forwards
+inside its own user-mode NAT, while Virtualization.framework and Cloud
+Hypervisor hand the guest a private address and `astd` binds
+`127.0.0.1:HOST` itself and carries traffic to it. The declaration is durable
+and is recovered on exactly its own port across `down`/`up`, a VMM crash and a
+daemon restart — never on a different one. A backend with neither path refuses
+the create before an Instance row is written. See
 [Instance networking and egress](docs/instance-network.md).
 
 On macOS the product backend is Virtualization.framework, through the signed
 `astd-vz` helper that every install lane installs beside `astd`. QEMU is not an
 install dependency: the Homebrew formula does not declare it, nothing bundles
 it, and it is never selected ahead of VZ. It is the opt-in compatibility and
-development fallback for the two things VZ does not do — `-p` port publication
-and reading a qcow2 base image you point at directly. Install it yourself and
-ask for it by name when you want it:
+development fallback for what VZ does not do — reading a qcow2 base image you
+point at directly, and running a guest of a foreign architecture. Install it
+yourself and ask for it by name when you want it:
 
 ```console
 $ brew install qemu

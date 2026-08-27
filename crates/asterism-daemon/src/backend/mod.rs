@@ -215,25 +215,6 @@ pub struct CreateRequirements {
     port_forward: bool,
 }
 
-/// Refuse a declaration QEMU could not bind before an instance row exists.
-///
-/// TCP and UDP have separate host-port spaces, so the same number may be
-/// published once for each. Repeating a protocol+host pair would make QEMU
-/// fail at boot after create had already promised a usable endpoint.
-pub(crate) fn validate_publish(publish: &[PortForward]) -> Result<()> {
-    let mut seen = std::collections::HashSet::new();
-    for mapping in publish {
-        if !seen.insert((mapping.protocol, mapping.host)) {
-            bail!(
-                "host port {}/{} is published more than once — each protocol and host port may name only one guest endpoint",
-                mapping.host,
-                mapping.protocol
-            );
-        }
-    }
-    Ok(())
-}
-
 impl CreateRequirements {
     pub fn new(image: &ImageRef, publish: &[PortForward]) -> Self {
         Self {
@@ -270,8 +251,9 @@ impl CreateRequirements {
         }
         if self.port_forward && !caps.port_forward {
             bail!(
-                "the {} backend gives each guest an address of its own, so there is \
-                 nothing for -p to forward from this device's loopback",
+                "the {} backend cannot publish a guest port on this device's loopback: it \
+                 neither forwards one inside its own network stack nor hands the guest a \
+                 private address a host listener could be spliced to",
                 hv.id()
             );
         }
@@ -1512,9 +1494,18 @@ mod tests {
         check_can_boot(&*vz, &oci, &[]).expect("vz boots an OCI rootfs directly");
         // A cloud image on vz remains exactly as fine as it ever was.
         check_can_boot(&*vz, &disk, &[]).unwrap();
-        // Publishing to loopback needs a guest that is reached that way.
-        assert!(check_can_boot(&*vz, &disk, &port).is_err());
-        assert!(check_can_boot(&*vz, &oci, &port).is_err());
+        // Publishing no longer needs a user-mode NAT: VZ's guest holds a
+        // private address and `astd` binds the host end (`crate::publish`).
+        check_can_boot(&*vz, &disk, &port).expect("vz publishes through the daemon");
+        check_can_boot(&*vz, &oci, &port).expect("vz publishes an OCI guest's ports");
+
+        // Hyper-V has neither seam, and is still refused before a row exists.
+        let hyperv = by_id("hyperv").unwrap();
+        assert!(!hyperv.caps().port_forward);
+        let error = check_can_boot(&*hyperv, &disk, &port)
+            .expect_err("a backend with no publication path refuses the declaration")
+            .to_string();
+        assert!(error.contains("publish a guest port"), "{error}");
     }
 
     #[test]
@@ -1533,11 +1524,12 @@ mod tests {
             ..tcp
         };
 
-        let error = validate_publish(&[tcp, another_tcp])
+        let error = crate::publish::validate(&[tcp, another_tcp], ImageKind::OciRootfs)
             .unwrap_err()
             .to_string();
         assert!(error.contains("8080/tcp"), "{error}");
-        validate_publish(&[tcp, udp]).expect("TCP and UDP have separate host-port spaces");
+        crate::publish::validate(&[tcp, udp], ImageKind::OciRootfs)
+            .expect("TCP and UDP have separate host-port spaces");
     }
 
     #[test]
@@ -1552,14 +1544,16 @@ mod tests {
             Some(GuestEgress::LoopbackGateway { .. })
         ));
 
-        // VZ and Cloud Hypervisor both have a door and still no
-        // publication: each guest holds an address of its own — on a shared
-        // NAT bridge and on a per-instance TAP respectively — so there is
-        // nothing to forward from this host's loopback. Their door does not
-        // go through the network at all, which is why it is the same one.
+        // VZ and Cloud Hypervisor publish too, but not the way QEMU does.
+        // Each guest holds an address of its own — on a shared NAT bridge and
+        // on a per-instance TAP respectively — so there is no in-VMM forward
+        // to configure and `astd` binds the declared host port and splices it
+        // to that address (`crate::publish`). Their door is a separate seam
+        // that does not go through the network at all, which is why it is the
+        // same one on both.
         for id in [vz::ID, chv::ID] {
             let caps = by_id(id).unwrap().caps();
-            assert!(!caps.port_forward, "{id} falsely advertises publication");
+            assert!(caps.port_forward, "{id} publishes through astd");
             assert_eq!(
                 caps.guest_egress,
                 Some(GuestEgress::AgentVsock {
@@ -1694,16 +1688,29 @@ mod tests {
     ///
     /// Host-neutral: the backends and their absence are injected, so this
     /// proves the contract on a developer Mac that does have QEMU installed.
+    ///
+    /// AST-139 narrowed what "genuinely needs QEMU" means. Loopback
+    /// publication is no longer on that list — `astd` publishes a VZ guest's
+    /// ports itself now (`crate::publish`) — so the case exercised here is
+    /// the one that is still QEMU's alone on a Mac: a qcow2 base image the
+    /// user pointed at directly, which Virtualization.framework cannot read
+    /// in any version.
     #[test]
-    fn a_mac_without_qemu_keeps_vz_and_refuses_a_publish_with_the_install_command() {
-        // VZ as it really is: raw disks, no loopback publication door.
+    fn a_mac_without_qemu_keeps_vz_and_refuses_a_qcow2_base_with_the_install_command() {
+        // VZ as it really is: raw disks only, and publication of its own.
         // QEMU as it really is on a machine nobody installed it on — its
         // probe fails, and the failure ends on the install command.
         let absent = qemu_install_hint();
         let mac = || {
             host(
-                fake("vz", None, false, false),
-                fake("qemu", Some(absent), true, true),
+                fake("vz", None, true, true),
+                fake_reading(
+                    "qemu",
+                    Some(absent),
+                    true,
+                    true,
+                    &[DiskFormat::Raw, DiskFormat::Qcow2],
+                ),
             )
         };
 
@@ -1714,18 +1721,27 @@ mod tests {
             "an ordinary create is VZ's, and a missing QEMU is not its problem"
         );
 
+        // ...and so is a create that publishes ports, now that VZ has that.
         let port = [PortForward {
             host: 8080,
             guest: 80,
             protocol: asterism_core::instance::PortProtocol::Tcp,
         }];
+        let published = select_with(None, CreateRequirements::new(&disk, &port), mac())
+            .expect("publication no longer needs the compatibility backend");
+        assert_eq!(
+            published.backend, "vz",
+            "`-p` is served by the product backend and must not reach for QEMU"
+        );
+
+        let qcow2 = local_qcow2();
         let error = format!(
             "{:#}",
-            select_with(None, CreateRequirements::new(&disk, &port), mac())
-                .expect_err("-p needs a door VZ does not have and QEMU is not installed")
+            select_with(None, CreateRequirements::new(&qcow2, &[]), mac())
+                .expect_err("VZ cannot read qcow2 and QEMU is not installed")
         );
         assert!(
-            error.contains("vz") && error.contains("-p"),
+            error.contains("vz") && error.contains("qcow2"),
             "the refusal has to say why the product backend could not take it: {error}"
         );
         assert!(
@@ -1737,7 +1753,7 @@ mod tests {
         // substitution back onto VZ.
         let error = format!(
             "{:#}",
-            select_with(Some("qemu"), CreateRequirements::new(&disk, &port), mac())
+            select_with(Some("qemu"), CreateRequirements::new(&qcow2, &[]), mac())
                 .expect_err("an explicitly requested absent backend is a refusal")
         );
         assert!(error.contains(absent), "{error}");

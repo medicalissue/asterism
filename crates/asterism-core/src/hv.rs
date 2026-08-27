@@ -596,9 +596,14 @@ pub struct Caps {
     /// bootloader of its own. What an OCI image needs
     /// ([`ImageKind::OciRootfs`]).
     pub direct_kernel: bool,
-    /// Can publish a guest port on this host's loopback. True where the
-    /// guest is reached through a host forward rather than at an address of
-    /// its own.
+    /// Can publish a guest port on this host's loopback (`ast create -p`).
+    ///
+    /// Deliberately says nothing about *how*. A backend with a user-mode NAT
+    /// forwards inside its own network stack; a backend that hands the guest
+    /// a private address on a NAT or a TAP is published by a listener the
+    /// daemon binds and splices to that address. Either counts, and the
+    /// difference belongs to the backend rather than to callers gating on
+    /// this. `false` is a backend that offers neither.
     pub port_forward: bool,
     /// How a guest reaches a host-side listener without one existing on the
     /// LAN, or `None` where this backend has no such path. See

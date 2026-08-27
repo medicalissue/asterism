@@ -37,7 +37,7 @@ use asterism_core::{backup, compat};
 use asterism_core::{paths, VERSION};
 
 use crate::mesh::Mesh;
-use crate::{backend, egress, persist, swap, volume, Node};
+use crate::{backend, egress, persist, publish, swap, volume, Node};
 
 /// A startup recovery attempt may span more than one provider round trip,
 /// but it may not keep daemon startup hostage indefinitely. Cancellation is
@@ -171,6 +171,10 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
                 // The port is remembered, so the next boot puts it back where
                 // the seed already says it is.
                 egress::stop(&name);
+                // Published endpoints are the opposite: the host port is let
+                // go the moment the guest behind it is proven stopped, and
+                // the durable declaration is what puts it back on `up`.
+                publish::retire(&name);
                 Ok(stopped)
             }
             Err(error) => Err(error),
@@ -216,6 +220,9 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
                 // The instance directory goes below, and this instance's CA
                 // private key is in it.
                 egress::stop(&inst.name);
+                // A removed instance has no declaration left to recover, so
+                // its host ports go back to the device unconditionally.
+                publish::retire(&inst.name);
             }
             reg.remove(&name).inspect(|inst| {
                 persist::forget(&inst.name);
@@ -434,8 +441,10 @@ fn create_instance(
     profiles: Vec<String>,
 ) -> Result<Instance> {
     ensure_new_runtime_is_vm(runtime)?;
-    backend::validate_publish(&publish)?;
     let image = backend::image_ref_recording(image)?;
+    // After the image is resolved, because whether a guest port is Asterism's
+    // own control endpoint depends on what the image turned out to be.
+    publish::validate(&publish, image.kind)?;
     check_profiles(&profiles)?;
     let requirements = backend::CreateRequirements::new(&image, &publish);
     let machine = backend::select_for(requested.as_deref(), requirements)?;
@@ -923,7 +932,24 @@ async fn claim(name: &str, node: &Node, mesh: Option<&Arc<Mesh>>) -> Result<()> 
 
 // ---- booting and stopping --------------------------------------------------
 
+/// Bring an instance's guest up, and its published endpoints with it.
+///
+/// Every path that starts a guest lands here — `ast up`, the crash
+/// supervisor's restart, and resurrection after a daemon or host restart — so
+/// this is the one place publication has to be attached to.
 pub(crate) fn up(reg: &mut Shard, name: &str, restart: Option<Restart>) -> Result<Instance> {
+    let running = up_guest(reg, name, restart)?;
+    // The guest exists now, and its address is known, so a failure here
+    // cannot be turned into a refusal without killing a guest that came up
+    // correctly. It is reported loudly instead, and stays reported: the
+    // declaration is durable, so the next `down`/`up` retries it exactly.
+    if let Err(error) = publish::ensure(&running) {
+        eprintln!("astd: {name}'s published endpoints did not come up: {error:#}");
+    }
+    Ok(running)
+}
+
+fn up_guest(reg: &mut Shard, name: &str, restart: Option<Restart>) -> Result<Instance> {
     let inst = reg.get(name)?.clone();
     if let Some(intent) = &inst.boot_intent_id {
         anyhow::bail!(
@@ -945,6 +971,10 @@ pub(crate) fn up(reg: &mut Shard, name: &str, restart: Option<Restart>) -> Resul
             let hv = backend::for_instance(&inst)?;
             volume::preflight_boot(&inst, &*hv)
         })?;
+        // A declared endpoint whose host port somebody else holds is a
+        // refusal while there is still nothing running, not a guest that
+        // boots without the endpoint it was created for.
+        publish::preflight(&inst)?;
     }
 
     // Fence this launch before it can renew one provider epoch or create one
@@ -1252,6 +1282,9 @@ pub(crate) fn reconcile(reg: &mut Shard) {
         // Stopped is the truth right now; the supervisor decides whether it
         // stays that way.
         persist::note_died(&name);
+        // The guest these forwards pointed at is gone. Holding its host
+        // ports would make a restart fail to reclaim its own declaration.
+        publish::retire(&name);
         let _ = reg.set_stopped(&name);
     }
     let _ = reg.save();

@@ -72,6 +72,7 @@ mod nbd;
 mod nbd;
 mod orbit;
 mod persist;
+mod publish;
 mod relay_meter;
 mod secret;
 mod snapshot;

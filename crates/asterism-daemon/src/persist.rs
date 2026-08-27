@@ -222,6 +222,14 @@ pub async fn resurrect(registry: &Arc<Mutex<Shard>>) {
             if let Err(e) = crate::egress::restore_running(&inst) {
                 eprintln!("astd: {name}'s secret egress did not recover: {e:#}");
             }
+            // Published endpoints are the other part of this guest the last
+            // daemon was holding. The guest kept its address, so the
+            // declaration is rebuilt on exactly its own host ports; a port
+            // something else took in the meantime is reported and left down
+            // rather than quietly moved.
+            if let Err(e) = crate::publish::ensure(&inst) {
+                eprintln!("astd: {name}'s published endpoints did not recover: {e:#}");
+            }
             continue;
         }
         if inst.policy.restart == Restart::Never {
@@ -338,6 +346,7 @@ fn restart(reg: &mut Shard, name: &str) -> bool {
         forget(name);
         if inst.status == Status::Running {
             eprintln!("astd: {name} is down and its policy says restart=never");
+            crate::publish::retire(name);
             let _ = reg.set_stopped(name);
             return true;
         }
@@ -395,6 +404,7 @@ fn give_up(reg: &mut Shard, name: &str, attempts: u32) {
     if let Err(e) = append_to_console(name, &why) {
         eprintln!("astd: could not write that to {name}'s console log: {e:#}");
     }
+    crate::publish::retire(name);
     let _ = reg.set_stopped(name);
     forget(name);
 }
@@ -428,6 +438,10 @@ fn boot_again(reg: &mut Shard, inst: &Instance) -> anyhow::Result<Instance> {
     if inst.status == Status::Running {
         let _ = reg.set_stopped(&inst.name);
     }
+    // The forwards this instance had pointed at a guest that is gone, and
+    // the guest coming back may not land on the same address. Letting the
+    // host ports go first is what lets `up` reclaim exactly the declaration.
+    crate::publish::retire(&inst.name);
     clear_stale_control(inst);
     crate::instance::up(reg, &inst.name, None)
 }
