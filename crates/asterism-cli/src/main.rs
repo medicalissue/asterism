@@ -476,7 +476,15 @@ enum Command {
     #[command(subcommand)]
     Secret(SecretCommand),
     /// List the devices in this orbit.
-    Devices,
+    Devices {
+        /// Print the rows as JSON, including the exact byte counters.
+        ///
+        /// The table rounds — `1.2 MiB` is not a number anything can
+        /// reconcile a bill against — and the relay meter it is drawn from is
+        /// the billing basis. This is how a machine reads it.
+        #[arg(long)]
+        json: bool,
+    },
     /// Add, list and remove the devices in this orbit.
     #[command(subcommand)]
     Device(DeviceCommand),
@@ -1086,9 +1094,13 @@ fn main() -> Result<()> {
             local_only("exec", device.as_deref())?;
             return guest_exec(&name, command, timeout);
         }
-        Command::Devices | Command::Device(DeviceCommand::Ls) => {
+        Command::Devices { json } => {
             local_only("devices", device.as_deref())?;
-            return print_devices();
+            return print_devices(json);
+        }
+        Command::Device(DeviceCommand::Ls) => {
+            local_only("devices", device.as_deref())?;
+            return print_devices(false);
         }
         // The one device command that is worth asking of another device:
         // "can *you* be woken" is a question about the machine you are not
@@ -2075,15 +2087,22 @@ fn local_only(what: &str, device: Option<&str>) -> Result<()> {
 
 /// `ast devices`, in the shape `tailscale status` has: who is here, what
 /// they are called, and whether they are answering right now.
-fn print_devices() -> Result<()> {
+fn print_devices(json: bool) -> Result<()> {
     let devices = match send(&Request::Devices)? {
         Response::Devices { devices } => devices,
         Response::Error { message } => bail!(message),
         other => bail!("unexpected reply from astd: {other:?}"),
     };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&devices)?);
+        return Ok(());
+    }
+    // The byte columns go on the end, after RECOVERY. The columns before them
+    // are positional in the operational suites, so appending is the only
+    // change that adds information without rewriting what reads it.
     println!(
-        "{:<24} {:<14} {:<8} {:<7} {:>8}  {:<34} RECOVERY",
-        "NAME", "DEVICE ID", "STATUS", "PATH", "RTT", "TRANSITION"
+        "{:<24} {:<14} {:<8} {:<7} {:>8}  {:<34} {:<10} {:>10} {:>10}  RELAY",
+        "NAME", "DEVICE ID", "STATUS", "PATH", "RTT", "TRANSITION", "RECOVERY", "DIRECT", "RELAYED"
     );
     for d in &devices {
         let status = if d.online { "online" } else { "offline" };
@@ -2097,7 +2116,7 @@ fn print_devices() -> Result<()> {
             .map(|us| format!("{:.1}ms", us as f64 / 1_000.0))
             .unwrap_or_else(|| "-".into());
         println!(
-            "{:<24} {:<14} {:<8} {:<7} {:>8}  {:<34} {}",
+            "{:<24} {:<14} {:<8} {:<7} {:>8}  {:<34} {:<10} {:>10} {:>10}  {}",
             name,
             d.short_id(),
             status,
@@ -2105,6 +2124,9 @@ fn print_devices() -> Result<()> {
             rtt,
             d.transition_reason.as_deref().unwrap_or("-"),
             d.recovery_result.as_deref().unwrap_or("-"),
+            human_bytes(d.bytes.direct_total()),
+            human_bytes(d.bytes.relayed_total()),
+            d.relay_url.as_deref().unwrap_or("-"),
         );
     }
     if devices.len() == 1 {
@@ -2122,15 +2144,45 @@ fn ping(device: &str) -> Result<()> {
             device_id,
             path,
             millis,
+            relay_url,
+            connection_type,
+            upgrade_millis,
+            direct_bytes_sent,
+            direct_bytes_recv,
+            relayed_bytes_sent,
+            relayed_bytes_recv,
         } => {
             let short: String = device_id.chars().take(12).collect();
+            // This first line's shape is depended on by the operational
+            // suites. Everything new goes underneath it.
             println!("pong from {device} ({short}) via {path} in {millis:.1}ms");
+            println!(
+                "  bytes    direct {} sent / {} recv, relayed {} sent / {} recv",
+                human_bytes(direct_bytes_sent),
+                human_bytes(direct_bytes_recv),
+                human_bytes(relayed_bytes_sent),
+                human_bytes(relayed_bytes_recv),
+            );
+            // A relay is a rendezvous first and a fallback second: the useful
+            // reading is not "is it relayed" but "did it get off the relay,
+            // and how fast". `mixed` is the healthy answer.
+            let conn = connection_type.as_deref().unwrap_or("-");
+            match upgrade_millis {
+                Some(ms) => println!("  path     {conn}, went direct after {ms}ms"),
+                None if conn == "relay" => {
+                    println!("  path     {conn}, still relayed — no direct path yet")
+                }
+                None => println!("  path     {conn}"),
+            }
+            println!("  relay    {}", relay_url.as_deref().unwrap_or("-"));
             Ok(())
         }
         Response::Error { message } => bail!(message),
         other => bail!("unexpected reply from astd: {other:?}"),
     }
 }
+
+use asterism_core::orbit::human_bytes;
 
 /// `ast compat` — what this build speaks, what the daemon speaks, and what
 /// the two of them settled on.
@@ -2248,7 +2300,7 @@ fn describe(min: u32, max: u32) -> String {
 
 fn device_command(cmd: DeviceCommand) -> Result<()> {
     match cmd {
-        DeviceCommand::Ls => print_devices(),
+        DeviceCommand::Ls => print_devices(false),
         DeviceCommand::Rm { name } => {
             send_ok(&Request::DeviceRemove { name: name.clone() })?;
             println!("{name}  removed from this orbit");

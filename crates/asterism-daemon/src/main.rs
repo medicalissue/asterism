@@ -71,6 +71,7 @@ mod nbd;
 mod nbd;
 mod orbit;
 mod persist;
+mod relay_meter;
 mod secret;
 mod snapshot;
 mod ssh;
@@ -472,6 +473,12 @@ async fn run_daemon(stop_source: StopSource) -> Result<()> {
             }
             _ = stop.next() => {
                 node.shell.revoke_all("astd is shutting down");
+                // The byte meter flushes on a timer; a clean stop is the other
+                // moment it must be written, or every orderly shutdown would
+                // discard up to a flush interval of accounting.
+                if let Some(mesh) = mesh.as_ref() {
+                    mesh.flush_meter().await;
+                }
                 let _ = std::fs::remove_file(&sock);
                 let _ = std::fs::remove_file(&pidfile);
                 eprintln!("astd: shutting down");

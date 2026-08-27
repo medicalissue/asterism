@@ -5,6 +5,16 @@ The CLI ships from this repository:
 | | what it is | how it is installed |
 |---|---|---|
 | **CLI** | `ast`, the `astd` daemon, and the code-signed `astd-vz` helper | `install.sh`, or Homebrew |
+| **Relay** | `astrelay`, the self-hostable relay server | **not packaged yet** — `cargo build -p asterism-relay` |
+
+`astrelay` is a server, not a device binary: it belongs on a host somewhere
+with a public address, and nothing a user installs needs it. So it is
+deliberately **not** in the CLI tarball, not in `SHA256SUMS`, and not in the
+Homebrew formula — shipping a relay to every laptop would be shipping a daemon
+nobody there will run. When a relay deployment exists it gets its own release
+lane (a container image is the likely shape); until then, self-hosters build it
+from this tree. `docs/RELAY.md` is the operator's guide.
+
 The CLI binaries belong on `PATH` and get upgraded from a shell. Desktop is
 released privately and is not built or packaged from this source tree. The
 updater deliberately retains its authenticated Desktop-manifest boundary: a

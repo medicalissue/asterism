@@ -5,6 +5,7 @@ members = [
     "crates/asterism-daemon",
     "crates/asterism-cli",
     "crates/asterism-mesh",
+    "crates/asterism-relay",
     "crates/asterism-coordinator",
     "crates/asterism-hyperv",
     "crates/asterism-vz",

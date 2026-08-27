@@ -33,12 +33,16 @@
 //! # Reachability, and whose servers provide it
 //!
 //! Trust needs no server; *reachability* does, once the two devices are not on
-//! the same wire. [`MeshMode::Discovery`] — the default — uses relays and a
-//! pkarr/DNS directory so two machines behind two different NATs can find each
-//! other by key alone. Today those are n0's public servers, which means this
-//! device publishes its public key and current addresses somewhere public;
-//! [`MeshMode::LocalOnly`] is the opt-out and [`MeshInfra`] is the seam the
-//! hosted coordination plane replaces them through. Read
+//! the same wire. [`MeshMode::Discovery`] uses relays and a pkarr/DNS
+//! directory so two machines behind two different NATs can find each other by
+//! key alone — and it names no servers of its own. [`MeshInfra`] carries them,
+//! and it is empty until either the hosted coordination plane fills it
+//! ([`MeshInfra::with_hosted`], after a login) or an operator does
+//! (`ASTERISM_RELAY_URL` and friends, `ast config set relay`, `astrelay`).
+//!
+//! So [`MeshMode::LocalOnly`] is **the default**: a fresh install relays
+//! nothing and publishes nothing. Cross-network connectivity is something a
+//! device is given, not something an installer helps itself to. Read
 //! [`endpoint`](crate::endpoint) before shipping a device into someone's
 //! house.
 //!
@@ -52,7 +56,10 @@ pub mod pairing;
 pub mod sas;
 pub mod ticket;
 
-pub use endpoint::{MeshConnection, MeshEndpoint, MeshInfra, MeshMode, MeshStream, PathKind, ALPN};
+pub use endpoint::{
+    ConnectionType, HostedDiscovery, MeshConnection, MeshEndpoint, MeshInfra, MeshMode, MeshStream,
+    PathBytes, PathKind, ALPN,
+};
 pub use identity::{DeviceId, DeviceIdentity};
 pub use pairing::{IssuedTicket, PairedPeer, PairingError};
 pub use sas::SasCode;

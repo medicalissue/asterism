@@ -1,0 +1,57 @@
+[package]
+name = "asterism-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "astrelay: Asterism's self-operated iroh relay server. Forwards ciphertext between devices that cannot reach each other directly."
+
+[[bin]]
+name = "astrelay"
+path = "src/main.rs"
+
+[dependencies]
+# The same iroh version asterism-mesh binds its endpoints to. A relay and the
+# clients that use it speak one wire protocol, and the way to keep those two
+# halves in step is to take them from one release rather than to pin them
+# apart. `server` is the feature that turns iroh-relay from a client library
+# into a server; the crate itself is not forked, only configured.
+iroh-relay = { version = "1.0.3", default-features = false, features = [
+  "server",
+  "tls-ring",
+] }
+# The metrics endpoint serves the relay's own counters and ours from one
+# registry, so our per-client group has to be built with the same crate and the
+# same version iroh-relay registers into.
+iroh-metrics = { version = "1.0.1", default-features = false, features = [
+  "metrics",
+  "service",
+] }
+# `EndpointId` — the client's public key — appears in the access-control hook
+# but is not re-exported by iroh-relay, so the shared base crate is a direct
+# dependency. Same version, so it is the same type.
+iroh-base = { version = "1.0.3", default-features = false, features = [
+  "key",
+  "relay",
+] }
+anyhow.workspace = true
+clap.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Building a `rustls::ServerConfig` for `--tls manual` needs rustls itself, and
+# it must be the same rustls iroh-relay uses, on the same `ring` provider —
+# two providers in one process is a runtime panic, not a link error.
+rustls = { version = "0.23", default-features = false, features = [
+  "ring",
+  "std",
+  "logging",
+  "tls12",
+] }
+rustls-pki-types = { version = "1.12", features = ["std"] }
+
+[dev-dependencies]
+tempfile = "3"
+# Building a `ClientRequest` in a test needs the HTTP request parts the relay
+# would have received.
+http = "1"

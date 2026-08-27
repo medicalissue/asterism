@@ -1214,6 +1214,30 @@ pub enum Response {
         device_id: String,
         path: String,
         millis: f64,
+        /// The relay in this connection's path, if any. Naming it is what
+        /// turns a latency figure into an attributable one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relay_url: Option<String>,
+        /// `direct`, `mixed`, `relay` or `-`: what the connection's open paths
+        /// add up to, which is a different question from which one is carrying
+        /// the next byte.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connection_type: Option<String>,
+        /// How long this connection took to move from the relay onto a direct
+        /// path, in milliseconds. `None` when it has not made the move.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        upgrade_millis: Option<u64>,
+        /// Bytes exchanged with this device over direct paths, cumulative.
+        #[serde(default)]
+        direct_bytes_sent: u64,
+        #[serde(default)]
+        direct_bytes_recv: u64,
+        /// Bytes exchanged with this device through a relay, cumulative. The
+        /// billing basis.
+        #[serde(default)]
+        relayed_bytes_sent: u64,
+        #[serde(default)]
+        relayed_bytes_recv: u64,
     },
 
     // ---- power and presence -------------------------------------------------
