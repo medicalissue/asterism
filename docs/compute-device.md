@@ -55,10 +55,10 @@ Asterism has. Status, list output, errors, and help always call this part
 
 What travels and what does not:
 
-- The **root disk and snapshots** transfer peer-to-peer, and only the bytes
-  this instance actually wrote. The base image is content-addressed, so the
-  target fetches it from an orbit peer that already has it rather than
-  re-downloading it.
+- The **root disk and snapshots** transfer peer-to-peer, sparsely: what
+  crosses is the blocks the instance actually allocated, not the disk's
+  declared size. The base image is content-addressed, so the target fetches
+  it from an orbit peer that already has it rather than re-downloading it.
 - The **name and id** stay as they are. Instance names resolve across the
   orbit, so `ast ssh NAME` reaches the instance from any device and needs no
   retyping after a move.
