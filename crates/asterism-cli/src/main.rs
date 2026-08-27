@@ -218,6 +218,43 @@ enum Command {
         /// The instance to look at.
         name: String,
     },
+    /// Open a port served inside an instance on this device's loopback.
+    ///
+    /// The morning after: an agent has been building a UI overnight on the
+    /// machine with the RAM, and this is how you look at it from the laptop
+    /// you are holding. The compute stays where it is; one TCP connection at
+    /// a time crosses the mesh.
+    ///
+    /// Never names a device, for the same reason `ast ssh` does not: the
+    /// instance is enough, and the daemon in front of you finds it. The
+    /// listener lives exactly as long as this command — Ctrl-C closes it.
+    ///
+    /// The port does not have to have been published with `-p`. Publishing is
+    /// a durable declaration on the device supplying the compute; this is a
+    /// tunnel, and it leaves nothing behind on either device.
+    Open {
+        /// The instance and the port it serves inside its guest: bot:3000.
+        #[arg(value_name = "NAME:PORT")]
+        target: String,
+        /// Print the address instead of opening a browser at it.
+        #[arg(long)]
+        no_browser: bool,
+        /// Print the mapping as one JSON object, and open no browser.
+        ///
+        /// For the case where something other than a person is going to dial
+        /// the port: the local address, the instance, the device really
+        /// supplying its compute, the guest port, and which mesh path is
+        /// carrying it.
+        #[arg(long)]
+        json: bool,
+        /// Bind this loopback port here instead of an ephemeral one.
+        ///
+        /// For when the URL has to be the same twice — a bookmark, an OAuth
+        /// redirect registered against a fixed port. Refused rather than
+        /// moved if something else holds it.
+        #[arg(long, value_name = "N")]
+        local_port: Option<u16>,
+    },
     /// Open a shell in a running instance (or run a command).
     ///
     /// Works from any device in the orbit and never names one: the daemon
@@ -1348,6 +1385,18 @@ fn run() -> Result<()> {
         // Which device is running the guest is the daemon's problem, not the
         // user's and not this process's: it answers with a loopback port
         // either way.
+        // Answered by the daemon in front of the user, because that is the
+        // one that can bind a listener the user can reach. `--device` would
+        // open the port on the other machine's loopback, where nobody is.
+        Command::Open {
+            target,
+            no_browser,
+            json,
+            local_port,
+        } => {
+            local_only("open", device.as_deref())?;
+            return open(&target, no_browser, json, local_port);
+        }
         Command::Ssh {
             name,
             host,
@@ -1597,6 +1646,9 @@ fn run() -> Result<()> {
         | Response::ContainerExec { .. }
         | Response::Exec { .. }
         | Response::SshEndpoint { .. }
+        // `ast open` reads its own reply on the conversation it holds open,
+        // and never returns here.
+        | Response::OpenPort { .. }
         | Response::DeviceShellStatus { .. }
         | Response::DeviceShellAccepted { .. }
         | Response::DeviceShellRefused { .. }
@@ -3730,6 +3782,187 @@ fn ssh(name: &str, command: &[String]) -> Result<()> {
     // exiting rather than leaving it to process cleanup.
     drop(conn);
     std::process::exit(status.code().unwrap_or(1));
+}
+
+// ---- `ast open` ------------------------------------------------------------
+//
+// One line, a browser, and a listener that lives exactly as long as this
+// process. The daemon does all the work — this half is the URL, the
+// parenthetical after it, and the Ctrl-C.
+
+/// The JSON object `--json` prints.
+///
+/// A struct rather than a `json!` literal because `serde_json`'s map sorts
+/// its keys and this order is deliberate: the address you dial, then what is
+/// on the other end of it, then how it gets there.
+#[derive(serde::Serialize)]
+struct OpenedJson<'a> {
+    local: String,
+    instance: &'a str,
+    device: &'a str,
+    port: u16,
+    path: &'a str,
+}
+
+/// `ast open bot:3000`.
+///
+/// The reply is an address that is already listening, so the line can be
+/// printed and the browser launched with nothing left to wait for. After that
+/// this process's only job is to *stay running*: the daemon holds the
+/// listener on behalf of this connection, so the Ctrl-C that ends this
+/// command is what closes it. Nothing is written down and nothing needs
+/// cleaning up if this process is killed instead.
+fn open(target: &str, no_browser: bool, json: bool, local_port: Option<u16>) -> Result<()> {
+    let target = asterism_core::open::parse(target)?;
+    let mut conn = Conversation::open(&Request::OpenPort {
+        name: target.name.clone(),
+        port: target.port,
+        local_port,
+    })?;
+    let opened = match conn.next()? {
+        Response::OpenPort {
+            local_port,
+            instance,
+            device,
+            port,
+            path,
+            rtt_micros,
+        } => (local_port, instance, device, port, path, rtt_micros),
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected reply from astd: {other:?}"),
+    };
+    let (local_port, instance, device, port, path, rtt_micros) = opened;
+
+    let local = format!("127.0.0.1:{local_port}");
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&OpenedJson {
+                local: local.clone(),
+                instance: &instance,
+                device: &device,
+                port,
+                path: &path,
+            })?
+        );
+    } else {
+        println!(
+            "http://{local} → {instance}:{port} on {device} {}",
+            asterism_core::open::path_suffix(&path, rtt_micros)
+        );
+        // Not under --json: a machine reading a JSON line did not ask for a
+        // window, and opening one would be a side effect it cannot see.
+        if !no_browser {
+            browse(&format!("http://{local}"));
+        }
+    }
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+
+    wait_for_interrupt();
+    if !json {
+        println!("closed {instance}:{port}");
+    }
+    // Dropping the connection is the teardown signal: the daemon drops the
+    // listener with it. Explicit rather than left to process exit, so the
+    // port is gone before this process is.
+    drop(conn);
+    Ok(())
+}
+
+/// Hand a URL to whatever the desktop opens URLs with.
+///
+/// Best effort and deliberately silent about failure. The address has already
+/// been printed, so a machine with no browser — a server, a container, a ssh
+/// session — has lost nothing; being told that `xdg-open` is missing would be
+/// noise on the line that matters.
+fn browse(url: &str) {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut c = std::process::Command::new("open");
+        c.arg(url);
+        c
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", "", url]);
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    let _ = command
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// Block until the user interrupts.
+///
+/// On Unix that is a real handler, because the command has a closing line to
+/// print and a connection to drop in order rather than by process death.
+#[cfg(unix)]
+fn wait_for_interrupt() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+    // Async-signal-safe, and nothing more than it has to be: one relaxed
+    // store. Everything else — the line, the drop — happens back on the main
+    // thread, where it is allowed to allocate.
+    extern "C" fn note(_signal: libc::c_int) {
+        INTERRUPTED.store(true, Ordering::SeqCst);
+    }
+
+    // SAFETY: `note` is `extern "C"`, takes the signal number and touches
+    // only a static atomic, which is what a handler is permitted to do.
+    unsafe {
+        libc::signal(libc::SIGINT, note as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, note as *const () as libc::sighandler_t);
+    }
+    while !INTERRUPTED.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The same on Windows, through the console's control handler.
+///
+/// Returning TRUE claims the event, which is the whole point: the *default*
+/// handler ends the process, and a process that ends here loses both the
+/// closing line and the ordered drop of the connection. The teardown would
+/// still happen — a dead process closes its socket and the daemon drops the
+/// listener — but it would happen without a word.
+#[cfg(windows)]
+fn wait_for_interrupt() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+
+    static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+    // Runs on a thread the OS makes for it, so it touches only the atomic —
+    // the same discipline the Unix handler keeps, for a different reason.
+    unsafe extern "system" fn note(_kind: u32) -> i32 {
+        INTERRUPTED.store(true, Ordering::SeqCst);
+        1
+    }
+
+    // SAFETY: registering and unregistering one function pointer with the
+    // console. A failure to register is not worth failing the command over:
+    // without the handler the default one ends the process, which is still a
+    // teardown, just a silent one.
+    unsafe {
+        SetConsoleCtrlHandler(Some(note), 1);
+    }
+    while !INTERRUPTED.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    unsafe {
+        SetConsoleCtrlHandler(Some(note), 0);
+    }
 }
 
 /// `ast ssh` into an OCI instance, said no to early and in full.

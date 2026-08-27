@@ -72,10 +72,12 @@ mod nbd;
 #[cfg(windows)]
 #[path = "nbd_windows.rs"]
 mod nbd;
+mod open;
 mod orbit;
 mod persist;
 mod publish;
 mod relay_meter;
+mod resolve;
 mod rewind;
 mod secret;
 mod snapshot;
@@ -950,6 +952,24 @@ async fn serve(conn: Admitted, node: Node, mesh: Option<Arc<Mesh>>) -> Result<()
             let (response, splice) = ssh::endpoint(name, &node, mesh.as_ref()).await;
             splices.extend(splice);
             write.send(&response).await?;
+            continue;
+        }
+
+        // `ast open` is the same arrangement as `ast ssh` and is here for the
+        // same reason: the listener it answers with has to outlive the reply,
+        // and the connection is the only thing whose lifetime is the
+        // command's. `ast` holds this socket open until Ctrl-C, so dropping
+        // these at the end of the loop is the whole of the teardown.
+        if let Request::OpenPort {
+            name,
+            port,
+            local_port,
+        } = &request
+        {
+            let (response, splice) =
+                open::endpoint(name, *port, *local_port, &node, mesh.as_ref()).await;
+            splices.extend(splice);
+            write.send(&at_most(response, spoken)).await?;
             continue;
         }
 

@@ -37,6 +37,7 @@
 //! local one rather than a parallel implementation of it.
 
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -200,6 +201,22 @@ enum MeshRequest {
     /// after that the stream carries ssh's own bytes in both directions until
     /// either end hangs up.
     SshSplice { name: String },
+    /// Hand this stream to `port` inside the guest and stop framing it.
+    ///
+    /// The third pipe, and the one that carries somebody's own service rather
+    /// than a protocol Asterism owns. `ast open bot:3000` on a laptop opens
+    /// one of these per accepted loopback connection to the device supplying
+    /// `bot`'s compute; that daemon dials the guest's *private* address on
+    /// `port` and splices.
+    ///
+    /// Deliberately not [`MeshRequest::SshSplice`] with a port on it. An ssh
+    /// splice goes to a port the guest was seeded to answer on and the far
+    /// side chooses it; this one goes to a port the *asker* names, so the far
+    /// side owes it a check of its own — the guest must be running, and
+    /// Asterism's guest-control port is never a destination. A peer too old
+    /// to make that check must refuse the stream rather than treat it as the
+    /// splice it already knows, which is what the version on it is for.
+    PortSplice { name: String, port: u16 },
     /// Open the target daemon user's explicitly enabled shell. The opening
     /// frame is followed by bounded [`ShellFrame`]s, never a raw pipe.
     DeviceShell { open: ShellOpen },
@@ -274,6 +291,11 @@ impl MeshRequest {
             MeshRequest::Rpc { request } => request.since(),
             MeshRequest::DeviceShell { .. } => 4,
             MeshRequest::Bench { .. } => 13,
+            // The asker names the guest port, so this pipe means nothing
+            // without the far side's own check of it. An older peer would
+            // deserialize the frame as an unknown tag and drop the stream;
+            // numbering it turns that into a sentence.
+            MeshRequest::PortSplice { .. } => 16,
             // This changes the pipe's authority semantics: its holder identity
             // and epoch are the provider-side writer fence, so an older peer
             // must refuse it rather than treating it as an ordinary splice.
@@ -323,6 +345,7 @@ impl MeshRequest {
             MeshRequest::Bench { .. } => "a path benchmark",
             MeshRequest::GuestKey => "a guest key",
             MeshRequest::SshSplice { .. } => "an ssh connection",
+            MeshRequest::PortSplice { .. } => "an opened guest port",
             MeshRequest::DeviceShell { .. } => "a device shell",
             MeshRequest::Gpu { .. } => "a GPU session",
             MeshRequest::VolumeSplice { .. } => "a volume connection",
@@ -1699,6 +1722,131 @@ impl Mesh {
         Ok(Some((port, identity, Splice::new(task, None))))
     }
 
+    /// A loopback port on *this* device that reaches `port` inside `name`'s
+    /// guest on `device`.
+    ///
+    /// [`Mesh::ssh_splice`]'s shape, for somebody else's service instead of
+    /// ssh. The differences are all in what is *not* here: no key, because
+    /// the bytes are not ours to authenticate; no declaration, because the
+    /// port was never published and nothing on `device` changes; and a
+    /// caller-chosen local port, because a user who wants the same URL twice
+    /// should be able to ask for it.
+    ///
+    /// The far side is asked whether the guest is running before anything is
+    /// bound, so "it is not up" is an error about the instance rather than a
+    /// URL that refuses connections a moment later.
+    pub async fn port_splice(
+        self: &Arc<Self>,
+        device: &str,
+        name: &str,
+        port: u16,
+        local_port: Option<u16>,
+    ) -> Result<Opened> {
+        // Version first, before anything is asked or bound. A peer too old to
+        // serve the stream answers `Status` perfectly happily and then refuses
+        // every connection under the URL, which would reach the user as an
+        // address that does not work rather than as a device that needs
+        // upgrading.
+        let peer = self.device(device).await?;
+        let connection = self.live_connection(&peer).await?;
+        let asking = MeshRequest::PortSplice {
+            name: name.to_owned(),
+            port,
+        };
+        if let Some(spoken) = self.spoken_on(&connection).await {
+            if asking.since() > spoken {
+                bail!(compat::frame_too_new(
+                    asking.name(),
+                    asking.since(),
+                    spoken,
+                    &format!("device {device:?}"),
+                ));
+            }
+        }
+
+        match self
+            .proxy(
+                device,
+                Request::Status {
+                    name: name.to_owned(),
+                },
+            )
+            .await?
+        {
+            Response::Instance { instance, .. } => {
+                if instance.endpoint().is_none() {
+                    bail!("{}", asterism_core::open::not_running(name));
+                }
+            }
+            Response::Error { message } => bail!(message),
+            other => bail!("device {device:?} answered with {other:?}"),
+        }
+
+        // Read off the connection that just answered, so the path printed
+        // beside the URL is the path the user's bytes are about to take.
+        let observed = self.measure_link(device).await;
+
+        let listener =
+            tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, local_port.unwrap_or(0)))
+                .await
+                .with_context(|| match local_port {
+                    Some(port) => format!(
+                        "binding 127.0.0.1:{port} — another process or instance holds it. Leave \
+                     --local-port off to take a free one"
+                    ),
+                    None => "binding a local port".to_owned(),
+                })?;
+        let local = listener.local_addr()?.port();
+
+        let (mesh, name, device) = (self.clone(), name.to_owned(), device.to_owned());
+        let task = tokio::spawn(async move {
+            // A JoinSet, so aborting this task takes every live connection
+            // with it: the listener's lifetime is the command's, and a page
+            // left open in a browser must not outlive the Ctrl-C that closed
+            // the tunnel.
+            let mut sessions = tokio::task::JoinSet::new();
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    return;
+                };
+                let (mesh, device, name) = (mesh.clone(), device.clone(), name.clone());
+                sessions.spawn(async move {
+                    if let Err(e) = splice_to_port(&mesh, &device, &name, port, tcp).await {
+                        eprintln!("astd: opening {name}:{port} on {device} failed: {e:#}");
+                    }
+                });
+                while sessions.try_join_next().is_some() {}
+            }
+        });
+        Ok(Opened {
+            local_port: local,
+            path: path_word(observed.as_ref().and_then(|o| o.path)),
+            rtt_micros: observed.and_then(|o| o.rtt_micros),
+            splice: Splice::new(task, None),
+        })
+    }
+
+    /// When this device last got an answer out of `device`, in Unix seconds.
+    ///
+    /// Two sources, and the fresher of the two wins. The orbit store records
+    /// the moment a dial succeeded; the shard cache records the moment a peer
+    /// last handed over its instances. Neither is a heartbeat and neither
+    /// pretends to be — this is "when did we last hear anything", which is
+    /// the honest thing to put in an offline refusal.
+    pub async fn last_seen(&self, device: &str) -> Option<u64> {
+        let dialed = self
+            .orbit
+            .lock()
+            .await
+            .devices()
+            .iter()
+            .find(|d| d.name == device)
+            .map(|d| d.addrs_seen_at)
+            .filter(|seen| *seen != 0);
+        let answered = ShardCache::load().seen_at(device);
+        dialed.into_iter().chain(answered).max()
+    }
+
     /// Carry one QEMU-to-NBD connection to the device holding a block volume.
     ///
     /// The same shape as [`Mesh::ssh_splice`]'s inner half, and deliberately
@@ -2744,6 +2892,23 @@ fn superseded(rows: &[OrbitRow]) -> Vec<usize> {
 /// and the drop happens at `ast down`. A unix listener also leaves a file
 /// behind, so that comes off here too — a socket nothing is listening on is a
 /// trap for the next boot.
+/// What [`Mesh::port_splice`] hands back: the URL's port, an account of the
+/// path its bytes take, and the lease on the listener.
+///
+/// A struct rather than a tuple because three of its four fields are printed
+/// on the one line the user reads, and a tuple would let two of them be
+/// swapped without anything noticing.
+pub struct Opened {
+    /// The loopback port bound on this device.
+    pub local_port: u16,
+    /// `direct` or `relay` — the vocabulary `ast devices` and `ast ping` use.
+    pub path: String,
+    /// Round trip to the device supplying the compute, if one was measured.
+    pub rtt_micros: Option<u64>,
+    /// Dropping this closes the listener and every connection under it.
+    pub splice: Splice,
+}
+
 pub struct Splice {
     task: tokio::task::JoinHandle<()>,
     /// The unix socket to unlink on the way out, when the listener was one.
@@ -2791,6 +2956,47 @@ async fn splice_to_guest(
         MeshReply::Incompatible { message, .. } => bail!(message),
         other => bail!("device {device:?} would not splice: {other:?}"),
     }
+    pump(tcp, stream).await.map(|_| ())
+}
+
+/// One accepted loopback connection, carried to `port` inside the guest on
+/// whichever device is supplying that guest's compute.
+///
+/// The same three moves as [`splice_to_guest`] — open a stream, say what it
+/// is for, read one frame — and the frame is where they differ: this one
+/// names a port the far side has to have an opinion about. A refusal comes
+/// back as an ordinary error frame, so a connection to a guest that stopped
+/// between the URL and the click closes with a reason in the daemon log
+/// rather than silently.
+async fn splice_to_port(
+    mesh: &Arc<Mesh>,
+    device: &str,
+    name: &str,
+    port: u16,
+    tcp: tokio::net::TcpStream,
+) -> Result<()> {
+    let peer = mesh.device(device).await?;
+    let connection = mesh.live_connection(&peer).await?;
+    let mut stream = connection.open_stream().await?;
+    open_stream_with(
+        &mut stream.send,
+        &MeshRequest::PortSplice {
+            name: name.to_owned(),
+            port,
+        },
+    )
+    .await?;
+    match read_frame::<MeshReply>(&mut stream.recv).await? {
+        MeshReply::SpliceReady => {}
+        MeshReply::Rpc {
+            response: Response::Error { message },
+        } => bail!(message),
+        MeshReply::Incompatible { message, .. } => bail!(message),
+        other => bail!("device {device:?} would not open {name}:{port}: {other:?}"),
+    }
+    // A request/response service over a buffered pipe pays Nagle's delay on
+    // every round trip, and a web UI is exactly that.
+    let _ = tcp.set_nodelay(true);
     pump(tcp, stream).await.map(|_| ())
 }
 
@@ -2967,6 +3173,91 @@ async fn serve_splice(
         .with_context(|| format!("connecting to {name:?}'s guest on {host}:{port}"))?;
     write_frame(&mut stream.send, &MeshReply::SpliceReady).await?;
     pump(tcp, stream).await.map(|_| ())
+}
+
+/// The far end of an opened guest port: check the rules, dial the guest's
+/// private address and become a pipe.
+///
+/// Every check `crate::publish` makes before it binds a host port is made
+/// here too, and for the same reasons — this is the same forward with the
+/// listener on somebody else's loopback:
+///
+/// * the guest must be running and must hold a private address this device
+///   can route to, which is what [`crate::publish::guest_address`] answers;
+/// * Asterism's guest-control port is never a destination, because it is not
+///   a service of the user's and carrying it would hand a peer the control
+///   plane under the name of a web page.
+///
+/// The checks are made *here*, on the device supplying the compute, and not
+/// only on the asking side. The asking side is the party they constrain.
+async fn serve_port_splice(
+    mut stream: asterism_mesh::MeshStream,
+    node: &Node,
+    name: &str,
+    port: u16,
+) -> Result<()> {
+    let target = match resolve_open_target(node, name, port).await {
+        Ok(target) => target,
+        Err(e) => {
+            let refusal = MeshReply::Rpc {
+                response: Response::Error {
+                    message: format!("{e:#}"),
+                },
+            };
+            write_frame(&mut stream.send, &refusal).await?;
+            let _ = stream.send.finish();
+            return Ok(());
+        }
+    };
+
+    // A guest that is not listening on that port should look, from the far
+    // loopback, exactly like a service that is not listening — so this
+    // failure closes the connection rather than reporting anything.
+    let tcp = tokio::net::TcpStream::connect(target)
+        .await
+        .with_context(|| format!("connecting to {name:?}'s guest on {target}"))?;
+    let _ = tcp.set_nodelay(true);
+    write_frame(&mut stream.send, &MeshReply::SpliceReady).await?;
+    pump(tcp, stream).await.map(|_| ())
+}
+
+/// Where an opened port lands on this device, or why it does not.
+///
+/// Split out from [`serve_port_splice`] because it is the whole of the rule
+/// and none of the plumbing: it is what a unit test can assert about, and
+/// what `crate::open` calls directly when the instance is on this device and
+/// there is no mesh stream in the picture at all.
+pub(crate) async fn resolve_open_target(
+    node: &Node,
+    name: &str,
+    port: u16,
+) -> Result<std::net::SocketAddr> {
+    asterism_core::open::refuse_guest_control_port(port)?;
+    // Resolved through the ordinary request path, so a conflicted or missing
+    // instance refuses here in exactly the words it refuses everywhere else.
+    let instance = match crate::handle(
+        Request::Status {
+            name: name.to_owned(),
+        },
+        node,
+    )
+    .await
+    {
+        Response::Instance { instance, .. } => instance,
+        Response::Error { message } => bail!(message),
+        other => bail!("{name:?} resolved to {other:?}"),
+    };
+    let Some(guest) = crate::publish::guest_address(&instance) else {
+        if instance.status != asterism_core::instance::Status::Running {
+            bail!("{}", asterism_core::open::not_running(name));
+        }
+        bail!(
+            "instance {name:?} has no guest address this device can route to — its backend \
+             publishes ports through the VMM's own forward, so declare the port with \
+             `ast create -p` instead of opening it"
+        );
+    };
+    Ok(std::net::SocketAddr::new(guest, port))
 }
 
 /// The provider's end of a volume splice: check the lease, then become a pipe.
@@ -3563,6 +3854,14 @@ fn guest_key() -> Result<String> {
 struct ShardCache {
     #[serde(default)]
     shards: std::collections::BTreeMap<String, Vec<Instance>>,
+    /// When each of those shards was collected, Unix seconds.
+    ///
+    /// The rows say what a device had; this says when it last said so, which
+    /// is what `ast open` puts in "dev5 is offline (last seen 4 min ago)".
+    /// Defaulted, so a cache written before this field existed loads as rows
+    /// with no timestamp rather than as no rows.
+    #[serde(default)]
+    answered_at: std::collections::BTreeMap<String, u64>,
 }
 
 impl ShardCache {
@@ -3575,10 +3874,17 @@ impl ShardCache {
 
     fn remember(&mut self, device: &str, instances: &[Instance]) {
         self.shards.insert(device.to_owned(), instances.to_vec());
+        self.answered_at
+            .insert(device.to_owned(), asterism_core::instance::now_unix());
     }
 
     fn last_seen(&self, device: &str) -> Vec<Instance> {
         self.shards.get(device).cloned().unwrap_or_default()
+    }
+
+    /// When `device` last answered a shard query, if it ever has.
+    fn seen_at(&self, device: &str) -> Option<u64> {
+        self.answered_at.get(device).copied().filter(|at| *at != 0)
     }
 
     /// Committed like everything else, and read back with none of the
@@ -3790,6 +4096,9 @@ async fn serve_stream(
         }
         MeshRequest::Bench { bytes } => return serve_bench(stream, bytes).await,
         MeshRequest::SshSplice { name } => return serve_splice(stream, &node, &name).await,
+        MeshRequest::PortSplice { name, port } => {
+            return serve_port_splice(stream, &node, &name, port).await
+        }
         MeshRequest::DeviceShell { open } => {
             return crate::device_shell::serve_mesh(stream, peer, &node, open).await
         }
@@ -4186,6 +4495,91 @@ async fn read_frame_with_len<T: serde::de::DeserializeOwned>(
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// The opening frame an `ast open` stream carries is the same flattened
+    /// shape every other stream's is: a version range plus a tagged request,
+    /// in one JSON map. A peer that reads only the tag sees `port_splice`.
+    #[test]
+    fn an_opened_port_names_itself_and_its_port_in_the_opening_frame() {
+        let request = MeshRequest::PortSplice {
+            name: "bot".into(),
+            port: 3000,
+        };
+        let wire = serde_json::to_string(&Opening {
+            protocol: 16,
+            min_protocol: 1,
+            request: &request,
+        })
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(value["kind"], "port_splice");
+        assert_eq!(value["name"], "bot");
+        assert_eq!(value["port"], 3000);
+
+        let back: Arriving = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.protocol, 16);
+        match back.request {
+            MeshRequest::PortSplice { name, port } => {
+                assert_eq!((name.as_str(), port), ("bot", 3000));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A peer from before protocol 16 refuses the stream in a sentence rather
+    /// than dropping it. Dropping it would reach the user as "the device is
+    /// off", which during a rolling upgrade is both untrue and unactionable.
+    #[test]
+    fn a_peer_that_predates_open_refuses_the_stream_by_name() {
+        let arriving = Arriving {
+            protocol: 15,
+            min_protocol: 1,
+            request: MeshRequest::PortSplice {
+                name: "bot".into(),
+                port: 3000,
+            },
+        };
+        let refusal = settle(&arriving).expect_err("protocol 15 cannot serve an opened port");
+        match *refusal {
+            MeshReply::Incompatible { message, .. } => {
+                assert!(message.contains("an opened guest port"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The same frame at protocol 16 is served, which is what makes the
+    /// refusal above a statement about the version rather than about the
+    /// frame.
+    #[test]
+    fn a_peer_at_sixteen_serves_it() {
+        let arriving = Arriving {
+            protocol: compat::PROTOCOL_VERSION,
+            min_protocol: 1,
+            request: MeshRequest::PortSplice {
+                name: "bot".into(),
+                port: 3000,
+            },
+        };
+        assert_eq!(settle(&arriving).unwrap(), compat::PROTOCOL_VERSION);
+    }
+
+    /// A shard cache written before it carried timestamps still loads, and
+    /// answers "I do not know when" rather than "at the epoch".
+    #[test]
+    fn a_shard_cache_without_timestamps_has_no_opinion_about_last_seen() {
+        let cache: ShardCache = serde_json::from_str(r#"{"shards":{"dev5":[]}}"#).unwrap();
+        assert!(cache.seen_at("dev5").is_none());
+        assert!(cache.last_seen("dev5").is_empty());
+    }
+
+    #[test]
+    fn a_remembered_shard_records_when_it_was_collected() {
+        let mut cache = ShardCache::default();
+        cache.remember("dev5", &[]);
+        let seen = cache.seen_at("dev5").expect("just remembered");
+        assert!(asterism_core::instance::now_unix().saturating_sub(seen) < 5);
+    }
 
     fn test_machine() -> asterism_core::hv::Machine {
         asterism_core::hv::Machine {

@@ -44,6 +44,7 @@ pub mod ipc;
 pub mod layout;
 pub mod ledger;
 pub mod oci;
+pub mod open;
 pub mod orbit;
 pub mod paths;
 pub mod power;

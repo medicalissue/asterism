@@ -28,5 +28,12 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde.workspace = true
 zeroize = "1"
 
+[target.'cfg(windows)'.dependencies]
+# `ast open` runs until the user interrupts it and has a closing line to
+# print, so it claims the console's Ctrl-C rather than letting the default
+# handler end the process mid-sentence. The same crate the core's named-pipe
+# door uses; this needs one function out of it.
+windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }
+
 [dev-dependencies]
 tempfile = "3"
