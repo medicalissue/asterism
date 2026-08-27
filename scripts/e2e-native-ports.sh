@@ -239,11 +239,27 @@ expect_udp_echo() {
 
 mkdir -p "$BIN/guest/bin" "$EVIDENCE"
 cp "$AST" "$ASTD" "$BIN/"
+# Both backends reach their VMM through a sibling of `astd`, and this lane
+# moves `astd`. Whatever it needs has to move with it, or the copy under test
+# is one that cannot boot anything.
 if [ "$BACKEND" = vz ]; then
   if [ -x "$(dirname "$ASTD")/astd-vz" ]; then
     cp "$(dirname "$ASTD")/astd-vz" "$BIN/astd-vz"
   else
     fail "no astd-vz beside $ASTD — run scripts/sign-vz.sh"
+  fi
+else
+  CHV_BIN="${ASTERISM_CLOUD_HYPERVISOR:-$(dirname "$ASTD")/cloud-hypervisor}"
+  if [ -x "$CHV_BIN" ]; then
+    cp "$CHV_BIN" "$BIN/cloud-hypervisor"
+  else
+    fail "no cloud-hypervisor at $CHV_BIN — put the pinned static binary beside astd, or set ASTERISM_CLOUD_HYPERVISOR"
+  fi
+  # Optional: it is what `Caps::shared_dir` turns on, and this lane attaches
+  # no directory. Copied when present so the backend under test is the one
+  # this device actually ships.
+  if [ -x "$(dirname "$ASTD")/virtiofsd" ]; then
+    cp "$(dirname "$ASTD")/virtiofsd" "$BIN/virtiofsd"
   fi
 fi
 cp "$GUEST_ARTIFACT" "$BIN/guest/bin/asterism-guest"
