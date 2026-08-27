@@ -181,6 +181,12 @@ enum MeshRequest {
     Rpc { request: Request },
     /// A round trip and nothing else: `ast ping`.
     Ping,
+    /// Send `bytes` bytes down this stream and then finish it: `ast mesh
+    /// bench`. One reply frame accepts, and everything after it is payload.
+    ///
+    /// The payload is generated, not read from anywhere. A benchmark that
+    /// opened a file would be measuring the file.
+    Bench { bytes: u64 },
     /// This device's guest key, so the asker can open guests it seeded.
     ///
     /// Answered only to a peer already in the orbit — the accept loop has
@@ -267,6 +273,7 @@ impl MeshRequest {
         match self {
             MeshRequest::Rpc { request } => request.since(),
             MeshRequest::DeviceShell { .. } => 4,
+            MeshRequest::Bench { .. } => 13,
             // This changes the pipe's authority semantics: its holder identity
             // and epoch are the provider-side writer fence, so an older peer
             // must refuse it rather than treating it as an ordinary splice.
@@ -313,6 +320,7 @@ impl MeshRequest {
         match self {
             MeshRequest::Rpc { .. } => "that request",
             MeshRequest::Ping => "a ping",
+            MeshRequest::Bench { .. } => "a path benchmark",
             MeshRequest::GuestKey => "a guest key",
             MeshRequest::SshSplice { .. } => "an ssh connection",
             MeshRequest::DeviceShell { .. } => "a device shell",
@@ -414,6 +422,13 @@ enum MeshReply {
     /// The last framed message on a stream that is becoming a pipe — an ssh
     /// session, or a volume's NBD connection.
     SpliceReady,
+    /// The last framed message before exactly `bytes` bytes of benchmark
+    /// payload. Distinct from [`MeshReply::SpliceReady`] because the asker is
+    /// about to read a known length and then a clean end of stream, not pipe
+    /// traffic in both directions.
+    BenchReady {
+        bytes: u64,
+    },
     /// The private half of this device's guest key, in OpenSSH format.
     GuestKey {
         key: String,
@@ -1012,6 +1027,73 @@ impl Mesh {
             direct_bytes_recv: bytes.direct_recv,
             relayed_bytes_sent: bytes.relayed_sent,
             relayed_bytes_recv: bytes.relayed_recv,
+        })
+    }
+
+    /// Asks a device for `bytes` bytes down one stream and times the drain.
+    ///
+    /// Timed from after the accepting reply frame, so the number is the path
+    /// moving payload and not the round trip that set it up — `ast ping`
+    /// already reports that, and adding it in here would flatter a fast path
+    /// on a long link and slander it on a short one.
+    pub async fn bench(&self, name: &str, bytes: u64) -> Result<Response> {
+        if bytes == 0 {
+            bail!("a benchmark of zero bytes measures nothing");
+        }
+        if bytes > MAX_BENCH_BYTES {
+            bail!("a benchmark of {bytes} bytes exceeds the {MAX_BENCH_BYTES}-byte limit");
+        }
+        let device = self.device(name).await?;
+        let connection = self.live_connection(&device).await?;
+        let request = MeshRequest::Bench { bytes };
+        self.require_peer_version(&connection, &request, &device.name)
+            .await?;
+        let mut stream = connection.open_stream().await?;
+        open_stream_with(&mut stream.send, &request).await?;
+        let _ = stream.send.finish();
+        match read_frame::<MeshReply>(&mut stream.recv).await? {
+            MeshReply::BenchReady { .. } => {}
+            MeshReply::Rpc {
+                response: Response::Error { message },
+            } => bail!("device {name:?} refused the benchmark: {message}"),
+            other => bail!("device {name:?} answered a benchmark with {other:?}"),
+        }
+        let started = Instant::now();
+        let mut drained: u64 = 0;
+        let mut buf = vec![0u8; BENCH_CHUNK];
+        loop {
+            let n = stream.recv.read(&mut buf).await?;
+            match n {
+                Some(0) | None => break,
+                Some(n) => drained += n as u64,
+            }
+        }
+        let elapsed = started.elapsed();
+        let millis = elapsed.as_secs_f64() * 1000.0;
+        if drained != bytes {
+            bail!("device {name:?} sent {drained} of the {bytes} bytes asked for");
+        }
+        // Read after the drain so the counters include the payload that was
+        // just moved: the difference across a bench is how much of it relayed.
+        let counters = self.meter_peer(&device.device_id, &connection).await;
+        let seconds = elapsed.as_secs_f64();
+        let mbytes_per_sec = if seconds > 0.0 {
+            drained as f64 / seconds / 1_000_000.0
+        } else {
+            0.0
+        };
+        Ok(Response::DeviceBenchResult {
+            device: device.name.clone(),
+            device_id: device.device_id.clone(),
+            bytes: drained,
+            millis,
+            mbytes_per_sec,
+            relay_url: connection.relay_url(),
+            connection_type: Some(connection.connection_type().as_str().to_owned()),
+            direct_bytes_sent: counters.direct_sent,
+            direct_bytes_recv: counters.direct_recv,
+            relayed_bytes_sent: counters.relayed_sent,
+            relayed_bytes_recv: counters.relayed_recv,
         })
     }
 
@@ -2797,6 +2879,51 @@ where
     })
 }
 
+/// The largest benchmark a peer will generate for someone who asks.
+///
+/// A cap rather than no cap because this frame is a stranger-facing request
+/// for work: the asker names a length and the answerer does the writing. One
+/// gibibyte is far past any path this is meant to characterise and still
+/// bounded, so a peer cannot be talked into an unbounded send.
+const MAX_BENCH_BYTES: u64 = 1 << 30;
+
+/// One chunk of generated benchmark payload. Sized to fill the path without
+/// making the loop itself the thing being measured.
+const BENCH_CHUNK: usize = 1 << 16;
+
+/// The far end of a benchmark: accept, then write the bytes and stop.
+///
+/// The payload is a constant buffer written repeatedly. It is never read by
+/// the asker, which only counts it — so its contents are the one part of this
+/// that does not matter, and generating it costs nothing that would show up
+/// in the number.
+async fn serve_bench(mut stream: asterism_mesh::MeshStream, bytes: u64) -> Result<()> {
+    if bytes > MAX_BENCH_BYTES {
+        let refusal = MeshReply::Rpc {
+            response: Response::Error {
+                message: format!(
+                    "a benchmark of {bytes} bytes exceeds the {MAX_BENCH_BYTES}-byte limit"
+                ),
+            },
+        };
+        write_frame(&mut stream.send, &refusal).await?;
+        let _ = stream.send.finish();
+        return Ok(());
+    }
+    write_frame(&mut stream.send, &MeshReply::BenchReady { bytes }).await?;
+    let chunk = vec![0u8; BENCH_CHUNK];
+    let mut left = bytes;
+    while left > 0 {
+        let n = left.min(BENCH_CHUNK as u64) as usize;
+        stream.send.write_all(&chunk[..n]).await?;
+        left -= n as u64;
+    }
+    // The asker times up to the end of stream, so finishing is part of the
+    // measurement and not cleanup after it.
+    let _ = stream.send.finish();
+    Ok(())
+}
+
 /// The far end of a splice: connect to the guest and become a pipe.
 async fn serve_splice(
     mut stream: asterism_mesh::MeshStream,
@@ -3661,6 +3788,7 @@ async fn serve_stream(
                 speaking: spoken,
             }
         }
+        MeshRequest::Bench { bytes } => return serve_bench(stream, bytes).await,
         MeshRequest::SshSplice { name } => return serve_splice(stream, &node, &name).await,
         MeshRequest::DeviceShell { open } => {
             return crate::device_shell::serve_mesh(stream, peer, &node, open).await
