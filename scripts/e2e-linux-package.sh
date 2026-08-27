@@ -63,7 +63,9 @@ assert_no_qemu() {
 assert_no_qemu
 ok "package inventory carries no QEMU"
 
-[ -r /dev/kvm ] && [ -w /dev/kvm ] || fail "/dev/kvm is not readable and writable"
+if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+	fail "/dev/kvm is not readable and writable"
+fi
 
 # ---- 2. install ------------------------------------------------------------
 
