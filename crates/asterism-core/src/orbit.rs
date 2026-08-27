@@ -649,6 +649,27 @@ impl Orbit {
     /// once can save the store once, or not at all. Empty facts are ignored
     /// for the same reason [`Orbit::add`] ignores them: a peer that cannot
     /// answer the question has not answered it "no".
+    /// Refreshes the routing hints of a device this orbit already trusts.
+    ///
+    /// A dial hint and nothing else: it cannot add a device, rename one, or
+    /// change what is trusted, which is why a hosted coordinator is allowed to
+    /// be the source of one. An untrusted key is silently ignored.
+    pub fn set_hints(&mut self, device_id: &str, addrs: Vec<String>, relays: Vec<String>) -> bool {
+        if addrs.is_empty() && relays.is_empty() {
+            return false;
+        }
+        match self.devices.iter_mut().find(|d| d.device_id == device_id) {
+            Some(d) if d.addrs == addrs && d.relays == relays => false,
+            Some(d) => {
+                d.addrs = addrs;
+                d.relays = relays;
+                d.addrs_seen_at = now_unix();
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn set_wake(&mut self, device_id: &str, wake: WakeFacts) -> bool {
         if wake.is_empty() {
             return false;
@@ -784,6 +805,38 @@ mod tests {
         assert_eq!(reloaded.devices(), o.devices());
         assert!(reloaded.trusts("aa"));
         assert!(!reloaded.trusts("bb"));
+    }
+
+    #[test]
+    fn hosted_hints_refresh_a_trusted_peer_and_cannot_add_an_untrusted_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut o = orbit(dir.path());
+        o.add(peer("desktop", "aa")).unwrap();
+
+        assert!(o.set_hints(
+            "aa",
+            vec!["192.0.2.9:41641".into()],
+            vec!["https://relay.example".into()],
+        ));
+        let refreshed = o.get("desktop").unwrap();
+        assert_eq!(refreshed.addrs, vec!["192.0.2.9:41641".to_owned()]);
+        assert_eq!(refreshed.relays, vec!["https://relay.example".to_owned()]);
+        assert_ne!(refreshed.addrs_seen_at, 0);
+
+        // Idempotent: the same hints twice are not a write.
+        assert!(!o.set_hints(
+            "aa",
+            vec!["192.0.2.9:41641".into()],
+            vec!["https://relay.example".into()],
+        ));
+        // Empty hints never blank out a working address.
+        assert!(!o.set_hints("aa", Vec::new(), Vec::new()));
+
+        // A key this orbit has never paired with stays out. A hosted
+        // coordinator supplies dial hints, never membership.
+        assert!(!o.set_hints("bb", vec!["192.0.2.10:41641".into()], Vec::new()));
+        assert_eq!(o.devices().len(), 1);
+        assert!(!o.trusts("bb"));
     }
 
     #[test]

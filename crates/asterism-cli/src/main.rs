@@ -40,8 +40,9 @@ use asterism_core::instance::{
     now_unix, Instance, PortForward, PortProtocol, Restart, RuntimeKind, Shape,
 };
 use asterism_core::ipc;
+use asterism_core::orbit::DeviceStatus;
 use asterism_core::proc::{ProcId, Signal};
-use asterism_core::protocol::{self, Request, Response};
+use asterism_core::protocol::{self, HostedStatus, RedactedBearer, Request, Response};
 use asterism_core::registry::OrbitRow;
 use asterism_core::{
     cow, doctor, image, oci, paths, service, snapshot, verify, windows_host, VERSION,
@@ -729,6 +730,23 @@ enum AuthCommand {
         #[arg(long)]
         coordinator: Option<String>,
     },
+    /// Enroll this device with the hosted coordinator using the stored
+    /// session. `ast auth login` does this for you; run it by hand after a
+    /// daemon restart, or to change the account-device trust setting.
+    Enroll {
+        /// Assert that the session belongs to this coordinator. When omitted,
+        /// the session's bound issuer is used.
+        #[arg(long)]
+        coordinator: Option<String>,
+        /// Let keys this account has enrolled enter this orbit's ACL.
+        ///
+        /// Off by default, and deliberately so: a pairing ticket is the trust
+        /// root, and a coordinator must not be able to add a device to an
+        /// orbit. With this off, an account-enrolled key that this orbit has
+        /// not paired with is shown by `ast devices` and dialed by nothing.
+        #[arg(long)]
+        trust_account_devices: bool,
+    },
     /// Revoke the hosted session and remove it from the OS credential store.
     Logout {
         /// Assert the expected coordinator. When omitted, the session's
@@ -1312,6 +1330,8 @@ fn main() -> Result<()> {
         | Response::Pong { .. }
         | Response::Compat { .. }
         | Response::Devices { .. }
+        // `ast auth` and `ast devices` read hosted status directly.
+        | Response::Hosted { .. }
         | Response::Ticket { .. }
         | Response::Sas { .. }
         | Response::Paired { .. }
@@ -1779,6 +1799,11 @@ fn login_with(
                     session.account.display_name,
                     session.account.provider.as_str()
                 )?;
+                // Enrolling is what signing in is for: it gives this account a
+                // private directory its own devices resolve each other
+                // through. It is reported, never required — a daemon that is
+                // down leaves a signed-in session and a working orbit.
+                arm_hosted(&session, false, output, errors);
                 return Ok(());
             }
             PollAction::Wait(next) => wait = next,
@@ -1817,16 +1842,137 @@ fn auth_command(command: AuthCommand) -> Result<()> {
                 &mut std::io::stderr(),
             )
         }
-        AuthCommand::Status { coordinator } => {
-            auth_status_with(&store, coordinator.as_deref(), &mut std::io::stdout())
-        }
-        AuthCommand::Logout { coordinator } => logout_with(
+        AuthCommand::Enroll {
+            coordinator,
+            trust_account_devices,
+        } => enroll_device(
             &store,
             coordinator.as_deref(),
+            trust_account_devices,
             &mut std::io::stdout(),
             &mut std::io::stderr(),
         ),
+        AuthCommand::Status { coordinator } => {
+            auth_status_with(&store, coordinator.as_deref(), &mut std::io::stdout())?;
+            print_hosted_status(&mut std::io::stdout())
+        }
+        AuthCommand::Logout { coordinator } => {
+            let result = logout_with(
+                &store,
+                coordinator.as_deref(),
+                &mut std::io::stdout(),
+                &mut std::io::stderr(),
+            );
+            // The local session is gone either way, so the daemon must not
+            // keep acting as this account. A daemon that is not running has
+            // no session to drop.
+            let _ = send(&Request::HostedForget);
+            result
+        }
     }
+}
+
+/// Hands the daemon the session so it can enroll this device's public mesh
+/// key. Reported rather than enforced: nothing about being signed in should
+/// depend on the daemon being up at that instant.
+fn arm_hosted(
+    session: &Session,
+    trust_account_devices: bool,
+    output: &mut dyn Write,
+    errors: &mut dyn Write,
+) {
+    let bearer = match RedactedBearer::new(session.access_token.expose()) {
+        Ok(bearer) => bearer,
+        Err(error) => {
+            let _ = writeln!(errors, "this device was not enrolled: {error:#}");
+            return;
+        }
+    };
+    let request = Request::HostedEnroll {
+        coordinator: session.issuer.clone(),
+        bearer,
+        trust_account_devices,
+    };
+    match send(&request) {
+        Ok(Response::Hosted { hosted }) => {
+            let _ = writeln!(
+                output,
+                "enrolled this device  {}  with account {}",
+                short_device(&hosted.device_id),
+                hosted.account_id.as_deref().unwrap_or("-")
+            );
+        }
+        Ok(Response::Error { message }) => {
+            let _ = writeln!(errors, "this device was not enrolled: {message}");
+        }
+        Ok(other) => {
+            let _ = writeln!(errors, "unexpected reply from astd: {other:?}");
+        }
+        Err(error) => {
+            let _ = writeln!(
+                errors,
+                "this device was not enrolled ({error:#}); run ast auth enroll once astd is up"
+            );
+        }
+    }
+}
+
+/// `ast auth enroll` — the same step `ast auth login` ends with, on its own.
+fn enroll_device(
+    store: &dyn CredentialStore,
+    expected: Option<&str>,
+    trust_account_devices: bool,
+    output: &mut dyn Write,
+    errors: &mut dyn Write,
+) -> Result<()> {
+    let Some(mut session) = store.load()? else {
+        bail!("not signed in; run ast auth login first");
+    };
+    session.issuer = bound_issuer(&session, expected)?;
+    arm_hosted(&session, trust_account_devices, output, errors);
+    Ok(())
+}
+
+/// The hosted half of `ast auth status`. Silent when this daemon has no
+/// hosted client and honest when it cannot be reached.
+fn print_hosted_status(output: &mut dyn Write) -> Result<()> {
+    let hosted = match send(&Request::HostedStatus) {
+        Ok(Response::Hosted { hosted }) => hosted,
+        _ => return Ok(()),
+    };
+    if !hosted.enrolled {
+        writeln!(output, "device     not enrolled — run ast auth enroll")?;
+        return Ok(());
+    }
+    writeln!(
+        output,
+        "device     {}  enrolled  presence {}",
+        short_device(&hosted.device_id),
+        hosted.presence.as_str()
+    )?;
+    writeln!(
+        output,
+        "directory  {}  {} account device(s)  account trust {}",
+        hosted.coordinator.as_deref().unwrap_or("-"),
+        hosted.peers.len() + 1,
+        if hosted.trust_account_devices {
+            "on"
+        } else {
+            "off"
+        }
+    )?;
+    if let Some(error) = &hosted.last_error {
+        writeln!(output, "last error {error}")?;
+    }
+    Ok(())
+}
+
+/// The same twelve characters `DeviceStatus::short_id` prints.
+fn short_device(device_id: &str) -> String {
+    if device_id.is_empty() {
+        return "-".into();
+    }
+    device_id.chars().take(12).collect()
 }
 
 fn bound_issuer(session: &Session, expected: Option<&str>) -> Result<String> {
@@ -2097,12 +2243,27 @@ fn print_devices(json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&devices)?);
         return Ok(());
     }
+    // Hosted presence is decoration on this table, so a coordinator that is
+    // unreachable costs a column and never the command.
+    let hosted = match send(&Request::HostedStatus) {
+        Ok(Response::Hosted { hosted }) => Some(hosted),
+        _ => None,
+    };
     // The byte columns go on the end, after RECOVERY. The columns before them
     // are positional in the operational suites, so appending is the only
     // change that adds information without rewriting what reads it.
     println!(
-        "{:<24} {:<14} {:<8} {:<7} {:>8}  {:<34} {:<10} {:>10} {:>10}  RELAY",
-        "NAME", "DEVICE ID", "STATUS", "PATH", "RTT", "TRANSITION", "RECOVERY", "DIRECT", "RELAYED"
+        "{:<24} {:<14} {:<8} {:<9} {:<7} {:>8}  {:<34} {:<10} {:>10} {:>10}  RELAY",
+        "NAME",
+        "DEVICE ID",
+        "STATUS",
+        "HOSTED",
+        "PATH",
+        "RTT",
+        "TRANSITION",
+        "RECOVERY",
+        "DIRECT",
+        "RELAYED"
     );
     for d in &devices {
         let status = if d.online { "online" } else { "offline" };
@@ -2116,10 +2277,11 @@ fn print_devices(json: bool) -> Result<()> {
             .map(|us| format!("{:.1}ms", us as f64 / 1_000.0))
             .unwrap_or_else(|| "-".into());
         println!(
-            "{:<24} {:<14} {:<8} {:<7} {:>8}  {:<34} {:<10} {:>10} {:>10}  {}",
+            "{:<24} {:<14} {:<8} {:<9} {:<7} {:>8}  {:<34} {:<10} {:>10} {:>10}  {}",
             name,
             d.short_id(),
             status,
+            hosted_cell(hosted.as_ref(), &d.device_id, d.is_self),
             d.path,
             rtt,
             d.transition_reason.as_deref().unwrap_or("-"),
@@ -2129,10 +2291,55 @@ fn print_devices(json: bool) -> Result<()> {
             d.relay_url.as_deref().unwrap_or("-"),
         );
     }
+    print_unpaired_account_devices(hosted.as_ref(), &devices);
     if devices.len() == 1 {
         println!("\nno other devices yet — add one with: ast device invite");
     }
     Ok(())
+}
+
+/// What the HOSTED column says for one row of `ast devices`.
+fn hosted_cell(hosted: Option<&HostedStatus>, device_id: &str, is_self: bool) -> &'static str {
+    let Some(hosted) = hosted else { return "-" };
+    if is_self {
+        return if hosted.enrolled {
+            hosted.presence.as_str()
+        } else {
+            "-"
+        };
+    }
+    match hosted.peers.iter().find(|peer| peer.device_id == device_id) {
+        Some(peer) if peer.online => "online",
+        Some(_) => "offline",
+        None => "-",
+    }
+}
+
+/// Devices the account has enrolled that this orbit has not paired with.
+///
+/// They are listed rather than hidden, and listed apart rather than mixed in,
+/// because that difference is the trust boundary: the account knows the key,
+/// this orbit does not trust it, and nothing here dials it.
+fn print_unpaired_account_devices(hosted: Option<&HostedStatus>, devices: &[DeviceStatus]) {
+    let Some(hosted) = hosted else { return };
+    let unpaired: Vec<_> = hosted
+        .peers
+        .iter()
+        .filter(|peer| !peer.in_orbit && !devices.iter().any(|d| d.device_id == peer.device_id))
+        .collect();
+    if unpaired.is_empty() {
+        return;
+    }
+    println!("\nenrolled with this account, not paired into this orbit:");
+    for peer in unpaired {
+        println!(
+            "  {:<14} {:<8} {}",
+            short_device(&peer.device_id),
+            if peer.online { "online" } else { "offline" },
+            peer.addrs.first().map(String::as_str).unwrap_or("-"),
+        );
+    }
+    println!("  pair one with: ast device invite");
 }
 
 fn ping(device: &str) -> Result<()> {
@@ -5625,6 +5832,77 @@ DAwMDAwMDAsImV4cCI6MTcwMDA0MzIwMCwic2NvcGUiOiJvcGVuaWQifQ.c2lnbmF0dXJl";
         assert!(Cli::try_parse_from(["ast", "auth", "logout"]).is_ok());
         assert!(Cli::try_parse_from(["ast", "create", "dev"]).is_ok());
         assert!(Cli::try_parse_from(["ast", "devices"]).is_ok());
+        assert!(Cli::try_parse_from(["ast", "auth", "enroll"]).is_ok());
+        assert!(Cli::try_parse_from(["ast", "auth", "enroll", "--trust-account-devices"]).is_ok());
+    }
+
+    #[test]
+    fn the_enrollment_frame_carries_a_bearer_that_no_debug_line_can_print() {
+        let request = Request::HostedEnroll {
+            coordinator: "https://asterism.run".into(),
+            bearer: RedactedBearer::new("token-not-for-logs").unwrap(),
+            trust_account_devices: false,
+        };
+        // The daemon and the CLI both print unexpected frames with `{:?}`.
+        // This is the assertion that keeps that from being a token in a log.
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("token-not-for-logs"), "{debug}");
+        assert!(debug.contains("[REDACTED]"), "{debug}");
+        // The wire itself still carries it: redaction is a Debug property,
+        // not an encoding one.
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(encoded.contains("token-not-for-logs"));
+        let round_tripped: Request = serde_json::from_str(&encoded).unwrap();
+        match round_tripped {
+            Request::HostedEnroll { bearer, .. } => {
+                assert_eq!(bearer.expose(), "token-not-for-logs");
+            }
+            other => panic!("unexpected frame {other:?}"),
+        }
+    }
+
+    #[test]
+    fn account_enrolled_devices_are_shown_apart_from_the_orbit_and_never_dialed() {
+        let hosted = HostedStatus {
+            coordinator: Some("https://asterism.run".into()),
+            account_id: Some("usr_abc".into()),
+            device_id: "a".repeat(64),
+            enrolled: true,
+            enrolled_at: 1,
+            presence: protocol::HostedPresence::Online,
+            trust_account_devices: false,
+            peers: vec![
+                protocol::HostedPeerStatus {
+                    device_id: "b".repeat(64),
+                    online: true,
+                    in_orbit: true,
+                    relays: vec!["https://relay.example".into()],
+                    addrs: vec!["192.0.2.2:41641".into()],
+                    updated_at: 2,
+                },
+                protocol::HostedPeerStatus {
+                    device_id: "c".repeat(64),
+                    online: false,
+                    in_orbit: false,
+                    relays: Vec::new(),
+                    addrs: Vec::new(),
+                    updated_at: 0,
+                },
+            ],
+            last_error: None,
+        };
+        // This device: its own presence. A paired peer: the account's view of
+        // it. A device with no hosted record at all: a dash, not a guess.
+        assert_eq!(hosted_cell(Some(&hosted), &"a".repeat(64), true), "online");
+        assert_eq!(hosted_cell(Some(&hosted), &"b".repeat(64), false), "online");
+        assert_eq!(hosted_cell(Some(&hosted), &"d".repeat(64), false), "-");
+        assert_eq!(hosted_cell(None, &"b".repeat(64), false), "-");
+    }
+
+    #[test]
+    fn a_short_device_id_is_twelve_characters_or_a_dash() {
+        assert_eq!(short_device(&"a".repeat(64)), "aaaaaaaaaaaa");
+        assert_eq!(short_device(""), "-");
     }
 
     #[test]

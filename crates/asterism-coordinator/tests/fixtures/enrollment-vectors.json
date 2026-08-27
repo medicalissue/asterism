@@ -1,0 +1,66 @@
+{
+  "comment": "Shared enrollment test vectors for the 'Device enrollment and presence' contract in medicalissue/asterism docs/hosted-coordination.md. Source of truth: medicalissue/asterism-site tests/fixtures/enrollment-vectors.json. The copy under medicalissue/asterism crates/asterism-coordinator/tests/fixtures/ must stay byte-identical.",
+  "enrollment_domain_hex": "617374657269736d2e636f6f7264696e61746f722f656e726f6c6c2f3100",
+  "generation_domain_hex": "617374657269736d2e636f6f7264696e61746f722f656e726f6c6c2d67656e65726174696f6e2f3100",
+  "valid": [
+    {
+      "name": "first-device",
+      "device_secret_seed_hex": "9ad245e529691841f8daf70b6401eea028f6fb0911cc7b3b7b63b2e3fafaca22",
+      "device_id": "056b3acbe157ead773e28779cfb77e5240b906bbe222c4a9a5783874c2223fcf",
+      "generation": "tUEGvbeq2KivKmFtSSd5_OBZT2vIHUSP2JEvLZGAPkY",
+      "generation_binding_hex": "ab48f8bc71900f044ebaf52dfd392a591637189cf7914aa78e2abdda1e2933db",
+      "nonce_hex": "4351248738959f853476c9e2de6afa90846f7ce30de5dc66e655dd3ff96d3d7f",
+      "challenge": "Q1EkhziVn4U0dsni3mr6kIRvfOMN5dxm5lXdP_ltPX-rSPi8cZAPBE669S39OSpZFjcYnPeRSqeOKr3aHikz2w",
+      "message_hex": "617374657269736d2e636f6f7264696e61746f722f656e726f6c6c2f3100ab48f8bc71900f044ebaf52dfd392a591637189cf7914aa78e2abdda1e2933db4351248738959f853476c9e2de6afa90846f7ce30de5dc66e655dd3ff96d3d7f",
+      "signature": "OPw0BWFdiOMa-LDcOKHtEdxSsEmMoXeqe3SmMxrjnSJ4MbuM5yRSdagPiIClBrjA-h0XRk8qMiXi5Xs67pvVCg"
+    },
+    {
+      "name": "second-device",
+      "device_secret_seed_hex": "875450aaf1f1cf6255455ed81b0dbccffbf774bf2671b2fb3124c68e032ada15",
+      "device_id": "9a814f57d58f68b51757498aeaf26554d3fa13124af5ca48d3a6d2b3d2ff46b1",
+      "generation": "tUEGvbeq2KivKmFtSSd5_OBZT2vIHUSP2JEvLZGAPkY",
+      "generation_binding_hex": "ab48f8bc71900f044ebaf52dfd392a591637189cf7914aa78e2abdda1e2933db",
+      "nonce_hex": "c4b472c7bbb6b6ecb451160c90c93a7b5722c5911baeef38716d1abc5489c4ff",
+      "challenge": "xLRyx7u2tuy0URYMkMk6e1cixZEbru84cW0avFSJxP-rSPi8cZAPBE669S39OSpZFjcYnPeRSqeOKr3aHikz2w",
+      "message_hex": "617374657269736d2e636f6f7264696e61746f722f656e726f6c6c2f3100ab48f8bc71900f044ebaf52dfd392a591637189cf7914aa78e2abdda1e2933dbc4b472c7bbb6b6ecb451160c90c93a7b5722c5911baeef38716d1abc5489c4ff",
+      "signature": "X239B2IT9FfPVwE-LpXSqvTsCydMInIU2yyTiQpZXDvtKX4NLLf2kZ7D-p9MOYDHV2Rg0ttA5C5SJsZKl0YKDw"
+    },
+    {
+      "name": "same-device-after-generation-roll",
+      "device_secret_seed_hex": "9ad245e529691841f8daf70b6401eea028f6fb0911cc7b3b7b63b2e3fafaca22",
+      "device_id": "056b3acbe157ead773e28779cfb77e5240b906bbe222c4a9a5783874c2223fcf",
+      "generation": "gw8qLyZ-IQxRLkMUJP4XEPZafYCjR_A17TBQjPtyTFU",
+      "generation_binding_hex": "80440aec0263705ed33127b6caf025ab61af71ac1234f4332f96d63bb08769eb",
+      "nonce_hex": "4351248738959f853476c9e2de6afa90846f7ce30de5dc66e655dd3ff96d3d7f",
+      "challenge": "Q1EkhziVn4U0dsni3mr6kIRvfOMN5dxm5lXdP_ltPX-ARArsAmNwXtMxJ7bK8CWrYa9xrBI09DMvltY7sIdp6w",
+      "message_hex": "617374657269736d2e636f6f7264696e61746f722f656e726f6c6c2f310080440aec0263705ed33127b6caf025ab61af71ac1234f4332f96d63bb08769eb4351248738959f853476c9e2de6afa90846f7ce30de5dc66e655dd3ff96d3d7f",
+      "signature": "9URsVqv7BO83tPI2x0Jgv9UG72H1Mp_gJxuQNWYfqcILwta8qEyydrgNpIrNNlrM8m_rXoDDf4XahnJpH7mhCQ"
+    }
+  ],
+  "invalid": [
+    {
+      "name": "tampered-signature",
+      "device_secret_seed_hex": "9ad245e529691841f8daf70b6401eea028f6fb0911cc7b3b7b63b2e3fafaca22",
+      "device_id": "056b3acbe157ead773e28779cfb77e5240b906bbe222c4a9a5783874c2223fcf",
+      "generation": "tUEGvbeq2KivKmFtSSd5_OBZT2vIHUSP2JEvLZGAPkY",
+      "generation_binding_hex": "ab48f8bc71900f044ebaf52dfd392a591637189cf7914aa78e2abdda1e2933db",
+      "nonce_hex": "4351248738959f853476c9e2de6afa90846f7ce30de5dc66e655dd3ff96d3d7f",
+      "challenge": "Q1EkhziVn4U0dsni3mr6kIRvfOMN5dxm5lXdP_ltPX-rSPi8cZAPBE669S39OSpZFjcYnPeRSqeOKr3aHikz2w",
+      "message_hex": "617374657269736d2e636f6f7264696e61746f722f656e726f6c6c2f3100ab48f8bc71900f044ebaf52dfd392a591637189cf7914aa78e2abdda1e2933db4351248738959f853476c9e2de6afa90846f7ce30de5dc66e655dd3ff96d3d7f",
+      "signature": "OPw0BWFdiOMa-LDcOKHtEdxSsEmMoXeqe3SmMxrjnSJ4MbuM5yRSdagPiIClBrjA-h0XRk8qMiXi5Xs67pvVCw",
+      "reason": "signature_bit_flipped"
+    },
+    {
+      "name": "wrong-generation",
+      "device_secret_seed_hex": "9ad245e529691841f8daf70b6401eea028f6fb0911cc7b3b7b63b2e3fafaca22",
+      "device_id": "056b3acbe157ead773e28779cfb77e5240b906bbe222c4a9a5783874c2223fcf",
+      "generation": "gw8qLyZ-IQxRLkMUJP4XEPZafYCjR_A17TBQjPtyTFU",
+      "generation_binding_hex": "ab48f8bc71900f044ebaf52dfd392a591637189cf7914aa78e2abdda1e2933db",
+      "nonce_hex": "4351248738959f853476c9e2de6afa90846f7ce30de5dc66e655dd3ff96d3d7f",
+      "challenge": "Q1EkhziVn4U0dsni3mr6kIRvfOMN5dxm5lXdP_ltPX-rSPi8cZAPBE669S39OSpZFjcYnPeRSqeOKr3aHikz2w",
+      "message_hex": "617374657269736d2e636f6f7264696e61746f722f656e726f6c6c2f3100ab48f8bc71900f044ebaf52dfd392a591637189cf7914aa78e2abdda1e2933db4351248738959f853476c9e2de6afa90846f7ce30de5dc66e655dd3ff96d3d7f",
+      "signature": "OPw0BWFdiOMa-LDcOKHtEdxSsEmMoXeqe3SmMxrjnSJ4MbuM5yRSdagPiIClBrjA-h0XRk8qMiXi5Xs67pvVCg",
+      "reason": "challenge_binds_a_different_generation"
+    }
+  ]
+}

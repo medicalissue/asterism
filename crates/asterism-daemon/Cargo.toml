@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 asterism-core.workspace = true
+asterism-coordinator.workspace = true
 asterism-hyperv.workspace = true
 asterism-mesh.workspace = true
 anyhow.workspace = true
@@ -46,6 +47,11 @@ rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"]
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pki-types = "1"
+# The hosted presence socket. Both crates were already in this workspace's
+# lockfile behind iroh, so the coordinator client adds no third-party code to
+# the build that was not compiled before, and no second crypto backend.
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+tokio-websockets = { version = "0.13", default-features = false, features = ["client", "ring", "rustls-platform-verifier", "rustls-tls12"] }
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["time", "process"] }

@@ -12,6 +12,9 @@ asterism-mesh.workspace = true
 blake3.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The generation commitment is SHA-256 because the canonical Worker verifies
+# the same bytes with WebCrypto, which has no BLAKE3. Already in the lockfile.
+sha2 = "0.10"
 uuid.workspace = true
 data-encoding = "2"
 # Nonces come from UUID v4 below; do not enable aes-gcm's separate RNG feature.

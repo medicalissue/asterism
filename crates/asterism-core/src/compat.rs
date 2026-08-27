@@ -119,7 +119,11 @@ use crate::VERSION;
 /// * **10** — transport-aware TCP/UDP guest port publication.
 /// * **11** — target-aware backup import with explicit OCI
 ///   re-materialization and backend selection.
-pub const PROTOCOL_VERSION: u32 = 11;
+/// * **12** — hosted-coordinator enrollment and device presence: `ast` hands
+///   the daemon a session, the daemon proves possession of its own mesh key,
+///   and the account's device list comes back as public keys, chosen
+///   endpoints and presence.
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// The wire as it was before it carried a version.
 ///
@@ -133,7 +137,7 @@ pub const FIRST_PROTOCOL: u32 = 1;
 /// How many versions back this build still serves. Protocol 8 adds runtime
 /// and GPU guest frames; keep the unnumbered protocol-1 release reachable in
 /// a rolling orbit.
-pub const SUPPORTED_BACK: u32 = 10;
+pub const SUPPORTED_BACK: u32 = 11;
 
 /// Format version of the home stamp document itself.
 pub const STAMP_VERSION: u32 = 1;

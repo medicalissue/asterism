@@ -798,6 +798,24 @@ impl Mesh {
         Ok(mesh)
     }
 
+    /// This device's mesh endpoint, for the hosted coordinator client's
+    /// address publication. Read-only: it hands out where this device says it
+    /// can be reached, and nothing that dials or trusts anyone.
+    pub(crate) fn endpoint(&self) -> &MeshEndpoint {
+        &self.endpoint
+    }
+
+    /// Everything this device has moved through a relay since the meter's
+    /// period began, for the hosted coordinator's quota accounting.
+    ///
+    /// One number, summed over every peer. The meter knows which peers those
+    /// bytes belong to; this does not hand that out, because a relay quota
+    /// does not need it and the coordinator is not told anything it does not
+    /// need. See [`crate::relay_meter`].
+    pub(crate) async fn relayed_bytes_total(&self) -> u64 {
+        self.meter.lock().await.relayed_total()
+    }
+
     /// This device's id — its public key.
     pub fn device_id(&self) -> DeviceId {
         self.endpoint.device_id()
