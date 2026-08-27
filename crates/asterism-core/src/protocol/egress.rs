@@ -56,6 +56,17 @@ pub struct EgressRequest {
     /// rather than re-derived, so the source performs the substitution the
     /// consumer authenticated and not one of its own choosing.
     pub placement: Placement,
+    /// What the source device must *do* to produce the credential it puts at
+    /// that placement: substitute the stored bytes, exchange a grant for an
+    /// access token first, or sign the whole request.
+    ///
+    /// On the frame for the same reason `placement` is. A source that looked
+    /// the rule up from a provider name would be performing an operation of
+    /// its own choosing — and a source running a different build would
+    /// perform a different one. Defaulted to substitution, so a frame from a
+    /// consumer that predates credential parts means what it always meant.
+    #[serde(default)]
+    pub rule: crate::credential::CredentialRule,
     /// Base64 in the frame — see [`base64`]. The cap on how much of it there
     /// may be is [`crate::rewrite::MAX_BODY_BYTES`].
     #[serde(with = "base64")]
@@ -246,6 +257,7 @@ mod tests {
                 name: "x-api-key".into(),
             },
             body: Vec::new(),
+            rule: crate::credential::CredentialRule::Substitute,
         };
         let rebuilt = request.header_map().unwrap();
         assert_eq!(rebuilt.get("host").unwrap(), "api.anthropic.com");
@@ -269,6 +281,7 @@ mod tests {
                 name: "x-api-key".into(),
             },
             body: vec![0xff; crate::rewrite::MAX_BODY_BYTES],
+            rule: crate::credential::CredentialRule::Substitute,
         };
         let wire = serde_json::to_vec(&request).unwrap();
         assert!(

@@ -329,6 +329,22 @@ the architecture and compatibility contract.
   $ ast attach agent --secret anthropic --to api.anthropic.com
   ```
 
+  **Credential parts** are the same mechanism, told what a provider is. `ast
+  login gh` reuses the token this device's own `gh` already holds; `ast oauth
+  add google --scopes gmail.readonly` grants a refresh token, and the door
+  mints an hour-long access token per request rather than writing one down.
+  One `--credential` binds every host that provider needs, under one handle,
+  and exports the variables the tools actually read — so `gh api user` inside
+  the guest just works, with `$GH_TOKEN` holding `sk-ast-gh-…` and the real
+  token still on your Mac. [docs/credentials.md](docs/credentials.md) is the
+  guide.
+
+  ```console
+  $ ast login gh
+  gh: signed in as medicalissue — stored on this device as credential part "gh"
+  $ ast create bot --profile claude --with gh,google
+  ```
+
   Because those calls pass through the host, Asterism can also tell you what
   they cost. `ast cost agent` reads the providers' own token counters out of
   the answers that already came back, and `ast ls` carries today's figure in a

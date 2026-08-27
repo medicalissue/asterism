@@ -1,0 +1,13 @@
+Not executed by this lane:
+  * a real Google OAuth grant. `ast oauth add google` opens a browser and
+    needs a human; the refresh -> access exchange and the Bearer substitution
+    that follow it are proved instead by the daemon test
+    egress::tests::a_refresh_rule_spends_a_grant_and_sends_only_what_it_bought,
+    against a local mock token endpoint over real TLS.
+  * a real AWS call. The SigV4 signer is proved against AWS's own published
+    get-vanilla vector and against a mock verifier that recomputes the
+    signature from the canonical request, in
+    crates/asterism-core/src/sigv4.rs; the door-side rule is proved by
+    egress::tests::a_sign_rule_signs_the_request_the_guest_actually_made.
+  * npm, docker, slack, notion and linear. Declared, marked experimental, and
+    not proved against the real service.

@@ -141,7 +141,12 @@ use crate::VERSION;
 ///   port is never declared and nothing on the far device changes, so an old
 ///   peer that cannot serve the stream must refuse it rather than mistake it
 ///   for an ssh splice.
-pub const PROTOCOL_VERSION: u32 = 16;
+/// * **17** — credential parts: `ast attach --credential gh` binds every
+///   authority a provider declares under one handle, in one frame, because
+///   half a credential is not a credential. Everything else about the
+///   feature — the parts themselves, the door rules, the revocation — rides
+///   on frames that already existed.
+pub const PROTOCOL_VERSION: u32 = 17;
 
 /// The wire as it was before it carried a version.
 ///
@@ -156,7 +161,7 @@ pub const FIRST_PROTOCOL: u32 = 1;
 /// and GPU guest frames; keep the unnumbered protocol-1 release reachable in
 /// a rolling orbit — so this moves with [`PROTOCOL_VERSION`] rather than
 /// staying put, which is what keeps the floor at [`FIRST_PROTOCOL`].
-pub const SUPPORTED_BACK: u32 = 15;
+pub const SUPPORTED_BACK: u32 = 16;
 
 /// Format version of the home stamp document itself.
 pub const STAMP_VERSION: u32 = 1;

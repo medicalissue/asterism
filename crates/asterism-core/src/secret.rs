@@ -123,6 +123,37 @@ pub struct Secret {
     pub updated_at: u64,
     #[serde(default)]
     pub sources: Vec<SourceDevice>,
+    /// What kind of part this is: a raw value, a provider login, or an
+    /// authorization grant. Defaulted, so every catalog written before
+    /// credential parts existed reads back as the raw values it holds.
+    ///
+    /// This is metadata about the *shape* of the value and never about the
+    /// value: knowing that `gh` is a login tells a reader which door rule
+    /// applies and nothing about the token.
+    #[serde(default)]
+    pub kind: crate::credential::PartKind,
+    /// The provider a credential part belongs to, as
+    /// [`crate::credential::catalog`] names it. `None` for a plain secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+}
+
+impl Secret {
+    /// A new secret with no source, of the plain kind. The constructor
+    /// exists so that adding a field here does not mean editing every
+    /// struct literal that ever made one.
+    pub fn new(id: SecretId, name: String, created_at: u64) -> Self {
+        Self {
+            id,
+            name,
+            version: 1,
+            created_at,
+            updated_at: created_at,
+            sources: Vec::new(),
+            kind: crate::credential::PartKind::Secret,
+            provider: None,
+        }
+    }
 }
 
 /// Why a secret's sources cannot be treated as interchangeable.
@@ -325,10 +356,25 @@ impl GuestHandle {
     /// Mint a fresh handle. Two v4 UUIDs' worth of randomness — 244 bits —
     /// base32'd, because a handle travels in a header and through a shell.
     pub fn mint(shape: HandleShape) -> Self {
+        Self::mint_prefixed(shape.prefix())
+    }
+
+    /// The same, wearing a prefix a provider declaration chose.
+    ///
+    /// [`HandleShape`] is the closed set of house styles this crate knows
+    /// about by name; a credential part's prefix comes out of
+    /// [`crate::credential`] and is one string among many, so it cannot be an
+    /// enum variant. The entropy is identical either way — the prefix is
+    /// cosmetic and it is the 240-odd bits after it that are the handle. The
+    /// prefix is checked where the declaration is parsed
+    /// ([`crate::credential::check_handle_prefix`]), because a handle that
+    /// could not be told from the credential it stands in for is a handle
+    /// somebody will report as a leak.
+    pub fn mint_prefixed(prefix: &str) -> Self {
         let mut bytes = [0u8; 32];
         bytes[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
         bytes[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-        let mut out = String::from(shape.prefix());
+        let mut out = String::from(prefix);
         // Crockford-ish base32 without the ambiguous glyphs, so a handle can
         // be read off a terminal and typed back in.
         const ALPHABET: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
@@ -413,6 +459,28 @@ pub struct Binding {
     /// The secret's version when the binding was made.
     pub version: u64,
     pub bound_at: u64,
+    /// The provider this binding came from, when it came from a credential
+    /// part. Carried so `ast status` can say `gh` rather than listing five
+    /// unexplained authorities, and so a detach can find every binding one
+    /// `ast attach --credential` made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Extra placements at which a *guest* may present the handle.
+    ///
+    /// Empty for a plain secret, which accepts the handle at exactly the
+    /// placement it was bound at. A credential part is wider by necessity:
+    /// `gh` sends `Authorization: token …` to some GitHub endpoints and
+    /// `Bearer …` to others, and a door that recognised only one of them
+    /// would refuse the tool it exists to serve. Every entry reads the same
+    /// *header* as `placement` — checked when the declaration is parsed —
+    /// so widening this cannot widen what [`crate::rewrite::strip`] removes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accept: Vec<Placement>,
+    /// What the source device does with the material. Defaulted to
+    /// substitution, which is what every binding written before credential
+    /// parts existed meant.
+    #[serde(default)]
+    pub rule: crate::credential::CredentialRule,
 }
 
 /// A source handle selected for one request, and whether selecting it moved.
@@ -724,6 +792,8 @@ mod tests {
             created_at: 1,
             updated_at: version,
             sources,
+            kind: crate::credential::PartKind::Secret,
+            provider: None,
         }
     }
 
@@ -980,6 +1050,9 @@ mod tests {
             source_device: "laptop".into(),
             version: 3,
             bound_at: 7,
+            provider: None,
+            accept: Vec::new(),
+            rule: crate::credential::CredentialRule::Substitute,
         };
         let json = serde_json::to_string(&binding).unwrap();
         assert!(!json.contains("value"));
@@ -1006,6 +1079,9 @@ mod tests {
             source_device: "laptop".into(),
             version: 1,
             bound_at: 1,
+            provider: None,
+            accept: Vec::new(),
+            rule: crate::credential::CredentialRule::Substitute,
         };
         let held = secret(1, vec![source("source-key", 1, &lineage)]);
         assert!(binding.refresh(&held).is_ok());

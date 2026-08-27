@@ -1575,6 +1575,32 @@ fn init_script_with_parts(
         for (name, value) in seed::egress_environment(egress) {
             s.push_str(&format!("export {name}={}\n", sh_quote(&value)));
         }
+        // The config files a credential part's tools read instead of an
+        // environment variable. Written from this same generated init for the
+        // same reason the CA is: an OCI guest has no cloud-init to do it.
+        for (index, (path, mode, content)) in egress.files.iter().enumerate() {
+            let parent = Path::new(path)
+                .parent()
+                .and_then(Path::to_str)
+                .unwrap_or("/");
+            let mut delimiter = format!("ASTERISM_CREDENTIAL_{index}");
+            while content.lines().any(|line| line == delimiter) {
+                delimiter.push('_');
+            }
+            s.push_str(&format!(
+                "$BB mkdir -p {}\n$BB cat > {} <<'{delimiter}'\n",
+                sh_quote(parent),
+                sh_quote(path)
+            ));
+            s.push_str(content);
+            if !content.ends_with('\n') {
+                s.push('\n');
+            }
+            s.push_str(&format!(
+                "{delimiter}\n$BB chmod {mode} {}\n",
+                sh_quote(path)
+            ));
+        }
     }
     if !bootstrap.is_empty() {
         s.push_str(
@@ -2499,6 +2525,7 @@ mod tests {
             ca_pem: "-----BEGIN CERTIFICATE-----\npublic\n-----END CERTIFICATE-----\n".into(),
             authorities: vec!["api.example.com:443".into()],
             handles: vec![("EXAMPLE_TOKEN".into(), "ast-handle-opaque".into())],
+            files: Vec::new(),
         }
     }
 
@@ -2714,6 +2741,7 @@ mod tests {
             ca_pem: "-----BEGIN CERTIFICATE-----\npublic\n-----END CERTIFICATE-----\n".into(),
             authorities: vec!["api.example.com:443".into()],
             handles: vec![("EXAMPLE_TOKEN".into(), "ast-handle-opaque".into())],
+            files: Vec::new(),
         };
         let bootstrap = Bootstrap::resolve(&["base".to_owned()]).unwrap();
         let gpu_boot = "$BB mkdir -p /usr/local/sbin\n\
@@ -2884,6 +2912,7 @@ mod tests {
             ca_pem: "public egress ca\n".into(),
             authorities: vec!["api.example.com:443".into()],
             handles: vec![("EXAMPLE_TOKEN".into(), "ast-handle-opaque".into())],
+            files: Vec::new(),
         };
         let bootstrap = Bootstrap::resolve(&["base".to_owned()]).unwrap();
         let parts = InstanceParts {

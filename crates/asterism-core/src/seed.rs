@@ -101,6 +101,16 @@ pub struct Egress {
     pub authorities: Vec<String>,
     /// `(environment variable, opaque handle)`, one per bound secret.
     pub handles: Vec<(String, String)>,
+    /// `(path, mode, content)` config files a credential part's tools read
+    /// instead of an environment variable — `npm` reads `.npmrc`, not
+    /// `$NPM_TOKEN`.
+    ///
+    /// The invariant above holds here too, and more sharply, because these
+    /// land on the guest's *disk*: the content may name a variable and may
+    /// never carry a value. `//registry.npmjs.org/:_authToken=${NPM_TOKEN}`
+    /// is a file that says where to look, and the thing it points at is
+    /// itself only a handle. See [`crate::credential::ProviderFile`].
+    pub files: Vec<(String, String, String)>,
 }
 
 /// Backend-neutral and backend-supplied facts that determine one NoCloud
@@ -669,6 +679,14 @@ fn egress_files(egress: &Egress) -> String {
     );
     for (key, value) in &exports {
         out.push_str(&format!("\x20     {key}={value}\n"));
+    }
+    for (path, mode, content) in &egress.files {
+        out.push_str(&format!(
+            "\x20 - path: {path}\n\x20   permissions: '{mode}'\n\x20   content: |\n"
+        ));
+        for line in content.lines() {
+            out.push_str(&format!("\x20     {line}\n"));
+        }
     }
     out
 }
@@ -1393,6 +1411,7 @@ mod tests {
             ca_pem: "-----BEGIN CERTIFICATE-----\nMIIBfake\n-----END CERTIFICATE-----".into(),
             authorities: vec!["api.anthropic.com".into()],
             handles: vec![("ANTHROPIC_API_KEY".into(), "sk-ant-ast-ZZZ".into())],
+            files: Vec::new(),
         }
     }
 

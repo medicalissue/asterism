@@ -1,0 +1,9 @@
+NAME       KIND     RULE        SUMMARY
+aws        login    sign        AWS APIs, signed at the door with SigV4  (experimental, not proved against the real service)
+docker     login    substitute  Docker Hub registry pulls and pushes  (experimental, not proved against the real service)
+github     login    substitute  GitHub API, git over HTTPS, and the gh CLI
+google     oauth    refresh     Google APIs: Gmail, Calendar, Drive, and anything gcloud reaches
+linear     login    substitute  Linear GraphQL API with a personal API key  (experimental, not proved against the real service)
+notion     login    substitute  Notion API as an internal integration  (experimental, not proved against the real service)
+npm        login    substitute  the npm registry, for private packages and publishing
+slack      oauth    substitute  Slack Web API as a workspace app  (experimental, not proved against the real service)

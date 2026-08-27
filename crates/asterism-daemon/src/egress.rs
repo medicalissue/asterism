@@ -358,16 +358,12 @@ pub(crate) fn seed_config(inst: &Instance) -> Result<seed::Egress> {
             .iter()
             .map(|binding| binding.authority.clone())
             .collect(),
-        handles: inst
-            .secrets
-            .iter()
-            .map(|binding| {
-                (
-                    binding.env.clone(),
-                    binding.guest_handle.as_str().to_owned(),
-                )
-            })
-            .collect(),
+        // Not one entry per binding: a credential part is several bindings
+        // sharing one handle, so the naive mapping would export `GH_TOKEN`
+        // five times and would never export the second name its provider
+        // declares. See `crate::credential::guest_environment`.
+        handles: crate::credential::guest_environment(&inst.secrets),
+        files: crate::credential::guest_files(&inst.secrets),
     })
 }
 
@@ -906,6 +902,10 @@ async fn carry(
             .unwrap_or_else(|| "/".into()),
         headers: EgressRequest::flatten(&headers),
         placement: binding.placement.clone(),
+        // The rule travels with the request rather than being looked up at
+        // the far end, so the source performs the operation this instance's
+        // binding authorised and not one of its own choosing.
+        rule: binding.rule.clone(),
         body: body.to_vec(),
     };
 
@@ -942,6 +942,16 @@ async fn carry(
 /// address is unreachable is the ordinary case on a laptop, and pinning one
 /// answer would turn "the first address in the list" into "whether this works
 /// at all".
+/// The same check, for the one caller outside this module: the token
+/// endpoint a `refresh` rule exchanges a grant at
+/// ([`crate::credential::post_form`]). A token endpoint that resolved to the
+/// host's own network would be a way to make this daemon hand a refresh token
+/// to something on loopback, and it is refused by exactly the rule that
+/// refuses it for a guest.
+pub(crate) async fn vet_public(authority: &str) -> Result<Vec<SocketAddr>, Refusal> {
+    vet(authority).await
+}
+
 async fn vet(authority: &str) -> Result<Vec<SocketAddr>, Refusal> {
     let target = match authority.rsplit_once(':') {
         Some((_, port)) if port.parse::<u16>().is_ok() => authority.to_owned(),
@@ -1029,20 +1039,15 @@ where
     // dropped with the request a few lines later.
     if let Some(handle) = handle {
         let material = resolve(&handle).map_err(|e| Refusal::Upstream(format!("{e:#}")))?;
-        let value = Zeroizing::new(
-            String::from_utf8(material.into_bytes())
-                .map_err(|_| Refusal::Malformed("the bound secret is not text"))?,
-        );
-        rewrite::fill(
-            &Binding {
-                // Only the placement is read by `fill`; the rest of a binding
-                // is the consumer's business and is not on this frame.
-                placement: request.placement.clone(),
-                ..placeholder()
-            },
-            &mut headers,
-            &value,
-        )?;
+        // The `Host` this request will actually carry, port included when it
+        // is not the default — because that is the header reqwest writes from
+        // the url below, and a SigV4 signature over a different one is a
+        // signature the far end rejects for a reason nobody can see.
+        let signed_host = match port {
+            443 => host.clone(),
+            port => format!("{host}:{port}"),
+        };
+        apply_rule(&handle, &material, &request, &signed_host, &mut headers).await?;
     }
 
     let scheme = if request.tls { "https" } else { "http" };
@@ -1094,13 +1099,117 @@ where
     })
 }
 
+/// Turn the material this device holds into the credential this request
+/// carries, and put it where the frame says.
+///
+/// The three arms are the three door rules, and they are the only place in
+/// the daemon where the difference between them exists. Everything before
+/// this point — the policy, the handle, the strip, the frame — is identical
+/// whether the part is a GitHub token, a Google grant or an AWS key pair,
+/// which is what makes credential parts an extension of the secret plane
+/// rather than a second one.
+async fn apply_rule(
+    handle: &Handle,
+    material: &asterism_core::protocol::SecretValue,
+    request: &EgressRequest,
+    host: &str,
+    headers: &mut http::HeaderMap,
+) -> Result<(), Refusal> {
+    let placement = &request.placement;
+    let fill = |headers: &mut http::HeaderMap, value: &str| {
+        rewrite::fill(
+            &Binding {
+                // Only the placement is read by `fill`; the rest of a binding
+                // is the consumer's business and is not on this frame.
+                placement: placement.clone(),
+                ..placeholder()
+            },
+            headers,
+            value,
+        )
+    };
+    match &request.rule {
+        // The stored bytes are the credential.
+        asterism_core::credential::CredentialRule::Substitute => {
+            let value = Zeroizing::new(
+                std::str::from_utf8(material.as_bytes())
+                    .map_err(|_| Refusal::Malformed("the bound secret is not text"))?
+                    .to_owned(),
+            );
+            fill(headers, &value)
+        }
+        // The stored bytes buy the credential. The exchange happens here,
+        // seconds before the connection out, and what it produces is never
+        // written down — see `crate::credential`.
+        asterism_core::credential::CredentialRule::Refresh {
+            token_url,
+            skew_secs,
+        } => {
+            let grant = asterism_core::credential::OAuthGrant::parse(material.as_bytes())
+                .map_err(|e| Refusal::Upstream(format!("{e:#}")))?;
+            let token = crate::credential::access_token(
+                handle,
+                &grant,
+                token_url,
+                *skew_secs,
+                asterism_core::instance::now_unix(),
+            )
+            .await
+            .map_err(|e| Refusal::Upstream(format!("{e:#}")))?;
+            fill(headers, &token)
+        }
+        // There is no credential to substitute: the credential *is* a
+        // signature over this request, and the guest never held anything that
+        // could produce one.
+        asterism_core::credential::CredentialRule::Sign {
+            algorithm: asterism_core::credential::SigningAlgorithm::AwsSigv4,
+            service,
+            region,
+        } => {
+            let keys = asterism_core::credential::SigningKeys::parse(material.as_bytes())
+                .map_err(|e| Refusal::Upstream(format!("{e:#}")))?;
+            // The blank the consumer left is not part of what is signed: the
+            // signer writes this header itself.
+            headers.remove(placement.header());
+            let rest: Vec<(String, String)> =
+                asterism_core::protocol::EgressRequest::flatten(headers);
+            let signed = asterism_core::sigv4::sign(
+                &asterism_core::sigv4::Key {
+                    access_key_id: &keys.access_key_id,
+                    secret_access_key: &keys.secret_access_key,
+                    session_token: keys.session_token.as_deref(),
+                },
+                &asterism_core::sigv4::Request {
+                    method: &request.method,
+                    target: &request.target,
+                    host,
+                    headers: &rest,
+                    body: &request.body,
+                    service,
+                    region,
+                    now: asterism_core::instance::now_unix(),
+                },
+            );
+            for (name, value) in signed.headers {
+                let name = http::HeaderName::try_from(name.as_str())
+                    .map_err(|_| Refusal::Malformed("a signed header name is not a token"))?;
+                let mut value = http::HeaderValue::try_from(value)
+                    .map_err(|_| Refusal::Malformed("a signature is not a header value"))?;
+                value.set_sensitive(true);
+                headers.insert(name, value);
+            }
+            Ok(())
+        }
+    }
+}
+
 /// The client every upstream call is made with.
 ///
 /// A function rather than an inline builder so that the one thing a test needs
 /// to change — which roots are trusted, so a fake upstream on loopback can be
 /// reached — is a `cfg(test)` branch in one place, and does not exist at all
 /// in a released binary.
-fn client_builder() -> reqwest::ClientBuilder {
+pub(crate) fn client_builder() -> reqwest::ClientBuilder {
     let builder = reqwest::Client::builder();
     #[cfg(test)]
     let builder = match tests::extra_root() {
@@ -1152,6 +1261,9 @@ fn placeholder() -> Binding {
         source_device: String::new(),
         version: 0,
         bound_at: 0,
+        provider: None,
+        accept: Vec::new(),
+        rule: asterism_core::credential::CredentialRule::Substitute,
     }
 }
 
@@ -1359,6 +1471,9 @@ mod tests {
             source_device: "laptop".into(),
             version: 1,
             bound_at: 1,
+            provider: None,
+            accept: Vec::new(),
+            rule: asterism_core::credential::CredentialRule::Substitute,
         }
     }
 
@@ -1412,11 +1527,30 @@ mod tests {
     }
 
     /// A real HTTPS server on loopback that records the headers it is sent.
+    ///
+    /// It answers two things: `/token`, in the shape an OAuth token endpoint
+    /// answers, and everything else in the shape an API answers. One server
+    /// because there is one test root, and one root because
+    /// [`client_builder`]'s test hook is one PEM — which is the honest
+    /// constraint rather than a shortcut: what is being proved is that the
+    /// door exchanges a grant and sends the *result*, and that is visible
+    /// whether the two endpoints share a certificate or not.
     struct Upstream {
         port: u16,
         ca_pem: String,
         seen: Arc<StdMutex<Vec<(String, String)>>>,
+        /// The bodies `/token` was posted, so a test can prove the refresh
+        /// token was spent exactly once and the access token was reused.
+        token_requests: Arc<StdMutex<Vec<String>>>,
     }
+
+    /// What the mock token endpoint hands back. Distinctive so that finding
+    /// it anywhere is unambiguous.
+    const MOCK_ACCESS_TOKEN: &str = "ya29.MOCK-ACCESS-TOKEN-3c0ffee";
+    /// The refresh token the store holds. It buys an access token and is
+    /// never itself something an API accepts, so it must reach the token
+    /// endpoint and nowhere else.
+    const MOCK_REFRESH_TOKEN: &str = "1//MOCK-REFRESH-TOKEN-d0not5end";
 
     async fn upstream() -> Upstream {
         provider();
@@ -1432,13 +1566,16 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("a port");
         let port = listener.local_addr().unwrap().port();
         let seen: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(Vec::new()));
+        let token_requests: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
         let recorder = seen.clone();
+        let tokens = token_requests.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     continue;
                 };
-                let (acceptor, recorder) = (acceptor.clone(), recorder.clone());
+                let (acceptor, recorder, tokens) =
+                    (acceptor.clone(), recorder.clone(), tokens.clone());
                 tokio::spawn(async move {
                     let Ok(tls) = acceptor.accept(stream).await else {
                         return;
@@ -1447,13 +1584,35 @@ mod tests {
                         .serve_connection(
                             TokioIo::new(tls),
                             service_fn(move |req: hyper::Request<Incoming>| {
-                                let recorder = recorder.clone();
+                                let (recorder, tokens) = (recorder.clone(), tokens.clone());
                                 async move {
-                                    for (name, value) in req.headers() {
-                                        recorder.lock().expect("seen poisoned").push((
-                                            name.as_str().to_owned(),
-                                            value.to_str().unwrap_or_default().to_owned(),
-                                        ));
+                                    let is_token = req.uri().path() == "/token";
+                                    if !is_token {
+                                        for (name, value) in req.headers() {
+                                            recorder.lock().expect("seen poisoned").push((
+                                                name.as_str().to_owned(),
+                                                value.to_str().unwrap_or_default().to_owned(),
+                                            ));
+                                        }
+                                    }
+                                    let body = req
+                                        .into_body()
+                                        .collect()
+                                        .await
+                                        .map(|collected| collected.to_bytes())
+                                        .unwrap_or_default();
+                                    if is_token {
+                                        tokens
+                                            .lock()
+                                            .expect("tokens poisoned")
+                                            .push(String::from_utf8_lossy(&body).into_owned());
+                                        return Ok::<_, std::convert::Infallible>(
+                                            hyper::Response::new(Full::new(Bytes::from(format!(
+                                                "{{\"access_token\":\"{MOCK_ACCESS_TOKEN}\",\
+                                                 \"expires_in\":3600,\
+                                                 \"token_type\":\"Bearer\"}}"
+                                            )))),
+                                        );
                                     }
                                     Ok::<_, std::convert::Infallible>(hyper::Response::new(
                                         Full::new(Bytes::from_static(b"{\"upstream\":\"ok\"}")),
@@ -1465,7 +1624,12 @@ mod tests {
                 });
             }
         });
-        Upstream { port, ca_pem, seen }
+        Upstream {
+            port,
+            ca_pem,
+            seen,
+            token_requests,
+        }
     }
 
     /// Start a proxy for one binding, without a registry or a daemon behind
@@ -1497,6 +1661,248 @@ mod tests {
             .timeout(Duration::from_secs(20))
             .build()
             .expect("a guest client")
+    }
+
+    /// A source device holding whatever bytes the test says, under whatever
+    /// rule the binding says.
+    ///
+    /// The same `egress_with` the real one uses, so what is exercised is the
+    /// production path and not a description of it.
+    struct RuleSource {
+        material: Vec<u8>,
+        /// One handle for the life of this source, rather than a fresh mint
+        /// per call. A handle names a version *and* a revision, and a real
+        /// one is stable until the part is rotated — which is what lets the
+        /// access-token cache be keyed on it.
+        handle: Handle,
+    }
+
+    impl Source for RuleSource {
+        fn handle_for<'a>(&'a self, _binding: &'a Binding) -> Fut<'a, Result<Handle>> {
+            let handle = self.handle.clone();
+            Box::pin(async move { Ok(handle) })
+        }
+
+        fn egress<'a>(
+            &'a self,
+            _binding: &'a Binding,
+            handle: Option<Handle>,
+            request: EgressRequest,
+        ) -> Fut<'a, Result<EgressResponse>> {
+            let material = self.material.clone();
+            Box::pin(async move {
+                egress_with(handle, request, move |_| Ok(SecretValue::new(material)))
+                    .await
+                    .map_err(|refusal| anyhow!("{refusal}"))
+            })
+        }
+    }
+
+    fn credential_binding(
+        authority: &str,
+        rule: asterism_core::credential::CredentialRule,
+    ) -> Binding {
+        Binding {
+            placement: Placement::Authorization {
+                scheme: "Bearer".into(),
+            },
+            guest_handle: GuestHandle::mint_prefixed("sk-ast-google-"),
+            secret: "google".into(),
+            env: "GOOGLE_OAUTH_ACCESS_TOKEN".into(),
+            provider: Some("google".into()),
+            rule,
+            authority: authority.to_owned(),
+            ..binding(authority)
+        }
+    }
+
+    /// The `refresh` rule, end to end, against a local mock token endpoint.
+    ///
+    /// A real guest client, a real CONNECT, a real TLS termination, the real
+    /// policy — and then the thing this rule adds: the source device reads a
+    /// *grant* out of its store, spends it at the token endpoint, and sends
+    /// the access token it got back. What is asserted is where each of the
+    /// three credentials was allowed to be.
+    ///
+    /// The grant here is a fixture rather than a real Google authorization,
+    /// which is the honest limit of this test and of the lane beside it: a
+    /// real grant needs a human in a browser. What is *not* mocked is the
+    /// exchange, the substitution, the caching, or any of the plumbing
+    /// between them.
+    #[tokio::test]
+    async fn a_refresh_rule_spends_a_grant_and_sends_only_what_it_bought() {
+        let _exclusive = exclusive().await;
+        ALLOW_LOOPBACK.store(true, Ordering::Relaxed);
+        let up = upstream().await;
+        *EXTRA_ROOT.lock().unwrap() = Some(up.ca_pem.clone());
+
+        let authority = format!("localhost:{}", up.port);
+        let bound = credential_binding(
+            &authority,
+            asterism_core::credential::CredentialRule::Refresh {
+                token_url: format!("https://localhost:{}/token", up.port),
+                skew_secs: 120,
+            },
+        );
+        let handle_text = bound.guest_handle.as_str().to_owned();
+        let grant = serde_json::to_vec(&asterism_core::credential::OAuthGrant {
+            marker: asterism_core::credential::OAUTH_MARKER,
+            provider: "google".into(),
+            refresh_token: MOCK_REFRESH_TOKEN.into(),
+            scopes: vec!["https://www.googleapis.com/auth/gmail.readonly".into()],
+            client_id: "mock-client-id".into(),
+            client_secret: Some("mock-client-secret".into()),
+            token_url: format!("https://localhost:{}/token", up.port),
+            account: Some("someone@example.com".into()),
+        })
+        .unwrap();
+        let source = Arc::new(RuleSource {
+            material: grant,
+            handle: handle(),
+        });
+        let (port, ca_pem, _dir) = proxy(vec![bound.clone()], source).await;
+
+        let response = guest(port, &ca_pem)
+            .get(format!("https://{authority}/gmail/v1/users/me/profile"))
+            // Exactly what `curl` inside the guest would send, having read
+            // the handle out of `$GOOGLE_OAUTH_ACCESS_TOKEN`.
+            .header("authorization", format!("Bearer {handle_text}"))
+            .send()
+            .await
+            .expect("the proxied request should reach the upstream");
+        assert_eq!(response.status(), 200);
+
+        // 1. The token endpoint was asked, with the refresh grant.
+        let asked = up.token_requests.lock().unwrap().clone();
+        assert_eq!(asked.len(), 1, "the grant was spent {} times", asked.len());
+        assert!(
+            asked[0].contains("grant_type=refresh_token"),
+            "{}",
+            asked[0]
+        );
+        assert!(asked[0].contains("mock-client-id"), "{}", asked[0]);
+
+        // 2. The API got the access token, as a Bearer.
+        let received = up.seen.lock().unwrap().clone();
+        let sent = received
+            .iter()
+            .find(|(name, _)| name == "authorization")
+            .map(|(_, value)| value.clone())
+            .expect("the upstream should have been sent an Authorization header");
+        assert_eq!(sent, format!("Bearer {MOCK_ACCESS_TOKEN}"));
+
+        // 3. And never the refresh token or the handle. The refresh token is
+        //    not something an API accepts, so sending it there would be both
+        //    a leak and a bug that fails silently.
+        assert!(
+            !received
+                .iter()
+                .any(|(_, value)| value.contains(MOCK_REFRESH_TOKEN)),
+            "the refresh token reached the API"
+        );
+        assert!(
+            !received
+                .iter()
+                .any(|(_, value)| value.contains(&handle_text)),
+            "the guest's handle reached the API"
+        );
+
+        // 4. A second call reuses the token that is still good. The access
+        //    token is not written down anywhere, so "cached" has to mean in
+        //    this process and nowhere else — and this is what proves the
+        //    cache exists at all.
+        guest(port, &ca_pem)
+            .get(format!("https://{authority}/gmail/v1/users/me/messages"))
+            .header("authorization", format!("Bearer {handle_text}"))
+            .send()
+            .await
+            .expect("the second call should also reach the upstream");
+        assert_eq!(
+            up.token_requests.lock().unwrap().len(),
+            1,
+            "the grant was spent again for a token that was still good"
+        );
+
+        ALLOW_LOOPBACK.store(false, Ordering::Relaxed);
+        *EXTRA_ROOT.lock().unwrap() = None;
+    }
+
+    /// The `sign` rule, end to end, against a verifier that recomputes the
+    /// signature the way a service would.
+    ///
+    /// The signer itself is proved against AWS's published vector in
+    /// `asterism_core::sigv4`. What this proves is the part that lives here:
+    /// that a request arriving at the door with a handle in it leaves it
+    /// signed, over the body and the target it actually carries, with a key
+    /// the guest never held.
+    #[tokio::test]
+    async fn a_sign_rule_signs_the_request_the_guest_actually_made() {
+        let _exclusive = exclusive().await;
+        ALLOW_LOOPBACK.store(true, Ordering::Relaxed);
+        let up = upstream().await;
+        *EXTRA_ROOT.lock().unwrap() = Some(up.ca_pem.clone());
+
+        let authority = format!("localhost:{}", up.port);
+        let bound = credential_binding(
+            &authority,
+            asterism_core::credential::CredentialRule::Sign {
+                algorithm: asterism_core::credential::SigningAlgorithm::AwsSigv4,
+                service: "sts".into(),
+                region: "us-east-1".into(),
+            },
+        );
+        let handle_text = bound.guest_handle.as_str().to_owned();
+        let source = Arc::new(RuleSource {
+            material: b"AKIDEXAMPLE\nwJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_vec(),
+            handle: handle(),
+        });
+        let (port, ca_pem, _dir) = proxy(vec![bound.clone()], source).await;
+
+        let response = guest(port, &ca_pem)
+            .post(format!("https://{authority}/"))
+            .header("authorization", format!("Bearer {handle_text}"))
+            .body("Action=GetCallerIdentity&Version=2011-06-15")
+            .send()
+            .await
+            .expect("the proxied request should reach the upstream");
+        assert_eq!(response.status(), 200);
+
+        let received = up.seen.lock().unwrap().clone();
+        let signature = received
+            .iter()
+            .find(|(name, _)| name == "authorization")
+            .map(|(_, value)| value.clone())
+            .expect("the upstream should have been sent an Authorization header");
+        // The guest's handle was replaced by a signature, and the signature
+        // names the credential the *source* holds.
+        assert!(signature.starts_with("AWS4-HMAC-SHA256 "), "{signature}");
+        assert!(signature.contains("Credential=AKIDEXAMPLE/"), "{signature}");
+        assert!(
+            signature.contains("/us-east-1/sts/aws4_request"),
+            "{signature}"
+        );
+        assert!(!signature.contains(&handle_text), "{signature}");
+        // The signature covers the body the guest sent, so the payload hash
+        // header has to be the one for those bytes.
+        let payload = received
+            .iter()
+            .find(|(name, _)| name == "x-amz-content-sha256")
+            .map(|(_, value)| value.clone())
+            .expect("a signed request carries its payload hash");
+        assert_eq!(
+            payload,
+            asterism_core::sigv4::payload_hash(b"Action=GetCallerIdentity&Version=2011-06-15")
+        );
+        // And the secret key itself never went anywhere.
+        assert!(
+            !received
+                .iter()
+                .any(|(_, value)| value.contains("wJalrXUtnFEMI")),
+            "the signing key reached the upstream"
+        );
+
+        ALLOW_LOOPBACK.store(false, Ordering::Relaxed);
+        *EXTRA_ROOT.lock().unwrap() = None;
     }
 
     /// The end-to-end proof, and the reason the rest of this module exists.
@@ -1589,6 +1995,7 @@ mod tests {
             ca_pem: ca_pem.clone(),
             authorities: vec![bound.authority.clone()],
             handles: vec![(bound.env.clone(), handle_text.clone())],
+            files: Vec::new(),
         };
         assert!(!format!("{egress:?}").contains(REAL_VALUE));
         assert!(!ca_pem.contains(REAL_VALUE));
@@ -2228,7 +2635,12 @@ mod tests {
                 });
             }
         });
-        Upstream { port, ca_pem, seen }
+        Upstream {
+            port,
+            ca_pem,
+            seen,
+            token_requests: Arc::new(StdMutex::new(Vec::new())),
+        }
     }
 
     fn model_api_body(target: &str) -> &'static [u8] {

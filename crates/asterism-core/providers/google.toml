@@ -1,0 +1,62 @@
+# Google — an oauth part: what this device keeps is a refresh token, and the
+# access token the guest's request actually carries is minted at the door,
+# seconds before the connection out, and never written down.
+#
+# That is the whole reason `oauth` is a kind of its own rather than a secret
+# with a long value in it. A refresh token is not something an API accepts;
+# it is something that buys an hour of something an API accepts. A part that
+# could only substitute would have to keep the hour-old access token
+# somewhere, and "somewhere" is a file.
+name = "google"
+kind = "oauth"
+summary = "Google APIs: Gmail, Calendar, Drive, and anything gcloud reaches"
+
+handle_prefix = "sk-ast-google-"
+
+# Exact hosts, so the set is readable. Google fronts most of its APIs on
+# per-product `*.googleapis.com` names and the rest on `www.googleapis.com`.
+authorities = [
+  "www.googleapis.com",
+  "gmail.googleapis.com",
+  "calendar-json.googleapis.com",
+  "people.googleapis.com",
+  "drive.googleapis.com",
+  "sheets.googleapis.com",
+  "docs.googleapis.com",
+  "cloudresourcemanager.googleapis.com",
+  "storage.googleapis.com",
+]
+
+# `gcloud` reads CLOUDSDK_AUTH_ACCESS_TOKEN and skips its own credential
+# machinery entirely; the Google client libraries read GOOGLE_OAUTH_ACCESS_TOKEN.
+env = ["GOOGLE_OAUTH_ACCESS_TOKEN", "CLOUDSDK_AUTH_ACCESS_TOKEN"]
+
+[rule]
+type = "refresh"
+placement = "bearer"
+accept = ["bearer"]
+# Where the source device exchanges refresh → access. Public configuration:
+# the grant itself never leaves the store.
+token_url = "https://oauth2.googleapis.com/token"
+# An access token is minted this many seconds before the one in hand expires,
+# because a token that expires in flight fails in somebody else's log.
+refresh_skew_secs = 120
+
+[oauth]
+device_authorization_url = "https://oauth2.googleapis.com/device/code"
+token_url = "https://oauth2.googleapis.com/token"
+# Google's device flow covers a limited scope set; anything outside it needs
+# the loopback redirect flow, which `ast oauth add` falls back to.
+device_flow_scopes = [
+  "https://www.googleapis.com/auth/userinfo.email",
+  "https://www.googleapis.com/auth/userinfo.profile",
+  "https://www.googleapis.com/auth/drive",
+  "https://www.googleapis.com/auth/youtube",
+]
+default_scopes = ["https://www.googleapis.com/auth/userinfo.email"]
+# Short names a human can type. `--scopes gmail.readonly` is the same grant
+# as the URL underneath it, and the URL is what goes on the wire.
+scope_prefix = "https://www.googleapis.com/auth/"
+# Google issues no public client id: a grant needs one registered by whoever
+# owns the project, so `ast oauth add google` asks for --client-id.
+client_id_required = true

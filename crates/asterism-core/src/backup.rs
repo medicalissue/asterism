@@ -1220,6 +1220,9 @@ mod tests {
             source_device: "source".into(),
             version: 1,
             bound_at: 1,
+            provider: None,
+            accept: Vec::new(),
+            rule: crate::credential::CredentialRule::Substitute,
         });
         inst.gpu = Some(GpuAttachment {
             provider_device: "gpu-box".into(),

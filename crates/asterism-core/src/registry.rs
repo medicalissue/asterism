@@ -711,7 +711,16 @@ impl Shard {
                 clash.authority
             );
         }
-        if let Some(clash) = inst.secrets.iter().find(|held| held.env == binding.env) {
+        // One variable per guest, except when the two bindings *are* one
+        // credential. A credential part is several authorities under a single
+        // handle and a single `GH_TOKEN`, so the second and subsequent
+        // bindings it makes share an environment variable by construction —
+        // and sharing it is the point, not a collision.
+        if let Some(clash) = inst
+            .secrets
+            .iter()
+            .find(|held| held.env == binding.env && held.secret != binding.secret)
+        {
             bail!(
                 "{name:?} already exports {:?} as ${} — pick another with --env",
                 clash.secret,
@@ -757,15 +766,29 @@ impl Shard {
 
     /// Take a secret off an instance, by its orbit name.
     ///
-    /// Returns the binding, because revoking one is more than forgetting a
-    /// row: the handle it carried has to stop being honoured by the running
-    /// proxy, and the seed that told the guest about it has to be reissued.
-    pub fn detach_secret(&mut self, name: &str, secret: &str) -> Result<(Instance, Binding)> {
+    /// Returns the bindings, because revoking one is more than forgetting a
+    /// row: the handle each carried has to stop being honoured by the running
+    /// proxy, and the seed that told the guest about them has to be reissued.
+    ///
+    /// *Every* binding by that name, and not the first. A plain secret makes
+    /// one and this is a list of one; a credential part makes several — one
+    /// per authority its provider declares — and they share a handle. Leaving
+    /// four of five behind would be a revocation that revoked nothing, since
+    /// the handle the guest still holds would still be honoured everywhere it
+    /// was not removed from.
+    pub fn detach_secret(&mut self, name: &str, secret: &str) -> Result<(Instance, Vec<Binding>)> {
         let inst = self.get_mut(name)?;
-        let Some(index) = inst.secrets.iter().position(|held| held.secret == secret) else {
+        if !inst.secrets.iter().any(|held| held.secret == secret) {
             bail!("{secret:?} is not attached to {name:?} — see: ast status {name}");
-        };
-        let removed = inst.secrets.remove(index);
+        }
+        let mut removed = Vec::new();
+        inst.secrets.retain(|held| match held.secret == secret {
+            true => {
+                removed.push(held.clone());
+                false
+            }
+            false => true,
+        });
         Ok((inst.clone(), removed))
     }
 

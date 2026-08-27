@@ -228,13 +228,21 @@ pub fn decide(
     // says `Bearer` — is not this binding's credential. Treated as a
     // mismatch, not a pass-through: forwarding it would send whatever it is
     // to a host the user considers sensitive enough to bind.
-    let Some(candidate) = binding.placement.extract(raw) else {
-        return Err(Refusal::HandleMismatch);
-    };
-    match binding.guest_handle.matches(candidate) {
-        true => Ok(Decision::Substitute),
-        false => Err(Refusal::HandleMismatch),
+    //
+    // `accept` widens the *shapes* and never the header: a credential part
+    // declares the schemes its own tools actually use — `gh` sends
+    // `Authorization: token …` to some endpoints and `Bearer …` to others —
+    // and each of them still has to carry this instance's handle, compared in
+    // constant time, to be substituted.
+    let accepted = std::iter::once(&binding.placement).chain(binding.accept.iter());
+    for placement in accepted {
+        if let Some(candidate) = placement.extract(raw) {
+            if binding.guest_handle.matches(candidate) {
+                return Ok(Decision::Substitute);
+            }
+        }
     }
+    Err(Refusal::HandleMismatch)
 }
 
 /// Take the handle out of a header map, leaving a blank where the source
@@ -416,6 +424,9 @@ mod tests {
             source_device: "laptop".into(),
             version: 1,
             bound_at: 1,
+            provider: None,
+            accept: Vec::new(),
+            rule: crate::credential::CredentialRule::Substitute,
         }
     }
 
@@ -460,6 +471,8 @@ mod tests {
                 origin: revision.clone(),
                 revision: revision.clone(),
             }],
+            kind: crate::credential::PartKind::Secret,
+            provider: None,
         }
     }
 

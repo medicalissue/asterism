@@ -28,6 +28,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use zeroize::Zeroize;
 
+mod credential;
+
 use asterism_core::compat;
 use asterism_core::device_shell::{
     ShellData, ShellEnv, ShellOpen, ShellOutput, ShellPolicyAction, ShellPolicyState,
@@ -142,6 +144,15 @@ enum Command {
         /// snapshot and restore of the root disk.
         #[arg(long, value_name = "URL", requires = "agent")]
         repo: Option<String>,
+        /// Credential parts to attach once it exists: `--with gh,google`.
+        ///
+        /// A thin layer over `ast attach <name> --credential <part>`, run
+        /// once per part after the instance is defined — so what it does is
+        /// exactly what those commands do, and a failure names the part it
+        /// failed on rather than leaving a half-configured instance behind a
+        /// single opaque error.
+        #[arg(long = "with", value_name = "PART", value_delimiter = ',')]
+        with: Vec<String>,
     },
     /// Boot an instance.
     ///
@@ -535,6 +546,14 @@ enum Command {
         /// An orbit secret to bind, by the name `ast secret ls` shows.
         #[arg(long, value_name = "NAME")]
         secret: Option<String>,
+        /// A credential part to bind, by the name `ast credential ls` shows.
+        ///
+        /// No `--to` and no `--as`: a credential part's provider already says
+        /// which hosts it is for, which header it rides in, and what the
+        /// guest's tools will look for it in. That is the difference between
+        /// this flag and `--secret`.
+        #[arg(long, value_name = "NAME", conflicts_with_all = ["secret", "volume", "gpu"])]
+        credential: Option<String>,
         /// The one authority the secret may be used against: `host`, or
         /// `host:port`. Required with --secret, and deliberately not spelled
         /// `--host`, which on this command already means the device a volume
@@ -590,6 +609,12 @@ enum Command {
         /// The secret to revoke, by its orbit name.
         #[arg(long, value_name = "NAME")]
         secret: Option<String>,
+        /// The credential part to revoke, by its orbit name. Every binding it
+        /// made goes at once: half a credential revoked is not a revocation,
+        /// because the handle the guest holds would still be honoured
+        /// everywhere it was left behind.
+        #[arg(long, value_name = "NAME", conflicts_with_all = ["secret", "volume", "gpu"])]
+        credential: Option<String>,
         /// Revoke and detach the instance's GPU part.
         #[arg(long, conflicts_with_all = ["volume", "secret"])]
         gpu: bool,
@@ -639,6 +664,26 @@ enum Command {
     /// Values are read from stdin and are never accepted as arguments.
     #[command(subcommand)]
     Secret(SecretCommand),
+    /// Sign in to a provider and keep the token on this device.
+    ///
+    /// `ast login gh` reuses the token this device's own `gh` already holds
+    /// when there is one, and opens GitHub's device flow when there is not.
+    /// What it leaves behind is a credential part: attach it to an instance
+    /// with `ast attach <instance> --credential gh` and the guest's `gh`
+    /// works, holding a handle rather than the token.
+    Login {
+        /// The provider, as `ast credential providers` names it.
+        provider: String,
+        /// What to call the part. Defaults to the provider's short name.
+        #[arg(long = "as", value_name = "NAME")]
+        part: Option<String>,
+    },
+    /// Grant this device an OAuth refresh token for a provider.
+    #[command(subcommand)]
+    Oauth(OauthCommand),
+    /// List credential parts and the providers this build can sign in to.
+    #[command(subcommand)]
+    Credential(CredentialCommand),
     /// List the devices in this orbit.
     Devices {
         /// Print the rows as JSON, including the exact byte counters.
@@ -821,6 +866,44 @@ enum VolumeCommand {
         /// The volume to delete, by its name on this device.
         name: String,
     },
+}
+
+/// `ast oauth ...` — authorization grants, which are not tokens.
+#[derive(Subcommand)]
+enum OauthCommand {
+    /// Grant this device a refresh token for one provider and set of scopes.
+    ///
+    /// The browser opens; what comes back and is kept is the refresh token
+    /// and the client identity that can spend it. The access token a request
+    /// actually carries is minted at the egress door, per request, and is
+    /// never written down — see docs/credentials.md.
+    Add {
+        /// The provider, as `ast credential providers` names it.
+        provider: String,
+        /// What to ask for: `--scopes gmail.readonly,calendar.readonly`.
+        /// Short names are expanded to the URLs the provider published.
+        #[arg(long, value_name = "SCOPE", value_delimiter = ',')]
+        scopes: Vec<String>,
+        /// The OAuth client id to grant against. Required for providers that
+        /// publish no public client of their own, which is most of them.
+        #[arg(long, value_name = "ID")]
+        client_id: Option<String>,
+        /// Read the OAuth client secret from stdin. Never from argv.
+        #[arg(long)]
+        client_secret_from_stdin: bool,
+        /// What to call the part. Defaults to the provider's short name.
+        #[arg(long = "as", value_name = "NAME")]
+        part: Option<String>,
+    },
+}
+
+/// `ast credential ...` — what this device holds, and what it could hold.
+#[derive(Subcommand)]
+enum CredentialCommand {
+    /// List every part in the orbit with its kind, provider and door rule.
+    Ls,
+    /// List the providers this build knows how to sign in to.
+    Providers,
 }
 
 /// `ast secret ...` — orbit metadata backed by independent source devices.
@@ -1175,8 +1258,14 @@ fn run() -> Result<()> {
             disk,
             backend,
             profiles,
+            with: parts,
             ..
         } => {
+            // Named parts are checked before the image is pulled, so a typo
+            // costs a sentence rather than a gigabyte.
+            for part in &parts {
+                asterism_core::secret::check_name(part)?;
+            }
             // Profile names are cheap to validate locally. Image bytes are
             // always pulled by the device that will own the instance.
             asterism_core::profile::resolve(&profiles)?;
@@ -1191,7 +1280,7 @@ fn run() -> Result<()> {
                 .map(|p| p.parse::<PortForward>())
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| anyhow::anyhow!(e))?;
-            if publish
+            let created = if publish
                 .iter()
                 .any(|mapping| mapping.protocol == PortProtocol::Udp)
             {
@@ -1212,6 +1301,15 @@ fn run() -> Result<()> {
                     profiles,
                     publish,
                 }
+            };
+            if parts.is_empty() {
+                created
+            } else {
+                // `--with` is exactly the attach commands, run in order, and
+                // it is written that way on purpose: there is no second
+                // create path that knows about credentials, so a bug in one
+                // is a bug in both or in neither.
+                return create_with(created, &parts);
             }
         }
         Command::Up { name, restart } => Request::Up { name, restart },
@@ -1258,9 +1356,15 @@ fn run() -> Result<()> {
             placement,
             env,
             from,
+            credential,
             gpu,
             gpu_memory,
-        } => match attaching(volume, secret, gpu)? {
+        } => match attaching(volume, secret, credential, gpu)? {
+            Attaching::Credential(credential) => Request::AttachCredential {
+                name,
+                credential,
+                source_device: from,
+            },
             Attaching::Secret(secret) => Request::AttachSecret {
                 name,
                 secret,
@@ -1324,8 +1428,16 @@ fn run() -> Result<()> {
             volume,
             host,
             secret,
+            credential,
             gpu,
-        } => match attaching(volume, secret, gpu.then(String::new))? {
+        } => match attaching(volume, secret, credential, gpu.then(String::new))? {
+            // One frame for both, because revoking a credential part is
+            // revoking every binding made under its name — which is what
+            // `DetachSecret` already means.
+            Attaching::Credential(credential) => Request::DetachSecret {
+                name,
+                secret: credential,
+            },
             Attaching::Secret(secret) => Request::DetachSecret { name, secret },
             Attaching::Volume(volume) => match storage_ref(&volume, host.as_deref()) {
                 Some((device, volume)) => Request::Detach {
@@ -1366,6 +1478,39 @@ fn run() -> Result<()> {
         Command::Volume(VolumeCommand::Ls) => Request::VolumeCatalog,
         Command::Volume(VolumeCommand::Rm { name }) => Request::VolumeRemove { name },
         Command::Secret(cmd) => return secret_command(cmd, device.as_deref()),
+        Command::Login { provider, part } => {
+            return credential::login(&provider, part, device.as_deref())
+        }
+        Command::Oauth(OauthCommand::Add {
+            provider,
+            scopes,
+            client_id,
+            client_secret_from_stdin,
+            part,
+        }) => {
+            return credential::oauth_add(
+                &provider,
+                scopes,
+                client_id,
+                client_secret_from_stdin,
+                part,
+                device.as_deref(),
+            )
+        }
+        Command::Credential(CredentialCommand::Providers) => {
+            local_only("credential providers", device.as_deref())?;
+            credential::providers();
+            return Ok(());
+        }
+        Command::Credential(CredentialCommand::Ls) => {
+            local_only("credential ls", device.as_deref())?;
+            match send(&Request::SecretList)? {
+                Response::Secrets { secrets } => credential::list(&secrets),
+                Response::Error { message } => bail!(message),
+                other => bail!("unexpected reply from astd: {other:?}"),
+            }
+            return Ok(());
+        }
         Command::Logs {
             name,
             console,
@@ -1643,6 +1788,9 @@ fn run() -> Result<()> {
                 print_attached(&instance)
             }
             Request::AttachSecret { ref secret, .. } => print_bound(&instance, secret),
+            Request::AttachCredential { ref credential, .. } => {
+                print_bound(&instance, credential)
+            }
             Request::DetachSecret { ref secret, .. } => {
                 println!("{}  {secret} revoked", instance.name);
                 println!(
@@ -2558,6 +2706,11 @@ fn secret_command(command: SecretCommand, device: Option<&str>) -> Result<()> {
             name,
             value: read_secret_stdin()?,
             source_device: device.map(str::to_owned),
+            // A value the user piped in is a value and nothing else. What
+            // makes a part a credential is a provider behind it, and this
+            // command has none — see `ast login` and `ast oauth add`.
+            kind: asterism_core::credential::PartKind::Secret,
+            provider: None,
         },
         SecretCommand::Ls => {
             local_only("secret ls", device)?;
@@ -2620,7 +2773,11 @@ fn read_secret_stdin() -> Result<asterism_core::protocol::SecretValue> {
 }
 
 fn print_secrets(secrets: &[asterism_core::secret::Secret]) {
-    println!("{:<28} {:<9} SOURCES", "NAME", "VERSION");
+    // The kind column is here as well as in `ast credential ls` because there
+    // is one namespace: `ast secret rm gh` removes the credential part, and a
+    // listing that showed the name without saying what it was would make that
+    // a surprise.
+    println!("{:<24} {:<14} {:<9} SOURCES", "NAME", "KIND", "VERSION");
     for secret in secrets {
         let sources = secret
             .sources
@@ -2634,7 +2791,14 @@ fn print_secrets(secrets: &[asterism_core::secret::Secret]) {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        println!("{:<28} {:<9} {}", secret.name, secret.version, sources);
+        let kind = match secret.provider.as_deref() {
+            Some(provider) => format!("{}:{provider}", secret.kind),
+            None => secret.kind.to_string(),
+        };
+        println!(
+            "{:<24} {:<14} {:<9} {}",
+            secret.name, kind, secret.version, sources
+        );
     }
 }
 
@@ -5977,28 +6141,69 @@ fn local_disk(inst: &Instance) -> Option<String> {
 enum Attaching {
     Volume(String),
     Secret(String),
+    /// A credential part, which is a secret plus everything about how it is
+    /// used — so it is its own arm and not a `--secret` with defaults.
+    Credential(String),
     Gpu(String),
 }
 
 fn attaching(
     volume: Option<String>,
     secret: Option<String>,
+    credential: Option<String>,
     gpu: Option<String>,
 ) -> Result<Attaching> {
-    match (volume, secret, gpu) {
-        (Some(volume), None, None) => Ok(Attaching::Volume(volume)),
-        (None, Some(secret), None) => Ok(Attaching::Secret(secret)),
-        (None, None, Some(gpu)) => Ok(Attaching::Gpu(gpu)),
-        // clap refuses this one first; the arm exists so that adding a third
-        // part later cannot make it fall through to "say which".
-        (Some(_), Some(_), _) | (Some(_), _, Some(_)) | (_, Some(_), Some(_)) => bail!(
-            "--volume, --secret, and --gpu are different parts — attach them one command at a time"
-        ),
-        (None, None, None) => bail!(
+    match (volume, secret, credential, gpu) {
+        (Some(volume), None, None, None) => Ok(Attaching::Volume(volume)),
+        (None, Some(secret), None, None) => Ok(Attaching::Secret(secret)),
+        (None, None, Some(credential), None) => Ok(Attaching::Credential(credential)),
+        (None, None, None, Some(gpu)) => Ok(Attaching::Gpu(gpu)),
+        (None, None, None, None) => bail!(
             "say which part: --volume /tank/media, --volume desktop:tank, or \
-             --secret anthropic --to api.anthropic.com, or --gpu desktop"
+             --credential gh, or --secret anthropic --to api.anthropic.com, or --gpu desktop"
+        ),
+        // clap refuses every one of these first; the arm exists so that
+        // adding a fifth part later cannot make it fall through to "say
+        // which".
+        _ => bail!(
+            "--volume, --secret, --credential and --gpu are different parts — attach them one \
+             command at a time"
         ),
     }
+}
+
+/// `ast create … --with gh,google`: define the instance, then bind each part.
+///
+/// Not one frame. A create that also attached would have to decide what to do
+/// when the third of five parts is missing — and every answer to that is
+/// worse than the honest one, which is that the instance exists, the parts
+/// that bound are bound, and the failure names the one that did not.
+fn create_with(request: Request, parts: &[String]) -> Result<()> {
+    let name = match &request {
+        Request::Create { name, .. } | Request::CreateNetwork { name, .. } => name.clone(),
+        other => bail!("--with is for `ast create`, not {other:?}"),
+    };
+    match send(&request)? {
+        Response::Instance { instance, .. } => {
+            println!("{}  {}", instance.name, instance.status)
+        }
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected reply from astd: {other:?}"),
+    }
+    for part in parts {
+        match send(&Request::AttachCredential {
+            name: name.clone(),
+            credential: part.clone(),
+            source_device: None,
+        })? {
+            Response::Instance { instance, .. } => print_bound(&instance, part),
+            Response::Error { message } => {
+                bail!("{name} exists, but attaching {part:?} failed: {message}")
+            }
+            other => bail!("unexpected reply from astd: {other:?}"),
+        }
+    }
+    Ok(())
 }
 
 /// Report on the secret that was just bound — the one at the end.
@@ -6009,19 +6214,41 @@ fn attaching(
 /// this device will honour. The value is not printed because this process
 /// never had it.
 fn print_bound(inst: &Instance, secret: &str) {
-    let Some(binding) = inst.secrets.iter().find(|b| b.secret == secret) else {
+    let bound: Vec<&asterism_core::secret::Binding> =
+        inst.secrets.iter().filter(|b| b.secret == secret).collect();
+    let Some(binding) = bound.first().copied() else {
         return;
     };
+    // One line per authority. A credential part is several, and printing
+    // only the first would understate what was just granted — which is
+    // exactly the thing a person is running this command to see.
+    for bound in &bound {
+        println!(
+            "{}  {secret} -> {}  ({}, from {})",
+            inst.name, bound.authority, bound.placement, bound.source_device
+        );
+    }
+    let reach = match bound.len() {
+        1 => binding.authority.clone(),
+        _ => format!("{} and {} more", binding.authority, bound.len() - 1),
+    };
+    // Every variable the provider declares, not just the one on the binding
+    // row: `gcloud` and the Google client libraries read different names and
+    // both are given the same handle.
+    let names: Vec<String> = binding
+        .provider
+        .as_deref()
+        .and_then(asterism_core::credential::find)
+        .map(|provider| provider.env.clone())
+        .unwrap_or_else(|| vec![binding.env.clone()]);
     println!(
-        "{}  {secret} -> {}  ({}, from {})",
-        inst.name, binding.authority, binding.placement, binding.source_device
-    );
-    println!(
-        "the guest gets ${}={} — an opaque handle, honoured only by this instance's \
-         proxy and only for {}. The value stays on {}.",
-        binding.env,
-        binding.guest_handle.as_str(),
-        binding.authority,
+        "the guest gets {} — an opaque handle, honoured only by this instance's \
+         proxy and only for {reach}. The value stays on {}.",
+        names
+            .iter()
+            .map(|name| format!("${name}={}", binding.guest_handle.as_str()))
+            .collect::<Vec<_>>()
+            .join(" and "),
         binding.source_device
     );
     if inst.status == asterism_core::instance::Status::Running {

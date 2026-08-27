@@ -1,0 +1,35 @@
+# npm — a login part whose token is pasted rather than granted.
+#
+# The registry has no device flow: `npm token create` on a signed-in machine
+# is how one is minted, so `ast login npm` reads it from stdin the way
+# `ast secret create` does. What makes it a credential part rather than a
+# secret is everything after that — the door rule, the env var, and the
+# `.npmrc` the guest gets so `npm` works unmodified.
+name = "npm"
+kind = "login"
+summary = "the npm registry, for private packages and publishing"
+
+handle_prefix = "sk-ast-npm-"
+
+authorities = ["registry.npmjs.org"]
+
+env = ["NPM_TOKEN"]
+
+[rule]
+type = "substitute"
+placement = "bearer"
+accept = ["bearer"]
+
+# npm does not read a bare environment variable for registry auth. It reads
+# `.npmrc`, and `.npmrc` expands `${VAR}` — which is how every CI in the world
+# already does this, and it means the file on the guest's disk holds the
+# handle's *name* and not even the handle.
+[[files]]
+path = "/etc/npmrc"
+mode = "0644"
+content = "//registry.npmjs.org/:_authToken=${NPM_TOKEN}\n"
+
+[login]
+# No import: there is no host CLI that will print this on request.
+paste = true
+paste_hint = "npm token create --read-only  # then paste it here"
