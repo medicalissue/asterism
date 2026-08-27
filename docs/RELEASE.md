@@ -151,7 +151,37 @@ This behaviour was left unchanged rather than turned into a hard failure,
 because tightening it is a release-policy decision. Treat the macOS
 credentials as a prerequisite, not an optimisation.
 
-### 8. Windows verification is weaker than macOS and Linux
+### 8. `install.ps1`'s checksum lookup has never been executed — **suspected defect**
+
+`scripts/windows-host-test.sh` runs the PowerShell *parser* over `install.ps1`
+and packages it into fixtures, but never executes its download-and-verify
+path. The SHA256SUMS lookup in `Install-Release` — the thing standing between
+a user and an unverified binary — has therefore never run in CI.
+
+The first `verify-windows` job written for this document copied that lookup
+idiom verbatim:
+
+```powershell
+$parts = $line.Split(@(' ', "`t"), [StringSplitOptions]::RemoveEmptyEntries)
+if ($parts.Count -ge 2 -and ($parts[1] -eq $archive -or $parts[1] -eq "*$archive")) { … }
+```
+
+Against a real `SHA256SUMS` on a real runner — a file since confirmed
+byte-for-byte correct, `<64 hex><space><space><name>\n`, LF, no BOM — it
+matched nothing and the job failed with "SHA256SUMS does not list …" on both
+`windows-x86_64` and `windows-arm64`. Replacing it with a single regex made
+the same job pass against the same file. The root cause was not chased
+further here, and the failure has not been reproduced against `install.ps1`
+itself, so this is a strong suspicion rather than a proven defect — but
+`install.ps1` would fail exactly this way, refusing every Windows release as
+"unlisted", and nothing in CI would notice.
+
+**This should be its own issue**: execute `install.ps1`'s verify path in CI,
+and fix the parse if it reproduces. It is not fixed here because changing the
+installer's security-critical path on a suspicion, without a test that runs
+it, is the same mistake in the other direction.
+
+### 9. Windows verification is weaker than macOS and Linux
 
 The macOS and Linux lanes install the artifacts they just built with the real
 installer over `file://`. The Windows lane cannot: `install.ps1` downloads
