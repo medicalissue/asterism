@@ -3649,12 +3649,18 @@ fn pull_here(reference: &str, json: bool) -> Result<()> {
 ///
 /// A name that is *free* comes back as an error here ("unknown name …"),
 /// which is not this function's business: only a name that resolves to a
-/// device is.
+/// device is. Nor is a daemon too old to be asked — it is also too old to
+/// have the rule, so there is nothing this could usefully say.
 fn refuse_a_device_name(name: &str) -> Result<()> {
+    let request = Request::Resolve { name: name.into() };
+    let mut client = Client::open()?;
+    if client.spoken < request.since() {
+        return Ok(());
+    }
     let Ok(Response::Resolved {
         kind: NameKind::Device,
         ..
-    }) = send(&Request::Resolve { name: name.into() })
+    }) = client.ask(&request)
     else {
         return Ok(());
     };
