@@ -1,0 +1,4 @@
+bot rewound to 20:10 (3.4 s) — current state kept as "before-rewind"
+"/private/tmp/ast-fork-39650/cache" was not put back: it is no longer attached to bot as a local directory a rewind may roll back
+"/private/tmp/ast-fork-39650/memory" was not put back: it is no longer attached to bot as a local directory a rewind may roll back
+memory and cache volumes are not rolled back — add --include-memory to roll memory back too

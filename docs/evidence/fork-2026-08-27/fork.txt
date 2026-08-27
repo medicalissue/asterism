@@ -1,0 +1,3 @@
+bot-1 bot-2 bot-3 up — cloned from bot in 9.0 s, 316.55 MiB shared
+the forks publish no ports: 1 host port belongs to bot and cannot be in two places — `ast exec <fork>` and `ast ssh <fork>` reach them
+/cache is shared with the forks rather than copied: it is a cache volume, so they warm one of it between them

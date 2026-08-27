@@ -1,0 +1,5 @@
+NAME           STATUS    IMAGE          SHAPE            COMPUTE      AGE    TODAY    ACCESS                NOTE
+bot            running   nginx:alpine   2c/1024M/4G      macbook-pro.tail0de304.ts.net 16s    -        192.168.64.35:22      -
+bot-2          running   nginx:alpine   2c/1024M/4G      macbook-pro.tail0de304.ts.net 11s    -        192.168.64.40:22      fork of bot @ 20:10 · B: patch the tokenizer
+bot-1          running   nginx:alpine   2c/1024M/4G      macbook-pro.tail0de304.ts.net 11s    -        192.168.64.39:22      fork of bot @ 20:10 · A: rewrite the parser
+bot-3          running   nginx:alpine   2c/1024M/4G      macbook-pro.tail0de304.ts.net 11s    -        192.168.64.41:22      fork of bot @ 20:10 · C: add a fallback path

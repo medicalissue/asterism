@@ -515,6 +515,11 @@ pub enum RestartReason {
     /// crash and not a hand-started boot, and a status line that implied
     /// either would be misleading in different directions.
     Rewound,
+    /// `ast pick` replaced this instance's working volume with a fork's and
+    /// started it again. Its own reason for the same reason [`Self::Rewound`]
+    /// is: the guest went down and came back because of something a person
+    /// did to its disk, and which thing matters when reading the history.
+    Picked,
 }
 
 impl std::fmt::Display for RestartReason {
@@ -524,6 +529,7 @@ impl std::fmt::Display for RestartReason {
             RestartReason::Crash => "crash restart",
             RestartReason::Resurrected => "restart=always resurrection",
             RestartReason::Rewound => "ast rewind",
+            RestartReason::Picked => "ast pick",
         })
     }
 }
@@ -790,6 +796,18 @@ pub struct Instance {
     /// asked for anything else follow it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rewind: Option<crate::rewind::Settings>,
+    /// Where this instance was cloned from, when it is a fork.
+    ///
+    /// Provenance, not a link: the parent it names may be renamed or removed
+    /// and this still says what this instance *is*, which is what `ast ls`
+    /// needs a day later. `ast diff` and `ast pick` read the snapshot out of
+    /// it, which is why the fork point is taken as a named snapshot that
+    /// retention never touches.
+    ///
+    /// `None` on every instance created any other way, and on every registry
+    /// written before `ast fork` existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_of: Option<crate::fork::Origin>,
 
     // ---- legacy, read once and folded into `handle` ------------------------
     //
@@ -832,6 +850,7 @@ impl Instance {
             stranded: Vec::new(),
             gpu: None,
             rewind: None,
+            fork_of: None,
             legacy_pid: None,
             legacy_ssh_port: None,
         }

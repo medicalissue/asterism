@@ -417,6 +417,51 @@ pub(crate) fn is_agent(name: &str) -> bool {
     matches!(read_record(name), Ok(Some(_)))
 }
 
+/// Type one instruction into a fork's running agent session.
+///
+/// What `ast fork --each` is for. A fork boots from a cloned disk, so its
+/// agent comes up in the same session the parent's did, holding the same
+/// context — and the only thing missing is the sentence saying which of the
+/// three approaches this copy is meant to take. This is that sentence,
+/// arriving where a person sitting at `ast session <fork>` would have typed
+/// it.
+///
+/// The message goes in through a file and a tmux paste buffer rather than
+/// through `send-keys -l`: an instruction is a sentence somebody wrote, and
+/// putting it in argv would mean quoting it correctly through the daemon,
+/// `/bin/sh` and tmux in turn. `load-buffer` reads bytes and stops there.
+///
+/// `Ok(false)` when this instance is not an agent — a fork of a plain
+/// instance has no session to type into, and its note is the file in its
+/// working volume.
+pub(crate) fn tell(name: &str, message: &str) -> Result<bool> {
+    let Some(record) = read_record(name)? else {
+        return Ok(false);
+    };
+    let path = format!("{}/.asterism/fork-note", record.workdir);
+    guest_write(name, &path, message)?;
+    let session = &record.session;
+    // The session is started by the image's entrypoint, so a fork that has
+    // only just booted may not have one yet. Waiting is the whole reason
+    // this is not one `send-keys`.
+    guest(
+        name,
+        "give the fork its instruction",
+        &format!(
+            "for _ in $(seq 1 60); do\n\
+             \x20 tmux has-session -t {session} 2>/dev/null && break\n\
+             \x20 sleep 1\n\
+             done\n\
+             tmux has-session -t {session} 2>/dev/null || exit 1\n\
+             tmux load-buffer -b asterism-fork {path}\n\
+             tmux paste-buffer -b asterism-fork -d -t {session}\n\
+             tmux send-keys -t {session} Enter\n"
+        ),
+        120,
+    )?;
+    Ok(true)
+}
+
 // ---- the guest side --------------------------------------------------------
 
 /// Run a shell fragment in the guest and give back its stdout.

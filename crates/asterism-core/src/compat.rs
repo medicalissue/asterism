@@ -146,7 +146,10 @@ use crate::VERSION;
 ///   half a credential is not a credential. Everything else about the
 ///   feature — the parts themselves, the door rules, the revocation — rides
 ///   on frames that already existed.
-pub const PROTOCOL_VERSION: u32 = 17;
+/// * **18** — `ast fork`, `ast diff` and `ast pick`: cloning one instance
+///   into several over the same copy-on-write engine, summarising what each
+///   changed, and putting one of them back onto the parent.
+pub const PROTOCOL_VERSION: u32 = 18;
 
 /// The wire as it was before it carried a version.
 ///
@@ -161,7 +164,7 @@ pub const FIRST_PROTOCOL: u32 = 1;
 /// and GPU guest frames; keep the unnumbered protocol-1 release reachable in
 /// a rolling orbit — so this moves with [`PROTOCOL_VERSION`] rather than
 /// staying put, which is what keeps the floor at [`FIRST_PROTOCOL`].
-pub const SUPPORTED_BACK: u32 = 16;
+pub const SUPPORTED_BACK: u32 = 17;
 
 /// Format version of the home stamp document itself.
 pub const STAMP_VERSION: u32 = 1;
