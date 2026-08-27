@@ -51,6 +51,8 @@ mod agent;
 #[cfg(target_os = "macos")]
 mod ctl;
 #[cfg(target_os = "macos")]
+mod egress;
+#[cfg(target_os = "macos")]
 mod gpu;
 #[cfg(target_os = "macos")]
 mod net;
@@ -283,6 +285,13 @@ fn main() -> anyhow::Result<()> {
 
     let reason: StopReason = 'run: loop {
         vm::pump(Duration::from_millis(100));
+
+        // Egress door sessions run on threads of their own; this is the one
+        // thread allowed to let go of the framework connections they came
+        // in on, so the ones that have finished are released here.
+        //
+        // SAFETY: the run loop is the main thread.
+        unsafe { machine.reap_egress() };
 
         if let Some(key) = agent_key.as_ref() {
             keep_session(

@@ -520,6 +520,23 @@ pub enum GuestEgress {
         /// user-net, whose layout is fixed and documented.
         gateway: &'static str,
     },
+    /// The backend puts every guest on a *shared* network with an address of
+    /// its own, so there is no host address only one guest can reach — and
+    /// the door is built inside the guest instead. The guest's own agent
+    /// listens on the guest's loopback and carries what it accepts over an
+    /// authenticated virtio-socket hop to the per-instance helper, which
+    /// splices it to the private unix socket the egress plane owns.
+    ///
+    /// Nothing binds a host interface at all, which is why this is *more*
+    /// private than [`GuestEgress::LoopbackGateway`] rather than a weaker
+    /// substitute for it. See [`crate::egress_door`].
+    AgentVsock {
+        /// The address the guest calls the door by. Its own loopback: no
+        /// other guest, and nothing on this device, shares it.
+        gateway: &'static str,
+        /// Host vsock port the guest agent dials.
+        vsock_port: u32,
+    },
 }
 
 /// One optional operation at the backend boundary.

@@ -23,14 +23,18 @@ use std::cell::{Cell, RefCell};
 use std::ffi::{c_int, c_void};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::Path;
+use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use block2::RcBlock;
 use objc2::rc::Retained;
+use objc2::runtime::Bool;
 use objc2::runtime::ProtocolObject;
-use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass, MainThreadOnly};
+use objc2::{define_class, msg_send, AllocAnyThread, DefinedClass, MainThreadOnly, Message};
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSDate, NSError, NSFileHandle, NSObject, NSObjectProtocol,
     NSRunLoop, NSString, NSURL,
@@ -48,12 +52,14 @@ use objc2_virtualization::{
     VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
     VZVirtioEntropyDeviceConfiguration, VZVirtioFileSystemDeviceConfiguration,
     VZVirtioNetworkDeviceConfiguration, VZVirtioSocketConnection, VZVirtioSocketDevice,
-    VZVirtioSocketDeviceConfiguration, VZVirtioTraditionalMemoryBalloonDeviceConfiguration,
-    VZVirtualMachine, VZVirtualMachineConfiguration, VZVirtualMachineDelegate,
-    VZVirtualMachineState,
+    VZVirtioSocketDeviceConfiguration, VZVirtioSocketListener, VZVirtioSocketListenerDelegate,
+    VZVirtioTraditionalMemoryBalloonDeviceConfiguration, VZVirtualMachine,
+    VZVirtualMachineConfiguration, VZVirtualMachineDelegate, VZVirtualMachineState,
 };
 
-use asterism_vz::{Config, Disk, State, StopReason, StorageError};
+use asterism_core::egress_door::EGRESS_VSOCK_PORT;
+use asterism_vz::guest::Key;
+use asterism_vz::{Config, Disk, EgressDoor, State, StopReason, StorageError};
 
 /// Shared between the delegate object and the run loop. `Rc`, not `Arc`:
 /// both live on the queue the VM is bound to, and nothing here crosses a
@@ -249,6 +255,138 @@ define_class!(
     }
 );
 
+/// One accepted door connection, while its session thread is running.
+///
+/// VZ releases the connection's own descriptor when this object is released,
+/// so the object has to outlive the session working on the duplicate. The
+/// flag is what the run loop reads to know it may let go.
+struct OpenDoor {
+    _connection: Retained<VZVirtioSocketConnection>,
+    live: Arc<AtomicBool>,
+}
+
+/// What the egress listener delegate needs to answer a connection.
+struct EgressIvars {
+    key: [u8; 32],
+    socket: PathBuf,
+    instance: String,
+    /// `Rc`/`RefCell` rather than `Arc`/`Mutex` for the same reason
+    /// [`Signals`] is: delegate callbacks arrive on the VM's queue, which is
+    /// this process's main thread, and so does the run loop that reaps this.
+    open: Rc<RefCell<Vec<OpenDoor>>>,
+}
+
+define_class!(
+    // `shouldAcceptNewConnection:` is delivered on the VM's queue, which is
+    // the main queue.
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "AsterismVzEgressListenerDelegate"]
+    #[ivars = EgressIvars]
+    struct EgressDelegate;
+
+    unsafe impl NSObjectProtocol for EgressDelegate {}
+
+    unsafe impl VZVirtioSocketListenerDelegate for EgressDelegate {
+        /// Take the guest's connection, or refuse it.
+        ///
+        /// This runs on the queue the VM is bound to, so it does exactly two
+        /// things that cannot block: duplicate the descriptor, and start a
+        /// thread. Everything else — the handshake, the connect to `astd`'s
+        /// socket, and the splice itself — happens on that thread (spike
+        /// landmine 9).
+        #[unsafe(method(listener:shouldAcceptNewConnection:fromSocketDevice:))]
+        fn should_accept(
+            &self,
+            _listener: &VZVirtioSocketListener,
+            connection: &VZVirtioSocketConnection,
+            _device: &VZVirtioSocketDevice,
+        ) -> Bool {
+            let ivars = self.ivars();
+            // SAFETY: delegate callbacks arrive on the VM's queue, which
+            // is the thread this class is declared to live on.
+            let raw = unsafe { connection.fileDescriptor() };
+            let fd = match duplicate_socket_fd(raw) {
+                Ok(fd) => fd,
+                Err(why) => {
+                    eprintln!(
+                        "astd-vz: {}: refused an egress door connection: {why}",
+                        ivars.instance
+                    );
+                    return Bool::NO;
+                }
+            };
+            let live = Arc::new(AtomicBool::new(true));
+            crate::egress::carry(
+                fd,
+                ivars.key,
+                ivars.socket.clone(),
+                ivars.instance.clone(),
+                live.clone(),
+            );
+            ivars.open.borrow_mut().push(OpenDoor {
+                _connection: connection.retain(),
+                live,
+            });
+            Bool::YES
+        }
+    }
+);
+
+/// The listener, its delegate, and the sessions running under it.
+struct Door {
+    /// `VZVirtioSocketDevice` retains the listener, but the listener holds
+    /// its delegate *weakly* — the same landmine as every other VZ delegate
+    /// in this file. Both are kept here for the life of the machine.
+    _listener: Retained<VZVirtioSocketListener>,
+    _delegate: Retained<EgressDelegate>,
+    open: Rc<RefCell<Vec<OpenDoor>>>,
+}
+
+/// Install this instance's egress door on the running guest's socket device.
+///
+/// # Safety
+/// Main thread only.
+unsafe fn install_door(
+    door: &EgressDoor,
+    device: &VZVirtioSocketDevice,
+    instance: &str,
+    mtm: MainThreadMarker,
+) -> Result<Door> {
+    let key = Key::read(&door.key)
+        .with_context(|| format!("reading the egress door key at {}", door.key.display()))?
+        .ok_or_else(|| {
+            anyhow!(
+                "no egress door key at {} — this instance has a bound secret and \
+                 nothing to authenticate its guest with",
+                door.key.display()
+            )
+        })?;
+    let open: Rc<RefCell<Vec<OpenDoor>>> = Rc::default();
+    let delegate = {
+        let this = EgressDelegate::alloc(mtm).set_ivars(EgressIvars {
+            key: *key.as_bytes(),
+            socket: door.socket.clone(),
+            instance: instance.to_owned(),
+            open: open.clone(),
+        });
+        let this: Retained<EgressDelegate> = msg_send![super(this), init];
+        this
+    };
+    let listener = VZVirtioSocketListener::new();
+    listener.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+    device.setSocketListener_forPort(&listener, EGRESS_VSOCK_PORT);
+    eprintln!(
+        "astd-vz: {instance}: egress door open on vsock port {EGRESS_VSOCK_PORT} -> {}",
+        door.socket.display()
+    );
+    Ok(Door {
+        _listener: listener,
+        _delegate: delegate,
+        open,
+    })
+}
+
 fn url(path: &Path) -> Retained<NSURL> {
     NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()))
 }
@@ -387,6 +525,10 @@ pub struct Machine {
     connection: RefCell<Option<Retained<VZVirtioSocketConnection>>>,
     gpu_connecting: RefCell<Option<Rc<RefCell<Option<Connected>>>>>,
     gpu_connection: RefCell<Option<Retained<VZVirtioSocketConnection>>>,
+    /// This instance's secret-egress door, when a secret is bound.
+    /// `None` is a guest with nothing to serve through one, which is
+    /// also the only guest for which no listener is installed at all.
+    egress: Option<Door>,
     pub signals: Rc<Signals>,
 }
 
@@ -784,6 +926,19 @@ pub unsafe fn start(config: &Config) -> Result<Machine> {
             None
         });
 
+    // The door goes up with the machine rather than when the guest first
+    // asks for it: a guest that came up before its door did would be a guest
+    // holding a handle that nothing on this device honours.
+    let egress = match (&config.egress, socket_device.as_ref()) {
+        (None, _) => None,
+        (Some(door), Some(device)) => Some(install_door(door, device, &config.instance, mtm)?),
+        (Some(_), None) => bail!(
+            "{} has a bound secret but this guest has no virtio socket device, so there \
+             is no door to serve it through",
+            config.instance
+        ),
+    };
+
     Ok(Machine {
         vm,
         _delegate: delegate,
@@ -794,6 +949,7 @@ pub unsafe fn start(config: &Config) -> Result<Machine> {
         connection: RefCell::new(None),
         gpu_connecting: RefCell::new(None),
         gpu_connection: RefCell::new(None),
+        egress,
         signals,
     })
 }
@@ -938,6 +1094,27 @@ impl Machine {
                 Ok(fd)
             }
         })
+    }
+
+    /// Release the framework connections of egress door sessions that have
+    /// ended, and say how many are still open.
+    ///
+    /// Called from the run loop because that is the only thread allowed to
+    /// touch these objects. Without it, a guest that made a thousand
+    /// requests would hold a thousand `VZVirtioSocketConnection`s until it
+    /// stopped.
+    ///
+    /// # Safety
+    /// Main thread only.
+    pub unsafe fn reap_egress(&self) -> usize {
+        match self.egress.as_ref() {
+            None => 0,
+            Some(door) => {
+                let mut open = door.open.borrow_mut();
+                open.retain(|session| session.live.load(Ordering::SeqCst));
+                open.len()
+            }
+        }
     }
 
     /// Has a connect been asked for and not yet answered?

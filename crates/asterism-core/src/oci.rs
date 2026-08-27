@@ -179,6 +179,18 @@ pub const VIRTIOFS_MODULES: &[GuestModule] = &[
     },
 ];
 
+/// The virtio-vsock client stack, in dependency order.
+///
+/// An OCI guest needs it when its backend's egress door is carried over the
+/// instance's virtio socket ([`crate::hv::GuestEgress::AgentVsock`]): the
+/// pinned cloud kernel builds all three as modules and an OCI root
+/// filesystem has no matching module tree of its own to fall back on.
+const VSOCK_MODULE_NAMES: &[&str] = &[
+    "vsock",
+    "vmw_vsock_virtio_transport_common",
+    "vmw_vsock_virtio_transport",
+];
+
 const DIRECT_BOOT_MODULE_NAMES: &[&str] = &[
     "virtiofs",
     "vsock",
@@ -1292,6 +1304,7 @@ pub fn init_script(config: &Config) -> String {
     init_script_with_parts(
         config,
         &InstanceParts {
+            egress_over_vsock: false,
             shares: &[],
             share_kind: None,
             egress: &egress,
@@ -1309,9 +1322,26 @@ pub struct InstanceParts<'a> {
     pub shares: &'a [Share],
     pub share_kind: Option<ShareKind>,
     pub egress: &'a Egress,
+    /// The backend serves this instance's bound secrets through the guest's
+    /// own virtio socket rather than a host gateway, so the guest's init has
+    /// to load the vsock transport before the agent opens the door.
+    /// Backend-declared, never inferred here.
+    pub egress_over_vsock: bool,
     pub bootstrap: &'a Bootstrap,
     pub gpu_boot: Option<&'a str>,
     pub guest_control_boot: Option<&'a str>,
+}
+
+impl InstanceParts<'_> {
+    /// Whether this guest's init has to bring the virtio-vsock transport up.
+    ///
+    /// Only when a secret is actually bound, and only on a backend whose
+    /// door is the guest's own virtio socket. QEMU's door is its user-mode
+    /// NAT gateway and needs none of this, so an unbound guest — and every
+    /// QEMU guest — pays nothing for a transport it will never open.
+    pub fn needs_vsock(&self) -> bool {
+        self.egress_over_vsock && !self.egress.is_empty()
+    }
 }
 
 /// Generate the per-instance init for an OCI rootfs.
@@ -1635,7 +1665,7 @@ pub fn configure_instance(source: &Path, root: &Path, parts: &InstanceParts<'_>)
     let doc: Value = serde_json::from_str(&text)
         .with_context(|| format!("reading OCI config at {}", sidecar.display()))?;
     let config = Config::from_json(&doc);
-    let modules = match parts.share_kind {
+    let mut modules = match parts.share_kind {
         Some(ShareKind::Virtiofs) => vec![KernelModule {
             name: "virtiofs",
             bytes: virtiofs_module()?,
@@ -1643,6 +1673,9 @@ pub fn configure_instance(source: &Path, root: &Path, parts: &InstanceParts<'_>)
         Some(ShareKind::NinePfs) => ninep_modules()?,
         None => Vec::new(),
     };
+    if parts.needs_vsock() {
+        modules.extend(vsock_modules()?);
+    }
     let init = init_script_with_parts(&config, parts, &modules);
     rewrite_guest_files(root, &init)
         .with_context(|| format!("configuring OCI guest disk {}", root.display()))
@@ -1921,6 +1954,11 @@ pub fn direct_boot_modules() -> Result<Vec<KernelModule>> {
 /// Verified 9p client stack for QEMU directory shares, in dependency order.
 fn ninep_modules() -> Result<Vec<KernelModule>> {
     kernel_modules(NINEP_MODULE_NAMES)
+}
+
+/// Verified virtio-vsock client stack, in dependency order.
+fn vsock_modules() -> Result<Vec<KernelModule>> {
+    kernel_modules(VSOCK_MODULE_NAMES)
 }
 
 fn kernel_modules(names: &[&'static str]) -> Result<Vec<KernelModule>> {
@@ -2428,6 +2466,129 @@ mod tests {
         assert!(empty.contains("no entrypoint or cmd"));
     }
 
+    fn bound_egress(proxy: &str) -> Egress {
+        Egress {
+            proxy: proxy.to_owned(),
+            ca_pem: "-----BEGIN CERTIFICATE-----\npublic\n-----END CERTIFICATE-----\n".into(),
+            authorities: vec!["api.example.com:443".into()],
+            handles: vec![("EXAMPLE_TOKEN".into(), "ast-handle-opaque".into())],
+        }
+    }
+
+    /// A backend whose door is the guest's own virtio socket needs the vsock
+    /// transport up before the agent that opens it starts, and an OCI rootfs
+    /// has no module tree of its own to find one in. The chain loads in
+    /// dependency order, ahead of the guest-control agent.
+    #[test]
+    fn a_vsock_door_loads_its_transport_before_the_agent_that_opens_it() {
+        let egress = bound_egress(&format!(
+            "http://{}:{}",
+            crate::egress_door::EGRESS_GUEST_GATEWAY,
+            crate::egress_door::EGRESS_GUEST_PORT
+        ));
+        let parts = InstanceParts {
+            egress_over_vsock: true,
+            shares: &[],
+            share_kind: None,
+            egress: &egress,
+            bootstrap: &Bootstrap::default(),
+            gpu_boot: None,
+            guest_control_boot: Some("/.asterism/asterism-guest &\n"),
+        };
+        assert!(parts.needs_vsock());
+        let modules: Vec<_> = VSOCK_MODULE_NAMES
+            .iter()
+            .map(|&name| KernelModule {
+                name,
+                bytes: format!("fixture-{name}").into_bytes(),
+            })
+            .collect();
+        let script = init_script_with_parts(&Config::default(), &parts, &modules);
+        let dir = tempfile::tempdir().unwrap();
+        let init = dir.path().join("asterism-init");
+        std::fs::write(&init, &script).unwrap();
+        run(Command::new("sh").arg("-n").arg(&init)).expect("the vsock init is valid shell");
+
+        let mut previous = 0;
+        for name in VSOCK_MODULE_NAMES {
+            let at = script
+                .find(&format!("insmod /run/asterism-{name}.ko"))
+                .unwrap_or_else(|| panic!("{name} is not loaded: {script}"));
+            assert!(at > previous, "{name} loads out of dependency order");
+            previous = at;
+        }
+        assert!(
+            previous < script.find("/.asterism/asterism-guest").unwrap(),
+            "the transport must be up before the agent opens the door: {script}"
+        );
+        assert!(
+            script.contains(&format!(
+                "export HTTPS_PROXY='http://{}:{}'",
+                crate::egress_door::EGRESS_GUEST_GATEWAY,
+                crate::egress_door::EGRESS_GUEST_PORT
+            )),
+            "the guest is pointed at its own loopback: {script}"
+        );
+    }
+
+    /// And nothing else pays for it. An unbound guest on the same backend,
+    /// and every QEMU guest bound or not, gets no vsock modules at all.
+    #[test]
+    fn only_a_bound_guest_on_a_vsock_door_backend_carries_the_transport() {
+        let bound = bound_egress("http://10.0.2.2:38123");
+        let unbound = Egress::default();
+        let cases = [
+            // (door is vsock, a secret is bound, expected)
+            (true, true, true),
+            (true, false, false),
+            (false, true, false),
+            (false, false, false),
+        ];
+        for (over_vsock, is_bound, expected) in cases {
+            let parts = InstanceParts {
+                egress_over_vsock: over_vsock,
+                shares: &[],
+                share_kind: None,
+                egress: match is_bound {
+                    true => &bound,
+                    false => &unbound,
+                },
+                bootstrap: &Bootstrap::default(),
+                gpu_boot: None,
+                guest_control_boot: None,
+            };
+            assert_eq!(
+                parts.needs_vsock(),
+                expected,
+                "vsock door {over_vsock}, bound {is_bound}"
+            );
+        }
+    }
+
+    /// The whole point of the feature, at the one place the guest's own disk
+    /// is written: the init carries the opaque handle and the public CA, and
+    /// never the value the handle stands for.
+    #[test]
+    fn a_bound_guests_init_carries_the_handle_and_never_the_value() {
+        const SENTINEL: &str = "NEVER-WRITE-THIS-PLAINTEXT";
+        let egress = bound_egress("http://127.0.0.1:1021");
+        let parts = InstanceParts {
+            egress_over_vsock: true,
+            shares: &[],
+            share_kind: None,
+            egress: &egress,
+            bootstrap: &Bootstrap::default(),
+            gpu_boot: None,
+            guest_control_boot: None,
+        };
+        let script = init_script_with_parts(&Config::default(), &parts, &[]);
+        assert!(script.contains("ast-handle-opaque"), "{script}");
+        assert!(
+            !script.contains(SENTINEL),
+            "a secret value reached the guest disk"
+        );
+    }
+
     /// Instance parts belong in the private root disk, never in the shared
     /// OCI store image. The generated pid 1 mounts the selected transport
     /// and exports only opaque secret handles before starting the image.
@@ -2469,6 +2630,7 @@ mod tests {
         let script = init_script_with_parts(
             &config,
             &InstanceParts {
+                egress_over_vsock: false,
                 shares: &shares,
                 share_kind: Some(ShareKind::NinePfs),
                 egress: &egress,
@@ -2561,6 +2723,7 @@ mod tests {
             &dir.path().join("source.raw"),
             &dir.path().join("root.raw"),
             &InstanceParts {
+                egress_over_vsock: false,
                 shares: &[share],
                 share_kind: None,
                 egress: &Egress::default(),
@@ -2622,6 +2785,7 @@ mod tests {
         };
         let bootstrap = Bootstrap::resolve(&["base".to_owned()]).unwrap();
         let parts = InstanceParts {
+            egress_over_vsock: false,
             shares: &[],
             share_kind: None,
             egress: &egress,

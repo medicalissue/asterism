@@ -1516,17 +1516,67 @@ mod tests {
 
     #[test]
     fn backends_advertise_only_the_network_doors_they_implement() {
+        use asterism_core::egress_door::{EGRESS_GUEST_GATEWAY, EGRESS_VSOCK_PORT};
+        use asterism_core::hv::GuestEgress;
+
         let qemu = by_id(qemu::ID).unwrap().caps();
         assert!(qemu.port_forward);
-        assert!(qemu.guest_egress.is_some());
+        assert!(matches!(
+            qemu.guest_egress,
+            Some(GuestEgress::LoopbackGateway { .. })
+        ));
 
-        for id in [vz::ID, chv::ID, hyperv::ID] {
+        // VZ has a door and still no publication: the guest holds an
+        // address of its own on the NAT, so there is nothing to forward
+        // from this host's loopback, but the door does not go through the
+        // network at all.
+        let vz_caps = by_id(vz::ID).unwrap().caps();
+        assert!(!vz_caps.port_forward, "vz falsely advertises publication");
+        assert_eq!(
+            vz_caps.guest_egress,
+            Some(GuestEgress::AgentVsock {
+                gateway: EGRESS_GUEST_GATEWAY,
+                vsock_port: EGRESS_VSOCK_PORT,
+            }),
+        );
+
+        for id in [chv::ID, hyperv::ID] {
             let caps = by_id(id).unwrap().caps();
             assert!(!caps.port_forward, "{id} falsely advertises publication");
             assert!(
                 caps.guest_egress.is_none(),
                 "{id} falsely advertises a guest-only egress door"
             );
+        }
+    }
+
+    /// The door a backend declares has to be one a guest could actually
+    /// reach without anything else on the machine reaching it too. Both
+    /// declared doors are addresses that only the guest making the call
+    /// owns: QEMU's virtual NAT gateway, proxied to host loopback, and the
+    /// guest's own loopback with the hop leaving over its virtio socket.
+    #[test]
+    fn no_backend_declares_a_door_on_a_shared_address() {
+        use asterism_core::hv::GuestEgress;
+
+        for id in [qemu::ID, vz::ID, chv::ID, hyperv::ID] {
+            match by_id(id).unwrap().caps().guest_egress {
+                None => {}
+                Some(GuestEgress::LoopbackGateway { gateway }) => {
+                    assert!(!gateway.is_empty(), "{id} declares an empty gateway");
+                    assert_ne!(gateway, "0.0.0.0", "{id} declares a wildcard door");
+                }
+                Some(GuestEgress::AgentVsock {
+                    gateway,
+                    vsock_port,
+                }) => {
+                    assert_eq!(
+                        gateway, "127.0.0.1",
+                        "{id} puts an agent door somewhere other than the guest's loopback"
+                    );
+                    assert!(vsock_port > 0, "{id} declares vsock port 0");
+                }
+            }
         }
     }
 
