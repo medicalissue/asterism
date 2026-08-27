@@ -52,10 +52,17 @@ const MAX_HIGH_WATERMARK_BYTES: usize = 32;
 const MAX_SESSION_BEARER_BYTES: usize = 8 * 1024;
 const MAX_DEVICE_ID_BYTES: usize = 128;
 
-/// Version advertised by both the Cloudflare edge and native clients.
+/// Version native clients send on their device-authorization requests. The
+/// Cloudflare edge does not echo it, so clients treat its absence in a
+/// response as silence rather than as an incompatible deployment.
 pub const DEVICE_AUTHORIZATION_PROTOCOL: &str = "asterism-device-authorization/1";
 /// RFC 8628 grant vocabulary used by the token polling request.
 pub const DEVICE_AUTHORIZATION_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
+/// The public client id registered for `ast` at the edge. RFC 8628 public
+/// clients are identified, not authenticated, so this carries no secret.
+pub const DEVICE_AUTHORIZATION_CLIENT_ID: &str = "asterism-cli";
+/// Scopes registered against [`DEVICE_AUTHORIZATION_CLIENT_ID`].
+pub const DEVICE_AUTHORIZATION_SCOPE: &str = "openid orbit.read orbit.write";
 
 /// Provider selection vocabulary at the edge protocol boundary. This does not
 /// give the coordinator any provider credential or callback responsibility.
@@ -116,6 +123,31 @@ impl DeviceAuthorizationRequest {
         };
         request.validate()?;
         Ok(request)
+    }
+
+    /// The edge reads `application/x-www-form-urlencoded` on
+    /// `POST /oauth/device/code` and identifies the caller by `client_id`.
+    /// `provider` is advisory: the edge resolves the provider from the
+    /// browser session that approves the user code.
+    pub fn form_pairs(&self) -> Vec<(&'static str, String)> {
+        let mut pairs = vec![
+            ("client_id", DEVICE_AUTHORIZATION_CLIENT_ID.to_owned()),
+            ("scope", DEVICE_AUTHORIZATION_SCOPE.to_owned()),
+            (
+                "provider",
+                match self.provider {
+                    AuthorizationProvider::Google => "google".to_owned(),
+                    AuthorizationProvider::Github => "github".to_owned(),
+                },
+            ),
+        ];
+        if let Some(uri) = &self.redirect_uri {
+            pairs.push(("redirect_uri", uri.clone()));
+        }
+        if let Some(state) = &self.deep_link_state {
+            pairs.push(("deep_link_state", state.clone()));
+        }
+        pairs
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -218,6 +250,55 @@ impl DeviceTokenRequest {
         }
         if self.grant_type != DEVICE_AUTHORIZATION_GRANT_TYPE {
             bail!("device authorization grant type is invalid");
+        }
+        Ok(())
+    }
+
+    /// `POST /oauth/token` is form-encoded and rejects a request that does
+    /// not name a registered client.
+    pub fn form_pairs(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("client_id", DEVICE_AUTHORIZATION_CLIENT_ID.to_owned()),
+            ("grant_type", self.grant_type.clone()),
+            ("device_code", self.device_code.clone()),
+        ]
+    }
+}
+
+/// RFC 6749 token response returned once a user code is approved. The edge
+/// returns a bearer and its scope here; the account the bearer belongs to is
+/// named by the bearer itself, not by a second document on this endpoint.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceTokenResponse {
+    pub access_token: String,
+    pub token_type: String,
+    pub expires_in: u64,
+    #[serde(default)]
+    pub scope: Option<String>,
+}
+
+impl fmt::Debug for DeviceTokenResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DeviceTokenResponse")
+            .field("access_token", &"[REDACTED]")
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
+impl DeviceTokenResponse {
+    pub fn validate(&self) -> Result<()> {
+        if self.access_token.is_empty() || self.access_token.len() > MAX_SESSION_BEARER_BYTES {
+            bail!("device token response bearer is invalid");
+        }
+        if !self.token_type.eq_ignore_ascii_case("Bearer") {
+            bail!("device token response is not a bearer token");
+        }
+        if self.expires_in == 0 || self.expires_in > 24 * 60 * 60 {
+            bail!("device token response expiry is outside the supported bound");
         }
         Ok(())
     }
@@ -1773,24 +1854,44 @@ mod tests {
         }))
         .unwrap();
         response.validate().unwrap();
+        // Both OAuth endpoints are form-encoded and name a registered public
+        // client. Neither takes a JSON document.
         assert_eq!(
-            serde_json::to_value(DeviceAuthorizationRequest::cli(
-                AuthorizationProvider::Github
-            ))
-            .unwrap(),
-            serde_json::json!({ "provider": "github" })
+            DeviceAuthorizationRequest::cli(AuthorizationProvider::Github).form_pairs(),
+            vec![
+                ("client_id", "asterism-cli".to_owned()),
+                ("scope", "openid orbit.read orbit.write".to_owned()),
+                ("provider", "github".to_owned()),
+            ]
         );
         DeviceAuthorizationRequest::cli(AuthorizationProvider::Github)
             .validate()
             .unwrap();
         assert_eq!(
-            serde_json::to_value(DeviceTokenRequest::new(response.device_code.clone()).unwrap())
-                .unwrap(),
-            serde_json::json!({
-                "device_code": "opaque-device-secret",
-                "grant_type": "urn:ietf:params:oauth:grant-type:device_code"
-            })
+            DeviceTokenRequest::new(response.device_code.clone())
+                .unwrap()
+                .form_pairs(),
+            vec![
+                ("client_id", "asterism-cli".to_owned()),
+                (
+                    "grant_type",
+                    "urn:ietf:params:oauth:grant-type:device_code".to_owned()
+                ),
+                ("device_code", "opaque-device-secret".to_owned()),
+            ]
         );
+        let token: DeviceTokenResponse = serde_json::from_value(serde_json::json!({
+            "access_token": "header.payload.signature",
+            "token_type": "Bearer",
+            "expires_in": 43_200,
+            "scope": "openid orbit.read orbit.write"
+        }))
+        .unwrap();
+        token.validate().unwrap();
+        assert!(!format!("{token:?}").contains("header.payload.signature"));
+        let mut not_a_bearer = token;
+        not_a_bearer.token_type = "mac".into();
+        assert!(not_a_bearer.validate().is_err());
         let mut invalid = response;
         invalid.verification_uri = "http://auth.invalid/device".into();
         assert!(invalid.validate().is_err());

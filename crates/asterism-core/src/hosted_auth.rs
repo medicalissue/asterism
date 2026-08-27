@@ -17,6 +17,15 @@ use zeroize::Zeroize;
 pub const PROTOCOL: &str = "asterism-device-authorization/1";
 pub const DEFAULT_AUTHORITY: &str = "https://asterism.run";
 pub const CREDENTIAL_SERVICE: &str = "run.asterism.auth";
+/// The public OAuth client id the authority has registered for `ast`. RFC 8628
+/// public clients are identified, not authenticated, so this is not a secret;
+/// the authority refuses every other id.
+pub const CLI_CLIENT_ID: &str = "asterism-cli";
+/// The scopes registered against [`CLI_CLIENT_ID`]. Asking for anything
+/// outside the registered set is refused with `invalid_scope`.
+pub const CLI_SCOPE: &str = "openid orbit.read orbit.write";
+/// RFC 8628 grant vocabulary sent while polling for the bearer.
+pub const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 /// The pre-issuer credential slot. New clients only remove this entry: a
 /// bearer read from it has no trustworthy destination and must never leave
 /// the machine.
@@ -122,6 +131,122 @@ impl DeviceAuthorizationRequest {
             deep_link_state: Some(state.into()),
         })
     }
+
+    /// The authority reads `application/x-www-form-urlencoded`, not JSON, and
+    /// identifies the caller by `client_id`.
+    ///
+    /// `provider` is advisory. The deployed authority resolves the provider
+    /// from the browser session that approves the user code and ignores form
+    /// fields it does not know, so sending the caller's choice costs nothing
+    /// and keeps `--provider` meaningful if pre-selection is ever added.
+    pub fn form_pairs(&self) -> Vec<(&'static str, String)> {
+        let mut pairs = vec![
+            ("client_id", CLI_CLIENT_ID.to_owned()),
+            ("scope", CLI_SCOPE.to_owned()),
+            ("provider", self.provider.as_str().to_owned()),
+        ];
+        if let Some(uri) = &self.redirect_uri {
+            pairs.push(("redirect_uri", uri.clone()));
+        }
+        if let Some(state) = &self.deep_link_state {
+            pairs.push(("deep_link_state", state.clone()));
+        }
+        pairs
+    }
+}
+
+/// The RFC 6749 token response the authority returns once a user code is
+/// approved. It carries a bearer and its scope; there is no separate account
+/// document on this endpoint.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TokenResponse {
+    pub access_token: Secret,
+    pub token_type: String,
+    pub expires_in: u64,
+    #[serde(default)]
+    pub scope: Option<String>,
+}
+
+impl fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TokenResponse")
+            .field("access_token", &"[REDACTED]")
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .field("scope", &self.scope)
+            .finish()
+    }
+}
+
+impl TokenResponse {
+    /// Bind the bearer to the origin that issued it and name the account it
+    /// belongs to. `now` is only a fallback for a bearer that carries no
+    /// issue time of its own.
+    pub fn into_session(self, issuer: &str, now: u64) -> Result<Session> {
+        if !self.token_type.eq_ignore_ascii_case("Bearer") {
+            bail!("the authorization service returned a non-bearer token");
+        }
+        let (account, issued_at) = account_of_unverified_bearer(self.access_token.expose())?;
+        Ok(Session {
+            access_token: self.access_token,
+            token_type: self.token_type,
+            account,
+            issued_at: issued_at.unwrap_or(now),
+            issuer: issuer.to_owned(),
+        })
+    }
+}
+
+/// Claims carried by the authority's bearer. Only the fields a client is
+/// allowed to act on locally are named here.
+#[derive(Deserialize)]
+struct BearerClaims {
+    sub: String,
+    provider: Provider,
+    name: String,
+    #[serde(default)]
+    iat: Option<u64>,
+}
+
+/// Read the account a bearer was minted for out of the bearer itself.
+///
+/// The authority signs its bearers with a key no client holds, so this
+/// signature is deliberately **not** checked: these claims are read for the
+/// name `ast auth status` prints and for the local credential-store
+/// namespace, and for nothing else. No privilege is granted here. Every
+/// answer that matters still comes from the authority, which does verify the
+/// signature before it acts. A bearer that does not parse is refused outright
+/// rather than stored under a guessed identity.
+fn account_of_unverified_bearer(token: &str) -> Result<(Account, Option<u64>)> {
+    let mut parts = token.split('.');
+    let (Some(_header), Some(payload), Some(_signature), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        bail!("the authorization service returned a token in an unknown format");
+    };
+    if payload.is_empty() || payload.len() > 4096 {
+        bail!("the authorization service returned an unbounded token payload");
+    }
+    let decoded = data_encoding::BASE64URL_NOPAD
+        .decode(payload.as_bytes())
+        .map_err(|_| anyhow::anyhow!("the authorization service returned an undecodable token"))?;
+    let claims: BearerClaims = serde_json::from_slice(&decoded)
+        .map_err(|_| anyhow::anyhow!("the authorization service returned unreadable claims"))?;
+    if claims.sub.is_empty()
+        || claims.sub.len() > 256
+        || claims.name.is_empty()
+        || claims.name.len() > 256
+    {
+        bail!("the authorization service returned an invalid account");
+    }
+    Ok((
+        Account {
+            id: claims.sub,
+            provider: claims.provider,
+            display_name: claims.name,
+        },
+        claims.iat,
+    ))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -378,6 +503,76 @@ mod tests {
         assert!(!debug.contains("super-secret"));
         assert!(serde_json::from_str::<Secret>(r#"""#).is_err());
         assert!(serde_json::from_str::<Secret>(&format!(r#""{}""#, "x".repeat(8193))).is_err());
+    }
+
+    /// A bearer minted by the authority for `asterism-cli`. The signature is
+    /// deliberately not a real one: nothing in this crate verifies it.
+    const BEARER: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhc3Rlcmlzb\
+S1jbGkiLCJzdWIiOiJ1c2VyLTQyIiwicHJvdmlkZXIiOiJnaXRodWIiLCJuYW1lIjoiT2N0byBDYXQiLCJpYXQiOjE3M\
+DAwMDAwMDAsImV4cCI6MTcwMDA0MzIwMCwic2NvcGUiOiJvcGVuaWQifQ.c2lnbmF0dXJl";
+
+    fn token(access_token: &str) -> TokenResponse {
+        TokenResponse {
+            access_token: Secret::new(access_token.into()).unwrap(),
+            token_type: "Bearer".into(),
+            expires_in: 43_200,
+            scope: Some("openid".into()),
+        }
+    }
+
+    #[test]
+    fn a_token_response_names_its_account_and_binds_to_the_issuing_origin() {
+        let session = token(BEARER)
+            .into_session(DEFAULT_AUTHORITY, 1_800_000_000)
+            .unwrap();
+        assert_eq!(session.account.id, "user-42");
+        assert_eq!(session.account.provider, Provider::Github);
+        assert_eq!(session.account.display_name, "Octo Cat");
+        // The bearer carries its own issue time; the clock is only a fallback.
+        assert_eq!(session.issued_at, 1_700_000_000);
+        assert_eq!(session.issuer, DEFAULT_AUTHORITY);
+        assert!(!format!("{session:?}").contains(BEARER));
+        assert!(!format!("{:?}", token(BEARER)).contains(BEARER));
+    }
+
+    #[test]
+    fn a_bearer_that_does_not_name_an_account_is_refused_rather_than_guessed() {
+        for rejected in [
+            "not-a-token",
+            "one.two",
+            "a.b.c.d",
+            // A payload that decodes but claims nothing usable.
+            "eyJhIjoxfQ.eyJhIjoxfQ.sig",
+            // A payload that is not base64url at all.
+            "eyJhIjoxfQ.!!!!.sig",
+        ] {
+            assert!(
+                token(rejected).into_session(DEFAULT_AUTHORITY, 1).is_err(),
+                "{rejected} must not become a stored session"
+            );
+        }
+        let mut wrong_type = token(BEARER);
+        wrong_type.token_type = "mac".into();
+        assert!(wrong_type.into_session(DEFAULT_AUTHORITY, 1).is_err());
+    }
+
+    #[test]
+    fn the_device_code_request_is_form_encoded_and_names_the_registered_client() {
+        assert_eq!(
+            DeviceAuthorizationRequest::cli(Provider::Github).form_pairs(),
+            vec![
+                ("client_id", CLI_CLIENT_ID.to_owned()),
+                ("scope", CLI_SCOPE.to_owned()),
+                ("provider", "github".to_owned()),
+            ]
+        );
+        let desktop =
+            DeviceAuthorizationRequest::desktop(Provider::Google, &"a".repeat(32)).unwrap();
+        let pairs = desktop.form_pairs();
+        assert_eq!(
+            pairs.iter().find(|(key, _)| *key == "redirect_uri"),
+            Some(&("redirect_uri", "asterism://auth/callback".to_owned()))
+        );
     }
 
     #[test]
