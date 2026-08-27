@@ -62,8 +62,9 @@ case "$(uname -s)" in
     ;;
   Linux)
     BACKEND=chv
-    [ -r /dev/kvm ] && [ -w /dev/kvm ] \
-      || fail "/dev/kvm is not readable and writable"
+    if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+      fail "/dev/kvm is not readable and writable"
+    fi
     ;;
   *)
     fail "only macOS VZ and Linux Cloud Hypervisor are native lanes"
