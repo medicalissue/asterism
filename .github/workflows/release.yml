@@ -450,9 +450,17 @@ jobs:
           $images = & (Join-Path $unpack 'ast.exe') images
           if (-not ($images -match 'debian:13')) { throw 'ast images did not list debian:13' }
 
-          # astd-hyperv is the only product virtualization path on Windows.
-          # `--help` is enough to prove the helper links and starts.
-          & (Join-Path $unpack 'astd-hyperv.exe') --help | Out-Null
+          # astd-hyperv is the only product virtualization path on Windows,
+          # so its presence is checked — but not by running it. It takes no
+          # arguments at all: main() goes straight to serve_once() on stdin
+          # and blocks for a protocol frame, so any invocation here would
+          # hang the job rather than print usage. Check it is a real PE
+          # image instead; the protocol itself is covered by
+          # asterism-hyperv's own suite in the windows-hyperv workflow.
+          $helper = Join-Path $unpack 'astd-hyperv.exe'
+          $magic = [IO.File]::ReadAllBytes($helper)[0..1]
+          if ($magic[0] -ne 0x4D -or $magic[1] -ne 0x5A) { throw 'astd-hyperv.exe is not a PE image' }
+          Write-Host "astd-hyperv.exe: PE image, $((Get-Item $helper).Length) bytes"
 
           # Both scripts must parse, since the updater invokes the installer.
           foreach ($script in @('asterism-update.ps1', 'install.ps1')) {
