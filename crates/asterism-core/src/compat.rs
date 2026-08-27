@@ -59,7 +59,7 @@
 //! ### The window
 //!
 //! A build serves its own version and the [`SUPPORTED_BACK`] before it:
-//! currently N-13 through N. That is a floor on how far back it will *serve*, not a
+//! currently N-15 through N. That is a floor on how far back it will *serve*, not a
 //! ceiling on how far forward it will speak — the ceiling is the other side's
 //! range, which is why a newer peer is usable.
 //!
@@ -133,7 +133,15 @@ use crate::VERSION;
 ///   throttles or refuses anything.
 /// * **15** — automatic snapshots and `ast rewind`: the timeline, the roll
 ///   back, and the per-instance snapshot interval and retention.
-pub const PROTOCOL_VERSION: u32 = 15;
+/// * **16** — a port served inside a guest, opened on another device's
+///   loopback: `ast open bot:3000`. One frame on the unix socket asks the
+///   daemon in front of the user for a listener, and one new mesh stream kind
+///   carries each accepted connection to the device supplying that guest's
+///   compute, which connects to the guest's private address and splices. The
+///   port is never declared and nothing on the far device changes, so an old
+///   peer that cannot serve the stream must refuse it rather than mistake it
+///   for an ssh splice.
+pub const PROTOCOL_VERSION: u32 = 16;
 
 /// The wire as it was before it carried a version.
 ///
@@ -148,7 +156,7 @@ pub const FIRST_PROTOCOL: u32 = 1;
 /// and GPU guest frames; keep the unnumbered protocol-1 release reachable in
 /// a rolling orbit — so this moves with [`PROTOCOL_VERSION`] rather than
 /// staying put, which is what keeps the floor at [`FIRST_PROTOCOL`].
-pub const SUPPORTED_BACK: u32 = 14;
+pub const SUPPORTED_BACK: u32 = 15;
 
 /// Format version of the home stamp document itself.
 pub const STAMP_VERSION: u32 = 1;

@@ -432,6 +432,24 @@ pub enum Request {
     SshEndpoint {
         name: String,
     },
+    /// A loopback port on *this* device that reaches `port` inside `name`'s
+    /// guest, wherever in the orbit that guest's compute is.
+    ///
+    /// The cross-device sibling of a published endpoint, and deliberately not
+    /// the same thing: nothing is declared, nothing is durable and nothing on
+    /// the device supplying the compute changes. The listener exists for
+    /// exactly as long as the connection that asked for it, which is how
+    /// `ast open` can be Ctrl-C'd and leave no port behind.
+    OpenPort {
+        name: String,
+        /// The port the service listens on *inside* the guest.
+        port: u16,
+        /// The loopback port to bind here. `None` takes an ephemeral one,
+        /// which is the usual case — the user is about to be handed a URL,
+        /// not to write the number down.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        local_port: Option<u16>,
+    },
     /// Open the user shell offered by one device. Unlike guest SSH this is a
     /// framed conversation on the existing unix socket and mesh stream; it
     /// never creates a TCP listener or invokes sshd.
@@ -913,7 +931,12 @@ impl Request {
             | Request::GpuGuestClose
             | Request::HostedEnroll { .. }
             | Request::HostedStatus
-            | Request::HostedForget => None,
+            | Request::HostedForget
+            // Answered by the daemon in front of the user, which is the one
+            // that has to bind the loopback listener. Routing it by name
+            // would open the port on the *other* device's loopback, where
+            // nobody is sitting.
+            | Request::OpenPort { .. } => None,
             Request::GpuProviderList
             | Request::GpuProviderAttach { .. }
             | Request::GpuProviderRevoke { .. } => None,
@@ -1024,6 +1047,7 @@ impl Request {
             Request::HostedEnroll { .. } | Request::HostedStatus | Request::HostedForget => 12,
             Request::DeviceBench { .. } => 13,
             Request::Cost { .. } => 14,
+            Request::OpenPort { .. } => 16,
             Request::DeviceShellPolicy { .. }
             | Request::DeviceShellOpen { .. }
             | Request::DeviceShellInput { .. }
@@ -1072,6 +1096,7 @@ impl Request {
             Request::HostedEnroll { .. } => Some("hosted_enroll"),
             Request::HostedStatus => Some("hosted_status"),
             Request::HostedForget => Some("hosted_forget"),
+            Request::OpenPort { .. } => Some("open_port"),
             Request::ContainerExec { .. } => Some("container_exec"),
             Request::Exec { .. } => Some("exec"),
             Request::GpuGuestOpen { .. }
@@ -1258,6 +1283,25 @@ pub enum Response {
         host: String,
         port: u16,
         identity: String,
+    },
+    /// Reply to [`Request::OpenPort`]: the loopback port bound on this
+    /// device, and an honest account of where its bytes end up.
+    ///
+    /// Everything after `local_port` exists so the one line the user reads
+    /// can be true without a second round trip: which device is really
+    /// supplying the compute, which port inside its guest, and which mesh
+    /// path is carrying it. `path` is the same vocabulary `ast devices` and
+    /// `ast ping` print — `direct`, `relay`, or `local` when there is no mesh
+    /// hop at all.
+    OpenPort {
+        local_port: u16,
+        instance: String,
+        device: String,
+        port: u16,
+        path: String,
+        /// Round trip to that device, when the mesh had already measured one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rtt_micros: Option<u64>,
     },
     /// Read model for `ast device shell status`.
     DeviceShellStatus {
@@ -1554,6 +1598,7 @@ impl Response {
             Response::Hosted { .. } => 12,
             Response::Cost { .. } => 14,
             Response::RewindTimeline { .. } | Response::Rewound { .. } => 15,
+            Response::OpenPort { .. } => 16,
             Response::Instance { instance, .. } if instance.runtime == RuntimeKind::Container => 8,
             Response::Instances { instances }
                 if instances
@@ -1628,6 +1673,15 @@ pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
             Request::DeviceBench {
                 device: String::new(),
                 bytes: 0,
+            }
+            .since(),
+        ),
+        (
+            "open_port",
+            Request::OpenPort {
+                name: String::new(),
+                port: 0,
+                local_port: None,
             }
             .since(),
         ),

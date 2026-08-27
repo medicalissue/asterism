@@ -83,6 +83,103 @@ to a process that happens to be alive:
   a published endpoint is a promise about one number, and moving it would
   report success while every client that read `ast status` points at nothing.
 
+## Opening a port from another device
+
+`ast open NAME:PORT` puts a port served *inside* a guest on the loopback of
+the device you are sitting at, whichever device in the orbit is supplying that
+guest's compute. The scene it exists for: an agent has been building a UI all
+night on the machine with the RAM, and in the morning you look at it from your
+laptop.
+
+```
+$ ast open bot:3000
+http://127.0.0.1:53000 → bot:3000 on dev5 (direct, 3 ms)
+^C
+closed bot:3000
+```
+
+The compute does not move. What crosses the mesh is one TCP connection at a
+time: `ast` asks the daemon in front of it for a listener, that daemon binds
+`127.0.0.1:<ephemeral>` and, for each accepted connection, opens a mesh stream
+to the device supplying the compute, whose daemon dials the guest's private
+address on `PORT` and splices the two together. TCP only. The bytes are
+encrypted twice on the wire — once by whatever the service speaks, once by
+QUIC — and nothing is exposed beyond loopback at either end.
+
+### It is not a published endpoint
+
+| | `ast create -p HOST:GUEST` | `ast open NAME:PORT` |
+| --- | --- | --- |
+| Where the listener is | the device running the guest | the device you are on |
+| Durable | yes, part of the Instance | no, lives with the command |
+| Survives a daemon restart | rebuilt from the registry | gone |
+| Requires the port be declared | it *is* the declaration | no |
+| Changes anything on the far device | binds a host port there | nothing |
+
+So the port does not have to have been published with `-p`, and opening one
+never publishes it. `ast down` does not close it either: a published port is
+released with the declaration it belongs to, but an opened one belongs to the
+command that opened it. Connections through it fail while the guest is
+stopped — which is what a stopped service looks like from a browser — and
+`ast up` makes the same URL work again. Ctrl-C is a complete teardown because there is nothing
+written down: `ast` holds its unix socket open for the life of the command,
+and dropping it drops the listener and every connection under it.
+
+### Flags
+
+* `--no-browser` prints the address and opens nothing.
+* `--json` prints one object — `{"local","instance","device","port","path"}` —
+  and opens nothing. `path` is the same vocabulary `ast devices` and `ast ping`
+  use: `direct`, `relay`, or `local` when there is no mesh hop at all.
+* `--local-port N` binds that port here instead of an ephemeral one, for a URL
+  that has to be the same twice. Refused if something else holds it, never
+  moved.
+
+### Refusals, all of them before a listener exists
+
+A URL that is printed and then does not work is worse than no URL, so every
+check happens first:
+
+```
+$ ast open nope:3000
+unknown instance "nope" (orbit has: bot, web)
+
+$ ast open bot:3000          # dev5 is not answering
+dev5 is offline (last seen 4 min ago) — bot:3000 is unreachable
+
+$ ast open bot:3000          # bot is down
+instance "bot" is not running — `ast up bot` first
+
+$ ast open bot:1023
+guest port 1023 is Asterism's own guest-control endpoint on an OCI instance …
+```
+
+The command never names a device, because it does not have to: instance names
+are unique across an orbit. Resolving one — this device first, then every peer
+— is `astd`'s `resolve::locate`, shared rather than owned by `ast open`, so
+every other command that addresses an instance by bare name gets the same
+answer and the same two refusals.
+
+The unknown-instance refusal lists the orbit's instance names because that is
+the next thing you would ask for. The offline refusal is worded as a fact
+about the *device*, because that is the thing to go and fix; "last seen" is
+the most recent of two facts the local daemon holds — when it last dialled
+that device successfully, and when that device last handed over its shard.
+
+Guest port 1023 is refused here for the same reason a published mapping may
+not name it, and it is refused **twice**: once by the daemon in front of you,
+so you get a sentence, and again by the daemon supplying the compute, which is
+the side the rule protects. The asking side is the party the rule constrains,
+so its check alone would not be one.
+
+### Wire
+
+Protocol 16. One unix-socket frame (`open_port`) and one new mesh stream kind
+(`port_splice`), which carries `{name, port}` in its opening frame, one
+`splice_ready` reply, and then raw bytes in both directions. A peer older than
+16 refuses the stream by name — `an opened guest port` — rather than dropping
+it, because a dropped stream reads as a device that is switched off.
+
 ## Orbit-scoped secret egress
 
 This is what lets you hand an always-on agent the keys you actually use. A
