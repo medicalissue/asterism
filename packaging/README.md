@@ -289,13 +289,26 @@ separately drift separately.
 | `/usr/share/doc/asterism` | `copyright`, `NOTICE` |
 
 Dependencies are the packages `install.sh` installs, under each family's
-names: `nbd-client kmod e2fsprogs iproute2 libcap2-bin openssh-client sudo` on
-Debian, `nbd kmod e2fsprogs iproute libcap openssh-clients sudo` on Fedora —
-plus OpenSSH, which `install.sh` assumes rather than installs and which
-`ast ssh` and the seed builder both exec. `gnome-keyring` is a
-recommendation, because Secret Service is required for secrets and there is
-no plaintext fallback, but the rest of the product works without one. There
-is no `qemu` dependency in either family, and CI asserts its absence.
+names: `curl nbd-client kmod e2fsprogs iproute2 libcap2-bin openssh-client
+sudo` on Debian, `curl nbd kmod e2fsprogs iproute libcap openssh-clients
+sudo` on Fedora — plus the two `install.sh` assumes rather than installs.
+Those two are the interesting ones, because a package is where the
+assumption stops holding:
+
+* **`curl`.** The OCI transport execs it (`asterism_core::oci`, `tool("curl")`)
+  for every image layer and for the pinned guest kernel. Nobody who runs
+  `curl -fsSL https://asterism.run/install.sh | sh` can be missing curl, so
+  the script never had to say so; `apt-get install ./asterism.deb` on a
+  minimal image absolutely can be, and then every `ast pull` fails at its
+  first fetch on a host that otherwise looks healthy. Found by
+  `scripts/e2e-linux-package.sh` on a clean Ubuntu 26.04, which is what that
+  gate is for.
+* **OpenSSH.** `ast ssh` execs `ssh` and the seed builder runs `ssh-keygen`.
+
+`gnome-keyring` is a recommendation, because Secret Service is required for
+secrets and there is no plaintext fallback, but the rest of the product works
+without one. There is no `qemu` dependency in either family, and CI asserts
+both its absence and curl's presence.
 
 ### The permission model
 

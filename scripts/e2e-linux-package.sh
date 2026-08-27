@@ -154,9 +154,26 @@ printf '%s\n' "$doctor_out" | grep -q '/usr/libexec/asterism/asterism-nbd' ||
 	fail "doctor did not probe the packaged NBD wrapper path"
 ok "ast doctor reports the packaged paths with no environment override"
 
-as_user ast pull "${E2E_KERNEL_IMAGE:-busybox:musl}" >/dev/null ||
+# A pull reaches two public mirrors — a registry and cloud-images.ubuntu.com
+# for the pinned guest kernel — and one slow response there is a flaky gate,
+# not a broken package. Retry the fetch, and only the fetch: nothing about
+# what a pull produces is retried or relaxed.
+pull_with_retry() {
+	attempt=1
+	while [ "$attempt" -le 3 ]; do
+		if as_user ast pull "$1" >/dev/null; then
+			return 0
+		fi
+		echo "note: pull $1 failed on attempt ${attempt}; retrying" >&2
+		attempt=$((attempt + 1))
+		sleep 10
+	done
+	return 1
+}
+
+pull_with_retry "${E2E_KERNEL_IMAGE:-busybox:musl}" ||
 	fail "could not pull the pinned CHV guest kernel payload"
-as_user ast pull "$IMAGE" >/dev/null || fail "pull $IMAGE failed"
+pull_with_retry "$IMAGE" || fail "pull $IMAGE failed"
 ok "pull retained a verified image"
 
 as_user ast create "$INST" --backend chv --image "$IMAGE" --mem 2G --disk 10G |

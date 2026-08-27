@@ -238,11 +238,15 @@ jobs:
           done
           dpkg-deb -I "$deb" | grep -q 'Depends:.*nbd-client'
           dpkg-deb -I "$deb" | grep -q 'Depends:.*kmod'
+          # The OCI transport execs curl. Without this dependency the package
+          # installs onto a minimal image and then cannot pull one byte.
+          dpkg-deb -I "$deb" | grep -q 'Depends:.*curl'
           if dpkg-deb -I "$deb" | grep -Eq '(Depends|Recommends):.*qemu'; then
             echo "the .deb depends on qemu" >&2; exit 1
           fi
           rpm -qpR "$rpm" | grep -qx 'nbd'
           rpm -qpR "$rpm" | grep -qx 'kmod'
+          rpm -qpR "$rpm" | grep -qx 'curl'
           if rpm -qpR "$rpm" | grep -q qemu; then
             echo "the .rpm requires qemu" >&2; exit 1
           fi
