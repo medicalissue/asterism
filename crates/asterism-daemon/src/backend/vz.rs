@@ -387,9 +387,12 @@ impl Hypervisor for Vz {
             // the publisher's gzip wrapper removed when necessary), so an
             // OCI rootfs needs no firmware or bootloader of its own.
             direct_kernel: true,
-            // The guest gets an address of its own on the NAT, so there is
-            // nothing to forward from this host's loopback.
-            port_forward: false,
+            // The guest gets an address of its own on macOS's NAT, so there
+            // is no user-mode `hostfwd` to hand the VMM. Publication is a
+            // listener `astd` binds on this device's loopback and splices to
+            // that private address instead (`crate::publish`), which is why
+            // this is true without anything here changing.
+            port_forward: true,
             // There is still no *host* address only this guest can reach:
             // macOS's NAT puts the guest on a shared bridge, and a listener
             // bound on that bridge's host address is reachable by every

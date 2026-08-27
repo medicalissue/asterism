@@ -451,7 +451,11 @@ impl Hypervisor for Chv {
             nbd_disks: true,
             foreign_arch: false,
             direct_kernel: true,
-            port_forward: false,
+            // The per-instance TAP gives the guest a private address this
+            // host routes to. There is no in-VMM forward to configure;
+            // `astd` binds the declared host port and splices it to that
+            // address (`crate::publish`).
+            port_forward: true,
             // Each CHV guest holds an address of its own on a per-instance
             // TAP, so no host address is reachable from exactly one guest —
             // the TAP's host address is a real interface on this device and
@@ -3502,11 +3506,12 @@ mod tests {
         assert!(caps.live_snapshot && caps.disk_snapshot && caps.live_migration);
         assert!(caps.disk_hotplug && caps.direct_kernel);
         assert!(caps.nbd_disks);
-        // No publication: a CHV guest holds an address of its own on a
-        // per-instance TAP, so there is nothing to forward from this host's
-        // loopback. The egress door is a different thing entirely and does
-        // not go through the network at all.
-        assert!(!caps.port_forward);
+        // Publication, through the daemon's own listener rather than through
+        // a user-mode NAT this VMM does not have: a CHV guest holds an address
+        // of its own on a per-instance TAP and `astd` splices the declared
+        // host port to it. The egress door is a different thing entirely and
+        // does not go through the network at all.
+        assert!(caps.port_forward);
         assert_eq!(
             caps.guest_egress,
             Some(GuestEgress::AgentVsock {

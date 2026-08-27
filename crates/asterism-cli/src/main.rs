@@ -87,6 +87,8 @@ enum Command {
         ///
         /// How an OCI instance is reached: a container image has no ssh
         /// server, so the port it listens on is the way in. Repeatable.
+        /// Always `127.0.0.1` — there is no form of this flag that binds a
+        /// LAN-reachable address.
         #[arg(short = 'p', long = "publish", value_name = "HOST:GUEST[/tcp|/udp]")]
         publish: Vec<String>,
         /// How many cores the guest gets.
@@ -107,8 +109,9 @@ enum Command {
         /// always tried first. `qemu` is an optional compatibility and
         /// development backend that Asterism never installs and never selects
         /// on its own; install it separately (`brew install qemu` on macOS)
-        /// and name it here. It is what covers `-p` port publication and a
-        /// qcow2 base image you point at directly.
+        /// and name it here. It is what covers a qcow2 base image you point
+        /// at directly and a guest of a foreign architecture; `-p` port
+        /// publication is served by the native backends themselves.
         #[arg(long, value_name = "NAME")]
         backend: Option<String>,
         /// Bootstrap profile to apply at first boot (`ast profiles` lists

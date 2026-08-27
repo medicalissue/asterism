@@ -13,6 +13,7 @@ of those seams.
 | Native helper | **Required.** `astd-vz` next to `astd`, code-signed with `com.apple.security.virtualization` and `com.apple.security.network.client`. Every install lane — Homebrew formula, release tarball, source build — installs and signs it; without it macOS has no product backend. | Cloud Hypervisor / Firecracker as decided by the Linux backend | `astd-hyperv.exe` next to `astd.exe` (`ASTERISM_HYPERV_HELPER` override). `ast doctor` **Probes** the helper over the 510d330 protocol; a file on disk is not readiness. |
 | Install / update / uninstall | `install.sh`, signed `RELEASE.json`, Homebrew | native `.deb` and `.rpm` (nfpm, `scripts/build-linux-packages.sh`) built from the release payload: `/usr/bin`, `/usr/libexec/asterism`, `/usr/lib/asterism`, `/usr/share/asterism`, bundled VMM `cap_net_admin+ep` and `nbd` from the post-install, the per-account sudoers rule from `ast service install`, and `~/.asterism` kept on removal. `install.sh` remains the tarball and source path. The signed updater refuses to write over a packaged install and names `apt-get install --only-upgrade asterism` or `dnf upgrade asterism`, as it does for Homebrew. | `install.ps1` (native) and `install.sh` (Git Bash); SHA-256; optional Authenticode thumbprint; receipt uninstall. The updater (`asterism-update.ps1`) is claimed, backed up, and rolled back on failure. |
 | Relay | no relay and no directory unless the device is logged in or configured; `ASTERISM_RELAY_URL` points at a self-hosted `astrelay`. Not a host seam: the same portable Rust on all three. See `docs/RELAY.md`. | same | same |
+| Published ports (`ast create -p`) | Virtualization.framework hands the guest an address on macOS's NAT, so `astd` binds `127.0.0.1:HOST` itself and splices TCP / relays UDP to `<guest>:GUEST` (`crates/asterism-daemon/src/publish.rs`). QEMU, when explicitly selected, uses its own user-mode `hostfwd` instead. | Cloud Hypervisor gives the guest a per-instance TAP address; the same `astd` listener publishes it. QEMU, when explicitly selected, uses `hostfwd`. | not yet: the native Hyper-V backend declares `port_forward: false` and a `-p` create is refused before an Instance row exists. |
 | Capability doctor | `ast doctor` / `ast bugreport` | `ast doctor` / `ast bugreport` | `ast doctor`: Windows build 22000+, elevated token, `vmcompute`/`hns`/`vmms`, exact inbound firewall rule `Asterism device daemon` matching `astd.exe` (a Hyper-V group substring is not a pass), helper Probe, SCM, Credential Manager, sleep assertion. Home is reported as experimental and passes only on real HCS/HCN capability, never on SKU alone. |
 
 macOS product virtualization is Virtualization.framework behind `astd-vz`.
@@ -22,10 +23,12 @@ selected ahead of it: the order is `vz`, `chv`, `qemu`
 install lane declares or ships QEMU — the formula has no `depends_on "qemu"`,
 and qcow2-to-raw materialisation is pure Rust — so QEMU on a Mac exists only
 if someone ran `brew install qemu` and only runs if they pass `--backend
-qemu`. It is a compatibility and development fallback for the two things VZ
-does not do (loopback port publication with `-p`, and reading a qcow2 base
-image the user pointed at directly), and asking for it while it is absent is a
-refusal naming that install command, never a silent substitution.
+qemu`. It is a compatibility and development fallback for what VZ does not do —
+reading a qcow2 base image the user pointed at directly, and running a guest of
+a foreign architecture — and asking for it while it is absent is a refusal
+naming that install command, never a silent substitution. Loopback port
+publication with `-p` left that list in AST-139: VZ serves it through the
+daemon's own listener.
 
 Windows product virtualization is native Hyper-V behind the helper protocol
 preserved from `510d3304e648ae884b125a2eb4dc8d4b92f7475d`. HCS/HCN/VirtDisk
