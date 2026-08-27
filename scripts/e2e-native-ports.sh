@@ -66,7 +66,6 @@ GUEST_ARTIFACT="${ASTERISM_GUEST_AGENT_ARTIFACT:-$(dirname "$ASTD")/guest/bin/as
 export ASTERISM_HOME="/private/tmp/ast-ports-$$"
 [ -d /private/tmp ] || export ASTERISM_HOME="/tmp/ast-ports-$$"
 export ASTERISM_MESH=local
-export ASTERISM_TEST_SERVICE_LABEL="com.asterism.astd.test.ports.$$.$RANDOM"
 mkdir -p "$ASTERISM_HOME"
 harness_own_home "$ASTERISM_HOME"
 
@@ -78,7 +77,6 @@ INST=ports
 RIVAL=ports-rival
 GUEST_UDP=7777
 ASTD_PID=
-SERVICE_INSTALLED=
 
 # Two host ports nothing else on this device holds. Taken from the ephemeral
 # range by binding and letting go, which is what every other port allocation
@@ -97,9 +95,6 @@ cleanup() {
   "$AST" down "$INST" >/dev/null 2>&1 || true
   "$AST" rm "$INST" >/dev/null 2>&1 || true
   "$AST" rm "$RIVAL" >/dev/null 2>&1 || true
-  if [ -n "$SERVICE_INSTALLED" ]; then
-    "$AST" service uninstall >/dev/null 2>&1 || true
-  fi
   harness_keep_home "$ASTERISM_HOME" home
   harness_reap
   if [ -n "${KEEP:-}" ]; then
@@ -131,9 +126,21 @@ guest_pid() {
   "$AST" status "$INST" 2>/dev/null | sed -n 's/^running: .* pid \([0-9]*\),.*/\1/p'
 }
 
-wait_daemon_pid() {
-  local old="$1" now
-  for _ in $(seq 1 150); do
+# Start a daemon over this home and wait for it to claim the pidfile.
+#
+# Deliberately a plain background process rather than `ast service install`.
+# Which service manager brings astd back is proved by the lifecycle suites; it
+# is not what this lane is about, and depending on one would make this lane
+# unrunnable in the clean container the Cloud Hypervisor half runs in. What
+# matters here is that a *new* astd, holding nothing from the old one, rebuilds
+# the published endpoints from the registry — and that is the same code path
+# (`persist::resurrect`) either way.
+start_daemon() {
+  local old="${1:-}" now
+  "$ASTD" >>"$LOG" 2>&1 &
+  ASTD_PID=$!
+  harness_own "$ASTD_PID"
+  for _ in $(seq 1 300); do
     now="$(cat "$ASTERISM_HOME/astd.pid" 2>/dev/null || true)"
     if [ -n "$now" ] && [ "$now" != "$old" ] && kill -0 "$now" 2>/dev/null; then
       ASTD_PID="$now"
@@ -257,15 +264,7 @@ echo "== tcp 127.0.0.1:$HTTP_PORT -> :80, udp 127.0.0.1:$UDP_PORT -> :$GUEST_UDP
 harness_cache_image "$AST" "$IMAGE" || fail "could not cache $IMAGE"
 harness_seed_images "$ASTERISM_HOME"
 
-"$ASTD" >>"$LOG" 2>&1 &
-ASTD_PID=$!
-for _ in $(seq 1 100); do
-  if [ "$(cat "$ASTERISM_HOME/astd.pid" 2>/dev/null || true)" = "$ASTD_PID" ]; then
-    break
-  fi
-  sleep 0.2
-done
-[ "$(cat "$ASTERISM_HOME/astd.pid" 2>/dev/null || true)" = "$ASTD_PID" ] \
+start_daemon \
   || fail "astd did not come up:"$'\n'"$(cat "$LOG" 2>/dev/null || true)"
 
 # The create that used to be refused on this backend. AST-97's refusal named
@@ -333,13 +332,10 @@ expect_udp_echo "the UDP endpoint came back on its own port too" \
 # registry — on the same port, or not at all.
 OLD_DAEMON="$ASTD_PID"
 kill -9 "$ASTD_PID" 2>/dev/null || true
-wait "$ASTD_PID" 2>/dev/null || true
+harness_wait "$ASTD_PID" || true
 ASTD_PID=
 expect_no_tcp "a dead daemon takes its listeners with it" "$HTTP_PORT"
-SERVICE_INSTALLED=1
-service_report="$("$AST" service install 2>&1)" \
-  || fail "installing the scratch astd service:"$'\n'"$service_report"
-wait_daemon_pid "$OLD_DAEMON" || fail "the service manager did not start the scratch astd"
+start_daemon "$OLD_DAEMON" || fail "a second astd did not come up"
 expect "the adopted guest is still the same guest" "machine: $BACKEND" \
   "$AST" status "$INST"
 expect_http_200 "a restarted daemon recovered the endpoint on its declared port" "$HTTP_PORT"
@@ -348,12 +344,19 @@ assert_loopback_only "the recovered listener is still loopback-only" "$HTTP_PORT
 # ---- daemon + VMM loss, restart=always -------------------------------------
 BEFORE_DAEMON="$ASTD_PID"
 BEFORE_GUEST="$(guest_pid)"
-[ -n "$BEFORE_GUEST" ] || fail "no VMM pid before host-equivalent loss"
+if [ -z "$BEFORE_GUEST" ]; then
+  fail "no VMM pid before host-equivalent loss"
+fi
+# Stop the daemon before killing the guest, so it never sees the death and
+# cannot restart it: what comes next has to be resurrection from the durable
+# registry by a daemon that was not running when the guest died, which is what
+# a host losing power looks like from here.
 kill -STOP "$BEFORE_DAEMON"
 kill -9 "$BEFORE_GUEST"
 kill -9 "$BEFORE_DAEMON"
+harness_wait "$BEFORE_DAEMON" || true
 ASTD_PID=
-wait_daemon_pid "$BEFORE_DAEMON" || fail "the service manager did not resurrect astd"
+start_daemon "$BEFORE_DAEMON" || fail "a third astd did not come up"
 AFTER_GUEST="$(wait_guest_pid "$BEFORE_GUEST")" \
   || fail "the resurrected daemon did not recreate the guest"
 ok "astd was resurrected and recreated the VMM as $AFTER_GUEST"
