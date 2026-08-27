@@ -1552,21 +1552,25 @@ mod tests {
             Some(GuestEgress::LoopbackGateway { .. })
         ));
 
-        // VZ has a door and still no publication: the guest holds an
-        // address of its own on the NAT, so there is nothing to forward
-        // from this host's loopback, but the door does not go through the
-        // network at all.
-        let vz_caps = by_id(vz::ID).unwrap().caps();
-        assert!(!vz_caps.port_forward, "vz falsely advertises publication");
-        assert_eq!(
-            vz_caps.guest_egress,
-            Some(GuestEgress::AgentVsock {
-                gateway: EGRESS_GUEST_GATEWAY,
-                vsock_port: EGRESS_VSOCK_PORT,
-            }),
-        );
+        // VZ and Cloud Hypervisor both have a door and still no
+        // publication: each guest holds an address of its own — on a shared
+        // NAT bridge and on a per-instance TAP respectively — so there is
+        // nothing to forward from this host's loopback. Their door does not
+        // go through the network at all, which is why it is the same one.
+        for id in [vz::ID, chv::ID] {
+            let caps = by_id(id).unwrap().caps();
+            assert!(!caps.port_forward, "{id} falsely advertises publication");
+            assert_eq!(
+                caps.guest_egress,
+                Some(GuestEgress::AgentVsock {
+                    gateway: EGRESS_GUEST_GATEWAY,
+                    vsock_port: EGRESS_VSOCK_PORT,
+                }),
+                "{id} does not declare the agent-vsock door",
+            );
+        }
 
-        for id in [chv::ID, hyperv::ID] {
+        for id in [hyperv::ID] {
             let caps = by_id(id).unwrap().caps();
             assert!(!caps.port_forward, "{id} falsely advertises publication");
             assert!(
