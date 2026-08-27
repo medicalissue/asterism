@@ -283,8 +283,11 @@ string as "not configured" rather than as an error.
 
 Also check, before tagging:
 
-- `Cargo.toml` version is `0.1.0`. The build job refuses a tag the tree does
-  not agree with.
+- **`Cargo.toml` says `0.1.0`.** It says `0.0.2` today. The build job compares
+  the tag against the workspace version and refuses the tag if they disagree,
+  so the version bump is a separate, merged pull request that lands *before*
+  the tag — not part of the cut. A dry run for `v0.1.0` fails at the first
+  step until it lands, which is the gate working.
 - The site's `RELEASE_TAG_STABLE` is `v0.1.0` (it already is), so the Worker
   starts serving the moment the release exists.
 - No `v0.1.0` tag or release exists. The draft `v0.0.1` name-reservation stub
@@ -301,6 +304,8 @@ Builds, packages and verifies every platform; the `publish` job is gated on
 release and no tap PR. Do this and let it go green before tagging.
 
 ### The one command
+
+Once the version bump above is merged to `main` and the dry run is green:
 
 ```console
 $ git tag v0.1.0 && git push origin v0.1.0
