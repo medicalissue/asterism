@@ -22,7 +22,9 @@
 //! and two-device harness around that ABI. [`verify`] is the gate every boot
 //! input passes through on its way
 //! into the store and out of it again, and [`profile`] is what a guest is
-//! asked to become once it has booted.
+//! asked to become once it has booted. [`fix`] is how an error carries the
+//! command that repairs it, so the CLI and `ast doctor` can say the same
+//! sentence about the same missing thing.
 
 pub mod backup;
 pub mod compat;
@@ -31,6 +33,7 @@ pub mod device_shell;
 pub mod doctor;
 pub mod durable;
 pub mod egress_door;
+pub mod fix;
 pub mod guest;
 pub mod hosted_auth;
 pub mod hv;

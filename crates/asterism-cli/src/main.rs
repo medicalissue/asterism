@@ -359,6 +359,10 @@ enum Command {
         /// before anything is downloaded rather than fetched and hoped for.
         /// A path may carry one too.
         image: String,
+        /// Report the result — or the failure, its causes and its fix — as
+        /// one JSON object instead of prose.
+        #[arg(long)]
+        json: bool,
     },
     /// Attach a part to an instance: a volume, secret, or hardware GPU.
     ///
@@ -892,9 +896,81 @@ enum DeviceShellCommand {
     Disable,
 }
 
-fn main() -> Result<()> {
+/// The whole point of the wrapper: `anyhow`'s own `Termination` prints the
+/// first sentence and, in a shape nobody greps for, the rest. A missing
+/// `curl` used to surface as `Error: fetching the guest kernel from …` and
+/// took three containers to diagnose, because the sentence that actually
+/// named the problem — and the one-line command that fixes it — never reached
+/// the terminal. Everything an error knows is printed here, once, in a shape
+/// a human and `--json` can both read.
+fn main() -> std::process::ExitCode {
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            report_error(&error, json_output_requested(), &mut std::io::stderr());
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// Whether this invocation asked for machine-readable output.
+///
+/// Read off the raw arguments rather than the parsed command: `--json` is a
+/// per-subcommand flag on a dozen different subcommands, the error may come
+/// from argument parsing itself, and every one of them means the same thing
+/// here.
+fn json_output_requested() -> bool {
+    std::env::args_os().any(|arg| arg == "--json")
+}
+
+/// The lines `ast` prints for a failed command.
+///
+/// The first line is the outermost error verbatim, which is what existing
+/// assertions match on. Below it, one `caused by:` line per link, in the
+/// order the stack wrapped them, and last the remedy when the error carries
+/// one.
+fn error_lines(error: &anyhow::Error) -> Vec<String> {
+    let mut lines = vec![format!("error: {error}")];
+    for cause in error.chain().skip(1) {
+        lines.push(format!("  caused by: {cause}"));
+    }
+    if let Some(fix) = asterism_core::fix::of(error) {
+        lines.push(format!("  fix: {fix}"));
+    }
+    lines
+}
+
+/// The same failure as one JSON object, for a caller that is a program.
+fn error_json(error: &anyhow::Error) -> serde_json::Value {
+    let causes: Vec<String> = error.chain().skip(1).map(|c| c.to_string()).collect();
+    let mut object = serde_json::Map::new();
+    object.insert("error".to_owned(), error.to_string().into());
+    object.insert("causes".to_owned(), causes.into());
+    if let Some(fix) = asterism_core::fix::of(error) {
+        object.insert("fix".to_owned(), fix.command.clone().into());
+        if let Some(note) = &fix.note {
+            object.insert("fix_note".to_owned(), note.clone().into());
+        }
+    }
+    serde_json::Value::Object(object)
+}
+
+fn report_error(error: &anyhow::Error, json: bool, out: &mut impl Write) {
+    let rendered = if json {
+        error_json(error).to_string()
+    } else {
+        error_lines(error).join("\n")
+    };
+    // A closed pipe is not worth a second failure on the way out.
+    let _ = writeln!(out, "{rendered}");
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     let device = cli.device;
+    // Set by the one command that carries `--json` through the generic RPC
+    // dispatch below rather than returning from its own arm.
+    let mut pull_json = false;
 
     let request = match cli.command {
         Command::Create {
@@ -1163,8 +1239,11 @@ fn main() -> Result<()> {
         }
         Command::Images { .. } if device.is_none() => return images_here(),
         Command::Images { verify: _ } => Request::ImageList,
-        Command::Pull { image } if device.is_none() => return pull_here(&image),
-        Command::Pull { image } => Request::ImagePull { reference: image },
+        Command::Pull { image, json } if device.is_none() => return pull_here(&image, json),
+        Command::Pull { image, json } => {
+            pull_json = json;
+            Request::ImagePull { reference: image }
+        }
         // Which device is running the guest is the daemon's problem, not the
         // user's and not this process's: it answers with a loopback port
         // either way.
@@ -1345,7 +1424,7 @@ fn main() -> Result<()> {
                 .collect::<Vec<_>>(),
         ),
         Response::Images { images } => print_image_rows(&images)?,
-        Response::ImagePulled { result } => print_image_pull(&result)?,
+        Response::ImagePulled { result } => print_image_pull(&result, pull_json)?,
         Response::BackupExported { report } => {
             println!(
                 "exported {} file(s), {} logical bytes to {}",
@@ -2951,13 +3030,13 @@ fn images_here() -> Result<()> {
     }
 }
 
-fn pull_here(reference: &str) -> Result<()> {
+fn pull_here(reference: &str, json: bool) -> Result<()> {
     let mut client = Client::open()?;
     let result = match image_path(None, client.spoken) {
         ImagePath::DeviceProtocol => pull_image_with_client(&mut client, reference)?,
         ImagePath::LocalCore => pull_image_locally(reference)?,
     };
-    print_image_pull(&result)
+    print_image_pull(&result, json)
 }
 
 /// Make an image available on the device that will own the next operation.
@@ -3103,7 +3182,11 @@ fn print_image_rows(images: &[asterism_core::image::ImageRow]) -> Result<()> {
     Ok(())
 }
 
-fn print_image_pull(result: &asterism_core::image::ImagePullResult) -> Result<()> {
+fn print_image_pull(result: &asterism_core::image::ImagePullResult, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(result)?);
+        return Ok(());
+    }
     println!(
         "{}  {} image ready ({} bytes{})",
         result.reference,
@@ -4772,6 +4855,11 @@ fn print_doctor() -> Result<()> {
             check.name,
             check.detail
         );
+        // Indented under the row it repairs, in the same words `ast pull`
+        // would have used for the same missing thing.
+        if let Some(fix) = &check.fix {
+            println!("      fix: {fix}");
+        }
     }
     if doctor::all_clear(&checks) {
         println!("doctor: ok");
@@ -6674,5 +6762,128 @@ DAwMDAwMDAsImV4cCI6MTcwMDA0MzIwMCwic2NvcGUiOiJvcGVuaWQifQ.c2lnbmF0dXJl";
                 "health:  load 0.42 · memory 1536 MiB available",
             ]
         );
+    }
+
+    /// The bug this exists to prevent: a missing `curl` reaching the terminal
+    /// as nothing but "fetching the guest kernel", with the sentence that
+    /// names the problem and the command that fixes it thrown away.
+    fn missing_curl_during_a_kernel_fetch() -> anyhow::Error {
+        anyhow::Error::new(asterism_core::fix::Fixable::new(
+            "curl not found — is it installed and on PATH?",
+            asterism_core::fix::Fix::new("sudo apt-get install -y curl"),
+        ))
+        .context("fetching the guest kernel from https://cloud-images.ubuntu.com/vmlinuz-generic")
+    }
+
+    #[test]
+    fn an_error_prints_its_whole_chain_and_its_fix() {
+        assert_eq!(
+            error_lines(&missing_curl_during_a_kernel_fetch()),
+            vec![
+                "error: fetching the guest kernel from https://cloud-images.ubuntu.com/vmlinuz-generic",
+                "  caused by: curl not found — is it installed and on PATH?",
+                "  fix: sudo apt-get install -y curl",
+            ]
+        );
+    }
+
+    #[test]
+    fn every_link_of_a_deep_chain_gets_a_line_outermost_first() {
+        let error = anyhow::anyhow!("the disk is full")
+            .context("writing the blob")
+            .context("pulling busybox:musl");
+        assert_eq!(
+            error_lines(&error),
+            vec![
+                "error: pulling busybox:musl",
+                "  caused by: writing the blob",
+                "  caused by: the disk is full",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bare_error_is_still_one_line() {
+        // The first line is the contract older assertions match on, so an
+        // error with nothing else to say must not grow decoration.
+        assert_eq!(
+            error_lines(&anyhow::anyhow!("no awake device on dev's network")),
+            vec!["error: no awake device on dev's network"]
+        );
+    }
+
+    #[test]
+    fn a_noted_fix_carries_its_platform_onto_the_fix_line() {
+        let error = anyhow::Error::new(asterism_core::fix::Fixable::new(
+            "qemu-system-x86_64 not found — is it installed and on PATH?",
+            asterism_core::fix::Fix::noted("sudo apt-get install -y qemu-system", "Debian/Ubuntu"),
+        ));
+        assert_eq!(
+            error_lines(&error).last().unwrap(),
+            "  fix: sudo apt-get install -y qemu-system   # Debian/Ubuntu"
+        );
+    }
+
+    #[test]
+    fn json_carries_the_causes_array_and_the_fix() {
+        let value = error_json(&missing_curl_during_a_kernel_fetch());
+        assert_eq!(
+            value["error"],
+            "fetching the guest kernel from https://cloud-images.ubuntu.com/vmlinuz-generic"
+        );
+        assert_eq!(
+            value["causes"],
+            serde_json::json!(["curl not found — is it installed and on PATH?"])
+        );
+        assert_eq!(value["fix"], "sudo apt-get install -y curl");
+        assert!(value.get("fix_note").is_none());
+    }
+
+    #[test]
+    fn json_always_has_causes_even_when_there_are_none() {
+        // A consumer that indexes `causes` must never have to check first.
+        let value = error_json(&anyhow::anyhow!("nothing to say"));
+        assert_eq!(value["causes"], serde_json::json!([]));
+        assert!(value.get("fix").is_none());
+    }
+
+    #[test]
+    fn report_error_writes_one_line_of_json_in_json_mode() {
+        let mut out = Vec::new();
+        report_error(&missing_curl_during_a_kernel_fetch(), true, &mut out);
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(value["fix"], "sudo apt-get install -y curl");
+    }
+
+    #[test]
+    fn report_error_writes_the_chain_in_prose_otherwise() {
+        let mut out = Vec::new();
+        report_error(&missing_curl_during_a_kernel_fetch(), false, &mut out);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.starts_with("error: fetching the guest kernel"),
+            "{text}"
+        );
+        assert!(text.contains("\n  caused by: curl not found"), "{text}");
+        assert!(
+            text.contains("\n  fix: sudo apt-get install -y curl"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn pull_accepts_json() {
+        let Command::Pull { image, json } = parse_cli(&["pull", "busybox:musl", "--json"]).command
+        else {
+            panic!("pull did not parse");
+        };
+        assert_eq!(image, "busybox:musl");
+        assert!(json);
+        let Command::Pull { json, .. } = parse_cli(&["pull", "busybox:musl"]).command else {
+            panic!("pull did not parse");
+        };
+        assert!(!json);
     }
 }

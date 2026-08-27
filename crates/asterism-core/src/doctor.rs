@@ -15,12 +15,28 @@ use std::process::Command;
 
 use anyhow::{bail, Result};
 
+use crate::fix::{install_hint, Fix};
+
 /// One row of `ast doctor`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Check {
     pub name: &'static str,
     pub status: Status,
     pub detail: String,
+    /// What to run to clear this row, when the check knows.
+    ///
+    /// A row that names a remedy is the difference between a diagnosis and a
+    /// bug report. Most rows still say `None`; filling the rest in is
+    /// AST-163's job, and this field is the shape it fills.
+    pub fix: Option<Fix>,
+}
+
+impl Check {
+    /// Attach the remedy for this row.
+    pub fn with_fix(mut self, fix: Fix) -> Self {
+        self.fix = Some(fix);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,6 +216,7 @@ fn probe_version_binary(name: &'static str, path: &Path, pin: &str, missing: &st
             name,
             status: Status::Fail,
             detail: format!("{missing} ({})", path.display()),
+            fix: None,
         };
     }
     match run_probe(path, &["--version"]) {
@@ -214,6 +231,7 @@ fn probe_version_binary(name: &'static str, path: &Path, pin: &str, missing: &st
                         stdout.trim().lines().next().unwrap_or(pin),
                         path.display()
                     ),
+                    fix: None,
                 }
             } else {
                 Check {
@@ -225,6 +243,7 @@ fn probe_version_binary(name: &'static str, path: &Path, pin: &str, missing: &st
                         pin,
                         stdout.trim()
                     ),
+                    fix: None,
                 }
             }
         }
@@ -232,6 +251,7 @@ fn probe_version_binary(name: &'static str, path: &Path, pin: &str, missing: &st
             name,
             status: Status::Fail,
             detail: format!("could not execute {}: {error}", path.display()),
+            fix: None,
         },
     }
 }
@@ -242,6 +262,7 @@ fn skip(name: &'static str, detail: impl Into<String>) -> Check {
         name,
         status: Status::Skip,
         detail: detail.into(),
+        fix: None,
     }
 }
 
@@ -272,21 +293,25 @@ pub fn run() -> Vec<Check> {
                     name: "service",
                     status,
                     detail: format!("{}: {}", manager.mechanism(), state.summary()),
+                    fix: None,
                 });
             }
             Err(error) => checks.push(Check {
                 name: "service",
                 status: Status::Fail,
                 detail: format!("{error:#}"),
+                fix: None,
             }),
         },
         Err(error) => checks.push(Check {
             name: "service",
             status: Status::Fail,
             detail: format!("{error:#}"),
+            fix: None,
         }),
     }
 
+    checks.push(curl_check());
     checks.push(secret_store_check());
     checks.push(sleep_check());
 
@@ -309,6 +334,7 @@ pub fn run() -> Vec<Check> {
                 name: "receipt",
                 status: Status::Ok,
                 detail: receipt.display().to_string(),
+                fix: None,
             });
         } else {
             checks.push(Check {
@@ -318,11 +344,33 @@ pub fn run() -> Vec<Check> {
                     "{} is missing — this tree was not installed by install.sh",
                     receipt.display()
                 ),
+                fix: None,
             });
         }
     }
 
     checks
+}
+
+/// `curl` is how every image blob, every guest kernel and every pinned
+/// component reaches this device. Without it nothing can be pulled at all,
+/// which is a `fail` and not a `warn`: an Asterism that cannot fetch an OCI
+/// image cannot start its first instance.
+fn curl_check() -> Check {
+    match crate::tools::tool("curl") {
+        Ok(path) => Check {
+            name: "curl",
+            status: Status::Ok,
+            detail: path.display().to_string(),
+            fix: None,
+        },
+        Err(_) => Check {
+            name: "curl",
+            status: Status::Fail,
+            detail: "not found on PATH — needed to fetch images and kernels".to_owned(),
+            fix: install_hint("curl"),
+        },
+    }
 }
 
 fn file_or_exec(name: &'static str, path: &Path, missing: &str) -> Check {
@@ -331,12 +379,14 @@ fn file_or_exec(name: &'static str, path: &Path, missing: &str) -> Check {
             name,
             status: Status::Ok,
             detail: path.display().to_string(),
+            fix: None,
         }
     } else {
         Check {
             name,
             status: Status::Fail,
             detail: format!("{missing} ({})", path.display()),
+            fix: None,
         }
     }
 }
@@ -356,6 +406,7 @@ fn secret_store_check() -> Check {
             name: "secrets",
             status: Status::Fail,
             detail: "secret storage is not built for this OS; no plaintext fallback is used".into(),
+            fix: None,
         }
     }
 }
@@ -370,6 +421,7 @@ fn probe_macos_keychain() -> Check {
                 "{} answered list-keychains; no file fallback",
                 secret_store_name()
             ),
+            fix: None,
         },
         Ok(out) => Check {
             name: "secrets",
@@ -378,11 +430,13 @@ fn probe_macos_keychain() -> Check {
                 "security list-keychains failed: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             ),
+            fix: None,
         },
         Err(error) => Check {
             name: "secrets",
             status: Status::Fail,
             detail: format!("could not execute security(1) to probe the login Keychain: {error}"),
+            fix: None,
         },
     }
 }
@@ -403,6 +457,7 @@ fn probe_secret_service() -> Check {
                     "{} answered on the session bus; no plaintext fallback",
                     secret_store_name()
                 ),
+                fix: None,
             };
         }
     }
@@ -423,6 +478,7 @@ fn probe_secret_service() -> Check {
                 "{} answered Peer.Ping; no plaintext fallback",
                 secret_store_name()
             ),
+            fix: None,
         },
         Ok(out) => Check {
             name: "secrets",
@@ -432,6 +488,7 @@ fn probe_secret_service() -> Check {
                 secret_store_name(),
                 String::from_utf8_lossy(&out.stderr).trim()
             ),
+            fix: None,
         },
         Err(_) => Check {
             name: "secrets",
@@ -440,6 +497,7 @@ fn probe_secret_service() -> Check {
                 "{} could not be probed (busctl/dbus-send missing). Without a Secret Service provider, secret material cannot be stored.",
                 secret_store_name()
             ),
+            fix: None,
         },
     }
 }
@@ -461,6 +519,7 @@ fn sleep_check() -> Check {
                 name: "sleep",
                 status: Status::Ok,
                 detail: format!("{} (inhibit probe succeeded)", sleep_mechanism_name()),
+                fix: None,
             },
             Ok(out) => Check {
                 name: "sleep",
@@ -469,6 +528,7 @@ fn sleep_check() -> Check {
                     "systemd-inhibit probe failed: {}",
                     String::from_utf8_lossy(&out.stderr).trim()
                 ),
+                fix: None,
             },
             Err(_) => Check {
                 name: "sleep",
@@ -476,6 +536,7 @@ fn sleep_check() -> Check {
                 detail:
                     "systemd-inhibit is not executable, so running guests cannot block idle sleep"
                         .into(),
+                fix: None,
             },
         }
     }
@@ -485,6 +546,7 @@ fn sleep_check() -> Check {
             name: "sleep",
             status: Status::Ok,
             detail: sleep_mechanism_name().into(),
+            fix: None,
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -493,6 +555,7 @@ fn sleep_check() -> Check {
             name: "sleep",
             status: Status::Fail,
             detail: "this device cannot prevent sleep yet".into(),
+            fix: None,
         }
     }
 }
@@ -548,17 +611,20 @@ fn linux_checks() -> Vec<Check> {
                         "Cloud Hypervisor {} and virtiofsd {}",
                         parsed.cloud_hypervisor_version, parsed.virtiofsd_version
                     ),
+                    fix: None,
                 }),
                 Err(error) => checks.push(Check {
                     name: "linux-pins",
                     status: Status::Fail,
                     detail: format!("{error:#}"),
+                    fix: None,
                 }),
             },
             Err(_) => checks.push(Check {
                 name: "linux-pins",
                 status: Status::Warn,
                 detail: format!("{} is missing", lock.display()),
+                fix: None,
             }),
         }
         checks.push(probe_nbd_helper(&crate::layout::nbd_helper()));
@@ -578,6 +644,7 @@ fn probe_nbd_helper(nbd: &Path) -> Check {
                 "{} is missing; remote volumes cannot attach until install.sh or `ast service install` configures NBD",
                 nbd.display()
             ),
+            fix: None,
         };
     }
     probe_nbd_helper_through(nbd, Path::new("sudo"))
@@ -601,6 +668,7 @@ fn probe_nbd_helper_through(nbd: &Path, sudo: &Path) -> Check {
                         "privileged helper probe succeeded through sudo ({})",
                         nbd.display()
                     ),
+                    fix: None,
                 }
             } else {
                 Check {
@@ -611,6 +679,7 @@ fn probe_nbd_helper_through(nbd: &Path, sudo: &Path) -> Check {
                         nbd.display(),
                         stderr.trim()
                     ),
+                    fix: None,
                 }
             }
         }
@@ -618,6 +687,7 @@ fn probe_nbd_helper_through(nbd: &Path, sudo: &Path) -> Check {
             name: "nbd-helper",
             status: Status::Fail,
             detail: format!("could not execute {}: {error}", nbd.display()),
+            fix: None,
         },
     }
 }
@@ -629,6 +699,7 @@ fn probe_kvm(kvm: &Path) -> Check {
             name: "kvm",
             status: Status::Fail,
             detail: format!("{} is missing; Cloud Hypervisor cannot run", kvm.display()),
+            fix: None,
         };
     }
     match OpenOptions::new().read(true).write(true).open(kvm) {
@@ -636,6 +707,7 @@ fn probe_kvm(kvm: &Path) -> Check {
             name: "kvm",
             status: Status::Ok,
             detail: format!("{} opens read-write", kvm.display()),
+            fix: None,
         },
         Err(error) => Check {
             name: "kvm",
@@ -644,6 +716,7 @@ fn probe_kvm(kvm: &Path) -> Check {
                 "{} does not open read-write ({error}); add this user to the kvm group and log in again",
                 kvm.display()
             ),
+            fix: None,
         },
     }
 }
@@ -663,6 +736,7 @@ fn linger_check() -> Check {
                     status: Status::Ok,
                     detail: "lingering is on; the user systemd instance survives logout and reboot"
                         .into(),
+                    fix: None,
                 },
                 Some(false) => Check {
                     name: "linger",
@@ -670,11 +744,13 @@ fn linger_check() -> Check {
                     detail: format!(
                         "lingering is off; astd dies at logout. Enable it with: loginctl enable-linger {user}"
                     ),
+                    fix: None,
                 },
                 None => Check {
                     name: "linger",
                     status: Status::Warn,
                     detail: format!("loginctl did not report Linger ({})", text.trim()),
+                    fix: None,
                 },
             }
         }
@@ -684,6 +760,7 @@ fn linger_check() -> Check {
             detail: format!(
                 "loginctl is unavailable; enable lingering with: loginctl enable-linger {user}"
             ),
+            fix: None,
         },
     }
 }

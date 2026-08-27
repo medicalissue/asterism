@@ -884,7 +884,12 @@ fn download(url: &str, dest: &Path) -> Result<()> {
     if let Some(dir) = dest.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let status = Command::new("curl")
+    // Resolved through `tools::tool` rather than spawned by bare name: an
+    // absent `curl` has to arrive as "curl not found — is it installed and on
+    // PATH?" with the command that installs it, not as an ENOENT under
+    // "running curl".
+    let curl = crate::tools::tool("curl")?;
+    let status = Command::new(curl)
         .args(["--location", "--fail", "--progress-bar", "--output"])
         .arg(dest)
         .arg(url)
