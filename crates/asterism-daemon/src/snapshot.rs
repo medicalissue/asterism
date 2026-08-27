@@ -99,6 +99,11 @@ fn stopped(reg: &Shard, name: &str) -> Result<Instance> {
 }
 
 fn create(inst: &Instance, tag: &str) -> Result<()> {
+    // A snapshot taken by hand is kept forever, and that promise is carried
+    // by the name: retention deletes what is called `auto-…` and nothing
+    // else. So a hand-typed tag that would pass for the scheduler's is
+    // refused here rather than silently becoming a snapshot that expires.
+    asterism_core::rewind::check_human_tag(tag)?;
     let hv = backend::for_instance(inst)?;
     let caps = hv.caps();
     if !caps.disk_snapshot {

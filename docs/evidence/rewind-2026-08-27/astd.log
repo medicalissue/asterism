@@ -1,0 +1,12 @@
+astd: /private/tmp/ast-rewind-57807 was mode 0755 — other users on this machine could read                  it; it is 0700 now
+astd: stamped /private/tmp/ast-rewind-57807 as Asterism 0.0.2 (protocol 14)
+astd 0.0.2: listening on /private/tmp/ast-rewind-57807/astd.sock
+astd: mesh is local — no relay, no directory, nothing published. Devices reach each other where a direct path already works; log in, or set ASTERISM_RELAY_URL, to go further.
+astd: device e6a2d75dfb7c on the mesh as "macbook-pro.tail0de304.ts.net"
+astd: relay meter at /private/tmp/ast-rewind-57807/relay-meter.json: 0 peer(s), 0 B relayed since unix 1787817692
+astd: automatic snapshots every 1m, kept 1h (per-instance: ast rewind <name> --every)
+astd: bot received 192.168.64.35 from Virtualization.framework's DHCP network
+astd: holding this device awake (IOKit PreventUserIdleSystemSleep)
+astd: bot received 192.168.64.35 from Virtualization.framework's DHCP network
+astd: bot received 192.168.64.35 from Virtualization.framework's DHCP network
+astd: bot received 192.168.64.35 from Virtualization.framework's DHCP network

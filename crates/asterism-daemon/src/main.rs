@@ -56,6 +56,7 @@ use asterism_core::{paths, VERSION};
 
 use transport::{Admitted, Framing};
 
+mod autosnap;
 mod backend;
 mod container;
 mod cost;
@@ -75,6 +76,7 @@ mod orbit;
 mod persist;
 mod publish;
 mod relay_meter;
+mod rewind;
 mod secret;
 mod snapshot;
 mod ssh;
@@ -448,6 +450,13 @@ async fn run_daemon(stop_source: StopSource) -> Result<()> {
     // request is served, and then continuously (see `persist`).
     persist::resurrect(&node.shard).await;
     persist::supervise(node.shard.clone());
+
+    // What makes running an agent with every permission granted a reasonable
+    // thing to do: a disk snapshot on a timer, so `ast rewind` always has
+    // somewhere to go back to. Started after resurrection, so the first pass
+    // sees what this device is actually running rather than what it was
+    // halfway through bringing back.
+    autosnap::supervise(node.shard.clone());
 
     // Optional, and never on a critical path: a device with no account still
     // pairs, boots, and serves. Signing in only adds a private directory.
@@ -1205,6 +1214,9 @@ pub(crate) async fn handle(req: Request, node: &Node) -> Response {
     }
     if snapshot::claims(&req) {
         return snapshot::serve(req, &reg);
+    }
+    if rewind::claims(&req) {
+        return rewind::serve(req, &mut reg).await;
     }
     instance::serve(req, &mut reg, &cpu_device).await
 }

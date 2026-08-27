@@ -462,6 +462,21 @@ impl Shard {
         Ok(inst.clone())
     }
 
+    /// Change how often this instance is snapshotted, and for how long those
+    /// snapshots are kept. `None` puts it back on this device's default.
+    pub fn set_rewind(
+        &mut self,
+        name: &str,
+        settings: Option<crate::rewind::Settings>,
+    ) -> Result<Instance> {
+        if let Some(settings) = &settings {
+            settings.check()?;
+        }
+        let inst = self.get_mut(name)?;
+        inst.rewind = settings;
+        Ok(inst.clone())
+    }
+
     pub fn set_stopped(&mut self, name: &str) -> Result<Instance> {
         let inst = self.get_mut(name)?;
         if let Some(intent) = &inst.boot_intent_id {

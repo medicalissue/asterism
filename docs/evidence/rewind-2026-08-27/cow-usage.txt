@@ -1,0 +1,3 @@
+live disk 81396 KiB
+du of the snapshots directory 244180 KiB
+free space consumed by one clone of the stopped disk 12 KiB

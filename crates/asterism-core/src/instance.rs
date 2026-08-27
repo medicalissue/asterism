@@ -654,6 +654,16 @@ pub struct Instance {
     /// an ordinary registry/backup read into authority to execute GPU work.
     #[serde(default)]
     pub gpu: Option<GpuAttachment>,
+    /// How often this instance is snapshotted automatically, and how long
+    /// those snapshots are kept — `ast rewind <name> --every 5m --keep 6h`.
+    ///
+    /// `None` is the ordinary case and means "whatever this device's default
+    /// is", which is what every registry written before `ast rewind` existed
+    /// loads as. Storing the override rather than the resolved value is what
+    /// lets a device change its default and have every instance that never
+    /// asked for anything else follow it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewind: Option<crate::rewind::Settings>,
 
     // ---- legacy, read once and folded into `handle` ------------------------
     //
@@ -694,6 +704,7 @@ impl Instance {
             profiles: Vec::new(),
             stranded: Vec::new(),
             gpu: None,
+            rewind: None,
             legacy_pid: None,
             legacy_ssh_port: None,
         }

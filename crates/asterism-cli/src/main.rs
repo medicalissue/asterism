@@ -45,7 +45,7 @@ use asterism_core::proc::{ProcId, Signal};
 use asterism_core::protocol::{self, HostedStatus, RedactedBearer, Request, Response};
 use asterism_core::registry::OrbitRow;
 use asterism_core::{
-    cow, doctor, image, oci, paths, service, snapshot, verify, windows_host, VERSION,
+    cow, doctor, fix, image, oci, paths, rewind, service, snapshot, verify, windows_host, VERSION,
 };
 
 #[derive(Parser)]
@@ -303,6 +303,47 @@ enum Command {
         name: String,
         /// The snapshot to roll back to, as `ast snapshots` lists it.
         tag: String,
+    },
+    /// Go back to how this instance was, minutes or hours ago.
+    ///
+    /// The daemon snapshots a running instance every ten minutes and keeps a
+    /// day of them, so there is almost always somewhere to go back to. That
+    /// is what makes running an agent with `--dangerously-skip-permissions`
+    /// a reasonable thing to do rather than a brave one.
+    ///
+    ///   ast rewind bot                  the timeline
+    ///
+    ///   ast rewind bot 20m              back twenty minutes
+    ///
+    ///   ast rewind bot --to before-refactor
+    ///
+    ///   ast rewind bot --every 5m       snapshot this one more often
+    ///
+    /// The state being replaced is kept as `before-rewind`, so a rewind can
+    /// itself be rewound. `ast snapshot bot <name>` takes one that is kept
+    /// forever.
+    #[command(override_usage = "ast rewind <INSTANCE> [DURATION]\n       \
+                                ast rewind <INSTANCE> --to <SNAPSHOT>")]
+    Rewind {
+        /// The instance to rewind.
+        name: String,
+        /// How far back: 20m, 2h, 90s, 1h30m.
+        back: Option<String>,
+        /// Roll back to a snapshot by name instead of by time.
+        #[arg(long = "to", value_name = "SNAPSHOT", conflicts_with = "back")]
+        to: Option<String>,
+        /// Add what the snapshots cost to the listing.
+        #[arg(long)]
+        usage: bool,
+        /// Snapshot this instance this often, instead of the device default.
+        #[arg(long, value_name = "DURATION")]
+        every: Option<String>,
+        /// Keep this instance's automatic snapshots this long.
+        #[arg(long, value_name = "DURATION")]
+        keep: Option<String>,
+        /// Forget this instance's own interval and follow the device again.
+        #[arg(long, conflicts_with_all = ["every", "keep"])]
+        reset: bool,
     },
     /// Export, inspect and restore portable content-addressed backups.
     #[command(subcommand)]
@@ -904,6 +945,46 @@ enum DeviceShellCommand {
 /// the terminal. Everything an error knows is printed here, once, in a shape
 /// a human and `--json` can both read.
 fn main() -> std::process::ExitCode {
+    // On a thread this process sized itself, rather than on the one the
+    // operating system handed it.
+    //
+    // Windows gives a process's first thread whatever stack the executable's
+    // header asks for, and the Rust default for that is one megabyte —
+    // an eighth of what Linux and macOS give the same thread. `Cli::parse()`
+    // builds this CLI's entire subcommand tree in a single unwound frame in
+    // an unoptimised build, and one more subcommand was enough to run out:
+    // the symptom is `thread 'main' has overflowed its stack` on whichever
+    // `ast` command happened to be first, with no relationship to what that
+    // command was.
+    //
+    // Rationing subcommands to fit a linker default is not a design. Every
+    // spawned thread's stack is sized by the program rather than by the
+    // platform, so the work runs on one — on every platform, so that there
+    // is one answer and it is exercised everywhere rather than only in CI on
+    // Windows.
+    let worker = std::thread::Builder::new()
+        .name("ast".to_owned())
+        .stack_size(STACK)
+        .spawn(dispatch);
+    match worker {
+        Ok(worker) => match worker.join() {
+            Ok(code) => code,
+            // It panicked and has already said so. Carry the panic up so the
+            // process still dies as one rather than reporting a tidy failure.
+            Err(panic) => std::panic::resume_unwind(panic),
+        },
+        // A machine that will not spawn a thread can still run the command,
+        // on whatever stack it was given.
+        Err(_) => dispatch(),
+    }
+}
+
+/// Stack for the thread the CLI actually runs on. Eight megabytes, which is
+/// what Linux and macOS give a main thread, so this is the familiar size made
+/// explicit rather than a new one invented.
+const STACK: usize = 8 * 1024 * 1024;
+
+fn dispatch() -> std::process::ExitCode {
     match run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
@@ -1180,6 +1261,26 @@ fn run() -> Result<()> {
         }
         Command::Snapshots { name } => return print_snapshots(&name, device.as_deref()),
         Command::Restore { name, tag } => return restore_snapshot(&name, &tag, device.as_deref()),
+        Command::Rewind {
+            name,
+            back,
+            to,
+            usage,
+            every,
+            keep,
+            reset,
+        } => {
+            return rewind(
+                &name,
+                back.as_deref(),
+                to.as_deref(),
+                usage,
+                every.as_deref(),
+                keep.as_deref(),
+                reset,
+                device.as_deref(),
+            )
+        }
         Command::Backup(BackupCommand::Export { name, destination }) => Request::BackupExport {
             name,
             destination: absolute_path(&destination)?.display().to_string(),
@@ -1489,6 +1590,9 @@ fn run() -> Result<()> {
         // and `ast logs` return long before here. Any of them arriving is astd
         // answering a different question.
         Response::Snapshots { .. }
+        // `ast rewind` prints its own timeline and its own report.
+        | Response::RewindTimeline { .. }
+        | Response::Rewound { .. }
         | Response::Log { .. }
         | Response::ContainerExec { .. }
         | Response::Exec { .. }
@@ -3769,6 +3873,94 @@ fn print_snapshots(name: &str, device: Option<&str>) -> Result<()> {
             snap.id, snap.tag, snap.size, snap.date
         );
     }
+    Ok(())
+}
+
+// ---- rewind ----------------------------------------------------------------
+
+/// `ast rewind` — the timeline, the roll back, and the two settings.
+///
+/// One command with three jobs, because from where the user stands they are
+/// one thing: the timeline is what you read to decide, the roll back is what
+/// you do about it, and the interval is how much of a timeline there is to
+/// read. Splitting them into three commands would mean typing the instance
+/// name three times to answer one question.
+#[allow(clippy::too_many_arguments)]
+fn rewind(
+    name: &str,
+    back: Option<&str>,
+    to: Option<&str>,
+    usage: bool,
+    every: Option<&str>,
+    keep: Option<&str>,
+    reset: bool,
+    device: Option<&str>,
+) -> Result<()> {
+    if every.is_some() || keep.is_some() || reset {
+        let request = Request::RewindSettings {
+            name: name.into(),
+            every_secs: every.map(rewind::parse_duration).transpose()?,
+            keep_secs: keep.map(rewind::parse_duration).transpose()?,
+            reset,
+        };
+        // Answered with the timeline the new settings apply to, so the
+        // interval is shown against the snapshots it will govern rather than
+        // echoed back on its own.
+        return print_timeline(&aimed(request, device), true);
+    }
+    let target = match (back, to) {
+        (None, None) => return print_timeline(&aimed(rewind_timeline(name), device), usage),
+        (Some(back), None) => rewind::Target::Back {
+            seconds: rewind::parse_duration(back)?,
+        },
+        (None, Some(tag)) => rewind::Target::Tag { tag: tag.into() },
+        // clap refuses this pairing; the arm is here so the match is total.
+        (Some(_), Some(_)) => bail!("say how far back, or --to which snapshot, not both"),
+    };
+    let request = aimed(
+        Request::Rewind {
+            name: name.into(),
+            to: target,
+        },
+        device,
+    );
+    let report = match send(&request)? {
+        Response::Rewound { report } => report,
+        // Every refusal a rewind can produce is about the target, and the
+        // next thing to type is the timeline. The daemon already puts it in
+        // the message; this puts the command under it, so somebody reading
+        // the tail of a long refusal still gets one line to act on.
+        Response::Error { message } => {
+            return Err(anyhow::Error::new(fix::Fixable::new(
+                message,
+                fix::Fix::new(format!("ast rewind {name}")),
+            )))
+        }
+        other => bail!("unexpected reply from astd: {other:?}"),
+    };
+    let now = asterism_core::instance::now_unix();
+    println!("{}", report.render(rewind::local_offset(now), now));
+    Ok(())
+}
+
+fn rewind_timeline(name: &str) -> Request {
+    Request::RewindTimeline { name: name.into() }
+}
+
+fn print_timeline(request: &Request, usage: bool) -> Result<()> {
+    let timeline = match send(request)? {
+        Response::RewindTimeline { timeline } => timeline,
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected reply from astd: {other:?}"),
+    };
+    let now = asterism_core::instance::now_unix();
+    // The times are the reader's, not the daemon's: a timeline is read to
+    // answer "what was it doing at two o'clock", and two o'clock is where
+    // the person is.
+    print!(
+        "{}",
+        rewind::render(&timeline, now, rewind::local_offset(now), usage)
+    );
     Ok(())
 }
 

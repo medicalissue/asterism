@@ -373,6 +373,34 @@ pub enum Request {
         tag: String,
     },
 
+    // ---- rewind --------------------------------------------------------------
+    //
+    // The same snapshots, walked as a timeline. Reading one writes nothing;
+    // taking one is a stop, a roll back and a start, so `Rewind` is the only
+    // frame here that touches a guest.
+    /// The timeline `ast rewind <instance>` prints.
+    RewindTimeline {
+        name: String,
+    },
+    /// Stop, keep the current state, roll back, start, republish.
+    Rewind {
+        name: String,
+        to: crate::rewind::Target,
+    },
+    /// Change this instance's snapshot interval and retention. `None` on
+    /// either leaves that half where it was; both `None` puts the instance
+    /// back on this device's default.
+    RewindSettings {
+        name: String,
+        #[serde(default)]
+        every_secs: Option<u64>,
+        #[serde(default)]
+        keep_secs: Option<u64>,
+        /// Forget this instance's own settings and follow the device again.
+        #[serde(default)]
+        reset: bool,
+    },
+
     // ---- the console, and the way in -----------------------------------------
     /// The last `lines` lines of an instance's guest console.
     ///
@@ -833,6 +861,9 @@ impl Request {
             | Request::SnapshotList { name }
             | Request::SnapshotRestore { name, .. }
             | Request::SnapshotRemove { name, .. }
+            | Request::RewindTimeline { name }
+            | Request::Rewind { name, .. }
+            | Request::RewindSettings { name, .. }
             | Request::Logs { name, .. }
             | Request::Exec { name, .. }
             | Request::GpuGuestOpen { name }
@@ -965,6 +996,9 @@ impl Request {
             // envelope cannot be spoken at an earlier protocol than it.
             Request::Proxy { inner, .. } => inner.since(),
             Request::Compat => 2,
+            Request::RewindTimeline { .. }
+            | Request::Rewind { .. }
+            | Request::RewindSettings { .. } => 15,
             Request::BackupImportV2 { .. } => 11,
             Request::BackupExport { .. } | Request::BackupImport { .. } => 3,
             Request::AttachStorage { .. }
@@ -1180,6 +1214,18 @@ pub enum Response {
     // ---- snapshots -----------------------------------------------------------
     Snapshots {
         snapshots: Vec<Snapshot>,
+    },
+
+    // ---- rewind --------------------------------------------------------------
+    /// Reply to [`Request::RewindTimeline`] and to
+    /// [`Request::RewindSettings`], which answers with the timeline the new
+    /// settings apply to rather than with a bare acknowledgement.
+    RewindTimeline {
+        timeline: crate::rewind::Timeline,
+    },
+    /// Reply to [`Request::Rewind`].
+    Rewound {
+        report: crate::rewind::Report,
     },
 
     // ---- the console, and the way in -----------------------------------------
@@ -1507,6 +1553,7 @@ impl Response {
             Response::Exec { .. } => 9,
             Response::Hosted { .. } => 12,
             Response::Cost { .. } => 14,
+            Response::RewindTimeline { .. } | Response::Rewound { .. } => 15,
             Response::Instance { instance, .. } if instance.runtime == RuntimeKind::Container => 8,
             Response::Instances { instances }
                 if instances
@@ -1557,6 +1604,13 @@ pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
                 name: None,
                 since: 0,
                 window: String::new(),
+            }
+            .since(),
+        ),
+        (
+            "rewind",
+            Request::RewindTimeline {
+                name: String::new(),
             }
             .since(),
         ),

@@ -1,0 +1,57 @@
+== rewind e2e in /private/tmp/ast-rewind-57807 (backend vz, every 1m)
+ok: astd announced automatic snapshots every 1m, kept 1h
+ok: create the agent instance with a published port
+ok: attach a local directory volume as /work
+ok: boot it
+ok: the published port answers before anything is snapshotted (HTTP 200 on 127.0.0.1:63177)
+ok: the agent writes t0
+ok: the daemon has taken 1 automatic snapshot(s) on its own
+ok: the first automatic snapshot is auto-20260827T080147Z
+ok: the agent writes t1
+ok: the daemon has taken 2 automatic snapshot(s) on its own
+ok: the agent writes t2
+ok: the daemon has taken 3 automatic snapshot(s) on its own
+ok: the /work volume was snapshotted beside the root disk (auto-20260827T080147Z.vol0)
+cow: live disk 81396 KiB; du charges the snapshots directory 244180 KiB
+ok: the agent destroys its own work
+ok: t0, t1 and t2 are gone from the guest and from the host share
+--- ast rewind bot (before)
+ 17:03  auto    (now)
+ 17:02  auto
+ 17:01  auto
+ok: a snapshot that does not exist is refused with the timeline
+ok: the guest was left running by the refusal
+ok: a bare number is not a duration
+--- ast rewind bot 2m
+bot rewound to 17:01 (5.1 s) — current state kept as "before-rewind"
+ok: the rewind reported its target, its cost and its undo
+ok: the instance is running again
+ok: the published port answers again on exactly its own number (HTTP 200 on 127.0.0.1:63177)
+ok: the root disk came back
+ok: the volume came back
+ok: the rewound /work is the same directory the host shares
+--- ast rewind bot (after)
+ 17:03  rewind  before-rewind  (now)
+ 17:03  auto
+ 17:02  auto
+ 17:01  auto
+ok: the state the rewind replaced is on the timeline as before-rewind
+ok: stop for a named snapshot
+ok: a hand-typed tag may not pass for the scheduler's
+ok: take a named snapshot
+cow: cloning the 81396 KiB root disk cost 12 KiB of free space
+ok: boot again
+ok: the named snapshot is on the timeline
+ok: rewind to the very first automatic snapshot by name
+ok: the instance is running after the named rewind
+ok: the published port survived a second rewind (HTTP 200 on 127.0.0.1:63177)
+ok: the baseline snapshot is what came back
+ok: usage is a footer on the listing
+ok: the per-instance interval can be changed
+ok: an interval that would delete every snapshot before the next
+ok: the instance can be put back on the device default
+ok: the named snapshot outlived every automatic one
+ok: stop the completed rewind lane
+ok: remove the completed rewind lane
+REWIND E2E GREEN (docker.io/library/nginx:alpine, vz, snapshots every 1m)
+LANE EXIT=0

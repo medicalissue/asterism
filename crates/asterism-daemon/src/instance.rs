@@ -174,20 +174,7 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
         // backend proves it stopped. Only then do its local bridges and egress
         // proxy go away. A failed stop, including an unresolved launch with no
         // handle, must preserve every side effect behind that authority row.
-        Request::Down { name } => match down(reg, &name) {
-            Ok(stopped) => {
-                volume::take_down(&name).await;
-                // The port is remembered, so the next boot puts it back where
-                // the seed already says it is.
-                egress::stop(&name);
-                // Published endpoints are the opposite: the host port is let
-                // go the moment the guest behind it is proven stopped, and
-                // the durable declaration is what puts it back on `up`.
-                publish::retire(&name);
-                Ok(stopped)
-            }
-            Err(error) => Err(error),
-        },
+        Request::Down { name } => down_completely(reg, &name).await,
         Request::Remove { name } => {
             // Leases are handed back while the immutable instance identity
             // still exists. A sleeping or refusing provider leaves the row
@@ -1252,6 +1239,26 @@ fn up_container(reg: &mut Shard, inst: &Instance, boot_intent_id: &str) -> Resul
     }
     *reg = running;
     Ok(answer)
+}
+
+/// Stop a guest and everything this daemon was holding on its behalf.
+///
+/// The counterpart of [`up`], and it exists for the same reason: every path
+/// that stops a guest has to let go of the same three things, and a second
+/// path that stopped the guest without them left the daemon holding its
+/// published host port — so the boot that followed refused its own
+/// declaration as taken. `ast down` and `ast rewind` are both that path now.
+pub(crate) async fn down_completely(reg: &mut Shard, name: &str) -> Result<Instance> {
+    let stopped = down(reg, name)?;
+    volume::take_down(name).await;
+    // The port is remembered, so the next boot puts it back where the seed
+    // already says it is.
+    egress::stop(name);
+    // Published endpoints are the opposite: the host port is let go the
+    // moment the guest behind it is proven stopped, and the durable
+    // declaration is what puts it back on `up`.
+    publish::retire(name);
+    Ok(stopped)
 }
 
 fn down(reg: &mut Shard, name: &str) -> Result<Instance> {
