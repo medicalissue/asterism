@@ -1,0 +1,4 @@
+ 17:03  rewind  before-rewind  (now)
+ 17:03  auto
+ 17:02  auto
+ 17:01  auto

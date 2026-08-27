@@ -93,7 +93,7 @@ fn date_at(unix_secs: u64) -> String {
 
 /// Days since the unix epoch to a civil date (Howard Hinnant's algorithm);
 /// cheaper than taking on a calendar crate for one filename.
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
+pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;
@@ -286,7 +286,13 @@ pub fn remove(instance_dir: &Path, tag: &str) -> Result<()> {
         );
     }
     std::fs::remove_file(&target)
-        .with_context(|| format!("deleting snapshot {tag:?} at {}", target.display()))
+        .with_context(|| format!("deleting snapshot {tag:?} at {}", target.display()))?;
+    // A snapshot taken by the scheduler has a sidecar and may have a cloned
+    // directory volume beside it. Both belong to the disk image that has
+    // just gone, and leaving either would make the next timeline read
+    // describe a snapshot that no longer exists.
+    crate::rewind::forget_sidecars(instance_dir, tag);
+    Ok(())
 }
 
 /// Where the in-flight restore records the tag it is reading from. Named
