@@ -5,8 +5,28 @@
 //! It listens only inside the guest, authenticates every connection with the
 //! instance key, and keeps command output and lifetime bounded.
 
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod agent_cli;
+
 #[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
+    // Two programs in one file, told apart by the name they were run under.
+    //
+    // Inside the box the agent types `ast`, and `/usr/local/bin/ast` is a
+    // symlink to this binary made at boot beside the binary itself. It is the
+    // same bytes because the alternative — a second static artifact, cross
+    // built, audited, shipped in every release tarball and injected on every
+    // boot — is a whole supply chain for a program that formats one JSON
+    // object. Nothing of the agent's privileges comes with the name: the
+    // client half opens one guest-local socket and prints what comes back.
+    let called = std::env::args().next().unwrap_or_default();
+    if std::path::Path::new(&called)
+        .file_name()
+        .is_some_and(|name| name == "ast")
+    {
+        return agent_cli::client();
+    }
     linux::run()
 }
 
@@ -33,6 +53,8 @@ mod linux {
         VERSIONS,
     };
     use data_encoding::BASE64;
+
+    use crate::agent_cli;
 
     const KEY_PATH: &str = "/etc/asterism/agent.key";
 
@@ -176,14 +198,24 @@ mod linux {
         let key = Key::read(Path::new(KEY_PATH))?
             .ok_or_else(|| anyhow::anyhow!("no instance key at {KEY_PATH}"))?;
         door::start(key.clone());
+        agent_cli::start();
         let listener = TcpListener::bind(("0.0.0.0", OCI_TCP_PORT))
             .with_context(|| format!("binding OCI guest control port {OCI_TCP_PORT}"))?;
         for incoming in listener.incoming() {
             match incoming {
+                // A thread per session, because one of them is now a long
+                // poll. The host keeps a session parked on `agent_next` for
+                // as long as the instance is up, and a serial accept loop
+                // would make that session the only session — `ast exec`,
+                // readiness, `stop`, all of it queued behind a poll that is
+                // deliberately not in a hurry.
                 Ok(stream) => {
-                    if let Err(error) = serve(stream, &key) {
-                        eprintln!("asterism-guest: session ended: {error:#}");
-                    }
+                    let key = key.clone();
+                    std::thread::spawn(move || {
+                        if let Err(error) = serve(stream, &key) {
+                            eprintln!("asterism-guest: session ended: {error:#}");
+                        }
+                    });
                 }
                 Err(error) => eprintln!("asterism-guest: accept failed: {error}"),
             }
@@ -285,6 +317,30 @@ mod linux {
                     Err(error) => refused(request.id, format!("{error:#}")),
                 },
                 "exec" => refused(request.id, "exec requires guest protocol 2".into()),
+                "agent_arm" if accept.version >= 3 => match request.token.clone() {
+                    Some(token) => {
+                        agent_cli::arm(token);
+                        ok(request.id)
+                    }
+                    None => refused(request.id, "agent_arm carries no token".into()),
+                },
+                "agent_next" if accept.version >= 3 => Answer {
+                    agent: agent_cli::next(Duration::from_millis(
+                        request.wait_ms.unwrap_or(1_000).min(60_000),
+                    )),
+                    ..ok(request.id)
+                },
+                "agent_reply" if accept.version >= 3 => match request.agent_reply.clone() {
+                    Some(reply) => {
+                        agent_cli::reply(reply);
+                        ok(request.id)
+                    }
+                    None => refused(request.id, "agent_reply carries no reply".into()),
+                },
+                "agent_arm" | "agent_next" | "agent_reply" => refused(
+                    request.id,
+                    format!("{:?} requires guest protocol 3", request.op),
+                ),
                 other => refused(request.id, format!("this agent has no {other:?}")),
             };
             write_frame(&mut stream, &answer)?;
@@ -306,6 +362,7 @@ mod linux {
             status: None,
             elapsed_ms: None,
             exec: None,
+            agent: None,
         }
     }
 
@@ -317,6 +374,7 @@ mod linux {
             status: None,
             elapsed_ms: None,
             exec: None,
+            agent: None,
         }
     }
 

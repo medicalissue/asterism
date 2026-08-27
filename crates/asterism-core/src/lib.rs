@@ -41,6 +41,7 @@ pub mod hosted_auth;
 pub mod hv;
 pub mod hyperv;
 pub mod image;
+pub mod inbox;
 pub mod instance;
 pub mod ipc;
 pub mod layout;

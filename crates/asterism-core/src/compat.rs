@@ -154,7 +154,12 @@ use crate::VERSION;
 ///   so the CLI asks the daemon what a bare name *is* before it chooses which
 ///   frame to send. A daemon too old to answer cannot be asked, because it
 ///   is also too old to have refused an instance named after a device.
-pub const PROTOCOL_VERSION: u32 = 19;
+/// * **20** — `ast` inside the box, and the channel back out: the agent runs
+///   `ast snapshot`, `ast cost`, `ast fork`, `ast notify` and `ast ask` for
+///   itself, and the person who owns it gets `ast tell` and `ast inbox`.
+///   Leverage rather than restriction — nothing on these frames can refuse
+///   work the agent was going to do anyway.
+pub const PROTOCOL_VERSION: u32 = 20;
 
 /// The wire as it was before it carried a version.
 ///
@@ -169,7 +174,7 @@ pub const FIRST_PROTOCOL: u32 = 1;
 /// and GPU guest frames; keep the unnumbered protocol-1 release reachable in
 /// a rolling orbit — so this moves with [`PROTOCOL_VERSION`] rather than
 /// staying put, which is what keeps the floor at [`FIRST_PROTOCOL`].
-pub const SUPPORTED_BACK: u32 = 18;
+pub const SUPPORTED_BACK: u32 = 19;
 
 /// Format version of the home stamp document itself.
 pub const STAMP_VERSION: u32 = 1;

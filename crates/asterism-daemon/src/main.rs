@@ -65,8 +65,10 @@ mod device_shell;
 mod egress;
 mod fork;
 mod gpu;
+mod guest_cli;
 mod hosted;
 mod images;
+mod inbox;
 mod instance;
 mod mesh;
 #[cfg(unix)]
@@ -461,6 +463,12 @@ async fn run_daemon(stop_source: StopSource) -> Result<()> {
     // sees what this device is actually running rather than what it was
     // halfway through bringing back.
     autosnap::supervise(node.shard.clone());
+
+    // The other half of "an agent with every permission granted": the agent
+    // can reach for those tools itself. One long poll per running instance,
+    // carrying `ast snapshot`, `ast cost`, `ast notify` and `ast ask` out of
+    // the box on the channel that already proves the instance key.
+    guest_cli::supervise(node.clone());
 
     // Optional, and never on a critical path: a device with no account still
     // pairs, boots, and serves. Signing in only adds a private directory.
@@ -1174,6 +1182,16 @@ pub(crate) async fn handle(req: Request, node: &Node) -> Response {
     }
     if images::is_plane_request(&req) {
         return images::serve(req).await;
+    }
+    // The channel between an agent and its owner. Before the shard is locked,
+    // because `tell` runs an exec that must not be queued behind a boot, and
+    // because the inbox is files this device wrote rather than a row in its
+    // registry.
+    if inbox::claims(&req) {
+        return inbox::serve(req);
+    }
+    if guest_cli::claims(&req) {
+        return guest_cli::serve(req, node).await;
     }
     // Exec is the one instance command whose useful work may be long-lived.
     // Clone its immutable authority while holding the shard, then release the

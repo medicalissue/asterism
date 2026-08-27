@@ -301,6 +301,83 @@ pub struct Report {
     pub priced_at: String,
 }
 
+/// The line `ast cost` prints, wherever it is typed.
+///
+/// Here rather than in the CLI because there are now two callers: the `ast`
+/// somebody runs on their laptop, and the `ast cost` an agent runs inside its
+/// own box. Two spellings of this line would eventually be two different
+/// numbers on the same day, and there is no version of that a person could be
+/// expected to reconcile.
+///
+/// `detail` is the difference between a name and a total (`ast cost --all`,
+/// one instance per row) and the whole of it.
+pub fn line(report: &Report, detail: bool) -> String {
+    let label = &report.window;
+    if !detail {
+        return format!("{label:<10} {}", money(report.usd));
+    }
+    if report.calls == 0 {
+        return format!("{label:<10} {}   no calls", money(report.usd));
+    }
+    let mut parts = vec![format!(
+        "{} in \u{b7} {} out",
+        count(report.input_tokens),
+        count(report.output_tokens)
+    )];
+    let cached = report.cache_read_tokens + report.cache_write_tokens;
+    if cached > 0 {
+        parts.push(format!("cache {}", count(cached)));
+    }
+    // The busiest model, named. A list of eight would be a different command;
+    // what somebody wants on this line is which model this is.
+    let models = match report.models.first() {
+        Some(top) if report.models.len() == 1 => format!("{} ({})", top.model, calls(top.calls)),
+        Some(top) => format!(
+            "{} ({}) +{} more",
+            top.model,
+            calls(top.calls),
+            report.models.len() - 1
+        ),
+        None => calls(report.calls),
+    };
+    format!(
+        "{label:<10} {}   {}   {}",
+        money(report.usd),
+        parts.join(" \u{b7} "),
+        models
+    )
+}
+
+/// A dollar figure, or a dash when this device cannot price what it saw.
+///
+/// Two decimal places always: a column of `$4.1` and `$19.8` is harder to
+/// read down than one of `$4.12` and `$19.80`, and cents is the unit people
+/// hold these numbers in.
+pub fn money(usd: Option<f64>) -> String {
+    match usd {
+        Some(amount) => format!("${amount:.2}"),
+        None => "-".into(),
+    }
+}
+
+/// "1 call", "312 calls". A count in a sentence, not in a column.
+pub fn calls(count: u64) -> String {
+    match count {
+        1 => "1 call".into(),
+        other => format!("{other} calls"),
+    }
+}
+
+/// A token count at the precision anybody reads it at.
+pub fn count(tokens: u64) -> String {
+    match tokens {
+        0 => "0".into(),
+        1..=9_999 => tokens.to_string(),
+        10_000..=999_999 => format!("{}k", tokens / 1_000),
+        _ => format!("{:.2}M", tokens as f64 / 1_000_000.0),
+    }
+}
+
 /// Roll a window of entries up into one report.
 pub fn summarize(instance: &str, window: &str, since: u64, entries: &[Entry]) -> Report {
     let mut report = Report {

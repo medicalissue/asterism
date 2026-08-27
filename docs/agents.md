@@ -118,6 +118,50 @@ into `<workdir>/.asterism/agent.log` on the volume. `-f` follows it. The
 guest's serial console — Asterism's init and the image's entrypoint — is still
 there under `ast logs <name> --console`.
 
+## The agent can run `ast` too
+
+The other half of what this gets you over tmux and a VPN, and the half that
+only matters once the agent has been running for a day: inside the box, `ast`
+is there.
+
+```
+agent@bot:~$ ast snapshot before-schema-migration
+snapshot "before-schema-migration" taken (0.02 s)
+agent@bot:~$ ast ask "Change the prod schema now (A) or tomorrow morning (B)?"
+waiting for a reply… (your owner has been notified)
+A
+agent@bot:~$ ast notify "PR #42 opened — ready for review"
+```
+
+and you are the other end of it:
+
+```
+$ ast tell bot "run the test suite and fix what fails"
+sent to bot — follow with: ast logs bot -f
+$ ast inbox
+ 14:02  bot  ask     Change the prod schema now (A) or tomorrow morning (B)?   [reply: ast inbox reply 1 …]
+ 14:31  bot  notify  PR #42 opened — ready for review
+$ ast inbox reply 1 A
+replied to bot
+```
+
+Six verbs in the box — `snapshot`, `rewind`, `cost`, `fork`, `notify`, `ask`
+— and two outside it. Nothing in there can refuse the agent anything: `ast ask`
+blocks because the agent chose to ask and times out on its own, and there is
+no approval gate anywhere in the feature. `docs/guest-ast.md` is the whole of
+it, including the per-instance token that makes `ast snapshot other-bot` a
+sentence rather than a snapshot.
+
+### Telling the agent it has them
+
+An agent only uses a tool it has been told about. `presets/AGENT-SNIPPET.md`
+is the paragraph to put in a `CLAUDE.md` or an `AGENTS.md`: snapshot before
+risky work, ask when a decision is expensive, notify when something is worth
+knowing. `ast create --agent` writes it into the box at
+`<workdir>/.asterism/AGENT-SNIPPET.md` — beside `start.sh` rather than into
+the repository, because the repository belongs to whoever cloned it. Point the
+agent at that path, or paste the file into whatever it already reads.
+
 ## Removing one
 
 `ast rm <name>` deletes the instance, its root disk and its snapshots. It does
