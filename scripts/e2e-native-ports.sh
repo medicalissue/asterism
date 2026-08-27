@@ -170,7 +170,10 @@ expect_http_200() {
   local desc="$1" port="$2" code=
   for _ in $(seq 1 60); do
     code="$(http_status "$port")"
-    [ "$code" = 200 ] && { ok "$desc (HTTP $code on 127.0.0.1:$port)"; return 0; }
+    if [ "$code" = 200 ]; then
+      ok "$desc (HTTP $code on 127.0.0.1:$port)"
+      return 0
+    fi
     sleep 2
   done
   fail "$desc: 127.0.0.1:$port answered \"$code\", not 200"
@@ -180,7 +183,10 @@ expect_no_tcp() {
   local desc="$1" port="$2" code=
   for _ in $(seq 1 30); do
     code="$(http_status "$port")"
-    [ "$code" = 000 ] && { ok "$desc"; return 0; }
+    if [ "$code" = 000 ]; then
+      ok "$desc"
+      return 0
+    fi
     sleep 1
   done
   fail "$desc: 127.0.0.1:$port is still answering (\"$code\")"
@@ -241,7 +247,9 @@ export AST ASTD
 
 HTTP_PORT="$(free_port)"
 UDP_PORT="$(free_port)"
-[ -n "$HTTP_PORT" ] && [ -n "$UDP_PORT" ] || fail "could not pick two free host ports"
+if [ -z "$HTTP_PORT" ] || [ -z "$UDP_PORT" ]; then
+  fail "could not pick two free host ports"
+fi
 
 echo "== native published ports on $BACKEND, in $ASTERISM_HOME"
 echo "== tcp 127.0.0.1:$HTTP_PORT -> :80, udp 127.0.0.1:$UDP_PORT -> :$GUEST_UDP"
@@ -252,7 +260,9 @@ harness_seed_images "$ASTERISM_HOME"
 "$ASTD" >>"$LOG" 2>&1 &
 ASTD_PID=$!
 for _ in $(seq 1 100); do
-  [ "$(cat "$ASTERISM_HOME/astd.pid" 2>/dev/null || true)" = "$ASTD_PID" ] && break
+  if [ "$(cat "$ASTERISM_HOME/astd.pid" 2>/dev/null || true)" = "$ASTD_PID" ]; then
+    break
+  fi
   sleep 0.2
 done
 [ "$(cat "$ASTERISM_HOME/astd.pid" 2>/dev/null || true)" = "$ASTD_PID" ] \
