@@ -36,8 +36,8 @@ use serde::{Deserialize, Serialize};
 use crate::durable::{self, Loaded};
 use crate::hv::{Handle, ImageKind, Machine};
 use crate::instance::{
-    self, now_unix, Conflict, Instance, Moving, Policy, PortForward, Restart, RuntimeKind, Shape,
-    Status, Volume,
+    self, now_unix, Conflict, Instance, Moving, Policy, PortForward, Restart, RestartReason,
+    RuntimeKind, Shape, Status, Volume,
 };
 use crate::proc::ProcId;
 use crate::remote_gpu::GpuAttachment;
@@ -474,6 +474,22 @@ impl Shard {
         }
         let inst = self.get_mut(name)?;
         inst.rewind = settings;
+        Ok(inst.clone())
+    }
+
+    /// Record that this instance's guest was started, and why.
+    ///
+    /// Bookkeeping, deliberately separate from [`Self::set_running`]: it is
+    /// written after the handle is committed and never gates a boot, so a
+    /// history that fails to save can never cost anybody a running guest.
+    pub fn note_restart(
+        &mut self,
+        name: &str,
+        reason: RestartReason,
+        epoch: u64,
+    ) -> Result<Instance> {
+        let inst = self.get_mut(name)?;
+        inst.restarts.note(reason, epoch);
         Ok(inst.clone())
     }
 

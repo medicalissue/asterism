@@ -223,7 +223,11 @@ fn family_packager(family: &str) -> Option<Packager> {
 
 /// How Asterism's own pinned helpers are restored. They are not in anybody's
 /// package repository — the installer fetches them by digest.
-const REINSTALL: &str = "curl -fsSL https://asterism.run/install.sh | sh";
+///
+/// Public because it is also the remedy for everything else the installer
+/// puts on a device: the guest-control artifact, the component lock, the
+/// install receipt. `ast doctor` names it for those rows.
+pub const REINSTALL: &str = "curl -fsSL https://asterism.run/install.sh | sh";
 
 /// The package that carries `tool`, in the words of `packager`.
 ///
@@ -243,11 +247,19 @@ fn package_for(tool: &str, packager: Packager) -> Option<&'static str> {
         "newuidmap" | "newgidmap" => "uidmap",
         "slirp4netns" => "slirp4netns",
         "ip" => "iproute2",
+        // The Secret Service and the sleep inhibitor are host integration
+        // rather than backend tooling, but they are installed the same way
+        // and `ast doctor` asks for them by binary name too.
+        "gnome-keyring" | "gnome-keyring-daemon" => "gnome-keyring",
+        "systemd-inhibit" | "loginctl" => "systemd",
         "qemu-img" => "qemu",
         other if other.starts_with("qemu-system-") => "qemu",
         _ => return None,
     };
     Some(match (family, packager) {
+        // Neither of these host-integration packages exists off Linux, and a
+        // name that is not there is worse than no name at all.
+        ("gnome-keyring" | "systemd", Packager::Brew | Packager::Winget) => return None,
         ("curl", Packager::Winget) => "cURL.cURL",
         ("gzip", Packager::Winget) => "GnuWin32.Gzip",
         ("xz", Packager::Apt) => "xz-utils",
@@ -276,7 +288,15 @@ pub fn install_hint(tool: &str) -> Option<Fix> {
         .trim_end_matches(".exe");
     if matches!(
         stem,
-        "cloud-hypervisor" | "virtiofsd" | "asterism-nbd" | "asterism-vz-helper"
+        "cloud-hypervisor"
+            | "virtiofsd"
+            | "asterism-nbd"
+            | "asterism-vz-helper"
+            // The signed macOS helper, by the name every install lane and
+            // `codesign` uses for it.
+            | "astd-vz"
+            | "ast"
+            | "astd"
     ) {
         return Some(Fix::noted(
             REINSTALL,
@@ -403,6 +423,36 @@ mod tests {
         // An absolute path is what the backend actually asked for.
         let fix = install_hint("/usr/libexec/asterism/virtiofsd").expect("stem is what matters");
         assert!(fix.command.contains("install.sh"), "{}", fix.command);
+    }
+
+    /// The signed macOS helper and the two binaries beside it come from the
+    /// installer, not from a package manager that has never heard of them.
+    #[test]
+    fn the_installed_binaries_point_at_the_installer() {
+        for tool in ["astd-vz", "ast", "astd"] {
+            let fix = install_hint(tool).unwrap_or_else(|| panic!("{tool} has no remedy"));
+            assert!(
+                fix.command.contains("install.sh"),
+                "{tool}: {}",
+                fix.command
+            );
+        }
+    }
+
+    /// Host integration has packages too, but only where such a package
+    /// exists: naming a Homebrew formula for `systemd` would be a lie.
+    #[test]
+    fn host_integration_packages_exist_only_where_they_exist() {
+        assert_eq!(
+            package_for("systemd-inhibit", Packager::Apt),
+            Some("systemd")
+        );
+        assert_eq!(
+            package_for("gnome-keyring", Packager::Dnf),
+            Some("gnome-keyring")
+        );
+        assert_eq!(package_for("systemd-inhibit", Packager::Brew), None);
+        assert_eq!(package_for("gnome-keyring", Packager::Winget), None);
     }
 
     #[test]

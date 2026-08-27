@@ -47,7 +47,7 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 
-use asterism_core::instance::{Instance, Status, VolumeKind};
+use asterism_core::instance::{Instance, RestartReason, Status, VolumeKind};
 use asterism_core::paths;
 use asterism_core::protocol::{Request, Response};
 use asterism_core::registry::Shard;
@@ -349,7 +349,10 @@ async fn rewind(reg: &mut Shard, name: &str, to: &Target) -> Result<model::Repor
     // an instance left stopped by a failed rewind is the worst of both.
     let mut restarted = false;
     if was_running {
-        match crate::instance::up(reg, name, None) {
+        // Its own reason: a guest that is up again because its disk was
+        // rolled back has not crashed and nobody typed `ast up`, and
+        // `ast status` should not imply either.
+        match crate::instance::up(reg, name, None, RestartReason::Rewound) {
             Ok(_) => restarted = true,
             Err(error) => warnings.extend(boot_failure(reg, name, &error)),
         }

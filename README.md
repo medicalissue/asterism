@@ -64,6 +64,10 @@ You can already leave Claude Code, Codex, OpenClaw, or Hermes running under
   with the tools already provisioned, not a machine you now have to set up.
 - **It stays up.** `ast service install` plus `--restart always` survives
   logout and reboot; the daemon keeps the device awake while a guest is running.
+  `ast status NAME` shows what that policy has actually done — when the guest
+  last came back, how many times since the daemon started, and whether it was
+  a crash restart, a `restart=always` resurrection, an `ast rewind`, or
+  somebody's `ast up`.
 - **Dispatch from anywhere.** `ast ssh agent` resolves the name orbit-wide, so
   you send work to the agent from whichever device you have on you and pick up
   the results later.
@@ -170,6 +174,29 @@ $ ast doctor
 $ ast up agent --restart always
 $ ast service status
 ```
+
+`ast doctor` checks this device's host integration one row at a time, and
+every row that is not `ok` prints the command that clears it, written for this
+platform — the package manager this distribution actually uses, the account
+this shell is in:
+
+```console
+$ ast doctor
+ok    ast                 /usr/local/bin/ast
+ok    astd                /usr/local/bin/astd
+warn  service             launchd: installed, not loaded
+      fix: ast service install
+fail  curl                not found on PATH — needed to fetch images and kernels
+      fix: sudo apt-get install -y curl
+fail  vz                  astd-vz is not signed with com.apple.security.virtualization …
+      fix: scripts/sign-vz.sh   # in an Asterism checkout — cargo invalidates …
+```
+
+On macOS the `vz` row is the whole backend in one line: the helper is
+installed, it carries both entitlements Virtualization.framework requires, and
+the guest-control agent every OCI guest is handed is where a boot will look
+for it. On Linux the rows are `kvm`, `linger`, the pinned Cloud Hypervisor and
+virtiofsd, the component lock and the NBD privilege helper.
 
 On macOS, install `astd` as the user service that keeps instances running:
 

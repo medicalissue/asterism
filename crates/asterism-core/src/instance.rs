@@ -462,6 +462,90 @@ impl Policy {
     }
 }
 
+/// Why a guest was started.
+///
+/// The distinction is the whole value of the restart history: a guest that
+/// came back three times on its own is a guest that is crashing, and a guest
+/// somebody started three times is a person at a keyboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestartReason {
+    /// A person ran `ast up`.
+    User,
+    /// The crash supervisor found the guest dead and restarted it.
+    Crash,
+    /// `restart=always` brought it back when the daemon started — a host
+    /// reboot, or an `astd` that was restarted or upgraded.
+    Resurrected,
+    /// `ast rewind` rolled the disk back and put the guest up again. Not a
+    /// crash and not a hand-started boot, and a status line that implied
+    /// either would be misleading in different directions.
+    Rewound,
+}
+
+impl std::fmt::Display for RestartReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RestartReason::User => "ast up",
+            RestartReason::Crash => "crash restart",
+            RestartReason::Resurrected => "restart=always resurrection",
+            RestartReason::Rewound => "ast rewind",
+        })
+    }
+}
+
+/// What has happened to this instance's guest since the daemon started.
+///
+/// Recorded on the instance rather than kept in the supervisor's watch
+/// table, because the table is memory: it is emptied by the very daemon
+/// restart the user is trying to ask about. `ast status` reads this.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Restarts {
+    /// Restarts counted since [`Restarts::since`]. A first-ever `ast up` is
+    /// a boot and not a restart, so it does not count; everything the
+    /// supervisor does, does.
+    #[serde(default)]
+    pub count: u32,
+    /// Unix seconds of the daemon start this count is measured from. The
+    /// count resets when the daemon does, because "twice since Tuesday" and
+    /// "twice in the last hour" are different findings.
+    #[serde(default)]
+    pub since: u64,
+    /// Unix seconds of the most recent start, of any kind. Survives daemon
+    /// restarts: it is the answer to "when did this last come back?".
+    #[serde(default)]
+    pub last_at: u64,
+    /// Why that one happened.
+    #[serde(default)]
+    pub last_reason: Option<RestartReason>,
+}
+
+impl Restarts {
+    /// Record a start. `epoch` is the daemon start the count belongs to.
+    ///
+    /// The first start this instance has ever had is a boot, not a restart,
+    /// and is remembered without being counted: a freshly created instance
+    /// that was brought up once must not read as having restarted.
+    pub fn note(&mut self, reason: RestartReason, epoch: u64) {
+        let first_ever = self.last_at == 0 && reason == RestartReason::User;
+        if self.since != epoch {
+            self.since = epoch;
+            self.count = 0;
+        }
+        if !first_ever {
+            self.count = self.count.saturating_add(1);
+        }
+        self.last_at = now_unix();
+        self.last_reason = Some(reason);
+    }
+
+    /// Has this instance ever come back? A `false` here is what keeps
+    /// `ast status` from printing a line about nothing having happened.
+    pub fn happened(&self) -> bool {
+        self.count > 0 || self.last_reason.is_some_and(|r| r != RestartReason::User)
+    }
+}
+
 /// Hardware shape of an instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Shape {
@@ -564,6 +648,14 @@ pub struct Instance {
     /// alongside is folded in and deleted at load.
     #[serde(default)]
     pub policy: Policy,
+    /// What that policy has actually done: when this guest last came back,
+    /// how many times since the daemon started, and why.
+    ///
+    /// Defaulted, so a shard written before any of this was recorded loads
+    /// as an instance that has not restarted — which is all that can honestly
+    /// be said about it.
+    #[serde(default)]
+    pub restarts: Restarts,
     /// The machine this instance was defined against: backend, machine
     /// type, cpu model, hypervisor version. Recorded at create time and
     /// left alone afterwards — it is what a future live migration has to
@@ -693,6 +785,7 @@ impl Instance {
             publish: Vec::new(),
             shape,
             policy: Policy::default(),
+            restarts: Restarts::default(),
             machine,
             handle: None,
             boot_intent_id: None,
@@ -1346,5 +1439,82 @@ mod tests {
         value.as_object_mut().unwrap().remove("runtime");
         let restored: Instance = serde_json::from_value(value).unwrap();
         assert_eq!(restored.runtime, RuntimeKind::Vm);
+    }
+
+    /// The first `ast up` is a boot. Everything the supervisor does after
+    /// that is a restart, and is counted as one.
+    #[test]
+    fn the_first_boot_is_not_a_restart_but_every_resurrection_is() {
+        let mut restarts = Restarts::default();
+        restarts.note(RestartReason::User, 1000);
+        assert_eq!(restarts.count, 0);
+        assert!(!restarts.happened(), "a fresh instance has no history");
+        assert_eq!(restarts.last_reason, Some(RestartReason::User));
+
+        restarts.note(RestartReason::Crash, 1000);
+        assert_eq!(restarts.count, 1);
+        assert!(restarts.happened());
+        restarts.note(RestartReason::User, 1000);
+        assert_eq!(
+            restarts.count, 2,
+            "a hand-started guest had still gone down"
+        );
+        assert_eq!(restarts.last_reason, Some(RestartReason::User));
+    }
+
+    /// The reason is the point of the record, so each one has to read as
+    /// what it is on the status line — and survive a round trip through the
+    /// shard that carries it.
+    #[test]
+    fn every_reason_says_what_happened_and_round_trips() {
+        for (reason, said) in [
+            (RestartReason::User, "ast up"),
+            (RestartReason::Crash, "crash restart"),
+            (RestartReason::Resurrected, "restart=always resurrection"),
+            (RestartReason::Rewound, "ast rewind"),
+        ] {
+            assert_eq!(reason.to_string(), said);
+            let json = serde_json::to_string(&reason).unwrap();
+            assert_eq!(
+                serde_json::from_str::<RestartReason>(&json).unwrap(),
+                reason
+            );
+        }
+    }
+
+    /// "Twice" has to mean twice since something. A new daemon is that
+    /// something, and the last restart itself outlives the reset.
+    #[test]
+    fn a_new_daemon_resets_the_count_and_keeps_the_last_restart() {
+        let mut restarts = Restarts::default();
+        restarts.note(RestartReason::User, 1000);
+        restarts.note(RestartReason::Crash, 1000);
+        restarts.note(RestartReason::Crash, 1000);
+        assert_eq!(restarts.count, 2);
+        let before = restarts.last_at;
+
+        restarts.note(RestartReason::Resurrected, 2000);
+        assert_eq!(restarts.since, 2000);
+        assert_eq!(restarts.count, 1, "the count is per daemon, not forever");
+        assert_eq!(restarts.last_reason, Some(RestartReason::Resurrected));
+        assert!(restarts.last_at >= before);
+    }
+
+    /// A registry written before any of this existed is an instance that has
+    /// not restarted, which is the only honest reading of it.
+    #[test]
+    fn a_shard_written_before_restart_history_loads_without_one() {
+        let mut value = serde_json::to_value(Instance::new(
+            "dev",
+            "laptop",
+            "debian:13",
+            Shape::default(),
+            machine(),
+        ))
+        .unwrap();
+        value.as_object_mut().unwrap().remove("restarts");
+        let restored: Instance = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.restarts, Restarts::default());
+        assert!(!restored.restarts.happened());
     }
 }

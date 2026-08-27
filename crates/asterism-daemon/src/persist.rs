@@ -51,7 +51,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 use asterism_core::hv::RunState;
-use asterism_core::instance::{Instance, Restart, Status};
+use asterism_core::instance::{Instance, Restart, RestartReason, Status};
 use asterism_core::paths;
 use asterism_core::power::{Change, SleepGuard};
 use asterism_core::registry::Shard;
@@ -82,6 +82,19 @@ struct Watch {
     due: Option<Instant>,
     /// When the guest was last seen (or booted) alive.
     seen_alive: Instant,
+}
+
+/// Unix seconds this daemon started, and the epoch every restart count is
+/// measured against.
+///
+/// The watch table is memory and dies with the process; the counts written
+/// onto instances outlive it. Scoping them to this timestamp is what keeps
+/// "restarted twice" from meaning "twice, at some point, possibly years
+/// ago" — [`asterism_core::instance::Restarts::note`] resets the count when
+/// it sees a new one.
+pub fn daemon_epoch() -> u64 {
+    static STARTED: OnceLock<u64> = OnceLock::new();
+    *STARTED.get_or_init(asterism_core::instance::now_unix)
 }
 
 fn watches() -> MutexGuard<'static, BTreeMap<String, Watch>> {
@@ -238,7 +251,7 @@ pub async fn resurrect(registry: &Arc<Mutex<Shard>>) {
             continue;
         }
         eprintln!("astd: {name} was running when this device last had a daemon — booting it");
-        match boot_again(&mut reg, &inst) {
+        match boot_again(&mut reg, &inst, RestartReason::Resurrected) {
             Ok(booted) => eprintln!(
                 "astd: {name} is back{}",
                 booted
@@ -363,7 +376,7 @@ fn restart(reg: &mut Shard, name: &str) -> bool {
         "astd: {name} is down — restarting it (attempt {attempt} of {})",
         inst.policy.max_attempts
     );
-    match boot_again(reg, &inst) {
+    match boot_again(reg, &inst, RestartReason::Crash) {
         Ok(booted) => {
             eprintln!(
                 "astd: {name} is back{}",
@@ -425,7 +438,7 @@ fn append_to_console(name: &str, message: &str) -> anyhow::Result<()> {
 
 /// Boot an instance whose recorded guest is gone, through the same path
 /// `ast up` uses — a resurrected instance is not a special kind of boot.
-fn boot_again(reg: &mut Shard, inst: &Instance) -> anyhow::Result<Instance> {
+fn boot_again(reg: &mut Shard, inst: &Instance, reason: RestartReason) -> anyhow::Result<Instance> {
     if let Some(intent) = &inst.boot_intent_id {
         anyhow::bail!(
             "instance {:?} has unresolved boot intent {intent}; refusing a second guest",
@@ -443,7 +456,7 @@ fn boot_again(reg: &mut Shard, inst: &Instance) -> anyhow::Result<Instance> {
     // host ports go first is what lets `up` reclaim exactly the declaration.
     crate::publish::retire(&inst.name);
     clear_stale_control(inst);
-    crate::instance::up(reg, &inst.name, None)
+    crate::instance::up(reg, &inst.name, None, reason)
 }
 
 /// A killed guest leaves its control socket behind; the next boot binds
@@ -703,7 +716,9 @@ mod tests {
         assert_eq!(owed(), 0, "the stale restart watch survived");
 
         let pending = reg.get(&name).unwrap().clone();
-        let error = boot_again(&mut reg, &pending).unwrap_err().to_string();
+        let error = boot_again(&mut reg, &pending, RestartReason::Crash)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("refusing a second guest"), "{error}");
         let preserved = reg.get(&name).unwrap();
         assert_eq!(preserved.status, Status::Running);
