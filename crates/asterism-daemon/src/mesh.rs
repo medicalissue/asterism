@@ -3,7 +3,8 @@
 //! The shape here is deliberately Tailscale's. The CLI never opens a mesh
 //! connection — it talks to the daemon on the machine the user is sitting at,
 //! over the same unix socket as always, and *that* daemon holds the always-on
-//! endpoint and dials peers. So `ast --device desktop ls` is one unix socket
+//! endpoint and dials peers. So `ast ls` naming a guest on `desktop` is one
+//! unix socket
 //! round trip plus one mesh stream, and a command that reaches another device
 //! never has to bind an endpoint, wait for a hole punch, or hold a key.
 //!
@@ -51,10 +52,11 @@ use asterism_core::cow;
 use asterism_core::device_shell::{ShellFrame, ShellOpen, MAX_OPEN_FRAME_BYTES};
 use asterism_core::durable;
 use asterism_core::instance::Instance;
+use asterism_core::names;
 use asterism_core::orbit::{self, Device, DeviceStatus, Orbit, WakeFacts};
 use asterism_core::paths;
 use asterism_core::protocol::{MoveManifest, Request, Response};
-use asterism_core::registry::OrbitRow;
+use asterism_core::registry::{OrbitRow, Shard};
 use asterism_core::verify::{self, Source};
 use asterism_core::VERSION;
 
@@ -74,7 +76,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How long to spend dialling a peer before giving up on a command aimed at
 /// it. Covers the dial and nothing after it: the work the far daemon then does
-/// is not on a clock here, because `ast --device desktop create` can
+/// is not on a clock here, because a forwarded `ast create` can
 /// legitimately take minutes.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -518,6 +520,15 @@ struct Ack {
 pub struct Mesh {
     endpoint: MeshEndpoint,
     orbit: Arc<Mutex<Orbit>>,
+    /// This device's shard of the orbit registry.
+    ///
+    /// Held here for one question only: devices and instances share a single
+    /// namespace, so a peer joining as `bot` has to be refused when an
+    /// instance in this orbit is already called `bot`. Pairing is where that
+    /// is decided, pairing lives in this file, and the instance names are in
+    /// the shard — everything else this type does about instances it does by
+    /// asking a peer.
+    shard: Arc<Mutex<Shard>>,
     /// Where the accept loop sends a connection from a device that is not in
     /// the orbit, while a ticket is outstanding. `None` the rest of the time,
     /// which is what makes an unpaired connection a refusal.
@@ -808,6 +819,7 @@ impl Mesh {
         let mesh = Arc::new(Self {
             endpoint,
             orbit: node.orbit.clone(),
+            shard: node.shard.clone(),
             pending: Arc::new(Mutex::new(None)),
             conns: Mutex::new(HashMap::new()),
             speaking: Mutex::new(HashMap::new()),
@@ -862,6 +874,22 @@ impl Mesh {
     /// What this device calls itself.
     pub async fn self_name(&self) -> String {
         self.orbit.lock().await.self_name().to_owned()
+    }
+
+    /// Every device name in this orbit, this one first, without probing any
+    /// of them.
+    ///
+    /// Deliberately not [`Mesh::devices`]: that one opens a connection to
+    /// each peer to say whether it is answering, and the questions this
+    /// serves — is this bare name a device, and what are the names when it is
+    /// not — are about *membership*, which is on disk. A name lookup that
+    /// waited on a sleeping laptop would make `ast ssh bot` slow because some
+    /// other machine is asleep.
+    pub async fn device_names(&self) -> Vec<String> {
+        let orbit = self.orbit.lock().await;
+        let mut names = vec![orbit.self_name().to_owned()];
+        names.extend(orbit.devices().iter().map(|device| device.name.clone()));
+        names
     }
 
     /// The orbit as `ast devices` prints it: this device first, then every
@@ -1133,7 +1161,7 @@ impl Mesh {
         // version on the old ping stream before emitting the storage frame.
         self.require_peer_version(&connection, &request, &device.name)
             .await?;
-        // Deliberately unbounded from here: `ast --device desktop create` can
+        // Deliberately unbounded from here: a forwarded `ast create` can
         // legitimately spend minutes pulling an image, and a timeout on the
         // far device's work would turn slow into broken.
         match ask(&connection, &request)
@@ -1374,7 +1402,7 @@ impl Mesh {
         bail!(
             "{name} has not come online within {}s. The packet went out; whether it \
              arrived, and whether {name} was asleep rather than shut down, is not \
-             something this device can see — try: ast --device {name} device check",
+             something this device can see — try: ast device check --on {name}",
             wait.as_secs()
         )
     }
@@ -2128,7 +2156,7 @@ impl Mesh {
     /// device aborts the pairing on *both*, which is the only version of this
     /// that leaves an orbit a set of mutual relationships.
     async fn exchange(
-        &self,
+        self: &Arc<Self>,
         connection: &MeshConnection,
         mine: Hello,
         role: Role,
@@ -2149,7 +2177,7 @@ impl Mesh {
     /// The joiner opened the pairing connection, so it opens this stream too
     /// and speaks first.
     async fn exchange_as_joiner(
-        &self,
+        self: &Arc<Self>,
         connection: &MeshConnection,
         mine: Hello,
         peer_id: &str,
@@ -2188,7 +2216,7 @@ impl Mesh {
     /// The inviter answers, and stages the peer before it knows whether the
     /// joiner will accept, then takes that back if it does not.
     async fn exchange_as_inviter(
-        &self,
+        self: &Arc<Self>,
         connection: &MeshConnection,
         mine: Hello,
         peer_id: &str,
@@ -2236,8 +2264,37 @@ impl Mesh {
         orbit.save()
     }
 
+    /// Refuses a device name that an instance in this orbit already holds.
+    ///
+    /// The other half of the namespace rule `instance::claim` enforces, and
+    /// it has to be here rather than only there because the two directions
+    /// happen at different moments: an instance is created against an orbit
+    /// whose devices are already known, while a device joins an orbit whose
+    /// instances are already running. Whichever arrives second is the one
+    /// that has to give way.
+    ///
+    /// Both halves of the orbit are asked — this device's shard directly, and
+    /// every reachable peer through [`Mesh::claim`] — because the clash is
+    /// with an instance anywhere, not only with one here.
+    async fn refuse_a_name_an_instance_holds(self: &Arc<Self>, name: &str) -> Result<()> {
+        if let Ok(held) = self.shard.lock().await.get(name) {
+            bail!(
+                "{}",
+                names::device_name_is_an_instance(name, held.compute_device())
+            );
+        }
+        if let Some(held) = self.claim(name).await? {
+            bail!(
+                "{}",
+                names::device_name_is_an_instance(name, held.compute_device())
+            );
+        }
+        Ok(())
+    }
+
     /// Writes a freshly paired peer to the orbit store.
-    async fn stage(&self, hello: &Hello, peer_id: &str) -> Result<()> {
+    async fn stage(self: &Arc<Self>, hello: &Hello, peer_id: &str) -> Result<()> {
+        self.refuse_a_name_an_instance_holds(&hello.name).await?;
         let mut orbit = self.orbit.lock().await;
         let mut device = orbit::device_now(
             &hello.name,
@@ -2261,8 +2318,10 @@ impl Mesh {
         }
     }
 
-    /// Renames this device, refusing a name a peer already answers to.
-    async fn rename_self(&self, name: &str) -> Result<()> {
+    /// Renames this device, refusing a name a peer or an instance already
+    /// answers to.
+    async fn rename_self(self: &Arc<Self>, name: &str) -> Result<()> {
+        self.refuse_a_name_an_instance_holds(name).await?;
         let mut orbit = self.orbit.lock().await;
         orbit.set_self_name(name)?;
         orbit.save()
@@ -5200,6 +5259,84 @@ mod tests {
         client.close().await;
     }
 
+    /// One namespace, and the pairing half of it. An instance was here
+    /// first, so the machine that wants to join under its name is the one
+    /// that has to give way — before the peer is written to the orbit store,
+    /// because a device that is a member is already trusted.
+    #[tokio::test]
+    async fn a_device_cannot_join_under_a_name_an_instance_already_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node {
+            shard: Arc::new(Mutex::new(
+                asterism_core::registry::Shard::load(&dir.path().join("state.json")).unwrap(),
+            )),
+            orbit: Arc::new(Mutex::new(
+                Orbit::load(&dir.path().join("orbit.json")).unwrap(),
+            )),
+            shell: crate::device_shell::Manager::load_at(dir.path()),
+            gpu: crate::gpu::Manager::new(),
+        };
+        {
+            let mut shard = node.shard.lock().await;
+            shard
+                .create(
+                    "bot",
+                    "studio",
+                    "debian:13",
+                    asterism_core::instance::Shape::default(),
+                    asterism_core::hv::Machine {
+                        backend: "qemu".into(),
+                        machine_type: "virt".into(),
+                        cpu: "host".into(),
+                        hv_version: "test".into(),
+                    },
+                )
+                .unwrap();
+        }
+        let server = MeshEndpoint::bind(&DeviceIdentity::generate(), MeshMode::LocalOnly)
+            .await
+            .unwrap();
+        let mesh = Arc::new(Mesh {
+            endpoint: server,
+            orbit: node.orbit.clone(),
+            shard: node.shard.clone(),
+            pending: Arc::new(Mutex::new(None)),
+            conns: Mutex::new(HashMap::new()),
+            speaking: Mutex::new(HashMap::new()),
+            telemetry: Mutex::new(HashMap::new()),
+            active: Mutex::new(HashMap::new()),
+            meter: Mutex::new(RelayMeter::new()),
+        });
+
+        let hello = Hello {
+            accepted: true,
+            name: "bot".into(),
+            addrs: Vec::new(),
+            relays: Vec::new(),
+            error: None,
+            wake: WakeFacts::default(),
+        };
+        let refusal = mesh.stage(&hello, "peer-id").await.unwrap_err().to_string();
+        assert!(
+            refusal.contains("already an instance in this orbit (compute on studio)"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("--name bot-host"), "{refusal}");
+        // Nothing was written down: a refused peer is not a member.
+        assert!(node.orbit.lock().await.devices().is_empty());
+
+        // And this device may not rename itself into the same collision.
+        let refusal = mesh.rename_self("bot").await.unwrap_err().to_string();
+        assert!(refusal.contains("already an instance"), "{refusal}");
+
+        let free = Hello {
+            name: "dev5".into(),
+            ..hello
+        };
+        mesh.stage(&free, "peer-id").await.unwrap();
+        assert_eq!(node.orbit.lock().await.devices().len(), 1);
+    }
+
     #[tokio::test]
     async fn a_slow_stranger_cannot_block_the_real_ticket_holder() {
         let dir = tempfile::tempdir().unwrap();
@@ -5220,6 +5357,7 @@ mod tests {
         let mesh = Arc::new(Mesh {
             endpoint: server,
             orbit: node.orbit.clone(),
+            shard: node.shard.clone(),
             pending: Arc::new(Mutex::new(None)),
             conns: Mutex::new(HashMap::new()),
             speaking: Mutex::new(HashMap::new()),
@@ -5309,6 +5447,7 @@ mod tests {
         let mesh = Arc::new(Mesh {
             endpoint: server,
             orbit,
+            shard: node.shard.clone(),
             pending: Arc::new(Mutex::new(None)),
             conns: Mutex::new(HashMap::new()),
             speaking: Mutex::new(HashMap::new()),

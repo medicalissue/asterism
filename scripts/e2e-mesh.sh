@@ -221,25 +221,30 @@ grep -qE "^$B_NAME +\S+ +online +direct" <<<"$DEVICES" \
   || fail "A does not see B online over a direct path:"$'\n'"$DEVICES"
 echo "ok: ast devices shows this device and B online"
 
-# ---- 3. --device still asks one device directly ----------------------------
+# ---- 3. a device-scoped frame still reaches one device directly ------------
 #
 # A tiny qcow2 that is never booted. `ast create` records an instance against
 # the image it is given, and `ls`/`status` read the registry — which is all the
-# proxy has to carry.
+# routing has to carry.
 #
-# Nothing here is how a user reaches an instance any more; section 5 is. This
-# is the debugging override kept working: aim a frame at one device's daemon
-# and get that daemon's own answer back.
+# There is no `--device` any more: devices and instances share one namespace,
+# so nothing reaches an instance by naming a device — section 5 is how that is
+# done. What is left is the handful of commands that really are about one
+# machine's own disk, and `--on` is their address. The envelope underneath is
+# the same proxy frame the retired flag used.
 
 DISK="$B/tiny.qcow2"
 qemu-img create -f qcow2 "$DISK" 1M >/dev/null 2>&1 || fail "qemu-img create failed (is qemu installed?)"
 expect "create on B" "$INST  defined" \
   env ASTERISM_HOME="$B" "$AST" create "$INST" --image "$DISK" --mem 512M --disk 1G
 
-expect "ls proxied from A to B" "$INST" \
+expect "volume ls aimed at B" "no volumes on this device" \
+  env ASTERISM_HOME="$A" "$AST" volume ls --on "$B_NAME"
+expect "status resolves to B without naming it" "name:    $INST" \
+  env ASTERISM_HOME="$A" "$AST" status "$INST"
+
+refute "the retired --device names the form that replaced it" "--device is gone" \
   env ASTERISM_HOME="$A" "$AST" --device "$B_NAME" ls
-expect "status proxied from A to B" "name:    $INST" \
-  env ASTERISM_HOME="$A" "$AST" --device "$B_NAME" status "$INST"
 
 # The proxy must reach B and not answer out of A's own shard, which is the
 # failure mode that would otherwise pass every assertion above.
@@ -250,7 +255,7 @@ echo "ok: B supplies the instance's compute and A supplies none"
 
 # A name that is in nobody's orbit is a local error, with a way out in it.
 refute "an unknown device name is refused locally" "no device named" \
-  env ASTERISM_HOME="$A" "$AST" --device nowhere ls
+  env ASTERISM_HOME="$A" "$AST" volume ls --on nowhere
 
 # ---- 4. one flat namespace across the orbit --------------------------------
 #
@@ -292,8 +297,8 @@ expect "ls --local on A holds nothing" "no instances" \
 
 # ---- 5. resolution without naming a device ---------------------------------
 #
-# The instance lives on B. Every one of these is typed on A, none of them says
-# --device, and none of them has any way to know which device is involved.
+# The instance lives on B. Every one of these is typed on A, none of them
+# names a device, and none of them has any way to know which one is involved.
 
 expect "status resolves across the orbit" "name:    $INST" \
   env ASTERISM_HOME="$A" "$AST" status "$INST"
@@ -350,7 +355,7 @@ ASTERISM_HOME="$B" "$AST" pull "$IMAGE" >/dev/null 2>&1 \
 expect "create the bootable instance on B" "$FAR  defined" \
   env ASTERISM_HOME="$B" "$AST" create "$FAR" --image "$IMAGE" --mem 2G --disk 10G
 
-# Typed on A, about an instance A does not hold. No --device anywhere.
+# Typed on A, about an instance A does not hold. No device named anywhere.
 expect "up resolves across the orbit" "$FAR  running" \
   env ASTERISM_HOME="$A" "$AST" up "$FAR"
 
@@ -494,7 +499,7 @@ stop_daemon "$C"
 start_daemon "$C"
 
 refute "an unpaired device cannot reach B" "not in this orbit" \
-  env ASTERISM_HOME="$C" "$AST" --device "$B_NAME" ls
+  env ASTERISM_HOME="$C" "$AST" volume ls --on "$B_NAME"
 grep -qF "not in this orbit" "$B/astd.log" \
   || fail "B did not log a refusal:"$'\n'"$(cat "$B/astd.log")"
 echo "ok: B refused the unpaired device and said so in its log"
@@ -528,6 +533,6 @@ grep -qE "^$DUP-a +stopped .*$A_NAME" <<<"$GONE" \
 echo "ok: an out-of-touch device's instances are listed as unknown, not dropped"
 
 refute "a command aimed at a dead device says so" "is its astd running?" \
-  env ASTERISM_HOME="$A" "$AST" --device "$B_NAME" ls
+  env ASTERISM_HOME="$A" "$AST" volume ls --on "$B_NAME"
 
 echo "MESH E2E GREEN"

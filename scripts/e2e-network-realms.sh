@@ -386,7 +386,7 @@ sudo iptables -D FORWARD -s 198.18.77.0/24 -o "$UPLINK" \
 WAN_RULE=0
 
 kill_daemon "$A"
-if timeout 8 ast_b --device "$A_NAME" volume ls >/dev/null 2>&1; then
+if timeout 8 ast_b volume ls --on "$A_NAME" >/dev/null 2>&1; then
   fail "a disappeared provider still answered"
 fi
 echo "ok: provider disappearance is observable from the consumer"

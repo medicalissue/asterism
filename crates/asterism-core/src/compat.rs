@@ -149,7 +149,12 @@ use crate::VERSION;
 /// * **18** — `ast fork`, `ast diff` and `ast pick`: cloning one instance
 ///   into several over the same copy-on-write engine, summarising what each
 ///   changed, and putting one of them back onto the parent.
-pub const PROTOCOL_VERSION: u32 = 18;
+/// * **19** — one orbit-wide namespace: `ast ssh bot` reaches an instance
+///   wherever it runs and `ast ssh studio` opens a device's own host shell,
+///   so the CLI asks the daemon what a bare name *is* before it chooses which
+///   frame to send. A daemon too old to answer cannot be asked, because it
+///   is also too old to have refused an instance named after a device.
+pub const PROTOCOL_VERSION: u32 = 19;
 
 /// The wire as it was before it carried a version.
 ///
@@ -164,7 +169,7 @@ pub const FIRST_PROTOCOL: u32 = 1;
 /// and GPU guest frames; keep the unnumbered protocol-1 release reachable in
 /// a rolling orbit — so this moves with [`PROTOCOL_VERSION`] rather than
 /// staying put, which is what keeps the floor at [`FIRST_PROTOCOL`].
-pub const SUPPORTED_BACK: u32 = 17;
+pub const SUPPORTED_BACK: u32 = 18;
 
 /// Format version of the home stamp document itself.
 pub const STAMP_VERSION: u32 = 1;

@@ -93,7 +93,7 @@ pub const STAGING: &str = ".moving-";
 
 /// How long a device remembers that an instance left it.
 ///
-/// A cache note and nothing more. It exists so that `ast --device laptop
+/// A cache note and nothing more. It exists so that `ast ls` on `laptop
 /// status dev` says "moved to desktop" for a while instead of "no instance
 /// named dev in this orbit", which would be true of that shard and useless to
 /// the person reading it. Every path that matters resolves across the orbit

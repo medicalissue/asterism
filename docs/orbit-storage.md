@@ -25,9 +25,10 @@ instance runs.
 | sharing | `single-writer`: at most one writable lease, fenced by a durable monotonic epoch. |
 | held by | Current instance, compute device and epoch, or availability. |
 
-Provider-local administration remains available with `ast --device DEVICE
-volume ...`. This is useful for creation, removal and diagnosis, but consumers
-do not need to query devices one at a time.
+Provider-local administration remains available with `--on DEVICE` on
+`ast volume create`, `ast volume rm` and `ast volume ls`. This is useful for
+creation, removal and diagnosis, but consumers do not need to query devices
+one at a time.
 
 ## Choosing a provider
 

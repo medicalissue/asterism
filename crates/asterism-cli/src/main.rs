@@ -12,9 +12,13 @@
 //! knows nothing about how a peer is reached — all of which lives in `astd`,
 //! which is the process that is always running.
 //!
-//! `--device` survives as a debugging tool, for asking one specific daemon a
-//! question about itself, and as the address for the commands that really are
-//! about devices: pairing, and the orbit's own membership.
+//! Devices and instances share that one namespace, so `ast ssh bot` and
+//! `ast ssh studio` are the same words with two different things behind them,
+//! and which one it is comes from the daemon rather than from a flag. The
+//! commands that are genuinely about one machine's own disk — its image
+//! store, its volumes, whether it could be woken — take `--on <device>`,
+//! which is an envelope around the identical frame that device's own CLI
+//! would have sent.
 
 mod agent;
 
@@ -44,6 +48,7 @@ use asterism_core::instance::{
     now_unix, Instance, PortForward, PortProtocol, Restart, Restarts, RuntimeKind, Shape,
 };
 use asterism_core::ipc;
+use asterism_core::names::{self, NameKind};
 use asterism_core::orbit::DeviceStatus;
 use asterism_core::proc::{ProcId, Signal};
 use asterism_core::protocol::{self, HostedStatus, RedactedBearer, Request, Response};
@@ -59,13 +64,13 @@ use asterism_core::{
     about = "Asterism — everything your agent needs. Made local. Always on."
 )]
 struct Cli {
-    /// Ask one specific device's daemon, instead of the orbit (debugging).
+    /// Retired. An orbit has one namespace; a bare name is the address.
     ///
-    /// Instances resolve by name across the whole orbit, so this is never
-    /// needed to reach one. It exists for looking at a single device's shard,
-    /// and for the commands that are genuinely about devices.
-    #[arg(long, global = true, value_name = "NAME")]
-    device: Option<String>,
+    /// Kept, hidden, only so that the fingers and the shell scripts that
+    /// still have it get a sentence naming the form that replaced it rather
+    /// than clap's "unexpected argument". See [`names::device_flag_retired`].
+    #[arg(long = "device", global = true, hide = true, value_name = "NAME")]
+    retired_device: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -286,16 +291,18 @@ enum Command {
     },
     /// Open a shell in a running instance (or run a command).
     ///
-    /// Works from any device in the orbit and never names one: the daemon
-    /// in front of you answers with a loopback address, whether the guest
-    /// is here or on the far side of the mesh.
+    /// Works from any device in the orbit, and one name is enough.
+    ///
+    /// `ast ssh bot` lands in the instance called `bot`, whichever device is
+    /// supplying its compute; `ast ssh studio` lands in the host shell of the
+    /// device called `studio`, if that device's owner has enabled one. The
+    /// name says which, because an orbit has one namespace — nothing is
+    /// guessed and there is nothing to disambiguate.
     Ssh {
-        /// The instance to connect to. Omit it and say --host to open a
-        /// device's own explicitly enabled user shell.
-        #[arg(required_unless_present = "host", conflicts_with = "host")]
-        name: Option<String>,
-        /// A device in this orbit, by the name ast devices shows.
-        #[arg(long, value_name = "DEVICE")]
+        /// The instance or device to reach, by its name in this orbit.
+        name: String,
+        /// Retired: `ast ssh <device>` is the device form now.
+        #[arg(long, hide = true, value_name = "DEVICE")]
         host: Option<String>,
         /// Force a pty for a remote command, like ssh -t.
         #[arg(short = 't', long)]
@@ -506,6 +513,13 @@ enum Command {
     /// This device's image store: the aliases it knows and what is already
     /// on its disk. Every device has its own.
     Images {
+        /// Ask this device's store instead of the one in front of you.
+        ///
+        /// An image store is a device's own disk, so unlike an instance it
+        /// genuinely has to be addressed by device. `--on` is that address,
+        /// and it takes the same bare device name as `ast ssh`.
+        #[arg(long, value_name = "DEVICE")]
+        on: Option<String>,
         /// Re-hash every image in the store and report what no longer
         /// matches what was pulled.
         ///
@@ -573,6 +587,10 @@ enum Command {
         /// before anything is downloaded rather than fetched and hoped for.
         /// A path may carry one too.
         image: String,
+        /// Download into this device's store instead of the one in front of
+        /// you.
+        #[arg(long, value_name = "DEVICE")]
+        on: Option<String>,
         /// Report the result — or the failure, its causes and its fix — as
         /// one JSON object instead of prose.
         #[arg(long)]
@@ -726,9 +744,6 @@ enum Command {
         #[arg(value_name = "PART")]
         part: String,
         /// The device to source it from.
-        //
-        // Not called `device`: `--device` is a global flag with that id, and
-        // clap would hand this positional's value to it.
         #[arg(value_name = "DEVICE")]
         to: String,
         /// Shut the guest down first. Moving compute is offline on every
@@ -936,7 +951,7 @@ enum BackupCommand {
 ///
 /// Volumes belong to the device that holds their bytes, and their names are
 /// per-device rather than orbit-global: `desktop:tank` and `nas:tank` are two
-/// distinct parts. Creation and removal target this device unless `--device`
+/// distinct parts. Creation and removal target this device unless `--on`
 /// says otherwise; listing without a target assembles the orbit catalog.
 #[derive(Subcommand)]
 enum VolumeCommand {
@@ -973,13 +988,23 @@ enum VolumeCommand {
         /// `--lifecycle cache`.
         #[arg(long, value_name = "KEY")]
         key: Option<String>,
+        /// Make it on this device instead of the one in front of you.
+        #[arg(long, value_name = "DEVICE")]
+        on: Option<String>,
     },
     /// List orbit storage, its owners, access latency and attachment policy.
-    Ls,
+    Ls {
+        /// Only this device's own volumes.
+        #[arg(long, value_name = "DEVICE")]
+        on: Option<String>,
+    },
     /// Delete a block volume and its bytes. Refused while it is attached.
     Rm {
         /// The volume to delete, by its name on this device.
         name: String,
+        /// Delete it from this device instead of the one in front of you.
+        #[arg(long, value_name = "DEVICE")]
+        on: Option<String>,
     },
 }
 
@@ -1026,14 +1051,19 @@ enum CredentialCommand {
 enum SecretCommand {
     /// Add this device as a source for a new or existing named secret.
     ///
-    /// Pipe the exact bytes on stdin. `--device` selects a different source
-    /// device over the existing mesh.
+    /// Pipe the exact bytes on stdin. `--on` puts the value on a different
+    /// source device over the existing mesh.
     ///
     /// Spelled `add` too, because that is the word every refusal that asks
     /// for a secret uses, and a command a message tells you to type has to be
     /// a command that exists.
     #[command(alias = "add")]
-    Create { name: String },
+    Create {
+        name: String,
+        /// Hold the value on this device instead of the one in front of you.
+        #[arg(long, value_name = "DEVICE")]
+        on: Option<String>,
+    },
     /// List orbit-visible secret metadata. Values are never shown.
     Ls,
     /// Remove a secret from every reachable source device.
@@ -1197,7 +1227,14 @@ enum DeviceCommand {
         name: String,
     },
     /// Report whether this device could be woken, and what cannot be checked.
-    Check,
+    Check {
+        /// Ask this device instead of the one in front of you.
+        ///
+        /// The question worth asking of another machine: "can *you* be
+        /// woken" is about the one you are not sitting at.
+        #[arg(long, value_name = "DEVICE")]
+        on: Option<String>,
+    },
     /// Enable, disable or inspect this device's opt-in shell offer.
     ///
     /// Enabling grants every device currently paired into this orbit the
@@ -1330,7 +1367,15 @@ fn report_error(error: &anyhow::Error, json: bool, out: &mut impl Write) {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    let device = cli.device;
+    if let Some(name) = cli.retired_device.as_deref() {
+        bail!(names::device_flag_retired(name));
+    }
+    // Which device a command is aimed at, for the handful that are genuinely
+    // about one machine's own disk — its image store, its block volumes. Set
+    // from that command's own `--on`, and `None` for everything else, because
+    // everything else addresses an instance and an instance is found by name
+    // from any device in the orbit.
+    let mut device: Option<String> = None;
     // Set by the one command that carries `--json` through the generic RPC
     // dispatch below rather than returning from its own arm.
     let mut pull_json = false;
@@ -1355,14 +1400,7 @@ fn run() -> Result<()> {
                 mem_mib: parse_mem_mib(&mem)?,
                 disk_gib: parse_disk_gib(&disk)?,
             };
-            return agent::create(
-                device.as_deref(),
-                &name,
-                &agent,
-                repo.as_deref(),
-                shape,
-                backend,
-            );
+            return agent::create(&name, &agent, repo.as_deref(), shape, backend);
         }
         Command::Create {
             name,
@@ -1384,6 +1422,12 @@ fn run() -> Result<()> {
             // Profile names are cheap to validate locally. Image bytes are
             // always pulled by the device that will own the instance.
             asterism_core::profile::resolve(&profiles)?;
+            // And the name is checked before them all, for the same reason at
+            // a larger scale: the daemon refuses a name a device already
+            // answers to when the create frame reaches it, but that is after
+            // the pull, and downloading 350 MB to be told the name was never
+            // available is the wrong order to find out in.
+            refuse_a_device_name(&name)?;
             let resolved = ensure_image_on_device(device.as_deref(), &image)?;
             let shape = Shape {
                 cpus,
@@ -1432,9 +1476,10 @@ fn run() -> Result<()> {
         Command::Shell { name, command } => return container_shell(&name, command),
         Command::Rm { name } => Request::Remove { name },
         Command::Rename { name, new_name } => Request::Rename { name, new_name },
-        // `ast ls` is the orbit's registry; `--local` is one device's shard of
-        // it, and `--device X ls` is X's shard. Only the first is the model.
-        Command::Ls { local } if local || device.is_some() => Request::List,
+        // `ast ls` is the orbit's registry, with the device each instance
+        // runs on named on its row; `--local` is this device's shard of it,
+        // for debugging. Only the first is the model.
+        Command::Ls { local: true } => Request::List,
         Command::Ls { .. } => Request::ListOrbit,
         Command::Cost {
             name,
@@ -1458,7 +1503,7 @@ fn run() -> Result<()> {
             gpu,
             ..
         } if volume.is_none() && secret.is_none() && gpu.is_none() && agent::is_agent(&name) => {
-            return agent::attach(device.as_deref(), &name);
+            return agent::attach(&name);
         }
         Command::Attach {
             name,
@@ -1598,33 +1643,39 @@ fn run() -> Result<()> {
             to,
             down,
         } => {
-            local_only("set", device.as_deref())?;
             return set_part(&name, &part, &to, down);
         }
         Command::Move { name, to, down } => {
-            local_only("move", device.as_deref())?;
             return set_part(&name, "compute", &to, down);
         }
         // A volume is a device's part of the pool, so these are about the
-        // daemon in front of you unless `--device` aims them elsewhere.
+        // daemon in front of you unless `--on` aims them elsewhere.
         Command::Volume(VolumeCommand::Create {
             name,
             size,
             lifecycle,
             key,
-        }) => Request::VolumeCreate {
-            name,
-            size_bytes: asterism_core::volume::parse_size(&size)?,
-            lifecycle: lifecycle.parse()?,
-            key,
-        },
-        Command::Volume(VolumeCommand::Ls) if device.is_some() => Request::VolumeList,
-        Command::Volume(VolumeCommand::Ls) => Request::VolumeCatalog,
-        Command::Volume(VolumeCommand::Rm { name }) => Request::VolumeRemove { name },
-        Command::Secret(cmd) => return secret_command(cmd, device.as_deref()),
-        Command::Login { provider, part } => {
-            return credential::login(&provider, part, device.as_deref())
+            on,
+        }) => {
+            device = on;
+            Request::VolumeCreate {
+                name,
+                size_bytes: asterism_core::volume::parse_size(&size)?,
+                lifecycle: lifecycle.parse()?,
+                key,
+            }
         }
+        Command::Volume(VolumeCommand::Ls { on: Some(on) }) => {
+            device = Some(on);
+            Request::VolumeList
+        }
+        Command::Volume(VolumeCommand::Ls { on: None }) => Request::VolumeCatalog,
+        Command::Volume(VolumeCommand::Rm { name, on }) => {
+            device = on;
+            Request::VolumeRemove { name }
+        }
+        Command::Secret(cmd) => return secret_command(cmd),
+        Command::Login { provider, part } => return credential::login(&provider, part),
         Command::Oauth(OauthCommand::Add {
             provider,
             scopes,
@@ -1638,16 +1689,13 @@ fn run() -> Result<()> {
                 client_id,
                 client_secret_from_stdin,
                 part,
-                device.as_deref(),
             )
         }
         Command::Credential(CredentialCommand::Providers) => {
-            local_only("credential providers", device.as_deref())?;
             credential::providers();
             return Ok(());
         }
         Command::Credential(CredentialCommand::Ls) => {
-            local_only("credential ls", device.as_deref())?;
             match send(&Request::SecretList)? {
                 Response::Secrets { secrets } => credential::list(&secrets),
                 Response::Error { message } => bail!(message),
@@ -1661,7 +1709,6 @@ fn run() -> Result<()> {
             follow,
             lines,
         } => {
-            local_only("logs", device.as_deref())?;
             // An agent instance's console is Asterism's own init and the
             // image's entrypoint saying they came up, which is not what
             // somebody typing `ast logs bot` wants to read. What they want is
@@ -1723,7 +1770,6 @@ fn run() -> Result<()> {
             destination: absolute_path(&destination)?.display().to_string(),
         },
         Command::Backup(BackupCommand::Inspect { source, json }) => {
-            local_only("backup inspect", device.as_deref())?;
             return inspect_backup(&source, json);
         }
         Command::Backup(BackupCommand::Import {
@@ -1751,13 +1797,11 @@ fn run() -> Result<()> {
         }
         // The catalog is this binary's, not a device's: it is what this
         // Asterism knows how to make a guest into.
-        Command::Session { name } => return agent::attach(device.as_deref(), &name),
+        Command::Session { name } => return agent::attach(&name),
         Command::Agents => {
-            local_only("agents", device.as_deref())?;
             return agent::print_catalog();
         }
         Command::Profiles => {
-            local_only("profiles", device.as_deref())?;
             return print_profiles();
         }
         // `--check` is not a request at all: the answer is inside the guest,
@@ -1765,7 +1809,6 @@ fn run() -> Result<()> {
         Command::Profile {
             name, check: true, ..
         } => {
-            local_only("profile --check", device.as_deref())?;
             return check_profiles(&name);
         }
         Command::Profile { name, profiles, .. } if profiles.is_empty() => {
@@ -1775,15 +1818,26 @@ fn run() -> Result<()> {
             asterism_core::profile::resolve(&profiles)?;
             Request::SetProfiles { name, profiles }
         }
-        // Image state is per device, so `--device` asks that device rather
-        // than consulting this process's store.
-        Command::Images { verify: true } if device.is_none() => {
+        // Image state is per device, so `--on` asks that device rather than
+        // consulting this process's store.
+        Command::Images {
+            on: None,
+            verify: true,
+        } => {
             return print_image_rows(&image::catalog_rows_full()?);
         }
-        Command::Images { .. } if device.is_none() => return images_here(),
-        Command::Images { verify: _ } => Request::ImageList,
-        Command::Pull { image, json } if device.is_none() => return pull_here(&image, json),
-        Command::Pull { image, json } => {
+        Command::Images { on: None, .. } => return images_here(),
+        Command::Images { on, verify: _ } => {
+            device = on;
+            Request::ImageList
+        }
+        Command::Pull {
+            image,
+            on: None,
+            json,
+        } => return pull_here(&image, json),
+        Command::Pull { image, on, json } => {
+            device = on;
             pull_json = json;
             Request::ImagePull { reference: image }
         }
@@ -1791,15 +1845,14 @@ fn run() -> Result<()> {
         // user's and not this process's: it answers with a loopback port
         // either way.
         // Answered by the daemon in front of the user, because that is the
-        // one that can bind a listener the user can reach. `--device` would
-        // open the port on the other machine's loopback, where nobody is.
+        // one that can bind a listener the user can reach: opening the port on
+        // the other machine's loopback would put it where nobody is.
         Command::Open {
             target,
             no_browser,
             json,
             local_port,
         } => {
-            local_only("open", device.as_deref())?;
             return open(&target, no_browser, json, local_port);
         }
         Command::Ssh {
@@ -1808,70 +1861,47 @@ fn run() -> Result<()> {
             tty,
             command,
         } => {
-            local_only("ssh", device.as_deref())?;
-            return match host {
-                None => {
-                    let name = name
-                        .as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("an instance name is required"))?;
-                    // An agent instance's shell is its session. Asking for a
-                    // shell in one and being dropped somewhere else would be
-                    // the surprise; `ast exec` is still there for a command
-                    // that is not a session.
-                    if command.is_empty() && agent::is_agent(name) {
-                        return agent::attach(device.as_deref(), name);
-                    }
-                    ssh(name, &command)
-                }
-                Some(host) => device_shell(&host, &command, tty),
-            };
+            if let Some(host) = host.as_deref() {
+                bail!(names::host_flag_retired(host));
+            }
+            return ssh_by_name(&name, &command, tty);
         }
         Command::Exec {
             name,
             timeout,
             command,
         } => {
-            local_only("exec", device.as_deref())?;
             return guest_exec(&name, command, timeout);
         }
         Command::Devices { json } => {
-            local_only("devices", device.as_deref())?;
             return print_devices(json);
         }
         Command::Device(DeviceCommand::Ls) => {
-            local_only("devices", device.as_deref())?;
             return print_devices(false);
         }
         // The one device command that is worth asking of another device:
         // "can *you* be woken" is a question about the machine you are not
         // sitting at, which is the only kind that matters.
-        Command::Device(DeviceCommand::Check) => return device_check(device.as_deref()),
+        Command::Device(DeviceCommand::Check { on }) => return device_check(on.as_deref()),
         Command::Device(cmd) => {
-            local_only("device", device.as_deref())?;
             return device_command(cmd);
         }
         Command::Ping { peer, json } => {
-            local_only("ping", device.as_deref())?;
             return ping(&peer, json);
         }
         Command::Mesh(MeshCommand::Bench { to, bytes, json }) => {
-            local_only("mesh bench", device.as_deref())?;
             return mesh_bench(&to, bytes, json);
         }
         Command::Compat { json } => {
-            local_only("compat", device.as_deref())?;
             return print_compat(json);
         }
         Command::Auth(command) => {
-            local_only("auth", device.as_deref())?;
             return auth_command(command);
         }
         Command::Update(cmd) => {
-            local_only("update", device.as_deref())?;
             return update_command(cmd);
         }
         Command::ActivateUpdate { build } => {
-            local_only("__activate-update", device.as_deref())?;
             return activate_update(&build);
         }
         Command::SyncUpdatePath {
@@ -1879,28 +1909,22 @@ fn run() -> Result<()> {
             recursive,
             parent_only,
         } => {
-            local_only("__sync-update-path", device.as_deref())?;
             return sync_update_path(&path, recursive, parent_only);
         }
         Command::Service(cmd) => {
-            local_only("service", device.as_deref())?;
             return service_command(cmd);
         }
         Command::Daemon => {
-            local_only("daemon", device.as_deref())?;
             let err = exec_daemon();
             return Err(err).context("running astd");
         }
         Command::Version => {
-            local_only("version", device.as_deref())?;
             return print_version();
         }
         Command::Bugreport => {
-            local_only("bugreport", device.as_deref())?;
             return print_bugreport();
         }
         Command::Doctor => {
-            local_only("doctor", device.as_deref())?;
             return print_doctor();
         }
     };
@@ -1981,8 +2005,9 @@ fn run() -> Result<()> {
         }
         Response::VolumeCatalog { catalog } => print_volume_catalog(&catalog),
         Response::Orbit { rows } => print_table(&rows),
-        // One device's shard, asked for by `--local` or `--device`. Rows from
-        // a single shard are live by construction: the device answered.
+        // One device's shard, asked for by `--local` or by `--on` on a
+        // device-scoped command. Rows from a single shard are live by
+        // construction: the device answered.
         Response::Instances { instances } => print_table(
             &instances
                 .into_iter()
@@ -2094,7 +2119,10 @@ fn run() -> Result<()> {
         | Response::WakeCheck { .. }
         // A lease is granted daemon-to-daemon, on the way to an attach or a
         // boot. Nobody types a request that gets one back.
-        | Response::VolumeLease { .. } => bail!("unexpected reply from astd: {request:?}"),
+        | Response::VolumeLease { .. }
+        // `ast ssh` asks what a name is and then sends a second frame; it
+        // never comes back through this printer.
+        | Response::Resolved { .. } => bail!("unexpected reply from astd: {request:?}"),
         // Secret commands return from `secret_command`; an egress reply is
         // daemon-to-daemon, on the inside of a proxied request, and nothing
         // the CLI can ask for.
@@ -2865,33 +2893,24 @@ fn inspect_backup(source: &str, json: bool) -> Result<()> {
 
 // ---- secrets ---------------------------------------------------------------
 
-fn secret_command(command: SecretCommand, device: Option<&str>) -> Result<()> {
+fn secret_command(command: SecretCommand) -> Result<()> {
     let request = match command {
-        SecretCommand::Create { name } => Request::SecretCreate {
+        SecretCommand::Create { name, on } => Request::SecretCreate {
             name,
             value: read_secret_stdin()?,
-            source_device: device.map(str::to_owned),
+            source_device: on,
             // A value the user piped in is a value and nothing else. What
             // makes a part a credential is a provider behind it, and this
             // command has none — see `ast login` and `ast oauth add`.
             kind: asterism_core::credential::PartKind::Secret,
             provider: None,
         },
-        SecretCommand::Ls => {
-            local_only("secret ls", device)?;
-            Request::SecretList
-        }
-        SecretCommand::Rm { name } => {
-            local_only("secret rm", device)?;
-            Request::SecretRemove { name }
-        }
-        SecretCommand::Rotate { name } => {
-            local_only("secret rotate", device)?;
-            Request::SecretRotate {
-                name,
-                value: read_secret_stdin()?,
-            }
-        }
+        SecretCommand::Ls => Request::SecretList,
+        SecretCommand::Rm { name } => Request::SecretRemove { name },
+        SecretCommand::Rotate { name } => Request::SecretRotate {
+            name,
+            value: read_secret_stdin()?,
+        },
     };
 
     match send(&request)? {
@@ -2967,10 +2986,10 @@ fn print_secrets(secrets: &[asterism_core::secret::Secret]) {
     }
 }
 
-/// Puts a request in the envelope `--device` implies.
+/// Puts a request in the envelope `--on` implies.
 ///
-/// The envelope is all `--device` is: the far daemon runs the identical frame
-/// its own CLI would have handed it, which is why no command needed a second
+/// The envelope is all `--on` is: the far daemon runs the identical frame its
+/// own CLI would have handed it, which is why no command needed a second
 /// implementation to become remote.
 fn aimed(request: Request, device: Option<&str>) -> Request {
     match device {
@@ -2979,17 +2998,6 @@ fn aimed(request: Request, device: Option<&str>) -> Request {
             inner: Box::new(request),
         },
         None => request,
-    }
-}
-
-/// Refuses `--device` on a command that could not mean anything remotely.
-pub(crate) fn local_only(what: &str, device: Option<&str>) -> Result<()> {
-    match device {
-        Some(name) => bail!(
-            "ast {what} is about this device, so it cannot be aimed at {name:?} \
-             — run it on {name} instead"
-        ),
-        None => Ok(()),
     }
 }
 
@@ -3368,8 +3376,8 @@ fn device_command(cmd: DeviceCommand) -> Result<()> {
         DeviceCommand::Add { ticket, name, yes } => pair(Request::DeviceAdd { ticket, name }, yes),
         DeviceCommand::Wake { name } => wake(&name),
         DeviceCommand::Shell { action } => device_shell_policy(action),
-        // Routed before this, so that `--device` can aim it.
-        DeviceCommand::Check => device_check(None),
+        // The one device question worth asking of another machine.
+        DeviceCommand::Check { on } => device_check(on.as_deref()),
     }
 }
 
@@ -3629,6 +3637,40 @@ fn pull_here(reference: &str, json: bool) -> Result<()> {
         ImagePath::LocalCore => pull_image_locally(reference)?,
     };
     print_image_pull(&result, json)
+}
+
+/// Refuses `ast create <device>` before a byte is downloaded.
+///
+/// Not a second implementation of the rule — the daemon still enforces it on
+/// the create frame, and has to, because a create can also arrive from
+/// somewhere that never ran this. This is the same question asked early
+/// enough to be worth asking: the answer costs one round trip on a unix
+/// socket, and being wrong about it costs an image pull.
+///
+/// A name that is *free* comes back as an error here ("unknown name …"),
+/// which is not this function's business: only a name that resolves to a
+/// device is. Nor is a daemon too old to be asked — it is also too old to
+/// have the rule, so there is nothing this could usefully say.
+fn refuse_a_device_name(name: &str) -> Result<()> {
+    let request = Request::Resolve { name: name.into() };
+    let mut client = Client::open()?;
+    if client.spoken < request.since() {
+        return Ok(());
+    }
+    let Ok(Response::Resolved {
+        kind: NameKind::Device,
+        ..
+    }) = client.ask(&request)
+    else {
+        return Ok(());
+    };
+    bail!(names::instance_name_is_a_device(
+        name,
+        &format!(
+            "ast create {} --image …",
+            names::suggested_instance_name(name)
+        )
+    ))
 }
 
 /// Make an image available on the device that will own the next operation.
@@ -3939,6 +3981,35 @@ fn volume_path(volume: &str, host: Option<&str>) -> Result<String> {
 }
 
 // ---- ssh -------------------------------------------------------------------
+
+/// `ast ssh <name>` — the one command, either side of the namespace.
+///
+/// The dispatch is a question to the daemon rather than a guess here, because
+/// only the daemon can see the orbit: this process holds no device key and
+/// knows nothing about who is paired with whom. What comes back is what the
+/// name *is*, and the two answers are two different operations — a splice
+/// into a guest's own ssh server, or a device's host shell over the mesh —
+/// so the choice has to be made before either frame is sent.
+///
+/// A name that is neither comes back as the daemon's refusal, which lists
+/// both halves of the namespace. It is printed verbatim: this is the one
+/// place a user finds out that what they typed was a device when they meant
+/// an instance, or the other way round.
+fn ssh_by_name(name: &str, command: &[String], force_pty: bool) -> Result<()> {
+    let (kind, _device) = match send(&Request::Resolve { name: name.into() })? {
+        Response::Resolved { kind, device, .. } => (kind, device),
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected reply from astd: {other:?}"),
+    };
+    match kind {
+        NameKind::Device => device_shell(name, command, force_pty),
+        // An agent instance's shell is its session. Asking for a shell in one
+        // and being dropped somewhere else would be the surprise; `ast exec`
+        // is still there for a command that is not a session.
+        NameKind::Instance if command.is_empty() && agent::is_agent(name) => agent::attach(name),
+        NameKind::Instance => ssh(name, command),
+    }
+}
 
 /// Open the explicitly enabled user shell of one device over the existing
 /// daemon connection and mesh. No TCP socket and no ssh process is involved.
@@ -6237,12 +6308,12 @@ fn print_table(rows: &[OrbitRow]) {
     if notes.is_empty() {
         println!(
             "{:<14} {:<9} {:<14} {:<16} {:<12} {:<6} {:<8} ACCESS",
-            "NAME", "STATUS", "IMAGE", "SHAPE", "COMPUTE", "AGE", "TODAY"
+            "NAME", "STATUS", "IMAGE", "SHAPE", "DEVICE", "AGE", "TODAY"
         );
     } else {
         println!(
             "{:<14} {:<9} {:<14} {:<16} {:<12} {:<6} {:<8} {:<21} NOTE",
-            "NAME", "STATUS", "IMAGE", "SHAPE", "COMPUTE", "AGE", "TODAY", "ACCESS"
+            "NAME", "STATUS", "IMAGE", "SHAPE", "DEVICE", "AGE", "TODAY", "ACCESS"
         );
     }
     let mut stale = false;
@@ -7822,49 +7893,39 @@ DAwMDAwMDAsImV4cCI6MTcwMDA0MzIwMCwic2NvcGUiOiJvcGVuaWQifQ.c2lnbmF0dXJl";
         assert_eq!(all.stream_position().unwrap(), 14);
     }
 
+    /// One namespace, so one argument. Both `ast ssh bot` and `ast ssh
+    /// studio` are this shape, and which one the user meant is decided by
+    /// what the name *is* rather than by which flag they remembered.
     #[test]
-    fn ssh_guest_and_device_forms_remain_unambiguous() {
-        let guest = Cli::try_parse_from(["ast", "ssh", "guest", "--", "uname", "-a"])
-            .expect("the existing guest ssh form must keep parsing");
-        match guest.command {
-            Command::Ssh {
-                name,
-                host,
-                command,
-                ..
-            } => {
-                assert_eq!(name.as_deref(), Some("guest"));
-                assert!(host.is_none());
-                assert_eq!(command, ["uname", "-a"]);
+    fn ssh_takes_one_bare_name_for_an_instance_and_for_a_device() {
+        for target in ["guest", "laptop"] {
+            let parsed = Cli::try_parse_from(["ast", "ssh", target, "--", "uname", "-a"])
+                .expect("the one ssh form must parse for either kind of name");
+            match parsed.command {
+                Command::Ssh { name, command, .. } => {
+                    assert_eq!(name, target);
+                    assert_eq!(command, ["uname", "-a"]);
+                }
+                _ => panic!("parsed the wrong command"),
             }
-            _ => panic!("parsed the wrong command"),
         }
 
-        let device = Cli::try_parse_from([
-            "ast",
-            "ssh",
-            "--host",
-            "laptop",
-            "--",
-            "printf",
-            "hello world",
-        ])
-        .expect("the device shell form must parse without an instance name");
-        match device.command {
-            Command::Ssh {
-                name,
-                host,
-                command,
-                ..
-            } => {
-                assert!(name.is_none());
-                assert_eq!(host.as_deref(), Some("laptop"));
-                assert_eq!(command, ["printf", "hello world"]);
-            }
+        // The two retired addresses parse — they have to, or their sentence
+        // never reaches the user — and each carries the name it was aimed at
+        // so the refusal can spell the bare-name form.
+        let host = Cli::try_parse_from(["ast", "ssh", "laptop", "--host", "laptop"])
+            .expect("the retired --host must still parse, to be refused with words");
+        match host.command {
+            Command::Ssh { host, .. } => assert_eq!(host.as_deref(), Some("laptop")),
             _ => panic!("parsed the wrong command"),
         }
+        let aimed = Cli::try_parse_from(["ast", "--device", "studio", "ls"])
+            .expect("the retired --device must still parse, to be refused with words");
+        assert_eq!(aimed.retired_device.as_deref(), Some("studio"));
 
-        assert!(Cli::try_parse_from(["ast", "ssh", "guest", "--host", "laptop"]).is_err());
+        // A name is required: `ast ssh` with nothing after it is a question
+        // with no subject, not a shell somewhere.
+        assert!(Cli::try_parse_from(["ast", "ssh"]).is_err());
     }
 
     #[test]
@@ -8095,7 +8156,8 @@ DAwMDAwMDAsImV4cCI6MTcwMDA0MzIwMCwic2NvcGUiOiJvcGVuaWQifQ.c2lnbmF0dXJl";
 
     #[test]
     fn pull_accepts_json() {
-        let Command::Pull { image, json } = parse_cli(&["pull", "busybox:musl", "--json"]).command
+        let Command::Pull { image, json, .. } =
+            parse_cli(&["pull", "busybox:musl", "--json"]).command
         else {
             panic!("pull did not parse");
         };

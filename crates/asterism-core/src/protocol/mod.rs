@@ -197,6 +197,19 @@ pub enum Request {
     /// The whole orbit registry, assembled: every shard the daemon can reach,
     /// plus the last-seen rows of the devices it cannot. This is `ast ls`.
     ListOrbit,
+    /// What one bare name means in this orbit: an instance, or a device.
+    ///
+    /// Asked by the commands whose *shape* depends on the answer rather than
+    /// only their destination. `ast ssh bot` splices a guest's ssh server and
+    /// `ast ssh studio` opens a device's host shell — two different frames,
+    /// chosen before either is sent — so the CLI has to know which kind of
+    /// thing it is holding, and only the daemon can see the whole orbit.
+    ///
+    /// Not a request that is ever forwarded: the answer is about the orbit,
+    /// which every device in it sees the same way.
+    Resolve {
+        name: String,
+    },
     Status {
         name: String,
     },
@@ -587,7 +600,8 @@ pub enum Request {
     ///
     /// Normally nobody types this: the daemon puts a request in this envelope
     /// itself, once it has resolved the instance name to the device holding
-    /// that shard. `ast --device <name> <command>` is the manual override, for
+    /// that shard. `--on <name>` on the device-scoped commands is the manual
+    /// override, for
     /// asking one specific daemon a question about itself.
     Proxy {
         device: String,
@@ -713,7 +727,7 @@ pub enum Request {
     // Volumes are a *device's* part of the pool, not an instance's, so none of
     // these resolves through the instance namespace. They are answered by the
     // device that holds the bytes — reached by name, either because the user
-    // typed `--device`, or because a consumer's daemon put the frame in a
+    // typed `--on`, or because a consumer's daemon put the frame in a
     // [`Request::Proxy`] envelope aimed at the device an attach named.
     /// Make a new block volume on this device: a sparse raw image and the
     /// bookkeeping that goes with it.
@@ -1020,7 +1034,10 @@ impl Request {
             | Request::BackupImport { .. }
             | Request::BackupImportV2 { .. }
             | Request::List
-            | Request::ListOrbit => None,
+            | Request::ListOrbit
+            // A question about the namespace, not about one instance in it:
+            // routing it at a name would be circular.
+            | Request::Resolve { .. } => None,
 
             // About the orbit and the devices in it.
             Request::Proxy { .. }
@@ -1164,6 +1181,10 @@ impl Request {
             // A daemon too old to know what a credential part is must refuse
             // this by name rather than record half of it.
             Request::AttachCredential { .. } => 17,
+            // A daemon too old to know that devices and instances share one
+            // namespace cannot answer this, and must say so by name rather
+            // than fall through to "unknown frame".
+            Request::Resolve { .. } => 19,
             Request::DeviceShellPolicy { .. }
             | Request::DeviceShellOpen { .. }
             | Request::DeviceShellInput { .. }
@@ -1205,6 +1226,7 @@ impl Request {
             | Request::DeviceShellResize { .. }
             | Request::DeviceShellSignal { .. }
             | Request::DeviceShellClose => Some("device shell"),
+            Request::Resolve { .. } => Some("resolve"),
             Request::ImageList => Some("image_list"),
             Request::ImagePull { .. } => Some("image_pull"),
             Request::CreateRuntime { .. } => Some("create_runtime"),
@@ -1337,6 +1359,17 @@ pub enum Response {
     /// every shard that answered plus the cached rows of those that did not.
     Orbit {
         rows: Vec<OrbitRow>,
+    },
+    /// Reply to [`Request::Resolve`]: what the name turned out to be, and the
+    /// device it is on.
+    ///
+    /// `device` is the machine supplying an instance's compute, and the
+    /// device itself when `kind` is [`NameKind::Device`] — so a caller that
+    /// only wants to say where something is need not branch.
+    Resolved {
+        name: String,
+        kind: crate::names::NameKind,
+        device: String,
     },
 
     /// Reply to [`Request::Cost`]: one report per instance asked about.
@@ -1740,6 +1773,7 @@ impl Response {
             Response::RewindTimeline { .. } | Response::Rewound { .. } => 15,
             Response::OpenPort { .. } => 16,
             Response::Forked { .. } | Response::ForkDiff { .. } | Response::Picked { .. } => 18,
+            Response::Resolved { .. } => 19,
             Response::Instance { instance, .. } if instance.runtime == RuntimeKind::Container => 8,
             Response::Instances { instances }
                 if instances
@@ -1834,6 +1868,13 @@ pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
                 name: String::new(),
                 port: 0,
                 local_port: None,
+            }
+            .since(),
+        ),
+        (
+            "resolve",
+            Request::Resolve {
+                name: String::new(),
             }
             .since(),
         ),
@@ -2450,7 +2491,7 @@ mod tests {
 
     #[test]
     fn a_proxied_request_carries_the_inner_one_unchanged() {
-        // `ast --device desktop ls` is `ls` in an envelope; the remote daemon
+        // `ast images --on desktop` is `images` in an envelope; the remote daemon
         // must see the very same frame its own CLI would have sent.
         let wire = serde_json::to_string(&Request::Proxy {
             device: "desktop".into(),

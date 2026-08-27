@@ -301,7 +301,7 @@ sed 's/^/    /' <<<"$CHECK"
 echo "---"
 
 expect "device check can be asked of another device" "wake readiness for $B_NAME" \
-  env ASTERISM_HOME="$A" "$AST" --device "$B_NAME" device check
+  env ASTERISM_HOME="$A" "$AST" device check --on "$B_NAME"
 
 # ---- 3. waking a device that is already awake ------------------------------
 

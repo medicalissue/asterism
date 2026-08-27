@@ -142,6 +142,12 @@ async fn open_port(
                 target.name
             )
         }
+        // `locate` answers about instances only, so this is unreachable
+        // rather than merely unlikely — and is still spelled out, because a
+        // port is opened *inside a guest* and a device is not one.
+        (Located::Device(device), _) => {
+            bail!("{device:?} is a device in this orbit, not an instance with ports in it")
+        }
     };
 
     let opened = mesh

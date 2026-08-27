@@ -42,7 +42,7 @@ use asterism_core::preset::{self, AgentRecord, Preset};
 use asterism_core::protocol::{Request, Response};
 use asterism_core::{image, paths};
 
-use crate::{local_only, send, ssh_banner_up, Conversation};
+use crate::{send, ssh_banner_up, Conversation};
 
 /// How long the guest gets to come up far enough to answer guest control.
 const READY_TIMEOUT: Duration = Duration::from_secs(240);
@@ -114,16 +114,13 @@ pub(crate) fn print_catalog() -> Result<()> {
 }
 
 /// `ast create <name> --agent <preset> [--repo <url>]`.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn create(
-    device: Option<&str>,
     name: &str,
     agent: &str,
     repo: Option<&str>,
     shape: Shape,
     backend: Option<String>,
 ) -> Result<()> {
-    local_only("create --agent", device)?;
     let preset = preset::get(agent)?;
 
     // ---- everything that can be refused, refused first --------------------
@@ -300,8 +297,7 @@ pub(crate) fn ready_line(name: &str, record: &AgentRecord) -> String {
 }
 
 /// `ast attach <name>` — the tmux session, from anywhere.
-pub(crate) fn attach(device: Option<&str>, name: &str) -> Result<()> {
-    local_only("attach", device)?;
+pub(crate) fn attach(name: &str) -> Result<()> {
     let record = read_record(name)?.ok_or_else(|| {
         anyhow::anyhow!(
             "{name} is not an agent instance — say which part to attach \

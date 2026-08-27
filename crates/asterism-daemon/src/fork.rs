@@ -168,6 +168,29 @@ fn fork_volume_dir(child: &str, index: usize) -> PathBuf {
 
 // ---- forking ---------------------------------------------------------------
 
+/// Every name a fork of this parent may not take.
+///
+/// The instances on this device, and the *devices* in this orbit — because
+/// they are one namespace. `ast fork bot` naming its second child `bot-2`
+/// would be a quiet collision if a machine in the orbit is already called
+/// `bot-2`: `ast ssh bot-2` would then have two answers, which is the
+/// situation `instance::claim` and pairing both exist to prevent. A name
+/// generator has no user to refuse, so it skips the name instead.
+///
+/// The orbit store is read here rather than passed in because a fork is
+/// answered at the shard-local end of the daemon, which by design has no
+/// mesh: this is a file on this device's disk holding the names of the
+/// devices this device has paired with, and reading it is not asking the
+/// orbit anything.
+fn held(reg: &Shard) -> Vec<String> {
+    let mut names: Vec<String> = reg.list().into_iter().map(|inst| inst.name).collect();
+    if let Ok(orbit) = asterism_core::orbit::Orbit::load(&paths::orbit_path()) {
+        names.push(orbit.self_name().to_owned());
+        names.extend(orbit.devices().iter().map(|device| device.name.clone()));
+    }
+    names
+}
+
 async fn fork(
     reg: &mut Shard,
     name: &str,
@@ -193,8 +216,7 @@ async fn fork(
         bail!("{}", model::too_many(name, count));
     }
     let notes = model::notes(count, each)?;
-    let held: Vec<String> = reg.list().into_iter().map(|inst| inst.name).collect();
-    let children = model::allocate(name, count, &held)?;
+    let children = model::allocate(name, count, &held(reg))?;
     for child in &children {
         let leftover = paths::instance_dir(child);
         if leftover.exists() {

@@ -31,6 +31,7 @@ use asterism_core::hv::{GuestHealth, ImageKind, RunState, STOP_DEADLINE};
 use asterism_core::instance::{
     local_host, Instance, Policy, Restart, RestartReason, RuntimeKind, Status,
 };
+use asterism_core::names;
 use asterism_core::profile;
 use asterism_core::protocol::{Request, Response};
 use asterism_core::registry::{self, Shard};
@@ -703,6 +704,18 @@ pub(crate) fn refusal(req: &Request, reg: &Shard) -> Option<Response> {
 /// The refusal a request owes the orbit's one flat instance namespace before
 /// it is routed anywhere, or `None` if it claims no name.
 ///
+/// The `ast create` line offered to a user whose chosen name is a device.
+///
+/// Suggested rather than performed: the name is the user's, and a daemon that
+/// quietly created `studio-bot` when they asked for `studio` would be a
+/// surprise a shell script cannot see.
+fn create_line(name: &str) -> String {
+    format!(
+        "ast create {} --image …",
+        names::suggested_instance_name(name)
+    )
+}
+
 /// Two commands claim rather than resolve, and they are here together because
 /// they are the same question asked twice: `create` claims the name it is
 /// given, `rename` claims the name it is moving to. Renaming claims first and
@@ -1035,10 +1048,32 @@ fn check_profiles(profiles: &[String]) -> Result<()> {
 /// happens instead when the two devices can see each other again.
 async fn claim(name: &str, node: &Node, mesh: Option<&Arc<Mesh>>) -> Result<()> {
     registry::check_name(name)?;
+    // Devices are in the same namespace, and are checked first because the
+    // clash is knowable without asking anyone: this device's own name is on
+    // its disk, and so is every peer's. An orbit where `bot` is both a
+    // machine and a guest has no answer to `ast ssh bot`, so the moment to
+    // refuse it is before either exists.
+    if name == node.device_name().await {
+        anyhow::bail!(
+            "{}",
+            names::instance_name_is_a_device(name, &create_line(name))
+        );
+    }
     if let Ok(existing) = node.shard.lock().await.get(name) {
         anyhow::bail!("{}", registry::taken(existing));
     }
     let Some(mesh) = mesh else { return Ok(()) };
+    if mesh
+        .device_names()
+        .await
+        .iter()
+        .any(|device| device == name)
+    {
+        anyhow::bail!(
+            "{}",
+            names::instance_name_is_a_device(name, &create_line(name))
+        );
+    }
     if let Some(existing) = mesh.claim(name).await? {
         anyhow::bail!("{}", registry::taken(&existing));
     }
@@ -2395,6 +2430,27 @@ mod tests {
             shell: crate::device_shell::Manager::load_at(dir),
             gpu: crate::gpu::Manager::new(),
         }
+    }
+
+    /// One namespace, and the create half of it. A device is knowable
+    /// without a mesh — this device's own name is on its own disk — so the
+    /// refusal must arrive on a lone daemon too, not only in an orbit.
+    #[tokio::test]
+    async fn an_instance_cannot_take_a_name_a_device_already_answers_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = recovery_node(dir.path());
+        node.orbit.lock().await.set_self_name("studio").unwrap();
+
+        let error = claim("studio", &node, None).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "\"studio\" is already a device in this orbit — Instance and device \
+             names share one namespace\n  fix: ast create studio-bot --image …"
+        );
+
+        // A name that is nobody's is still free: the check is a collision
+        // test, not a new class of reserved word.
+        claim("studio-bot", &node, None).await.unwrap();
     }
 
     /// Recovery writes a whole journal map after each item. A mesh attach

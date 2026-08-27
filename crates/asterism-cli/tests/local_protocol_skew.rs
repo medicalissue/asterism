@@ -33,20 +33,25 @@ fn create_uses_core_pull_before_legacy_create_for_protocols_one_through_five() {
         let listener = UnixListener::bind(&socket).unwrap();
         fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
         let server = thread::spawn(move || {
-            // The compatibility probe for image preparation must be the only
-            // frame on this connection: the fallback does the pull in core,
-            // then drops it before opening the legacy Create connection.
-            let (mut first, _) = listener.accept().unwrap();
-            let mut first_reader = BufReader::new(first.try_clone().unwrap());
-            let ping = read_frame(&mut first_reader);
-            assert_eq!(ping["cmd"], "ping");
-            write_pong(&mut first, protocol);
-            first
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let mut unexpected = String::new();
-            let read = first_reader.read_line(&mut unexpected).unwrap();
-            assert_eq!(read, 0, "protocol {protocol} received an image frame");
+            // Two probes come before the create, and neither may put a frame
+            // on the wire at these vintages. The first asks whether the name
+            // is a device in this orbit — a question protocol 18 introduced —
+            // and the second asks whether image preparation can be done on
+            // the daemon; both find a daemon too old, answer from this
+            // process, and drop the connection.
+            for probe in ["name", "image"] {
+                let (mut connection, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(connection.try_clone().unwrap());
+                let ping = read_frame(&mut reader);
+                assert_eq!(ping["cmd"], "ping");
+                write_pong(&mut connection, protocol);
+                connection
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut unexpected = String::new();
+                let read = reader.read_line(&mut unexpected).unwrap();
+                assert_eq!(read, 0, "protocol {protocol} received a {probe} frame");
+            }
 
             let (mut second, _) = listener.accept().unwrap();
             let mut second_reader = BufReader::new(second.try_clone().unwrap());
@@ -156,7 +161,7 @@ fn proxied_image_request_uses_its_inner_protocol_floor() {
 
         let output = Command::new(env!("CARGO_BIN_EXE_ast"))
             .env("ASTERISM_HOME", home.path())
-            .args(["--device", "nas", "images"])
+            .args(["images", "--on", "nas"])
             .output()
             .unwrap();
         if protocol == 5 {

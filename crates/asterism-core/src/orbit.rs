@@ -17,9 +17,11 @@
 //!   are all local, so an orbit on a LAN with no coordinator, no relay and no
 //!   internet is a fully working orbit.
 //!
-//! Device *names* are first-class addressing — `ast --device desktop ls` — so
-//! the store refuses two devices with the same name, and refuses a peer that
-//! wants to be called what this device is already called.
+//! Device *names* are first-class addressing — `ast ssh desktop` — and they
+//! share one namespace with instance names, so the store refuses two devices
+//! with the same name, refuses a peer that wants to be called what this
+//! device is already called, and (in `crate::names`, enforced at pairing)
+//! refuses one that wants to be called what an instance is called.
 //!
 //! The file carries no key material. A device id is a public key; the secret
 //! half lives in `id_device`, alone, at mode 0600.
@@ -39,7 +41,7 @@ pub const ORBIT_VERSION: u32 = 1;
 /// One peer device in this orbit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Device {
-    /// What the user calls it: `ast --device <name> ...`.
+    /// What the user calls it: `ast ssh <name>`, `ast move bot <name>`.
     pub name: String,
     /// The peer's Ed25519 public key, hex. This is the identity; the name is
     /// only a label for it.
@@ -494,7 +496,7 @@ impl Orbit {
     /// Renames this device.
     ///
     /// Refused if a peer already answers to that name — two devices called
-    /// `laptop` would make `ast --device laptop` a coin toss.
+    /// `laptop` would make `ast ssh laptop` a coin toss.
     pub fn set_self_name(&mut self, name: &str) -> Result<()> {
         check_name(name)?;
         if let Some(existing) = self.get(name) {

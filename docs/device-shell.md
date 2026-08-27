@@ -21,9 +21,9 @@ Removing a peer from the orbit terminates that peer's tracked sessions too.
 From an approved peer:
 
 ```console
-$ ast ssh --host desktop
-$ ast ssh --host desktop -- uname -a
-$ ast ssh --host desktop -t -- 'stty size'
+$ ast ssh desktop
+$ ast ssh desktop -- uname -a
+$ ast ssh desktop -t -- 'stty size'
 ```
 
 An interactive terminal gets a PTY automatically. Commands do not get one

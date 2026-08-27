@@ -1007,7 +1007,7 @@ fn at_most(response: Response, spoken: u32) -> Response {
 /// against the instance namespace. Requests that claim a name have that claim
 /// put to every device. Everything left is about one instance, so it is
 /// resolved across the orbit and forwarded to whichever device holds that
-/// row — which is where `--device` stops being necessary.
+/// row — which is why nothing has to name a device.
 async fn dispatch(request: Request, node: &Node, mesh: Option<&Arc<Mesh>>) -> Response {
     if let Request::AttachGpu {
         name,
@@ -1089,11 +1089,21 @@ async fn route(request: Request, node: &Node, mesh: Option<&Arc<Mesh>>) -> Respo
     let Some(mesh) = mesh else {
         return handle(request, node).await;
     };
-    match mesh.locate(name).await {
-        Ok(Some(device)) => orbit::reply_or_error(mesh.proxy(&device, request).await),
-        // Nowhere in the orbit answers to it, so the local shard's "no such
-        // instance" is both true and the message the user should see.
-        Ok(None) => handle(request, node).await,
+    // One resolver, one set of refusals. `resolve::locate` is what `ast open`
+    // has used since it learned to cross the mesh, and the two sentences it
+    // gets right are exactly the two every other instance command was getting
+    // wrong here: a name that is nowhere came back as this shard's "no such
+    // instance" with no orbit in it, and an instance whose device is asleep
+    // came back as if it had never existed.
+    match resolve::locate(name, name, node, Some(mesh)).await {
+        Ok(resolve::Located::Here) => handle(request, node).await,
+        Ok(resolve::Located::On(device)) => {
+            orbit::reply_or_error(mesh.proxy(&device, request).await)
+        }
+        // `locate` never answers this for an instance lookup; a device name
+        // reaching an instance command is the same mistake as a name that is
+        // not there at all.
+        Ok(resolve::Located::Device(_)) => handle(request, node).await,
         Err(e) => Response::Error {
             message: format!("{e:#}"),
         },

@@ -224,8 +224,6 @@ DISK="$A/tiny.qcow2"
 qemu-img create -f qcow2 "$DISK" 1M >/dev/null 2>&1 || fail "qemu-img create failed"
 expect "create on A" "$INST  defined" \
   env ASTERISM_HOME="$A" "$AST" create "$INST" --image "$DISK" --mem 512M --disk 1G
-expect "ls proxied from B to A" "$INST" \
-  env ASTERISM_HOME="$B" "$AST" --device "$A_NAME" ls
 expect "the orbit is one namespace across the relay" "$INST" \
   env ASTERISM_HOME="$B" "$AST" ls
 expect "status resolves without naming a device" "name:    $INST" \
@@ -266,7 +264,7 @@ PY
 start_daemon "$B"
 
 expect "a peer at a wrong address is found by its key" "$INST" \
-  env ASTERISM_HOME="$B" "$AST" --device "$A_NAME" ls
+  env ASTERISM_HOME="$B" "$AST" ls
 assert_real_path "and reports a real path afterwards" "$(path_of "$B" "$A_NAME")"
 RECOVERY="$(telemetry_of "$B" "$A_NAME")"
 grep -qE '^[0-9]+\.[0-9]ms +stale_address_recovered_by_discovery +recovered$' <<<"$RECOVERY" \

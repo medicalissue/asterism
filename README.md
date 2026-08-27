@@ -247,13 +247,18 @@ $ ast ping desktop
 $ ast ls
 ```
 
-Instance names form one orbit-wide namespace. `ast create` and `ast rename`
-claim a name across the orbit, and ordinary commands such as `ast up agent`,
-`ast ssh agent`, and `ast status agent` locate it and forward the request to
-the device it runs on. `ast ls` combines every device's registry shard into one
-view and marks the state from an unreachable device as `unknown`.
-The global `--device` option is for device-local administration and debugging,
-not for reaching an instance.
+Devices and instances share **one** orbit-wide namespace. `ast create` and
+`ast rename` claim a name across the orbit, pairing refuses a device named
+after an instance, and one bare name is the address for either kind of thing:
+`ast up agent`, `ast ssh agent` and `ast status agent` locate the instance and
+forward the request to the device it runs on, while `ast ssh desktop` opens
+that device's own host shell. `ast ls` combines every device's registry shard
+into one view, names the device each instance runs on, and marks the state
+from an unreachable device as `unknown`.
+
+The few commands that really are about one machine's own disk — its image
+store, its block volumes, whether it can be woken — take `--on <device>`.
+[The orbit, and the one namespace inside it](docs/orbit.md) is the guide.
 
 ## Give an instance its parts
 
@@ -311,7 +316,7 @@ the architecture and compatibility contract.
   the guest does not need to know which device holds the bytes.
 
   ```console
-  $ ast --device storage volume create data --size 100G
+  $ ast volume create data --size 100G --on storage
   $ ast volume ls
   $ ast attach agent --volume data
   ```
@@ -382,8 +387,8 @@ default and grants approved peers the full authority of that user account:
 
 ```console
 desktop$ ast device shell enable
-laptop$ ast ssh --host desktop
-laptop$ ast ssh --host desktop -- uname -a
+laptop$ ast ssh desktop
+laptop$ ast ssh desktop -- uname -a
 desktop$ ast device shell disable
 ```
 

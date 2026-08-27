@@ -1149,7 +1149,7 @@ pub(crate) async fn serve_mesh(
     run(open, member, lease, wire).await
 }
 
-/// Serve `ast ssh --host` when the target name is this device. It deliberately
+/// Serve `ast ssh <device>` when the target name is this device. It deliberately
 /// enters the same policy/session path as a remote peer.
 pub(crate) async fn serve_self<'a, 'b>(
     open: ShellOpen,
