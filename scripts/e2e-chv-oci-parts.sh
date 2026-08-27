@@ -374,12 +374,18 @@ expect "the restored OCI profile still verifies" "this guest is ready" \
 eventually "the restored OCI handle still resolves through the door" \
   "sentinel-handle-works" handle_works
 
-# Detach revokes before the plane is rebuilt: the door survives, the socket it
-# would splice onto does not, and the guest's handle stops resolving.
+# Detach revokes before it refreshes. The listener deliberately comes back —
+# a running guest was told to send its traffic here and goes on doing that
+# until its next boot — but what comes back holds the remaining bindings,
+# which is none. So the door is still there, the socket behind it is still
+# there, and the handle the guest is still holding stops resolving without
+# the guest being rebooted. That last part is the assertion.
 expect "detach the secret part" "$SECRET" "$AST" detach "$INST" --secret "$SECRET"
-[ ! -e "$PLANE" ] \
-  || fail "detach left the egress plane's socket in place at $PLANE"
-ok "detach removed the plane's socket, so the door now splices onto nothing"
+[ -S "$DOOR" ] || fail "detach took the guest's egress door down at $DOOR"
+if handle_works >/dev/null 2>&1; then
+  fail "the detached handle still resolved through the door"
+fi
+ok "the detached handle stops resolving, with the guest never rebooted"
 
 bugreport="$("$AST" bugreport 2>&1)" || fail "ast bugreport failed:"$'\n'"$bugreport"
 printf '%s\n' "$bugreport" >"$EVIDENCE/bugreport.txt"
