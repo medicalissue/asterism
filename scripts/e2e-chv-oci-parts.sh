@@ -167,8 +167,7 @@ handle_works() {
   guest "case \"\$ASTERISM_SENTINEL\" in ast-*) ;; *) exit 41 ;; esac
     curl -fsS https://httpbin.org/bearer \\
       -H \"Authorization: Bearer \$ASTERISM_SENTINEL\" \\
-      | sed -n 's/.*\"token\": *\"\\([^\"]*\\)\".*/\\1/p' \\
-      | tr -d '\\n' | sha256sum | grep -q '$SENTINEL_DIGEST'
+      | jq -j .token | sha256sum | grep -q '$SENTINEL_DIGEST'
     echo sentinel-handle-works"
 }
 
@@ -214,8 +213,12 @@ expect "create an OCI VM on the native Cloud Hypervisor backend" "$INST  defined
 expect "the instance records chv and not a compatibility fallback" "machine: chv" \
   "$AST" status "$INST"
 
-expect "attach a writable directory part" "$GUEST_DIR" \
-  "$AST" attach "$INST" --volume "$WORKDIR" --at "$GUEST_DIR"
+# What the attach prints is not the assertion — that the guest can write
+# through it and the host sees the bytes is, and it is made below once the
+# guest is up.
+attach_out="$("$AST" attach "$INST" --volume "$WORKDIR" --at "$GUEST_DIR" 2>&1)" \
+  || fail "attaching a writable directory part:"$'\n'"$attach_out"
+ok "attach a writable directory part"
 
 secret_report="$(printf %s "$SENTINEL" | "$AST" secret create "$SECRET" 2>&1)" \
   || fail "creating the Secret Service sentinel:"$'\n'"$secret_report"
