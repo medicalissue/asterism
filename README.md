@@ -51,11 +51,15 @@ You can already leave Claude Code, Codex, OpenClaw, or Hermes running under
   lets you run the next attempt from exactly the same starting point.
   `ast backup export` and `ast backup import` turn that starting point into a
   second instance, so several agents can work the same problem at once.
-- **Hand it every key you own.** The guest gets an opaque `sk-ast-…` handle;
-  the real value stays in your Keychain or Secret Service and is substituted
-  at the host's egress door on the way out. It is never in the guest disk, the
-  seed, or a snapshot — which is what makes giving an always-on agent your
-  real credentials a thing you can actually do.
+- **Hand it every key you own.** The guest gets an opaque handle shaped like
+  the credential it stands in for, so a client that checks the prefix still
+  works — `sk-ant-ast-…` for `api.anthropic.com`, `sk-ast-…` for
+  `api.openai.com`, plain `ast-…` for everything else. Every shape contains
+  `ast`, so a handle in a log is recognisable as one rather than mistaken for
+  a real key. The real value stays in your Keychain or Secret Service and is
+  substituted at the host's egress door on the way out — never in the guest
+  disk, the seed, or a snapshot. That is what makes giving an always-on agent
+  your real credentials a thing you can actually do.
 - **An agent ready in a minute.** `ast create … --profile codex` boots a guest
   with the tools already provisioned, not a machine you now have to set up.
 - **It stays up.** `ast service install` plus `--restart always` survives
