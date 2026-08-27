@@ -15,10 +15,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
+use asterism_core::egress_door;
 use asterism_core::hv::{
-    BootReq, Caps, ControlChannel, DirectKernel, DiskFormat, DiskSpec, GuestEndpoint, Handle,
-    Hypervisor, ImageKind, MigrationSource, MigrationTarget, Prepared, Ready, RunState, ShareKind,
-    SnapshotId,
+    BootReq, Caps, ControlChannel, DirectKernel, DiskFormat, DiskSpec, GuestEgress, GuestEndpoint,
+    Handle, Hypervisor, ImageKind, MigrationSource, MigrationTarget, Prepared, Ready, RunState,
+    ShareKind, SnapshotId,
 };
 use asterism_core::proc::{ProcId, Signal};
 use asterism_core::snapshot::{self, Snapshot};
@@ -137,6 +138,11 @@ impl Chv {
         for stale in [&api, &vsock, &pidfile] {
             let _ = std::fs::remove_file(stale);
         }
+        // Up before the VMM is, so a guest that dials the door in its first
+        // second finds it. An OCI guest is the only one whose agent opens it.
+        if req.base.kind == ImageKind::OciRootfs {
+            ensure_door(&req.instance.name, &req.dir);
+        }
 
         if restore.is_none() && req.base.kind == ImageKind::OciRootfs {
             let key = Key::ensure(&paths::guest_agent_key_path(&req.instance.name)).with_context(
@@ -149,7 +155,11 @@ impl Chv {
                 &req.base.path,
                 prep.root_path()?,
                 &oci::InstanceParts {
-                    egress_over_vsock: false,
+                    // This backend's door is the guest's own virtio socket,
+                    // so a *bound* guest's init has to bring the vsock
+                    // transport up before the agent that opens it starts.
+                    // An unbound guest loads none of it.
+                    egress_over_vsock: true,
                     shares: &req.shares,
                     share_kind: (!req.shares.is_empty()).then_some(ShareKind::Virtiofs),
                     egress: &req.egress,
@@ -442,7 +452,18 @@ impl Hypervisor for Chv {
             foreign_arch: false,
             direct_kernel: true,
             port_forward: false,
-            guest_egress: None,
+            // Each CHV guest holds an address of its own on a per-instance
+            // TAP, so no host address is reachable from exactly one guest —
+            // the TAP's host address is a real interface on this device and
+            // one route table away from the LAN. The door is therefore built
+            // inside the guest and carried out over this VM's virtio socket,
+            // which on Cloud Hypervisor is a unix stream under the instance
+            // directory and never a port on any interface. See
+            // `docs/adr/0004-chv-egress-door.md`.
+            guest_egress: Some(GuestEgress::AgentVsock {
+                gateway: egress_door::EGRESS_GUEST_GATEWAY,
+                vsock_port: egress_door::EGRESS_VSOCK_PORT,
+            }),
             // New Cloud Hypervisor instances use the same sparse raw base
             // seam as VZ. Existing `disk.qcow2` instances remain readable in
             // `prepare`; qcow2 is omitted here so a catalog source is
@@ -1014,6 +1035,12 @@ fn recover_interrupted_process(
 }
 
 fn recovered_handle(req: &BootReq, proc: ProcId) -> Result<Handle> {
+    // Adoption: a daemon restart under a running guest reclaims the door
+    // from the path the VMM already holds, so a guest mid-request keeps
+    // being served without noticing there was a new process behind it.
+    if req.base.kind == ImageKind::OciRootfs {
+        ensure_door(&req.instance.name, &req.dir);
+    }
     let api = req.dir.join(API_NAME);
     let endpoint = recovered_endpoint(req, &proc)?;
     Ok(Handle::owning(
@@ -1462,6 +1489,201 @@ fn vsock_from_api(api: &Path) -> PathBuf {
 
 fn instance_dir_from_api(api: &Path) -> &Path {
     api.parent().unwrap_or_else(|| Path::new("."))
+}
+
+// ---- the guest-only secret-egress door -------------------------------------
+//
+// Cloud Hypervisor's virtio socket is a *hybrid* one: the VMM owns a unix
+// socket, and a guest that connects to host port `p` makes the VMM connect
+// out to `<socket>_p` on the host and splice the two streams. So the host
+// half of `asterism_core::egress_door` needs no helper process here — the
+// daemon binds `<instance>/chv-vsock.sock_1021` itself, which is a path
+// under `$ASTERISM_HOME` governed by filesystem permissions and not a port
+// on any interface.
+//
+// What that buys is the property the whole feature turns on: the address the
+// guest is told to use is its own loopback, inside its own network
+// namespace, and nothing on this device — no other guest, no other instance,
+// nothing on the LAN — has anything to aim at. See
+// `docs/adr/0004-chv-egress-door.md`.
+
+/// The unix socket Cloud Hypervisor dials when a guest opens the egress door.
+///
+/// The `_<port>` suffix is CHV's hybrid-vsock convention and is a suffix on
+/// the *file name*, not a path component.
+fn door_socket(vsock: &Path) -> PathBuf {
+    let mut name = vsock.file_name().unwrap_or_default().to_os_string();
+    name.push(format!("_{}", egress_door::EGRESS_VSOCK_PORT));
+    vsock.with_file_name(name)
+}
+
+/// One instance's door, as this daemon holds it.
+struct Door {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    socket: PathBuf,
+}
+
+fn doors() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, Door>> {
+    static DOORS: OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, Door>>> =
+        OnceLock::new();
+    DOORS.get_or_init(Default::default)
+}
+
+/// Put this instance's egress door up, if it is not already.
+///
+/// Idempotent, and called from both the boot path and the adoption path, so
+/// a daemon restart under a running guest reclaims the door without the
+/// guest noticing. Failing to bind is *not* fatal to the boot: an instance
+/// with no bound secret never dials it, and one that does gets a refusal it
+/// can act on rather than a guest that never came up.
+///
+/// The door is opened for every OCI guest on this backend rather than only
+/// for bound ones, because what makes it serviceable is the plane's socket
+/// at the far end — which exists exactly while a secret is bound. A door
+/// onto nothing carries nothing, and this way `ast attach --secret` on a
+/// running instance needs no second listener to appear from somewhere.
+fn ensure_door(instance: &str, dir: &Path) {
+    ensure_door_with_key(instance, dir, &paths::guest_agent_key_path(instance))
+}
+
+/// [`ensure_door`], with the instance key's path named rather than derived.
+///
+/// The path is fixed for an instance, so resolving it once here costs a hop
+/// nothing per connection — and naming it makes the door testable without a
+/// test reaching into the process-wide `ASTERISM_HOME` that every other test
+/// in this binary is also reading.
+fn ensure_door_with_key(instance: &str, dir: &Path, key_path: &Path) {
+    let socket = door_socket(&dir.join(VSOCK_NAME));
+    let mut doors = match doors().lock() {
+        Ok(doors) => doors,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if doors.contains_key(&socket) {
+        return;
+    }
+    let _ = std::fs::remove_file(&socket);
+    let listener = match std::os::unix::net::UnixListener::bind(&socket) {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!(
+                "astd: {instance:?} has no secret-egress door at {}: {error}",
+                socket.display()
+            );
+            return;
+        }
+    };
+    // Belt and braces on top of the instance directory's own mode: nothing
+    // but this user may even connect to the door, before the key proof.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600));
+    }
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let serving = stop.clone();
+    let owner = instance.to_owned();
+    let key_path = key_path.to_owned();
+    thread::spawn(move || serve_door(listener, owner, key_path, serving));
+    doors.insert(socket.clone(), Door { stop, socket });
+}
+
+/// Take this instance's door down and remove its socket.
+fn close_door(dir: &Path) {
+    let socket = door_socket(&dir.join(VSOCK_NAME));
+    let mut doors = match doors().lock() {
+        Ok(doors) => doors,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let Some(door) = doors.remove(&socket) else {
+        let _ = std::fs::remove_file(&socket);
+        return;
+    };
+    door.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    // Wake the blocking accept so the thread observes the flag and exits.
+    let _ = UnixStream::connect(&door.socket);
+    let _ = std::fs::remove_file(&door.socket);
+}
+
+fn serve_door(
+    listener: std::os::unix::net::UnixListener,
+    instance: String,
+    key_path: PathBuf,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    for incoming in listener.incoming() {
+        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        match incoming {
+            Ok(stream) => {
+                let instance = instance.clone();
+                let key_path = key_path.clone();
+                thread::spawn(move || {
+                    if let Err(error) = carry_door(stream, &instance, &key_path) {
+                        // Never the value, never the handle: this is a
+                        // transport message and both ends log it.
+                        eprintln!("astd: {instance:?} egress door session ended: {error:#}");
+                    }
+                });
+            }
+            Err(error) => {
+                if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                eprintln!("astd: {instance:?} egress door accept failed: {error}");
+            }
+        }
+    }
+}
+
+/// One hop: prove this instance's key, then splice to the plane's socket.
+///
+/// The key is read per connection rather than held, so a rotated key is
+/// honoured without restarting anything and this thread owns no key material
+/// between sessions. The proof carries the door's own transcript label, so a
+/// guest-control or GPU proof minted for the same key does not open it.
+fn carry_door(guest: UnixStream, instance: &str, key_path: &Path) -> Result<()> {
+    let key = Key::read(key_path)?
+        .with_context(|| format!("{instance:?} has no instance key to prove on the egress door"))?;
+    let mut reader = BufReader::new(guest.try_clone()?);
+    let mut writer = guest.try_clone()?;
+    egress_door::door_host_handshake(&mut reader, &mut writer, key.as_bytes(), &door_nonce()?)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    // Whatever the BufReader took while framing the handshake is the guest's
+    // own next bytes only if the guest sent them ahead of our accept, which
+    // it cannot: the guest waits for the accept frame before proving, and
+    // says nothing after its welcome until this end has connected. Dropping
+    // it keeps the splice on plain descriptors.
+    drop(reader);
+
+    // Deliberately *after* the proof: the plane's socket exists exactly while
+    // a secret is bound, so detach — which removes it — makes the next hop
+    // fail here rather than reaching a proxy that is on its way down.
+    let plane = crate::egress::vm_transport_path(instance);
+    let host = UnixStream::connect(&plane).with_context(|| {
+        format!(
+            "no bound secret is being served for {instance:?}: nothing is listening at {}",
+            plane.display()
+        )
+    })?;
+
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            let _ = egress_door::pump(&guest, &host);
+            let _ = host.shutdown(std::net::Shutdown::Write);
+            let _ = guest.shutdown(std::net::Shutdown::Read);
+        });
+        let _ = egress_door::pump(&host, &guest);
+        let _ = guest.shutdown(std::net::Shutdown::Write);
+        let _ = host.shutdown(std::net::Shutdown::Read);
+    });
+    Ok(())
+}
+
+fn door_nonce() -> Result<String> {
+    let mut bytes = [0u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 /// Resources started while assembling one VMM command.  A `BootReq` has no
@@ -2526,6 +2748,7 @@ fn cleanup_fs_helpers(dir: &Path) -> bool {
 }
 
 fn cleanup_stopped(dir: &Path) {
+    close_door(dir);
     cleanup_fs_helpers(dir);
     cleanup_remote_blocks(dir);
     clear_vmm_authority(dir);
@@ -3279,7 +3502,73 @@ mod tests {
         assert!(caps.live_snapshot && caps.disk_snapshot && caps.live_migration);
         assert!(caps.disk_hotplug && caps.direct_kernel);
         assert!(caps.nbd_disks);
-        assert!(!caps.port_forward && caps.guest_egress.is_none());
+        // No publication: a CHV guest holds an address of its own on a
+        // per-instance TAP, so there is nothing to forward from this host's
+        // loopback. The egress door is a different thing entirely and does
+        // not go through the network at all.
+        assert!(!caps.port_forward);
+        assert_eq!(
+            caps.guest_egress,
+            Some(GuestEgress::AgentVsock {
+                gateway: egress_door::EGRESS_GUEST_GATEWAY,
+                vsock_port: egress_door::EGRESS_VSOCK_PORT,
+            })
+        );
         assert_eq!(caps.disk_formats, &[DiskFormat::Raw]);
+    }
+
+    /// Cloud Hypervisor's hybrid vsock names the host end of a
+    /// guest-initiated connection by suffixing the *file name* with the port.
+    /// Getting this wrong produces a door nothing ever knocks on, which is
+    /// indistinguishable at a glance from one that works.
+    #[test]
+    fn the_door_is_named_the_way_cloud_hypervisor_dials_it() {
+        let dir = Path::new("/home/u/.asterism/instances/web");
+        assert_eq!(
+            door_socket(&dir.join(VSOCK_NAME)),
+            dir.join(format!("{VSOCK_NAME}_{}", egress_door::EGRESS_VSOCK_PORT))
+        );
+    }
+
+    /// The door is a path under the instance directory and never a port, and
+    /// the only thing that reaches the egress plane through it is a caller
+    /// that proves this instance's key under the door's own label. A caller
+    /// holding another instance's key is refused *before* the plane's socket
+    /// is even dialled.
+    #[test]
+    fn a_caller_without_this_instances_key_never_reaches_the_plane() {
+        use asterism_core::egress_door::{door_guest_handshake, EGRESS_PROOF_LABEL};
+        use std::io::BufReader as StdBufReader;
+
+        let home = tempfile::tempdir().unwrap();
+        let instance = "doorkeeper";
+        let key_path = home.path().join("agent.key");
+        Key::ensure(&key_path).unwrap();
+
+        let dir = home.path().join("vmm");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Named rather than derived, so this test never writes to — or reads
+        // from — the process-wide home every other test in this binary shares.
+        ensure_door_with_key(instance, &dir, &key_path);
+        let socket = door_socket(&dir.join(VSOCK_NAME));
+        assert!(socket.exists(), "the door is a path, not a port");
+        // Idempotent: the adoption path calls this under a guest that is
+        // already being served, and must not steal its own listener.
+        ensure_door_with_key(instance, &dir, &key_path);
+
+        // A guest holding some other instance's key.
+        let stranger = UnixStream::connect(&socket).unwrap();
+        let mut reader = StdBufReader::new(stranger.try_clone().unwrap());
+        let mut writer = stranger.try_clone().unwrap();
+        let refusal = door_guest_handshake(&mut reader, &mut writer, &[0x5au8; 32], "guest-nonce")
+            .expect_err("a stranger's key does not open the door");
+        assert!(refusal.message.contains("did not prove"), "{refusal}");
+        assert!(
+            !refusal.message.contains(EGRESS_PROOF_LABEL),
+            "a refusal must not echo the transcript back at the caller"
+        );
+
+        close_door(&dir);
+        assert!(!socket.exists(), "closing the door removes its socket");
     }
 }

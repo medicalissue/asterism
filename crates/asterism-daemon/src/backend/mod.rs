@@ -1552,28 +1552,36 @@ mod tests {
             Some(GuestEgress::LoopbackGateway { .. })
         ));
 
-        // VZ has a door and still no publication: the guest holds an
-        // address of its own on the NAT, so there is nothing to forward
-        // from this host's loopback, but the door does not go through the
-        // network at all.
-        let vz_caps = by_id(vz::ID).unwrap().caps();
-        assert!(!vz_caps.port_forward, "vz falsely advertises publication");
-        assert_eq!(
-            vz_caps.guest_egress,
-            Some(GuestEgress::AgentVsock {
-                gateway: EGRESS_GUEST_GATEWAY,
-                vsock_port: EGRESS_VSOCK_PORT,
-            }),
-        );
-
-        for id in [chv::ID, hyperv::ID] {
+        // VZ and Cloud Hypervisor both have a door and still no
+        // publication: each guest holds an address of its own — on a shared
+        // NAT bridge and on a per-instance TAP respectively — so there is
+        // nothing to forward from this host's loopback. Their door does not
+        // go through the network at all, which is why it is the same one.
+        for id in [vz::ID, chv::ID] {
             let caps = by_id(id).unwrap().caps();
             assert!(!caps.port_forward, "{id} falsely advertises publication");
-            assert!(
-                caps.guest_egress.is_none(),
-                "{id} falsely advertises a guest-only egress door"
+            assert_eq!(
+                caps.guest_egress,
+                Some(GuestEgress::AgentVsock {
+                    gateway: EGRESS_GUEST_GATEWAY,
+                    vsock_port: EGRESS_VSOCK_PORT,
+                }),
+                "{id} does not declare the agent-vsock door",
             );
         }
+
+        // Native Hyper-V attaches Hyper-V sockets and could carry the same
+        // protocol; until it does, it declares neither door nor publication
+        // and refuses a bound secret before the registry changes.
+        let hyperv_caps = by_id(hyperv::ID).unwrap().caps();
+        assert!(
+            !hyperv_caps.port_forward,
+            "hyperv falsely advertises publication"
+        );
+        assert!(
+            hyperv_caps.guest_egress.is_none(),
+            "hyperv falsely advertises a guest-only egress door"
+        );
     }
 
     /// The door a backend declares has to be one a guest could actually

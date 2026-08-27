@@ -287,8 +287,8 @@ pub(crate) fn check_can_bind(inst: &Instance) -> Result<()> {
              door of its own into this device, so there is no listener only {:?} could \
              reach — a bound secret needs a guest-only door, and binding a wildcard \
              address instead would publish a proxy for this secret on your LAN. Run this \
-             instance on a backend that declares one (qemu's user-mode gateway, or vz's \
-             per-instance virtio-socket door)",
+             instance on a backend that declares one (qemu's user-mode gateway, or the \
+             per-instance virtio-socket door vz and chv open inside the guest)",
             hv.id(),
             inst.name
         );
@@ -1708,33 +1708,46 @@ mod tests {
 
     #[test]
     fn an_incapable_recorded_backend_refuses_before_probe_or_mutation() {
-        let instance = recorded_on(crate::backend::chv::ID, "chv-linux");
+        let instance = recorded_on(crate::backend::hyperv::ID, "hyperv");
         let error = check_can_bind(&instance).unwrap_err().to_string();
         assert!(error.contains("guest-only door"), "{error}");
     }
 
-    /// VZ's door is the guest's own loopback, carried out over this
+    /// Both agent doors are the guest's own loopback, carried out over that
     /// instance's virtio socket. What the seed tells the guest has to be
-    /// that address and nothing else: a bridge address would be reachable
-    /// by every other guest on the same NAT.
+    /// that address and nothing else, and each backend has its own reason:
+    /// VZ's bridge address is reachable by every other guest on the same
+    /// NAT, and CHV's per-instance TAP host address is a real interface on
+    /// this device, one route table away from every other guest and the LAN.
     #[test]
-    fn vz_binds_and_points_the_guest_at_its_own_loopback() {
-        let mut instance = recorded_on(crate::backend::vz::ID, "vz-linux");
-        instance.image_kind = asterism_core::hv::ImageKind::OciRootfs;
-        check_can_bind(&instance).expect("vz declares a guest-only door");
-        assert_eq!(gateway(&instance).unwrap(), "127.0.0.1");
+    fn an_agent_door_points_the_guest_at_its_own_loopback() {
+        for (backend, machine) in [
+            (crate::backend::vz::ID, "vz-linux"),
+            (crate::backend::chv::ID, "chv-linux"),
+        ] {
+            let mut instance = recorded_on(backend, machine);
+            instance.image_kind = asterism_core::hv::ImageKind::OciRootfs;
+            check_can_bind(&instance)
+                .unwrap_or_else(|_| panic!("{backend} declares a guest-only door"));
+            assert_eq!(gateway(&instance).unwrap(), "127.0.0.1");
+        }
     }
 
-    /// The door is only as real as the agent that opens it. A VZ instance
+    /// The door is only as real as the agent that opens it. An instance
     /// created from a cloud image has the cloud-init agent, which does not
     /// carry one — so the binding is refused before the row changes rather
     /// than discovered as a guest holding a handle nothing honours.
     #[test]
-    fn a_vz_cloud_image_has_no_agent_to_open_the_door_and_is_refused() {
-        let instance = recorded_on(crate::backend::vz::ID, "vz-linux");
-        assert_eq!(instance.image_kind, asterism_core::hv::ImageKind::Disk);
-        let error = check_can_bind(&instance).unwrap_err().to_string();
-        assert!(error.contains("OCI root filesystem"), "{error}");
+    fn a_cloud_image_has_no_agent_to_open_the_door_and_is_refused() {
+        for (backend, machine) in [
+            (crate::backend::vz::ID, "vz-linux"),
+            (crate::backend::chv::ID, "chv-linux"),
+        ] {
+            let instance = recorded_on(backend, machine);
+            assert_eq!(instance.image_kind, asterism_core::hv::ImageKind::Disk);
+            let error = check_can_bind(&instance).unwrap_err().to_string();
+            assert!(error.contains("OCI root filesystem"), "{backend}: {error}");
+        }
     }
 
     /// A VM proxy is on loopback, and that is the whole of why it is safe.
@@ -1804,18 +1817,21 @@ mod tests {
         ALLOW_LOOPBACK.store(false, Ordering::Relaxed);
     }
 
-    /// The whole vz door, minus Virtualization.framework: a guest agent
-    /// listening on the *guest's* loopback, an authenticated vsock hop, and
-    /// the private unix socket the plane owns. A real bound request crosses
-    /// all three and comes back substituted, and the value never appears on
-    /// the guest side of the hop.
+    /// The whole agent door, minus the VMM: a guest agent listening on the
+    /// *guest's* loopback, an authenticated vsock hop, and the private unix
+    /// socket the plane owns. A real bound request crosses all three and
+    /// comes back substituted, and the value never appears on the guest side
+    /// of the hop.
     ///
-    /// The vsock itself is a socket pair here, which is exactly what it is
-    /// on the wire: a stream between one guest and one helper. What this
-    /// proves is the protocol and the splice, not Apple's transport.
+    /// One test for both backends, because above the transport they are the
+    /// same door. The vsock is a socket pair here: for VZ that stands in for
+    /// Apple's transport, and for Cloud Hypervisor it is not a
+    /// simplification at all — its hybrid vsock *is* a unix stream, one the
+    /// VMM connects to `<vsock>_<port>` and splices to the guest. What runs
+    /// below is the protocol and the splice, not either VMM.
     #[cfg(unix)]
     #[tokio::test]
-    async fn the_vz_door_carries_a_bound_request_over_an_authenticated_hop() {
+    async fn the_agent_door_carries_a_bound_request_over_an_authenticated_hop() {
         use asterism_core::egress_door::{door_guest_handshake, door_host_handshake, pump};
         use std::io::BufReader;
         use std::os::unix::net::UnixStream as StdUnixStream;
@@ -1833,12 +1849,12 @@ mod tests {
         let seen = Arc::new(StdMutex::new(Vec::new()));
 
         let dir = tempfile::tempdir().unwrap();
-        let authority = Authority::load_or_create(dir.path(), "vzdoor").unwrap();
+        let authority = Authority::load_or_create(dir.path(), "agentdoor").unwrap();
         let ca_pem = authority.ca_pem.clone();
         let socket = dir.path().join("proxy.sock");
         let unix = UnixListener::bind(&socket).unwrap();
         let ctx = Arc::new(ProxyCtx {
-            instance: "vzdoor".into(),
+            instance: "agentdoor".into(),
             bindings: vec![bound],
             authority,
             source: Arc::new(FakeSource { seen: seen.clone() }),
