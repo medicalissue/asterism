@@ -131,9 +131,9 @@ list is checked against real clients rather than assumed:
   lease's own export name is accepted; any other name is refused and the
   connection closed.
 - `NBD_OPT_STRUCTURED_REPLY` and `base:allocation` through
-  `NBD_OPT_SET_META_CONTEXT`, because `nbd-client -b` and QEMU both ask for
-  them. `NBD_CMD_BLOCK_STATUS` is answered only when that context was
-  negotiated.
+  `NBD_OPT_SET_META_CONTEXT`. QEMU's client asks for both; VZ asks for
+  neither and never sends `NBD_CMD_BLOCK_STATUS`. That command is answered
+  only when the context was negotiated, and refused with `EINVAL` otherwise.
 - `NBD_CMD_READ`, `WRITE`, `FLUSH`, `TRIM`, `WRITE_ZEROES`, `DISC` and
   `BLOCK_STATUS`, with `FUA`, `DF`, `NO_HOLE` and `REQ_ONE`. Nothing else is
   advertised, and an unknown command flag closes the connection rather than
