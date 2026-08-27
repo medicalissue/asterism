@@ -2,7 +2,7 @@
 //!
 //! The orbit is a pool of parts; an instance is a computer assembled from
 //! them. Compute is the one orbit device an instance runs on — its CPU,
-//! physical RAM, and GPU. Data parts (storage, secrets, exit points) attach
+//! physical RAM, and GPU. Data parts — block volumes and secrets — attach
 //! across devices. That sentence is the
 //! shape of this crate: [`orbit`] is the set of
 //! devices supplying the pool, [`instance`] is what gets assembled and which
