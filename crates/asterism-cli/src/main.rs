@@ -1540,31 +1540,57 @@ impl AuthHttp {
         })
     }
 
-    fn post<T: serde::de::DeserializeOwned>(
+    /// The RFC 8628 endpoints read `application/x-www-form-urlencoded` and
+    /// identify the caller by `client_id`.
+    fn post_form<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        pairs: &[(&'static str, String)],
+    ) -> Result<AuthReply<T>> {
+        self.send(
+            self.client
+                .post(format!("{}{path}", self.authority))
+                .header("Asterism-Protocol", hosted_auth::PROTOCOL)
+                .form(pairs),
+        )
+    }
+
+    /// The account-management endpoints read JSON and identify the caller by
+    /// the bearer alone.
+    fn post_json<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
         body: &serde_json::Value,
-        bearer: Option<&str>,
+        bearer: &str,
     ) -> Result<AuthReply<T>> {
-        let mut request = self
-            .client
-            .post(format!("{}{path}", self.authority))
-            .header("Asterism-Protocol", hosted_auth::PROTOCOL)
-            .json(body);
-        if let Some(token) = bearer {
-            request = request.bearer_auth(token);
-        }
+        self.send(
+            self.client
+                .post(format!("{}{path}", self.authority))
+                .header("Asterism-Protocol", hosted_auth::PROTOCOL)
+                .bearer_auth(bearer)
+                .json(body),
+        )
+    }
+
+    fn send<T: serde::de::DeserializeOwned>(
+        &self,
+        request: reqwest::blocking::RequestBuilder,
+    ) -> Result<AuthReply<T>> {
         let response = request
             .send()
             .context("contacting the hosted authorization service")?;
         let status = response.status();
-        if response
+        // The authority does not echo a protocol version, so its absence
+        // cannot be a failure. A version that *is* present and disagrees
+        // still is: that is a deployment this client cannot read.
+        if let Some(advertised) = response
             .headers()
             .get("Asterism-Protocol")
             .and_then(|value| value.to_str().ok())
-            != Some(hosted_auth::PROTOCOL)
         {
-            bail!("hosted coordinator protocol is incompatible");
+            if advertised != hosted_auth::PROTOCOL {
+                bail!("hosted coordinator protocol is incompatible");
+            }
         }
         // Every authorization response is tiny. Capping before deserialization
         // prevents an untrusted coordinator from turning a failure into an
@@ -1640,8 +1666,10 @@ impl CoordinatorClient for AuthHttp {
     }
 
     fn issue(&self, provider: Provider) -> Result<DeviceAuthorization> {
-        let request = serde_json::to_value(DeviceAuthorizationRequest::cli(provider))?;
-        match self.post("/oauth/device/code", &request, None)? {
+        match self.post_form(
+            "/oauth/device/code",
+            &DeviceAuthorizationRequest::cli(provider).form_pairs(),
+        )? {
             AuthReply::Ok(reply) => {
                 self.validate_authorization(&reply)?;
                 Ok(reply)
@@ -1651,32 +1679,32 @@ impl CoordinatorClient for AuthHttp {
     }
 
     fn poll(&self, device_code: &str) -> Result<AuthReply<Session>> {
-        let reply: AuthReply<Session> = self.post(
-            "/oauth/device/token",
-            &serde_json::json!({
-                "device_code": device_code,
-                "grant_type": "urn:ietf:params:oauth:grant-type:device_code"
-            }),
-            None,
+        let reply: AuthReply<hosted_auth::TokenResponse> = self.post_form(
+            "/oauth/token",
+            &[
+                ("client_id", hosted_auth::CLI_CLIENT_ID.to_owned()),
+                ("grant_type", hosted_auth::DEVICE_GRANT_TYPE.to_owned()),
+                ("device_code", device_code.to_owned()),
+            ],
         )?;
-        if let AuthReply::Ok(session) = &reply {
-            if session.token_type != "Bearer"
-                || session.account.id.is_empty()
-                || session.account.id.len() > 256
-                || session.account.display_name.is_empty()
-                || session.account.display_name.len() > 256
-            {
-                bail!("hosted coordinator returned an invalid session");
-            }
-        }
-        Ok(reply)
+        Ok(match reply {
+            // The token endpoint answers with a bearer and its scope, not an
+            // account document: the account this bearer belongs to is named
+            // by the bearer itself.
+            AuthReply::Ok(token) => AuthReply::Ok(
+                token
+                    .into_session(&self.authority, unix_seconds())
+                    .context("reading the issued session")?,
+            ),
+            AuthReply::Protocol(error) => AuthReply::Protocol(error),
+        })
     }
 
     fn revoke(&self, access_token: &str) -> Result<()> {
-        match self.post::<serde_json::Value>(
-            "/oauth/revoke",
+        match self.post_json::<serde_json::Value>(
+            "/api/v1/account/sessions/revoke",
             &serde_json::json!({}),
-            Some(access_token),
+            access_token,
         )? {
             AuthReply::Ok(_) => Ok(()),
             AuthReply::Protocol(error) => bail!("remote revocation refused: {}", error.error),
@@ -5324,13 +5352,93 @@ mod tests {
         assert_eq!(issued.user_code, "ABCD-EFGH");
         let (head, body) = received.recv().unwrap();
         assert!(head.starts_with("POST /oauth/device/code HTTP/1.1"));
-        assert!(head
-            .to_ascii_lowercase()
-            .contains(&format!("asterism-protocol: {}", hosted_auth::PROTOCOL)));
+        let lowercase = head.to_ascii_lowercase();
+        assert!(lowercase.contains(&format!("asterism-protocol: {}", hosted_auth::PROTOCOL)));
+        // The authority reads a form body and identifies the caller by the
+        // registered public client id, not by a JSON document.
+        assert!(lowercase.contains("content-type: application/x-www-form-urlencoded"));
+        let fields: std::collections::BTreeMap<String, String> = body
+            .split('&')
+            .map(|pair| {
+                let (key, value) = pair.split_once('=').unwrap();
+                (key.to_owned(), value.replace("%20", " ").replace('+', " "))
+            })
+            .collect();
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&body).unwrap(),
-            serde_json::json!({"provider":"github"})
+            fields.get("client_id").map(String::as_str),
+            Some(hosted_auth::CLI_CLIENT_ID)
         );
+        assert_eq!(
+            fields.get("scope").map(String::as_str),
+            Some(hosted_auth::CLI_SCOPE)
+        );
+        assert_eq!(fields.get("provider").map(String::as_str), Some("github"));
+        server.join().unwrap();
+    }
+
+    /// The deployed authority answers the token endpoint with an RFC 6749
+    /// token response and no protocol header at all. Neither may stop a
+    /// login, and the account still has to come out of the bearer.
+    #[test]
+    fn token_response_without_a_protocol_header_still_names_the_account() {
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        const BEARER: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJhc3Rlcmlzb\
+S1jbGkiLCJzdWIiOiJ1c2VyLTQyIiwicHJvdmlkZXIiOiJnaXRodWIiLCJuYW1lIjoiT2N0byBDYXQiLCJpYXQiOjE3M\
+DAwMDAwMDAsImV4cCI6MTcwMDA0MzIwMCwic2NvcGUiOiJvcGVuaWQifQ.c2lnbmF0dXJl";
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sent, received) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut head = String::new();
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = value.trim().parse::<usize>().unwrap();
+                }
+                head.push_str(&line);
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            sent.send((head, String::from_utf8(body).unwrap())).unwrap();
+            let response = format!(
+                r#"{{"access_token":"{BEARER}","token_type":"Bearer","expires_in":43200,"scope":"openid"}}"#
+            );
+            let mut stream = stream;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response.len(),
+                response
+            )
+            .unwrap();
+        });
+
+        let client = AuthHttp::new(&format!("http://{address}")).unwrap();
+        let AuthReply::Ok(session) = client.poll("opaque-device-code").unwrap() else {
+            panic!("a token response is not a protocol error");
+        };
+        assert_eq!(session.account.id, "user-42");
+        assert_eq!(session.account.display_name, "Octo Cat");
+        assert_eq!(session.account.provider, Provider::Github);
+        assert_eq!(session.issued_at, 1_700_000_000);
+        assert_eq!(session.issuer, format!("http://{address}"));
+        assert!(!format!("{session:?}").contains(BEARER));
+
+        let (head, body) = received.recv().unwrap();
+        assert!(head.starts_with("POST /oauth/token HTTP/1.1"));
+        assert!(body.contains(&format!("client_id={}", hosted_auth::CLI_CLIENT_ID)));
+        assert!(body.contains("device_code=opaque-device-code"));
+        assert!(body.contains("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code"));
         server.join().unwrap();
     }
 
@@ -5394,7 +5502,7 @@ mod tests {
 
         logout_with(&store, None, &mut output, &mut errors).unwrap();
         let issuer_request = received.recv().unwrap().to_ascii_lowercase();
-        assert!(issuer_request.starts_with("post /oauth/revoke http/1.1"));
+        assert!(issuer_request.starts_with("post /api/v1/account/sessions/revoke http/1.1"));
         assert!(issuer_request.contains("authorization: bearer token-not-for-logs"));
         assert_eq!(
             other_listener.accept().unwrap_err().kind(),

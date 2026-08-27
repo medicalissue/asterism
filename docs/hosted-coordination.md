@@ -22,15 +22,28 @@ persisted. `site-nca` can place the returned opaque `AccountBinding` in its
 session. The binding includes a random account generation, not a provider
 credential or core-owned session token.
 
-Native clients and the Worker share these stable values and JSON shapes:
+Native clients and the Worker share these stable values and wire shapes. Both
+OAuth endpoints read `application/x-www-form-urlencoded`; only the
+account-management endpoints read JSON.
 
-- protocol: `asterism-device-authorization/1`
+- protocol: `asterism-device-authorization/1`, sent as a request header. The
+  Worker does not echo it, so clients treat a missing response header as
+  silence rather than as an incompatible deployment.
 - grant type: `urn:ietf:params:oauth:grant-type:device_code`
-- transaction request: `provider` (`google` or `github`) and optional Desktop
-  `redirect_uri` / `deep_link_state`
-- authorization response: `device_code`, `user_code`, `verification_uri`,
-  `verification_uri_complete`, `expires_in`, `interval`
-- polling request: `device_code`, `grant_type`
+- public client id: `asterism-cli`, registered with scopes
+  `openid orbit.read orbit.write`. RFC 8628 public clients are identified, not
+  authenticated, so this is not a secret.
+- transaction request (form): `client_id`, `scope`, an advisory `provider`
+  (`google` or `github`), and optional Desktop `redirect_uri` /
+  `deep_link_state`. The Worker resolves the provider from the browser session
+  that approves the user code and ignores form fields it does not know.
+- authorization response (JSON): `device_code`, `user_code`,
+  `verification_uri`, `verification_uri_complete`, `expires_in`, `interval`
+- polling request (form): `client_id`, `grant_type`, `device_code`
+- token response (JSON): `access_token`, `token_type`, `expires_in`, `scope`.
+  There is no account document on this endpoint: the bearer is a signed token
+  whose payload names the account it was minted for.
+- error envelope (JSON): `error` and `error_description`
 
 The core validates that authorization responses are bounded and use HTTPS. It
 does not initiate a browser flow, exchange a code, handle a callback, set a

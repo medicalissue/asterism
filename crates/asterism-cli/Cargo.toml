@@ -21,7 +21,9 @@ libc = "0.2"
 # Explicit platform features are security-critical: without them keyring's
 # fallback backend is an in-memory mock, not an OS credential store.
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust", "vendored"] }
-reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls-no-provider"] }
+# `form` is the RFC 8628 body encoding: the hosted authority reads
+# application/x-www-form-urlencoded on its OAuth endpoints, not JSON.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "form", "json", "rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde.workspace = true
 zeroize = "1"
