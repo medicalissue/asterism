@@ -313,6 +313,28 @@ impl DeviceIdentity {
 /// A filesystem that refuses `fsync` on a directory (some network mounts,
 /// most container fakes) is not a reason to refuse to save a key: the rename
 /// is still ordered, it is only the barrier that is missing.
+///
+/// Windows has no directory fsync at all. `File::open` on a directory there
+/// fails with `ERROR_ACCESS_DENIED` before a handle exists, and even a
+/// backup-semantics handle refuses `FlushFileBuffers`. Treating that as a
+/// failure made every first daemon start on Windows report "the mesh is
+/// unavailable: device key i/o failed: Access is denied" *after* the key had
+/// already been installed — a device that could never join an orbit. So the
+/// barrier is simply absent there, exactly as it is in
+/// `asterism_core::durable::sync_dir`, and the only thing checked is that the
+/// directory is still a directory.
+#[cfg(windows)]
+fn sync_dir(dir: &Path) -> Result<(), IdentityError> {
+    if !std::fs::metadata(dir)?.is_dir() {
+        return Err(IdentityError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a directory", dir.display()),
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
 fn sync_dir(dir: &Path) -> Result<(), IdentityError> {
     match std::fs::File::open(dir).and_then(|handle| handle.sync_all()) {
         Ok(()) => Ok(()),
@@ -423,6 +445,22 @@ mod tests {
         assert_eq!(DeviceId::from_public_key(parsed), id);
         assert_eq!(id.short().len(), 12);
         assert!(id.to_string().starts_with(&id.short()));
+    }
+
+    #[test]
+    fn syncing_a_real_directory_is_never_an_error() {
+        // Windows has no directory fsync: `File::open` on a directory there
+        // fails with ERROR_ACCESS_DENIED, which used to propagate out of
+        // `install_new` *after* the key was already on disk and left the
+        // daemon reporting "the mesh is unavailable: device key i/o failed:
+        // Access is denied" on every first start. A directory that exists is
+        // a success on every platform; only a non-directory is a mistake.
+        let dir = tempfile::tempdir().unwrap();
+        sync_dir(dir.path()).expect("an existing directory must sync or be skipped");
+
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        sync_dir(&nested).expect("a freshly created directory must sync or be skipped");
     }
 
     #[test]

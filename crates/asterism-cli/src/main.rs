@@ -485,6 +485,15 @@ enum Command {
         /// the billing basis. This is how a machine reads it.
         #[arg(long)]
         json: bool,
+        /// List the hardware GPU providers a device advertises, instead of
+        /// the devices themselves.
+        ///
+        /// `ast --device desktop devices --gpu` is how you find the exact
+        /// `DEVICE:GPU-UUID` pair to hand `ast attach --gpu`, and how you
+        /// check that a provider really advertises a CUDA executor rather
+        /// than a reference one before you attach to it.
+        #[arg(long, conflicts_with = "json")]
+        gpu: bool,
     },
     /// Add, list and remove the devices in this orbit.
     #[command(subcommand)]
@@ -1112,7 +1121,11 @@ fn main() -> Result<()> {
             local_only("exec", device.as_deref())?;
             return guest_exec(&name, command, timeout);
         }
-        Command::Devices { json } => {
+        // `--gpu` is the one shape of this command that is worth asking of
+        // another device: a GPU provider is advertised by the machine the
+        // card is in, so `--device` has to be allowed to aim it there.
+        Command::Devices { json: _, gpu: true } => Request::GpuProviderList,
+        Command::Devices { json, gpu: false } => {
             local_only("devices", device.as_deref())?;
             return print_devices(json);
         }
@@ -1355,15 +1368,35 @@ fn main() -> Result<()> {
         }
         Response::Error { message } => bail!(message),
         Response::GpuProviders { providers } => {
+            if providers.is_empty() {
+                println!("no GPU providers here — this device advertises no admitted NVIDIA GPU");
+            }
             for provider in providers {
+                // The executor is the honest half of this line: only a
+                // provider that actually launches on NVIDIA hardware says
+                // `cuda`, and `ast attach --gpu` will not place on anything
+                // else. Printing it next to the UUID is what makes this
+                // command usable as evidence rather than decoration.
                 println!(
-                    "{}  {}  {} bytes  {:?}",
+                    "{}  {}  {}  executor={}  {:?}  free {}  leases {}/{}  generation {}  abi {}-{}",
                     provider.device_name,
                     provider.gpu_uuid,
-                    provider
-                        .total_memory_bytes
-                        .saturating_sub(provider.leased_memory_bytes),
-                    provider.health
+                    provider.device_name_cuda,
+                    match provider.executor {
+                        asterism_core::remote_gpu::Executor::Cuda => "cuda",
+                        asterism_core::remote_gpu::Executor::Reference => "reference",
+                    },
+                    provider.health,
+                    human_bytes(
+                        provider
+                            .total_memory_bytes
+                            .saturating_sub(provider.leased_memory_bytes)
+                    ),
+                    provider.active_leases,
+                    provider.max_leases,
+                    provider.generation,
+                    provider.versions.min,
+                    provider.versions.max,
                 );
             }
         }
@@ -5267,6 +5300,30 @@ mod tests {
 
     fn parse_cli(args: &[&str]) -> Cli {
         Cli::try_parse_from(std::iter::once("ast").chain(args.iter().copied())).unwrap()
+    }
+
+    #[test]
+    fn devices_gpu_asks_a_named_device_for_its_provider_inventory() {
+        // Plain `ast devices` is a local-only question about the orbit.
+        let Command::Devices { json, gpu } = parse_cli(&["devices"]).command else {
+            panic!("devices did not parse as devices");
+        };
+        assert!(!json);
+        assert!(!gpu);
+
+        // `--gpu` is the inventory question, and it is the one form that may
+        // be aimed at the device the card is actually in.
+        let cli = parse_cli(&["--device", "desktop", "devices", "--gpu"]);
+        assert_eq!(cli.device.as_deref(), Some("desktop"));
+        let Command::Devices { json, gpu } = cli.command else {
+            panic!("devices --gpu did not parse as devices");
+        };
+        assert!(!json);
+        assert!(gpu);
+
+        // The two output shapes are different answers to different
+        // questions; asking for both at once is a mistake, not a merge.
+        assert!(Cli::try_parse_from(["ast", "devices", "--gpu", "--json"]).is_err());
     }
 
     #[test]

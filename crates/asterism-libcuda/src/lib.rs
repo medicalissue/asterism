@@ -643,6 +643,29 @@ mod tests {
         assert!(!EXPORTED_CUDA_DRIVER_SYMBOLS.contains(&"cuMemAllocManaged"));
     }
 
+    /// The in-guest C client carries its own copy of the pinned PTX, because
+    /// an ordinary CUDA application supplies the module bytes and cannot
+    /// link this crate to borrow them. `cuModuleLoadData` compares those
+    /// bytes to `VECTOR_ADD_PTX` exactly, so any drift turns the whole guest
+    /// proof into `CUDA_ERROR_NOT_SUPPORTED` at the last step. Catch it here
+    /// instead of on a GPU host.
+    #[test]
+    fn the_guest_c_client_embeds_the_same_pinned_ptx() {
+        const CLIENT: &str = include_str!("../../../scripts/lib/remote_gpu_guest_vector_add.c");
+        let body = CLIENT
+            .split_once("static const char VECTOR_ADD_PTX[] =")
+            .expect("the client declares the pinned PTX")
+            .1
+            .split_once(";\n")
+            .expect("the declaration ends")
+            .0;
+        let mut embedded = String::new();
+        for piece in body.split('"').skip(1).step_by(2) {
+            embedded.push_str(&piece.replace("\\n", "\n"));
+        }
+        assert_eq!(embedded, asterism_core::remote_gpu::VECTOR_ADD_PTX);
+    }
+
     #[test]
     fn error_pointers_are_nul_terminated() {
         let mut name: *const c_char = std::ptr::null();
