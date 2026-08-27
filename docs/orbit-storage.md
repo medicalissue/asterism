@@ -1,10 +1,19 @@
-# Orbit storage catalog and placement
+# Orbit storage catalog and provider selection
 
-Block storage is an orbit part. Its bytes have one owning device, but an
-instance can attach the part from any device and sees only an ordinary local
-disk. The catalog is the management view of that contract; the existing NBD
-bridge over the authenticated mesh is the transport implementation and never
-enters guest configuration.
+Block storage is a **data** part, and data is the thing that legitimately
+crosses devices: bytes have one owning device, an instance running on any
+device in the orbit can attach them, and the guest sees only an ordinary local
+disk. (Compute is not like this. An instance uses the CPU, RAM, and GPU of the
+device it runs on — see
+[Compute is the device an instance runs on](compute-device.md).)
+
+The catalog is the management view of that contract; the existing NBD bridge
+over the authenticated mesh is the transport implementation and never enters
+guest configuration.
+
+"Placement" below always means one thing: choosing which device's bytes back a
+volume attachment. It is not a compute scheduler and it never decides where an
+instance runs.
 
 `ast volume ls` asks every reachable provider and reports one row per part:
 
@@ -20,7 +29,7 @@ Provider-local administration remains available with `ast --device DEVICE
 volume ...`. This is useful for creation, removal and diagnosis, but consumers
 do not need to query devices one at a time.
 
-## Placement
+## Choosing a provider
 
 `ast attach INSTANCE --volume NAME` reads the live catalog before mutation.
 Eligible candidates must advertise the required durability and sharing mode,
@@ -102,9 +111,11 @@ provider and each attempt has a 30-second deadline. A timeout leaves the
 durable intent fenced for the next retry; it cannot stall every registry read
 or silently admit a guest.
 
-Compute placement is independent. Moving an instance changes where its CPU and RAM
-run, while attached volume ownership stays fixed; the bridge becomes local or
-remote as required. Portable backups record the external volume binding and
+Relocating an instance (parked; see
+[Compute is the device an instance runs on](compute-device.md)) is independent
+of this. It changes which device supplies CPU and RAM, while attached volume
+ownership stays fixed; the bridge becomes local or remote as required.
+Portable backups record the external volume binding and
 restore it as a part that must be rebound rather than copying or silently
 claiming provider bytes.
 

@@ -8,9 +8,7 @@
 <p align="center"><b>Run your AI agents 24/7 on hardware you already own.</b></p>
 
 <p align="center">
-  Everything your agent needs, made local.<br>
-  Assemble compute, storage, GPUs, routes, and secrets from wherever they live.<br>
-  Keep your agent running 24/7.
+  <b>Everything your agent needs. Made local. Always on.</b>
 </p>
 
 <p align="center">
@@ -24,19 +22,54 @@
        alt="Terminal session: ast create agent --image debian:13, ast up agent, ast ssh agent -- uname -a printing the guest kernel, ast down agent, ast snapshot agent clean, ast ls.">
 </p>
 
-Asterism assembles compute, storage, GPUs, routes, and secrets from wherever
-they live, then keeps your agent running 24/7. The `ast` CLI drives a local
-`astd` daemon and boots isolated instances from cloud or OCI images.
+Asterism gives an agent a box of its own on a machine you already have, and
+keeps it running. The `ast` CLI drives a local `astd` daemon and boots
+isolated instances from cloud or OCI images. An instance runs on one device
+and uses that device's CPU, RAM, and GPU — the same hardware you would have
+run the agent on directly, with a kernel and a disk of its own around it.
 
-A set of devices becomes an **orbit**: one computer whose compute, storage,
-secrets, and network reach can come from different places. Asterism runs
-persistent agents in real VMs, keeps each guest isolated behind its own kernel
-and disk, and lets you operate every instance by name from any device in the
-orbit.
+A set of devices becomes an **orbit**: a trusted pool your instances draw
+*data* from — block volumes over NBD, secrets by handle — and reach you
+through, by one orbit-wide name. Asterism runs persistent agents in real VMs,
+keeps each guest isolated behind its own kernel and disk, and lets you operate
+every instance by name from any device in the orbit.
 
 No Asterism account or hosted control plane is required. Devices pair
 directly, trust device keys, and communicate over an authenticated, encrypted
 mesh.
+
+## Why not tmux and ssh?
+
+You can already leave Claude Code, Codex, OpenClaw, or Hermes running under
+`tmux` behind `ssh` and a mesh VPN. What running it on Asterism gives you:
+
+- **A box it can break, at full speed.** Every instance is a real VM with its
+  own kernel and disk. Let the agent `sudo`, rewrite the toolchain, install
+  whatever it wants — it is working on its own machine, not yours.
+- **Rewind, and fork.** `ast snapshot` takes the machine as it stands and
+  costs almost nothing (copy-on-write); `ast restore` puts a bad hour back and
+  lets you run the next attempt from exactly the same starting point.
+  `ast backup export` and `ast backup import` turn that starting point into a
+  second instance, so several agents can work the same problem at once.
+- **Hand it every key you own.** The guest gets an opaque `sk-ast-…` handle;
+  the real value stays in your Keychain or Secret Service and is substituted
+  at the host's egress door on the way out. It is never in the guest disk, the
+  seed, or a snapshot — which is what makes giving an always-on agent your
+  real credentials a thing you can actually do.
+- **An agent ready in a minute.** `ast create … --profile codex` boots a guest
+  with the tools already provisioned, not a machine you now have to set up.
+- **It stays up.** `ast service install` plus `--restart always` survives
+  logout and reboot; the daemon keeps the device awake while a guest is running.
+- **Dispatch from anywhere.** `ast ssh agent` resolves the name orbit-wide, so
+  you send work to the agent from whichever device you have on you and pick up
+  the results later.
+- **Many agents, one pool of storage.** Run as many isolated guests as the
+  device will hold; a block volume lives on whichever device has the disk for
+  it and is handed from one instance to the next by a lease, fenced by a
+  durable epoch, so no two agents can quietly write the same bytes.
+
+What it does *not* do: pool CPU, RAM, or GPUs across devices. Compute is the
+device an instance runs on.
 
 ## Install
 
@@ -95,8 +128,8 @@ $ ast logs web -n 20
 `ast exec ... -- /bin/sh -c ...` covers non-interactive shell work. A PTY and
 interactive stdin are not part of this command.
 
-Published endpoints are loopback-only on the device supplying compute. TCP is
-the default; append `/udp` when the service uses UDP, for example
+Published endpoints are loopback-only on the device the instance runs on. TCP
+is the default; append `/udp` when the service uses UDP, for example
 `-p 5353:53/udp`. Every product backend supplies this endpoint: QEMU forwards
 inside its own user-mode NAT, while Virtualization.framework and Cloud
 Hypervisor hand the guest a private address and `astd` binds
@@ -186,33 +219,35 @@ $ ast ls
 Instance names form one orbit-wide namespace. `ast create` and `ast rename`
 claim a name across the orbit, and ordinary commands such as `ast up agent`,
 `ast ssh agent`, and `ast status agent` locate it and forward the request to
-the device supplying its compute. `ast ls` combines every device's registry
-shard into one view and marks the state from an unreachable device as `unknown`.
+the device it runs on. `ast ls` combines every device's registry shard into one
+view and marks the state from an unreachable device as `unknown`.
 The global `--device` option is for device-local administration and debugging,
 not for reaching an instance.
 
-## Assemble instances from parts
+## Give an instance its parts
 
-A device contributes parts. An orbit is the trusted pool of those devices. An
-instance keeps the durable identity assembled from those parts, without a
-special source device. Compute, root disk, remote block volumes, GPU provider
-placement, and orbit-scoped secret egress are represented as parts today;
-backend capability gates keep unavailable guest projections from being
-recorded as if they worked.
+An instance runs on one device and uses that device's hardware. What it can
+draw from the rest of the orbit is **data**: block volumes and secrets. Root
+disk, remote block volumes, and orbit-scoped secret egress are represented as
+parts today; backend capability gates keep unavailable guest projections from
+being recorded as if they worked.
 
-`ast status` shows where an instance's parts come from. Software inside the
-guest sees ordinary local resources even when Asterism carries their
-operations across the mesh.
+`ast status` shows where an instance's parts come from. A guest sees an
+ordinary local disk even when the bytes live on another device and Asterism
+carries the block operations across the mesh.
 
-See [Compute placement](docs/compute-placement.md) for the architecture and
-compatibility contract.
+See [Compute is the device an instance runs on](docs/compute-device.md) for
+the architecture and compatibility contract.
 
-- **Compute** comes from one device: CPU, physical RAM, and execution state
-  move together. The recorded hypervisor backend is an internal placement
-  detail; every new Instance is a VM. `--cpus` and `--mem` are quotas on that
-  selected compute device, not separately placeable resources. Move compute
-  offline without changing the instance's name or identity; its root disk and
-  snapshots transfer peer-to-peer as part of the move.
+- **Compute** is not a part Asterism places, splits, or borrows. An instance
+  gets the CPU, physical RAM, and GPU of the device it runs on; `--cpus` and
+  `--mem` are quotas on that device. The recorded hypervisor backend is an
+  internal detail; every new Instance is a VM. Asterism does not present CPU
+  and RAM from two devices as one machine, and there is no scheduler choosing
+  a device for you.
+
+  Relocating an instance to another device does exist, as an offline
+  migration, and it is parked rather than part of the core story:
 
   ```console
   $ ast set agent compute desktop --down
@@ -220,8 +255,15 @@ compatibility contract.
 
   `ast set agent cpu desktop` and `ast move agent desktop` remain aliases.
 
-- **Directory shares** expose a directory from the compute device through 9p on
-  QEMU or virtiofs on VZ.
+- **GPU** is the GPU of the device the instance runs on. Projecting another
+  device's NVIDIA GPU into a guest over the mesh is an **experimental
+  appendix**, not a shipped promise: one CUDA kernel launch becomes one
+  network round trip where PCIe takes sub-microseconds. See
+  [Roadmap](#roadmap).
+
+- **Directory shares** expose a directory from the instance's own device
+  through 9p on QEMU or virtiofs on VZ. They are local to that device; there
+  is no network transport for them.
 
   ```console
   $ ast attach agent --volume ~/work --at /workspace
@@ -239,16 +281,17 @@ compatibility contract.
 
   `ast volume ls` is one orbit catalog: each row identifies the owning device,
   measured access latency, single-device durability, single-writer sharing and
-  current lease. Placement prefers an eligible local part, then the lowest
+  current lease. Asterism prefers an eligible local part, then the lowest
   measured latency. Use `storage:data` to constrain an attach to one owner, or
   `--max-latency-ms` to refuse a path before any lease or guest state changes.
 
-- **Secrets** keep their values in a source device's macOS login Keychain or
-  FreeDesktop Secret Service on Linux. The
-  guest receives an opaque handle, and Asterism exchanges it for the value
-  only on requests to the allowed authority. The value never enters the guest
-  disk or a snapshot; platforms without a credential-store implementation
-  refuse secret storage instead of writing a plaintext fallback.
+- **Secrets** let you give an agent the real keys without putting them in the
+  box. Values stay in a source device's macOS login Keychain or FreeDesktop
+  Secret Service on Linux; the guest gets an opaque handle, and Asterism swaps
+  it for the value at the egress door on its way to the authority you bound it
+  to. The value never enters the guest disk or a snapshot; platforms without a
+  credential-store implementation refuse secret storage instead of writing a
+  plaintext fallback.
 
   ```console
   $ printf '%s' "$ANTHROPIC_API_KEY" | ast secret create anthropic
@@ -259,9 +302,9 @@ Remote block volumes need no QEMU on either device. The device holding the
 bytes serves them from a native NBD exporter inside `astd`, and the consumer
 side is VZ's own network block device on macOS or the kernel NBD client below
 Cloud Hypervisor on Linux; QEMU remains an optional consumer, never a
-prerequisite. Directory shares must be on the same device as the instance's
-compute, and an attach to an instance whose backend has no share transport is
-refused with the install command it would need rather than silently dropped.
+prerequisite. Directory shares must be on the device the instance runs on, and
+an attach to an instance whose backend has no share transport is refused with
+the install command it would need rather than silently dropped.
 
 ## Reach guests and devices
 
@@ -331,13 +374,38 @@ $ ast update apply --yes
 
 ## Roadmap
 
-The remote GPU part presents `/dev/nvidia0` inside an instance as a projected
-local endpoint (CUSE character device plus generated `libcuda.so.1`) and
-carries CUDA-semantic frames over the authenticated orbit mesh. See
+### Remote GPU — experimental appendix
+
+Projecting another device's NVIDIA GPU into an instance is checked in and it
+is **experimental**, not a shipped product promise and not part of the core
+story. The reason is physics: one CUDA kernel launch becomes one round trip
+over the mesh, against sub-microsecond PCIe on the device's own bus. A GPU an
+instance can actually depend on is the one in the machine it runs on.
+
+The experiment presents `/dev/nvidia0` inside an instance as a projected local
+endpoint (CUSE character device plus generated `libcuda.so.1`) and carries
+CUDA-semantic frames over the authenticated orbit mesh. See
 [docs/remote-gpu-guest.md](docs/remote-gpu-guest.md),
 [docs/remote-gpu-abi.md](docs/remote-gpu-abi.md), and
 [docs/remote-gpu-production.md](docs/remote-gpu-production.md). The portable
 reference executor is not NVIDIA hardware evidence.
+
+### Next at the egress door
+
+Every bound request already passes through a door this device owns, which is
+the natural place to tell you what an agent actually called and what it spent,
+per agent and per task. That ledger is not built yet: today the secrets plane
+handles HTTP/1.1 CONNECT and selective TLS termination, and per-call usage
+records are not written. See
+[Instance networking and egress](docs/instance-network.md) for the built
+boundary.
+
+### Parked
+
+- **Moving an instance between devices** (`ast move`, `ast set … compute`)
+  works as an offline migration and stays in the tree, but it is parked as a
+  product direction. Reason: product focus. Compute is the device an instance
+  runs on.
 
 ## Build from source
 
