@@ -431,10 +431,19 @@ async fn relay_out(
         flows.live.remove(&client);
     }
 
-    // Ephemeral on loopback, connected to the guest: the kernel then does the
-    // demultiplexing this relay would otherwise have to do by hand.
-    let bind = SocketAddr::new(BIND, 0);
-    let socket = Arc::new(UdpSocket::bind(bind).await.context("opening a UDP flow")?);
+    // Ephemeral and *unspecified*, then connected to the guest: the kernel
+    // picks a source address that can reach it and does the demultiplexing
+    // this relay would otherwise have to do by hand.
+    //
+    // Not [`BIND`]. The host end of a published endpoint is loopback, but the
+    // guest end is on a NAT or a TAP, and a socket bound to 127.0.0.1 has no
+    // route to either — the datagram leaves and never arrives, which is
+    // exactly as quiet as UDP always is about that.
+    let socket = Arc::new(
+        UdpSocket::bind(unspecified_for(target))
+            .await
+            .context("opening a UDP flow")?,
+    );
     socket
         .connect(target)
         .await
@@ -450,6 +459,14 @@ async fn relay_out(
         },
     );
     Ok(())
+}
+
+/// The wildcard address of `target`'s family, port zero.
+fn unspecified_for(target: SocketAddr) -> SocketAddr {
+    match target {
+        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0),
+    }
 }
 
 /// Carry the guest's replies on one flow back to the client that opened it.
@@ -759,6 +776,32 @@ mod tests {
             "both flows are past their idle window"
         );
         assert_eq!(flows.len(), 0);
+    }
+
+    /// A UDP flow's own socket must be able to reach the guest.
+    ///
+    /// It cannot be bound on [`BIND`], however natural that looks beside the
+    /// listener that accepted the datagram: the host end of a published
+    /// endpoint is loopback and the guest end is on a NAT or a TAP, and a
+    /// socket bound to 127.0.0.1 has no route to either. The datagram leaves
+    /// and never arrives — as quiet a failure as UDP always gives. This was a
+    /// real bug, caught only by a real guest, because every loopback fixture
+    /// in this file would pass either way.
+    #[test]
+    fn a_udp_flow_binds_a_source_address_that_can_reach_the_guest() {
+        let v4: SocketAddr = "192.168.64.29:7777".parse().unwrap();
+        assert!(
+            unspecified_for(v4).ip().is_unspecified(),
+            "a flow to a guest on a NAT must not be pinned to loopback"
+        );
+        assert!(unspecified_for(v4).is_ipv4());
+
+        let v6: SocketAddr = "[fd00::1]:7777".parse().unwrap();
+        assert!(unspecified_for(v6).ip().is_unspecified());
+        assert!(
+            unspecified_for(v6).is_ipv6(),
+            "the flow socket has to be of the target's own family"
+        );
     }
 
     #[tokio::test]

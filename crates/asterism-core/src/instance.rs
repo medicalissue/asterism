@@ -873,8 +873,16 @@ impl Instance {
                 (RuntimeKind::Container, false) => {
                     format!("rootless network · {}", published.join(", "))
                 }
-                (RuntimeKind::Vm, true) => "user-mode NAT".to_owned(),
-                (RuntimeKind::Vm, false) => format!("user-mode NAT · {}", published.join(", ")),
+                // Deliberately not "user-mode NAT": that is QEMU's mechanism,
+                // and it was already untrue of a Virtualization.framework
+                // guest on a shared NAT bridge or a Cloud Hypervisor guest on
+                // a per-instance TAP. What is true of all three, and is what
+                // this line is telling the user, is that the guest is on a
+                // network of its own that nothing outside this device names.
+                (RuntimeKind::Vm, true) => "private guest network".to_owned(),
+                (RuntimeKind::Vm, false) => {
+                    format!("private guest network · {}", published.join(", "))
+                }
             },
             note: Some(match self.runtime {
                 RuntimeKind::Vm => "exit default: same as compute".into(),
@@ -1143,7 +1151,7 @@ mod tests {
         );
         assert_eq!(
             find("network").detail,
-            "user-mode NAT · 127.0.0.1:8080 -> :80/tcp"
+            "private guest network · 127.0.0.1:8080 -> :80/tcp"
         );
 
         // ...and it survives the registry, kind and ports both.

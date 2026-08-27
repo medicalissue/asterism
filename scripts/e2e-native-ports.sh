@@ -266,12 +266,19 @@ expect "create a published OCI VM on the native $BACKEND backend" "$INST  define
     -p "$HTTP_PORT:80" -p "$UDP_PORT:$GUEST_UDP/udp"
 expect "the instance really recorded $BACKEND" "machine: $BACKEND" "$AST" status "$INST"
 expect "the declaration is durable and loopback-only" \
-  "published: 127.0.0.1:$HTTP_PORT  ->  guest :80/tcp" "$AST" status "$INST"
+  "127.0.0.1:$HTTP_PORT -> :80/tcp" "$AST" status "$INST"
 expect "the udp declaration carries its transport" \
-  "published: 127.0.0.1:$UDP_PORT  ->  guest :$GUEST_UDP/udp" "$AST" status "$INST"
+  "127.0.0.1:$UDP_PORT -> :$GUEST_UDP/udp" "$AST" status "$INST"
 
-expect "boot it with a persistent restart policy" "$INST  running" \
-  "$AST" up "$INST" --restart always
+up_out="$("$AST" up "$INST" --restart always 2>&1)" \
+  || fail "booting the published OCI VM:"$'\n'"$up_out"
+grep -qF "$INST  running" <<<"$up_out" || fail "up did not report running:"$'\n'"$up_out"
+ok "boot it with a persistent restart policy"
+grep -qF "published: 127.0.0.1:$HTTP_PORT  ->  guest :80/tcp" <<<"$up_out" \
+  || fail "up did not name the endpoint it published:"$'\n'"$up_out"
+grep -qF "published: 127.0.0.1:$UDP_PORT  ->  guest :$GUEST_UDP/udp" <<<"$up_out" \
+  || fail "up did not name the published UDP endpoint:"$'\n'"$up_out"
+ok "up names both endpoints it published, on 127.0.0.1"
 harness_assert_backend "$AST" "$INST" "$BACKEND"
 
 expect_http_200 "the published TCP endpoint serves the guest's nginx" "$HTTP_PORT"
