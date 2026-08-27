@@ -457,21 +457,31 @@ fn ensure_running(inst: &Instance, may_move_port: bool) -> Result<(u16, String)>
         // guest's own namespace, so two instances never collide, and a
         // daemon restart reclaims exactly what the running guest was seeded
         // with without having to remember anything.
-        let socket = vm_transport_path(&inst.name);
-        std::fs::create_dir_all(socket.parent().expect("egress transport parent"))?;
-        let _ = std::fs::remove_file(&socket);
-        let listener = UnixListener::bind(&socket).with_context(|| {
-            format!(
-                "binding {:?}'s guest egress door at {}",
-                inst.name,
-                socket.display()
+        //
+        // The host end is a unix socket, so this arm exists only where there
+        // are unix sockets. No backend that declares this door is reachable
+        // from Windows, and the bail keeps that a refusal rather than a type
+        // error in a graph that never runs it.
+        #[cfg(unix)]
+        {
+            let socket = vm_transport_path(&inst.name);
+            std::fs::create_dir_all(socket.parent().expect("egress transport parent"))?;
+            let _ = std::fs::remove_file(&socket);
+            let listener = UnixListener::bind(&socket).with_context(|| {
+                format!(
+                    "binding {:?}'s guest egress door at {}",
+                    inst.name,
+                    socket.display()
+                )
+            })?;
+            (
+                asterism_core::egress_door::EGRESS_GUEST_PORT,
+                tokio::runtime::Handle::current().spawn(accept_unix_loop(listener, ctx)),
+                Some(socket),
             )
-        })?;
-        (
-            asterism_core::egress_door::EGRESS_GUEST_PORT,
-            tokio::runtime::Handle::current().spawn(accept_unix_loop(listener, ctx)),
-            Some(socket),
-        )
+        }
+        #[cfg(not(unix))]
+        bail!("the guest secret egress door needs a unix socket on the host")
     } else {
         // VM user-mode networking maps its private gateway to host loopback.
         let preferred = stable_port(&inst.name);
