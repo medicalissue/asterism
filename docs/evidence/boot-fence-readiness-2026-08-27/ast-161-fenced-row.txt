@@ -1,0 +1,45 @@
+
+$ ast create bot --backend vz --image docker.io/library/nginx:alpine
+resolved
+kernel
+layers
+stored (356515840 bytes)
+bot  defined
+
+$ astd killed inside its boot window: the row it leaves behind
+boot_intent_id 86a6e953-5434-477e-806d-2dba975d1e57
+
+$ ast ls
+NAME           STATUS    IMAGE          SHAPE            DEVICE       AGE    TODAY    ACCESS
+bot            running   nginx:alpine   2c/2048M/20G     macbook-pro.tail0de304.ts.net 1s     -        -
+
+$ ast rm bot
+error: instance "bot" is holding a boot fence: its last launch left no handle and the backend cannot prove whether a VMM for it is still running, so releasing it here could put a second guest on one disk. `ast down bot` lowers the fence the moment the backend can prove there is nothing left; while it cannot, check yourself that no VMM for "bot" is running
+  fix: ast down --force bot
+
+$ ast up bot
+error: instance "bot" is holding a boot fence: its last launch left no handle and the backend cannot prove whether a VMM for it is still running, so releasing it here could put a second guest on one disk. `ast down bot` lowers the fence the moment the backend can prove there is nothing left; while it cannot, check yourself that no VMM for "bot" is running
+  fix: ast down --force bot
+
+$ ast down bot
+bot  stopped
+
+$ ast status bot
+name:    bot
+id:      1a7f1b39-1f56-4612-b72f-8eb7a5bbcc5a
+status:  stopped (boot failed: the launch left no VMM running)
+restart: never
+age:     1s
+machine: vz 26.5.2 (generic, cpu host)
+
+parts:
+  compute  macbook-pro.tail0de304.ts.net  2 cores · 2048 MiB
+  disk     macbook-pro.tail0de304.ts.net  20 GiB · docker.io/library/nginx:alpine  (follows compute · oci rootfs, direct kernel boot)
+  network  macbook-pro.tail0de304.ts.net  private guest network  (exit default: same as compute)
+  gpu      -                              none
+
+$ ast rm bot
+bot  removed
+
+$ ast ls
+no instances — start with: ast create <name>

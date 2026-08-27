@@ -355,7 +355,7 @@ async fn rewind(
         // while this daemon kept holding its published host port made the
         // boot on the other side of the rollback refuse its own declaration
         // as taken.
-        crate::instance::down_completely(reg, name)
+        crate::instance::down_completely(reg, name, false)
             .await
             .with_context(|| {
                 format!("stopping {name} to roll its disk back to {:?}", chosen.tag)
@@ -412,13 +412,13 @@ async fn rewind(
 /// reason to. What did not happen is the boot, and the reason is the
 /// backend's own.
 ///
-/// The second line is the case worth naming out loud. `up` compensates every
-/// failure it can prove, but a backend launch whose outcome is *ambiguous*
-/// deliberately leaves the durable boot fence in place rather than risk a
-/// second guest on one disk — and an instance in that state disagrees with
-/// itself about whether it is running (AST-161). Clearing the fence from here
-/// would be exactly the compensation the fence exists to prevent, so this
-/// says what state the row is in instead.
+/// The second line is the case worth naming out loud. `up` now resolves every
+/// lost launch it can get proof about — a backend that can show its spawn left
+/// nothing running gets its fence released and its failure recorded (AST-161).
+/// What is left is the launch nobody can prove either way, which deliberately
+/// keeps its fence rather than risk a second guest on one disk. Clearing that
+/// from here would be exactly the compensation the fence exists to prevent, so
+/// this repeats the one sentence that says how to clear it deliberately.
 fn boot_failure(reg: &Shard, name: &str, error: &anyhow::Error) -> Vec<String> {
     let mut said = vec![format!(
         "boot failed: {error:#} — the disk is rolled back, so `ast up {name}` is the \
@@ -428,11 +428,7 @@ fn boot_failure(reg: &Shard, name: &str, error: &anyhow::Error) -> Vec<String> {
         .get(name)
         .is_ok_and(|inst| inst.boot_intent_id.is_some())
     {
-        said.push(format!(
-            "{name} is left holding a durable boot fence: the backend's launch outcome \
-             could not be proven either way, and clearing it from here could admit a \
-             second guest onto one disk. Check for a running VMM before retrying"
-        ));
+        said.push(asterism_core::instance::fenced_boot_sentence(name));
     }
     said
 }

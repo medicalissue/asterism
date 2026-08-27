@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use asterism_core::durable;
-use asterism_core::hv::{GuestHealth, ImageKind, RunState, STOP_DEADLINE};
+use asterism_core::hv::{GuestHealth, ImageKind, RunState, VmmPresence, STOP_DEADLINE};
 use asterism_core::instance::{
     local_host, Instance, Policy, Restart, RestartReason, RuntimeKind, Status,
 };
@@ -65,389 +65,395 @@ async fn lock_recovery_shard(node: &Node) -> tokio::sync::MutexGuard<'_, Shard> 
 /// implementation to be answerable from anywhere in the orbit.
 pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Response {
     // Reads answer straight from memory; mutations persist before replying.
-    let mutation = match req {
-        // The version handshake, answered here rather than earlier on purpose:
-        // `ast` sends it before every command, and a daemon that has just
-        // noticed a dead guest should have reconciled that before it says it
-        // is well.
-        Request::Ping { .. } => {
-            let ours = compat::ours();
-            return Response::Pong {
-                version: VERSION.to_owned(),
-                build_id: Some(asterism_core::BUILD_ID.to_owned()),
-                protocol: ours.max,
-                min_protocol: ours.min,
-            };
-        }
-        Request::Compat => {
-            return Response::Compat {
-                compat: Box::new(compat::Compat::current()),
+    let mutation =
+        match req {
+            // The version handshake, answered here rather than earlier on purpose:
+            // `ast` sends it before every command, and a daemon that has just
+            // noticed a dead guest should have reconciled that before it says it
+            // is well.
+            Request::Ping { .. } => {
+                let ours = compat::ours();
+                return Response::Pong {
+                    version: VERSION.to_owned(),
+                    build_id: Some(asterism_core::BUILD_ID.to_owned()),
+                    protocol: ours.max,
+                    min_protocol: ours.min,
+                };
             }
-        }
-        Request::List => {
-            return Response::Instances {
-                instances: reg.list(),
+            Request::Compat => {
+                return Response::Compat {
+                    compat: Box::new(compat::Compat::current()),
+                }
             }
-        }
-        // A read of files this device already wrote, and never a mutation.
-        // It does not consult the registry on purpose: an instance that was
-        // removed last week still has last week's spend on disk, and hiding
-        // that would make the ledger disagree with the bill.
-        Request::Cost {
-            name,
-            since,
-            window,
-        } => return crate::cost::serve(name.as_deref(), since, &window),
-        Request::Status { name } => {
-            return match reg.get(&name) {
-                Ok(instance) => {
-                    let mut instance = instance.clone();
-                    volume::annotate_runtime(&mut instance).await;
-                    status_response(instance)
+            Request::List => {
+                return Response::Instances {
+                    instances: reg.list(),
                 }
-                Err(e) => Response::Error {
-                    message: format!("{e:#}"),
-                },
             }
-        }
-        // The backend is chosen once, here, and recorded on the instance. An
-        // explicit choice is forced; the default probes VZ first and falls
-        // back to QEMU when VZ is unavailable or lacks a required capability.
-        Request::Create {
-            name,
-            image,
-            shape,
-            backend: requested,
-            publish,
-            profiles,
-        } => {
-            create_instance(
-                reg,
-                cpu_device,
-                &name,
-                &image,
-                shape,
-                RuntimeKind::Vm,
-                requested,
-                publish,
-                profiles,
-            )
-            .await
-        }
-        Request::CreateNetwork {
-            name,
-            image,
-            shape,
-            backend: requested,
-            publish,
-            profiles,
-        } => {
-            create_instance(
-                reg,
-                cpu_device,
-                &name,
-                &image,
-                shape,
-                RuntimeKind::Vm,
-                requested,
-                publish,
-                profiles,
-            )
-            .await
-        }
-        Request::CreateRuntime {
-            name,
-            image,
-            shape,
-            runtime,
-            backend: requested,
-            publish,
-            profiles,
-        } => {
-            create_instance(
-                reg, cpu_device, &name, &image, shape, runtime, requested, publish, profiles,
-            )
-            .await
-        }
-        // Recorded now, applied at the next boot. Saying so is the CLI's
-        // job; refusing a name the catalog does not know is this one's.
-        Request::SetProfiles { name, profiles } => reg
-            .get(&name)
-            .map(|_| ())
-            .and_then(|_| check_profiles(&profiles))
-            .and_then(|_| reg.set_profiles(&name, profiles)),
-        Request::AttachGpuResolved { name, attachment } => reg.attach_gpu(&name, attachment),
-        Request::DetachGpu { name } => reg.detach_gpu(&name).map(|(instance, _)| instance),
-        // `--restart` is recorded before the boot, so an instance that comes
-        // up and immediately dies is already carrying the policy the user
-        // asked for when the supervisor looks at the corpse.
-        Request::Up { name, restart } => {
-            return attach_response(up(reg, &name, restart, RestartReason::User))
-        }
-        // A guest being asked to shut down cleanly keeps its disks until the
-        // backend proves it stopped. Only then do its local bridges and egress
-        // proxy go away. A failed stop, including an unresolved launch with no
-        // handle, must preserve every side effect behind that authority row.
-        Request::Down { name } => down_completely(reg, &name).await,
-        Request::Remove { name } => {
-            // Leases are handed back while the immutable instance identity
-            // still exists. A sleeping or refusing provider leaves the row
-            // intact; deleting it would strand a lease no same-name
-            // replacement is authorised to release.
-            if let Ok(inst) = reg.get(&name).cloned() {
-                if inst.status == Status::Running {
-                    return attach_response(Err(anyhow::anyhow!(
-                        "instance {name:?} is running — `ast down {name}` first"
-                    )));
-                }
-                if let Some(intent) = &inst.boot_intent_id {
-                    return attach_response(Err(anyhow::anyhow!(
-                        "instance {name:?} has unresolved boot intent {intent}; refusing to remove its authority row"
-                    )));
-                }
-                volume::take_down(&name).await;
-                if let Err(e) = volume::release_all(&inst).await {
-                    return attach_response(Err(e).context(
-                        "instance removal refused until every block-volume lease is released",
-                    ));
-                }
-                // Native containers have no hypervisor-owned resources. Their
-                // cgroup, namespaces, slirp process and control socket are
-                // retired by `container::down`; asking the VM backend selector
-                // to clean them up turns a successful container shutdown into
-                // a spurious "no backend" refusal at `ast rm`.
-                if inst.runtime == RuntimeKind::Vm {
-                    if let Err(e) = backend::for_instance(&inst)
-                        .and_then(|hv| hv.remove_instance_resources(&inst))
-                    {
-                        return attach_response(
-                            Err(e).context(
-                                "instance removal refused until backend cleanup completes",
-                            ),
-                        );
+            // A read of files this device already wrote, and never a mutation.
+            // It does not consult the registry on purpose: an instance that was
+            // removed last week still has last week's spend on disk, and hiding
+            // that would make the ledger disagree with the bill.
+            Request::Cost {
+                name,
+                since,
+                window,
+            } => return crate::cost::serve(name.as_deref(), since, &window),
+            Request::Status { name } => {
+                return match reg.get(&name) {
+                    Ok(instance) => {
+                        let mut instance = instance.clone();
+                        volume::annotate_runtime(&mut instance).await;
+                        status_response(instance)
                     }
-                }
-                // The instance directory goes below, and this instance's CA
-                // private key is in it.
-                egress::stop(&inst.name);
-                // A removed instance has no declaration left to recover, so
-                // its host ports go back to the device unconditionally.
-                publish::retire(&inst.name);
-            }
-            reg.remove(&name).inspect(|inst| {
-                persist::forget(&inst.name);
-                let _ = std::fs::remove_dir_all(paths::instance_dir(&inst.name));
-            })
-        }
-        // The instance's directory is named after the instance, so the rename
-        // is not done until the bytes have moved too.
-        Request::Rename { name, new_name } => reg.rename(&name, &new_name).inspect(|_| {
-            let (from, to) = (paths::instance_dir(&name), paths::instance_dir(&new_name));
-            if from.exists() {
-                // The rename is published like any other: the row committed
-                // above names the new directory, so a crash between the two
-                // with the rename still in the page cache would leave a row
-                // pointing at a directory that is not there.
-                if let Err(e) = durable::publish_rename(&from, &to) {
-                    eprintln!(
-                        "astd: renaming {} to {}: {e:#}",
-                        from.display(),
-                        to.display()
-                    );
-                }
-            }
-        }),
-        Request::MarkConflicted {
-            name,
-            other_cpu_device,
-        } => reg.mark_conflicted(&name, &other_cpu_device),
-        Request::AttachVolume {
-            name,
-            path,
-            host,
-            mount_point,
-            lifecycle,
-        } => {
-            let host = host.unwrap_or_else(local_host);
-            // Recording a volume the instance's backend could never show
-            // the guest would leave something that looks configured and is
-            // not, so the capability is checked before the registry moves.
-            reg.get(&name)
-                .cloned()
-                .and_then(|inst| match inst.runtime {
-                    RuntimeKind::Vm => backend::check_can_share(&inst),
-                    RuntimeKind::Container => Ok(()),
-                })
-                .and_then(|()| resolve_volume_path(&path, &host))
-                .and_then(|path| {
-                    reg.attach_volume(&name, &path, &host, mount_point.as_deref(), lifecycle)
-                })
-        }
-        // A block volume is taken, not merely recorded: the lease is asked
-        // for now, from the device that holds the bytes, so that "somebody
-        // else has it" is a refusal at attach time rather than a boot that
-        // fails later for reasons the user has to go and read about.
-        Request::AttachBlock {
-            name,
-            volume: vol,
-            device,
-            mount_point,
-        } => {
-            if reg
-                .get(&name)
-                .is_ok_and(|inst| inst.runtime == RuntimeKind::Container)
-            {
-                return attach_response(Err(anyhow::anyhow!(
-                    "block volumes are not supported by the native container adapter"
-                )));
-            }
-            let provider_id = match volume::provider_identity(&device).await {
-                Ok(id) => id,
-                Err(e) => return attach_response(Err(e)),
-            };
-            return attach_response(
-                attach_block_owned(
-                    reg,
-                    &name,
-                    &vol,
-                    &device,
-                    &provider_id,
-                    false,
-                    mount_point.as_deref(),
-                )
-                .await,
-            );
-        }
-        // Catalog placement is deliberately a separate frame from the
-        // device-qualified legacy attach. It resolves every eligibility
-        // requirement before taking a lease or changing the instance row;
-        // the provider's lease remains the race-safe final fence.
-        Request::AttachStorage {
-            name,
-            volume: vol,
-            owner_device,
-            max_latency_ms,
-            mount_point,
-        } => {
-            if reg
-                .get(&name)
-                .is_ok_and(|inst| inst.runtime == RuntimeKind::Container)
-            {
-                return attach_response(Err(anyhow::anyhow!(
-                    "block volumes are not supported by the native container adapter"
-                )));
-            }
-            return attach_response(
-                attach_storage(
-                    reg,
-                    &name,
-                    &vol,
-                    owner_device.as_deref(),
-                    max_latency_ms,
-                    mount_point.as_deref(),
-                )
-                .await,
-            );
-        }
-        Request::Detach {
-            name,
-            volume: vol,
-            host,
-        } => return attach_response(detach(reg, &name, &vol, host.as_deref()).await),
-        // A secret is taken, not merely recorded: the orbit is asked which
-        // devices hold it, and a source that cannot serve its current version
-        // is a refusal here rather than a guest that boots holding a handle
-        // nothing will ever honour.
-        Request::AttachSecret {
-            name,
-            secret,
-            authority,
-            placement,
-            env,
-            source_device,
-        } => {
-            attach_secret(
-                reg,
-                &name,
-                &secret,
-                &authority,
-                placement,
-                env,
-                source_device.as_deref(),
-            )
-            .await
-        }
-        // A credential part is several bindings, and they are made together
-        // or not at all: a `gh` that reached `api.github.com` but not
-        // `codeload.github.com` because the second attach failed would be a
-        // guest whose `gh` works until it clones.
-        Request::AttachCredential {
-            name,
-            credential,
-            source_device,
-        } => attach_credential(reg, &name, &credential, source_device.as_deref()).await,
-        Request::DetachSecret { name, secret } => detach_secret(reg, &name, &secret),
-        Request::BackupExport { name, destination } => {
-            let exported = reg.get(&name).cloned().and_then(|inst| {
-                let provenance = backup::image_provenance(&inst)?;
-                backup::export(
-                    &inst,
-                    &paths::instance_dir(&name),
-                    Path::new(&destination),
-                    provenance,
-                )
-            });
-            return match exported {
-                Ok(report) => Response::BackupExported { report },
-                Err(e) => Response::Error {
-                    message: format!("{e:#}"),
-                },
-            };
-        }
-        Request::BackupImport { source, name } => {
-            return tokio::task::block_in_place(|| {
-                restore_backup(reg, Path::new(&source), &name, cpu_device, None, false)
-            });
-        }
-        Request::BackupImportV2 {
-            source,
-            name,
-            backend,
-            rematerialize_oci,
-        } => {
-            return tokio::task::block_in_place(|| {
-                restore_backup(
-                    reg,
-                    Path::new(&source),
-                    &name,
-                    cpu_device,
-                    backend.as_deref(),
-                    rematerialize_oci,
-                )
-            });
-        }
-        // A file on this device's disk, read here rather than by the CLI, so
-        // that the answer is the same whoever asked and from wherever.
-        Request::Logs { name, lines } => {
-            return match reg.get(&name).map(|i| i.name.clone()) {
-                Ok(name) => match console_tail(&name, lines) {
-                    Ok((text, truncated)) => Response::Log { text, truncated },
                     Err(e) => Response::Error {
                         message: format!("{e:#}"),
                     },
-                },
-                Err(e) => Response::Error {
-                    message: format!("{e:#}"),
-                },
+                }
             }
-        }
-        Request::ContainerExec { .. } => {
-            return Response::Error {
-                message: "container exec reached the shard-locked dispatcher".into(),
-            };
-        }
-        _ => return not_a_shard_request(),
-    };
+            // The backend is chosen once, here, and recorded on the instance. An
+            // explicit choice is forced; the default probes VZ first and falls
+            // back to QEMU when VZ is unavailable or lacks a required capability.
+            Request::Create {
+                name,
+                image,
+                shape,
+                backend: requested,
+                publish,
+                profiles,
+            } => {
+                create_instance(
+                    reg,
+                    cpu_device,
+                    &name,
+                    &image,
+                    shape,
+                    RuntimeKind::Vm,
+                    requested,
+                    publish,
+                    profiles,
+                )
+                .await
+            }
+            Request::CreateNetwork {
+                name,
+                image,
+                shape,
+                backend: requested,
+                publish,
+                profiles,
+            } => {
+                create_instance(
+                    reg,
+                    cpu_device,
+                    &name,
+                    &image,
+                    shape,
+                    RuntimeKind::Vm,
+                    requested,
+                    publish,
+                    profiles,
+                )
+                .await
+            }
+            Request::CreateRuntime {
+                name,
+                image,
+                shape,
+                runtime,
+                backend: requested,
+                publish,
+                profiles,
+            } => {
+                create_instance(
+                    reg, cpu_device, &name, &image, shape, runtime, requested, publish, profiles,
+                )
+                .await
+            }
+            // Recorded now, applied at the next boot. Saying so is the CLI's
+            // job; refusing a name the catalog does not know is this one's.
+            Request::SetProfiles { name, profiles } => reg
+                .get(&name)
+                .map(|_| ())
+                .and_then(|_| check_profiles(&profiles))
+                .and_then(|_| reg.set_profiles(&name, profiles)),
+            Request::AttachGpuResolved { name, attachment } => reg.attach_gpu(&name, attachment),
+            Request::DetachGpu { name } => reg.detach_gpu(&name).map(|(instance, _)| instance),
+            // `--restart` is recorded before the boot, so an instance that comes
+            // up and immediately dies is already carrying the policy the user
+            // asked for when the supervisor looks at the corpse.
+            Request::Up { name, restart } => {
+                return attach_response(up(reg, &name, restart, RestartReason::User))
+            }
+            // A guest being asked to shut down cleanly keeps its disks until the
+            // backend proves it stopped. Only then do its local bridges and egress
+            // proxy go away. A failed stop, including an unresolved launch with no
+            // handle, must preserve every side effect behind that authority row.
+            Request::Down { name, force } => down_completely(reg, &name, force).await,
+            Request::Remove { name } => {
+                // Leases are handed back while the immutable instance identity
+                // still exists. A sleeping or refusing provider leaves the row
+                // intact; deleting it would strand a lease no same-name
+                // replacement is authorised to release.
+                if let Ok(inst) = reg.get(&name).cloned() {
+                    // The fence is checked before "is running", because a fenced
+                    // row is recorded running as part of the fence: telling its
+                    // owner to `ast down` it would send them to a command that
+                    // refuses for the opposite reason. One sentence answers both
+                    // and names the only command that ends it (AST-161).
+                    if inst.boot_intent_id.is_some() {
+                        return attach_response(Err(anyhow::anyhow!(
+                            "{}",
+                            asterism_core::instance::fenced_boot_sentence(&name)
+                        )));
+                    }
+                    if inst.status == Status::Running {
+                        return attach_response(Err(anyhow::anyhow!(
+                            "instance {name:?} is running — `ast down {name}` first"
+                        )));
+                    }
+                    volume::take_down(&name).await;
+                    if let Err(e) = volume::release_all(&inst).await {
+                        return attach_response(Err(e).context(
+                            "instance removal refused until every block-volume lease is released",
+                        ));
+                    }
+                    // Native containers have no hypervisor-owned resources. Their
+                    // cgroup, namespaces, slirp process and control socket are
+                    // retired by `container::down`; asking the VM backend selector
+                    // to clean them up turns a successful container shutdown into
+                    // a spurious "no backend" refusal at `ast rm`.
+                    if inst.runtime == RuntimeKind::Vm {
+                        if let Err(e) = backend::for_instance(&inst)
+                            .and_then(|hv| hv.remove_instance_resources(&inst))
+                        {
+                            return attach_response(Err(e).context(
+                                "instance removal refused until backend cleanup completes",
+                            ));
+                        }
+                    }
+                    // The instance directory goes below, and this instance's CA
+                    // private key is in it.
+                    egress::stop(&inst.name);
+                    // A removed instance has no declaration left to recover, so
+                    // its host ports go back to the device unconditionally.
+                    publish::retire(&inst.name);
+                }
+                reg.remove(&name).inspect(|inst| {
+                    persist::forget(&inst.name);
+                    crate::readiness::forget(&inst.name);
+                    let _ = std::fs::remove_dir_all(paths::instance_dir(&inst.name));
+                })
+            }
+            // The instance's directory is named after the instance, so the rename
+            // is not done until the bytes have moved too.
+            Request::Rename { name, new_name } => reg.rename(&name, &new_name).inspect(|_| {
+                let (from, to) = (paths::instance_dir(&name), paths::instance_dir(&new_name));
+                if from.exists() {
+                    // The rename is published like any other: the row committed
+                    // above names the new directory, so a crash between the two
+                    // with the rename still in the page cache would leave a row
+                    // pointing at a directory that is not there.
+                    if let Err(e) = durable::publish_rename(&from, &to) {
+                        eprintln!(
+                            "astd: renaming {} to {}: {e:#}",
+                            from.display(),
+                            to.display()
+                        );
+                    }
+                }
+            }),
+            Request::MarkConflicted {
+                name,
+                other_cpu_device,
+            } => reg.mark_conflicted(&name, &other_cpu_device),
+            Request::AttachVolume {
+                name,
+                path,
+                host,
+                mount_point,
+                lifecycle,
+            } => {
+                let host = host.unwrap_or_else(local_host);
+                // Recording a volume the instance's backend could never show
+                // the guest would leave something that looks configured and is
+                // not, so the capability is checked before the registry moves.
+                reg.get(&name)
+                    .cloned()
+                    .and_then(|inst| match inst.runtime {
+                        RuntimeKind::Vm => backend::check_can_share(&inst),
+                        RuntimeKind::Container => Ok(()),
+                    })
+                    .and_then(|()| resolve_volume_path(&path, &host))
+                    .and_then(|path| {
+                        reg.attach_volume(&name, &path, &host, mount_point.as_deref(), lifecycle)
+                    })
+            }
+            // A block volume is taken, not merely recorded: the lease is asked
+            // for now, from the device that holds the bytes, so that "somebody
+            // else has it" is a refusal at attach time rather than a boot that
+            // fails later for reasons the user has to go and read about.
+            Request::AttachBlock {
+                name,
+                volume: vol,
+                device,
+                mount_point,
+            } => {
+                if reg
+                    .get(&name)
+                    .is_ok_and(|inst| inst.runtime == RuntimeKind::Container)
+                {
+                    return attach_response(Err(anyhow::anyhow!(
+                        "block volumes are not supported by the native container adapter"
+                    )));
+                }
+                let provider_id = match volume::provider_identity(&device).await {
+                    Ok(id) => id,
+                    Err(e) => return attach_response(Err(e)),
+                };
+                return attach_response(
+                    attach_block_owned(
+                        reg,
+                        &name,
+                        &vol,
+                        &device,
+                        &provider_id,
+                        false,
+                        mount_point.as_deref(),
+                    )
+                    .await,
+                );
+            }
+            // Catalog placement is deliberately a separate frame from the
+            // device-qualified legacy attach. It resolves every eligibility
+            // requirement before taking a lease or changing the instance row;
+            // the provider's lease remains the race-safe final fence.
+            Request::AttachStorage {
+                name,
+                volume: vol,
+                owner_device,
+                max_latency_ms,
+                mount_point,
+            } => {
+                if reg
+                    .get(&name)
+                    .is_ok_and(|inst| inst.runtime == RuntimeKind::Container)
+                {
+                    return attach_response(Err(anyhow::anyhow!(
+                        "block volumes are not supported by the native container adapter"
+                    )));
+                }
+                return attach_response(
+                    attach_storage(
+                        reg,
+                        &name,
+                        &vol,
+                        owner_device.as_deref(),
+                        max_latency_ms,
+                        mount_point.as_deref(),
+                    )
+                    .await,
+                );
+            }
+            Request::Detach {
+                name,
+                volume: vol,
+                host,
+            } => return attach_response(detach(reg, &name, &vol, host.as_deref()).await),
+            // A secret is taken, not merely recorded: the orbit is asked which
+            // devices hold it, and a source that cannot serve its current version
+            // is a refusal here rather than a guest that boots holding a handle
+            // nothing will ever honour.
+            Request::AttachSecret {
+                name,
+                secret,
+                authority,
+                placement,
+                env,
+                source_device,
+            } => {
+                attach_secret(
+                    reg,
+                    &name,
+                    &secret,
+                    &authority,
+                    placement,
+                    env,
+                    source_device.as_deref(),
+                )
+                .await
+            }
+            // A credential part is several bindings, and they are made together
+            // or not at all: a `gh` that reached `api.github.com` but not
+            // `codeload.github.com` because the second attach failed would be a
+            // guest whose `gh` works until it clones.
+            Request::AttachCredential {
+                name,
+                credential,
+                source_device,
+            } => attach_credential(reg, &name, &credential, source_device.as_deref()).await,
+            Request::DetachSecret { name, secret } => detach_secret(reg, &name, &secret),
+            Request::BackupExport { name, destination } => {
+                let exported = reg.get(&name).cloned().and_then(|inst| {
+                    let provenance = backup::image_provenance(&inst)?;
+                    backup::export(
+                        &inst,
+                        &paths::instance_dir(&name),
+                        Path::new(&destination),
+                        provenance,
+                    )
+                });
+                return match exported {
+                    Ok(report) => Response::BackupExported { report },
+                    Err(e) => Response::Error {
+                        message: format!("{e:#}"),
+                    },
+                };
+            }
+            Request::BackupImport { source, name } => {
+                return tokio::task::block_in_place(|| {
+                    restore_backup(reg, Path::new(&source), &name, cpu_device, None, false)
+                });
+            }
+            Request::BackupImportV2 {
+                source,
+                name,
+                backend,
+                rematerialize_oci,
+            } => {
+                return tokio::task::block_in_place(|| {
+                    restore_backup(
+                        reg,
+                        Path::new(&source),
+                        &name,
+                        cpu_device,
+                        backend.as_deref(),
+                        rematerialize_oci,
+                    )
+                });
+            }
+            // A file on this device's disk, read here rather than by the CLI, so
+            // that the answer is the same whoever asked and from wherever.
+            Request::Logs { name, lines } => {
+                return match reg.get(&name).map(|i| i.name.clone()) {
+                    Ok(name) => match console_tail(&name, lines) {
+                        Ok((text, truncated)) => Response::Log { text, truncated },
+                        Err(e) => Response::Error {
+                            message: format!("{e:#}"),
+                        },
+                    },
+                    Err(e) => Response::Error {
+                        message: format!("{e:#}"),
+                    },
+                }
+            }
+            Request::ContainerExec { .. } => {
+                return Response::Error {
+                    message: "container exec reached the shard-locked dispatcher".into(),
+                };
+            }
+            _ => return not_a_shard_request(),
+        };
     match mutation {
         Ok(instance) => {
             if let Err(e) = reg.save() {
@@ -458,6 +464,7 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             Response::Instance {
                 instance,
                 guest_health: None,
+                readiness: None,
             }
         }
         Err(e) => Response::Error {
@@ -592,6 +599,7 @@ fn attach_response(result: Result<Instance>) -> Response {
         Ok(instance) => Response::Instance {
             instance,
             guest_health: None,
+            readiness: None,
         },
         Err(e) => Response::Error {
             message: format!("{e:#}"),
@@ -608,9 +616,17 @@ fn status_response(instance: Instance) -> Response {
         .as_ref()
         .and_then(guest_health)
         .map(Box::new);
+    // Probed here rather than inferred from the health above, and that is the
+    // whole of the AST-162 fix: what the guest says about its own sshd and
+    // what this host can reach are two different claims, and only the second
+    // one is what `ast ssh` and `ast exec` will do next.
+    let readiness = Box::new(tokio::task::block_in_place(|| {
+        crate::readiness::probe(&instance)
+    }));
     Response::Instance {
         instance,
         guest_health,
+        readiness: Some(readiness),
     }
 }
 
@@ -1122,10 +1138,8 @@ pub(crate) fn up(
 
 fn up_guest(reg: &mut Shard, name: &str, restart: Option<Restart>) -> Result<Instance> {
     let inst = reg.get(name)?.clone();
-    if let Some(intent) = &inst.boot_intent_id {
-        anyhow::bail!(
-            "instance {name:?} has unresolved boot intent {intent}; refusing a second guest"
-        );
+    if inst.boot_intent_id.is_some() {
+        anyhow::bail!("{}", asterism_core::instance::fenced_boot_sentence(name));
     }
     if inst.status == Status::Running {
         anyhow::bail!("instance {name:?} is already running");
@@ -1196,7 +1210,7 @@ fn up_guest(reg: &mut Shard, name: &str, restart: Option<Restart>) -> Result<Ins
     }) {
         Ok(raised) => raised,
         Err(error) => {
-            compensate_boot(reg, &inst, &boot_intent_id)
+            compensate_boot(reg, &inst, &boot_intent_id, &error)
                 .with_context(|| format!("raising storage for the guest failed ({error:#})"))?;
             return Err(error);
         }
@@ -1221,7 +1235,7 @@ fn up_guest(reg: &mut Shard, name: &str, restart: Option<Restart>) -> Result<Ins
         let durable = match Shard::load(&paths::state_path()) {
             Ok(durable) => durable,
             Err(reload) => {
-                compensate_boot(reg, &inst, &boot_intent_id).with_context(|| {
+                compensate_boot(reg, &inst, &boot_intent_id, &first).with_context(|| {
                     format!(
                         "renewed storage epochs failed to commit and the shard failed to reload ({first:#}; {reload:#})"
                     )
@@ -1231,14 +1245,14 @@ fn up_guest(reg: &mut Shard, name: &str, restart: Option<Restart>) -> Result<Ins
         };
         if !boot_epochs_match(&durable, name, &boot_intent_id, &raised.leases) {
             *reg = durable;
-            compensate_boot(reg, &inst, &boot_intent_id).with_context(|| {
+            compensate_boot(reg, &inst, &boot_intent_id, &first).with_context(|| {
                 format!("renewed storage epochs were not durably committed ({first:#})")
             })?;
             return Err(first).context("committing renewed storage epochs before guest launch");
         }
         if let Err(confirm) = durable.save_confirmed() {
             *reg = durable;
-            compensate_boot(reg, &inst, &boot_intent_id).with_context(|| {
+            compensate_boot(reg, &inst, &boot_intent_id, &confirm).with_context(|| {
                 format!("confirming renewed storage epochs failed ({confirm:#})")
             })?;
             return Err(confirm).context("confirming renewed storage epochs before guest launch");
@@ -1259,7 +1273,7 @@ fn up_guest(reg: &mut Shard, name: &str, restart: Option<Restart>) -> Result<Ins
     }) {
         Ok(prepared) => prepared,
         Err(error) => {
-            compensate_boot(reg, &boot_inst, &boot_intent_id)
+            compensate_boot(reg, &boot_inst, &boot_intent_id, &error)
                 .with_context(|| format!("preparing the backend launch failed ({error:#})"))?;
             return Err(error);
         }
@@ -1267,7 +1281,7 @@ fn up_guest(reg: &mut Shard, name: &str, restart: Option<Restart>) -> Result<Ins
     let handle = match tokio::task::block_in_place(|| hv.boot(&req, &prep)) {
         Ok(handle) => handle,
         Err(error) if backend::boot_failure_is_proven_stopped(&error) => {
-            compensate_boot(reg, &boot_inst, &boot_intent_id).with_context(|| {
+            compensate_boot(reg, &boot_inst, &boot_intent_id, &error).with_context(|| {
                 format!("backend launch failed after the guest was proven stopped ({error:#})")
             })?;
             return Err(error).context(
@@ -1279,11 +1293,13 @@ fn up_guest(reg: &mut Shard, name: &str, restart: Option<Restart>) -> Result<Ins
             // QEMU may daemonize successfully and then leave no readable
             // pidfile; VZ may spawn a helper and then fail to capture its
             // identity or endpoint. With no exact Handle there is nothing we
-            // can safely signal or use to prove death, so releasing leases or
-            // publishing stopped authority here could admit a second guest.
-            return Err(error).context(format!(
-                "backend launch outcome is ambiguous; durable boot intent {boot_intent_id} remains fenced"
-            ));
+            // can signal, so the fence stays up unless the backend can prove
+            // from its own pre-spawn records that nothing is there.
+            //
+            // Asking is the AST-161 fix. The fence is right and stays right;
+            // what was wrong was never asking again, which left a row that
+            // refused `down` for not running and `rm` for running.
+            return Err(resolve_lost_launch(reg, &boot_inst, &boot_intent_id, error));
         }
     };
 
@@ -1301,7 +1317,7 @@ fn up_guest(reg: &mut Shard, name: &str, restart: Option<Restart>) -> Result<Ins
                         "committing the running guest handle; the shard also failed to reload ({reload:#}) and shutdown is not proven: {stop:#}"
                     ));
                 }
-                compensate_boot(reg, &boot_inst, &boot_intent_id).with_context(|| {
+                compensate_boot(reg, &boot_inst, &boot_intent_id, &first).with_context(|| {
                     format!(
                         "the uncommitted guest was stopped, but the shard failed to reload ({reload:#})"
                     )
@@ -1330,13 +1346,62 @@ fn up_guest(reg: &mut Shard, name: &str, restart: Option<Restart>) -> Result<Ins
             ));
         }
         *reg = durable;
-        compensate_boot(reg, &boot_inst, &boot_intent_id).with_context(|| {
+        compensate_boot(reg, &boot_inst, &boot_intent_id, &first).with_context(|| {
             format!("the uncommitted guest was stopped after registry failure ({first:#})")
         })?;
         return Err(first).context("committing the running guest handle; guest was stopped");
     }
     *reg = running;
     Ok(answer)
+}
+
+/// Decide what a launch that returned no handle leaves behind.
+///
+/// One question, asked of the backend that made the attempt: is a VMM it may
+/// have created still there? The three answers are three different rows.
+///
+/// * **Gone** — proven, from a record the backend committed before it ever
+///   spawned. The launch is resolved: leases compensated, fence released, and
+///   the outcome *recorded* as `stopped (boot failed: ...)` rather than
+///   silently cleared, so `ast status` can still say why.
+/// * **Alive** or **Unknown** — the fence stays exactly where it is, and the
+///   error names the one command that can lower it and what that command will
+///   do first.
+fn resolve_lost_launch(
+    reg: &mut Shard,
+    inst: &Instance,
+    boot_intent_id: &str,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    let name = inst.name.as_str();
+    let presence = match backend::for_instance(inst) {
+        Ok(hv) => tokio::task::block_in_place(|| hv.vmm_presence(inst)),
+        Err(why) => VmmPresence::Unknown(format!("{why:#}")),
+    };
+    match presence {
+        VmmPresence::Gone => match compensate_boot(reg, inst, boot_intent_id, &error) {
+            Ok(()) => error.context(format!(
+                "no VMM for {name:?} was left running, so it is recorded stopped (boot failed)"
+            )),
+            Err(cleanup) => cleanup.context(format!(
+                "the failed launch of {name:?} left no VMM, but resolving its boot fence failed ({error:#})"
+            )),
+        },
+        VmmPresence::Alive(what) => error.context(format!(
+            "{what}, so the durable boot fence on {name:?} stays up. {}",
+            asterism_core::instance::fenced_boot_sentence(name)
+        )),
+        VmmPresence::Unknown(why) => error.context(format!(
+            "the backend could not prove the launch left nothing running ({why}). {}",
+            asterism_core::instance::fenced_boot_sentence(name)
+        )),
+    }
+}
+
+/// A backend's account of a failure, flattened to the one line a status page
+/// can hold.
+fn one_line(error: &anyhow::Error) -> String {
+    format!("{error:#}").replace('\n', " ")
 }
 
 fn boot_epochs_match(reg: &Shard, name: &str, intent_id: &str, leases: &[volume::Leased]) -> bool {
@@ -1353,18 +1418,37 @@ fn boot_epochs_match(reg: &Shard, name: &str, intent_id: &str, leases: &[volume:
     })
 }
 
-fn compensate_boot(reg: &mut Shard, instance: &Instance, boot_intent_id: &str) -> Result<()> {
+/// Undo a launch that produced no running guest, and say what it was.
+///
+/// One call resolves all three: the leases this boot renewed go back, the
+/// durable fence comes down, and the row that replaces it records *why* it is
+/// stopped. The third is the AST-161 half. A fence cleared silently leaves a
+/// row indistinguishable from a deliberate `ast down`, and the user who typed
+/// `ast up` and watched it fail then has nowhere to read the reason.
+fn compensate_boot(
+    reg: &mut Shard,
+    instance: &Instance,
+    boot_intent_id: &str,
+    why: &anyhow::Error,
+) -> Result<()> {
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current()
             .block_on(volume::compensate_boot_leases(instance, boot_intent_id))
     })?;
     let mut durable = Shard::load(&paths::state_path())?;
-    durable.clear_boot(&instance.name, boot_intent_id)?;
-    durable.set_stopped(&instance.name)?;
+    durable.resolve_failed_boot(
+        &instance.name,
+        boot_intent_id,
+        &format!("boot failed: {}", one_line(why)),
+    )?;
     durable
         .save_confirmed()
         .context("clearing the compensated guest-launch fence")?;
     *reg = durable;
+    // Whatever this launch had already bound goes back to the device, exactly
+    // as a clean `down` would return it.
+    persist::forget(&instance.name);
+    publish::retire(&instance.name);
     Ok(())
 }
 
@@ -1392,7 +1476,7 @@ fn up_container(reg: &mut Shard, inst: &Instance, boot_intent_id: &str) -> Resul
     let prepared = match crate::container::prepare(inst) {
         Ok(prepared) => prepared,
         Err(error) => {
-            compensate_boot(reg, inst, boot_intent_id)
+            compensate_boot(reg, inst, boot_intent_id, &error)
                 .with_context(|| format!("preparing the native container failed ({error:#})"))?;
             return Err(error);
         }
@@ -1408,7 +1492,7 @@ fn up_container(reg: &mut Shard, inst: &Instance, boot_intent_id: &str) -> Resul
                 "committing the running container handle; shutdown is not proven and the durable launch fence remains: {stop:#}"
             ));
         }
-        compensate_boot(reg, inst, boot_intent_id)?;
+        compensate_boot(reg, inst, boot_intent_id, &error)?;
         return Err(error)
             .context("committing the running container handle; container was stopped");
     }
@@ -1423,8 +1507,16 @@ fn up_container(reg: &mut Shard, inst: &Instance, boot_intent_id: &str) -> Resul
 /// path that stopped the guest without them left the daemon holding its
 /// published host port — so the boot that followed refused its own
 /// declaration as taken. `ast down` and `ast rewind` are both that path now.
-pub(crate) async fn down_completely(reg: &mut Shard, name: &str) -> Result<Instance> {
-    let stopped = down(reg, name)?;
+pub(crate) async fn down_completely(reg: &mut Shard, name: &str, force: bool) -> Result<Instance> {
+    let stopped = match reg.get(name)?.boot_intent_id.clone() {
+        // The way out of AST-161 when evidence cannot supply one. The user
+        // has been told what this does and has said to do it: kill whatever
+        // the backend can still find, then release the fence and record the
+        // instance stopped, with the reason kept so `ast status` still says
+        // this was a boot that failed rather than a stop somebody chose.
+        Some(intent) => resolve_fence(reg, name, &intent, force)?,
+        None => down(reg, name)?,
+    };
     volume::take_down(name).await;
     // The port is remembered, so the next boot puts it back where the seed
     // already says it is.
@@ -1434,6 +1526,44 @@ pub(crate) async fn down_completely(reg: &mut Shard, name: &str) -> Result<Insta
     // declaration is what puts it back on `up`.
     publish::retire(name);
     Ok(stopped)
+}
+
+/// `ast down` on an instance whose launch fence is still up.
+///
+/// Asked again, here, rather than only at the moment the launch failed: a
+/// fence can also survive a daemon that died inside the boot window, and then
+/// nothing ever went back to look. So the backend is asked now, and a fence it
+/// can prove nothing behind comes down whether or not `--force` was typed —
+/// which is what makes `ast down` the ordinary way out of AST-161.
+///
+/// `--force` buys exactly one thing: the right to release a fence whose
+/// outcome *cannot* be proven, because at that point the user has looked and
+/// this daemon has run out of ways to. It buys nothing against a VMM that is
+/// demonstrably there; that one is running, not stuck, and no flag turns a
+/// process this daemon holds no handle for into one it may retire.
+fn resolve_fence(reg: &mut Shard, name: &str, intent: &str, force: bool) -> Result<Instance> {
+    let inst = reg.get(name)?.clone();
+    let presence = match backend::for_instance(&inst) {
+        Ok(hv) => tokio::task::block_in_place(|| hv.vmm_presence(&inst)),
+        Err(why) => VmmPresence::Unknown(format!("{why:#}")),
+    };
+    let why = match presence {
+        VmmPresence::Gone => "the launch left no VMM running".to_owned(),
+        VmmPresence::Alive(what) => anyhow::bail!(
+            "{name:?}'s launch left a VMM that is still running: {what}. It is running, \
+             not stuck, and this daemon never got a handle for it — stop that process \
+             yourself, then: ast down --force {name}"
+        ),
+        VmmPresence::Unknown(_) if !force => {
+            anyhow::bail!("{}", asterism_core::instance::fenced_boot_sentence(name))
+        }
+        VmmPresence::Unknown(why) => format!(
+            "the launch outcome was never proven ({why}); the fence was released by \
+             `ast down --force`"
+        ),
+    };
+    compensate_boot(reg, &inst, intent, &anyhow::anyhow!("{why}"))?;
+    Ok(reg.get(name)?.clone())
 }
 
 fn down(reg: &mut Shard, name: &str) -> Result<Instance> {
@@ -2543,6 +2673,91 @@ mod tests {
 
         let persisted = ReleaseIntents::load(&path).unwrap();
         assert!(persisted.contains(&second), "mesh release intent was lost");
+    }
+
+    /// A machine no backend on this device answers for. Every path through
+    /// it reaches the "cannot be proven" branch, which is the branch that has
+    /// to leave a fence exactly where it found it.
+    fn unprovable_machine() -> asterism_core::hv::Machine {
+        asterism_core::hv::Machine {
+            backend: "no-such-backend".into(),
+            machine_type: "virt".into(),
+            cpu: "host".into(),
+            hv_version: "test".into(),
+        }
+    }
+
+    fn fenced(dir: &std::path::Path, name: &str) -> (Shard, String) {
+        let mut reg = Shard::load(&dir.join("state.json")).unwrap();
+        reg.create(
+            name,
+            "laptop",
+            "debian:13",
+            asterism_core::instance::Shape::default(),
+            unprovable_machine(),
+        )
+        .unwrap();
+        let (_, intent) = reg.begin_boot(name).unwrap();
+        (reg, intent)
+    }
+
+    /// AST-161, the half that must not change: a launch whose outcome cannot
+    /// be proven keeps its fence. What changes is that the refusal now names
+    /// the command that ends it, in the same words `ast rm` uses.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lost_launch_nobody_can_prove_keeps_its_fence_and_says_how_to_end_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut reg, intent) = fenced(dir.path(), "unprovable");
+        let inst = reg.get("unprovable").unwrap().clone();
+
+        let reported = format!(
+            "{:#}",
+            resolve_lost_launch(
+                &mut reg,
+                &inst,
+                &intent,
+                anyhow::anyhow!("the helper never answered"),
+            )
+        );
+        assert!(reported.contains("the helper never answered"), "{reported}");
+        assert!(
+            asterism_core::instance::is_fenced_boot_refusal(&reported),
+            "{reported}"
+        );
+
+        // Untouched: the fence is the point.
+        let preserved = reg.get("unprovable").unwrap();
+        assert_eq!(preserved.status, Status::Running);
+        assert_eq!(preserved.boot_intent_id.as_deref(), Some(intent.as_str()));
+        assert!(preserved.boot_failure.is_none());
+
+        // And `ast down` on it says the same sentence rather than the old
+        // "not running", which is what left the user with nothing to type.
+        let refused = format!(
+            "{:#}",
+            down_completely(&mut reg, "unprovable", false)
+                .await
+                .unwrap_err()
+        );
+        assert_eq!(
+            refused,
+            asterism_core::instance::fenced_boot_sentence("unprovable")
+        );
+        assert!(reg.get("unprovable").unwrap().boot_intent_id.is_some());
+    }
+
+    /// `ast up` on a fenced instance used to say only that something else was
+    /// booting it. It refuses for the same reason as before and now hands the
+    /// user the same way out as `down` and `rm`.
+    #[test]
+    fn up_on_a_fenced_instance_refuses_with_the_one_sentence() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut reg, _) = fenced(dir.path(), "fenced-up");
+        let error = format!("{:#}", up_guest(&mut reg, "fenced-up", None).unwrap_err());
+        assert_eq!(
+            error,
+            asterism_core::instance::fenced_boot_sentence("fenced-up")
+        );
     }
 
     /// The normal dead-handle reconciliation path must not turn the missing

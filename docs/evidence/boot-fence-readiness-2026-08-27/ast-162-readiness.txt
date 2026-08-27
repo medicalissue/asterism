@@ -1,0 +1,91 @@
+
+$ ast create dev --backend vz
+resolved
+downloaded
+verified
+stored (618370560 bytes)
+dev  defined
+
+$ ast up dev
+dev  running
+guest booting; ssh on 192.168.64.44:22 — try: ast ssh dev
+
+$ a guest that really is reachable
+
+$ ast status dev
+name:    dev
+id:      257e3a08-4f59-4c0b-8cb7-b7509047fbc2
+status:  running
+restart: always (up to 3 tries after a crash)
+age:     1m
+disk:    raw, 1.84 GiB of 20 GiB used
+machine: vz 26.5.2 (generic, cpu host)
+running: vz pid 92435, ssh 192.168.64.44:22
+control: /private/tmp/ast-ready/instances/dev/vz.sock
+ready:   yes (ssh banner from 192.168.64.44:22)
+guest:   192.168.64.44, fe80::5054:ff:fe61:fffc · up 6s · guest says sshd listening · cloud-init running
+health:  load 0.08 · memory 1682 MiB available
+
+parts:
+  compute  macbook-pro.tail0de304.ts.net  2 cores · 2048 MiB
+  disk     macbook-pro.tail0de304.ts.net  20 GiB · ubuntu:24.04  (follows compute)
+  network  macbook-pro.tail0de304.ts.net  private guest network  (exit default: same as compute)
+  gpu      -                              none
+
+$ ast ssh dev -- uname -a
+Linux dev 6.8.0-137-generic #137-Ubuntu SMP PREEMPT_DYNAMIC Fri Jul 17 19:15:13 UTC 2026 aarch64 aarch64 aarch64 GNU/Linux
+
+$ now stop sshd and leave something else holding port 22
+
+$ ast ssh dev -- sudo sh -c "systemctl stop ssh.socket ssh.service; setsid python3 -m http.server 22 --bind 0.0.0.0 >/dev/null 2>&1 </dev/null & sleep 2; ss -ltnp | head"
+State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess                                   
+LISTEN 0      4096      127.0.0.54:53        0.0.0.0:*    users:(("systemd-resolve",pid=438,fd=17))
+LISTEN 0      4096   127.0.0.53%lo:53        0.0.0.0:*    users:(("systemd-resolve",pid=438,fd=15))
+LISTEN 0      5            0.0.0.0:22        0.0.0.0:*    users:(("python3",pid=1279,fd=3))        
+
+$ --- before: the guest's own report, printed as if it were reachability
+
+$ ast-before status dev
+name:    dev
+id:      257e3a08-4f59-4c0b-8cb7-b7509047fbc2
+status:  running
+restart: always (up to 3 tries after a crash)
+age:     1m
+disk:    raw, 1.86 GiB of 20 GiB used
+machine: vz 26.5.2 (generic, cpu host)
+running: vz pid 92435, ssh 192.168.64.44:22
+control: /private/tmp/ast-ready/instances/dev/vz.sock
+guest:   192.168.64.44, fd1a:100e:7f39:18d4:5054:ff:fe61:fffc · up 11s · ssh listening · cloud-init done
+health:  load 0.23 · memory 1626 MiB available
+
+parts:
+  compute  macbook-pro.tail0de304.ts.net  2 cores · 2048 MiB
+  disk     macbook-pro.tail0de304.ts.net  20 GiB · ubuntu:24.04  (follows compute)
+  network  macbook-pro.tail0de304.ts.net  private guest network  (exit default: same as compute)
+  gpu      -                              none
+
+$ --- after: what this host can actually reach
+
+$ ast status dev
+name:    dev
+id:      257e3a08-4f59-4c0b-8cb7-b7509047fbc2
+status:  running
+restart: always (up to 3 tries after a crash)
+age:     1m
+disk:    raw, 1.86 GiB of 20 GiB used
+machine: vz 26.5.2 (generic, cpu host)
+running: vz pid 92435, ssh 192.168.64.44:22
+control: /private/tmp/ast-ready/instances/dev/vz.sock
+ready:   no — 192.168.64.44:22 accepts connections but sent no ssh banner within 600ms (last reachable 5s ago)
+guest:   192.168.64.44, fd1a:100e:7f39:18d4:5054:ff:fe61:fffc · up 11s · guest says sshd listening · cloud-init done
+health:  load 0.23 · memory 1626 MiB available
+
+parts:
+  compute  macbook-pro.tail0de304.ts.net  2 cores · 2048 MiB
+  disk     macbook-pro.tail0de304.ts.net  20 GiB · ubuntu:24.04  (follows compute)
+  network  macbook-pro.tail0de304.ts.net  private guest network  (exit default: same as compute)
+  gpu      -                              none
+
+$ ast ls
+NAME           STATUS    IMAGE          SHAPE            COMPUTE      AGE    TODAY    ACCESS
+dev            running   ubuntu:24.04   2c/2048M/20G     macbook-pro.tail0de304.ts.net 1m     -        192.168.64.44:22

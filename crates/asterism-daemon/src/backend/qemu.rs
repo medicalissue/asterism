@@ -44,8 +44,9 @@ use anyhow::{bail, Context, Result};
 use asterism_core::hv::{
     BootReq, Caps, ControlChannel, DirectKernel, DiskFormat, DiskSpec, Firmware, GuestEgress,
     GuestEndpoint, Handle, Hypervisor, ImageKind, Prepared, Ready, RunState, ShareKind, SnapshotId,
+    VmmPresence,
 };
-use asterism_core::instance::{now_unix, PortForward, PortProtocol};
+use asterism_core::instance::{now_unix, Instance, PortForward, PortProtocol};
 use asterism_core::proc::{ProcId, Signal};
 use asterism_core::snapshot::{self, Snapshot};
 use asterism_core::tools::{output, run, tool};
@@ -617,6 +618,25 @@ impl Hypervisor for Qemu {
         qmp::forget(h.ctl.path());
         proc.signal(Signal::Kill)?;
         Ok(())
+    }
+
+    /// QEMU's pidfile is the record a lost launch is checked against. It is
+    /// removed before the spawn and written by qemu itself, so its absence
+    /// is the launch never having got that far — and its contents are only
+    /// believed through the same instance-exclusive evidence every other
+    /// adoption in this daemon rests on.
+    fn vmm_presence(&self, inst: &Instance) -> VmmPresence {
+        let pidfile = paths::instance_dir(&inst.name).join("qemu.pid");
+        let Ok(text) = std::fs::read_to_string(&pidfile) else {
+            return VmmPresence::Gone;
+        };
+        let Ok(pid) = text.trim().parse::<u32>() else {
+            return VmmPresence::Unknown(format!(
+                "{} does not hold a pid, so a qemu for this instance cannot be ruled out",
+                pidfile.display()
+            ));
+        };
+        super::recorded_pid_presence(pid, "qemu", super::QEMU_EXECS, &[pidfile.as_path()])
     }
 
     fn state(&self, h: &Handle) -> Result<RunState> {

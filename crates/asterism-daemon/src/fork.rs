@@ -823,7 +823,7 @@ async fn pick(reg: &mut Shard, name: &str, apply: bool, cpu_device: &str) -> Res
     if was_running {
         // The whole stop, for the reason a rewind does it: a directory
         // replaced under a live guest is a directory the guest has cached.
-        crate::instance::down_completely(reg, &parent.name)
+        crate::instance::down_completely(reg, &parent.name, false)
             .await
             .with_context(|| format!("stopping {} to replace its {}", parent.name, plan.path))?;
     }
@@ -874,7 +874,7 @@ async fn pick(reg: &mut Shard, name: &str, apply: bool, cpu_device: &str) -> Res
 /// how to give all of those back is [`crate::instance::serve`].
 async fn retire(reg: &mut Shard, name: &str, cpu_device: &str) -> Result<()> {
     if reg.get(name)?.status == Status::Running {
-        crate::instance::down_completely(reg, name).await?;
+        crate::instance::down_completely(reg, name, false).await?;
     }
     match crate::instance::serve(
         Request::Remove {

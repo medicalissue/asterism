@@ -78,6 +78,7 @@ mod open;
 mod orbit;
 mod persist;
 mod publish;
+mod readiness;
 mod relay_meter;
 mod resolve;
 mod rewind;

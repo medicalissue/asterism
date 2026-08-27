@@ -1,0 +1,39 @@
+ast 0.0.2
+
+$ ast create bot --backend vz --image docker.io/library/nginx:alpine
+resolved
+kernel
+layers
+stored (356515840 bytes)
+bot  defined
+
+$ ast up bot
+error: backend launch outcome is ambiguous; durable boot intent 0b53ab58-5ffb-4a3e-89bc-ee76ad8edb94 remains fenced: finding the packaged Linux OCI guest-control agent: No such file or directory (os error 2)
+
+$ ast status bot
+name:    bot
+id:      9163f19b-06b1-4162-a2c5-a5cc04d76bae
+status:  running
+restart: never
+age:     0s
+disk:    raw, 77.31 MiB of 20 GiB used
+machine: vz 26.5.2 (generic, cpu host)
+
+parts:
+  compute  macbook-pro.tail0de304.ts.net  2 cores · 2048 MiB
+  disk     macbook-pro.tail0de304.ts.net  20 GiB · docker.io/library/nginx:alpine  (follows compute · oci rootfs, direct kernel boot)
+  network  macbook-pro.tail0de304.ts.net  private guest network  (exit default: same as compute)
+  gpu      -                              none
+
+$ ast ls
+NAME           STATUS    IMAGE          SHAPE            COMPUTE      AGE    TODAY    ACCESS
+bot            running   nginx:alpine   2c/2048M/20G     macbook-pro.tail0de304.ts.net 0s     -        -
+
+$ ast down bot
+error: instance "bot" is not running
+
+$ ast rm bot
+error: instance "bot" is running — `ast down bot` first
+
+$ ast up bot
+error: instance "bot" has unresolved boot intent 0b53ab58-5ffb-4a3e-89bc-ee76ad8edb94; refusing a second guest

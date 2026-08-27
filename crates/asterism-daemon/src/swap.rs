@@ -842,6 +842,7 @@ pub fn commit_target(
         Ok(instance) => Response::Instance {
             instance,
             guest_health: None,
+            readiness: None,
         },
         Err(e) => error(e),
     }
@@ -1020,6 +1021,7 @@ pub async fn run(
                 &source,
                 Request::Down {
                     name: name.to_owned(),
+                    force: false,
                 },
                 node,
                 mesh,
