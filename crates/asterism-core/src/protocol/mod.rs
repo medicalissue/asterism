@@ -1917,6 +1917,12 @@ mod tests {
         assert_eq!(table.get("container_exec"), Some(&8));
         assert_eq!(table.get("exec"), Some(&9));
         assert_eq!(
+            table.get("device_bench"),
+            Some(&13),
+            "a peer that predates the bench frame answers it with serde's \
+             unknown-variant error instead of a refusal naming the frame"
+        );
+        assert_eq!(
             table.get("device-shell"),
             Some(&4),
             "a protocol-3 backup daemon cannot parse device-shell variants"

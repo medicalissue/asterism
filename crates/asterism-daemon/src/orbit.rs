@@ -244,6 +244,10 @@ mod tests {
             Request::DevicePing {
                 device: "desktop".into(),
             },
+            Request::DeviceBench {
+                device: "desktop".into(),
+                bytes: 1 << 20,
+            },
             Request::DeviceRemove {
                 name: "desktop".into(),
             },
