@@ -161,6 +161,27 @@ fn default_backend_ids() -> &'static [&'static str] {
     }
 }
 
+/// How to get QEMU on this host, in the words of its package manager.
+///
+/// One sentence, in one place, because every refusal that turns on QEMU being
+/// absent has to end on the same words. No install lane declares QEMU — the
+/// Homebrew formula has no `depends_on "qemu"`, the release tarball carries
+/// none, and qcow2-to-raw materialisation is pure Rust — so a device without
+/// QEMU is the ordinary state of a device, not a broken one, and a refusal
+/// that names the backend without naming the opt-in is a dead end.
+///
+/// Host-neutral and outside `#[cfg(unix)]` so refusals raised where the QEMU
+/// backend does not exist can still say it.
+pub(crate) const fn qemu_install_hint() -> &'static str {
+    if cfg!(target_os = "macos") {
+        // macOS's product backend is VZ behind the signed `astd-vz` helper.
+        // `brew install qemu` is the whole of the opt-in.
+        "install the optional compatibility backend with `brew install qemu`"
+    } else {
+        "install the optional QEMU system package and qemu-img/qemu-utils"
+    }
+}
+
 /// A backend by its stable id, or the list of the ones that exist.
 pub fn by_id(id: &str) -> Result<Arc<dyn Hypervisor>> {
     if let Some(backend) = backends().iter().find(|backend| backend.id() == id) {
@@ -354,14 +375,19 @@ pub fn check_can_share(inst: &Instance) -> Result<()> {
     // turn a backend whose contract has no share transport into permission
     // to persist a part that can never reach the guest.
     if hv.caps().shared_dir.is_none() {
+        // The hint comes last because QEMU is not installed by any lane: on a
+        // machine that never asked for it, "recreate with --backend qemu" is
+        // an instruction the user cannot follow until they have installed it.
         bail!(
             "the {} backend on this device cannot share host directories, so a \
              volume attached to {:?} could never reach the guest — the backend is \
              fixed at create time, so destroy and recreate it with `ast create {:?} \
-             --backend qemu` (qemu has 9p support)",
+             --backend qemu` (qemu has 9p support; it is the optional \
+             compatibility backend, so if it is not on this device, {})",
             hv.id(),
             inst.name,
-            inst.name
+            inst.name,
+            qemu_install_hint(),
         );
     }
     Ok(())
@@ -1599,6 +1625,84 @@ mod tests {
         assert!(
             error.contains("qemu") && error.contains("qemu missing"),
             "{error}"
+        );
+    }
+
+    /// AST-97: a Mac with no QEMU is the shipped state of a Mac. Nothing in
+    /// the install path puts QEMU there, so this is the host every Homebrew
+    /// user has, and it has to behave in two ways at once — ordinary creates
+    /// are unaffected, and the one create that genuinely needs QEMU is refused
+    /// in words that name the opt-in rather than falling somewhere else.
+    ///
+    /// Host-neutral: the backends and their absence are injected, so this
+    /// proves the contract on a developer Mac that does have QEMU installed.
+    #[test]
+    fn a_mac_without_qemu_keeps_vz_and_refuses_a_publish_with_the_install_command() {
+        // VZ as it really is: raw disks, no loopback publication door.
+        // QEMU as it really is on a machine nobody installed it on — its
+        // probe fails, and the failure ends on the install command.
+        let absent = qemu_install_hint();
+        let mac = || {
+            host(
+                fake("vz", None, false, false),
+                fake("qemu", Some(absent), true, true),
+            )
+        };
+
+        let disk = image(ImageKind::Disk);
+        let selected = select_with(None, CreateRequirements::new(&disk, &[]), mac()).unwrap();
+        assert_eq!(
+            selected.backend, "vz",
+            "an ordinary create is VZ's, and a missing QEMU is not its problem"
+        );
+
+        let port = [PortForward {
+            host: 8080,
+            guest: 80,
+            protocol: asterism_core::instance::PortProtocol::Tcp,
+        }];
+        let error = format!(
+            "{:#}",
+            select_with(None, CreateRequirements::new(&disk, &port), mac())
+                .expect_err("-p needs a door VZ does not have and QEMU is not installed")
+        );
+        assert!(
+            error.contains("vz") && error.contains("-p"),
+            "the refusal has to say why the product backend could not take it: {error}"
+        );
+        assert!(
+            error.contains(absent),
+            "a refusal that needs QEMU must name the opt-in install: {error}"
+        );
+
+        // Asking for QEMU by name is the same refusal, not a silent
+        // substitution back onto VZ.
+        let error = format!(
+            "{:#}",
+            select_with(Some("qemu"), CreateRequirements::new(&disk, &port), mac())
+                .expect_err("an explicitly requested absent backend is a refusal")
+        );
+        assert!(error.contains(absent), "{error}");
+        assert!(
+            !error.contains("vz"),
+            "an explicit --backend qemu never reports a VZ selection: {error}"
+        );
+    }
+
+    /// The opt-in sentence is the same one the formula caveat, the install
+    /// script and README carry, and on macOS it is a Homebrew command
+    /// because Homebrew is the distributor of record there.
+    #[test]
+    fn the_qemu_opt_in_names_this_host_package_manager() {
+        let hint = qemu_install_hint();
+        if cfg!(target_os = "macos") {
+            assert!(hint.contains("brew install qemu"), "{hint}");
+        } else {
+            assert!(hint.contains("qemu-img"), "{hint}");
+        }
+        assert!(
+            hint.contains("optional"),
+            "QEMU is not a dependency and the words must not imply it is: {hint}"
         );
     }
 

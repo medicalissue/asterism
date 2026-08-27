@@ -101,6 +101,13 @@ enum Command {
         /// `vz` (Apple Virtualization.framework), native `hyperv` on Windows,
         /// or `qemu` (compatibility). Omit it to select this device's first
         /// capable native backend. Recorded and used for every later boot.
+        ///
+        /// The native backend for the host is the product default and is
+        /// always tried first. `qemu` is an optional compatibility and
+        /// development backend that Asterism never installs and never selects
+        /// on its own; install it separately (`brew install qemu` on macOS)
+        /// and name it here. It is what covers `-p` port publication and a
+        /// qcow2 base image you point at directly.
         #[arg(long, value_name = "NAME")]
         backend: Option<String>,
         /// Bootstrap profile to apply at first boot (`ast profiles` lists
@@ -5652,6 +5659,18 @@ DAwMDAwMDAsImV4cCI6MTcwMDA0MzIwMCwic2NvcGUiOiJvcGVuaWQifQ.c2lnbmF0dXJl";
         assert!(
             help.contains("select this device's first capable native backend"),
             "{help}"
+        );
+        // AST-97: the help text is part of the one contract the formula, the
+        // install script and the docs also state. QEMU is opt-in, never
+        // installed by us, never chosen for the user, and the help names the
+        // command that gets it.
+        assert!(
+            help.contains("never installs and never selects"),
+            "--backend help must say QEMU is never auto-selected: {help}"
+        );
+        assert!(
+            help.contains("brew install qemu"),
+            "--backend help must name the opt-in install command: {help}"
         );
         assert!(
             Cli::try_parse_from(["ast", "create", "box", "--runtime", "container"]).is_err(),

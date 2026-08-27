@@ -502,7 +502,10 @@ fresh_prefix unentitled
 printf '%s\n' "${PREFIX}/bin/astd-vz" >"${WORK}/unsigned"
 run_install ok
 says "does not carry the virtualization"
-says "QEMU backend"
+# AST-97: the consequence is stated as what it is — no product backend on
+# this device — and never as a fallback onto something no lane installed.
+says "no product backend"
+never_says "fall back to the QEMU backend"
 : >"${WORK}/unsigned"
 ok "a helper whose signature carries no entitlement is called out at install time"
 
@@ -520,6 +523,11 @@ ok "ASTERISM_VERSION installs exactly that tag"
 # about what that costs.
 [ ! -e "${PREFIX}/bin/astd-vz" ] || fail "a release with no helper installed one anyway"
 says "This release ships no astd-vz"
+# AST-97: what is missing is the macOS product backend, and the only way
+# round it is an opt-in the user performs themselves and asks for by name.
+says "no instance can be created"
+says "brew install qemu"
+says "--backend qemu"
 grep -q '^files=bin/ast bin/astd$' <<<"$(receipt)" \
 	|| fail "the receipt claims files the release did not carry:"$'\n'"$(receipt)"
 ok "a release cut before the helper existed installs, and says what is missing"

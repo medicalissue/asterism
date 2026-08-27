@@ -193,11 +193,7 @@ impl Qemu {
 
 impl Probe {
     fn run() -> Result<Self> {
-        let install = if cfg!(target_os = "macos") {
-            "install the optional compatibility backend with `brew install qemu`"
-        } else {
-            "install the optional QEMU system package and qemu-img/qemu-utils"
-        };
+        let install = super::qemu_install_hint();
         let system = tool(&format!("qemu-system-{}", image::host_arch())).with_context(|| {
             format!("the optional qemu compatibility backend is unavailable; {install}")
         })?;
