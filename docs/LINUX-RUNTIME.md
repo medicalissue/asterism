@@ -61,6 +61,65 @@ Cloud Hypervisor is Apache-2.0 and BSD-3-Clause; virtiofsd is Apache-2.0 and
 BSD-3-Clause. Their license texts are included by the Linux release packaging
 under `share/asterism/licenses/`.
 
+## Installed shapes
+
+Linux has two installed shapes, and the daemon finds its own components in
+both without an environment override:
+
+| | `ast`/`astd` | pinned helpers | guest payloads | component lock and licenses |
+|---|---|---|---|---|
+| flat prefix (`packaging/install.sh`) | `<prefix>/bin` | beside `astd` | beside `astd` | `<prefix>/share/asterism` |
+| native package (`.deb`, `.rpm`) | `/usr/bin` | `/usr/libexec/asterism` | `/usr/lib/asterism` | `/usr/share/asterism` |
+
+The shapes differ because a distribution package may not write into
+`/usr/local`, and because `/usr/bin/cloud-hypervisor` would be Asterism
+claiming a distribution-wide name for a version-pinned private copy.
+`asterism_core::layout` owns the difference: every lookup searches the shape
+the running executable was installed as first, then the absolute system
+shapes. The NBD wrapper is resolved the same way, because its path is the
+subject of the sudoers rule and the daemon has to name the one the
+installation authorised.
+
+The package installs `/usr/lib/systemd/user/astd.service`,
+`/usr/lib/modules-load.d/asterism-nbd.conf`,
+`/usr/lib/modprobe.d/asterism-nbd.conf` and
+`/usr/lib/tmpfiles.d/asterism-nbd.conf` — the vendor directories, not `/etc`,
+because those files are the package's and not the administrator's. Its
+post-install grants the bundled VMM `cap_net_admin+ep`, materialises the
+root-owned NBD lock and claim directory, and loads `nbd` with 64 devices.
+None of those may fail the installation: a container without
+module-loading rights makes one feature unavailable, and `ast doctor` says
+which.
+
+What the package deliberately does **not** do is write the sudoers rule. That
+rule names one account and one uid; at package-install time the only account
+present is root, and root is not who runs the daemon. So the package ships
+`/usr/libexec/asterism/asterism-nbd-policy`, and `ast service install` — run
+by the account that will own the instances — invokes it through `sudo`. It
+writes the same `/etc/sudoers.d/asterism-nbd-<uid>` with the same two lines
+and the same `visudo -cf` validation `install.sh` uses, so the two shapes
+cannot leave two conflicting rules for one account. `ast service uninstall`
+withdraws it, and asks for a password to do so: the rule authorises the NBD
+wrapper and the updater's capability restore, not the helper that writes the
+rule, so an account cannot silently re-grant itself. Removing the package
+removes every rule the helper wrote, whether or not the account got that far.
+
+Package removal refuses while an NBD device is still attached, for the same
+reason `install.sh --uninstall` does: the wrapper and its sudoers rule are
+the only way left to detach it. Removal leaves `~/.asterism` alone, does not
+unload the running `nbd` module (it is the kernel's, not Asterism's, and
+other software may hold it), and cannot disable another account's systemd
+user unit — `ast service uninstall` is that command, per account by
+construction.
+
+In-app updates over a packaged install are refused the way Homebrew is:
+`ast update status` reports `manager dpkg` or `manager rpm`, `check` still
+verifies the signed manifest and reports what is available, and `apply`
+refuses with `apt-get install --only-upgrade asterism` or
+`dnf upgrade asterism`. Files under `/usr` belong to the package database,
+and rewriting them from underneath it would leave that database describing
+bytes that are no longer on disk.
+
 ## Host integration
 
 `astd` is a systemd `--user` unit (`~/.config/systemd/user/astd.service`)

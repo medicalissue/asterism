@@ -108,23 +108,26 @@ impl GuestProjectionArtifacts {
     }
 
     /// Discover artifacts from explicit packaging configuration, then from
-    /// the installed daemon layout. Absence refuses the boot; it never
-    /// silently starts an attached instance without its projected device.
+    /// each installed daemon layout — beside `astd` for the flat release
+    /// payload, `lib/asterism` under this installation's prefix for a native
+    /// package. Absence refuses the boot; it never silently starts an
+    /// attached instance without its projected device.
     pub fn discover() -> io::Result<Self> {
         if let Some(directory) = std::env::var_os("ASTERISM_GPU_GUEST_ARTIFACT_DIR") {
             return Self::from_dir(Path::new(&directory));
         }
-        let beside_daemon = std::env::current_exe()?
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("guest-gpu");
-        match Self::from_dir(&beside_daemon) {
-            Ok(found) => Ok(found),
-            Err(first) if first.kind() == io::ErrorKind::NotFound => {
-                Self::from_dir(Path::new("/usr/local/lib/asterism/guest-gpu"))
+        let mut last = io::Error::new(
+            io::ErrorKind::NotFound,
+            "no installed GPU guest projection artifacts",
+        );
+        for dir in crate::layout::data_dirs() {
+            match Self::from_dir(&dir.join("guest-gpu")) {
+                Ok(found) => return Ok(found),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => last = err,
+                Err(err) => return Err(err),
             }
-            Err(err) => Err(err),
         }
+        Err(last)
     }
 
     pub fn cloud_config(&self) -> String {

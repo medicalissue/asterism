@@ -1,0 +1,148 @@
+# Native Linux package for the flat Asterism release payload.
+#
+# One description of one payload, rendered by nfpm into both a .deb and an
+# .rpm. Rendering, rather than two hand-written specs, is the point: the deb
+# and the rpm must contain the same files with the same modes and run the same
+# maintainer scripts, or "it works on Ubuntu" stops being evidence about
+# Fedora. Only the dependency names differ between the two families, and they
+# differ exactly where `packaging/install.sh` already installs different names.
+#
+# scripts/build-linux-packages.sh sets every variable read here and is the
+# only supported way to invoke this file.
+#
+# Layout, and why it is not the flat one:
+#
+#   /usr/bin/{ast,astd}                 on PATH, the only two commands
+#   /usr/libexec/asterism/              cloud-hypervisor, virtiofsd, the NBD
+#                                       wrapper, the per-account policy
+#                                       helper, the signed updater
+#   /usr/lib/asterism/{guest,guest-gpu} ELF payloads injected into guests
+#   /usr/share/asterism/                the component lock and every license
+#   /usr/lib/systemd/user/astd.service  the unit, available to every account
+#   /usr/lib/{modules-load,modprobe}.d/ nbd with 64 devices, across reboots
+#   /usr/lib/tmpfiles.d/                the root-owned NBD lock and claim dir
+#
+# A package may not write into /usr/local, and `/usr/bin/cloud-hypervisor`
+# would be Asterism claiming a distribution-wide name for a version-pinned
+# private copy. `asterism_core::layout` knows both shapes, so the packaged
+# daemon finds everything it shipped with no environment override.
+name: asterism
+arch: ${ASTERISM_PKG_ARCH}
+platform: linux
+version: ${ASTERISM_PKG_VERSION}
+release: "1"
+section: admin
+priority: optional
+maintainer: medicalissue <medicalissue@users.noreply.github.com>
+description: |
+  Virtual machine device manager with a bundled KVM runtime.
+  Asterism runs persistent Linux instances on Cloud Hypervisor over KVM.
+  The pinned Cloud Hypervisor and virtiofsd binaries are bundled and their
+  upstream licenses ship under /usr/share/asterism/licenses, so an install
+  needs neither a Rust toolchain nor a separately installed hypervisor.
+  QEMU is not required, used, or depended on by this package.
+vendor: medicalissue
+homepage: https://asterism.run
+license: MIT OR Apache-2.0
+
+depends:
+  # Exactly what packaging/install.sh installs, plus the two things it
+  # assumes: `ast ssh` execs ssh, and the seed builder runs ssh-keygen.
+  - nbd-client
+  - kmod
+  - e2fsprogs
+  - iproute2
+  - libcap2-bin
+  - openssh-client
+  - sudo
+recommends:
+  # Secret material lives in the FreeDesktop Secret Service and there is no
+  # plaintext fallback, so a host with no provider can hold no secrets. That
+  # is a recommendation and not a dependency because the rest of the product
+  # works without one, and refuses the parts that do not.
+  - gnome-keyring
+
+overrides:
+  rpm:
+    depends:
+      # The same packages, under the names the Fedora family gives them —
+      # the split `packaging/install.sh` already makes when it installs them.
+      - nbd
+      - kmod
+      - e2fsprogs
+      - iproute
+      - libcap
+      - openssh-clients
+      - sudo
+    recommends:
+      - gnome-keyring
+
+contents:
+  - src: ${ASTERISM_PKG_PAYLOAD}/ast
+    dst: /usr/bin/ast
+    file_info:
+      mode: 0755
+  - src: ${ASTERISM_PKG_PAYLOAD}/astd
+    dst: /usr/bin/astd
+    file_info:
+      mode: 0755
+
+  - src: ${ASTERISM_PKG_PAYLOAD}/cloud-hypervisor
+    dst: /usr/libexec/asterism/cloud-hypervisor
+    file_info:
+      mode: 0755
+  - src: ${ASTERISM_PKG_PAYLOAD}/virtiofsd
+    dst: /usr/libexec/asterism/virtiofsd
+    file_info:
+      mode: 0755
+  - src: ${ASTERISM_PKG_PAYLOAD}/asterism-update
+    dst: /usr/libexec/asterism/asterism-update
+    file_info:
+      mode: 0755
+  # Root-owned, root-executed, and the subject of the sudoers rule. 0755 is
+  # deliberate: the daemon's account has to be able to exec it through sudo,
+  # and must not be able to write it.
+  - src: ${ASTERISM_PKG_PAYLOAD}/share/asterism/asterism-nbd
+    dst: /usr/libexec/asterism/asterism-nbd
+    file_info:
+      mode: 0755
+      owner: root
+      group: root
+  - src: ${ASTERISM_PKG_SOURCE}/packaging/linux/asterism-nbd-policy
+    dst: /usr/libexec/asterism/asterism-nbd-policy
+    file_info:
+      mode: 0755
+      owner: root
+      group: root
+
+  - src: ${ASTERISM_PKG_PAYLOAD}/guest
+    dst: /usr/lib/asterism/guest
+    type: tree
+  - src: ${ASTERISM_PKG_PAYLOAD}/guest-gpu
+    dst: /usr/lib/asterism/guest-gpu
+    type: tree
+
+  - src: ${ASTERISM_PKG_PAYLOAD}/share/asterism/linux-components.env
+    dst: /usr/share/asterism/linux-components.env
+  - src: ${ASTERISM_PKG_PAYLOAD}/share/asterism/licenses
+    dst: /usr/share/asterism/licenses
+    type: tree
+
+  - src: ${ASTERISM_PKG_SOURCE}/packaging/linux/astd.service
+    dst: /usr/lib/systemd/user/astd.service
+  - src: ${ASTERISM_PKG_SOURCE}/packaging/linux/asterism-nbd.modules-load.conf
+    dst: /usr/lib/modules-load.d/asterism-nbd.conf
+  - src: ${ASTERISM_PKG_SOURCE}/packaging/linux/asterism-nbd.modprobe.conf
+    dst: /usr/lib/modprobe.d/asterism-nbd.conf
+  - src: ${ASTERISM_PKG_SOURCE}/packaging/linux/asterism-nbd.tmpfiles.conf
+    dst: /usr/lib/tmpfiles.d/asterism-nbd.conf
+
+  - src: ${ASTERISM_PKG_SOURCE}/packaging/linux/copyright
+    dst: /usr/share/doc/asterism/copyright
+  - src: ${ASTERISM_PKG_SOURCE}/NOTICE
+    dst: /usr/share/doc/asterism/NOTICE
+
+scripts:
+  postinstall: ${ASTERISM_PKG_SOURCE}/packaging/linux/postinstall.sh
+  preremove: ${ASTERISM_PKG_SOURCE}/packaging/linux/preremove.sh
+  postremove: ${ASTERISM_PKG_SOURCE}/packaging/linux/postremove.sh

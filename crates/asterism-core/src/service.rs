@@ -614,6 +614,16 @@ mod imp {
                 .with_context(|| format!("writing {}", unit.display()))?;
             report.step(format!("wrote {}", unit.display()));
 
+            // A native package is system-wide; the sudoers rule that lets
+            // one account drive the root-owned NBD wrapper is not. This is
+            // the moment the account that will actually run the daemon is
+            // known, so it is where the packaged policy helper is asked for
+            // its rule. It runs before systemd, because host privilege is
+            // configured whether or not this host has systemctl.
+            if let Some(step) = ensure_nbd_policy() {
+                report.step(step);
+            }
+
             // Writing the file is the part that always works. Enabling it
             // needs systemctl, which a container or a non-systemd distro
             // may not have — say so instead of failing the install.
@@ -654,6 +664,9 @@ mod imp {
                     report.step(format!("{} was not there", unit.display()))
                 }
                 Err(e) => return Err(e).with_context(|| format!("removing {}", unit.display())),
+            }
+            if let Some(step) = remove_nbd_policy() {
+                report.step(step);
             }
             // The commit leaves a last-known-good copy beside the unit.
             // Uninstall means uninstall: it goes too, or the next `ls` of
@@ -735,6 +748,43 @@ mod imp {
 
     fn user_name() -> String {
         std::env::var("USER").unwrap_or_else(|_| "$USER".into())
+    }
+
+    /// Run the packaged policy helper for this account's NBD rule.
+    ///
+    /// Only a native package ships the helper: a flat `install.sh`
+    /// installation wrote its sudoers rule while it already had root, and
+    /// has no helper here, so it gets no step and no second rule.
+    ///
+    /// The rule lives in `/etc/sudoers.d`, which is `0750 root:root` — an
+    /// unprivileged account cannot even see whether its own rule is there.
+    /// So this does not pretend to check: the helper is idempotent, and
+    /// running it is the check. It runs through `sudo` on this process's
+    /// terminal, so the operator sees the prompt and the exact command, and
+    /// a refusal is reported as a step rather than failing the install,
+    /// because a daemon without remote volumes is still a daemon.
+    fn run_nbd_policy(action: &str) -> Option<String> {
+        let helper = crate::layout::nbd_policy_helper()?;
+        let command = format!("sudo {} {action}", helper.display());
+        match std::process::Command::new("sudo")
+            .arg(&helper)
+            .arg(action)
+            .status()
+        {
+            Ok(status) if status.success() => Some(command),
+            Ok(_) => Some(format!("this account's NBD sudo policy needs: {command}")),
+            Err(error) => Some(format!("could not run {command}: {error}")),
+        }
+    }
+
+    fn ensure_nbd_policy() -> Option<String> {
+        run_nbd_policy("install")
+    }
+
+    /// The mirror image. Removing the service is the moment this account
+    /// stops needing privileged NBD, so the rule goes with it.
+    fn remove_nbd_policy() -> Option<String> {
+        run_nbd_policy("remove")
     }
 
     fn linger_state() -> Result<bool> {
