@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
-# End-to-end for the mesh's DEFAULT mode: discovery. Two daemons on one host,
-# each with its own ASTERISM_HOME, with ASTERISM_MESH deliberately unset — so
-# they bind relay-backed endpoints and publish their addresses to a real public
-# directory, exactly as a user's two machines would.
+# End-to-end for the mesh's CONFIGURED mode: discovery. Two daemons on one
+# host, each with its own ASTERISM_HOME, both pointed at a relay and a
+# directory by the variables below — so they bind relay-backed endpoints and
+# publish their addresses, exactly as a logged-in user's two machines would.
+#
+# WHY THE VARIABLES ARE SET HERE. Discovery is no longer a default. A device
+# with no login and no configuration has no relay and no directory and binds
+# local-only; that is the product decision AST-119 recorded, and it means this
+# suite has to say which servers it is testing against rather than inheriting
+# somebody's. The defaults below are n0's public infrastructure, which is a
+# convenient public deployment to test against and is *not* what a stock
+# Asterism device talks to. Override ASTERISM_RELAY_URL / ASTERISM_PKARR_RELAY
+# / ASTERISM_DNS_ORIGIN to run this against your own.
 #
 # This is the sibling of scripts/e2e-mesh.sh and not a replacement for it.
 # e2e-mesh.sh pins ASTERISM_MESH=local and proves the orbit's semantics with no
@@ -22,12 +31,10 @@
 # daemon came back on a different port was simply gone; here it is found under
 # its public key wherever it went, and the store is corrected.
 #
-# WHAT THIS TALKS TO. Unless ASTERISM_RELAY_URL / ASTERISM_PKARR_RELAY /
-# ASTERISM_DNS_ORIGIN say otherwise, this script uses n0's public relay fleet
-# and n0's pkarr/DNS server, and publishes two throwaway device keys and this
-# machine's addresses there. It needs working internet. It is not hermetic and
-# it is not meant to be: an assertion that discovery works, mocked, asserts
-# nothing.
+# WHAT THIS TALKS TO. Unless overridden, n0's public relay fleet and n0's
+# pkarr/DNS server, to which it publishes two throwaway device keys and this
+# machine's addresses. It needs working internet. It is not hermetic and it is
+# not meant to be: an assertion that discovery works, mocked, asserts nothing.
 #
 # WHAT ONE MACHINE CANNOT PROVE. See the ASTERISM_E2E_REAL_NET section at the
 # bottom.
@@ -40,6 +47,15 @@ cd "$ROOT"
 . "$ROOT/scripts/lib/harness.sh"
 harness_begin discovery
 harness_binaries "$ROOT"
+
+# The infrastructure under test, stated rather than inherited. See the header.
+export ASTERISM_RELAY_URL="${ASTERISM_RELAY_URL:-https://use1-1.relay.n0.iroh.link./}"
+export ASTERISM_PKARR_RELAY="${ASTERISM_PKARR_RELAY:-https://dns.iroh.link/pkarr}"
+export ASTERISM_DNS_ORIGIN="${ASTERISM_DNS_ORIGIN:-dns.iroh.link.}"
+echo "discovery e2e is testing against:"
+echo "  relay $ASTERISM_RELAY_URL"
+echo "  pkarr $ASTERISM_PKARR_RELAY"
+echo "  dns   $ASTERISM_DNS_ORIGIN"
 
 # Fresh, SHORT homes: unix socket paths are capped near 104 bytes, and these
 # are deliberately nowhere near the user's own ~/.asterism.

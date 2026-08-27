@@ -273,6 +273,82 @@ pub struct DeviceStatus {
     /// Whether this row is the device the command ran on.
     #[serde(default)]
     pub is_self: bool,
+    /// Which relay is in the path to this device right now, if any.
+    ///
+    /// Not the relay hint on file — that is where the peer said it could be
+    /// found — but the server actually carrying, or standing by to carry, this
+    /// connection. A latency number with no route named beside it cannot be
+    /// attributed to anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+    /// Bytes exchanged with this device, split by path.
+    #[serde(default)]
+    pub bytes: DeviceBytes,
+}
+
+/// Bytes exchanged with one device, split into direct and relayed.
+///
+/// On the wire because relayed bytes are the billing basis and a user is
+/// entitled to read the same meter the bill is drawn from. Defaulted in both
+/// directions so a rolling upgrade keeps the `Devices` frame readable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceBytes {
+    /// Bytes sent over a direct path.
+    #[serde(default)]
+    pub direct_sent: u64,
+    /// Bytes received over a direct path.
+    #[serde(default)]
+    pub direct_recv: u64,
+    /// Bytes sent through a relay.
+    #[serde(default)]
+    pub relayed_sent: u64,
+    /// Bytes received through a relay.
+    #[serde(default)]
+    pub relayed_recv: u64,
+    /// Bytes relayed before hole punching moved a connection direct: the cost
+    /// of the rendezvous, as opposed to the cost of a connection that never
+    /// got off the relay.
+    #[serde(default)]
+    pub relayed_before_direct: u64,
+    /// How long the most recent relay-to-direct upgrade took, in
+    /// milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_upgrade_millis: Option<u64>,
+}
+
+impl DeviceBytes {
+    /// Everything relayed, in both directions.
+    pub fn relayed_total(&self) -> u64 {
+        self.relayed_sent.saturating_add(self.relayed_recv)
+    }
+
+    /// Everything direct, in both directions.
+    pub fn direct_total(&self) -> u64 {
+        self.direct_sent.saturating_add(self.direct_recv)
+    }
+}
+
+/// Renders a byte count the way `ast ping` and `ast devices` print it.
+///
+/// Binary units, because these are network byte counts and every other tool an
+/// operator compares them against — a relay's own metrics included — counts in
+/// the same bytes. Exact whole numbers below a kibibyte, so that a small count
+/// reads as the figure it is rather than as `0.0 KiB`.
+///
+/// Lives here rather than in the CLI because the daemon's meter and the CLI's
+/// table must not disagree about what a megabyte is.
+pub fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["KiB", "MiB", "GiB", "TiB", "PiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
 }
 
 impl DeviceStatus {
@@ -968,6 +1044,10 @@ mod tests {
         assert_eq!(status.rtt_micros, None);
         assert_eq!(status.transition_reason, None);
         assert_eq!(status.recovery_result, None);
+        // A daemon that predates metering reports no relay and no bytes,
+        // rather than failing to be read at all.
+        assert_eq!(status.relay_url, None);
+        assert_eq!(status.bytes, DeviceBytes::default());
 
         let measured = DeviceStatus {
             name: "desktop".into(),
@@ -978,10 +1058,29 @@ mod tests {
             transition_reason: Some("stale_address_recovered_by_discovery".into()),
             recovery_result: Some("recovered".into()),
             is_self: false,
+            relay_url: Some("https://relay.asterism.run./".into()),
+            bytes: DeviceBytes {
+                direct_sent: 0,
+                direct_recv: 0,
+                relayed_sent: 4_096,
+                relayed_recv: 2_048,
+                relayed_before_direct: 0,
+                last_upgrade_millis: None,
+            },
         };
         let wire = serde_json::to_string(&measured).unwrap();
         let back: DeviceStatus = serde_json::from_str(&wire).unwrap();
         assert_eq!(back, measured);
+        assert_eq!(back.bytes.relayed_total(), 6_144);
+    }
+
+    #[test]
+    fn byte_counts_print_the_way_an_operator_reads_them() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(1023), "1023 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(1_258_291), "1.2 MiB");
+        assert_eq!(human_bytes(5 * 1024 * 1024 * 1024), "5.0 GiB");
     }
 
     /// A pairing whose commit was killed leaves the orbit exactly as it was.

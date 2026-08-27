@@ -57,6 +57,7 @@ use asterism_core::registry::OrbitRow;
 use asterism_core::verify::{self, Source};
 use asterism_core::VERSION;
 
+use crate::relay_meter::{PeerBytes, RelayMeter, FLUSH_INTERVAL, SAMPLE_INTERVAL};
 use crate::{swap, Node};
 
 use asterism_mesh::iroh_types::{EndpointAddr, PublicKey, RecvStream, SendStream};
@@ -495,6 +496,11 @@ pub struct Mesh {
     /// in flight. Device removal closes these, which is the revocation event
     /// for RPC, ssh and volume pipes alike.
     active: Mutex<HashMap<String, Vec<MeshConnection>>>,
+    /// Bytes per peer, split into direct and relayed. Unlike the telemetry
+    /// above this is *not* an observation that may die with the daemon: it is
+    /// the billing basis, so it is accumulated across reconnections and
+    /// persisted. See [`crate::relay_meter`].
+    meter: Mutex<RelayMeter>,
 }
 
 /// The current measured link to a peer, shared with remote-part health.
@@ -769,9 +775,13 @@ impl Mesh {
             speaking: Mutex::new(HashMap::new()),
             telemetry: Mutex::new(HashMap::new()),
             active: Mutex::new(HashMap::new()),
+            meter: Mutex::new(RelayMeter::load(&paths::relay_meter_path())),
         });
 
         tokio::spawn(accept_loop(mesh.clone(), node));
+        // The meter reads counters that vanish when a path closes, so it has
+        // to run on a clock rather than only when someone types `ast ping`.
+        tokio::spawn(mesh.clone().meter_loop());
         // Enrollment recorded where each peer was at pairing time; devices
         // move. Asking again at startup is what keeps `ast device wake` from
         // choosing a broadcaster that is no longer on the sleeper's LAN — and
@@ -817,6 +827,11 @@ impl Mesh {
             seen[i] = path;
         }
 
+        // Every probe above ran on a live connection; fold what they moved
+        // into the meter before reading it, so the table is current.
+        self.sample_all().await;
+        let relay_urls = self.peer_relay_urls().await;
+
         let mut rows = vec![DeviceStatus {
             name: self_name,
             device_id: self.device_id().to_string(),
@@ -827,23 +842,44 @@ impl Mesh {
             transition_reason: None,
             recovery_result: None,
             is_self: true,
+            relay_url: None,
+            bytes: Default::default(),
         }];
         let telemetry = self.telemetry.lock().await;
-        rows.extend(peers.iter().zip(seen).map(|(peer, path)| {
-            let observed = telemetry.get(&peer.device_id);
-            DeviceStatus {
-                name: peer.name.clone(),
-                device_id: peer.device_id.clone(),
-                online: path.is_some(),
-                // Whatever the live connection says, and a dash when there is no
-                // connection to ask.
-                path: path_word(path.flatten()),
-                rtt_micros: observed.and_then(|o| o.rtt_micros),
-                transition_reason: observed.and_then(|o| o.transition_reason.clone()),
-                recovery_result: observed.and_then(|o| o.recovery_result.clone()),
-                is_self: false,
-            }
-        }));
+        let mut metered = Vec::with_capacity(peers.len());
+        for peer in &peers {
+            metered.push(self.metered(&peer.device_id).await);
+        }
+        rows.extend(
+            peers
+                .iter()
+                .zip(seen)
+                .zip(metered)
+                .map(|((peer, path), bytes)| {
+                    let observed = telemetry.get(&peer.device_id);
+                    DeviceStatus {
+                        name: peer.name.clone(),
+                        device_id: peer.device_id.clone(),
+                        online: path.is_some(),
+                        // Whatever the live connection says, and a dash when there is no
+                        // connection to ask.
+                        path: path_word(path.flatten()),
+                        rtt_micros: observed.and_then(|o| o.rtt_micros),
+                        transition_reason: observed.and_then(|o| o.transition_reason.clone()),
+                        recovery_result: observed.and_then(|o| o.recovery_result.clone()),
+                        is_self: false,
+                        relay_url: relay_urls.get(&peer.device_id).cloned(),
+                        bytes: orbit::DeviceBytes {
+                            direct_sent: bytes.direct_sent,
+                            direct_recv: bytes.direct_recv,
+                            relayed_sent: bytes.relayed_sent,
+                            relayed_recv: bytes.relayed_recv,
+                            relayed_before_direct: bytes.relayed_before_direct,
+                            last_upgrade_millis: bytes.last_upgrade_millis,
+                        },
+                    }
+                }),
+        );
         rows
     }
 
@@ -867,6 +903,11 @@ impl Mesh {
         // if the caller must retry to obtain a durability guarantee.
         if membership_gone {
             self.close_device_connections(&device).await;
+            // A removed device's byte count is a record of a relationship the
+            // user just ended. It goes with the trust.
+            let mut meter = self.meter.lock().await;
+            meter.forget(&device.device_id);
+            let _ = meter.flush(&paths::relay_meter_path());
         }
         removal
     }
@@ -924,6 +965,15 @@ impl Mesh {
             MeshReply::Pong { .. } => {}
             other => bail!("device {name:?} answered a ping with {other:?}"),
         }
+        let millis = started.elapsed().as_secs_f64() * 1000.0;
+        // Metered after the round trip so the bytes this ping itself moved are
+        // in the answer it prints.
+        let bytes = self.meter_peer(&device.device_id, &connection).await;
+        let upgrade_millis = self
+            .meter
+            .lock()
+            .await
+            .upgrade_millis(&device.device_id, &connection);
         Ok(Response::DevicePong {
             device: device.name,
             device_id: device.device_id,
@@ -933,7 +983,17 @@ impl Mesh {
             // reports the direct path it ended on, which is the true answer to
             // "how am I reaching this device".
             path: path_word(connection.path()),
-            millis: started.elapsed().as_secs_f64() * 1000.0,
+            millis,
+            // The relay that carried the relayed half, if any. Without this a
+            // latency figure cannot be attributed to a route — which is
+            // exactly the wall `STATUS.md`'s path-speed investigation hit.
+            relay_url: connection.relay_url(),
+            connection_type: Some(connection.connection_type().as_str().to_owned()),
+            upgrade_millis,
+            direct_bytes_sent: bytes.direct_sent,
+            direct_bytes_recv: bytes.direct_recv,
+            relayed_bytes_sent: bytes.relayed_sent,
+            relayed_bytes_recv: bytes.relayed_recv,
         })
     }
 
@@ -2369,14 +2429,22 @@ impl Mesh {
     /// it is using to be reachable there.
     ///
     /// Under discovery this is also the moment the device's address record
-    /// reaches the public directory — iroh's publisher republishes whenever
-    /// the endpoint's address changes, and the home relay is the last part of
-    /// that address to arrive. Printing it is how a user finds out, without
-    /// reading the source, that their key and addresses are now on somebody's
-    /// server.
+    /// reaches the configured directory — iroh's publisher republishes
+    /// whenever the endpoint's address changes, and the home relay is the last
+    /// part of that address to arrive. Printing it is how a user finds out,
+    /// without reading the source, that their key and addresses are now on
+    /// somebody's server.
+    ///
+    /// The local case is no longer a warning to escape from. It is the
+    /// default, nothing is published in it, and the line says what would be
+    /// needed to go further rather than what to set to stay put.
     async fn announce(self: Arc<Self>) {
         if self.endpoint.mode() != MeshMode::Discovery {
-            eprintln!("astd: mesh mode local — no relay, no discovery, nothing published");
+            eprintln!(
+                "astd: mesh is local — no relay, no directory, nothing published. \
+                 Devices reach each other where a direct path already works; \
+                 log in, or set ASTERISM_RELAY_URL, to go further."
+            );
             return;
         }
         let online = self.endpoint.online(ANNOUNCE_TIMEOUT).await;
@@ -2393,6 +2461,106 @@ impl Mesh {
             "astd: discovery: published this device's key and addresses via {infra} \
              (home relay {relays}) — ASTERISM_MESH=local opts out"
         );
+    }
+
+    /// Samples every warm connection's byte counters, forever.
+    ///
+    /// The counters this reads live on paths, and a path takes its counts with
+    /// it when it closes — so metering cannot wait to be asked. See
+    /// [`crate::relay_meter`] for why the loop exists rather than a hook on
+    /// the read and write paths: a hook would have to be threaded through
+    /// every stream in the daemon and would still miss QUIC's own overhead,
+    /// which is a real part of what the relay forwarded.
+    async fn meter_loop(self: Arc<Self>) {
+        let path = paths::relay_meter_path();
+        eprintln!(
+            "astd: relay meter at {}: {}",
+            path.display(),
+            crate::relay_meter::describe(&*self.meter.lock().await)
+        );
+        // Set so that the first sample with anything in it writes immediately.
+        // A meter file that does not exist until a minute in looks, to
+        // anything that reads it, exactly like a meter that is not working.
+        let mut last_flush = Instant::now()
+            .checked_sub(FLUSH_INTERVAL)
+            .unwrap_or_else(Instant::now);
+        loop {
+            tokio::time::sleep(SAMPLE_INTERVAL).await;
+            self.sample_all().await;
+            if last_flush.elapsed() >= FLUSH_INTERVAL {
+                last_flush = Instant::now();
+                let mut meter = self.meter.lock().await;
+                if let Err(error) = meter.flush(&path) {
+                    // Not fatal, and not silent either: a byte counter that
+                    // stopped persisting is something an operator reconciling
+                    // a bill needs to know happened.
+                    eprintln!("astd: could not write the relay meter: {error}");
+                }
+            }
+        }
+    }
+
+    /// Folds every live connection's counters into the meter.
+    async fn sample_all(&self) {
+        let connections: Vec<(String, MeshConnection)> = {
+            let warm = self.conns.lock().await;
+            warm.iter()
+                .map(|(id, conn)| (id.clone(), conn.clone()))
+                .collect()
+        };
+        let extra: Vec<(String, MeshConnection)> = {
+            let active = self.active.lock().await;
+            active
+                .iter()
+                .flat_map(|(id, held)| held.iter().map(|c| (id.clone(), c.clone())))
+                .collect()
+        };
+        let mut meter = self.meter.lock().await;
+        for (id, connection) in connections.into_iter().chain(extra) {
+            meter.observe(&id, &connection);
+        }
+    }
+
+    /// Folds one peer's byte counters in and returns the running totals.
+    ///
+    /// Called on the way to answering `ast ping` and `ast devices`, so the
+    /// numbers a user is shown include what the very request they typed has
+    /// just moved. `observe` is idempotent, so this races the background
+    /// sampler harmlessly.
+    async fn meter_peer(&self, device_id: &str, connection: &MeshConnection) -> PeerBytes {
+        let mut meter = self.meter.lock().await;
+        meter.observe(device_id, connection);
+        meter.peer(device_id)
+    }
+
+    /// Samples every live connection and writes the meter, now.
+    ///
+    /// The shutdown path. A daemon that stopped cleanly and lost the last
+    /// minute of accounting would make the meter unreliable exactly when it is
+    /// most likely to be read — after a restart.
+    pub async fn flush_meter(&self) {
+        self.sample_all().await;
+        let mut meter = self.meter.lock().await;
+        if let Err(error) = meter.flush(&paths::relay_meter_path()) {
+            eprintln!("astd: could not write the relay meter on shutdown: {error}");
+        }
+    }
+
+    /// The metered totals for one peer, without sampling first.
+    async fn metered(&self, device_id: &str) -> PeerBytes {
+        self.meter.lock().await.peer(device_id)
+    }
+
+    /// The relay each warm connection is currently reachable through.
+    ///
+    /// Read off the live connections rather than off the orbit store's relay
+    /// hints, because a hint is where the peer said it could be found and this
+    /// is which server is actually in the path right now.
+    async fn peer_relay_urls(&self) -> HashMap<String, String> {
+        let warm = self.conns.lock().await;
+        warm.iter()
+            .filter_map(|(id, conn)| conn.relay_url().map(|url| (id.clone(), url)))
+            .collect()
     }
 }
 
@@ -3752,30 +3920,32 @@ impl ClientIo<'_> {
 
 /// How this daemon reaches the world.
 ///
-/// The default is discovery: relays and address lookup, so two devices on
-/// different networks behind different NATs can pair and talk without anyone
-/// forwarding a port. That is the mode a user gets and the mode Phase 2 is
-/// about.
+/// Two questions, and only one of them is this function's. *May* this daemon
+/// use discovery is `ASTERISM_MESH`; *has it anywhere to go* is `MeshInfra`.
+/// Discovery happens when both say yes.
 ///
-/// `ASTERISM_MESH=local` is loopback only — the mode the tests want, the
-/// roadmap's "bring your own route", and the opt-out from publishing this
-/// device's key and addresses to a public discovery service. Anything else,
-/// including an unreadable value, is discovery, because a typo must not
-/// silently strand a device in a mode where nothing outside the house can
-/// reach it.
-///
-/// Whose relays and whose directory is a separate question, answered by
-/// `MeshInfra` in `asterism-mesh` — today n0's, with the environment seam that
-/// lets our own take over.
+/// `ASTERISM_MESH=local` is a hard no: loopback only, whatever else is
+/// configured. Anything else, including an unreadable value, permits
+/// discovery — a typo must not silently strand a device in a mode where
+/// nothing outside the house can reach it. But permission is not the same as
+/// arrival: with no relay and no directory configured, `MeshEndpoint::bind_with`
+/// binds local-only anyway, because there is no default fleet to reach for.
+/// See `asterism-mesh`'s endpoint module for why that reversal happened.
 fn mesh_mode() -> MeshMode {
-    mesh_mode_from(std::env::var(MESH_MODE_ENV).ok().as_deref())
+    mesh_mode_from(
+        std::env::var(MESH_MODE_ENV).ok().as_deref(),
+        &asterism_mesh::MeshInfra::from_env(),
+    )
 }
 
-/// The rule itself, separated from where the string comes from so it can be
-/// tested without a process-global environment variable.
-fn mesh_mode_from(setting: Option<&str>) -> MeshMode {
+/// The rule itself, separated from where the strings come from so it can be
+/// tested without process-global environment variables.
+fn mesh_mode_from(setting: Option<&str>, infra: &asterism_mesh::MeshInfra) -> MeshMode {
     match setting {
         Some("local") => MeshMode::LocalOnly,
+        // Nothing to be discovered through and nowhere to be discovered: this
+        // device is local whether or not it was told it could be otherwise.
+        _ if infra.is_empty() => MeshMode::LocalOnly,
         _ => MeshMode::Discovery,
     }
 }
@@ -3989,20 +4159,45 @@ mod tests {
     }
 
     #[test]
-    fn the_mesh_reaches_the_world_unless_told_to_stay_home() {
-        // Discovery is the default because an orbit whose devices are on two
-        // networks is the product; a device that could only ever talk to its
-        // own LAN unless a variable was set would be a toy. The cost is that
-        // the default publishes this device's key and addresses to a public
-        // directory, which `local` is the way out of, and which the daemon
-        // says on stderr at startup rather than leaving to be discovered.
-        assert_eq!(mesh_mode_from(None), MeshMode::Discovery);
-        assert_eq!(mesh_mode_from(Some("discovery")), MeshMode::Discovery);
-        assert_eq!(mesh_mode_from(Some("local")), MeshMode::LocalOnly);
-        // A typo must not strand a device where nothing can reach it. It is
-        // the loud, reachable mode that is safe to guess wrong.
-        assert_eq!(mesh_mode_from(Some("locall")), MeshMode::Discovery);
-        assert_eq!(mesh_mode_from(Some("")), MeshMode::Discovery);
+    fn the_mesh_stays_home_until_it_is_given_somewhere_to_go() {
+        // Two conditions, not one. `ASTERISM_MESH` says whether discovery is
+        // *permitted*; `MeshInfra` says whether there is anywhere to discover
+        // through. A device with permission and nowhere to go is local — the
+        // reversal AST-119 made, and the reason a fresh install now publishes
+        // nothing about itself to anyone.
+        let nowhere = asterism_mesh::MeshInfra::default();
+        let somewhere = asterism_mesh::MeshInfra {
+            relays: vec!["https://relay.asterism.run./".into()],
+            ..Default::default()
+        };
+
+        assert_eq!(mesh_mode_from(None, &nowhere), MeshMode::LocalOnly);
+        assert_eq!(
+            mesh_mode_from(Some("discovery"), &nowhere),
+            MeshMode::LocalOnly
+        );
+        assert_eq!(mesh_mode_from(None, &somewhere), MeshMode::Discovery);
+        assert_eq!(
+            mesh_mode_from(Some("discovery"), &somewhere),
+            MeshMode::Discovery
+        );
+
+        // `local` is a hard no, whatever is configured: someone who set it
+        // meant it, and a relay URL left in the environment must not overrule
+        // them.
+        assert_eq!(mesh_mode_from(Some("local"), &nowhere), MeshMode::LocalOnly);
+        assert_eq!(
+            mesh_mode_from(Some("local"), &somewhere),
+            MeshMode::LocalOnly
+        );
+
+        // A typo must not strand a configured device where nothing can reach
+        // it. It is the reachable mode that is safe to guess wrong.
+        assert_eq!(
+            mesh_mode_from(Some("locall"), &somewhere),
+            MeshMode::Discovery
+        );
+        assert_eq!(mesh_mode_from(Some(""), &somewhere), MeshMode::Discovery);
     }
 
     #[test]
@@ -4490,6 +4685,7 @@ mod tests {
             speaking: Mutex::new(HashMap::new()),
             telemetry: Mutex::new(HashMap::new()),
             active: Mutex::new(HashMap::new()),
+            meter: Mutex::new(RelayMeter::new()),
         });
         let issued = Arc::new(IssuedTicket::new(PairingTicket::issue(
             addr,
@@ -4578,6 +4774,7 @@ mod tests {
             speaking: Mutex::new(HashMap::new()),
             telemetry: Mutex::new(HashMap::new()),
             active: Mutex::new(HashMap::new()),
+            meter: Mutex::new(RelayMeter::new()),
         });
         let loop_task = tokio::spawn(accept_loop(mesh.clone(), node));
         let connection = client.connect(addr).await.unwrap();

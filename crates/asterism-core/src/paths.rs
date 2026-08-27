@@ -266,6 +266,18 @@ pub fn local_mesh_addr_path() -> PathBuf {
     home_dir().join("mesh-local.addr")
 }
 
+/// Per-peer byte counters, split into direct and relayed.
+///
+/// Relayed bytes are the one resource an orbit consumes that costs the relay
+/// operator money per gigabyte, which makes them the billing basis — and a
+/// billing basis has to outlive a daemon restart, unlike the reachability
+/// observations next to it in memory. The file holds device ids and integers
+/// and deliberately nothing else: no addresses, no device names, no per-stream
+/// or per-instance attribution. See `docs/RELAY.md` for the reset policy.
+pub fn relay_meter_path() -> PathBuf {
+    home_dir().join("relay-meter.json")
+}
+
 /// Another device's guest key, cached here so `ast ssh` can open a guest that
 /// device seeded.
 ///

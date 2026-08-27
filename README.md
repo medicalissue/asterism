@@ -281,21 +281,35 @@ document covers approval scope, audit records, and revocation limits.
 
 ## Network and privacy
 
-The default mesh uses n0's public iroh relays and `dns.iroh.link` discovery so
-devices behind different NATs can find each other. Relays see ciphertext, but
-the directory publishes a device's public key and current addresses. It does
-not receive instance metadata.
+**A fresh install talks to nobody's servers.** There is no default relay and no
+default directory: an unconfigured, not-logged-in device is local-only, reaches
+peers wherever a direct path already works, and publishes nothing about itself
+anywhere. That is the default because cross-network reachability is something a
+device should be given, not something an installer helps itself to.
 
-If the devices already have routes to one another through a LAN, VPN, or
-tailnet, keep discovery and relay traffic local:
+Two ways to go further, and they use the same code path.
+
+**Log in.** The coordination plane supplies the relays and the account's own
+device directory, so devices behind different NATs can find each other. Relays
+forward ciphertext; the directory holds a device's public key and current
+addresses, and no instance metadata.
+
+**Run your own.** `astrelay` is in this repository under the same licence as
+everything else:
 
 ```console
-$ ASTERISM_MESH=local astd
+relay-host$ astrelay --tls lets-encrypt --acme-domain relay.example.com \
+                     --acme-contact ops@example.com --acme-cache /var/lib/astrelay
+laptop$     ASTERISM_RELAY_URL=https://relay.example.com astd
 ```
 
-This mode uses only peer addresses already on file. Custom relay and discovery
-infrastructure can be selected with `ASTERISM_RELAY_URL`,
-`ASTERISM_PKARR_RELAY`, and `ASTERISM_DNS_ORIGIN`.
+`ASTERISM_PKARR_RELAY` and `ASTERISM_DNS_ORIGIN` select a directory the same
+way, and any of the three overrides what a login supplied.
+`ASTERISM_MESH=local` forces local-only regardless.
+
+`ast ping` and `ast devices` report per-peer bytes split into direct and
+relayed, and name the relay carrying each connection.
+[docs/RELAY.md](docs/RELAY.md) is the guide.
 
 ## Updates
 
