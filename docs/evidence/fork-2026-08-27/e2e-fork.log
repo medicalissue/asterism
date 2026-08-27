@@ -1,0 +1,74 @@
+/private/tmp/claude-501/-Users-junesangkwon-Desktop-asterism/bc2d5563-74df-4170-a8f7-e356503d0640/scratchpad/target-ast152/debug/astd-vz: replacing existing signature
+signed /private/tmp/claude-501/-Users-junesangkwon-Desktop-asterism/bc2d5563-74df-4170-a8f7-e356503d0640/scratchpad/target-ast152/debug/astd-vz as - (com.apple.security.virtualization)
+== fork e2e in /private/tmp/ast-fork-39650 (backend vz)
+ok: the /work share is a git repository at f32158a
+ok: create the agent instance with a published port
+ok: attach the repository as /work
+ok: attach a cache the forks are meant to share
+ok: attach a memory each fork is meant to get its own of
+ok: boot it
+ok: the agent can see its work
+ok: a parent that is not here is refused
+ok: a double-digit fleet wants saying twice
+ok: --each is one message per fork or none
+ok: the guest was left running by every refusal
+--- ast fork bot --n 3 --each ...
+bot-1 bot-2 bot-3 up — cloned from bot in 9.0 s, 316.55 MiB shared
+the forks publish no ports: 1 host port belongs to bot and cannot be in two places — `ast exec <fork>` and `ast ssh <fork>` reach them
+/cache is shared with the forks rather than copied: it is a cache volume, so they warm one of it between them
+fork: df around the whole command moved 29588 KiB (noisy: includes three boots and any other writer); ast took 9227 ms end to end
+ok: three forks came up and the line said what they cost
+ok: the parent is still running
+--- ast ls
+NAME           STATUS    IMAGE          SHAPE            COMPUTE      AGE    TODAY    ACCESS                NOTE
+bot            running   nginx:alpine   2c/1024M/4G      macbook-pro.tail0de304.ts.net 16s    -        192.168.64.35:22      -
+bot-2          running   nginx:alpine   2c/1024M/4G      macbook-pro.tail0de304.ts.net 11s    -        192.168.64.40:22      fork of bot @ 20:10 · B: patch the tokenizer
+bot-1          running   nginx:alpine   2c/1024M/4G      macbook-pro.tail0de304.ts.net 11s    -        192.168.64.39:22      fork of bot @ 20:10 · A: rewrite the parser
+bot-3          running   nginx:alpine   2c/1024M/4G      macbook-pro.tail0de304.ts.net 11s    -        192.168.64.41:22      fork of bot @ 20:10 · C: add a fallback path
+ok: ast ls says where each fork came from and what it was told to try
+  bot-1: hostname bot-1, note "A: rewrite the parser"
+  bot-2: hostname bot-2, note "B: patch the tokenizer"
+  bot-3: hostname bot-3, note "C: add a fallback path"
+ok: every fork has its own hostname and its own copy of what it was told to try
+ok: fork 1 warms the shared cache
+ok: fork 2 sees what fork 1 put in the shared cache
+ok: the parent sees it too
+ok: a cache volume is one directory the parent and every fork share
+ok: fork 1 writes to its own memory
+ok: fork 2 writes to its own memory
+ok: fork 1's memory is still fork 1's
+ok: a memory volume is copied, so each fork remembers only what it did
+ok: fork 1 edits the parser
+ok: fork 2 edits both files
+ok: fork 3 adds a file
+ok: each fork writes into its own /work and nobody else's
+--- ast diff bot-1
+/work: 1 file changed, +2 −1 (vs bot @ 20:10)
+--- ast diff bot-2
+/work: 3 files changed, +4 −2 (vs bot @ 20:10)
+--- ast diff bot-3
+/work: 1 file changed, +1 −0 (vs bot @ 20:10)
+ok: every fork's diff is its own, counted against the fork point
+ok: diffing something that is not a fork says what to do instead
+ok: picking something that is not a fork is refused
+--- ast pick bot-2 --yes
+bot ← bot-2 (/work replaced; bot-1, bot-3 removed)
+the /work it replaced is kept as "before-pick" — `ast rewind bot --to before-pick` undoes this
+ok: the pick named the parent, the volume, the siblings and the undo
+ok: the parent is running after the pick
+ok: the parent now holds fork 2's parser
+ok: the parent now holds fork 2's new file
+ok: bot-2's work is on bot, on both sides of the share
+ok: the siblings are gone and the winner is still here
+ok: before-pick is on the parent's timeline
+--- ast rewind bot --to before-pick
+bot rewound to 20:10 (3.4 s) — current state kept as "before-rewind"
+"/private/tmp/ast-fork-39650/cache" was not put back: it is no longer attached to bot as a local directory a rewind may roll back
+"/private/tmp/ast-fork-39650/memory" was not put back: it is no longer attached to bot as a local directory a rewind may roll back
+memory and cache volumes are not rolled back — add --include-memory to roll memory back too
+ok: the parent is running after the undo
+ok: ast rewind --to before-pick put the parent's own /work back
+ok: stop the completed fork lane
+FORK E2E GREEN (docker.io/library/nginx:alpine, vz)
+kept /private/tmp/ast-fork-39650 for inspection
+kept: /var/folders/lr/v65fp3p92qlg5lhl05m_952m0000gn/T//asterism-harness-artifacts-39650/fork

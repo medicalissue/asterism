@@ -66,6 +66,12 @@ snapshot you name is never pruned, and appears on the timeline as `named`. The
 nothing else, so a hand-typed tag that would pass for the scheduler's is
 refused rather than quietly becoming a snapshot that expires.
 
+Two other things take named snapshots for the same reason — so that what they
+are measured against never expires. [`ast fork`](fork.md) takes a `fork-…` at
+the moment it clones an instance, and `ast pick` keeps the working volume it
+replaced as `before-pick`, which is what makes a pick undoable:
+`ast rewind bot --to before-pick`.
+
 ## What it costs
 
 ```console

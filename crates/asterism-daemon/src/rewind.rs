@@ -139,7 +139,7 @@ pub(crate) fn timeline(inst: &Instance) -> Result<model::Timeline> {
 /// real snapshots and `ast snapshot`/`ast restore` still work on them; they
 /// are simply not files this module can clone, date or prune, so it says so
 /// rather than showing an empty timeline for an instance that has snapshots.
-fn unsupported(inst: &Instance, dir: &Path) -> Option<String> {
+pub(crate) fn unsupported(inst: &Instance, dir: &Path) -> Option<String> {
     if inst.machine.backend == "qemu" && dir.join("disk.qcow2").is_file() {
         return Some(format!(
             "{} is a legacy qcow2 instance: its snapshots live inside the disk rather \

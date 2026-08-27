@@ -1,0 +1,15 @@
+astd: /private/tmp/ast-fork-39650 was mode 0755 — other users on this machine could read                  it; it is 0700 now
+astd: stamped /private/tmp/ast-fork-39650 as Asterism 0.0.2 (protocol 18)
+astd 0.0.2: listening on /private/tmp/ast-fork-39650/astd.sock
+astd: device ec1c6d31517f on the mesh as "macbook-pro.tail0de304.ts.net"
+astd: relay meter at /private/tmp/ast-fork-39650/relay-meter.json: 0 peer(s), 0 B relayed since unix 1787829006
+astd: mesh is local — no relay, no directory, nothing published. Devices reach each other where a direct path already works; log in, or set ASTERISM_RELAY_URL, to go further.
+astd: automatic snapshots every 1h, kept 6h (per-instance: ast rewind <name> --every)
+astd: bot received 192.168.64.35 from Virtualization.framework's DHCP network
+astd: bot-1 received 192.168.64.39 from Virtualization.framework's DHCP network
+astd: bot-2 received 192.168.64.40 from Virtualization.framework's DHCP network
+astd: bot-3 received 192.168.64.41 from Virtualization.framework's DHCP network
+astd: holding this device awake (IOKit PreventUserIdleSystemSleep)
+astd: bot received 192.168.64.35 from Virtualization.framework's DHCP network
+astd: bot received 192.168.64.35 from Virtualization.framework's DHCP network
+astd: shutting down

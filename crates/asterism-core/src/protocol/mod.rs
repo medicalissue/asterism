@@ -453,6 +453,45 @@ pub enum Request {
         reset: bool,
     },
 
+    // ---- fork ----------------------------------------------------------------
+    //
+    // The same copy-on-write clone, pointed sideways: a snapshot of the
+    // parent becomes N new instances instead of the parent's own past. All
+    // three are addressed to the instance the user named, so they route to
+    // the device supplying its compute — a fork lives where its parent does.
+    /// Clone a running instance into `count` new ones.
+    Fork {
+        /// The instance to clone. The forks are named after it.
+        name: String,
+        count: usize,
+        /// One message per fork, or none: what each was told to try.
+        #[serde(default)]
+        each: Vec<String>,
+        /// Leave the forks defined rather than booting them.
+        #[serde(default)]
+        stopped: bool,
+        /// Accept more forks than [`crate::fork::SOFT_LIMIT`].
+        #[serde(default)]
+        yes: bool,
+    },
+    /// Summarise what a fork has changed in its primary volume.
+    ForkDiff {
+        name: String,
+        /// Another instance, or a snapshot tag on the parent. `None` means
+        /// the snapshot this fork was taken at.
+        #[serde(default)]
+        against: Option<String>,
+    },
+    /// Put a fork's work back onto its parent and retire the siblings.
+    ///
+    /// `apply: false` computes and refuses without touching anything, which
+    /// is how the CLI gets an accurate sentence to ask the user to confirm.
+    ForkPick {
+        name: String,
+        #[serde(default)]
+        apply: bool,
+    },
+
     // ---- the console, and the way in -----------------------------------------
     /// The last `lines` lines of an instance's guest console.
     ///
@@ -951,6 +990,9 @@ impl Request {
             | Request::RewindTimeline { name }
             | Request::Rewind { name, .. }
             | Request::RewindSettings { name, .. }
+            | Request::Fork { name, .. }
+            | Request::ForkDiff { name, .. }
+            | Request::ForkPick { name, .. }
             | Request::Logs { name, .. }
             | Request::Exec { name, .. }
             | Request::GpuGuestOpen { name }
@@ -1092,6 +1134,7 @@ impl Request {
             Request::RewindTimeline { .. }
             | Request::Rewind { .. }
             | Request::RewindSettings { .. } => 15,
+            Request::Fork { .. } | Request::ForkDiff { .. } | Request::ForkPick { .. } => 18,
             Request::BackupImportV2 { .. } => 11,
             Request::BackupExport { .. } | Request::BackupImport { .. } => 3,
             Request::AttachStorage { .. }
@@ -1172,6 +1215,9 @@ impl Request {
             Request::OpenPort { .. } => Some("open_port"),
             Request::ContainerExec { .. } => Some("container_exec"),
             Request::Exec { .. } => Some("exec"),
+            Request::Fork { .. } => Some("fork"),
+            Request::ForkDiff { .. } => Some("fork_diff"),
+            Request::ForkPick { .. } => Some("fork_pick"),
             Request::GpuGuestOpen { .. }
             | Request::GpuGuestFrame { .. }
             | Request::GpuGuestClose => Some("gpu_guest"),
@@ -1324,6 +1370,21 @@ pub enum Response {
     /// Reply to [`Request::Rewind`].
     Rewound {
         report: crate::rewind::Report,
+    },
+
+    // ---- fork ----------------------------------------------------------------
+    /// Reply to [`Request::Fork`].
+    Forked {
+        report: crate::fork::Report,
+    },
+    /// Reply to [`Request::ForkDiff`].
+    ForkDiff {
+        diff: crate::fork::Diff,
+    },
+    /// Reply to [`Request::ForkPick`] — the plan when it was asked for
+    /// without `apply`, and what happened when it was not.
+    Picked {
+        pick: crate::fork::Pick,
     },
 
     // ---- the console, and the way in -----------------------------------------
@@ -1678,6 +1739,7 @@ impl Response {
             Response::Cost { .. } => 14,
             Response::RewindTimeline { .. } | Response::Rewound { .. } => 15,
             Response::OpenPort { .. } => 16,
+            Response::Forked { .. } | Response::ForkDiff { .. } | Response::Picked { .. } => 18,
             Response::Instance { instance, .. } if instance.runtime == RuntimeKind::Container => 8,
             Response::Instances { instances }
                 if instances
@@ -1735,6 +1797,17 @@ pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
             "rewind",
             Request::RewindTimeline {
                 name: String::new(),
+            }
+            .since(),
+        ),
+        (
+            "fork",
+            Request::Fork {
+                name: String::new(),
+                count: 1,
+                each: Vec::new(),
+                stopped: false,
+                yes: false,
             }
             .since(),
         ),

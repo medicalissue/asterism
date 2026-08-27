@@ -63,6 +63,7 @@ mod cost;
 mod credential;
 mod device_shell;
 mod egress;
+mod fork;
 mod gpu;
 mod hosted;
 mod images;
@@ -1243,6 +1244,9 @@ pub(crate) async fn handle(req: Request, node: &Node) -> Response {
     }
     if rewind::claims(&req) {
         return rewind::serve(req, &mut reg).await;
+    }
+    if fork::claims(&req) {
+        return fork::serve(req, &mut reg, &cpu_device).await;
     }
     instance::serve(req, &mut reg, &cpu_device).await
 }

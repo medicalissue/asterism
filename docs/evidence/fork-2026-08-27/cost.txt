@@ -1,0 +1,4 @@
+df around the whole fork of bot into 3: 29588 KiB (noisy — includes three
+guest boots and any other writer on this filesystem; has come out negative)
+ast fork wall clock: 9227 ms
+the honest clone cost is the figure ast fork prints for itself

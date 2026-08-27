@@ -35,6 +35,7 @@ pub mod doctor;
 pub mod durable;
 pub mod egress_door;
 pub mod fix;
+pub mod fork;
 pub mod guest;
 pub mod hosted_auth;
 pub mod hv;

@@ -1,0 +1,2 @@
+bot ← bot-2 (/work replaced; bot-1, bot-3 removed)
+the /work it replaced is kept as "before-pick" — `ast rewind bot --to before-pick` undoes this

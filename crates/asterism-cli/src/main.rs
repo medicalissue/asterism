@@ -436,6 +436,68 @@ enum Command {
         #[arg(long)]
         include_memory: bool,
     },
+    /// Clone a running agent's machine, so several approaches run at once.
+    ///
+    /// One agent becomes five. Each fork is a copy-on-write clone of the
+    /// instance exactly as it is right now — same disk, same working
+    /// directory, same secrets — booted beside it under its own name, its own
+    /// hostname and its own guest key. The parent keeps running.
+    ///
+    ///   ast fork bot --n 3
+    ///
+    ///   ast fork bot --n 3 --each "rewrite the parser" "patch the tokenizer" "add a fallback"
+    ///
+    ///   ast fork bot --stopped         clone without booting
+    ///
+    /// `ast diff <fork>` says what each one changed and `ast pick <fork>`
+    /// puts the winner's work back onto the parent. Forks publish no ports:
+    /// a host port is one number on one device.
+    Fork {
+        /// The instance to clone. The forks are named after it.
+        name: String,
+        /// How many. Names are taken from `<instance>-1` upwards, skipping
+        /// any already spoken for.
+        #[arg(long = "n", value_name = "COUNT", default_value_t = 2)]
+        count: usize,
+        /// What each fork should try — one message per fork, in order.
+        #[arg(long, value_name = "MSG", num_args = 1.., value_delimiter = None)]
+        each: Vec<String>,
+        /// Clone without booting.
+        #[arg(long)]
+        stopped: bool,
+        /// Accept more than nine forks without being asked again.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// What a fork has changed since it was cloned.
+    ///
+    ///   ast diff bot-2                      against the fork point
+    ///
+    ///   ast diff bot-2 --against bot        against the parent right now
+    ///
+    /// Counted with `git` when the volume is a repository, so a rebuilt
+    /// target directory does not read as a thousand changed files.
+    Diff {
+        /// The fork to summarise.
+        name: String,
+        /// Another instance, or a snapshot of the parent, instead of the
+        /// snapshot this fork was cloned from.
+        #[arg(long, value_name = "INSTANCE|SNAPSHOT")]
+        against: Option<String>,
+    },
+    /// Keep one fork's work and retire the rest.
+    ///
+    /// The parent's working volume is replaced with this fork's, the parent's
+    /// own disk is left where it is, and the sibling forks are removed. What
+    /// was replaced is kept as the snapshot `before-pick`, so
+    /// `ast rewind <parent> --to before-pick` undoes the whole thing.
+    Pick {
+        /// The fork that won.
+        name: String,
+        /// Do not ask before replacing the parent's working volume.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Export, inspect and restore portable content-addressed backups.
     #[command(subcommand)]
     Backup(BackupCommand),
@@ -1645,6 +1707,17 @@ fn run() -> Result<()> {
                 device.as_deref(),
             )
         }
+        Command::Fork {
+            name,
+            count,
+            each,
+            stopped,
+            yes,
+        } => return fork(&name, count, each, stopped, yes, device.as_deref()),
+        Command::Diff { name, against } => {
+            return fork_diff(&name, against.as_deref(), device.as_deref())
+        }
+        Command::Pick { name, yes } => return pick(&name, yes, device.as_deref()),
         Command::Backup(BackupCommand::Export { name, destination }) => Request::BackupExport {
             name,
             destination: absolute_path(&destination)?.display().to_string(),
@@ -1985,6 +2058,10 @@ fn run() -> Result<()> {
         // `ast rewind` prints its own timeline and its own report.
         | Response::RewindTimeline { .. }
         | Response::Rewound { .. }
+        // `ast fork`, `ast diff` and `ast pick` each print their own line.
+        | Response::Forked { .. }
+        | Response::ForkDiff { .. }
+        | Response::Picked { .. }
         | Response::Log { .. }
         | Response::ContainerExec { .. }
         | Response::Exec { .. }
@@ -4613,6 +4690,142 @@ fn print_timeline(request: &Request, usage: bool) -> Result<()> {
     Ok(())
 }
 
+// ---- fork ------------------------------------------------------------------
+
+/// `ast fork` — one agent becomes five.
+fn fork(
+    name: &str,
+    count: usize,
+    each: Vec<String>,
+    stopped: bool,
+    yes: bool,
+    device: Option<&str>,
+) -> Result<()> {
+    // Kept, because the daemon answers with what it made and this is what
+    // each of them was made to try: the two are zipped below to deliver the
+    // instructions into the sessions.
+    let instructions = each.clone();
+    let request = aimed(
+        Request::Fork {
+            name: name.into(),
+            count,
+            each,
+            stopped,
+            yes,
+        },
+        device,
+    );
+    let report = match send(&request)? {
+        Response::Forked { report } => report,
+        // Every refusal a fork can produce is about the parent — what it is,
+        // how many of it were asked for, whether this disk can hold them —
+        // and the next thing to look at is the instance itself.
+        Response::Error { message } => {
+            return Err(anyhow::Error::new(fix::Fixable::new(
+                message,
+                fix::Fix::new(format!("ast status {name}")),
+            )))
+        }
+        other => bail!("unexpected reply from astd: {other:?}"),
+    };
+    println!("{}", report.render());
+    // The instruction goes into the agent's own session, where a person
+    // sitting at `ast session <fork>` would have typed it — so the fork's
+    // agent reads it in the context it was cloned with, rather than only
+    // finding a file if it thinks to look. A fork of a plain instance has no
+    // session, and its note is the file in its working volume.
+    //
+    // After the report is printed, not before: the forks exist and are
+    // booting whether or not a message lands, and the line saying so should
+    // not wait on a tmux server coming up.
+    if !stopped && device.is_none() {
+        for (child, message) in report.children.iter().zip(instructions.iter()) {
+            match agent::tell(child, message) {
+                Ok(true) => println!("{child} was told: {message}"),
+                Ok(false) => {}
+                Err(error) => eprintln!(
+                    "{child} was not told what to try: {error:#} — it is in \
+                     `ast ls`, and in {} in its own volume",
+                    asterism_core::fork::NOTE_FILE
+                ),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `ast diff` — what one fork changed.
+fn fork_diff(name: &str, against: Option<&str>, device: Option<&str>) -> Result<()> {
+    let request = aimed(
+        Request::ForkDiff {
+            name: name.into(),
+            against: against.map(ToOwned::to_owned),
+        },
+        device,
+    );
+    match send(&request)? {
+        Response::ForkDiff { diff } => println!("{}", diff.render()),
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected reply from astd: {other:?}"),
+    }
+    Ok(())
+}
+
+/// `ast pick` — keep one fork's work and retire the rest.
+///
+/// Two round trips on purpose. The first asks the daemon what it would do and
+/// gets back the exact sentence — which parent, which volume, which siblings
+/// — and that sentence is what the user agrees to. A confirmation that
+/// describes something slightly different from what happens is how a
+/// destructive command loses the right to ask.
+fn pick(name: &str, yes: bool, device: Option<&str>) -> Result<()> {
+    let plan = match send(&aimed(
+        Request::ForkPick {
+            name: name.into(),
+            apply: false,
+        },
+        device,
+    ))? {
+        Response::Picked { pick } => pick,
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected reply from astd: {other:?}"),
+    };
+    if !yes {
+        print!("{}   [confirm: y] ", plan.render());
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        // A pipe with nothing in it is not a yes. Somebody scripting this
+        // says so with `--yes`.
+        if std::io::stdin().read_line(&mut answer)? == 0
+            || !matches!(answer.trim(), "y" | "Y" | "yes" | "YES")
+        {
+            bail!("nothing was replaced");
+        }
+    }
+    match send(&aimed(
+        Request::ForkPick {
+            name: name.into(),
+            apply: true,
+        },
+        device,
+    ))? {
+        Response::Picked { pick } => {
+            if yes {
+                println!("{}", pick.render());
+            } else {
+                // The plan line is already on the screen above the prompt;
+                // print only what the prompt could not say in advance.
+                for line in pick.render().lines().skip(1) {
+                    println!("{line}");
+                }
+            }
+        }
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected reply from astd: {other:?}"),
+    }
+    Ok(())
+}
+
 // ---- bootstrap profiles ----------------------------------------------------
 
 /// `ast profiles` — what this Asterism knows how to make a guest into.
@@ -6007,10 +6220,31 @@ fn print_table(rows: &[OrbitRow]) {
     // the whole table rather than once per row. A device that cannot answer
     // leaves the column empty; see `today_by_instance`.
     let today = today_by_instance();
-    println!(
-        "{:<14} {:<9} {:<14} {:<16} {:<12} {:<6} {:<8} ACCESS",
-        "NAME", "STATUS", "IMAGE", "SHAPE", "COMPUTE", "AGE", "TODAY"
-    );
+    // NOTE is only a column when there is something to put in it. The table
+    // is already eight columns wide and every instance in most orbits is not
+    // a fork; adding an empty ninth to every listing to carry provenance for
+    // the three rows that have it would cost every other reader a wrapped
+    // line. So ACCESS stays the last column until a fork appears, and then
+    // gets a width and lets NOTE past it.
+    let offset = rewind::local_offset(now_unix());
+    let notes: std::collections::BTreeMap<&str, String> = rows
+        .iter()
+        .filter_map(|row| {
+            let origin = row.instance.fork_of.as_ref()?;
+            Some((row.instance.name.as_str(), origin.line(offset)))
+        })
+        .collect();
+    if notes.is_empty() {
+        println!(
+            "{:<14} {:<9} {:<14} {:<16} {:<12} {:<6} {:<8} ACCESS",
+            "NAME", "STATUS", "IMAGE", "SHAPE", "COMPUTE", "AGE", "TODAY"
+        );
+    } else {
+        println!(
+            "{:<14} {:<9} {:<14} {:<16} {:<12} {:<6} {:<8} {:<21} NOTE",
+            "NAME", "STATUS", "IMAGE", "SHAPE", "COMPUTE", "AGE", "TODAY", "ACCESS"
+        );
+    }
     let mut stale = false;
     let mut conflicts = Vec::new();
     for row in rows {
@@ -6052,17 +6286,35 @@ fn print_table(rows: &[OrbitRow]) {
             .get(&inst.name)
             .map(|usd| money(*usd))
             .unwrap_or_else(|| "-".into());
-        println!(
-            "{:<14} {:<9} {:<14} {:<16} {:<12} {:<6} {:<8} {}",
-            inst.name,
-            status,
-            short_image(inst.image.as_deref().unwrap_or("-")),
-            shape,
-            inst.compute_device(),
-            age(inst.created_at),
-            spend,
-            access,
-        );
+        if notes.is_empty() {
+            println!(
+                "{:<14} {:<9} {:<14} {:<16} {:<12} {:<6} {:<8} {}",
+                inst.name,
+                status,
+                short_image(inst.image.as_deref().unwrap_or("-")),
+                shape,
+                inst.compute_device(),
+                age(inst.created_at),
+                spend,
+                access,
+            );
+        } else {
+            println!(
+                "{:<14} {:<9} {:<14} {:<16} {:<12} {:<6} {:<8} {:<21} {}",
+                inst.name,
+                status,
+                short_image(inst.image.as_deref().unwrap_or("-")),
+                shape,
+                inst.compute_device(),
+                age(inst.created_at),
+                spend,
+                access,
+                notes
+                    .get(inst.name.as_str())
+                    .map(String::as_str)
+                    .unwrap_or("-"),
+            );
+        }
     }
     if stale {
         println!("\nunknown: the device supplying that instance's compute is out of touch");
