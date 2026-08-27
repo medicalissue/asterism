@@ -156,7 +156,7 @@ fn proxied_image_request_uses_its_inner_protocol_floor() {
 
         let output = Command::new(env!("CARGO_BIN_EXE_ast"))
             .env("ASTERISM_HOME", home.path())
-            .args(["--device", "nas", "images"])
+            .args(["images", "--on", "nas"])
             .output()
             .unwrap();
         if protocol == 5 {

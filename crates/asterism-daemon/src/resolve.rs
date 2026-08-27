@@ -31,6 +31,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Result};
 
+use asterism_core::names;
 use asterism_core::open;
 use asterism_core::protocol::Response;
 use asterism_core::registry::OrbitRow;
@@ -45,6 +46,67 @@ pub(crate) enum Located {
     Here,
     /// Another device does, and it is answering right now.
     On(String),
+    /// The name is a *device* in this orbit rather than an instance.
+    ///
+    /// Only [`resolve`] ever returns this. The instance-addressed commands
+    /// call [`locate`], which refuses a device name rather than pretending
+    /// there is a guest behind it.
+    Device(String),
+}
+
+/// What one bare name means in this orbit — the whole namespace, in one call.
+///
+/// [`locate`] answers "where is this instance"; this answers the question in
+/// front of it, "what is this". They are separate because most commands are
+/// only ever about instances and should refuse a device name with the same
+/// sentence as any other name that is not an instance. `ast ssh` is the
+/// exception that motivates this one: it is two entirely different
+/// operations, chosen by what the name turns out to be.
+///
+/// Instances are looked up first, and that ordering is free rather than a
+/// tie-break: a name cannot be both. `claim` refuses an instance named after
+/// a device and pairing refuses a device named after an instance, so by the
+/// time anything is asked here the namespace has one entry per name.
+pub(crate) async fn resolve(name: &str, node: &Node, mesh: Option<&Arc<Mesh>>) -> Result<Located> {
+    let local = {
+        let mut reg = node.shard.lock().await;
+        instance::reconcile(&mut reg);
+        reg.get(name).ok().cloned()
+    };
+    if local.is_some() {
+        return Ok(Located::Here);
+    }
+    let myself = node.device_name().await;
+    if myself == name {
+        return Ok(Located::Device(name.to_owned()));
+    }
+
+    // No mesh: this device is the whole orbit, so the only device name there
+    // is is its own, and the only instances are the ones it holds.
+    let Some(mesh) = mesh else {
+        let mine = {
+            let reg = node.shard.lock().await;
+            let mut names: Vec<String> = reg.list().into_iter().map(|held| held.name).collect();
+            names.sort();
+            names
+        };
+        bail!(names::unknown_name(name, &[myself], &mine));
+    };
+    let devices = mesh.device_names().await;
+    if devices.iter().any(|device| device == name) {
+        return Ok(Located::Device(name.to_owned()));
+    }
+
+    let rows = orbit_rows(node, mesh).await?;
+    let Some(row) = rows.iter().find(|row| row.instance.name == name) else {
+        bail!(names::unknown_name(name, &devices, &names_of(&rows)));
+    };
+    let device = row.instance.cpu_device.clone();
+    if !row.live {
+        let seen = mesh.last_seen(&device).await.map(age_of);
+        bail!(open::device_offline(&device, seen, name));
+    }
+    Ok(Located::On(device))
 }
 
 /// Find `name` anywhere in this orbit: this device first, then every peer.
@@ -77,13 +139,9 @@ pub(crate) async fn locate(
         bail!(open::unknown_instance(name, &[]));
     };
 
-    let rows = match mesh.orbit_registry(node).await? {
-        Response::Orbit { rows } => rows,
-        Response::Error { message } => bail!(message),
-        other => bail!("the orbit registry answered with {other:?}"),
-    };
+    let rows = orbit_rows(node, mesh).await?;
     let Some(row) = rows.iter().find(|row| row.instance.name == name) else {
-        bail!(open::unknown_instance(name, &names(&rows)));
+        bail!(open::unknown_instance(name, &names_of(&rows)));
     };
     let device = row.instance.cpu_device.clone();
     if !row.live {
@@ -93,9 +151,18 @@ pub(crate) async fn locate(
     Ok(Located::On(device))
 }
 
+/// The assembled orbit registry, or the refusal that assembling it produced.
+async fn orbit_rows(node: &Node, mesh: &Arc<Mesh>) -> Result<Vec<OrbitRow>> {
+    match mesh.orbit_registry(node).await? {
+        Response::Orbit { rows } => Ok(rows),
+        Response::Error { message } => bail!(message),
+        other => bail!("the orbit registry answered with {other:?}"),
+    }
+}
+
 /// Every instance name in the orbit, sorted and deduplicated, for the
 /// "unknown instance" refusal to list.
-fn names(rows: &[OrbitRow]) -> Vec<String> {
+fn names_of(rows: &[OrbitRow]) -> Vec<String> {
     let mut names: Vec<String> = rows.iter().map(|row| row.instance.name.clone()).collect();
     names.sort();
     names.dedup();
@@ -134,7 +201,7 @@ mod tests {
     #[test]
     fn the_orbits_names_are_sorted_and_unique() {
         let rows = vec![row("web", true), row("bot", true), row("web", false)];
-        assert_eq!(names(&rows), vec!["bot".to_owned(), "web".to_owned()]);
+        assert_eq!(names_of(&rows), vec!["bot".to_owned(), "web".to_owned()]);
     }
 
     #[test]

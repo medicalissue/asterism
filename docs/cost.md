@@ -30,7 +30,7 @@ $ ast cost bot --json
 {"instance":"bot","window":"today","since":1756272000,"usd":4.12,...}
 
 $ ast ls
-NAME   STATUS   IMAGE  SHAPE  COMPUTE  AGE  TODAY  ACCESS
+NAME   STATUS   IMAGE  SHAPE  DEVICE   AGE  TODAY  ACCESS
 bot    running  ...                         $4.12  ...
 ```
 

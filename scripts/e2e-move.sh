@@ -405,7 +405,7 @@ echo "ok: A's copy and A's row are both gone"
 # instance", which would be true of that shard and useless to a human. Asked
 # from B, because a device does not list itself among its peers.
 refute "A says where it went if asked directly" "moved to $B_NAME" \
-  env ASTERISM_HOME="$B" "$AST" --device "$A_NAME" status "$INST"
+  env ASTERISM_HOME="$B" "$AST" status "$INST"
 
 # The move epoch is on the row that landed.
 expect "the row carries a move epoch" "moves:   1" \

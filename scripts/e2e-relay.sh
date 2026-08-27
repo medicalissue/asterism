@@ -206,8 +206,8 @@ echo "ok: two devices paired with a relay as the only path between them"
 # Enough round trips that the byte counters are unmistakably non-zero and the
 # ±5% comparison at the end is not dominated by a single packet.
 for _ in $(seq 1 20); do
-  ASTERISM_HOME="$B" "$AST" --device "$A_NAME" ls >/dev/null 2>&1 || true
-  ASTERISM_HOME="$A" "$AST" --device "$B_NAME" ls >/dev/null 2>&1 || true
+  ASTERISM_HOME="$B" "$AST" ping "$A_NAME" >/dev/null 2>&1 || true
+  ASTERISM_HOME="$A" "$AST" ping "$B_NAME" >/dev/null 2>&1 || true
 done
 
 # ---- 4. what the devices say -------------------------------------------------
@@ -277,7 +277,7 @@ echo "ok: the meter file records device ids and integers, no addresses"
 
 start_daemon "$B"
 for _ in $(seq 1 10); do
-  ASTERISM_HOME="$B" "$AST" --device "$A_NAME" ls >/dev/null 2>&1 || true
+  ASTERISM_HOME="$B" "$AST" ping "$A_NAME" >/dev/null 2>&1 || true
 done
 ASTERISM_HOME="$B" "$AST" ping "$A_NAME" >/dev/null 2>&1 || true
 stop_daemon "$B"
@@ -334,8 +334,8 @@ D0=$(( $(live_relayed "$A") + $(live_relayed "$B") ))
 R0="$(relay_forwarded)"
 
 for _ in $(seq 1 40); do
-  ASTERISM_HOME="$B" "$AST" --device "$A_NAME" ls >/dev/null 2>&1 || true
-  ASTERISM_HOME="$A" "$AST" --device "$B_NAME" ls >/dev/null 2>&1 || true
+  ASTERISM_HOME="$B" "$AST" ping "$A_NAME" >/dev/null 2>&1 || true
+  ASTERISM_HOME="$A" "$AST" ping "$B_NAME" >/dev/null 2>&1 || true
 done
 
 D1=$(( $(live_relayed "$A") + $(live_relayed "$B") ))

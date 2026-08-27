@@ -35,7 +35,7 @@ const GRANT_DEADLINE: Duration = Duration::from_secs(15 * 60);
 /// experience: a device that is already signed in should not make a human
 /// sign in again; a provider with a device flow should not make them paste;
 /// a provider with neither is asked for.
-pub(crate) fn login(provider_name: &str, part: Option<String>, device: Option<&str>) -> Result<()> {
+pub(crate) fn login(provider_name: &str, part: Option<String>) -> Result<()> {
     let provider = require(provider_name)?;
     let login = provider.login.as_ref().ok_or_else(|| {
         anyhow!(
@@ -79,7 +79,6 @@ pub(crate) fn login(provider_name: &str, part: Option<String>, device: Option<&s
         PartKind::Login,
         provider,
         SecretValue::new(token.as_bytes().to_vec()),
-        device,
     )?;
     match who {
         Some(who) => println!(
@@ -107,7 +106,6 @@ pub(crate) fn oauth_add(
     client_id: Option<String>,
     client_secret_from_stdin: bool,
     part: Option<String>,
-    device: Option<&str>,
 ) -> Result<()> {
     let provider = require(provider_name)?;
     let spec = provider.oauth.as_ref().ok_or_else(|| {
@@ -213,7 +211,6 @@ pub(crate) fn oauth_add(
         PartKind::OAuth,
         provider,
         SecretValue::new(bytes.to_vec()),
-        device,
     )?;
     match account {
         Some(who) => println!(
@@ -783,17 +780,17 @@ fn open_browser(url: &str) -> Result<()> {
 /// The same frame `ast secret create` sends, with the kind and the provider
 /// on it. From here the part is a part: the store, the handle grammar, the
 /// merge rules and the revocation are all the ones that already existed.
-fn store(
-    name: &str,
-    kind: PartKind,
-    provider: &Provider,
-    value: SecretValue,
-    device: Option<&str>,
-) -> Result<()> {
+/// Writes a credential part into this device's store.
+///
+/// Always this one: a token that was just minted in this process's own
+/// browser or `gh` lives here, and the orbit reads it from here. Which device
+/// resolves a part at boot is the instance's business — `ast attach --from` —
+/// and not the sign-in's.
+fn store(name: &str, kind: PartKind, provider: &Provider, value: SecretValue) -> Result<()> {
     let request = Request::SecretCreate {
         name: name.to_owned(),
         value,
-        source_device: device.map(str::to_owned),
+        source_device: None,
         kind,
         provider: Some(provider.name.clone()),
     };

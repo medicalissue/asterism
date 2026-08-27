@@ -569,6 +569,16 @@ mod tests {
         );
     }
 
+    /// `taken` is the whole namespace, not only the instances in it. A
+    /// device called `bot-2` would make `ast ssh bot-2` mean two things, and
+    /// a name generator has nobody to refuse — so it steps over the name.
+    /// The caller supplies the device names; see `fork::held` in the daemon.
+    #[test]
+    fn a_fork_steps_over_a_name_a_device_in_the_orbit_answers_to() {
+        let held = taken(&["bot", "bot-2", "bot-3"]);
+        assert_eq!(allocate("bot", 2, &held).unwrap(), vec!["bot-1", "bot-4"]);
+    }
+
     /// The whole reason numbers are skipped rather than reused: forking a
     /// second time while the first three are still running has to produce
     /// three more machines, not a refusal and not a collision.

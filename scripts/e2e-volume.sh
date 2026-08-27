@@ -391,14 +391,14 @@ refute "a volume nobody has is missing from this device" "on this device" \
   env ASTERISM_HOME="$B" "$AST" volume rm ghost
 
 # A sees the same part without querying B as a separate computer. The provider
-# remains explicit on the row, and `--device` still offers the provider-local
+# remains explicit on the row, and `--on` still offers the provider-local
 # administrative view.
 expect "A sees B's volume in one orbit catalog" "$B_NAME" \
   env ASTERISM_HOME="$A" "$AST" volume ls
 expect "A's catalog reports the remote access path" "single-writer" \
   env ASTERISM_HOME="$A" "$AST" volume ls
 expect "provider-local administration remains available" "$VOL" \
-  env ASTERISM_HOME="$A" "$AST" --device "$B_NAME" volume ls
+  env ASTERISM_HOME="$A" "$AST" volume ls --on "$B_NAME"
 
 # ---- 3. an instance on A, attaching B's volume -----------------------------
 
@@ -462,7 +462,7 @@ echo "ok: attach records a disk after $ATTEMPT measured attempt(s) and says the 
 [ "$(holder_now)" = "$INST" ] || fail "B does not think $INST holds the lease"
 E1="$(epoch_now)"
 [ "$E1" = "1" ] || fail "the first lease should be epoch 1, got $E1"
-LS_HELD="$(ASTERISM_HOME="$A" "$AST" --device "$B_NAME" volume ls 2>&1)"
+LS_HELD="$(ASTERISM_HOME="$A" "$AST" volume ls --on "$B_NAME" 2>&1)"
 grep -qF "$INST on $A_NAME (epoch 1)" <<<"$LS_HELD" \
   || fail "volume ls does not name the holder:"$'\n'"$LS_HELD"
 echo "ok: the lease is on B at epoch 1, naming $INST on $A_NAME"

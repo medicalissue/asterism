@@ -100,30 +100,30 @@ A_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["devices
 echo "ok: paired two real daemons"
 
 # Disabled is fail-closed, and policy control itself is local-only.
-refute "fresh target refuses a remote shell" "disabled" env ASTERISM_HOME="$A" "$AST" ssh --host "$B_NAME" -- "printf forbidden"
-refute "a peer cannot remotely enable the target" "cannot be aimed" env ASTERISM_HOME="$A" "$AST" --device "$B_NAME" device shell enable
+refute "fresh target refuses a remote shell" "disabled" env ASTERISM_HOME="$A" "$AST" ssh "$B_NAME" -- "printf forbidden"
+refute "there is no way to aim policy at a peer" "--device is gone" env ASTERISM_HOME="$A" "$AST" --device "$B_NAME" device shell enable
 
 ASTERISM_HOME="$B" "$AST" device shell enable >"$B/enable.out"
 grep -q "full authority" "$B/enable.out" || fail "enable did not disclose account authority"
 echo "ok: target accepted local approval with an explicit warning"
 
 # Non-PTY output and exact exit status.
-OUT="$(ASTERISM_HOME="$A" "$AST" ssh --host "$B_NAME" -- "printf mesh-ok")"
+OUT="$(ASTERISM_HOME="$A" "$AST" ssh "$B_NAME" -- "printf mesh-ok")"
 [ "$OUT" = "mesh-ok" ] || fail "remote command output was $OUT"
-ASTERISM_HOME="$A" "$AST" ssh --host "$B_NAME" -- \
+ASTERISM_HOME="$A" "$AST" ssh "$B_NAME" -- \
   "printf stdout-ok; printf stderr-ok >&2" >"$A/stdout.out" 2>"$A/stderr.out"
 [ "$(cat "$A/stdout.out")" = "stdout-ok" ] || fail "remote stdout was not kept separate"
 [ "$(cat "$A/stderr.out")" = "stderr-ok" ] || fail "remote stderr was not kept separate"
-ASTERISM_HOME="$A" "$AST" ssh --host "$B_NAME" -- \
+ASTERISM_HOME="$A" "$AST" ssh "$B_NAME" -- \
   "dd if=/dev/zero bs=65536 count=2 2>/dev/null" >"$A/large-output.bin"
 [ "$(wc -c <"$A/large-output.bin" | tr -d ' ')" -eq 131072 ] || \
   fail "large remote output did not cross multiple bounded frames"
 LARGE_INPUT_COUNT="$(dd if=/dev/zero bs=65536 count=2 2>/dev/null | \
-  ASTERISM_HOME="$A" "$AST" ssh --host "$B_NAME" -- "wc -c")"
+  ASTERISM_HOME="$A" "$AST" ssh "$B_NAME" -- "wc -c")"
 [ "$(tr -d ' ' <<<"$LARGE_INPUT_COUNT")" -eq 131072 ] || \
   fail "large stdin did not cross multiple bounded frames"
 set +e
-ASTERISM_HOME="$A" "$AST" ssh --host "$B_NAME" -- "exit 23" >/dev/null 2>&1
+ASTERISM_HOME="$A" "$AST" ssh "$B_NAME" -- "exit 23" >/dev/null 2>&1
 STATUS=$?
 set -e
 [ "$STATUS" -eq 23 ] || fail "remote exit 23 became $STATUS"
@@ -131,10 +131,11 @@ echo "ok: command output and exit status crossed the mesh"
 
 # A forced PTY is a real terminal. A non-interactive caller has the documented
 # 80x24 fallback; the unit test exercises a live resize to 94x42.
-PTY_OUT="$(ASTERISM_HOME="$A" "$AST" ssh --host "$B_NAME" -t -- "stty size")"
-tr -d '' <<<"$PTY_OUT" | grep -q "24 80" || fail "remote pty reported $PTY_OUT"
+PTY_OUT="$(ASTERISM_HOME="$A" "$AST" ssh "$B_NAME" -t -- "stty size")"
+tr -d '
+' <<<"$PTY_OUT" | grep -q "24 80" || fail "remote pty reported $PTY_OUT"
 INTERACTIVE_OUT="$(printf 'test -t 0 && echo interactive-ok\nexit\n' | \
-  ASTERISM_HOME="$A" "$AST" ssh --host "$B_NAME" -t)"
+  ASTERISM_HOME="$A" "$AST" ssh "$B_NAME" -t)"
 tr -d '\r' <<<"$INTERACTIVE_OUT" | grep -q "interactive-ok" || \
   fail "interactive shell did not receive a controlling pty: $INTERACTIVE_OUT"
 echo "ok: forced command and interactive shell received a real pty"
@@ -145,7 +146,7 @@ assert_no_tcp_listener
 echo "ok: device shell opened no TCP listener"
 
 # Disable linearizes before it drains and kills a tracked process group.
-ASTERISM_HOME="$A" "$AST" ssh --host "$B_NAME" -- "sleep 30" >/dev/null 2>"$A/disabled-session.out" &
+ASTERISM_HOME="$A" "$AST" ssh "$B_NAME" -- "sleep 30" >/dev/null 2>"$A/disabled-session.out" &
 SESSION_PID=$!
 harness_own "$SESSION_PID"
 for _ in $(seq 1 100); do
@@ -162,12 +163,12 @@ STATUS=$?
 set -e
 [ "$STATUS" -ne 0 ] || fail "the revoked session reported success"
 assert_no_tcp_listener
-refute "disabled target refuses a new stream" "disabled" env ASTERISM_HOME="$A" "$AST" ssh --host "$B_NAME" -- "printf forbidden"
+refute "disabled target refuses a new stream" "disabled" env ASTERISM_HOME="$A" "$AST" ssh "$B_NAME" -- "printf forbidden"
 echo "ok: disable revoked an active process group and blocked new opens"
 
 # Re-enable, then prove peer removal has the same live-session effect.
 ASTERISM_HOME="$B" "$AST" device shell enable >/dev/null
-ASTERISM_HOME="$A" "$AST" ssh --host "$B_NAME" -- "sleep 30" >/dev/null 2>"$A/removed-session.out" &
+ASTERISM_HOME="$A" "$AST" ssh "$B_NAME" -- "sleep 30" >/dev/null 2>"$A/removed-session.out" &
 SESSION_PID=$!
 harness_own "$SESSION_PID"
 for _ in $(seq 1 100); do
@@ -181,7 +182,7 @@ wait "$SESSION_PID"
 STATUS=$?
 set -e
 [ "$STATUS" -ne 0 ] || fail "peer removal left its session successful"
-refute "removed peer cannot reuse its authenticated connection" "not in this orbit" env ASTERISM_HOME="$A" "$AST" ssh --host "$B_NAME" -- "printf forbidden"
+refute "removed peer cannot reuse its authenticated connection" "not in this orbit" env ASTERISM_HOME="$A" "$AST" ssh "$B_NAME" -- "printf forbidden"
 assert_no_tcp_listener
 echo "ok: peer removal revoked its active session and stale connection"
 

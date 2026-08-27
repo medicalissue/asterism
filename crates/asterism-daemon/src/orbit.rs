@@ -50,6 +50,10 @@ pub(crate) fn claims(req: &Request) -> bool {
             | Request::DeviceShellPolicy { .. }
             | Request::PairConfirm { .. }
             | Request::ListOrbit
+            // A question about the namespace itself, and therefore about
+            // both halves of it. Routing it at the instance half would refuse
+            // every device name before it could be recognised as one.
+            | Request::Resolve { .. }
     )
 }
 
@@ -59,6 +63,29 @@ pub(crate) async fn serve(req: Request, node: &Node, mesh: Option<&Arc<Mesh>>) -
         Request::Proxy { device, inner } => match mesh {
             Some(mesh) => reply_or_error(mesh.proxy(&device, *inner).await),
             None => no_mesh(),
+        },
+        // What one bare name is: `ast ssh bot` and `ast ssh studio` are the
+        // same words and two different operations, and this is where the CLI
+        // finds out which one it is holding.
+        Request::Resolve { name } => match crate::resolve::resolve(&name, node, mesh).await {
+            Ok(crate::resolve::Located::Here) => Response::Resolved {
+                kind: asterism_core::names::NameKind::Instance,
+                device: node.device_name().await,
+                name,
+            },
+            Ok(crate::resolve::Located::On(device)) => Response::Resolved {
+                kind: asterism_core::names::NameKind::Instance,
+                device,
+                name,
+            },
+            Ok(crate::resolve::Located::Device(device)) => Response::Resolved {
+                kind: asterism_core::names::NameKind::Device,
+                device,
+                name,
+            },
+            Err(e) => Response::Error {
+                message: format!("{e:#}"),
+            },
         },
         Request::Devices => match mesh {
             Some(mesh) => Response::Devices {

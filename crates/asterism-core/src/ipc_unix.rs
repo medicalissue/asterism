@@ -92,7 +92,7 @@ pub fn admit_peer(stream: &impl AsRawFd) -> Result<u32> {
 ///
 /// The same ceiling the mesh reads, because it is the same protocol: a
 /// [`crate::protocol::Request`] that one daemon may send another over a mesh
-/// stream must not be one `ast` cannot send over the socket, or `--device`
+/// stream must not be one `ast` cannot send over the socket, or a proxied
 /// would mean something different from typing the command on that device.
 pub const MAX_REQUEST_FRAME: usize = crate::protocol::MESH_FRAME_LIMIT;
 
@@ -1018,7 +1018,7 @@ mod tests {
 
     /// One protocol, one ceiling. A request a daemon may send another over
     /// the mesh must not be one `ast` cannot send over the socket, or
-    /// `--device dev` would mean something different from typing the command
+    /// a proxied frame would mean something different from typing the command
     /// on `dev`.
     #[test]
     fn the_local_frame_limit_is_the_mesh_frame_limit() {

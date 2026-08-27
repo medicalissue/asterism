@@ -45,6 +45,7 @@ pub mod instance;
 pub mod ipc;
 pub mod layout;
 pub mod ledger;
+pub mod names;
 pub mod oci;
 pub mod open;
 pub mod orbit;
