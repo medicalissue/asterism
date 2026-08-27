@@ -28,7 +28,9 @@ use anyhow::{Context, Result};
 
 use asterism_core::durable;
 use asterism_core::hv::{GuestHealth, ImageKind, RunState, STOP_DEADLINE};
-use asterism_core::instance::{local_host, Instance, Policy, Restart, RuntimeKind, Status};
+use asterism_core::instance::{
+    local_host, Instance, Policy, Restart, RestartReason, RuntimeKind, Status,
+};
 use asterism_core::profile;
 use asterism_core::protocol::{Request, Response};
 use asterism_core::registry::{self, Shard};
@@ -169,7 +171,9 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
         // `--restart` is recorded before the boot, so an instance that comes
         // up and immediately dies is already carrying the policy the user
         // asked for when the supervisor looks at the corpse.
-        Request::Up { name, restart } => return attach_response(up(reg, &name, restart)),
+        Request::Up { name, restart } => {
+            return attach_response(up(reg, &name, restart, RestartReason::User))
+        }
         // A guest being asked to shut down cleanly keeps its disks until the
         // backend proves it stopped. Only then do its local bridges and egress
         // proxy go away. A failed stop, including an unresolved launch with no
@@ -933,8 +937,29 @@ async fn claim(name: &str, node: &Node, mesh: Option<&Arc<Mesh>>) -> Result<()> 
 /// Every path that starts a guest lands here — `ast up`, the crash
 /// supervisor's restart, and resurrection after a daemon or host restart — so
 /// this is the one place publication has to be attached to.
-pub(crate) fn up(reg: &mut Shard, name: &str, restart: Option<Restart>) -> Result<Instance> {
+pub(crate) fn up(
+    reg: &mut Shard,
+    name: &str,
+    restart: Option<Restart>,
+    reason: RestartReason,
+) -> Result<Instance> {
     let running = up_guest(reg, name, restart)?;
+    // Why this guest is running is worth as much as the fact that it is, and
+    // only this call knows it. Written after the handle is committed and
+    // never allowed to fail the boot: a history is not worth a guest.
+    let running = match reg.note_restart(name, reason, persist::daemon_epoch()) {
+        Ok(noted) => match reg.save() {
+            Ok(()) => noted,
+            Err(error) => {
+                eprintln!("astd: {name} is up; its restart history did not save: {error:#}");
+                running
+            }
+        },
+        Err(error) => {
+            eprintln!("astd: {name} is up; its restart history was not recorded: {error:#}");
+            running
+        }
+    };
     // The guest exists now, and its address is known, so a failure here
     // cannot be turned into a refusal without killing a guest that came up
     // correctly. It is reported loudly instead, and stays reported: the

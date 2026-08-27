@@ -6,6 +6,13 @@
 //! Cloud Hypervisor, virtiofsd, and NBD helper — not merely find them on
 //! disk. This module reports those facts as independent checks so a human
 //! (or `ast doctor`) can see exactly which one is missing.
+//!
+//! Every row that can be anything other than `ok` also carries the command
+//! that clears it ([`Check::fix`]). That is why the probes here are split in
+//! two: a thin function that reads the machine, and a pure one that turns
+//! what it read into a [`Check`]. The pure half is what the tests drive, so
+//! "every failure names a remedy" is a property this module proves about
+//! itself rather than a habit somebody has to remember.
 
 #[cfg(any(test, target_os = "linux"))]
 use std::fs::OpenOptions;
@@ -15,7 +22,20 @@ use std::process::Command;
 
 use anyhow::{bail, Result};
 
-use crate::fix::{install_hint, Fix};
+use crate::fix::{install_hint, Fix, REINSTALL};
+
+/// Name of the macOS helper that owns Virtualization.framework guests, and
+/// the two entitlements it must be signed with.
+///
+/// They live here, rather than in `asterism-vz` where the helper's protocol
+/// is defined, because `ast doctor` has to check the signature on a host
+/// whose `ast` does not link that crate at all. `asterism_vz` re-exports
+/// these, so there is still one spelling of each.
+pub const VZ_HELPER_BIN: &str = "astd-vz";
+/// The entitlement Virtualization.framework requires to create a VM.
+pub const VZ_ENTITLEMENT: &str = "com.apple.security.virtualization";
+/// The entitlement its NBD client requires, even over `nbd+unix`.
+pub const VZ_NETWORK_CLIENT_ENTITLEMENT: &str = "com.apple.security.network.client";
 
 /// One row of `ast doctor`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,11 +43,12 @@ pub struct Check {
     pub name: &'static str,
     pub status: Status,
     pub detail: String,
-    /// What to run to clear this row, when the check knows.
+    /// What to run to clear this row.
     ///
     /// A row that names a remedy is the difference between a diagnosis and a
-    /// bug report. Most rows still say `None`; filling the rest in is
-    /// AST-163's job, and this field is the shape it fills.
+    /// bug report. `None` on an `ok` or `skip` row — there is nothing to
+    /// repair — and never on a `warn` or `fail` one, which
+    /// `every_failing_row_names_a_command_to_run` holds this module to.
     pub fix: Option<Fix>,
 }
 
@@ -211,12 +232,20 @@ fn run_probe(path: &Path, args: &[&str]) -> std::io::Result<std::process::Output
 
 #[cfg(any(test, target_os = "linux"))]
 fn probe_version_binary(name: &'static str, path: &Path, pin: &str, missing: &str) -> Check {
+    // A pinned helper is not in anybody's package repository, so every way
+    // this row can fail — absent, wrong version, unexecutable — is repaired
+    // by the installer that fetches it by digest.
+    let reinstall = || {
+        install_hint(name).unwrap_or_else(|| {
+            Fix::noted(REINSTALL, format!("{name} is a pinned Asterism component"))
+        })
+    };
     if !path.is_file() {
         return Check {
             name,
             status: Status::Fail,
             detail: format!("{missing} ({})", path.display()),
-            fix: None,
+            fix: Some(reinstall()),
         };
     }
     match run_probe(path, &["--version"]) {
@@ -243,7 +272,7 @@ fn probe_version_binary(name: &'static str, path: &Path, pin: &str, missing: &st
                         pin,
                         stdout.trim()
                     ),
-                    fix: None,
+                    fix: Some(reinstall()),
                 }
             }
         }
@@ -251,7 +280,7 @@ fn probe_version_binary(name: &'static str, path: &Path, pin: &str, missing: &st
             name,
             status: Status::Fail,
             detail: format!("could not execute {}: {error}", path.display()),
-            fix: None,
+            fix: Some(reinstall()),
         },
     }
 }
@@ -281,39 +310,22 @@ pub fn run() -> Vec<Check> {
         ));
     }
 
-    match crate::service::manager() {
+    checks.push(match crate::service::manager() {
         Ok(manager) => match manager.status() {
-            Ok(state) => {
-                let status = if state.installed && state.loaded {
-                    Status::Ok
-                } else {
-                    Status::Warn
-                };
-                checks.push(Check {
-                    name: "service",
-                    status,
-                    detail: format!("{}: {}", manager.mechanism(), state.summary()),
-                    fix: None,
-                });
-            }
-            Err(error) => checks.push(Check {
-                name: "service",
-                status: Status::Fail,
-                detail: format!("{error:#}"),
-                fix: None,
-            }),
+            Ok(state) => service_row(manager.mechanism(), Ok(&state)),
+            Err(error) => service_row(manager.mechanism(), Err(format!("{error:#}"))),
         },
-        Err(error) => checks.push(Check {
-            name: "service",
-            status: Status::Fail,
-            detail: format!("{error:#}"),
-            fix: None,
-        }),
-    }
+        Err(error) => service_row("no service manager", Err(format!("{error:#}"))),
+    });
 
     checks.push(curl_check());
     checks.push(secret_store_check());
     checks.push(sleep_check());
+
+    #[cfg(target_os = "macos")]
+    {
+        checks.push(vz_check());
+    }
 
     #[cfg(target_os = "linux")]
     {
@@ -329,27 +341,62 @@ pub fn run() -> Vec<Check> {
 
     if let Some(prefix) = prefix_dir() {
         let receipt = receipt_path(&prefix);
-        if receipt.is_file() {
-            checks.push(Check {
-                name: "receipt",
-                status: Status::Ok,
-                detail: receipt.display().to_string(),
-                fix: None,
-            });
-        } else {
-            checks.push(Check {
-                name: "receipt",
-                status: Status::Warn,
-                detail: format!(
-                    "{} is missing — this tree was not installed by install.sh",
-                    receipt.display()
-                ),
-                fix: None,
-            });
-        }
+        checks.push(receipt_row(&receipt, receipt.is_file()));
     }
 
     checks
+}
+
+/// The service row: the daemon is only persistent once the OS has it.
+fn service_row(mechanism: &str, state: Result<&crate::service::State, String>) -> Check {
+    // Both halves of the not-ok answer — a unit that is absent or unloaded,
+    // and a service manager that could not be asked — are cleared by the
+    // command that writes the unit and loads it.
+    let install = || Fix::new("ast service install");
+    match state {
+        Ok(state) if state.installed && state.loaded => Check {
+            name: "service",
+            status: Status::Ok,
+            detail: format!("{mechanism}: {}", state.summary()),
+            fix: None,
+        },
+        Ok(state) => Check {
+            name: "service",
+            status: Status::Warn,
+            detail: format!("{mechanism}: {}", state.summary()),
+            fix: Some(install()),
+        },
+        Err(error) => Check {
+            name: "service",
+            status: Status::Fail,
+            detail: format!("{mechanism}: {error}"),
+            fix: Some(install()),
+        },
+    }
+}
+
+/// The install receipt: present when `install.sh` put this tree here.
+fn receipt_row(receipt: &Path, present: bool) -> Check {
+    if present {
+        return Check {
+            name: "receipt",
+            status: Status::Ok,
+            detail: receipt.display().to_string(),
+            fix: None,
+        };
+    }
+    Check {
+        name: "receipt",
+        status: Status::Warn,
+        detail: format!(
+            "{} is missing — this tree was not installed by install.sh",
+            receipt.display()
+        ),
+        fix: Some(Fix::noted(
+            REINSTALL,
+            "the installer writes the receipt; a source build has none and does not need one",
+        )),
+    }
 }
 
 /// `curl` is how every image blob, every guest kernel and every pinned
@@ -357,14 +404,18 @@ pub fn run() -> Vec<Check> {
 /// which is a `fail` and not a `warn`: an Asterism that cannot fetch an OCI
 /// image cannot start its first instance.
 fn curl_check() -> Check {
-    match crate::tools::tool("curl") {
-        Ok(path) => Check {
+    curl_row(crate::tools::tool("curl").ok().as_deref())
+}
+
+fn curl_row(found: Option<&Path>) -> Check {
+    match found {
+        Some(path) => Check {
             name: "curl",
             status: Status::Ok,
             detail: path.display().to_string(),
             fix: None,
         },
-        Err(_) => Check {
+        None => Check {
             name: "curl",
             status: Status::Fail,
             detail: "not found on PATH — needed to fetch images and kernels".to_owned(),
@@ -386,7 +437,12 @@ fn file_or_exec(name: &'static str, path: &Path, missing: &str) -> Check {
             name,
             status: Status::Fail,
             detail: format!("{missing} ({})", path.display()),
-            fix: None,
+            // Half an install is not something a user can assemble by hand:
+            // the installer is what puts these two beside each other.
+            fix: Some(Fix::noted(
+                REINSTALL,
+                format!("{name} ships with every install lane"),
+            )),
         }
     }
 }
@@ -406,7 +462,7 @@ fn secret_store_check() -> Check {
             name: "secrets",
             status: Status::Fail,
             detail: "secret storage is not built for this OS; no plaintext fallback is used".into(),
-            fix: None,
+            fix: Some(unsupported_host_fix()),
         }
     }
 }
@@ -414,7 +470,23 @@ fn secret_store_check() -> Check {
 #[cfg(target_os = "macos")]
 fn probe_macos_keychain() -> Check {
     match Command::new("security").arg("list-keychains").output() {
-        Ok(out) if out.status.success() => Check {
+        Ok(out) => macos_keychain_row(
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).trim(),
+        ),
+        Err(error) => macos_keychain_row(
+            false,
+            &format!("could not execute security(1) to probe the login Keychain: {error}"),
+        ),
+    }
+}
+
+/// The macOS secret row. A Keychain that will not answer is nearly always a
+/// locked one, which is a thing the person at the machine can unlock.
+#[cfg(any(test, target_os = "macos"))]
+fn macos_keychain_row(answered: bool, stderr: &str) -> Check {
+    if answered {
+        return Check {
             name: "secrets",
             status: Status::Ok,
             detail: format!(
@@ -422,22 +494,16 @@ fn probe_macos_keychain() -> Check {
                 secret_store_name()
             ),
             fix: None,
-        },
-        Ok(out) => Check {
-            name: "secrets",
-            status: Status::Fail,
-            detail: format!(
-                "security list-keychains failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
-            fix: None,
-        },
-        Err(error) => Check {
-            name: "secrets",
-            status: Status::Fail,
-            detail: format!("could not execute security(1) to probe the login Keychain: {error}"),
-            fix: None,
-        },
+        };
+    }
+    Check {
+        name: "secrets",
+        status: Status::Fail,
+        detail: format!("security list-keychains failed: {stderr}"),
+        fix: Some(Fix::noted(
+            "security unlock-keychain ~/Library/Keychains/login.keychain-db",
+            "macOS: the login Keychain has to exist and be unlocked",
+        )),
     }
 }
 
@@ -450,15 +516,7 @@ fn probe_secret_service() -> Check {
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         if secret_service_from_bus(out.status.success(), &stdout, &stderr) {
-            return Check {
-                name: "secrets",
-                status: Status::Ok,
-                detail: format!(
-                    "{} answered on the session bus; no plaintext fallback",
-                    secret_store_name()
-                ),
-                fix: None,
-            };
+            return secret_service_row(BusAnswer::Named);
         }
     }
     let ping = Command::new("dbus-send")
@@ -471,7 +529,50 @@ fn probe_secret_service() -> Check {
         ])
         .output();
     match ping {
-        Ok(out) if out.status.success() => Check {
+        Ok(out) if out.status.success() => secret_service_row(BusAnswer::Pinged),
+        Ok(out) => secret_service_row(BusAnswer::Refused(
+            String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+        )),
+        Err(_) => secret_service_row(BusAnswer::Unprobeable),
+    }
+}
+
+/// What the session bus said when it was asked for the Secret Service.
+#[cfg(any(test, target_os = "linux"))]
+enum BusAnswer {
+    /// `busctl` reported the well-known name.
+    Named,
+    /// The service answered `Peer.Ping`.
+    Pinged,
+    /// The bus is there and nothing owns the name.
+    Refused(String),
+    /// Neither `busctl` nor `dbus-send` could be run.
+    Unprobeable,
+}
+
+/// The Linux secret row. Both not-ok answers mean the same missing thing:
+/// no process on this session bus implements the Secret Service.
+#[cfg(any(test, target_os = "linux"))]
+fn secret_service_row(answer: BusAnswer) -> Check {
+    let provider = || {
+        install_hint("gnome-keyring").unwrap_or_else(|| {
+            Fix::noted(
+                "sudo apt-get install -y gnome-keyring",
+                "or this platform's kwallet / keepassxc package",
+            )
+        })
+    };
+    match answer {
+        BusAnswer::Named => Check {
+            name: "secrets",
+            status: Status::Ok,
+            detail: format!(
+                "{} answered on the session bus; no plaintext fallback",
+                secret_store_name()
+            ),
+            fix: None,
+        },
+        BusAnswer::Pinged => Check {
             name: "secrets",
             status: Status::Ok,
             detail: format!(
@@ -480,24 +581,23 @@ fn probe_secret_service() -> Check {
             ),
             fix: None,
         },
-        Ok(out) => Check {
+        BusAnswer::Refused(stderr) => Check {
             name: "secrets",
             status: Status::Warn,
             detail: format!(
-                "{} needs a session bus provider (gnome-keyring, kwallet, or keepassxc): {}",
+                "{} needs a session bus provider (gnome-keyring, kwallet, or keepassxc): {stderr}",
                 secret_store_name(),
-                String::from_utf8_lossy(&out.stderr).trim()
             ),
-            fix: None,
+            fix: Some(provider()),
         },
-        Err(_) => Check {
+        BusAnswer::Unprobeable => Check {
             name: "secrets",
             status: Status::Warn,
             detail: format!(
                 "{} could not be probed (busctl/dbus-send missing). Without a Secret Service provider, secret material cannot be stored.",
                 secret_store_name()
             ),
-            fix: None,
+            fix: Some(provider()),
         },
     }
 }
@@ -515,29 +615,11 @@ fn sleep_check() -> Check {
             ])
             .output()
         {
-            Ok(out) if out.status.success() => Check {
-                name: "sleep",
-                status: Status::Ok,
-                detail: format!("{} (inhibit probe succeeded)", sleep_mechanism_name()),
-                fix: None,
-            },
-            Ok(out) => Check {
-                name: "sleep",
-                status: Status::Fail,
-                detail: format!(
-                    "systemd-inhibit probe failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ),
-                fix: None,
-            },
-            Err(_) => Check {
-                name: "sleep",
-                status: Status::Fail,
-                detail:
-                    "systemd-inhibit is not executable, so running guests cannot block idle sleep"
-                        .into(),
-                fix: None,
-            },
+            Ok(out) if out.status.success() => sleep_row(InhibitProbe::Held),
+            Ok(out) => sleep_row(InhibitProbe::Refused(
+                String::from_utf8_lossy(&out.stderr).trim().to_owned(),
+            )),
+            Err(_) => sleep_row(InhibitProbe::NotExecutable),
         }
     }
     #[cfg(target_os = "macos")]
@@ -555,8 +637,74 @@ fn sleep_check() -> Check {
             name: "sleep",
             status: Status::Fail,
             detail: "this device cannot prevent sleep yet".into(),
-            fix: None,
+            fix: Some(unsupported_host_fix()),
         }
+    }
+}
+
+/// What the `systemd-inhibit` probe reported.
+#[cfg(any(test, target_os = "linux"))]
+enum InhibitProbe {
+    /// The inhibitor was taken and released.
+    Held,
+    /// `systemd-inhibit` ran and refused.
+    Refused(String),
+    /// It is not on this machine at all.
+    NotExecutable,
+}
+
+/// The Linux sleep row: without logind there is nothing holding this device
+/// awake while a guest runs.
+#[cfg(any(test, target_os = "linux"))]
+fn sleep_row(probe: InhibitProbe) -> Check {
+    match probe {
+        InhibitProbe::Held => Check {
+            name: "sleep",
+            status: Status::Ok,
+            detail: format!("{} (inhibit probe succeeded)", sleep_mechanism_name()),
+            fix: None,
+        },
+        InhibitProbe::Refused(stderr) => Check {
+            name: "sleep",
+            status: Status::Fail,
+            detail: format!("systemd-inhibit probe failed: {stderr}"),
+            // The binary is there and the call failed, which on every
+            // systemd host means logind is not running to take the lock.
+            fix: Some(Fix::new("sudo systemctl start systemd-logind")),
+        },
+        InhibitProbe::NotExecutable => Check {
+            name: "sleep",
+            status: Status::Fail,
+            detail: "systemd-inhibit is not executable, so running guests cannot block idle sleep"
+                .into(),
+            fix: Some(install_hint("systemd-inhibit").unwrap_or_else(|| {
+                Fix::noted(
+                    "sudo apt-get install -y systemd",
+                    "or this platform's systemd package",
+                )
+            })),
+        },
+    }
+}
+
+/// The remedy for a host Asterism has no host integration for at all.
+///
+/// Windows has one — the Hyper-V backend and its own report, which is what
+/// `ast doctor` prints there — and reaching it starts with the feature being
+/// on, so the command is that report's own. Anything else is not a supported
+/// host, and the honest command is the installer, which says so.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn unsupported_host_fix() -> Fix {
+    #[cfg(windows)]
+    {
+        crate::windows_host::enable_hyperv()
+    }
+    #[cfg(not(windows))]
+    {
+        Fix::noted(
+            REINSTALL,
+            "Asterism integrates with macOS, Linux and Windows hosts; this OS has neither a secret store nor a sleep inhibitor",
+        )
     }
 }
 
@@ -602,31 +750,7 @@ fn linux_checks() -> Vec<Check> {
 
     if let Some(prefix) = prefix_dir() {
         let lock = prefix.join("share/asterism/linux-components.env");
-        match std::fs::read_to_string(&lock) {
-            Ok(text) => match LinuxPins::parse(&text) {
-                Ok(parsed) => checks.push(Check {
-                    name: "linux-pins",
-                    status: Status::Ok,
-                    detail: format!(
-                        "Cloud Hypervisor {} and virtiofsd {}",
-                        parsed.cloud_hypervisor_version, parsed.virtiofsd_version
-                    ),
-                    fix: None,
-                }),
-                Err(error) => checks.push(Check {
-                    name: "linux-pins",
-                    status: Status::Fail,
-                    detail: format!("{error:#}"),
-                    fix: None,
-                }),
-            },
-            Err(_) => checks.push(Check {
-                name: "linux-pins",
-                status: Status::Warn,
-                detail: format!("{} is missing", lock.display()),
-                fix: None,
-            }),
-        }
+        checks.push(linux_pins_row(&lock, std::fs::read_to_string(&lock).ok()));
         checks.push(probe_nbd_helper(&crate::layout::nbd_helper()));
     }
 
@@ -634,7 +758,44 @@ fn linux_checks() -> Vec<Check> {
     checks
 }
 
-#[cfg(target_os = "linux")]
+/// The pinned component lock, which is what says *which* Cloud Hypervisor
+/// and virtiofsd this installation is entitled to.
+#[cfg(any(test, target_os = "linux"))]
+fn linux_pins_row(lock: &Path, text: Option<String>) -> Check {
+    let reinstall = || {
+        Fix::noted(
+            REINSTALL,
+            "the component lock is written by the installer, beside the helpers it pins",
+        )
+    };
+    match text {
+        Some(text) => match LinuxPins::parse(&text) {
+            Ok(parsed) => Check {
+                name: "linux-pins",
+                status: Status::Ok,
+                detail: format!(
+                    "Cloud Hypervisor {} and virtiofsd {}",
+                    parsed.cloud_hypervisor_version, parsed.virtiofsd_version
+                ),
+                fix: None,
+            },
+            Err(error) => Check {
+                name: "linux-pins",
+                status: Status::Fail,
+                detail: format!("{error:#}"),
+                fix: Some(reinstall()),
+            },
+        },
+        None => Check {
+            name: "linux-pins",
+            status: Status::Warn,
+            detail: format!("{} is missing", lock.display()),
+            fix: Some(reinstall()),
+        },
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
 fn probe_nbd_helper(nbd: &Path) -> Check {
     if !nbd.is_file() {
         return Check {
@@ -644,7 +805,9 @@ fn probe_nbd_helper(nbd: &Path) -> Check {
                 "{} is missing; remote volumes cannot attach until install.sh or `ast service install` configures NBD",
                 nbd.display()
             ),
-            fix: None,
+            // The root-owned wrapper and its sudoers rule are installed
+            // together, and this is the command that installs both.
+            fix: Some(Fix::new("ast service install")),
         };
     }
     probe_nbd_helper_through(nbd, Path::new("sudo"))
@@ -679,7 +842,7 @@ fn probe_nbd_helper_through(nbd: &Path, sudo: &Path) -> Check {
                         nbd.display(),
                         stderr.trim()
                     ),
-                    fix: None,
+                    fix: Some(Fix::new("ast service install")),
                 }
             }
         }
@@ -687,7 +850,7 @@ fn probe_nbd_helper_through(nbd: &Path, sudo: &Path) -> Check {
             name: "nbd-helper",
             status: Status::Fail,
             detail: format!("could not execute {}: {error}", nbd.display()),
-            fix: None,
+            fix: Some(Fix::new("ast service install")),
         },
     }
 }
@@ -699,7 +862,13 @@ fn probe_kvm(kvm: &Path) -> Check {
             name: "kvm",
             status: Status::Fail,
             detail: format!("{} is missing; Cloud Hypervisor cannot run", kvm.display()),
-            fix: None,
+            // No device node at all is the module not loaded — or, under it,
+            // hardware virtualization switched off where only firmware or a
+            // hosting provider can switch it back on.
+            fix: Some(Fix::noted(
+                "sudo modprobe kvm_intel || sudo modprobe kvm_amd",
+                "if that fails, virtualization (VT-x/AMD-V, or nested virtualization on a cloud VM) is off",
+            )),
         };
     }
     match OpenOptions::new().read(true).write(true).open(kvm) {
@@ -716,7 +885,7 @@ fn probe_kvm(kvm: &Path) -> Check {
                 "{} does not open read-write ({error}); add this user to the kvm group and log in again",
                 kvm.display()
             ),
-            fix: None,
+            fix: Some(Fix::new("sudo usermod -aG kvm $USER && newgrp kvm")),
         },
     }
 }
@@ -729,39 +898,221 @@ fn linger_check() -> Check {
         .output();
     match output {
         Ok(out) if out.status.success() => {
-            let text = String::from_utf8_lossy(&out.stdout);
-            match parse_linger_property(&text) {
-                Some(true) => Check {
-                    name: "linger",
-                    status: Status::Ok,
-                    detail: "lingering is on; the user systemd instance survives logout and reboot"
-                        .into(),
-                    fix: None,
-                },
-                Some(false) => Check {
-                    name: "linger",
-                    status: Status::Fail,
-                    detail: format!(
-                        "lingering is off; astd dies at logout. Enable it with: loginctl enable-linger {user}"
-                    ),
-                    fix: None,
-                },
-                None => Check {
-                    name: "linger",
-                    status: Status::Warn,
-                    detail: format!("loginctl did not report Linger ({})", text.trim()),
-                    fix: None,
-                },
-            }
+            linger_row(&user, Some(&String::from_utf8_lossy(&out.stdout)))
         }
-        _ => Check {
+        _ => linger_row(&user, None),
+    }
+}
+
+/// The lingering row, from whatever `loginctl show-user -p Linger` said —
+/// `None` when it could not be asked at all.
+#[cfg(any(test, target_os = "linux"))]
+fn linger_row(user: &str, property: Option<&str>) -> Check {
+    // `$USER` when the environment did not name one, because the command
+    // still has to be copy-pasteable into the shell that will run it.
+    let who = if user.is_empty() { "$USER" } else { user };
+    let enable = || Fix::new(format!("loginctl enable-linger {who}"));
+    let Some(text) = property else {
+        return Check {
             name: "linger",
             status: Status::Fail,
             detail: format!(
-                "loginctl is unavailable; enable lingering with: loginctl enable-linger {user}"
+                "loginctl is unavailable; enable lingering with: loginctl enable-linger {who}"
+            ),
+            fix: Some(enable()),
+        };
+    };
+    match parse_linger_property(text) {
+        Some(true) => Check {
+            name: "linger",
+            status: Status::Ok,
+            detail: "lingering is on; the user systemd instance survives logout and reboot".into(),
+            fix: None,
+        },
+        Some(false) => Check {
+            name: "linger",
+            status: Status::Fail,
+            detail: format!(
+                "lingering is off; astd dies at logout. Enable it with: loginctl enable-linger {who}"
+            ),
+            fix: Some(enable()),
+        },
+        None => Check {
+            name: "linger",
+            status: Status::Warn,
+            detail: format!("loginctl did not report Linger ({})", text.trim()),
+            fix: Some(enable()),
+        },
+    }
+}
+
+// ---- macOS: the signed helper that owns every guest ------------------------
+
+/// What `codesign` had to say about the helper's entitlements.
+#[cfg(any(test, target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Signature {
+    /// Both entitlements Virtualization.framework insists on are there.
+    Entitled,
+    /// The binary is unsigned, or signed without them — which VZ treats the
+    /// same way, and `cargo build` produces on every rebuild.
+    Unentitled,
+    /// `codesign` could not be run, so nothing can be said either way.
+    Unaskable,
+}
+
+/// The vz row: on macOS there is no other backend, so a helper that is
+/// absent or unsigned is not a degraded device, it is a device that cannot
+/// boot anything.
+#[cfg(target_os = "macos")]
+fn vz_check() -> Check {
+    let helper = vz_helper_path();
+    let signature = helper.as_deref().map(vz_signature);
+    vz_row(helper.as_deref(), signature, guest_artifact())
+}
+
+/// Where `astd` looks for its helper: the packaging override, then beside
+/// the running binary, then `PATH`.
+#[cfg(target_os = "macos")]
+fn vz_helper_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("ASTERISM_VZ_HELPER") {
+        let path = PathBuf::from(path);
+        return path.is_file().then_some(path);
+    }
+    if let Some(beside) = sibling(VZ_HELPER_BIN).filter(|p| p.is_file()) {
+        return Some(beside);
+    }
+    crate::tools::tool(VZ_HELPER_BIN).ok()
+}
+
+/// Ask the signature itself rather than trusting the file's provenance.
+///
+/// `codesign -d --entitlements -` prints the entitlement plist; an unsigned
+/// binary, or one cargo rewrote after it was signed, prints an error. Older
+/// releases print to stderr and newer ones to stdout, so both are read.
+#[cfg(target_os = "macos")]
+fn vz_signature(helper: &Path) -> Signature {
+    let Ok(out) = Command::new("codesign")
+        .args(["-d", "--entitlements", "-"])
+        .arg(helper)
+        .output()
+    else {
+        return Signature::Unaskable;
+    };
+    let printed =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    if printed.contains(VZ_ENTITLEMENT) && printed.contains(VZ_NETWORK_CLIENT_ENTITLEMENT) {
+        Signature::Entitled
+    } else {
+        Signature::Unentitled
+    }
+}
+
+/// The installed guest-control agent, validated the way a boot validates it.
+///
+/// Every direct-kernel OCI guest is handed this binary, and a VM whose agent
+/// is missing is a VM nothing can talk to — so its absence belongs in the
+/// same row as the helper's.
+#[cfg(target_os = "macos")]
+fn guest_artifact() -> Result<PathBuf, String> {
+    if let Some(path) = std::env::var_os("ASTERISM_GUEST_AGENT_ARTIFACT") {
+        let path = PathBuf::from(path);
+        return match crate::guest::Artifact::from_path(&path) {
+            Ok(_) => Ok(path),
+            Err(error) => Err(format!("$ASTERISM_GUEST_AGENT_ARTIFACT: {error}")),
+        };
+    }
+    let mut searched = Vec::new();
+    for dir in crate::layout::data_dirs() {
+        let candidate = dir.join("guest/bin/asterism-guest");
+        match crate::guest::Artifact::from_path(&candidate) {
+            Ok(_) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                searched.push(candidate.display().to_string())
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Err(format!(
+        "no guest-control agent at any of {}",
+        searched.join(", ")
+    ))
+}
+
+/// Turn what was read off the machine into the row. Pure, so every way this
+/// can fail is reachable from a test on any host.
+#[cfg(any(test, target_os = "macos"))]
+fn vz_row(
+    helper: Option<&Path>,
+    signature: Option<Signature>,
+    artifact: Result<PathBuf, String>,
+) -> Check {
+    let row = |status, detail, fix| Check {
+        name: "vz",
+        status,
+        detail,
+        fix: Some(fix),
+    };
+    let Some(helper) = helper else {
+        return row(
+            Status::Fail,
+            format!(
+                "{VZ_HELPER_BIN} is not installed beside astd; Virtualization.framework guests \
+                 have no process to live in"
+            ),
+            install_hint(VZ_HELPER_BIN).unwrap_or_else(|| Fix::new(REINSTALL)),
+        );
+    };
+    match signature {
+        Some(Signature::Unaskable) => {
+            return row(
+                Status::Fail,
+                format!(
+                    "codesign could not be run, so {}'s entitlements cannot be read",
+                    helper.display()
+                ),
+                Fix::noted(
+                    "xcode-select --install",
+                    "codesign ships with the Command Line Tools",
+                ),
+            )
+        }
+        Some(Signature::Unentitled) => {
+            return row(
+                Status::Fail,
+                format!(
+                    "{} is not signed with {VZ_ENTITLEMENT} and {VZ_NETWORK_CLIENT_ENTITLEMENT}; \
+                     VZ refuses to create a machine without them",
+                    helper.display()
+                ),
+                Fix::noted(
+                    "scripts/sign-vz.sh",
+                    "in an Asterism checkout — cargo invalidates the signature on every rebuild; \
+                     an installed release arrives signed",
+                ),
+            )
+        }
+        Some(Signature::Entitled) | None => {}
+    }
+    match artifact {
+        Ok(artifact) => Check {
+            name: "vz",
+            status: Status::Ok,
+            detail: format!(
+                "{} carries both entitlements; guest agent {}",
+                helper.display(),
+                artifact.display()
             ),
             fix: None,
         },
+        Err(why) => row(
+            Status::Fail,
+            format!("{VZ_HELPER_BIN} is signed, but the guest-control agent is unusable: {why}"),
+            Fix::noted(
+                REINSTALL,
+                "the guest agent ships beside the helper in every install lane",
+            ),
+        ),
     }
 }
 
@@ -953,5 +1304,227 @@ mod tests {
         let read_only = probe_kvm(&kvm);
         assert_eq!(read_only.status, Status::Fail, "{}", read_only.detail);
         assert!(read_only.detail.contains("read-write"));
+        assert_eq!(
+            read_only.fix.map(|fix| fix.command),
+            Some("sudo usermod -aG kvm $USER && newgrp kvm".to_owned())
+        );
+    }
+
+    // ---- every row knows its own remedy -------------------------------------
+
+    fn service_state(installed: bool, loaded: bool) -> crate::service::State {
+        crate::service::State {
+            unit: PathBuf::from("/nowhere/asterism.service"),
+            installed,
+            loaded,
+            pid: None,
+            program: None,
+            notes: Vec::new(),
+        }
+    }
+
+    /// A path that is not on any machine, which is what makes each of these
+    /// probes take its failing branch.
+    fn absent() -> &'static Path {
+        Path::new("/nonexistent/asterism/doctor-fixture")
+    }
+
+    /// Every not-ok row this module can produce, driven through the pure
+    /// half of each probe with the machine's answer injected.
+    ///
+    /// Adding a row without adding it here fails
+    /// `every_row_this_host_prints_has_a_failure_mode_that_names_a_fix`,
+    /// which is the point: a row whose failure has no remedy is a bug report
+    /// with an `ast doctor` prefix.
+    fn every_failure_mode() -> Vec<Check> {
+        let mut modes = vec![
+            file_or_exec("ast", absent(), "ast is not beside this binary"),
+            file_or_exec("astd", absent(), "astd is not beside ast"),
+            service_row("launchd", Err("no service manager here".into())),
+            service_row("launchd", Ok(&service_state(false, false))),
+            service_row("systemd (user)", Ok(&service_state(true, false))),
+            curl_row(None),
+            receipt_row(absent(), false),
+            // Linux rows. Compiled everywhere in test builds precisely so
+            // that a macOS laptop still holds the Linux rows to this.
+            probe_kvm(absent()),
+            probe_version_binary("cloud-hypervisor", absent(), "v53.0", "not installed"),
+            probe_version_binary("virtiofsd", absent(), "1.14.0", "not installed"),
+            linux_pins_row(absent(), None),
+            linux_pins_row(absent(), Some("CLOUD_HYPERVISOR_VERSION=v53.0\n".into())),
+            probe_nbd_helper(absent()),
+            linger_row("alice", Some("Linger=no\n")),
+            linger_row("alice", Some("Name=alice\n")),
+            linger_row("", None),
+            secret_service_row(BusAnswer::Refused("no such name".into())),
+            secret_service_row(BusAnswer::Unprobeable),
+            sleep_row(InhibitProbe::Refused("Failed to connect to bus".into())),
+            sleep_row(InhibitProbe::NotExecutable),
+            macos_keychain_row(false, "SecKeychainCopySearchList: locked"),
+            // The macOS-only row, likewise.
+            vz_row(None, None, Ok(PathBuf::from("/unused"))),
+            vz_row(
+                Some(absent()),
+                Some(Signature::Unaskable),
+                Ok(PathBuf::from("/unused")),
+            ),
+            vz_row(
+                Some(absent()),
+                Some(Signature::Unentitled),
+                Ok(PathBuf::from("/unused")),
+            ),
+            vz_row(
+                Some(absent()),
+                Some(Signature::Entitled),
+                Err("no guest-control agent".into()),
+            ),
+        ];
+        // `sudo -n` against a helper that refuses: the boundary is there and
+        // does not answer, which is the other way this row fails.
+        let dir = tempfile::tempdir().unwrap();
+        let helper = dir.path().join("asterism-nbd");
+        std::fs::write(&helper, b"not a helper").unwrap();
+        modes.push(probe_nbd_helper_through(&helper, absent()));
+        modes
+    }
+
+    #[test]
+    fn every_failing_row_names_a_command_to_run() {
+        for check in every_failure_mode() {
+            assert_ne!(
+                check.status,
+                Status::Ok,
+                "{} is not a failure mode",
+                check.name
+            );
+            let fix = check
+                .fix
+                .as_ref()
+                .unwrap_or_else(|| panic!("{}: {} has no fix", check.name, check.detail));
+            assert!(
+                !fix.command.trim().is_empty(),
+                "{}: empty command",
+                check.name
+            );
+            // A remedy is something to type, not a sentence about typing.
+            assert!(
+                !fix.command.contains('\n'),
+                "{}: {} is not one line",
+                check.name,
+                fix.command
+            );
+        }
+    }
+
+    /// The other half of the promise: what this host actually prints is
+    /// covered by the enumeration above, and any row of it that is not `ok`
+    /// carries its remedy on the real machine too.
+    #[test]
+    fn every_row_this_host_prints_has_a_failure_mode_that_names_a_fix() {
+        let covered: std::collections::BTreeSet<&str> = every_failure_mode()
+            .iter()
+            .map(|check| check.name)
+            .collect();
+        for check in run() {
+            if check.status == Status::Skip {
+                continue;
+            }
+            assert!(
+                covered.contains(check.name),
+                "doctor row {:?} has no enumerated failure mode",
+                check.name
+            );
+            if check.status != Status::Ok {
+                assert!(
+                    check.fix.is_some(),
+                    "{} is {} on this host and names no fix: {}",
+                    check.name,
+                    check.status.as_str(),
+                    check.detail
+                );
+            }
+        }
+    }
+
+    /// The vz row is the whole macOS backend story in one line, so each of
+    /// its failures has to point at a different command.
+    #[test]
+    fn the_vz_row_distinguishes_absent_unsigned_and_agentless() {
+        let helper = Path::new("/opt/asterism/bin/astd-vz");
+        let agent = PathBuf::from("/opt/asterism/lib/asterism/guest/bin/asterism-guest");
+
+        let absent = vz_row(None, None, Ok(agent.clone()));
+        assert_eq!(absent.status, Status::Fail);
+        assert!(absent.fix.unwrap().command.contains("install.sh"));
+
+        let unsigned = vz_row(Some(helper), Some(Signature::Unentitled), Ok(agent.clone()));
+        assert_eq!(unsigned.status, Status::Fail);
+        assert!(unsigned.detail.contains(VZ_ENTITLEMENT));
+        assert_eq!(unsigned.fix.unwrap().command, "scripts/sign-vz.sh");
+
+        let no_codesign = vz_row(Some(helper), Some(Signature::Unaskable), Ok(agent.clone()));
+        assert_eq!(no_codesign.fix.unwrap().command, "xcode-select --install");
+
+        let no_agent = vz_row(
+            Some(helper),
+            Some(Signature::Entitled),
+            Err("nothing under /usr/lib/asterism".into()),
+        );
+        assert_eq!(no_agent.status, Status::Fail);
+        assert!(no_agent.detail.contains("nothing under /usr/lib/asterism"));
+
+        let ready = vz_row(Some(helper), Some(Signature::Entitled), Ok(agent));
+        assert_eq!(ready.status, Status::Ok, "{}", ready.detail);
+        assert!(ready.fix.is_none());
+        assert!(ready.detail.contains("astd-vz"));
+    }
+
+    /// The entitlement strings are what `codesign` is grepped for, so they
+    /// have to be the same two the helper is actually signed with.
+    #[test]
+    fn the_entitlements_named_here_are_the_ones_the_helper_is_signed_with() {
+        let entitlements = include_str!("../../asterism-vz/vz.entitlements");
+        assert!(entitlements.contains(VZ_ENTITLEMENT), "{entitlements}");
+        assert!(
+            entitlements.contains(VZ_NETWORK_CLIENT_ENTITLEMENT),
+            "{entitlements}"
+        );
+    }
+
+    /// The other side of the promise: a row that is `ok` offers nothing to
+    /// run, because there is nothing to repair.
+    #[test]
+    fn a_working_bus_inhibitor_and_keychain_offer_no_command() {
+        for ok in [
+            secret_service_row(BusAnswer::Named),
+            secret_service_row(BusAnswer::Pinged),
+            sleep_row(InhibitProbe::Held),
+            macos_keychain_row(true, ""),
+            curl_row(Some(Path::new("/usr/bin/curl"))),
+            receipt_row(
+                Path::new("/opt/asterism/share/asterism/install-receipt.env"),
+                true,
+            ),
+            service_row("launchd", Ok(&service_state(true, true))),
+        ] {
+            assert_eq!(ok.status, Status::Ok, "{}", ok.detail);
+            assert!(ok.fix.is_none(), "{} offers a needless command", ok.name);
+        }
+    }
+
+    #[test]
+    fn lingering_off_is_repaired_by_the_command_for_this_account() {
+        let off = linger_row("alice", Some("Linger=no\n"));
+        assert_eq!(off.status, Status::Fail);
+        assert_eq!(
+            off.fix.map(|fix| fix.command),
+            Some("loginctl enable-linger alice".to_owned())
+        );
+        // No account in the environment still leaves something runnable.
+        assert_eq!(
+            linger_row("", None).fix.map(|fix| fix.command),
+            Some("loginctl enable-linger $USER".to_owned())
+        );
+        assert!(linger_row("alice", Some("Linger=yes\n")).fix.is_none());
     }
 }

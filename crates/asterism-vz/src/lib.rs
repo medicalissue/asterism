@@ -56,7 +56,12 @@ pub mod guest;
 
 /// Name of the helper binary, as `astd` looks for it and as `codesign`
 /// signs it.
-pub const HELPER_BIN: &str = "astd-vz";
+///
+/// Defined in `asterism-core` beside the `ast doctor` row that checks for
+/// it, because `ast` has to name this helper on a host whose CLI does not
+/// link this crate. Re-exported here so the helper's own protocol still
+/// spells it once.
+pub const HELPER_BIN: &str = asterism_core::doctor::VZ_HELPER_BIN;
 
 /// The entitlement Virtualization.framework requires to create a VM.
 /// Boolean and unrestricted: an ad-hoc signature carrying it is enough
@@ -64,7 +69,8 @@ pub const HELPER_BIN: &str = "astd-vz";
 /// [`NETWORK_CLIENT_ENTITLEMENT`]. Deliberately *not*
 /// `com.apple.vm.networking`, which gates bridged networking and does need
 /// Apple's blessing — which is why the helper uses NAT.
-pub const ENTITLEMENT: &str = "com.apple.security.virtualization";
+/// Defined in `asterism-core` for the same reason as [`HELPER_BIN`].
+pub const ENTITLEMENT: &str = asterism_core::doctor::VZ_ENTITLEMENT;
 
 /// Entitlement required by Virtualization.framework's NBD client.
 ///
@@ -72,7 +78,7 @@ pub const ENTITLEMENT: &str = "com.apple.security.virtualization";
 /// `com.apple.vm.networking` entitlement used by bridged guest networking.
 /// The helper needs it even for `nbd+unix` because the framework classifies
 /// every network-block attachment as an outgoing connection.
-pub const NETWORK_CLIENT_ENTITLEMENT: &str = "com.apple.security.network.client";
+pub const NETWORK_CLIENT_ENTITLEMENT: &str = asterism_core::doctor::VZ_NETWORK_CLIENT_ENTITLEMENT;
 
 /// Everything one helper needs to build and run its guest.
 ///

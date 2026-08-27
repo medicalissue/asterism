@@ -37,7 +37,7 @@ use asterism_core::hosted_auth::{
 };
 use asterism_core::hv::{GuestHealth, ImageKind};
 use asterism_core::instance::{
-    now_unix, Instance, PortForward, PortProtocol, Restart, RuntimeKind, Shape,
+    now_unix, Instance, PortForward, PortProtocol, Restart, Restarts, RuntimeKind, Shape,
 };
 use asterism_core::ipc;
 use asterism_core::orbit::DeviceStatus;
@@ -5440,6 +5440,11 @@ fn print_detail(inst: &Instance, guest_health: Option<&GuestHealth>) {
             Restart::Never => String::new(),
         }
     );
+    // What the policy has actually done. Only once it has done something:
+    // an instance that has never come back has nothing to report here.
+    if let Some(line) = restart_history_line(&inst.restarts) {
+        println!("{line}");
+    }
     println!("age:     {}", age(inst.created_at));
     // Worth a line only when there are some: an instance with no profiles is
     // the ordinary case and its guest is exactly its image.
@@ -5740,6 +5745,38 @@ fn volume_destination(v: &asterism_core::instance::Volume) -> String {
             v.host
         )
     }
+}
+
+/// The restart history as one line, or nothing when there is no history.
+///
+/// Three facts, because each one is useless without the others: when it last
+/// came back, how many times it has since the daemon started, and *why* —
+/// a guest the supervisor keeps resurrecting is a bug, and a guest somebody
+/// keeps starting by hand is a habit.
+fn restart_history_line(restarts: &Restarts) -> Option<String> {
+    if !restarts.happened() {
+        return None;
+    }
+    let reason = restarts
+        .last_reason
+        .map(|reason| format!(" ({reason})"))
+        .unwrap_or_default();
+    let last = if restarts.last_at == 0 {
+        "unknown".to_owned()
+    } else {
+        format!("{} ago", age(restarts.last_at))
+    };
+    Some(match restarts.count {
+        0 => format!("restarts: none since astd started; last start {last}{reason}"),
+        1 => format!(
+            "restarts: 1 since astd started {} ago, {last}{reason}",
+            age(restarts.since)
+        ),
+        n => format!(
+            "restarts: {n} since astd started {} ago; last {last}{reason}",
+            age(restarts.since)
+        ),
+    })
 }
 
 fn age(created_at: u64) -> String {
@@ -6554,6 +6591,33 @@ DAwMDAwMDAsImV4cCI6MTcwMDA0MzIwMCwic2NvcGUiOiJvcGVuaWQifQ.c2lnbmF0dXJl";
             interval: 5,
         };
         assert!(client.validate_authorization(&authorization).is_err());
+    }
+
+    /// `ast status` says nothing about restarts until there have been some,
+    /// and once there have it says all three facts in one line.
+    #[test]
+    fn the_restart_line_appears_only_once_a_guest_has_come_back() {
+        use asterism_core::instance::RestartReason;
+
+        let mut restarts = Restarts::default();
+        restarts.note(RestartReason::User, now_unix());
+        assert_eq!(restart_history_line(&restarts), None);
+
+        restarts.note(RestartReason::Crash, now_unix());
+        let line = restart_history_line(&restarts).expect("a crash restart is worth a line");
+        assert!(line.starts_with("restarts: 1 "), "{line}");
+        assert!(line.contains("crash restart"), "{line}");
+
+        restarts.note(RestartReason::Resurrected, now_unix());
+        let line = restart_history_line(&restarts).expect("still worth a line");
+        assert!(line.starts_with("restarts: 2 "), "{line}");
+        assert!(line.contains("restart=always resurrection"), "{line}");
+
+        // A daemon that has just come up has reset the count, and the last
+        // restart it inherited is still the answer to "when?".
+        restarts.count = 0;
+        let line = restart_history_line(&restarts).expect("history survives the reset");
+        assert!(line.contains("none since astd started"), "{line}");
     }
 
     #[test]
