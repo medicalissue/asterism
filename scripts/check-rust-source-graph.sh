@@ -9,6 +9,7 @@ cd "$ROOT"
 
 MACOS_ONLY_HELPER_MODULES='crates/asterism-vz/src/helper/agent.rs
 crates/asterism-vz/src/helper/ctl.rs
+crates/asterism-vz/src/helper/egress.rs
 crates/asterism-vz/src/helper/gpu.rs
 crates/asterism-vz/src/helper/net.rs
 crates/asterism-vz/src/helper/vm.rs'

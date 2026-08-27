@@ -3,6 +3,18 @@ title = "Asterism repository secret policy"
 [extend]
 useDefault = true
 
-# There are deliberately no allowlists. A false positive must be documented
-# in docs/supply-chain-exceptions.md with an exact rule/path, rationale, and
-# removal condition before it can be added here.
+# A false positive must be documented in docs/supply-chain-exceptions.md with
+# an exact rule/path, rationale, and removal condition before it can be added
+# here. There is exactly one, and it is one file:
+# crates/asterism-coordinator/tests/fixtures/enrollment-vectors.json.
+#
+# Every vector in it carries a `device_secret_seed_hex`, the deterministic
+# Ed25519 seed the vector's fixed device id and signature are derived from.
+# generic-api-key reads each one as a credential. It is not: it is a published
+# constant that has to stay byte-identical with the copy in
+# medicalissue/asterism-site so both suites prove the same wire bytes, and it
+# authenticates nothing anywhere. The file holds test vectors and nothing else,
+# which is why the whole path is the scope rather than one field name.
+[allowlist]
+description = "Deterministic Ed25519 seeds in the shared enrollment test vectors"
+paths = ['''crates/asterism-coordinator/tests/fixtures/enrollment-vectors\.json$''']
