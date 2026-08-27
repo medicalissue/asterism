@@ -386,7 +386,7 @@ echo "ok: a device on the target's own LAN sends the packet without the mesh"
 
 stop_daemon "$C"
 NOPEER="$(ASTERISM_HOME="$A" "$AST" device wake "$B_NAME" 2>&1 || true)"
-grep -qxF "Error: no awake device on $B_NAME's network" <<<"$NOPEER" \
+grep -qxF "error: no awake device on $B_NAME's network" <<<"$NOPEER" \
   || fail "not the spec's message, verbatim:"$'\n'"$NOPEER"
 grep -qF "it is the orbit's beacon" <<<"$NOPEER" \
   || fail "the refusal does not point at the beacon that would fix it:"$'\n'"$NOPEER"
