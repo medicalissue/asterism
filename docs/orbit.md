@@ -63,6 +63,10 @@ The pairing refusal happens *before* the peer is written to the orbit store: a
 device that is a member is already trusted, so a name clash has to end the
 pairing rather than be repaired afterwards.
 
+`ast fork` names its children `<parent>-1`, `<parent>-2` and so on. It has no
+user standing there to refuse, so it steps over any number a device or another
+instance already answers to, and the names it hands back are free ones.
+
 A name that is neither is refused with both halves of the namespace listed,
 because the next thing you want is the list:
 

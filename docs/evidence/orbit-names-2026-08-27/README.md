@@ -14,11 +14,11 @@ physical machines over Tailscale, not against a loopback pair.
 |---|---|
 | device `macbook` | this Mac, Darwin 25.5.0 arm64 (macOS 26.5.2), tailnet `100.121.213.11` |
 | device `dev5` | `DESTOP-DEV5`, Linux `6.6.87.2-microsoft-standard-WSL2` x86_64, 12 cores / 11 GiB, tailnet `100.91.138.55` |
-| build | `f09a0481` on `claude/ast-167-orbit-names`, on top of `9df8be05` |
+| build | `f09a0481` on `claude/ast-167-orbit-names`, then on top of `9df8be05` |
 | mesh | `LocalOnly` on both — no relay, no directory. Each daemon was pointed at
 its own tailnet address by writing `mesh-local.addr` before first start, so
 pairing and every later frame took a **direct** path between the two hosts. |
-| protocol | 18 on both (`astd: stamped … as Asterism 0.0.2 (protocol 18)`) |
+| protocol | 18 on both at run time (`astd: stamped … as Asterism 0.0.2 (protocol 18)`). The branch was afterwards rebased over `48c8c2db` (AST-152 fork), which had taken 18; the `resolve` frame is **19** on the branch as it stands, and nothing else about it moved. |
 | homes | scratch `ASTERISM_HOME` on both (`…/scratchpad/mac-home`, `/root/ast167/home`); no user orbit was touched |
 
 Pairing, from `ast devices` on each side after the ticket was redeemed:
@@ -209,6 +209,10 @@ typo gets. They are different situations and now they are different sentences.
   e2e below, which stands up three daemons.
 * **A relayed path.** Both devices were on one tailnet and every frame took a
   direct path. Relay behaviour is `scripts/e2e-relay.sh`'s subject.
+* **Fork names against devices.** `ast fork` names its children `<parent>-<n>`
+  and now steps over a number a device in the orbit answers to; that landed
+  after this run, over AST-152, and is covered by a unit test rather than by a
+  transcript here.
 
 ## Reproducing it
 
