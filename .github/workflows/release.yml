@@ -413,14 +413,24 @@ jobs:
           $archive = "asterism-$version-${{ matrix.target }}.tar.gz"
           $dist = "dist/$version"
 
-          # The exact lookup packaging/install.ps1 performs: an entry in
-          # SHA256SUMS for this bare archive name, matching these bytes.
+          # The same lookup packaging/install.ps1 performs — an entry in
+          # SHA256SUMS for this bare archive name, matching these bytes —
+          # written as one regex rather than a Split, so a stray CR or a
+          # double space cannot change how the line parses. `*name` is the
+          # binary-mode marker some sha256sum implementations emit.
+          $sums = "$dist/SHA256SUMS.${{ matrix.target }}"
           $want = $null
-          foreach ($line in Get-Content "$dist/SHA256SUMS.${{ matrix.target }}") {
-            $parts = $line.Split(@(' ', "`t"), [StringSplitOptions]::RemoveEmptyEntries)
-            if ($parts.Count -ge 2 -and ($parts[1] -eq $archive -or $parts[1] -eq "*$archive")) { $want = $parts[0].ToLowerInvariant() }
+          foreach ($line in Get-Content $sums) {
+            if ($line -match '^([0-9a-fA-F]{64})\s+\*?(\S+)\s*$' -and $Matches[2] -eq $archive) {
+              $want = $Matches[1].ToLowerInvariant()
+            }
           }
-          if (-not $want) { throw "SHA256SUMS does not list $archive" }
+          if (-not $want) {
+            Write-Host "no entry for $archive in ${sums}:"
+            Get-ChildItem $dist | ForEach-Object { Write-Host "  file: $($_.Name)" }
+            Get-Content $sums | ForEach-Object { Write-Host "  line: [$_]" }
+            throw "SHA256SUMS does not list $archive"
+          }
           $got = (Get-FileHash -Algorithm SHA256 "$dist/$archive").Hash.ToLowerInvariant()
           if ($got -ne $want) { throw "checksum mismatch on ${archive}: $got != $want" }
           Write-Host "sha256 ok: $got"
