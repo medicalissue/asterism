@@ -123,7 +123,11 @@ use crate::VERSION;
 ///   the daemon a session, the daemon proves possession of its own mesh key,
 ///   and the account's device list comes back as public keys, chosen
 ///   endpoints and presence.
-pub const PROTOCOL_VERSION: u32 = 12;
+/// * **13** — a measured bulk transfer between two devices: `ast mesh bench`
+///   asks a peer for N bytes down one mesh stream and times the drain. The
+///   frame exists so a path's throughput can be attributed to that path
+///   rather than inferred from a copy that also touched a disk.
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// The wire as it was before it carried a version.
 ///
@@ -136,8 +140,9 @@ pub const FIRST_PROTOCOL: u32 = 1;
 
 /// How many versions back this build still serves. Protocol 8 adds runtime
 /// and GPU guest frames; keep the unnumbered protocol-1 release reachable in
-/// a rolling orbit.
-pub const SUPPORTED_BACK: u32 = 11;
+/// a rolling orbit — so this moves with [`PROTOCOL_VERSION`] rather than
+/// staying put, which is what keeps the floor at [`FIRST_PROTOCOL`].
+pub const SUPPORTED_BACK: u32 = 12;
 
 /// Format version of the home stamp document itself.
 pub const STAMP_VERSION: u32 = 1;

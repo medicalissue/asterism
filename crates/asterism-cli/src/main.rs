@@ -492,11 +492,24 @@ enum Command {
     /// Add, list and remove the devices in this orbit.
     #[command(subcommand)]
     Device(DeviceCommand),
+    /// Measurement surface for the mesh itself. Hidden: these are not
+    /// commands anyone runs to get work done, they are how a path's numbers
+    /// are produced for an evidence run.
+    #[command(subcommand, hide = true)]
+    Mesh(MeshCommand),
     /// Time a round trip to another device.
     Ping {
         /// The device to ping, by name.
         #[arg(value_name = "DEVICE")]
         peer: String,
+        /// Print the round trip as JSON: the milliseconds, the path kind, the
+        /// relay that carried it, and the byte counters behind it.
+        ///
+        /// A latency figure a human reads is a number; a latency figure a
+        /// measurement harness reads has to say which path produced it, or
+        /// the number cannot be attributed to anything.
+        #[arg(long)]
+        json: bool,
     },
     /// What wire versions this build speaks, what the daemon speaks, and
     /// what the two of them have settled on.
@@ -756,6 +769,26 @@ enum AuthCommand {
         /// bound issuer is used.
         #[arg(long)]
         coordinator: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum MeshCommand {
+    /// Pull N bytes from a peer down one mesh stream and report the rate.
+    ///
+    /// The companion to `ast ping`: that one says how long the path takes to
+    /// answer, this one says how fast it carries. Neither touches a disk, so
+    /// a slow `ast move` can be attributed to the path or acquitted of it.
+    Bench {
+        /// The device to pull from, by name.
+        #[arg(long, value_name = "DEVICE")]
+        to: String,
+        /// How many bytes to pull. Accepts a plain count.
+        #[arg(long, default_value_t = 1 << 20)]
+        bytes: u64,
+        /// Print the result as JSON, including the path it was measured on.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1131,9 +1164,13 @@ fn main() -> Result<()> {
             local_only("device", device.as_deref())?;
             return device_command(cmd);
         }
-        Command::Ping { peer } => {
+        Command::Ping { peer, json } => {
             local_only("ping", device.as_deref())?;
-            return ping(&peer);
+            return ping(&peer, json);
+        }
+        Command::Mesh(MeshCommand::Bench { to, bytes, json }) => {
+            local_only("mesh bench", device.as_deref())?;
+            return mesh_bench(&to, bytes, json);
         }
         Command::Compat { json } => {
             local_only("compat", device.as_deref())?;
@@ -1339,6 +1376,7 @@ fn main() -> Result<()> {
         | Response::Sas { .. }
         | Response::Paired { .. }
         | Response::DevicePong { .. }
+        | Response::DeviceBenchResult { .. }
         // `ast device wake`, `ast device check` and `ast move` return long
         // before here.
         | Response::Move { .. }
@@ -2345,7 +2383,7 @@ fn print_unpaired_account_devices(hosted: Option<&HostedStatus>, devices: &[Devi
     println!("  pair one with: ast device invite");
 }
 
-fn ping(device: &str) -> Result<()> {
+fn ping(device: &str, json: bool) -> Result<()> {
     match send(&Request::DevicePing {
         device: device.into(),
     })? {
@@ -2362,6 +2400,28 @@ fn ping(device: &str) -> Result<()> {
             relayed_bytes_sent,
             relayed_bytes_recv,
         } => {
+            // Everything the human block prints, in one flat object. Flat
+            // because the consumer is a measurement harness appending one
+            // line per sample, and a nested shape would only make it dig.
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "device": device,
+                        "device_id": device_id,
+                        "path": path,
+                        "millis": millis,
+                        "relay_url": relay_url,
+                        "connection_type": connection_type,
+                        "upgrade_millis": upgrade_millis,
+                        "direct_bytes_sent": direct_bytes_sent,
+                        "direct_bytes_recv": direct_bytes_recv,
+                        "relayed_bytes_sent": relayed_bytes_sent,
+                        "relayed_bytes_recv": relayed_bytes_recv,
+                    }))?
+                );
+                return Ok(());
+            }
             let short: String = device_id.chars().take(12).collect();
             // This first line's shape is depended on by the operational
             // suites. Everything new goes underneath it.
@@ -2385,6 +2445,65 @@ fn ping(device: &str) -> Result<()> {
                 None => println!("  path     {conn}"),
             }
             println!("  relay    {}", relay_url.as_deref().unwrap_or("-"));
+            Ok(())
+        }
+        Response::Error { message } => bail!(message),
+        other => bail!("unexpected reply from astd: {other:?}"),
+    }
+}
+
+/// `ast mesh bench` — how fast the path to a peer actually carries bytes.
+fn mesh_bench(device: &str, bytes: u64, json: bool) -> Result<()> {
+    match send(&Request::DeviceBench {
+        device: device.into(),
+        bytes,
+    })? {
+        Response::DeviceBenchResult {
+            device,
+            device_id,
+            bytes,
+            millis,
+            mbytes_per_sec,
+            relay_url,
+            connection_type,
+            direct_bytes_sent,
+            direct_bytes_recv,
+            relayed_bytes_sent,
+            relayed_bytes_recv,
+        } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&serde_json::json!({
+                        "device": device,
+                        "device_id": device_id,
+                        "bytes": bytes,
+                        "millis": millis,
+                        "mbytes_per_sec": mbytes_per_sec,
+                        "relay_url": relay_url,
+                        "connection_type": connection_type,
+                        "direct_bytes_sent": direct_bytes_sent,
+                        "direct_bytes_recv": direct_bytes_recv,
+                        "relayed_bytes_sent": relayed_bytes_sent,
+                        "relayed_bytes_recv": relayed_bytes_recv,
+                    }))?
+                );
+                return Ok(());
+            }
+            let short: String = device_id.chars().take(12).collect();
+            println!(
+                "pulled {} from {device} ({short}) in {millis:.1}ms — {mbytes_per_sec:.1} MB/s",
+                human_bytes(bytes),
+            );
+            println!("  path     {}", connection_type.as_deref().unwrap_or("-"));
+            println!("  relay    {}", relay_url.as_deref().unwrap_or("-"));
+            println!(
+                "  bytes    direct {} sent / {} recv, relayed {} sent / {} recv",
+                human_bytes(direct_bytes_sent),
+                human_bytes(direct_bytes_recv),
+                human_bytes(relayed_bytes_sent),
+                human_bytes(relayed_bytes_recv),
+            );
             Ok(())
         }
         Response::Error { message } => bail!(message),

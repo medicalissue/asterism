@@ -44,6 +44,7 @@ pub(crate) fn claims(req: &Request) -> bool {
             | Request::WakeBroadcast { .. }
             | Request::DeviceWake { .. }
             | Request::DevicePing { .. }
+            | Request::DeviceBench { .. }
             | Request::DeviceRemove { .. }
             | Request::DeviceShellStatus
             | Request::DeviceShellPolicy { .. }
@@ -97,6 +98,10 @@ pub(crate) async fn serve(req: Request, node: &Node, mesh: Option<&Arc<Mesh>>) -
         },
         Request::DevicePing { device } => match mesh {
             Some(mesh) => reply_or_error(mesh.ping(&device).await),
+            None => no_mesh(),
+        },
+        Request::DeviceBench { device, bytes } => match mesh {
+            Some(mesh) => reply_or_error(mesh.bench(&device, bytes).await),
             None => no_mesh(),
         },
         Request::DeviceRemove { name } => match mesh {
@@ -238,6 +243,10 @@ mod tests {
             Request::ListOrbit,
             Request::DevicePing {
                 device: "desktop".into(),
+            },
+            Request::DeviceBench {
+                device: "desktop".into(),
+                bytes: 1 << 20,
             },
             Request::DeviceRemove {
                 name: "desktop".into(),

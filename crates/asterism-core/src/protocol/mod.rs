@@ -498,6 +498,16 @@ pub enum Request {
     DevicePing {
         device: String,
     },
+    /// Ask one device for `bytes` bytes down a mesh stream and time the drain.
+    ///
+    /// A round trip measures a path's latency; nothing in the orbit measured
+    /// its *throughput* without also measuring a disk. This is the frame that
+    /// separates the two, so a slow `ast move` can be attributed to the path
+    /// or acquitted of it.
+    DeviceBench {
+        device: String,
+        bytes: u64,
+    },
 
     // ---- power and presence -------------------------------------------------
     /// Wake a sleeping device: `ast device wake <name>`.
@@ -833,6 +843,7 @@ impl Request {
             | Request::PairConfirm { .. }
             | Request::DeviceRemove { .. }
             | Request::DevicePing { .. }
+            | Request::DeviceBench { .. }
             | Request::DeviceShellStatus
             | Request::DeviceShellPolicy { .. }
             | Request::DeviceShellOpen { .. }
@@ -951,6 +962,7 @@ impl Request {
             Request::Exec { .. } => 9,
             Request::CreateNetwork { .. } => 10,
             Request::HostedEnroll { .. } | Request::HostedStatus | Request::HostedForget => 12,
+            Request::DeviceBench { .. } => 13,
             Request::DeviceShellPolicy { .. }
             | Request::DeviceShellOpen { .. }
             | Request::DeviceShellInput { .. }
@@ -1269,6 +1281,33 @@ pub enum Response {
         #[serde(default)]
         relayed_bytes_recv: u64,
     },
+    /// Reply to [`Request::DeviceBench`]: what the path actually moved.
+    ///
+    /// `bytes` is what arrived rather than what was asked for, because a
+    /// truncated transfer that reported the request back would read as a fast
+    /// one.
+    DeviceBenchResult {
+        device: String,
+        device_id: String,
+        bytes: u64,
+        millis: f64,
+        /// Throughput over the drain alone, megabytes per second.
+        mbytes_per_sec: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relay_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connection_type: Option<String>,
+        /// The relay meter's per-peer counters, read after the drain. The
+        /// difference across a bench is how much of the payload was relayed.
+        #[serde(default)]
+        direct_bytes_sent: u64,
+        #[serde(default)]
+        direct_bytes_recv: u64,
+        #[serde(default)]
+        relayed_bytes_sent: u64,
+        #[serde(default)]
+        relayed_bytes_recv: u64,
+    },
 
     // ---- power and presence -------------------------------------------------
     /// One line of a wake in progress, and whether it was the last one.
@@ -1481,6 +1520,14 @@ pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
                 coordinator: String::new(),
                 bearer: RedactedBearer::new("placeholder").expect("a non-empty literal"),
                 trust_account_devices: false,
+            }
+            .since(),
+        ),
+        (
+            "device_bench",
+            Request::DeviceBench {
+                device: String::new(),
+                bytes: 0,
             }
             .since(),
         ),
@@ -1869,6 +1916,12 @@ mod tests {
         assert_eq!(table.get("create_runtime"), Some(&8));
         assert_eq!(table.get("container_exec"), Some(&8));
         assert_eq!(table.get("exec"), Some(&9));
+        assert_eq!(
+            table.get("device_bench"),
+            Some(&13),
+            "a peer that predates the bench frame answers it with serde's \
+             unknown-variant error instead of a refusal naming the frame"
+        );
         assert_eq!(
             table.get("device-shell"),
             Some(&4),
