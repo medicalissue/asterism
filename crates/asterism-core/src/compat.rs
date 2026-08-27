@@ -59,7 +59,7 @@
 //! ### The window
 //!
 //! A build serves its own version and the [`SUPPORTED_BACK`] before it:
-//! currently N-7 through N. That is a floor on how far back it will *serve*, not a
+//! currently N-13 through N. That is a floor on how far back it will *serve*, not a
 //! ceiling on how far forward it will speak — the ceiling is the other side's
 //! range, which is why a newer peer is usable.
 //!
@@ -127,7 +127,11 @@ use crate::VERSION;
 ///   asks a peer for N bytes down one mesh stream and times the drain. The
 ///   frame exists so a path's throughput can be attributed to that path
 ///   rather than inferred from a copy that also touched a disk.
-pub const PROTOCOL_VERSION: u32 = 13;
+/// * **14** — the token and cost ledger: `ast cost` asks the device whose
+///   egress door read the counters, and gets back token totals and a dollar
+///   figure per model. Information only — nothing on this frame limits,
+///   throttles or refuses anything.
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// The wire as it was before it carried a version.
 ///
@@ -142,7 +146,7 @@ pub const FIRST_PROTOCOL: u32 = 1;
 /// and GPU guest frames; keep the unnumbered protocol-1 release reachable in
 /// a rolling orbit — so this moves with [`PROTOCOL_VERSION`] rather than
 /// staying put, which is what keeps the floor at [`FIRST_PROTOCOL`].
-pub const SUPPORTED_BACK: u32 = 12;
+pub const SUPPORTED_BACK: u32 = 13;
 
 /// Format version of the home stamp document itself.
 pub const STAMP_VERSION: u32 = 1;

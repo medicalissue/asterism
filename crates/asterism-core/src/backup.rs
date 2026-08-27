@@ -713,8 +713,10 @@ fn requirements(instance: &Instance) -> RebindRequirements {
     }
 }
 
-/// Only durable guest state. The explicit allowlist is also the redaction
-/// boundary: a future sidecar does not become portable merely by appearing.
+/// Only durable guest state, plus the instance's own cost ledger. The
+/// explicit allowlist is also the redaction boundary: a future sidecar does
+/// not become portable merely by appearing, and every addition to this list
+/// is a decision made here about what a backup is allowed to carry.
 fn durable_files(instance_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     for name in [
@@ -728,6 +730,25 @@ fn durable_files(instance_dir: &Path) -> Result<Vec<PathBuf>> {
         if path.is_file() {
             files.push(path);
         }
+    }
+    // The cost ledger. It is not guest state — nothing inside the guest
+    // wrote it — but it is the only record of what that guest spent, and a
+    // backup that dropped it would silently reset an agent's accounting
+    // every time somebody moved it between machines. Counters and model
+    // names only: `ledger` has a test that no body byte can reach a line.
+    let cost = instance_dir.join("cost");
+    if let Ok(entries) = std::fs::read_dir(&cost) {
+        let mut days = Vec::new();
+        for entry in entries {
+            let path = entry?.path();
+            if path.is_file() && path.extension().is_some_and(|ext| ext == "jsonl") {
+                days.push(path);
+            }
+        }
+        // Deterministic order, so re-exporting an unchanged instance
+        // produces an unchanged manifest.
+        days.sort();
+        files.extend(days);
     }
     let snapshots = instance_dir.join("snapshots");
     if let Ok(entries) = std::fs::read_dir(&snapshots) {
@@ -1344,6 +1365,44 @@ mod tests {
         let mut bad = manifest;
         bad.files[0].path = "../escape".into();
         assert!(validate_manifest(&bad).is_err());
+    }
+
+    /// An agent's spending history is worth as much as the disk it ran on,
+    /// and it must survive being moved to another machine. Sockets, seeds
+    /// and the egress directory beside it must not.
+    #[test]
+    fn the_cost_ledger_travels_with_a_backup_and_host_plumbing_does_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("instance");
+        let backup = temp.path().join("backup");
+        let restore = temp.path().join("restore");
+        std::fs::create_dir_all(source.join("cost")).unwrap();
+        std::fs::create_dir_all(source.join("egress")).unwrap();
+        std::fs::write(source.join("disk.raw"), b"root").unwrap();
+        let line =
+            b"{\"ts\":1756300000,\"host\":\"api.anthropic.com\",\"calls\":1,\"input_tokens\":10}\n";
+        std::fs::write(source.join("cost/2026-08-27.jsonl"), line).unwrap();
+        std::fs::write(source.join("cost/2026-08-26.jsonl"), line).unwrap();
+        std::fs::write(source.join("egress/ca.pem"), b"a per-instance CA key").unwrap();
+        std::fs::write(source.join("agent.key"), b"the guest agent key").unwrap();
+
+        export(&instance("bot"), &source, &backup, None).unwrap();
+        let manifest = verify(&backup).unwrap();
+        let paths: Vec<&str> = manifest.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"cost/2026-08-26.jsonl"), "{paths:?}");
+        assert!(paths.contains(&"cost/2026-08-27.jsonl"), "{paths:?}");
+        assert!(
+            !paths.iter().any(|path| path.starts_with("egress/")),
+            "the egress directory is not portable: {paths:?}"
+        );
+        assert!(!paths.contains(&"agent.key"), "{paths:?}");
+
+        std::fs::create_dir_all(&restore).unwrap();
+        restore_to(&backup, &restore, "bot").unwrap();
+        assert_eq!(
+            std::fs::read(restore.join("cost/2026-08-27.jsonl")).unwrap(),
+            line
+        );
     }
 
     #[test]

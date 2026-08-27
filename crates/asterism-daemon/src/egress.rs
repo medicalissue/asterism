@@ -415,6 +415,7 @@ fn ensure_running(inst: &Instance, may_move_port: bool) -> Result<(u16, String)>
     let revoked = Arc::new(AtomicBool::new(false));
     let ctx = Arc::new(ProxyCtx {
         instance: inst.name.clone(),
+        cost: asterism_core::ledger::dir(&inst.name),
         bindings: inst.secrets.clone(),
         authority,
         source: Arc::new(OrbitSource {
@@ -606,6 +607,11 @@ fn bind_loopback_with<T>(
 /// What one instance's proxy knows.
 struct ProxyCtx {
     instance: String,
+    /// Where this instance's token ledger is written. Held here rather than
+    /// derived per call so the path is decided once, when the proxy starts,
+    /// and so a test can point one proxy at a directory of its own instead
+    /// of at the process-wide `ASTERISM_HOME`.
+    cost: PathBuf,
     /// The bindings as they were when this proxy started. Held by value on
     /// purpose: revoking one restarts the proxy, so a connection cannot
     /// outlive the policy it was accepted under.
@@ -855,10 +861,28 @@ async fn carry(
         body: body.to_vec(),
     };
 
-    ctx.source
+    let request_bytes = request.body.len() as u64;
+    let target = request.target.clone();
+    let response = ctx
+        .source
         .egress(binding, handle, request)
         .await
-        .map_err(|e| Refusal::Upstream(format!("{e:#}")))
+        .map_err(|e| Refusal::Upstream(format!("{e:#}")))?;
+
+    // The one line this feature adds to the data plane. It runs after the
+    // answer is in hand, reads integers out of bytes that are already in
+    // memory on their way back to the guest, and cannot fail the call. See
+    // `crate::cost`.
+    crate::cost::record(
+        &ctx.cost,
+        &ctx.instance,
+        authority,
+        &target,
+        request_bytes,
+        &response,
+    );
+
+    Ok(response)
 }
 
 /// Resolve an authority and refuse it if it is anywhere the guest could not
@@ -1406,6 +1430,7 @@ mod tests {
         let (listener, port) = bind_loopback(None).expect("a loopback port");
         let ctx = Arc::new(ProxyCtx {
             instance: "dev".into(),
+            cost: dir.join("cost"),
             bindings,
             authority,
             source,
@@ -1621,6 +1646,7 @@ mod tests {
         let (listener, port) = bind_loopback(None).unwrap();
         let ctx = Arc::new(ProxyCtx {
             instance: "dev".into(),
+            cost: dir.join("cost"),
             bindings: vec![bound.clone()],
             authority,
             source: Arc::new(FakeSource { seen: seen.clone() }),
@@ -1785,6 +1811,7 @@ mod tests {
         let unix = UnixListener::bind(&socket).unwrap();
         let ctx = Arc::new(ProxyCtx {
             instance: "container".into(),
+            cost: dir.path().join("cost"),
             bindings: vec![bound],
             authority,
             source: Arc::new(FakeSource { seen: seen.clone() }),
@@ -1855,6 +1882,7 @@ mod tests {
         let unix = UnixListener::bind(&socket).unwrap();
         let ctx = Arc::new(ProxyCtx {
             instance: "agentdoor".into(),
+            cost: dir.path().join("cost"),
             bindings: vec![bound],
             authority,
             source: Arc::new(FakeSource { seen: seen.clone() }),
@@ -2078,5 +2106,242 @@ mod tests {
         }
         // And a leaf for a bound authority chains to it.
         assert!(one.acceptor("api.anthropic.com:443").is_ok());
+    }
+
+    // ---- the model API mock, and the ledger it fills ----------------------
+    //
+    // Everything above proves the *credential* half of the door. This proves
+    // the accounting half, over exactly the same path: a real HTTPS client
+    // inside a "guest", a real CONNECT, a real TLS termination against a
+    // certificate this device minted, the real policy, and a real TLS
+    // connection out to a server that answers in the shapes Anthropic and
+    // OpenAI actually answer in — including SSE.
+    //
+    // No API key exists anywhere in it. That is the point: the numbers the
+    // ledger records come out of the *response*, so a server that says the
+    // right thing is a complete test of the reading.
+
+    /// A local HTTPS server that answers like a model API.
+    ///
+    /// Four routes, one per shape the door has to be able to read:
+    /// `/v1/messages` and its `?stream=1` form, `/v1/chat/completions` and
+    /// its stream. The bodies are the published response shapes, cut down to
+    /// the fields that carry counters.
+    async fn model_api() -> Upstream {
+        provider();
+        let dir = tempfile::tempdir().expect("a temp dir").keep();
+        let authority = Authority::load_or_create(&dir, "modelapi").expect("an upstream CA");
+        let acceptor = authority
+            .acceptor("localhost")
+            .expect("a leaf for localhost");
+        let ca_pem = authority.ca_pem.clone();
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("a port");
+        let port = listener.local_addr().unwrap().port();
+        let seen: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(Vec::new()));
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    continue;
+                };
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let _ = http1::Builder::new()
+                        .serve_connection(
+                            TokioIo::new(tls),
+                            service_fn(move |req: hyper::Request<Incoming>| async move {
+                                let target = req
+                                    .uri()
+                                    .path_and_query()
+                                    .map(|pq| pq.as_str().to_owned())
+                                    .unwrap_or_default();
+                                Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(
+                                    Bytes::from(model_api_body(&target)),
+                                )))
+                            }),
+                        )
+                        .await;
+                });
+            }
+        });
+        Upstream { port, ca_pem, seen }
+    }
+
+    fn model_api_body(target: &str) -> &'static [u8] {
+        match target {
+            "/v1/messages" => {
+                br#"{"id":"msg_01","type":"message","role":"assistant",
+                "model":"claude-sonnet-5","content":[{"type":"text","text":"hi"}],
+                "stop_reason":"end_turn",
+                "usage":{"input_tokens":1000,"output_tokens":200,
+                "cache_creation_input_tokens":300,"cache_read_input_tokens":4000}}"#
+            }
+            "/v1/messages?stream=1" => concat!(
+                "event: message_start\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_02\",",
+                "\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-opus-5\",",
+                "\"content\":[],\"usage\":{\"input_tokens\":2000,\"output_tokens\":1,",
+                "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":50000}}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,",
+                "\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
+                "event: message_delta\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},",
+                "\"usage\":{\"output_tokens\":500}}\n\n",
+                "event: message_stop\n",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            )
+            .as_bytes(),
+            "/v1/chat/completions" => {
+                br#"{"id":"chatcmpl-1","object":"chat.completion",
+                "model":"gpt-4o","choices":[],
+                "usage":{"prompt_tokens":900,"completion_tokens":90,"total_tokens":990,
+                "prompt_tokens_details":{"cached_tokens":400}}}"#
+            }
+            "/v1/chat/completions?stream=1" => concat!(
+                "data: {\"id\":\"chatcmpl-2\",\"object\":\"chat.completion.chunk\",",
+                "\"model\":\"gpt-4o-mini\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}],",
+                "\"usage\":null}\n\n",
+                "data: {\"id\":\"chatcmpl-2\",\"object\":\"chat.completion.chunk\",",
+                "\"model\":\"gpt-4o-mini\",\"choices\":[],",
+                "\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":7,\"total_tokens\":57}}\n\n",
+                "data: [DONE]\n\n",
+            )
+            .as_bytes(),
+            // Anything else is an API this device has never heard of, and is
+            // recorded as a call and its bytes.
+            _ => br#"{"answer":"something this device does not know how to read"}"#,
+        }
+    }
+
+    /// The proof the whole feature rests on: four real calls through the real
+    /// door produce a ledger with the providers' own numbers in it, and a
+    /// dollar figure per model.
+    #[tokio::test]
+    async fn the_door_records_what_four_real_calls_cost_without_a_key() {
+        let _exclusive = exclusive().await;
+        ALLOW_LOOPBACK.store(true, Ordering::Relaxed);
+        let up = model_api().await;
+        *EXTRA_ROOT.lock().unwrap() = Some(up.ca_pem.clone());
+        let bound = binding(&format!("localhost:{}", up.port));
+        let handle_text = bound.guest_handle.as_str().to_owned();
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let source = Arc::new(FakeSource { seen });
+        let (port, ca_pem, dir) = proxy(vec![bound], source).await;
+        let cost = dir.join("cost");
+        let client = guest(port, &ca_pem);
+
+        for target in [
+            "/v1/messages",
+            "/v1/messages?stream=1",
+            "/v1/chat/completions",
+            "/v1/chat/completions?stream=1",
+            "/v3/something-else",
+        ] {
+            let response = client
+                .post(format!("https://localhost:{}{target}", up.port))
+                .header("x-api-key", handle_text.clone())
+                .body("{}")
+                .send()
+                .await
+                .expect("the guest's call reaches the mock API");
+            assert_eq!(response.status(), 200, "{target}");
+        }
+
+        let report = asterism_core::ledger::report_in(&cost, "dev", "today", 0);
+        assert_eq!(report.calls, 5, "one line per call, unknown API included");
+
+        // Fresh input: 1000 + 2000 (Anthropic) + 500 + 50 (OpenAI, with the
+        // cached part taken out of the total the way OpenAI reports it).
+        assert_eq!(report.input_tokens, 1000 + 2000 + 500 + 50);
+        assert_eq!(report.output_tokens, 200 + 500 + 90 + 7);
+        assert_eq!(report.cache_write_tokens, 300);
+        assert_eq!(report.cache_read_tokens, 4000 + 50_000 + 400);
+
+        // The API nobody could read is a call and its bytes, and nothing it
+        // could not honestly claim to know.
+        assert_eq!(report.unpriced_calls, 1);
+        assert!(report.response_bytes > 0);
+
+        let models: Vec<&str> = report.models.iter().map(|m| m.model.as_str()).collect();
+        for expected in ["claude-sonnet-5", "claude-opus-5", "gpt-4o", "gpt-4o-mini"] {
+            assert!(
+                models.contains(&expected),
+                "{expected} missing from {models:?}"
+            );
+        }
+
+        // The dollar figure, computed the long way from the published rates
+        // in `pricing.json`, so a change to either side has to be argued for.
+        let sonnet = 1000.0 * 2.0 + 200.0 * 10.0 + 300.0 * 2.5 + 4000.0 * 0.2;
+        let opus = 2000.0 * 5.0 + 500.0 * 25.0 + 50_000.0 * 0.5;
+        let gpt4o = 500.0 * 2.5 + 90.0 * 10.0 + 400.0 * 1.25;
+        let mini = 50.0 * 0.15 + 7.0 * 0.6;
+        let expected = (sonnet + opus + gpt4o + mini) / 1_000_000.0;
+        let usd = report.usd.expect("four priced models");
+        assert!((usd - expected).abs() < 1e-9, "{usd} vs {expected}");
+
+        // And the line that must never appear: no body, from any of the five
+        // answers, reached the file.
+        let day = std::fs::read_to_string(asterism_core::ledger::day_path_in(
+            &cost,
+            asterism_core::instance::now_unix(),
+        ))
+        .expect("a day file");
+        for forbidden in ["hello", "end_turn", "chatcmpl", REAL_VALUE, &handle_text] {
+            assert!(
+                !day.contains(forbidden),
+                "{forbidden:?} reached the ledger:\n{day}"
+            );
+        }
+
+        *EXTRA_ROOT.lock().unwrap() = None;
+        ALLOW_LOOPBACK.store(false, Ordering::Relaxed);
+    }
+
+    /// A guest that reaches a host it has no binding for is tunnelled blind,
+    /// and nothing about it is recorded. The ledger is a by-product of
+    /// termination, not a second interception.
+    #[tokio::test]
+    async fn an_unbound_host_is_tunnelled_and_never_recorded() {
+        let _exclusive = exclusive().await;
+        ALLOW_LOOPBACK.store(true, Ordering::Relaxed);
+        let up = model_api().await;
+        *EXTRA_ROOT.lock().unwrap() = Some(up.ca_pem.clone());
+        // The proxy is bound to a *different* authority than the one the
+        // guest calls, so the call is tunnelled rather than terminated.
+        let bound = binding("api.example.com:443");
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let (port, ca_pem, dir) = proxy(vec![bound], Arc::new(FakeSource { seen })).await;
+        let cost = dir.join("cost");
+
+        // It trusts the mock's own CA, because this connection is end-to-end
+        // to the mock: the door never terminates it.
+        let client = reqwest::Client::builder()
+            .add_root_certificate(reqwest::Certificate::from_pem(up.ca_pem.as_bytes()).unwrap())
+            .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes()).unwrap())
+            .proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{port}")).unwrap())
+            .timeout(Duration::from_secs(20))
+            .build()
+            .unwrap();
+        let response = client
+            .post(format!("https://localhost:{}/v1/messages", up.port))
+            .body("{}")
+            .send()
+            .await
+            .expect("an unbound host is still reachable");
+        assert_eq!(response.status(), 200);
+
+        assert_eq!(
+            asterism_core::ledger::report_in(&cost, "dev", "today", 0).calls,
+            0,
+            "a blind tunnel has nothing to read and records nothing"
+        );
+
+        *EXTRA_ROOT.lock().unwrap() = None;
+        ALLOW_LOOPBACK.store(false, Ordering::Relaxed);
     }
 }

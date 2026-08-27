@@ -1,0 +1,4 @@
+today      $0.06   3500 in · 790 out · cache 54k   claude-opus-5 (1 call) +2 more
+this week  $0.06
+
+bot: 1 call used a model this device has no rate for, so the figure above is a floor. Add a row to $ASTERISM_HOME/pricing.json — see docs/cost.md.

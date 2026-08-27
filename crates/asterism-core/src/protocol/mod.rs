@@ -168,6 +168,28 @@ pub enum Request {
     Remove {
         name: String,
     },
+    /// What one instance — or every instance on the answering device — spent
+    /// on model APIs, over a window ending now.
+    ///
+    /// Routed like any other instance command when `name` is set, because
+    /// the ledger is written by the device that supplies the instance's
+    /// compute: that is where the egress door runs and therefore where the
+    /// counters were read. Asking any device in the orbit reaches the right
+    /// one. With `name` absent it is a device-local question — "everything
+    /// this machine has been paying for" — and is answered here.
+    Cost {
+        #[serde(default)]
+        name: Option<String>,
+        /// Unix seconds the window starts at, inclusive. Computed by the
+        /// CLI, so `today` means the *user's* today rather than the
+        /// answering device's.
+        since: u64,
+        /// What to call the window in the answer. Carried rather than
+        /// re-derived so `ast cost --since 6h --json` reports the window the
+        /// user asked for.
+        #[serde(default)]
+        window: String,
+    },
     /// One device's shard of the orbit registry — the instances whose compute
     /// it supplies. What one daemon asks another for while assembling
     /// [`Request::ListOrbit`], and what `ast ls --local` prints.
@@ -823,6 +845,10 @@ impl Request {
             | Request::SshEndpoint { name }
             | Request::ContainerExec { name, .. } => Some(name),
 
+            // Named: routed to the device whose door wrote the ledger.
+            // Unnamed (`ast cost --all`): a question about this device.
+            Request::Cost { name, .. } => name.as_deref(),
+
             // The handshake, and the two views of the registry. A list is
             // about every instance, which is not one instance.
             Request::Ping { .. }
@@ -963,6 +989,7 @@ impl Request {
             Request::CreateNetwork { .. } => 10,
             Request::HostedEnroll { .. } | Request::HostedStatus | Request::HostedForget => 12,
             Request::DeviceBench { .. } => 13,
+            Request::Cost { .. } => 14,
             Request::DeviceShellPolicy { .. }
             | Request::DeviceShellOpen { .. }
             | Request::DeviceShellInput { .. }
@@ -987,6 +1014,7 @@ impl Request {
             // routing envelope, in a compatibility refusal.
             Request::Proxy { inner, .. } => inner.versioned_name(),
             Request::Compat => Some("compat"),
+            Request::Cost { .. } => Some("cost"),
             Request::BackupExport { .. } => Some("backup_export"),
             Request::BackupImport { .. } => Some("backup_import"),
             Request::BackupImportV2 { .. } => Some("backup_import_v2"),
@@ -1131,6 +1159,14 @@ pub enum Response {
     /// every shard that answered plus the cached rows of those that did not.
     Orbit {
         rows: Vec<OrbitRow>,
+    },
+
+    /// Reply to [`Request::Cost`]: one report per instance asked about.
+    ///
+    /// A vector even for a single instance, so `--all` and a named instance
+    /// share one shape and the CLI has one printer.
+    Cost {
+        reports: Vec<crate::ledger::Report>,
     },
 
     // ---- portable backups ---------------------------------------------------
@@ -1470,6 +1506,7 @@ impl Response {
             Response::ContainerExec { .. } => 8,
             Response::Exec { .. } => 9,
             Response::Hosted { .. } => 12,
+            Response::Cost { .. } => 14,
             Response::Instance { instance, .. } if instance.runtime == RuntimeKind::Container => 8,
             Response::Instances { instances }
                 if instances
@@ -1514,6 +1551,15 @@ impl Response {
 pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
     [
         ("compat", Request::Compat.since()),
+        (
+            "cost",
+            Request::Cost {
+                name: None,
+                since: 0,
+                window: String::new(),
+            }
+            .since(),
+        ),
         (
             "hosted_enroll",
             Request::HostedEnroll {

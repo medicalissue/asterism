@@ -1,0 +1,4 @@
+{"ts":1787816267,"provider":"anthropic","host":"httpbin.org:443","model":"claude-sonnet-5","calls":1,"input_tokens":1000,"output_tokens":200,"cache_write_tokens":300,"cache_read_tokens":4000,"response_bytes":276}
+{"ts":1787816268,"provider":"anthropic","host":"httpbin.org:443","model":"claude-opus-5","calls":1,"input_tokens":2000,"output_tokens":500,"cache_read_tokens":50000,"response_bytes":570}
+{"ts":1787816269,"provider":"openai","host":"httpbin.org:443","model":"gpt-4o","calls":1,"input_tokens":500,"output_tokens":90,"cache_read_tokens":400,"response_bytes":201}
+{"ts":1787816270,"host":"httpbin.org:443","calls":1,"response_bytes":50}
