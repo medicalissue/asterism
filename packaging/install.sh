@@ -938,7 +938,7 @@ install_source() {
 				die "astd-vz could not be built and signed. Nothing was installed."
 			vz=1
 		else
-			say "this tree has no scripts/sign-vz.sh, so no vz helper was built — the qemu backend still works"
+			say "this tree has no scripts/sign-vz.sh, so no vz helper was built — instances will need an explicitly installed and selected compatibility backend"
 		fi
 	fi
 	if [ "$vz" = "1" ]; then
@@ -1321,8 +1321,12 @@ select_tap() {
 	SELECTED_TAP="$TAP"
 }
 
-# QEMU arrives as a formula dependency: Homebrew builds and ships it, we only
-# declare it. Asterism never bundles QEMU.
+# The formula declares no QEMU dependency. Virtualization.framework is the
+# macOS product backend and image materialisation is pure Rust, so a Homebrew
+# install lands `ast`, `astd` and the signed `astd-vz` helper and nothing else
+# that could boot a guest. Someone who wants the compatibility backend runs
+# `brew install qemu` themselves, under its own terms; Asterism never bundles
+# or declares QEMU.
 install_brew() {
 	brew_bin="$(find_brew)" || no_homebrew
 
@@ -1471,12 +1475,18 @@ note_vz() {
 	if [ "$1" != "1" ]; then
 		say ""
 		if [ "$METHOD" = "release" ]; then
-			say "This release ships no astd-vz, so Virtualization.framework is not"
-			say "available and Asterism will use the QEMU backend. A newer release, or"
-			say "ASTERISM_METHOD=source, builds and signs the helper."
+			say "This release ships no astd-vz, so Virtualization.framework — the macOS"
+			say "product backend — is unavailable and no instance can be created until"
+			say "it is. A newer release, or ASTERISM_METHOD=source, builds and signs the"
+			say "helper. Until then the only way to run a guest is to install the"
+			say "compatibility backend yourself and ask for it by name:"
+			say "    brew install qemu && ast create dev --image debian:13 --backend qemu"
 		else
-			say "No astd-vz was installed, so Virtualization.framework is not"
-			say "available and Asterism will use the QEMU backend."
+			say "No astd-vz was installed, so Virtualization.framework — the macOS"
+			say "product backend — is unavailable and no instance can be created until"
+			say "it is. Until then the only way to run a guest is to install the"
+			say "compatibility backend yourself and ask for it by name:"
+			say "    brew install qemu && ast create dev --image debian:13 --backend qemu"
 		fi
 		return 0
 	fi
@@ -1488,8 +1498,8 @@ note_vz() {
 	fi
 	say ""
 	say "astd-vz is installed but its signature does not carry the virtualization"
-	say "entitlement, so Virtualization.framework will refuse it and Asterism will"
-	say "fall back to the QEMU backend. Re-run with ASTERISM_FORCE=1; if it stays"
+	say "entitlement, so Virtualization.framework will refuse it and this device"
+	say "has no product backend. Re-run with ASTERISM_FORCE=1; if it stays"
 	say "this way, the release itself is at fault — please report it."
 }
 
@@ -1498,9 +1508,13 @@ note_qemu() {
 	have qemu-system-x86_64 && return 0
 	[ "$(uname -s)" = "Darwin" ] || return 0
 	say ""
-	say "QEMU is not installed. Asterism uses Virtualization.framework where it"
-	say "can and QEMU where it cannot, so install it when you need the QEMU"
-	say "backend:  brew install qemu"
+	say "QEMU is not installed, and nothing here installs it. Virtualization.framework"
+	say "is the macOS product backend and is never traded for QEMU behind your back."
+	say "QEMU is the opt-in compatibility backend for what VZ does not do — publishing"
+	say "a guest port with -p, and qcow2 base images you point at yourself. Install it"
+	say "under its own terms and ask for it by name when you need it:"
+	say "    brew install qemu"
+	say "    ast create dev --image debian:13 --backend qemu"
 }
 
 note_path() {

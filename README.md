@@ -98,14 +98,26 @@ interactive stdin are not part of this command.
 Published endpoints are loopback-only on the device supplying compute. TCP is
 the default; append `/udp` when the service uses UDP, for example
 `-p 5353:53/udp`. QEMU currently supplies this endpoint door. A native backend
-without it refuses the create before an Instance row is written. See
+without it refuses the create before an Instance row is written, and on a Mac
+with no QEMU installed the refusal names `brew install qemu` rather than
+picking something else. See
 [Instance networking and egress](docs/instance-network.md).
 
-On macOS, Asterism uses Virtualization.framework when it satisfies the
-instance's requirements. QEMU is an optional compatibility backend, not an
-install dependency. Pass `--backend vz` or install QEMU separately and pass
-`--backend qemu` to require one and get a specific capability refusal when it
-cannot serve the instance.
+On macOS the product backend is Virtualization.framework, through the signed
+`astd-vz` helper that every install lane installs beside `astd`. QEMU is not an
+install dependency: the Homebrew formula does not declare it, nothing bundles
+it, and it is never selected ahead of VZ. It is the opt-in compatibility and
+development fallback for the two things VZ does not do — `-p` port publication
+and reading a qcow2 base image you point at directly. Install it yourself and
+ask for it by name when you want it:
+
+```console
+$ brew install qemu
+$ ast create dev --image debian:13 --backend qemu
+```
+
+`--backend vz` likewise pins VZ, so a create that VZ cannot serve is a specific
+capability refusal rather than a quiet substitution.
 
 On Linux, a tagged release ships pinned Cloud Hypervisor v53.0 and virtiofsd
 v1.14.0 beside `ast` and `astd`. QEMU remains an explicit compatibility
@@ -240,8 +252,12 @@ compatibility contract.
   $ ast attach agent --secret anthropic --to api.anthropic.com
   ```
 
-Remote block volumes currently require the QEMU backend. Directory shares
-must be on the same device as the instance's compute.
+Remote block volumes currently require the QEMU backend, which is the opt-in
+compatibility backend rather than something an install lands: create the
+instance with `--backend qemu` on a device where you installed QEMU yourself,
+and an attach to an instance whose backend has no share transport is refused
+with that install command rather than silently dropped. Directory shares must
+be on the same device as the instance's compute.
 
 ## Reach guests and devices
 
