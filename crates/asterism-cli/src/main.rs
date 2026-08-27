@@ -1422,6 +1422,12 @@ fn run() -> Result<()> {
             // Profile names are cheap to validate locally. Image bytes are
             // always pulled by the device that will own the instance.
             asterism_core::profile::resolve(&profiles)?;
+            // And the name is checked before them all, for the same reason at
+            // a larger scale: the daemon refuses a name a device already
+            // answers to when the create frame reaches it, but that is after
+            // the pull, and downloading 350 MB to be told the name was never
+            // available is the wrong order to find out in.
+            refuse_a_device_name(&name)?;
             let resolved = ensure_image_on_device(device.as_deref(), &image)?;
             let shape = Shape {
                 cpus,
@@ -3631,6 +3637,34 @@ fn pull_here(reference: &str, json: bool) -> Result<()> {
         ImagePath::LocalCore => pull_image_locally(reference)?,
     };
     print_image_pull(&result, json)
+}
+
+/// Refuses `ast create <device>` before a byte is downloaded.
+///
+/// Not a second implementation of the rule — the daemon still enforces it on
+/// the create frame, and has to, because a create can also arrive from
+/// somewhere that never ran this. This is the same question asked early
+/// enough to be worth asking: the answer costs one round trip on a unix
+/// socket, and being wrong about it costs an image pull.
+///
+/// A name that is *free* comes back as an error here ("unknown name …"),
+/// which is not this function's business: only a name that resolves to a
+/// device is.
+fn refuse_a_device_name(name: &str) -> Result<()> {
+    let Ok(Response::Resolved {
+        kind: NameKind::Device,
+        ..
+    }) = send(&Request::Resolve { name: name.into() })
+    else {
+        return Ok(());
+    };
+    bail!(names::instance_name_is_a_device(
+        name,
+        &format!(
+            "ast create {} --image …",
+            names::suggested_instance_name(name)
+        )
+    ))
 }
 
 /// Make an image available on the device that will own the next operation.
