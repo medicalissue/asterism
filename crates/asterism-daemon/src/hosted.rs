@@ -35,7 +35,8 @@ use asterism_core::paths;
 use asterism_core::protocol::{
     HostedPeerStatus, HostedPresence, HostedStatus, RedactedBearer, Request, Response,
 };
-use asterism_mesh::{DeviceIdentity, MeshInfra};
+use asterism_mesh::iroh_types::RelayUrl;
+use asterism_mesh::{DeviceIdentity, HostedDiscovery, MeshInfra};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -117,6 +118,9 @@ pub(crate) struct Hosted {
     session: Mutex<Option<Session>>,
     presence: Mutex<HostedPresence>,
     last_error: Mutex<Option<String>>,
+    /// The hints this device last successfully published, so an unchanged
+    /// address is not republished on every tick.
+    published: Mutex<EndpointHints>,
     client: reqwest::Client,
     /// Woken whenever a session is armed or the record changes.
     wake: tokio::sync::Notify,
@@ -190,6 +194,7 @@ pub(crate) fn init(node: Node, mesh: Option<Arc<Mesh>>) -> Result<()> {
         session: Mutex::new(None),
         presence: Mutex::new(HostedPresence::Disabled),
         last_error: Mutex::new(None),
+        published: Mutex::new(EndpointHints::default()),
         client,
         wake: tokio::sync::Notify::new(),
     });
@@ -200,13 +205,19 @@ pub(crate) fn init(node: Node, mesh: Option<Arc<Mesh>>) -> Result<()> {
     Ok(())
 }
 
-/// The relay list and discovery seam an enrolled account supplies.
+/// The relays an enrolled account has selected for this device.
 ///
-/// This is the seam AST-119 fills in: when the account selects relays, they
-/// arrive here and become the `MeshInfra` the endpoint binds with. Until then
-/// an enrolled account with no selected relay yields an empty override, which
-/// means "use whatever the operator configured", not "use a public default".
-pub(crate) fn account_mesh_infra() -> Option<MeshInfra> {
+/// This is the seam the relay work owns from its side. The account's chosen
+/// relay list arrives here, and the endpoint binds with it; what this module
+/// deliberately does not do is decide what a relay default is.
+pub(crate) fn account_relay_list() -> Vec<String> {
+    account_discovery()
+        .map(|config| config.relays)
+        .unwrap_or_default()
+}
+
+/// The account's discovery configuration for this device, if it is enrolled.
+fn account_discovery() -> Option<DiscoveryConfig> {
     let hosted = HOSTED.get()?;
     let record = hosted.record.try_lock().ok()?;
     if record.account_id.is_empty() {
@@ -216,7 +227,43 @@ pub(crate) fn account_mesh_infra() -> Option<MeshInfra> {
         .peers
         .iter()
         .find(|peer| peer.device_id == record.device_id)?;
-    Some(own.discovery.mesh_infra())
+    Some(own.discovery.clone())
+}
+
+/// The [`MeshInfra`] an enrolled account implies.
+///
+/// `HostedDiscovery::none()` is the load-bearing half: an enrolled device's
+/// directory is its own account's device list, read by this module over the
+/// coordinator API, and never pkarr or DNS. Enrolling therefore *replaces*
+/// public publication rather than adding to it — there is no configuration in
+/// which signing in starts announcing this device to a directory run by
+/// strangers.
+///
+/// `with_env_overrides` is applied last, and that order is the point: a
+/// variable a human set on this machine outranks whatever the account was
+/// given, because that variable is how someone points a device at their own
+/// relay when the coordinator is wrong, unreachable, or not theirs.
+///
+/// An account with no selected relay yields an empty list, which means "use
+/// whatever the operator configured", never "use a public default".
+pub(crate) fn account_mesh_infra() -> Option<MeshInfra> {
+    let config = account_discovery()?;
+    // A relay the account named but that does not parse is dropped rather than
+    // stringified back into the endpoint: `with_hosted` takes parsed URLs
+    // precisely so a malformed entry fails here, where it can be ignored, and
+    // not later as a bind error that takes the whole mesh down with it.
+    let relays = config
+        .relays
+        .iter()
+        .filter_map(|relay| match relay.parse::<RelayUrl>() {
+            Ok(url) => Some(url),
+            Err(error) => {
+                eprintln!("astd: the account named an unusable relay {relay:?}: {error}");
+                None
+            }
+        })
+        .collect();
+    Some(MeshInfra::with_hosted(relays, HostedDiscovery::none()).with_env_overrides())
 }
 
 /// Where `hosted.json` lives.
@@ -336,11 +383,18 @@ impl Hosted {
         match &result {
             Ok(()) => {
                 *self.last_error.lock().await = None;
+                // The session is armed from this moment. Say so, rather than
+                // leaving the stale word the supervisor last wrote.
+                *self.presence.lock().await = HostedPresence::Connecting;
                 // Say whose infrastructure this account has selected, in the
                 // same words the endpoint uses at startup, so signing in never
                 // silently changes who this device talks to.
                 if let Some(infra) = account_mesh_infra() {
-                    eprintln!("astd: hosted discovery — {}", infra.describe());
+                    eprintln!(
+                        "astd: hosted discovery — {} ({} account relay(s))",
+                        infra.describe(),
+                        account_relay_list().len()
+                    );
                 }
             }
             Err(error) => *self.last_error.lock().await = Some(format!("{error:#}")),
@@ -355,6 +409,7 @@ impl Hosted {
     async fn forget(&self) -> Result<()> {
         *self.session.lock().await = None;
         *self.record.lock().await = HostedRecord::default();
+        *self.published.lock().await = EndpointHints::default();
         *self.presence.lock().await = HostedPresence::Disabled;
         *self.last_error.lock().await = None;
         match std::fs::remove_file(&self.path) {
@@ -397,6 +452,9 @@ impl Hosted {
             .and_then(|device| device.get("enrolled_at"))
             .and_then(serde_json::Value::as_u64)
             .unwrap_or_else(now_unix);
+        // The completion carried these, so the first refresh has nothing to
+        // republish.
+        *self.published.lock().await = endpoints;
         let account_id = self.read_account_id().await?;
         {
             let mut record = self.record.lock().await;
@@ -440,21 +498,62 @@ impl Hosted {
         }
     }
 
-    /// One pass of the refresh: publish where this device is, read where its
-    /// peers are, and merge that into local state.
+    /// How many bytes this device has moved through a relay, cumulatively.
+    ///
+    /// Reported so an account's relay quota can be accounted for without the
+    /// coordinator learning who the other end was or which address either side
+    /// used: one aggregate number per device, and nothing else. There is
+    /// nowhere in the record to put a peer even if this wanted to.
+    ///
+    /// The count comes from the daemon's relay meter, which is the same number
+    /// `ast devices` breaks down per peer. A daemon with no mesh has moved
+    /// nothing through a relay, and says zero.
+    async fn relay_bytes_total(&self) -> u64 {
+        match &self.mesh {
+            Some(mesh) => mesh.relayed_bytes_total().await,
+            None => 0,
+        }
+    }
+
+    /// One pass of the refresh: publish where this device is, then read where
+    /// its peers are.
     async fn sync(&self) -> Result<()> {
+        self.publish_hints().await?;
+        self.refresh_devices().await
+    }
+
+    /// Publishes this device's routing hints, and only when they moved.
+    ///
+    /// Republishing an unchanged address would be pure chatter, and it is the
+    /// half of the refresh that a `devices.changed` hint must never trigger:
+    /// publishing is what produces that hint in the first place.
+    async fn publish_hints(&self) -> Result<()> {
         let device_id = self.record.lock().await.device_id.clone();
         if device_id.is_empty() {
             return Ok(());
         }
         let endpoints = self.local_endpoints().await;
-        if !endpoints.is_empty() {
-            self.post(
-                "/api/v1/devices/hints",
-                serde_json::json!({ "device_id": device_id, "endpoints": endpoints }),
-            )
-            .await
-            .context("publishing this device's routing hints")?;
+        if endpoints.is_empty() || *self.published.lock().await == endpoints {
+            return Ok(());
+        }
+        self.post(
+            "/api/v1/devices/hints",
+            serde_json::json!({
+                "device_id": device_id,
+                "endpoints": endpoints,
+                "relay_bytes": self.relay_bytes_total().await,
+            }),
+        )
+        .await
+        .context("publishing this device's routing hints")?;
+        *self.published.lock().await = endpoints;
+        Ok(())
+    }
+
+    /// Reads the account's device list and merges it into local state.
+    async fn refresh_devices(&self) -> Result<()> {
+        if self.record.lock().await.device_id.is_empty() {
+            return Ok(());
         }
         let listed = self
             .get("/api/v1/devices")
@@ -652,7 +751,12 @@ impl Hosted {
                             .and_then(serde_json::Value::as_str)
                             == Some("devices.changed")
                         {
-                            self.sync_reporting().await;
+                            // Read, never write. Reacting to a hint by
+                            // publishing would make one device's address
+                            // change a conversation that never ends.
+                            if let Err(error) = self.refresh_devices().await {
+                                *self.last_error.lock().await = Some(format!("{error:#}"));
+                            }
                         }
                     }
                 },

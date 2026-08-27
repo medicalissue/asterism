@@ -280,6 +280,20 @@ impl RelayMeter {
         self.totals.get(device_id).copied().unwrap_or_default()
     }
 
+    /// Everything this device has relayed since the period began, summed over
+    /// every peer and both directions.
+    ///
+    /// This is the whole of what a relay quota needs, and deliberately the
+    /// whole of what anyone asking for a quota figure can get from here: one
+    /// number, with no peer in it. Which devices this one talks to is not a
+    /// fact a relay bill requires, so the aggregate is the only shape the
+    /// hosted coordinator is ever handed.
+    pub fn relayed_total(&self) -> u64 {
+        self.totals
+            .values()
+            .fold(0u64, |sum, peer| sum.saturating_add(peer.relayed_total()))
+    }
+
     /// Folds one connection's current path counters into the peer's totals.
     ///
     /// Idempotent by construction: calling it twice with nothing having moved

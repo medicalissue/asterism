@@ -215,6 +215,7 @@ Bearer session. A `asterism-cli` session needs `orbit.read`.
       "discovery": { "relays": [] },
       "endpoints": { "addrs": ["192.0.2.10:41641"], "relay_url": "https://…" },
       "endpoints_updated_at": 1756000200,
+      "relay_bytes": 1048576,
       "enrolled_at": 1756000000,
       "presence": { "status": "online", "updated_at": 1756000300 }
     }
@@ -236,12 +237,24 @@ session already proves the account, and the device must already be enrolled to
 it.
 
 ```json
-{ "device_id": "<64 hex>", "endpoints": { "addrs": ["198.51.100.7:41641"] } }
+{
+  "device_id": "<64 hex>",
+  "endpoints": { "addrs": ["198.51.100.7:41641"] },
+  "relay_bytes": 1048576
+}
 ```
 
 ```json
 { "ok": true, "endpoints_updated_at": 1756000400 }
 ```
+
+`relay_bytes` is optional: one non-negative safe integer, the cumulative bytes
+this device has moved through a relay as the device itself counts them. It is
+the whole of what relay quota accounting needs, and deliberately all of what it
+gets — there is no field for who the other end was, which address either side
+used, or when any of it happened. The stored value only ever rises, so a device
+that restarted and lost its counter cannot lower the account's total. Anything
+that is not a non-negative safe integer is a `400`, never a silent clamp.
 
 Hints are **replaced**, never appended. The coordinator therefore holds where a
 device is now and never a history of where it has been. `404 not_found` for a
@@ -353,9 +366,33 @@ infrastructure at enrollment in the same words the endpoint uses at startup. A
 device never silently changes whose servers it talks to.
 
 The relay half of an account's `discovery` configuration is owned by the relay
-work (AST-119), which fills in `DiscoveryConfig::relays`. This document and the
-enrollment code carry it end to end and hand it to `MeshInfra` unchanged; what
-they deliberately do not do is decide what a default relay is.
+work, which fills in `DiscoveryConfig::relays`. This document and the enrollment
+code carry it end to end and hand it to `MeshInfra` unchanged; what they
+deliberately do not do is decide what a default relay is. The daemon exposes
+`hosted::account_relay_list()` for exactly that hand-off, and
+`hosted::account_mesh_infra()` builds
+
+```rust
+MeshInfra::with_hosted(relays, HostedDiscovery::none())
+    .with_env_overrides()
+```
+
+from it, parsing each entry into a `RelayUrl` and dropping — with a line on
+stderr — any the account named that does not parse. A malformed entry costs one
+relay, never the bind.
+
+`HostedDiscovery::none()` is the load-bearing half: an enrolled device's
+directory is the account's own device list read through `GET /api/v1/devices`,
+not pkarr or DNS. Environment overrides still beat the coordinator field by
+field, which is what keeps the self-hosted mode reachable from inside the
+enrolled one.
+
+A device also reports one number back — `relay_bytes` on the hints endpoint —
+so an account's relay usage can be accounted for without the coordinator
+learning anything about who it talked to. It comes from the daemon's relay
+meter, summed over every peer and both directions: the same bytes `ast devices`
+breaks down per peer, with the peers taken out. A relay bill does not need to
+know which devices this one talks to, so that is not what gets sent.
 
 ### Local trust is not granted by enrollment
 
@@ -381,7 +418,11 @@ coordinator can withhold a hint; it cannot grant membership.
 
 `hosted.json` in the Asterism home holds the coordinator origin, the opaque
 account id, this device's own enrolled public key, the trust flag, and the
-account's last-seen device list. It has no field for a bearer, a session id, or
+account's last-seen device list. Routing hints are republished only when they
+actually change, and a `devices.changed` frame causes a read and never a write:
+publishing is what produces that frame, so reacting to one by publishing would
+turn a single address change into a conversation that never ends. The Worker
+also declines to echo the frame back to the device that caused it. It has no field for a bearer, a session id, or
 an account name, and a test asserts that.
 
 The bearer is deliberately never persisted by the daemon. `ast` owns the OS

@@ -10,7 +10,7 @@
 //! enrollment and presence".
 
 use asterism_coordinator::{
-    enrollment_signed_message, enrollment_proof, sign_enrollment_challenge, AccountBinding,
+    enrollment_proof, enrollment_signed_message, sign_enrollment_challenge, AccountBinding,
     AuthorizationProvider, Coordinator, DiscoveryConfig, EnrollmentProof, VerifiedIdentity,
     VerifiedIdentitySource, DEVICE_AUTHORIZATION_PROTOCOL,
 };
@@ -79,8 +79,9 @@ fn every_shared_vector_verifies_against_its_device_key() {
         assert_eq!(hex(&message), vector.message_hex, "{}", vector.name);
         assert_eq!(message.len(), 30 + 64, "{}", vector.name);
 
-        let proof = EnrollmentProof::from_tokens(&vector.device_id, &vector.challenge, &vector.signature)
-            .expect(&vector.name);
+        let proof =
+            EnrollmentProof::from_tokens(&vector.device_id, &vector.challenge, &vector.signature)
+                .expect(&vector.name);
         assert!(
             proof.device_id.verify(&message, &proof.signature),
             "{} did not verify",
@@ -95,9 +96,10 @@ fn a_tampered_signature_and_a_stale_generation_both_fail() {
     assert_eq!(vectors.invalid.len(), 2);
     for vector in &vectors.invalid {
         let message = enrollment_signed_message(&vector.challenge).expect(&vector.name);
-        let verified = EnrollmentProof::from_tokens(&vector.device_id, &vector.challenge, &vector.signature)
-            .map(|proof| proof.device_id.verify(&message, &proof.signature))
-            .unwrap_or(false);
+        let verified =
+            EnrollmentProof::from_tokens(&vector.device_id, &vector.challenge, &vector.signature)
+                .map(|proof| proof.device_id.verify(&message, &proof.signature))
+                .unwrap_or(false);
         match vector.name.as_str() {
             // A flipped bit is refused by the signature check itself.
             "tampered-signature" => assert!(!verified, "{} verified", vector.name),
@@ -120,7 +122,8 @@ fn signing_a_challenge_produces_the_wire_signature_the_proof_carries() {
     assert_eq!(token.len(), 86);
 
     let encoded = sign_enrollment_challenge(&identity, &token).unwrap();
-    let parsed = EnrollmentProof::from_tokens(&identity.device_id().to_string(), &token, &encoded).unwrap();
+    let parsed =
+        EnrollmentProof::from_tokens(&identity.device_id().to_string(), &token, &encoded).unwrap();
     let direct = enrollment_proof(&identity, challenge);
     assert_eq!(parsed.signature.to_bytes(), direct.signature.to_bytes());
 
@@ -191,7 +194,10 @@ fn published_hints_replace_rather_than_accumulate() {
         .publish_endpoints(&binding, &identity.device_id(), second)
         .unwrap();
     // Where it is now, never where it has been.
-    assert_eq!(device.endpoints.addrs, vec!["198.51.100.7:41641".to_owned()]);
+    assert_eq!(
+        device.endpoints.addrs,
+        vec!["198.51.100.7:41641".to_owned()]
+    );
     assert!(device.endpoints.relay_url.is_none());
 
     // Anything that is not a literal socket address is refused outright.

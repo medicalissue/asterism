@@ -5833,9 +5833,7 @@ DAwMDAwMDAsImV4cCI6MTcwMDA0MzIwMCwic2NvcGUiOiJvcGVuaWQifQ.c2lnbmF0dXJl";
         assert!(Cli::try_parse_from(["ast", "create", "dev"]).is_ok());
         assert!(Cli::try_parse_from(["ast", "devices"]).is_ok());
         assert!(Cli::try_parse_from(["ast", "auth", "enroll"]).is_ok());
-        assert!(
-            Cli::try_parse_from(["ast", "auth", "enroll", "--trust-account-devices"]).is_ok()
-        );
+        assert!(Cli::try_parse_from(["ast", "auth", "enroll", "--trust-account-devices"]).is_ok());
     }
 
     #[test]
