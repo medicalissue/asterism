@@ -186,6 +186,15 @@ scan_metadata_absence() {
 
 mkdir -p "$BIN/guest/bin" "$EVIDENCE" "$WORKDIR"
 cp "$AST" "$ASTD" "$BIN/"
+# The pair under test is moved so the guest agent beside it is the one this
+# lane injects. The pinned VMM and its virtiofs helper are found beside
+# `astd`, so they have to come along or the copy is a different product.
+RELEASE_DIR="$(dirname "$ASTD")"
+for helper in cloud-hypervisor virtiofsd; do
+  [ -x "$RELEASE_DIR/$helper" ] || continue
+  cp "$RELEASE_DIR/$helper" "$BIN/$helper"
+done
+[ ! -d "$RELEASE_DIR/share" ] || cp -R "$RELEASE_DIR/share" "$BIN/share"
 cp "$GUEST_ARTIFACT" "$BIN/guest/bin/asterism-guest"
 chmod 0755 "$BIN/guest/bin/asterism-guest"
 AST="$BIN/ast"
