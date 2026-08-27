@@ -316,5 +316,15 @@ State lives in `~/.asterism`; set `ASTERISM_HOME` to override it. The Rust
 workspace contains `asterism-core`, `asterism-daemon` (`astd`),
 `asterism-cli` (`ast`), `asterism-mesh`, and `asterism-vz`.
 
+## Contributing
+
+Sign off each commit with `git commit -s`. That `Signed-off-by` line is the
+DCO; there is no CLA. Before opening a pull request, run
+`cargo fmt --all --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`cargo test --workspace`. Changes to the wire protocol keep compatibility
+with released clients. The license footer below states the terms your
+contribution arrives under.
+
 Licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your
 option. Contributions are accepted under the same terms (DCO).
