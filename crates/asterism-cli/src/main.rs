@@ -16,6 +16,8 @@
 //! question about itself, and as the address for the commands that really are
 //! about devices: pairing, and the orbit's own membership.
 
+mod agent;
+
 use asterism_core::ipc::Stream;
 use std::fs::File;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write};
@@ -124,6 +126,22 @@ enum Command {
         /// it is done and what it got.
         #[arg(long = "profile", value_name = "NAME")]
         profiles: Vec<String>,
+        /// Make this an agent workspace instead of a bare guest: pull the
+        /// preset's image, bind the secrets it names as opaque handles, put a
+        /// data volume on its workdir, and leave the agent running in a tmux
+        /// session called after the instance. `ast agents` lists them.
+        ///
+        /// A required secret that this orbit does not have is refused before
+        /// anything is created, and the refusal names the command that fixes
+        /// it. The image is the preset's, so `--image` has nothing to say
+        /// here; pin your own by putting a preset in ~/.asterism/presets.
+        #[arg(long, value_name = "NAME", conflicts_with = "profiles")]
+        agent: Option<String>,
+        /// A git repository to clone into the agent's workspace. It lands
+        /// under the preset's workdir, on the data volume, so it survives a
+        /// snapshot and restore of the root disk.
+        #[arg(long, value_name = "URL", requires = "agent")]
+        repo: Option<String>,
     },
     /// Boot an instance.
     ///
@@ -260,6 +278,10 @@ enum Command {
     Logs {
         /// The instance whose console to print.
         name: String,
+        /// Print the guest's serial console even for an agent instance, whose
+        /// logs are otherwise the agent's own tmux pane.
+        #[arg(long)]
+        console: bool,
         /// Keep printing as the guest writes more. Needs the console log to be
         /// on this device's disk.
         #[arg(short, long)]
@@ -364,6 +386,26 @@ enum Command {
         #[arg(long)]
         verify: bool,
     },
+    /// Enter an agent instance's tmux session, from any device.
+    ///
+    /// A tty over ssh running `tmux new-session -A -s <name>`: attach to the
+    /// session if it is there, start it with the preset's command if it is
+    /// not. `Ctrl-b d` detaches and the agent keeps running, because the
+    /// session belongs to the guest and not to your terminal.
+    ///
+    /// `ast ssh <agent>` and a bare `ast attach <agent>` land in the same
+    /// place. This is the spelling to reach for: `ssh` is about a shell and
+    /// `attach` is about parts, and this is about neither.
+    Session {
+        /// The agent instance to enter.
+        name: String,
+    },
+    /// List the agent presets `ast create --agent` can bring up.
+    ///
+    /// The ones Asterism ships, plus anything in ~/.asterism/presets — a file
+    /// there with a shipped name replaces it, which is how you point an agent
+    /// at your own build of its image without patching Asterism.
+    Agents,
     /// List the bootstrap profiles this Asterism can apply to a guest.
     Profiles,
     /// Show, change or verify an instance's bootstrap profiles.
@@ -751,6 +793,11 @@ enum SecretCommand {
     ///
     /// Pipe the exact bytes on stdin. `--device` selects a different source
     /// device over the existing mesh.
+    ///
+    /// Spelled `add` too, because that is the word every refusal that asks
+    /// for a secret uses, and a command a message tells you to type has to be
+    /// a command that exists.
+    #[command(alias = "add")]
     Create { name: String },
     /// List orbit-visible secret metadata. Values are never shown.
     Ls,
@@ -1054,6 +1101,34 @@ fn run() -> Result<()> {
     let mut pull_json = false;
 
     let request = match cli.command {
+        // `--agent` is a shorthand for a sequence of the commands below it,
+        // in an order with refusals in it. It answers before the general
+        // create path so that nothing is made when a required secret is
+        // missing.
+        Command::Create {
+            name,
+            cpus,
+            mem,
+            disk,
+            backend,
+            agent: Some(agent),
+            repo,
+            ..
+        } => {
+            let shape = Shape {
+                cpus,
+                mem_mib: parse_mem_mib(&mem)?,
+                disk_gib: parse_disk_gib(&disk)?,
+            };
+            return agent::create(
+                device.as_deref(),
+                &name,
+                &agent,
+                repo.as_deref(),
+                shape,
+                backend,
+            );
+        }
         Command::Create {
             name,
             image,
@@ -1063,6 +1138,7 @@ fn run() -> Result<()> {
             disk,
             backend,
             profiles,
+            ..
         } => {
             // Profile names are cheap to validate locally. Image bytes are
             // always pulled by the device that will own the instance.
@@ -1125,6 +1201,15 @@ fn run() -> Result<()> {
         // because the user already said which they meant by how they wrote
         // it — and because a directory on another device has always had to be
         // an absolute path, so there is nothing ambiguous left over.
+        Command::Attach {
+            name,
+            volume,
+            secret,
+            gpu,
+            ..
+        } if volume.is_none() && secret.is_none() && gpu.is_none() && agent::is_agent(&name) => {
+            return agent::attach(device.as_deref(), &name);
+        }
         Command::Attach {
             name,
             volume,
@@ -1246,10 +1331,19 @@ fn run() -> Result<()> {
         Command::Secret(cmd) => return secret_command(cmd, device.as_deref()),
         Command::Logs {
             name,
+            console,
             follow,
             lines,
         } => {
             local_only("logs", device.as_deref())?;
+            // An agent instance's console is Asterism's own init and the
+            // image's entrypoint saying they came up, which is not what
+            // somebody typing `ast logs bot` wants to read. What they want is
+            // what the agent has been saying, so that is the default and the
+            // console is a flag.
+            if !console && agent::is_agent(&name) {
+                return agent::logs(&name, follow, lines);
+            }
             return logs(&name, follow, lines);
         }
         Command::Snapshot(SnapshotCommand::Rm { name, tag }) => {
@@ -1314,6 +1408,11 @@ fn run() -> Result<()> {
         }
         // The catalog is this binary's, not a device's: it is what this
         // Asterism knows how to make a guest into.
+        Command::Session { name } => return agent::attach(device.as_deref(), &name),
+        Command::Agents => {
+            local_only("agents", device.as_deref())?;
+            return agent::print_catalog();
+        }
         Command::Profiles => {
             local_only("profiles", device.as_deref())?;
             return print_profiles();
@@ -1356,11 +1455,19 @@ fn run() -> Result<()> {
         } => {
             local_only("ssh", device.as_deref())?;
             return match host {
-                None => ssh(
-                    name.as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("an instance name is required"))?,
-                    &command,
-                ),
+                None => {
+                    let name = name
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("an instance name is required"))?;
+                    // An agent instance's shell is its session. Asking for a
+                    // shell in one and being dropped somewhere else would be
+                    // the surprise; `ast exec` is still there for a command
+                    // that is not a session.
+                    if command.is_empty() && agent::is_agent(name) {
+                        return agent::attach(device.as_deref(), name);
+                    }
+                    ssh(name, &command)
+                }
                 Some(host) => device_shell(&host, &command, tty),
             };
         }
@@ -2495,7 +2602,7 @@ fn aimed(request: Request, device: Option<&str>) -> Request {
 }
 
 /// Refuses `--device` on a command that could not mean anything remotely.
-fn local_only(what: &str, device: Option<&str>) -> Result<()> {
+pub(crate) fn local_only(what: &str, device: Option<&str>) -> Result<()> {
     match device {
         Some(name) => bail!(
             "ast {what} is about this device, so it cannot be aimed at {name:?} \
@@ -3767,7 +3874,7 @@ fn refuse_ssh_to_an_oci_guest(name: &str) -> Result<()> {
     )
 }
 
-fn ssh_banner_up(host: &str, port: u16) -> bool {
+pub(crate) fn ssh_banner_up(host: &str, port: u16) -> bool {
     use std::io::Read;
     use std::net::ToSocketAddrs;
     let Ok(mut addrs) = (host, port).to_socket_addrs() else {
@@ -4288,7 +4395,7 @@ fn drain(file: &mut File, out: &mut std::io::Stdout) -> Result<u64> {
 /// the version in force belongs to the connection carrying the frame, so a
 /// daemon replaced between two commands is met by a fresh answer rather than
 /// by the last one's.
-fn send(request: &Request) -> Result<Response> {
+pub(crate) fn send(request: &Request) -> Result<Response> {
     let mut client = Client::open()?;
     let response = client.ask(request)?;
     // Belt and braces: a daemon that was replaced between the handshake and
@@ -4612,13 +4719,13 @@ fn timed_out(e: &anyhow::Error) -> bool {
 /// it needs an answer before it will write anything down. The socket is
 /// line-delimited JSON in both directions already, so this is the same wire —
 /// just a conversation on it rather than a question.
-struct Conversation {
+pub(crate) struct Conversation {
     write: Stream,
     read: BufReader<Stream>,
 }
 
 impl Conversation {
-    fn open(request: &Request) -> Result<Self> {
+    pub(crate) fn open(request: &Request) -> Result<Self> {
         // Through the same negotiated door as everything else: a
         // conversation is a longer exchange on the same wire, not a
         // different one, so it settles its version the same way.
@@ -4638,7 +4745,7 @@ impl Conversation {
         write_line(&mut self.write, request)
     }
 
-    fn next(&mut self) -> Result<Response> {
+    pub(crate) fn next(&mut self) -> Result<Response> {
         match read_frame(&mut self.read)? {
             Some(line) => Ok(serde_json::from_str(&line)?),
             None => bail!("astd closed the connection without answering"),

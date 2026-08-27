@@ -1,0 +1,115 @@
+name: agent-images
+
+# Builds and publishes the agent images the `--agent` presets name.
+#
+# Deliberately not on `push`: an agent image is a published artifact people
+# pull by digest, so it is cut from a tag or asked for by hand, never produced
+# as a side effect of a merge. A tag of the form `agent-images-vX.Y.Z` cuts
+# every image at that version; a manual dispatch can cut one.
+#
+# This workflow has never run. The repository has no GHCR publishing
+# credential wired up yet — `GITHUB_TOKEN` with `packages: write` is enough
+# for `ghcr.io/medicalissue/*` only once the owner has enabled package
+# publishing for this repository, which is a one-time setting in the
+# repository's package settings. Until then the presets in `presets/*.json`
+# point at images that do not exist on the registry yet, and a device runs an
+# agent from a locally built image loaded by digest (see docs/agents.md).
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: Which image to build (all, agent-claude-code, agent-codex)
+        required: false
+        default: all
+      version:
+        description: Tag to publish, e.g. 0.1.0
+        required: true
+  push:
+    tags:
+      - 'agent-images-v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [agent-claude-code, agent-codex]
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Decide whether this image is in scope
+        id: scope
+        env:
+          WANT: ${{ github.event.inputs.image }}
+          IMAGE: ${{ matrix.image }}
+        run: |
+          set -eu
+          if [ -z "${WANT:-}" ] || [ "${WANT}" = all ] || [ "${WANT}" = "${IMAGE}" ]; then
+            echo "build=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=no" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Work out the version to publish
+        if: steps.scope.outputs.build == 'yes'
+        id: version
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -eu
+          version="${INPUT_VERSION:-}"
+          if [ -z "$version" ]; then
+            version="${REF_NAME#agent-images-v}"
+          fi
+          case "$version" in
+            ''|*[!0-9.]*) echo "not a version: $version" >&2; exit 1 ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU for the second architecture
+        if: steps.scope.outputs.build == 'yes'
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+
+      - name: Set up buildx
+        if: steps.scope.outputs.build == 'yes'
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Log in to GHCR
+        if: steps.scope.outputs.build == 'yes'
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Both architectures, because a device runs an agent on whatever it has
+      # and Asterism refuses an image config that targets another machine's
+      # architecture rather than booting it.
+      - name: Build and push
+        if: steps.scope.outputs.build == 'yes'
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: images
+          file: images/${{ matrix.image }}/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          tags: |
+            ghcr.io/medicalissue/${{ matrix.image }}:${{ steps.version.outputs.version }}
+            ghcr.io/medicalissue/${{ matrix.image }}:latest
+
+      - name: Say what to pin the preset to
+        if: steps.scope.outputs.build == 'yes'
+        run: |
+          set -eu
+          echo "Pin presets/*.json to the digest this run published:"
+          echo "  docker buildx imagetools inspect \
+            ghcr.io/medicalissue/${{ matrix.image }}:${{ steps.version.outputs.version }}"

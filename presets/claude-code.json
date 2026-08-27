@@ -1,0 +1,27 @@
+{
+  "name": "claude-code",
+  "summary": "Anthropic's Claude Code CLI, in a tmux session that outlives your terminal.",
+  "image": "ghcr.io/medicalissue/agent-claude-code:0.1.0",
+  "digest": null,
+  "start": "claude",
+  "workdir": "/work",
+  "version_probe": "claude --version",
+  "docs": "https://docs.claude.com/en/docs/claude-code",
+  "experimental": false,
+  "secrets": [
+    {
+      "name": "ANTHROPIC_API_KEY",
+      "authority": "api.anthropic.com",
+      "placement": "x-api-key",
+      "env": "ANTHROPIC_API_KEY",
+      "required": true
+    },
+    {
+      "name": "GITHUB_TOKEN",
+      "authority": "github.com",
+      "placement": "bearer",
+      "env": "GITHUB_TOKEN",
+      "required": false
+    }
+  ]
+}
