@@ -8,8 +8,8 @@ devices as one cache-coherent machine.
 
 Which device that is can change. Compute is not a part Asterism splits,
 borrows, or places for you, but the whole instance moves to another device
-when you ask it to — see [Moving an instance between
-devices](#moving-an-instance-between-devices) below.
+when you ask it to — see [Moving an instance between devices](#moving-an-instance-between-devices)
+below.
 
 The `--cpus` and `--mem` shape values are quotas on that device, not
 independently sourced resources. The selected hypervisor is an internal detail
@@ -26,7 +26,7 @@ An instance is not welded to the device it was created on. Moving its compute
 to another orbit device is implemented and shipped, as an **offline** (cold)
 move: the guest is shut down, the instance's own written bytes are
 transferred, the cut-over is fenced, and the instance starts again on the new
-device. Its name, id, and snapshots do not move, because they were never on a
+device. Its name and id do not move at all, because they were never on a
 device.
 
 Live migration — transferring a *running* guest with the RAM it is holding —
@@ -67,7 +67,9 @@ What travels and what does not:
   remote as required. See
   [Orbit storage](orbit-storage.md).
 - A **directory share** is local to a device by construction (there is no
-  network transport for virtiofs or 9p), so it does not follow the instance.
+  network transport for virtiofs or 9p), so it stays behind on the device
+  that holds the directory. The move keeps the record and flags it rather
+  than silently dropping it.
 - **Secrets** never travelled: the guest holds a per-destination handle and
   the orbit re-resolves it after the move.
 
