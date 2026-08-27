@@ -71,53 +71,18 @@ kill_daemon() {
   sudo kill -KILL "$pid" 2>/dev/null || true
 }
 
-is_task_export() {
-  local pid="$1" pidfile="$2" exe=""
-  exe="$(sudo readlink "/proc/$pid/exe" 2>/dev/null || true)"
-  [ "${exe##*/}" = qemu-storage-daemon ] || return 1
-  sudo cat "/proc/$pid/cmdline" 2>/dev/null | tr '\0' '\n' | grep -Fqx -- "$pidfile"
-}
-
-stop_task_exports() {
-  local pidfile="" pid="" alive=0
-  while IFS= read -r pidfile; do
-    pid="$(cat "$pidfile" 2>/dev/null || true)"
-    case "$pid" in ''|*[!0-9]*) continue ;; esac
-    sudo kill -0 "$pid" 2>/dev/null || continue
-    if ! is_task_export "$pid" "$pidfile"; then
-      echo "NETWORK REALMS E2E FAIL: refusing to signal pid $pid from $pidfile: identity mismatch" >&2
-      alive=1
-      continue
-    fi
-    sudo kill -TERM "$pid" 2>/dev/null || true
-    for _ in $(seq 1 50); do
-      sudo kill -0 "$pid" 2>/dev/null || break
-      sleep 0.1
-    done
-    if sudo kill -0 "$pid" 2>/dev/null; then
-      sudo kill -KILL "$pid" 2>/dev/null || true
-      for _ in $(seq 1 50); do
-        sudo kill -0 "$pid" 2>/dev/null || break
-        sleep 0.1
-      done
-    fi
-    if sudo kill -0 "$pid" 2>/dev/null && is_task_export "$pid" "$pidfile"; then
-      echo "NETWORK REALMS E2E FAIL: task export pid $pid did not exit" >&2
-      alive=1
-    fi
-  done < <(find "$A/volumes" "$B/volumes" -type f -name 'nbd-e*.pid' 2>/dev/null)
-  return "$alive"
-}
-
+# A volume export is a listener inside `astd` itself, not a child process, so
+# it cannot outlive the daemon which published it and there is no export
+# pidfile to reap. What has to be proven after cleanup is therefore that
+# neither task-owned daemon survived: that, and only that, is what ends every
+# export this run created.
 assert_no_task_exports() {
-  local proc="" pid="" exe="" cmdline="" found=0
-  for proc in /proc/[0-9]*; do
-    pid="${proc##*/}"
-    exe="$(sudo readlink "$proc/exe" 2>/dev/null || true)"
-    [ "${exe##*/}" = qemu-storage-daemon ] || continue
-    cmdline="$(sudo cat "$proc/cmdline" 2>/dev/null | tr '\0' '\n' || true)"
-    if grep -Fq -- "$RUN/" <<<"$cmdline"; then
-      echo "NETWORK REALMS E2E FAIL: task export pid $pid survived cleanup" >&2
+  local home="" pid="" found=0
+  for home in "$A" "$B"; do
+    pid="$(cat "$home/astd.pid" 2>/dev/null || true)"
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    if sudo kill -0 "$pid" 2>/dev/null; then
+      echo "NETWORK REALMS E2E FAIL: task daemon pid $pid from $home survived cleanup, and with it any export it was serving" >&2
       found=1
     fi
   done
@@ -149,7 +114,6 @@ cleanup() {
   fi
   kill_daemon "$A"
   kill_daemon "$B"
-  stop_task_exports || failed=1
   # `sudo ... &` leaves a shell job which waits for the namespaced daemon.
   # SIGSTOP/SIGCONT targets the daemon's pidfile identity, not that wrapper;
   # reap any wrapper which remained stopped rather than leaking a task-owned

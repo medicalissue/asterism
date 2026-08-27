@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions, Permissions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -86,6 +87,9 @@ const NBD_REPLY_FLAG_DONE: u16 = 1;
 const NBD_REPLY_TYPE_OFFSET_DATA: u16 = 1;
 const NBD_REPLY_TYPE_BLOCK_STATUS: u16 = 5;
 const NBD_REPLY_TYPE_ERROR: u16 = 0x8001;
+
+const NBD_STATE_HOLE: u32 = 1;
+const NBD_STATE_ZERO: u32 = 1 << 1;
 
 const NBD_EIO: u32 = 5;
 const NBD_EINVAL: u32 = 22;
@@ -420,6 +424,41 @@ struct Negotiated {
     no_zeroes: bool,
     structured: bool,
     allocation: bool,
+    /// Which option the client used to select the export.
+    selected_by: u32,
+}
+
+/// Whether to report what a consumer actually negotiates and issues.
+///
+/// Off by default and deliberately not a config key: this exists so a
+/// real-host gate can record which of the protocol's optional halves the
+/// kernel `nbd-client`, VZ and QEMU each ask for, rather than leaving the
+/// answer to be assumed.
+fn tracing() -> bool {
+    static TRACE: OnceLock<bool> = OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var_os("ASTERISM_NBD_TRACE").is_some())
+}
+
+fn option_name(option: u32) -> &'static str {
+    match option {
+        NBD_OPT_EXPORT_NAME => "EXPORT_NAME",
+        NBD_OPT_INFO => "INFO",
+        NBD_OPT_GO => "GO",
+        _ => "other",
+    }
+}
+
+fn command_name(command: u16) -> &'static str {
+    match command {
+        NBD_CMD_READ => "READ",
+        NBD_CMD_WRITE => "WRITE",
+        NBD_CMD_DISC => "DISC",
+        NBD_CMD_FLUSH => "FLUSH",
+        NBD_CMD_TRIM => "TRIM",
+        NBD_CMD_WRITE_ZEROES => "WRITE_ZEROES",
+        NBD_CMD_BLOCK_STATUS => "BLOCK_STATUS",
+        _ => "unknown",
+    }
 }
 
 fn serve_client(
@@ -449,6 +488,16 @@ fn serve_client(
     };
     if !negotiate(&mut stream, export, size, &mut negotiated)? {
         return Ok(());
+    }
+    if tracing() {
+        eprintln!(
+            "astd: nbd trace: negotiated selected_by={} no_zeroes={} structured={} \
+             base_allocation={}",
+            option_name(negotiated.selected_by),
+            negotiated.no_zeroes,
+            negotiated.structured,
+            negotiated.allocation
+        );
     }
     stream.set_read_timeout(None)?;
     transmission(&mut stream, file, size, &negotiated, cancel)
@@ -490,6 +539,7 @@ fn negotiate(
                     stream.write_all(&[0; 124])?;
                 }
                 stream.flush()?;
+                negotiated.selected_by = option;
                 return Ok(true);
             }
             NBD_OPT_INFO | NBD_OPT_GO => {
@@ -511,6 +561,7 @@ fn negotiate(
                 )?;
                 option_reply(stream, option, NBD_REP_ACK, &[])?;
                 if option == NBD_OPT_GO {
+                    negotiated.selected_by = option;
                     return Ok(true);
                 }
             }
@@ -651,6 +702,7 @@ fn transmission(
     negotiated: &Negotiated,
     cancel: &AtomicBool,
 ) -> Result<()> {
+    let mut traced: u32 = 0;
     loop {
         if cancel.load(Ordering::Acquire) {
             return Ok(());
@@ -660,6 +712,13 @@ fn transmission(
         }
         let flags = read_u16(stream)?;
         let command = read_u16(stream)?;
+        if tracing() && command < 32 && traced & (1 << command) == 0 {
+            traced |= 1 << command;
+            eprintln!(
+                "astd: nbd trace: first {} on this session (flags {flags:#x})",
+                command_name(command)
+            );
+        }
         let handle = read_u64(stream)?;
         let offset = read_u64(stream)?;
         let length = read_u32(stream)?;
@@ -765,24 +824,13 @@ fn transmission(
                 )?;
             }
             NBD_CMD_TRIM => {
-                // TRIM is a hint: retaining the bytes is explicitly valid.
+                // TRIM is a hint: retaining the bytes is explicitly valid, so
+                // a filesystem which cannot punch is not a failure. Where it
+                // can, the guest's discard is what returns provider space.
                 // FUA still establishes the requested durability boundary.
-                let result = if flags & NBD_CMD_FLAG_FUA != 0 {
-                    file.lock().expect("NBD image lock poisoned").sync_data()
-                } else {
-                    Ok(())
-                };
-                simple_reply(
-                    stream,
-                    handle,
-                    result.as_ref().err().map_or(0, nbd_errno),
-                    &[],
-                )?;
-            }
-            NBD_CMD_WRITE_ZEROES => {
                 let result = {
                     let file = file.lock().expect("NBD image lock poisoned");
-                    write_zeroes(&file, offset, length).and_then(|()| {
+                    discard(&file, offset, length).and_then(|()| {
                         if flags & NBD_CMD_FLAG_FUA != 0 {
                             file.sync_data()
                         } else {
@@ -797,18 +845,42 @@ fn transmission(
                     &[],
                 )?;
             }
+            NBD_CMD_WRITE_ZEROES => {
+                let result = {
+                    let file = file.lock().expect("NBD image lock poisoned");
+                    zero_range(&file, offset, length, flags & NBD_CMD_FLAG_NO_HOLE != 0).and_then(
+                        |()| {
+                            if flags & NBD_CMD_FLAG_FUA != 0 {
+                                file.sync_data()
+                            } else {
+                                Ok(())
+                            }
+                        },
+                    )
+                };
+                simple_reply(
+                    stream,
+                    handle,
+                    result.as_ref().err().map_or(0, nbd_errno),
+                    &[],
+                )?;
+            }
             NBD_CMD_BLOCK_STATUS => {
                 if !negotiated.structured || !negotiated.allocation || length == 0 {
                     command_error(stream, handle, NBD_EINVAL, command, negotiated.structured)?;
                     continue;
                 }
-                // Reporting allocated is conservative and valid for every
-                // regular file, including sparse files. It never promises a
-                // hole whose future reads might expose non-zero data.
+                // One descriptor, which every client must accept: a server may
+                // always describe less of the range than was asked about.
+                // `NBD_CMD_FLAG_REQ_ONE` is therefore satisfied either way.
+                let (span, state) = {
+                    let file = file.lock().expect("NBD image lock poisoned");
+                    extent(&file, offset, length, size)
+                };
                 let mut payload = Vec::with_capacity(12);
                 payload.extend_from_slice(&META_CONTEXT_ID.to_be_bytes());
-                payload.extend_from_slice(&length.to_be_bytes());
-                payload.extend_from_slice(&0u32.to_be_bytes());
+                payload.extend_from_slice(&span.to_be_bytes());
+                payload.extend_from_slice(&state.to_be_bytes());
                 structured_reply(stream, handle, NBD_REPLY_TYPE_BLOCK_STATUS, &payload)?;
             }
             _ => simple_reply(stream, handle, NBD_ENOTSUP, &[])?,
@@ -907,6 +979,156 @@ fn write_zeroes(file: &File, mut offset: u64, mut length: u32) -> io::Result<()>
     Ok(())
 }
 
+/// The block-aligned interior of `[offset, offset + length)`, if any.
+///
+/// A filesystem can only drop whole blocks, so this is the part of a discard
+/// that is capable of returning space. The unaligned edges belong to blocks
+/// which are still holding a neighbour's bytes and must never be dropped.
+fn aligned_interior(offset: u64, length: u64) -> Option<(u64, u64)> {
+    let block = u64::from(PREFERRED_BLOCK);
+    let end = offset.checked_add(length)?;
+    let start = offset.checked_next_multiple_of(block)?;
+    let stop = end - end % block;
+    // `then`, not `then_some`: `stop` is below `start` for every request too
+    // small to cover a whole block, and the subtraction must not be evaluated.
+    (stop > start).then(|| (start, stop - start))
+}
+
+/// Drop the blocks under `[offset, offset + length)` without changing the
+/// file's length.
+///
+/// Keeping the length is not an optimisation: the exported size was promised
+/// during the handshake, and [`prepare`] refuses to export an image shorter
+/// than it. A discard that truncated would turn every later read past the new
+/// end into an I/O error.
+#[cfg(target_os = "linux")]
+fn punch(file: &File, offset: u64, length: u64) -> io::Result<()> {
+    let punched = unsafe {
+        libc::fallocate(
+            file.as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            offset as libc::off_t,
+            length as libc::off_t,
+        )
+    };
+    (punched == 0)
+        .then_some(())
+        .ok_or_else(io::Error::last_os_error)
+}
+
+#[cfg(target_os = "macos")]
+fn punch(file: &File, offset: u64, length: u64) -> io::Result<()> {
+    // F_PUNCHHOLE keeps the file length by definition, and it is the reason
+    // `offset` and `length` arrive here already block-aligned: APFS refuses
+    // an unaligned request with EINVAL rather than rounding it.
+    let mut hole = libc::fpunchhole_t {
+        fp_flags: 0,
+        reserved: 0,
+        fp_offset: offset as libc::off_t,
+        fp_length: length as libc::off_t,
+    };
+    let punched = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PUNCHHOLE, &mut hole) };
+    (punched == 0)
+        .then_some(())
+        .ok_or_else(io::Error::last_os_error)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn punch(file: &File, offset: u64, length: u64) -> io::Result<()> {
+    let _ = (file, offset, length);
+    Err(io::Error::from(io::ErrorKind::Unsupported))
+}
+
+/// Whether the kernel or filesystem declined the operation rather than
+/// failing it. Declining is not an error a client should ever be told about:
+/// the bytes are still correct, only the space was not returned.
+fn declined(error: &io::Error) -> bool {
+    let Some(code) = error.raw_os_error() else {
+        return error.kind() == io::ErrorKind::Unsupported;
+    };
+    code == libc::EOPNOTSUPP
+        || code == libc::ENOTSUP
+        || code == libc::EINVAL
+        || code == libc::ENOSYS
+}
+
+/// Best-effort space reclamation for TRIM, which is a hint. Only a genuine
+/// I/O failure propagates; a filesystem without hole punching keeps the bytes,
+/// which the protocol explicitly permits.
+fn discard(file: &File, offset: u64, length: u32) -> io::Result<()> {
+    let Some((start, span)) = aligned_interior(offset, u64::from(length)) else {
+        return Ok(());
+    };
+    match punch(file, start, span) {
+        Ok(()) => Ok(()),
+        Err(error) if declined(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Make `[offset, offset + length)` read as zeroes.
+///
+/// Without `NBD_CMD_FLAG_NO_HOLE` the client has explicitly allowed a hole,
+/// so the aligned interior is punched and only the unaligned edges are
+/// written. That is what keeps a guest's `mkfs` or `blkdiscard -z` over a
+/// sparse volume from allocating the whole advertised size on the provider.
+fn zero_range(file: &File, offset: u64, length: u32, no_hole: bool) -> io::Result<()> {
+    if length == 0 || no_hole {
+        return write_zeroes(file, offset, length);
+    }
+    let Some((start, span)) = aligned_interior(offset, u64::from(length)) else {
+        return write_zeroes(file, offset, length);
+    };
+    match punch(file, start, span) {
+        Ok(()) => {
+            let head = (start - offset) as u32;
+            let tail = (offset + u64::from(length) - (start + span)) as u32;
+            write_zeroes(file, offset, head)?;
+            write_zeroes(file, start + span, tail)
+        }
+        Err(error) if declined(&error) => write_zeroes(file, offset, length),
+        Err(error) => Err(error),
+    }
+}
+
+fn seek(file: &File, offset: u64, whence: libc::c_int) -> io::Result<u64> {
+    // Every data path here is `pread`/`pwrite`, so this server never depends
+    // on the description's own offset and moving it is free.
+    let found = unsafe { libc::lseek(file.as_raw_fd(), offset as libc::off_t, whence) };
+    if found < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(found as u64)
+    }
+}
+
+/// Describe the first extent of `[offset, offset + length)`.
+///
+/// A hole in a raw image reads as zeroes, so reporting one is a statement
+/// about content as much as about space, and both are true. Anything the
+/// kernel will not answer degrades to "allocated", which promises nothing and
+/// is valid for every regular file.
+fn extent(file: &File, offset: u64, length: u32, size: u64) -> (u32, u32) {
+    let end = offset.saturating_add(u64::from(length)).min(size);
+    let clamp = |boundary: u64| -> u32 {
+        u32::try_from(boundary.min(end).saturating_sub(offset))
+            .unwrap_or(length)
+            .clamp(1, length)
+    };
+    let hole = NBD_STATE_HOLE | NBD_STATE_ZERO;
+    match seek(file, offset, libc::SEEK_DATA) {
+        Ok(data) if data > offset => (clamp(data), hole),
+        Ok(_) => match seek(file, offset, libc::SEEK_HOLE) {
+            Ok(next) if next > offset => (clamp(next), 0),
+            _ => (length, 0),
+        },
+        // No data at or after `offset`: everything to the end of the file is
+        // a trailing hole.
+        Err(error) if error.raw_os_error() == Some(libc::ENXIO) => (length, hole),
+        Err(_) => (length, 0),
+    }
+}
+
 fn nbd_errno(error: &io::Error) -> u32 {
     match error.raw_os_error() {
         Some(libc::ENOSPC) => NBD_ENOSPC,
@@ -991,13 +1213,17 @@ mod tests {
 
     impl Fixture {
         fn start() -> Self {
+            Self::start_with(SIZE)
+        }
+
+        fn start_with(size: u64) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let image = dir.path().join("disk.raw");
             let socket = dir.path().join("nbd.sock");
             let file = File::create(&image).unwrap();
-            file.set_len(SIZE).unwrap();
+            file.set_len(size).unwrap();
             drop(file);
-            let prepared = prepare(&image, &socket, EXPORT, SIZE).unwrap();
+            let prepared = prepare(&image, &socket, EXPORT, size).unwrap();
             let process = start(prepared).unwrap();
             Self {
                 _dir: dir,
@@ -1063,6 +1289,10 @@ mod tests {
     }
 
     fn go(stream: &mut UnixStream, structured: bool) {
+        go_sized(stream, structured, SIZE);
+    }
+
+    fn go_sized(stream: &mut UnixStream, structured: bool, size: u64) {
         let mut payload = Vec::new();
         payload.extend_from_slice(&(EXPORT.len() as u32).to_be_bytes());
         payload.extend_from_slice(EXPORT.as_bytes());
@@ -1082,7 +1312,7 @@ mod tests {
             match u16::from_be_bytes(payload[..2].try_into().unwrap()) {
                 NBD_INFO_EXPORT => {
                     saw_export = true;
-                    assert_eq!(u64::from_be_bytes(payload[2..10].try_into().unwrap()), SIZE);
+                    assert_eq!(u64::from_be_bytes(payload[2..10].try_into().unwrap()), size);
                     assert_eq!(
                         u16::from_be_bytes(payload[10..12].try_into().unwrap()),
                         transmission_flags(structured)
@@ -1178,6 +1408,58 @@ mod tests {
         data
     }
 
+    /// Ask for one extent and return `(length, state)`.
+    fn block_status(stream: &mut UnixStream, handle: u64, offset: u64, length: u32) -> (u32, u32) {
+        request(
+            stream,
+            NBD_CMD_BLOCK_STATUS,
+            NBD_CMD_FLAG_REQ_ONE,
+            handle,
+            offset,
+            length,
+            &[],
+        );
+        assert_eq!(read_u32(stream).unwrap(), NBD_STRUCTURED_REPLY_MAGIC);
+        assert_eq!(read_u16(stream).unwrap(), NBD_REPLY_FLAG_DONE);
+        assert_eq!(read_u16(stream).unwrap(), NBD_REPLY_TYPE_BLOCK_STATUS);
+        assert_eq!(read_u64(stream).unwrap(), handle);
+        assert_eq!(read_u32(stream).unwrap(), 12);
+        assert_eq!(read_u32(stream).unwrap(), META_CONTEXT_ID);
+        let span = read_u32(stream).unwrap();
+        (span, read_u32(stream).unwrap())
+    }
+
+    fn structured_error_reply(stream: &mut UnixStream, handle: u64) -> u32 {
+        assert_eq!(read_u32(stream).unwrap(), NBD_STRUCTURED_REPLY_MAGIC);
+        assert_eq!(read_u16(stream).unwrap(), NBD_REPLY_FLAG_DONE);
+        assert_eq!(read_u16(stream).unwrap(), NBD_REPLY_TYPE_ERROR);
+        assert_eq!(read_u64(stream).unwrap(), handle);
+        assert_eq!(read_u32(stream).unwrap(), 6);
+        let error = read_u32(stream).unwrap();
+        assert_eq!(read_u16(stream).unwrap(), 0);
+        error
+    }
+
+    fn allocated_blocks(image: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(image).unwrap().blocks()
+    }
+
+    /// Whether this temporary directory's filesystem can actually return
+    /// space. Everything else in the sparse test is asserted regardless; only
+    /// the space claim is conditional, because "kept the bytes" is a valid
+    /// answer the protocol allows and the server deliberately does not fail.
+    fn punching_works(dir: &Path) -> bool {
+        let probe = dir.join("punch-probe");
+        let file = File::create(&probe).unwrap();
+        file.set_len(0).unwrap();
+        write_all_at(&file, &[1; 1024 * 1024], 0).unwrap();
+        let punched = punch(&file, 0, 1024 * 1024).is_ok();
+        drop(file);
+        let _ = std::fs::remove_file(&probe);
+        punched
+    }
+
     #[test]
     fn fixed_newstyle_commands_and_block_status_round_trip() {
         let mut fixture = Fixture::start();
@@ -1260,23 +1542,9 @@ mod tests {
             vec![0; written.len()]
         );
 
-        request(
-            &mut stream,
-            NBD_CMD_BLOCK_STATUS,
-            NBD_CMD_FLAG_REQ_ONE,
-            7,
-            0,
-            4096,
-            &[],
-        );
-        assert_eq!(read_u32(&mut stream).unwrap(), NBD_STRUCTURED_REPLY_MAGIC);
-        assert_eq!(read_u16(&mut stream).unwrap(), NBD_REPLY_FLAG_DONE);
-        assert_eq!(read_u16(&mut stream).unwrap(), NBD_REPLY_TYPE_BLOCK_STATUS);
-        assert_eq!(read_u64(&mut stream).unwrap(), 7);
-        assert_eq!(read_u32(&mut stream).unwrap(), 12);
-        assert_eq!(read_u32(&mut stream).unwrap(), META_CONTEXT_ID);
-        assert_eq!(read_u32(&mut stream).unwrap(), 4096);
-        assert_eq!(read_u32(&mut stream).unwrap(), 0);
+        // The block holding the write is allocated on every filesystem: it
+        // was written literally, because NO_HOLE was set above.
+        assert_eq!(block_status(&mut stream, 7, 4096, 4096), (4096, 0));
 
         request(&mut stream, NBD_CMD_DISC, 0, 8, 0, 0, &[]);
         drop(stream);
@@ -1376,6 +1644,261 @@ mod tests {
         assert!(!alive(Some(&process), &fixture.socket));
         let mut byte = [0];
         assert!(matches!(stream.read(&mut byte), Ok(0) | Err(_)));
+    }
+
+    /// A guest's `blkdiscard`/`blkdiscard -z` over a sparse volume must give
+    /// the provider its space back, not silently allocate the volume's whole
+    /// advertised size on the device that holds it.
+    #[test]
+    fn write_zeroes_and_trim_return_space_and_report_the_hole() {
+        const BIG: u64 = 8 * 1024 * 1024;
+        const SPAN: u32 = 4 * 1024 * 1024;
+        let mut fixture = Fixture::start_with(BIG);
+        let sparse = punching_works(fixture.image.parent().unwrap());
+        let mut stream = client(&fixture.socket);
+        structured_and_allocation(&mut stream);
+        go_sized(&mut stream, true, BIG);
+
+        let payload = vec![0xab; SPAN as usize];
+        // FUA on every fill: block accounting is settled only once the
+        // writeback has happened, and Darwin in particular leaves a delayed
+        // allocation uncounted until then.
+        let fill = |stream: &mut UnixStream, handle: u64| {
+            request(
+                stream,
+                NBD_CMD_WRITE,
+                NBD_CMD_FLAG_FUA,
+                handle,
+                0,
+                SPAN,
+                &payload,
+            );
+            assert_eq!(simple(stream, handle, 0).0, 0);
+        };
+
+        fill(&mut stream, 1);
+        let filled = allocated_blocks(&fixture.image);
+        assert!(filled > 0, "a written extent occupies space");
+        assert_eq!(block_status(&mut stream, 2, 0, SPAN), (SPAN, 0));
+
+        // WRITE_ZEROES without NO_HOLE: the client permits a hole.
+        request(
+            &mut stream,
+            NBD_CMD_WRITE_ZEROES,
+            NBD_CMD_FLAG_FUA,
+            3,
+            0,
+            SPAN,
+            &[],
+        );
+        assert_eq!(simple(&mut stream, 3, 0).0, 0);
+        request(&mut stream, NBD_CMD_READ, 0, 4, 0, 4096, &[]);
+        assert_eq!(structured_data(&mut stream, 4, 0, 4096), vec![0; 4096]);
+        let punched = allocated_blocks(&fixture.image);
+        if sparse {
+            assert!(
+                punched < filled,
+                "a hole-permitting WRITE_ZEROES did not return space \
+                 ({punched} blocks, was {filled})"
+            );
+            assert_eq!(
+                block_status(&mut stream, 5, 0, SPAN),
+                (SPAN, NBD_STATE_HOLE | NBD_STATE_ZERO)
+            );
+        }
+
+        // NO_HOLE is the opposite instruction and must be obeyed: the range
+        // stays allocated even though every byte in it is now zero.
+        fill(&mut stream, 6);
+        request(
+            &mut stream,
+            NBD_CMD_WRITE_ZEROES,
+            NBD_CMD_FLAG_NO_HOLE | NBD_CMD_FLAG_FUA,
+            7,
+            0,
+            SPAN,
+            &[],
+        );
+        assert_eq!(simple(&mut stream, 7, 0).0, 0);
+        let kept = allocated_blocks(&fixture.image);
+        assert!(kept >= filled, "NO_HOLE returned space it was denied");
+        assert_eq!(block_status(&mut stream, 8, 0, SPAN), (SPAN, 0));
+
+        // TRIM is a hint, so keeping the bytes is valid, but it must never
+        // fail and must never change the exported length.
+        request(&mut stream, NBD_CMD_TRIM, NBD_CMD_FLAG_FUA, 9, 0, SPAN, &[]);
+        assert_eq!(simple(&mut stream, 9, 0).0, 0);
+        assert_eq!(std::fs::metadata(&fixture.image).unwrap().len(), BIG);
+        if sparse {
+            let trimmed = allocated_blocks(&fixture.image);
+            assert!(
+                trimmed < kept,
+                "TRIM did not return space on a filesystem that can punch \
+                 ({trimmed} blocks, was {kept})"
+            );
+        }
+
+        // An unaligned discard may only touch the blocks it wholly covers,
+        // so a neighbour's bytes inside the same block survive it.
+        let edge = BIG - 4096;
+        request(&mut stream, NBD_CMD_WRITE, 0, 10, edge, 8, b"neighbor");
+        assert_eq!(simple(&mut stream, 10, 0).0, 0);
+        request(&mut stream, NBD_CMD_TRIM, 0, 11, edge + 8, 512, &[]);
+        assert_eq!(simple(&mut stream, 11, 0).0, 0);
+        request(&mut stream, NBD_CMD_READ, 0, 12, edge, 8, &[]);
+        assert_eq!(
+            structured_data(&mut stream, 12, edge, 8),
+            b"neighbor".to_vec()
+        );
+
+        // The same rule for a hole-permitting WRITE_ZEROES: the unaligned
+        // edges are written literally rather than left behind.
+        request(&mut stream, NBD_CMD_WRITE_ZEROES, 0, 13, edge + 8, 512, &[]);
+        assert_eq!(simple(&mut stream, 13, 0).0, 0);
+        request(&mut stream, NBD_CMD_READ, 0, 14, edge + 8, 512, &[]);
+        assert_eq!(
+            structured_data(&mut stream, 14, edge + 8, 512),
+            vec![0; 512]
+        );
+        request(&mut stream, NBD_CMD_READ, 0, 15, edge, 8, &[]);
+        assert_eq!(
+            structured_data(&mut stream, 15, edge, 8),
+            b"neighbor".to_vec()
+        );
+
+        fixture.stop();
+    }
+
+    /// `base:allocation` is only meaningful once the client has asked for it,
+    /// and the answer only fits in a structured reply.
+    #[test]
+    fn block_status_without_a_negotiated_context_is_refused() {
+        let mut fixture = Fixture::start();
+        let mut bare = client(&fixture.socket);
+        send_option(&mut bare, NBD_OPT_STRUCTURED_REPLY, &[]);
+        assert_eq!(option_reply(&mut bare).1, NBD_REP_ACK);
+        go(&mut bare, true);
+        request(
+            &mut bare,
+            NBD_CMD_BLOCK_STATUS,
+            NBD_CMD_FLAG_REQ_ONE,
+            1,
+            0,
+            4096,
+            &[],
+        );
+        assert_eq!(structured_error_reply(&mut bare, 1), NBD_EINVAL);
+        // A zero-length query is meaningless and refused the same way.
+        request(&mut bare, NBD_CMD_BLOCK_STATUS, 0, 2, 0, 0, &[]);
+        assert_eq!(structured_error_reply(&mut bare, 2), NBD_EINVAL);
+
+        let mut simple_client = client(&fixture.socket);
+        go(&mut simple_client, false);
+        request(&mut simple_client, NBD_CMD_BLOCK_STATUS, 0, 3, 0, 4096, &[]);
+        assert_eq!(simple(&mut simple_client, 3, 0).0, NBD_EINVAL);
+        fixture.stop();
+    }
+
+    /// A consumer that dies mid-request takes only its own session with it.
+    #[test]
+    fn a_truncated_request_leaves_other_sessions_serving() {
+        let mut fixture = Fixture::start();
+        let mut survivor = client(&fixture.socket);
+        go(&mut survivor, false);
+
+        let mut torn = client(&fixture.socket);
+        go(&mut torn, false);
+        // Six bytes of a sixteen-byte header, then gone.
+        write_u32(&mut torn, NBD_REQUEST_MAGIC).unwrap();
+        write_u16(&mut torn, 0).unwrap();
+        torn.flush().unwrap();
+        torn.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(torn);
+
+        let mut headless = client(&fixture.socket);
+        go(&mut headless, false);
+        write_u32(&mut headless, NBD_REQUEST_MAGIC).unwrap();
+        headless.flush().unwrap();
+        drop(headless);
+
+        request(&mut survivor, NBD_CMD_WRITE, 0, 1, 0, 4, b"live");
+        assert_eq!(simple(&mut survivor, 1, 0).0, 0);
+        request(&mut survivor, NBD_CMD_READ, 0, 2, 0, 4, &[]);
+        assert_eq!(simple(&mut survivor, 2, 4), (0, b"live".to_vec()));
+        fixture.stop();
+    }
+
+    /// The session cap is a refusal, never a queue that lets one consumer
+    /// starve the export it shares.
+    #[test]
+    fn sessions_past_the_cap_are_refused_without_disturbing_the_established() {
+        let mut fixture = Fixture::start();
+        let mut established = Vec::new();
+        for _ in 0..MAX_SESSIONS {
+            let mut stream = client(&fixture.socket);
+            go(&mut stream, false);
+            established.push(stream);
+        }
+
+        let mut refused = UnixStream::connect(&fixture.socket).unwrap();
+        refused
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut byte = [0];
+        assert!(
+            matches!(refused.read(&mut byte), Ok(0) | Err(_)),
+            "the {MAX_SESSIONS}th+1 session was not refused"
+        );
+
+        let first = &mut established[0];
+        request(first, NBD_CMD_READ, 0, 1, 0, 4, &[]);
+        assert_eq!(simple(first, 1, 4), (0, vec![0; 4]));
+
+        // Freeing one slot admits exactly one more.
+        request(&mut established[1], NBD_CMD_DISC, 0, 2, 0, 0, &[]);
+        established.remove(1);
+        let mut admitted = None;
+        for _ in 0..100 {
+            let mut candidate = UnixStream::connect(&fixture.socket).unwrap();
+            candidate
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            if read_u64(&mut candidate).is_ok_and(|magic| magic == NBD_MAGIC) {
+                admitted = Some(candidate);
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(admitted.is_some(), "a freed session slot was never reused");
+        fixture.stop();
+    }
+
+    #[test]
+    fn host_errors_map_to_the_errors_a_client_can_act_on() {
+        assert_eq!(
+            nbd_errno(&io::Error::from_raw_os_error(libc::ENOSPC)),
+            NBD_ENOSPC
+        );
+        assert_eq!(
+            nbd_errno(&io::Error::from_raw_os_error(libc::EINVAL)),
+            NBD_EINVAL
+        );
+        // Anything else is a device error, which is what a guest's block
+        // layer knows how to retry or surface.
+        assert_eq!(nbd_errno(&io::Error::from_raw_os_error(libc::EIO)), NBD_EIO);
+        assert_eq!(
+            nbd_errno(&io::Error::from(io::ErrorKind::UnexpectedEof)),
+            NBD_EIO
+        );
+    }
+
+    #[test]
+    fn a_discard_only_covers_the_blocks_it_wholly_contains() {
+        assert_eq!(aligned_interior(0, 8192), Some((0, 8192)));
+        assert_eq!(aligned_interior(1, 8192), Some((4096, 4096)));
+        assert_eq!(aligned_interior(4096, 4095), None);
+        assert_eq!(aligned_interior(100, 200), None);
+        assert_eq!(aligned_interior(u64::MAX, 1), None);
     }
 
     #[test]

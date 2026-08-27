@@ -225,7 +225,7 @@ compatibility contract.
   ```
 
 - **Block volumes** can live on any device. They are leased to one instance
-  at a time and appear in a QEMU guest as a normal disk such as `/dev/vdb`;
+  at a time and appear in the guest as a normal disk such as `/dev/vdb`;
   the guest does not need to know which device holds the bytes.
 
   ```console
@@ -252,12 +252,13 @@ compatibility contract.
   $ ast attach agent --secret anthropic --to api.anthropic.com
   ```
 
-Remote block volumes currently require the QEMU backend, which is the opt-in
-compatibility backend rather than something an install lands: create the
-instance with `--backend qemu` on a device where you installed QEMU yourself,
-and an attach to an instance whose backend has no share transport is refused
-with that install command rather than silently dropped. Directory shares must
-be on the same device as the instance's compute.
+Remote block volumes need no QEMU on either device. The device holding the
+bytes serves them from a native NBD exporter inside `astd`, and the consumer
+side is VZ's own network block device on macOS or the kernel NBD client below
+Cloud Hypervisor on Linux; QEMU remains an optional consumer, never a
+prerequisite. Directory shares must be on the same device as the instance's
+compute, and an attach to an instance whose backend has no share transport is
+refused with the install command it would need rather than silently dropped.
 
 ## Reach guests and devices
 

@@ -108,19 +108,76 @@ remote as required. Portable backups record the external volume binding and
 restore it as a part that must be rebound rather than copying or silently
 claiming provider bytes.
 
+## The exporter
+
+The provider serves a volume from inside `astd` itself. There is no
+`qemu-storage-daemon`, and no QEMU binary is required on either end of a
+remote attach: the exporter is a fixed-newstyle NBD server in Rust
+(`crates/asterism-daemon/src/nbd.rs`) bound to one Unix socket per lease
+epoch, `~/.asterism/volumes/<name>/nbd-e<epoch>.sock`, mode `0600`. It never
+listens on TCP, and no byte a client sends is ever used as a path: the image
+and the export name both come from the already-authorized lease.
+
+What it offers is bounded by what its consumers actually ask for — the Linux
+kernel's `nbd-client` below Cloud Hypervisor, VZ's
+`VZNetworkBlockDeviceStorageDeviceAttachment` over `nbd+unix://`, and QEMU's
+own client when the compatibility backend is installed. Setting
+`ASTERISM_NBD_TRACE=1` on the provider daemon makes it report the options each
+consumer negotiated and the first of each command it issued, which is how that
+list is checked against real clients rather than assumed:
+
+- `NBD_OPT_GO`/`NBD_OPT_INFO` with export, name and block-size info, plus
+  `NBD_OPT_EXPORT_NAME` and `NBD_OPT_ABORT` for older clients. Only the
+  lease's own export name is accepted; any other name is refused and the
+  connection closed.
+- `NBD_OPT_STRUCTURED_REPLY` and `base:allocation` through
+  `NBD_OPT_SET_META_CONTEXT`, because `nbd-client -b` and QEMU both ask for
+  them. `NBD_CMD_BLOCK_STATUS` is answered only when that context was
+  negotiated.
+- `NBD_CMD_READ`, `WRITE`, `FLUSH`, `TRIM`, `WRITE_ZEROES`, `DISC` and
+  `BLOCK_STATUS`, with `FUA`, `DF`, `NO_HOLE` and `REQ_ONE`. Nothing else is
+  advertised, and an unknown command flag closes the connection rather than
+  guessing at framing.
+
+Every request is bounds-checked against the exported size before it reaches
+the image, and only `ENOSPC` and `EINVAL` from the host are passed through as
+themselves; anything else becomes `EIO`, which is what a guest's block layer
+knows how to handle. A `WRITE` that would fall outside the export still has
+its payload consumed, so the next request header stays aligned.
+
+Volumes are sparse and stay sparse. `TRIM`, and `WRITE_ZEROES` without
+`NBD_CMD_FLAG_NO_HOLE`, punch a hole through the block-aligned interior of the
+requested range — `fallocate(FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE)` on
+Linux, `F_PUNCHHOLE` on macOS — so a guest's `mkfs` or `blkdiscard` returns
+space to the device that holds the bytes instead of allocating the volume's
+whole advertised size there. The unaligned edges are written literally,
+because the blocks under them still hold a neighbour's data. A filesystem
+that cannot punch keeps the bytes, which the protocol explicitly permits, and
+the length of the image never changes either way. `BLOCK_STATUS` reports what
+`SEEK_DATA`/`SEEK_HOLE` say, degrading to "allocated" — which promises
+nothing — when the kernel will not answer.
+
+The server is the lease's fence. Stopping it closes the listener and every
+accepted stream before returning, so revocation ends clients that connected
+before the socket was unlinked, and a daemon restart re-establishes the export
+at the *same* epoch rather than minting a new one under a running guest.
+
 ## Real-process verification
 
 `scripts/e2e-volume.sh` is the authoritative two-device lane. It uses two real
 daemons, real provider storage processes and a real guest to cover local and
 remote access, catalog discovery, automatic placement, single-writer
 contention, detach/reattach, stale epochs, provider and consumer restarts,
-provider loss, and refusal before mutation. It runs against both QEMU and VZ.
+provider loss, and refusal before mutation. It runs against the native
+backends — VZ on macOS and Cloud Hypervisor on Linux — and needs no QEMU
+binary on either device. `E2E_VOLUME_QEMU_COMPAT=1` adds the optional QEMU
+consumer lane against the same native exporter.
 
 The adjacent lanes cover the cross-feature durability boundaries:
 
 ```console
 $ scripts/e2e-volume.sh
-$ E2E_VOLUME_BACKEND=qemu E2E_VOLUME_OCI=1 scripts/e2e-volume.sh
+$ E2E_VOLUME_OCI=1 scripts/e2e-volume.sh
 $ scripts/e2e-move.sh
 $ scripts/e2e-durability.sh
 ```

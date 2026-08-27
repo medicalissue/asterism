@@ -23,7 +23,12 @@ then be cloned and grown to `disk_gib`. No QEMU binary or runtime converter is
 installed on the Linux product path; QEMU is a separately installed explicit
 compatibility backend.
 
-Remote volumes use the kernel NBD client below the backend seam. On a clean
+Remote volumes are served by a native NBD exporter inside `astd` itself, over
+a per-epoch Unix socket; no `qemu-storage-daemon` is installed or spawned on
+the provider side. See [orbit-storage.md](orbit-storage.md) for what that
+exporter negotiates and how it keeps volumes sparse.
+
+The consumer side uses the kernel NBD client below the backend seam. On a clean
 host the installer adds `nbd-client` plus `kmod` (`nbd` plus `kmod` on
 Fedora-family systems), loads `nbd` with 64 devices, and records the same
 setting under `modules-load.d` and `modprobe.d` for reboot. The daemon has no
