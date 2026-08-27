@@ -200,6 +200,15 @@ hanging a job on them, are worth keeping:
   `--help`, `--version` and every other flag hang forever rather than
   printing anything. Check the file, never invoke it; the protocol has its own
   suite in the `windows-hyperv` workflow.
+- **`ast images` cannot be used as a smoke test on a Windows runner.** Unlike
+  the macOS path, it goes through the named-pipe transport, and the runner
+  refuses its own call: the admin account owns the process while
+  `ASTERISM_HOME` belongs to the Administrators *group*, and peer admission
+  compares the two SIDs (`refusing Windows named-pipe peer SID S-1-5-21-…-500;
+  ASTERISM_HOME belongs to SID S-1-5-32-544`). That is the boundary working on
+  a host shaped unlike a user's. `--version` is the assertion that ties the
+  binary to the tag; the transport belongs to the `windows-hyperv` workflow,
+  which sets up the ownership the check expects.
 - **Invoke through `Start-Process` with a deadline, not through `&`.** The
   call operator waits for the inherited stdout pipe to close, so a child that
   outlives the command hangs the step, and with no deadline that consumes the
