@@ -1543,6 +1543,16 @@ fn doors() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, Door>
 /// onto nothing carries nothing, and this way `ast attach --secret` on a
 /// running instance needs no second listener to appear from somewhere.
 fn ensure_door(instance: &str, dir: &Path) {
+    ensure_door_with_key(instance, dir, &paths::guest_agent_key_path(instance))
+}
+
+/// [`ensure_door`], with the instance key's path named rather than derived.
+///
+/// The path is fixed for an instance, so resolving it once here costs a hop
+/// nothing per connection — and naming it makes the door testable without a
+/// test reaching into the process-wide `ASTERISM_HOME` that every other test
+/// in this binary is also reading.
+fn ensure_door_with_key(instance: &str, dir: &Path, key_path: &Path) {
     let socket = door_socket(&dir.join(VSOCK_NAME));
     let mut doors = match doors().lock() {
         Ok(doors) => doors,
@@ -1572,7 +1582,8 @@ fn ensure_door(instance: &str, dir: &Path) {
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let serving = stop.clone();
     let owner = instance.to_owned();
-    thread::spawn(move || serve_door(listener, owner, serving));
+    let key_path = key_path.to_owned();
+    thread::spawn(move || serve_door(listener, owner, key_path, serving));
     doors.insert(socket.clone(), Door { stop, socket });
 }
 
@@ -1596,6 +1607,7 @@ fn close_door(dir: &Path) {
 fn serve_door(
     listener: std::os::unix::net::UnixListener,
     instance: String,
+    key_path: PathBuf,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     for incoming in listener.incoming() {
@@ -1605,8 +1617,9 @@ fn serve_door(
         match incoming {
             Ok(stream) => {
                 let instance = instance.clone();
+                let key_path = key_path.clone();
                 thread::spawn(move || {
-                    if let Err(error) = carry_door(stream, &instance) {
+                    if let Err(error) = carry_door(stream, &instance, &key_path) {
                         // Never the value, never the handle: this is a
                         // transport message and both ends log it.
                         eprintln!("astd: {instance:?} egress door session ended: {error:#}");
@@ -1629,8 +1642,8 @@ fn serve_door(
 /// honoured without restarting anything and this thread owns no key material
 /// between sessions. The proof carries the door's own transcript label, so a
 /// guest-control or GPU proof minted for the same key does not open it.
-fn carry_door(guest: UnixStream, instance: &str) -> Result<()> {
-    let key = Key::read(&paths::guest_agent_key_path(instance))?
+fn carry_door(guest: UnixStream, instance: &str, key_path: &Path) -> Result<()> {
+    let key = Key::read(key_path)?
         .with_context(|| format!("{instance:?} has no instance key to prove on the egress door"))?;
     let mut reader = BufReader::new(guest.try_clone()?);
     let mut writer = guest.try_clone()?;
@@ -3528,17 +3541,20 @@ mod tests {
         use std::io::BufReader as StdBufReader;
 
         let home = tempfile::tempdir().unwrap();
-        std::env::set_var("ASTERISM_HOME", home.path());
         let instance = "doorkeeper";
-        let key_path = paths::guest_agent_key_path(instance);
-        std::fs::create_dir_all(key_path.parent().unwrap()).unwrap();
+        let key_path = home.path().join("agent.key");
         Key::ensure(&key_path).unwrap();
 
         let dir = home.path().join("vmm");
         std::fs::create_dir_all(&dir).unwrap();
-        ensure_door(instance, &dir);
+        // Named rather than derived, so this test never writes to — or reads
+        // from — the process-wide home every other test in this binary shares.
+        ensure_door_with_key(instance, &dir, &key_path);
         let socket = door_socket(&dir.join(VSOCK_NAME));
         assert!(socket.exists(), "the door is a path, not a port");
+        // Idempotent: the adoption path calls this under a guest that is
+        // already being served, and must not steal its own listener.
+        ensure_door_with_key(instance, &dir, &key_path);
 
         // A guest holding some other instance's key.
         let stranger = UnixStream::connect(&socket).unwrap();
@@ -3554,6 +3570,5 @@ mod tests {
 
         close_door(&dir);
         assert!(!socket.exists(), "closing the door removes its socket");
-        std::env::remove_var("ASTERISM_HOME");
     }
 }
