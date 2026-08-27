@@ -36,9 +36,146 @@ mod linux {
 
     const KEY_PATH: &str = "/etc/asterism/agent.key";
 
+    /// The guest half of the secret-egress door.
+    ///
+    /// A backend whose guests share one NAT bridge has no host address only
+    /// this guest can reach, so the door is put where only this guest can
+    /// reach it by construction: the guest's own loopback. What is accepted
+    /// there leaves over this VM's virtio socket, is proved against the
+    /// per-instance key, and is spliced by the host's per-instance helper
+    /// into the private unix socket `astd`'s egress plane owns.
+    ///
+    /// Nothing in here reads what it carries. The guest's HTTP CONNECT and
+    /// the TLS that follows it are opaque bytes on this side of the hop —
+    /// the substitution happens on the host, at the far end, which is the
+    /// whole point of the feature.
+    pub mod door {
+        use std::io::BufReader;
+        use std::net::{Ipv4Addr, Shutdown, TcpListener, TcpStream};
+        use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+        use std::os::unix::net::UnixStream;
+
+        use anyhow::{bail, Context, Result};
+        use asterism_core::egress_door::{
+            door_guest_handshake, pump, EGRESS_GUEST_PORT, EGRESS_VSOCK_PORT, VMADDR_CID_HOST,
+        };
+        use asterism_core::guest::Key;
+
+        /// Put the door up, on a thread of its own.
+        ///
+        /// Deliberately not fatal: an instance with no bound secret has no
+        /// listener on the other end of the hop, and an image with no
+        /// egress at all should still get its control channel. A guest that
+        /// cannot bind the door says so once and goes on serving exec.
+        pub fn start(key: Key) {
+            std::thread::spawn(move || {
+                if let Err(error) = serve(key) {
+                    eprintln!("asterism-guest: the egress door is not up: {error:#}");
+                }
+            });
+        }
+
+        fn serve(key: Key) -> Result<()> {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, EGRESS_GUEST_PORT))
+                .with_context(|| {
+                    format!("binding the egress door on 127.0.0.1:{EGRESS_GUEST_PORT}")
+                })?;
+            for incoming in listener.incoming() {
+                match incoming {
+                    Ok(stream) => {
+                        let key = key.clone();
+                        std::thread::spawn(move || {
+                            if let Err(error) = carry(stream, &key) {
+                                eprintln!("asterism-guest: egress door session ended: {error:#}");
+                            }
+                        });
+                    }
+                    Err(error) => eprintln!("asterism-guest: egress door accept failed: {error}"),
+                }
+            }
+            Ok(())
+        }
+
+        /// One proxied connection: authenticate the hop, then splice.
+        fn carry(guest: TcpStream, key: &Key) -> Result<()> {
+            let host = vsock(VMADDR_CID_HOST, EGRESS_VSOCK_PORT)
+                .context("dialing the host egress door over vsock")?;
+            let mut reader = BufReader::new(host.try_clone()?);
+            let mut writer = host.try_clone()?;
+            door_guest_handshake(&mut reader, &mut writer, key.as_bytes(), &nonce()?)
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            // Whatever the BufReader took while framing the handshake is
+            // the guest's own next bytes only if the host sent them, which
+            // it cannot: the host says nothing after its `accept` until the
+            // guest has spoken. Dropping it here is therefore safe and
+            // keeps the splice on plain descriptors.
+            drop(reader);
+
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    let _ = pump(&guest, &host);
+                    let _ = host.shutdown(Shutdown::Write);
+                    let _ = guest.shutdown(Shutdown::Read);
+                });
+                let _ = pump(&host, &guest);
+                let _ = guest.shutdown(Shutdown::Write);
+                let _ = host.shutdown(Shutdown::Read);
+            });
+            Ok(())
+        }
+
+        /// An AF_VSOCK stream to `(cid, port)`.
+        ///
+        /// Returned as a [`UnixStream`] because that type is used here only
+        /// as a handle for read, write, `try_clone` and `shutdown` — every
+        /// one of which is address-family-agnostic — and not as a claim
+        /// that this is an AF_UNIX socket. The helper's end of the same hop
+        /// does exactly this for the same reason.
+        fn vsock(cid: u32, port: u32) -> Result<UnixStream> {
+            // SAFETY: a plain socket(2) with constant arguments.
+            let fd: RawFd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
+            if fd < 0 {
+                let error = std::io::Error::last_os_error();
+                bail!("this guest kernel has no AF_VSOCK: {error}");
+            }
+            // SAFETY: socket(2) returned a descriptor owned by this process.
+            let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+            // SAFETY: `sockaddr_vm` is plain data and all-zero is a valid
+            // starting state for it.
+            let mut addr: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
+            addr.svm_family = libc::AF_VSOCK as libc::sa_family_t;
+            addr.svm_port = port;
+            addr.svm_cid = cid;
+            // SAFETY: `addr` is a live, fully initialised `sockaddr_vm` for
+            // the length passed, and the descriptor is open.
+            let connected = unsafe {
+                libc::connect(
+                    owned.as_raw_fd(),
+                    std::ptr::addr_of!(addr).cast::<libc::sockaddr>(),
+                    std::mem::size_of::<libc::sockaddr_vm>() as libc::socklen_t,
+                )
+            };
+            if connected < 0 {
+                let error = std::io::Error::last_os_error();
+                bail!("no egress door answering on host vsock port {port}: {error}");
+            }
+            // SAFETY: the descriptor is connected and owned; `UnixStream`
+            // takes ownership of it here and closes it on drop.
+            Ok(unsafe { UnixStream::from_raw_fd(owned.into_raw_fd()) })
+        }
+
+        fn nonce() -> Result<String> {
+            use std::io::Read;
+            let mut bytes = [0u8; 32];
+            std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+            Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+        }
+    }
+
     pub fn run() -> Result<()> {
         let key = Key::read(Path::new(KEY_PATH))?
             .ok_or_else(|| anyhow::anyhow!("no instance key at {KEY_PATH}"))?;
+        door::start(key.clone());
         let listener = TcpListener::bind(("0.0.0.0", OCI_TCP_PORT))
             .with_context(|| format!("binding OCI guest control port {OCI_TCP_PORT}"))?;
         for incoming in listener.incoming() {

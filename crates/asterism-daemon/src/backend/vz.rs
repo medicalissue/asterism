@@ -47,9 +47,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
+use asterism_core::egress_door;
 use asterism_core::hv::{
-    BootReq, Caps, ControlChannel, DirectKernel, DiskFormat, DiskSpec, GuestEndpoint, GuestHealth,
-    Handle, Hypervisor, ImageKind, Prepared, Ready, RunState, ShareKind, SnapshotId,
+    BootReq, Caps, ControlChannel, DirectKernel, DiskFormat, DiskSpec, GuestEgress, GuestEndpoint,
+    GuestHealth, Handle, Hypervisor, ImageKind, Prepared, Ready, RunState, ShareKind, SnapshotId,
 };
 use asterism_core::instance::{now_unix, Instance};
 use asterism_core::proc::{ProcId, Signal};
@@ -389,15 +390,20 @@ impl Hypervisor for Vz {
             // The guest gets an address of its own on the NAT, so there is
             // nothing to forward from this host's loopback.
             port_forward: false,
-            // And for the same reason, no guest-only door into this host.
-            // macOS's NAT puts the guest on a shared bridge with an address
-            // of its own; a listener the guest could reach would have to be
-            // bound on that bridge's host address, which is a real interface
-            // that other guests — and, on some configurations, the LAN — can
-            // reach too. There is no loopback path here, so this says so and
-            // the secrets data plane refuses to bind on vz rather than
-            // opening an unauthenticated proxy for somebody's API keys.
-            guest_egress: None,
+            // There is still no *host* address only this guest can reach:
+            // macOS's NAT puts the guest on a shared bridge, and a listener
+            // bound on that bridge's host address is reachable by every
+            // other guest and, on some configurations, by the LAN. So the
+            // door is not a host listener. The guest's own agent puts it on
+            // the guest's loopback and carries it over this instance's
+            // virtio socket to the helper, which splices it to the private
+            // unix socket `astd`'s egress plane owns. Nothing binds a host
+            // interface, so this is a narrower door than QEMU's, not a
+            // weaker one. See `asterism_core::egress_door` and ADR 0003.
+            guest_egress: Some(GuestEgress::AgentVsock {
+                gateway: egress_door::EGRESS_GUEST_GATEWAY,
+                vsock_port: egress_door::EGRESS_VSOCK_PORT,
+            }),
             guest_gpu_projection: true,
             disk_formats: &[DiskFormat::Raw],
         }
@@ -510,6 +516,9 @@ impl Hypervisor for Vz {
                 &req.base.path,
                 prep.root_path()?,
                 &oci::InstanceParts {
+                    // VZ's door is this guest's own virtio socket, so its
+                    // init has to bring the vsock transport up.
+                    egress_over_vsock: true,
                     shares: &req.shares,
                     share_kind: (!req.shares.is_empty()).then_some(ShareKind::Virtiofs),
                     egress: &req.egress,
@@ -519,6 +528,27 @@ impl Hypervisor for Vz {
                 },
             )?;
         }
+
+        // The door this guest's bound secrets are served through, if any.
+        // Built before the helper is spawned because the helper installs
+        // its vsock listener at start: a guest that comes up before the
+        // door does would be a guest holding a handle nothing honours.
+        //
+        // `ensure` rather than `read`: a cloud-image instance mints its key
+        // while its seed is built and an OCI one a few lines above, but a
+        // secret may also be attached to an instance old enough to predate
+        // either, and the door needs a key to prove.
+        let egress_door = if inst.secrets.is_empty() {
+            None
+        } else {
+            let key_path = paths::guest_agent_key_path(&inst.name);
+            guest::Key::ensure(&key_path)
+                .with_context(|| format!("minting {:?}'s egress door key", inst.name))?;
+            Some(asterism_vz::EgressDoor {
+                socket: crate::egress::vm_transport_path(&inst.name),
+                key: key_path,
+            })
+        };
 
         let direct_kernel = prep.kernel.as_ref().map(|direct| LinuxBoot {
             kernel: direct.kernel.clone(),
@@ -557,6 +587,10 @@ impl Hypervisor for Vz {
             agent_key: (prep.kernel.is_none() || inst.gpu.is_some())
                 .then(|| paths::guest_agent_key_path(&inst.name))
                 .filter(|path| path.exists()),
+            // Only when a secret is actually bound. An instance with none
+            // gets no vsock listener at all, which is the difference
+            // between a door that is shut and a door that is not there.
+            egress: egress_door,
         };
         let config_path = req.dir.join("vz.json");
         config.write(&config_path)?;

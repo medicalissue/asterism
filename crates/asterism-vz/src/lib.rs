@@ -136,6 +136,33 @@ pub struct Config {
     /// NAT, exactly as it did before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_key: Option<PathBuf>,
+    /// This instance's secret-egress door, when a secret is bound.
+    ///
+    /// Additive: a config without it installs no vsock listener, which is
+    /// exactly what an instance with no bound secret should get. Absent also
+    /// covers a helper older than the door reading a newer daemon's config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<EgressDoor>,
+}
+
+/// Where one instance's egress door goes, as the helper needs it.
+///
+/// Two paths and no port, because there is no port: the guest end is a
+/// virtio socket belonging to this VM and the host end is a unix socket the
+/// daemon owns. Both are paths rather than bytes for the same reason
+/// [`Config::agent_key`] is — `vz.json` is what a human reads to find out
+/// what a running guest was built from, and key material does not belong in
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgressDoor {
+    /// The daemon's per-instance proxy socket. The helper connects here and
+    /// splices; it never reads what crosses.
+    pub socket: PathBuf,
+    /// The per-instance key both ends of the vsock hop prove
+    /// (`asterism_core::egress_door`). The same file as
+    /// [`Config::agent_key`], named separately so a guest with a door but no
+    /// vsock control agent does not make the helper hunt for one.
+    pub key: PathBuf,
 }
 
 /// Virtualization.framework's native Linux boot-loader inputs.
@@ -580,9 +607,69 @@ mod tests {
             mac: mac_for("dev"),
             dhcp_lease_is_endpoint: true,
             agent_key: Some("/i/dev/agent.key".into()),
+            egress: Some(EgressDoor {
+                socket: "/i/dev/egress/proxy.sock".into(),
+                key: "/i/dev/agent.key".into(),
+            }),
         };
         config.write(&path).unwrap();
         assert_eq!(Config::read(&path).unwrap(), config);
+    }
+
+    /// A helper reading a config written before the door existed installs no
+    /// listener rather than failing to parse. Additive-only is the whole
+    /// rule of this wire: a running helper routinely outlives the daemon
+    /// that spawned it.
+    #[test]
+    fn a_config_from_before_the_egress_door_still_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vz.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "instance": "dev",
+                "root": "/i/dev/disk.raw",
+                "seed": "/i/dev/seed.iso",
+                "efi_vars": "/i/dev/efi-vars.bin",
+                "console": "/i/dev/console.log",
+                "ctl": "/i/dev/vz.sock",
+                "cpus": 2,
+                "mem_mib": 2048,
+                "mac": mac_for("dev"),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(Config::read(&path).unwrap().egress, None);
+    }
+
+    /// And an unbound instance's config does not grow a key that says
+    /// nothing: `vz.json` is what a human reads to find out what a running
+    /// guest was built from.
+    #[test]
+    fn an_unbound_config_carries_no_egress_key_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vz.json");
+        let config = Config {
+            instance: "dev".into(),
+            root: "/i/dev/disk.raw".into(),
+            seed: "/i/dev/seed.iso".into(),
+            efi_vars: "/i/dev/efi-vars.bin".into(),
+            direct_kernel: None,
+            console: "/i/dev/console.log".into(),
+            ctl: "/i/dev/vz.sock".into(),
+            extra_disks: Vec::new(),
+            shares: Vec::new(),
+            cpus: 1,
+            mem_mib: 512,
+            mac: mac_for("dev"),
+            dhcp_lease_is_endpoint: false,
+            agent_key: None,
+            egress: None,
+        };
+        config.write(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("egress"), "{text}");
     }
 
     /// An older config, written before extra disks existed, still starts a

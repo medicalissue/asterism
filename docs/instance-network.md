@@ -23,7 +23,7 @@ Current capability boundary:
 | Backend | Published TCP/UDP | Guest-only secret egress door |
 |---|---:|---:|
 | QEMU + HVF/KVM | yes, loopback `hostfwd` | yes, `10.0.2.2` to host loopback |
-| Virtualization.framework | no | no |
+| Virtualization.framework | no | yes, guest loopback over the instance's virtio socket (OCI guests) |
 | Cloud Hypervisor/KVM | no | no |
 | native Hyper-V | no | no |
 
@@ -39,14 +39,27 @@ secret store. Bound HTTPS requests cross the authenticated orbit seam with the
 credential position empty; the source device inserts the value only into the
 upstream request.
 
-The proxy listens on loopback only. Today the secure guest-only door exists on
-QEMU user-mode networking, so VZ, Cloud Hypervisor and Hyper-V refuse a secret
-binding before the binding row changes. Detach revokes the old proxy context,
-including already-open connections, before restarting against the remaining
-policy.
+The proxy is reachable from one guest and from nothing on the wire, and the
+two backends that offer that reach it differently. On QEMU it is a loopback
+listener the guest reaches through its user-mode NAT gateway. On
+Virtualization.framework there is no such gateway — every guest holds an
+address on a shared NAT bridge — so the door is the guest's own loopback: the
+injected guest agent listens there and carries what it accepts over this
+instance's virtio socket to the signed helper, which proves the per-Instance
+key and splices the stream onto a private unix socket. Nothing binds a host
+interface on that path. See `docs/adr/0003-vz-egress-door.md`.
 
-The proxy port and CA persist with the Instance. When `astd` restarts while a
-QEMU guest remains alive, it reclaims that exact port before serving requests.
+Because the VZ door is opened by the agent Asterism injects into an OCI root
+filesystem, a VZ instance created from a cloud image still refuses a secret
+binding before the row changes, and so do Cloud Hypervisor and Hyper-V. Detach
+revokes the old proxy context, including already-open connections and the
+door's unix socket, before restarting against the remaining policy.
+
+The proxy port and CA persist with the Instance. The VZ door's guest-side port
+is fixed rather than allocated: it is in the guest's own namespace, so two
+instances never collide and a daemon restart reclaims it by construction. When
+`astd` restarts while a QEMU guest remains alive, it reclaims that exact port
+before serving requests.
 If it cannot, recovery reports an error and remains fail-closed; choosing a new
 port would leave the already-booted guest pointed at the old one. If the VMM is
 restarted, the boot path reissues the seed and may safely choose a new free

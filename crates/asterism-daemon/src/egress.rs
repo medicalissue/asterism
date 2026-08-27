@@ -79,7 +79,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncRead, AsyncWrite};
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use tokio::net::UnixListener;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
@@ -283,11 +283,30 @@ pub(crate) fn check_can_bind(inst: &Instance) -> Result<()> {
     // registry on a machine without that backend, only to fail at boot.
     if hv.caps().guest_egress.is_none() {
         bail!(
-            "the {} backend gives each guest an address on a shared network, so there is \
-             no listener this device could put up that only {:?} can reach — a bound \
-             secret needs a guest-only door, and binding a wildcard address instead \
-             would publish a proxy for this secret on your LAN. Run this instance on a \
-             backend with user-mode networking (qemu, today)",
+            "the {} backend gives each guest an address on a shared network and offers no \
+             door of its own into this device, so there is no listener only {:?} could \
+             reach — a bound secret needs a guest-only door, and binding a wildcard \
+             address instead would publish a proxy for this secret on your LAN. Run this \
+             instance on a backend that declares one (qemu's user-mode gateway, or vz's \
+             per-instance virtio-socket door)",
+            hv.id(),
+            inst.name
+        );
+    }
+    // A door the guest itself opens needs the guest agent that opens it.
+    // Asterism injects that agent into an OCI root filesystem; a cloud image
+    // installs the guest-control agent through cloud-init, and that one does
+    // not carry the door yet. Refusing here rather than at boot keeps the
+    // rule this whole check exists for: a binding is never recorded for a
+    // guest that would come up holding a handle nothing honours.
+    if matches!(hv.caps().guest_egress, Some(GuestEgress::AgentVsock { .. }))
+        && inst.image_kind != asterism_core::hv::ImageKind::OciRootfs
+    {
+        bail!(
+            "on the {} backend the guest's own agent opens the secret door, and Asterism \
+             injects that agent only into an OCI root filesystem — {:?} was created from \
+             a cloud image, whose agent does not carry the door yet. Create it from an \
+             OCI reference, or run it on qemu",
             hv.id(),
             inst.name
         );
@@ -305,6 +324,9 @@ fn gateway(inst: &Instance) -> Result<&'static str> {
     let hv = backend::for_instance(inst)?;
     match hv.caps().guest_egress {
         Some(GuestEgress::LoopbackGateway { gateway }) => Ok(gateway),
+        // The guest's own loopback. Its agent is what listens there, and
+        // what it accepts leaves over this instance's virtio socket.
+        Some(GuestEgress::AgentVsock { gateway, .. }) => Ok(gateway),
         None => bail!(
             "the {} backend has no guest-only path to this device",
             hv.id()
@@ -401,6 +423,13 @@ fn ensure_running(inst: &Instance, may_move_port: bool) -> Result<(u16, String)>
         }),
         revoked: revoked.clone(),
     });
+    // Which door this instance's backend declares decides what is bound
+    // here. A container is its own case and never asks a hypervisor.
+    let door = if inst.runtime == RuntimeKind::Container {
+        None
+    } else {
+        backend::for_instance(inst)?.caps().guest_egress
+    };
     let (port, task, transport) = if inst.runtime == RuntimeKind::Container {
         #[cfg(target_os = "linux")]
         {
@@ -417,6 +446,32 @@ fn ensure_running(inst: &Instance, may_move_port: bool) -> Result<(u16, String)>
         }
         #[cfg(not(target_os = "linux"))]
         bail!("native-container secret egress is only available on Linux")
+    } else if matches!(door, Some(GuestEgress::AgentVsock { .. })) {
+        // Nothing binds a host interface for this door. The guest's agent
+        // listens on the guest's own loopback, and the per-instance helper
+        // carries what it accepts to here, so the host end is a unix socket
+        // under this instance's directory and there is no port on this
+        // device for anything else to reach.
+        //
+        // The guest-side port is fixed rather than allocated: it is in the
+        // guest's own namespace, so two instances never collide, and a
+        // daemon restart reclaims exactly what the running guest was seeded
+        // with without having to remember anything.
+        let socket = vm_transport_path(&inst.name);
+        std::fs::create_dir_all(socket.parent().expect("egress transport parent"))?;
+        let _ = std::fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).with_context(|| {
+            format!(
+                "binding {:?}'s guest egress door at {}",
+                inst.name,
+                socket.display()
+            )
+        })?;
+        (
+            asterism_core::egress_door::EGRESS_GUEST_PORT,
+            tokio::runtime::Handle::current().spawn(accept_unix_loop(listener, ctx)),
+            Some(socket),
+        )
     } else {
         // VM user-mode networking maps its private gateway to host loopback.
         let preferred = stable_port(&inst.name);
@@ -471,6 +526,17 @@ fn egress_dir(instance: &str) -> PathBuf {
 /// the proxy socket: CA keys and every other egress artifact stay outside it.
 pub(crate) fn container_transport_dir(instance: &str) -> PathBuf {
     egress_dir(instance).join("container-transport")
+}
+
+/// The host end of a [`GuestEgress::AgentVsock`] door.
+///
+/// Named here rather than in the backend because the egress plane owns it:
+/// the backend is only told where to find it, and this file existing is what
+/// makes a bound guest's traffic serviceable at all. Dropping the [`Proxy`]
+/// removes it, which is how detach makes the door unreachable without
+/// waiting for a reboot.
+pub(crate) fn vm_transport_path(instance: &str) -> PathBuf {
+    egress_dir(instance).join("proxy.sock")
 }
 
 fn port_path(instance: &str) -> PathBuf {
@@ -551,7 +617,7 @@ async fn accept_loop(listener: TcpListener, ctx: Arc<ProxyCtx>) {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 async fn accept_unix_loop(listener: UnixListener, ctx: Arc<ProxyCtx>) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
@@ -1615,22 +1681,50 @@ mod tests {
         assert_eq!(gateway(&instance).unwrap(), "127.0.0.1");
     }
 
-    #[test]
-    fn an_incapable_recorded_backend_refuses_before_probe_or_mutation() {
-        let instance = Instance::new(
+    fn recorded_on(backend: &str, machine_type: &str) -> Instance {
+        Instance::new(
             "dev",
             "laptop",
             "oci",
             asterism_core::instance::Shape::default(),
             asterism_core::hv::Machine {
-                backend: crate::backend::vz::ID.into(),
-                machine_type: "vz-linux".into(),
+                backend: backend.into(),
+                machine_type: machine_type.into(),
                 cpu: "aarch64".into(),
                 hv_version: "native".into(),
             },
-        );
+        )
+    }
+
+    #[test]
+    fn an_incapable_recorded_backend_refuses_before_probe_or_mutation() {
+        let instance = recorded_on(crate::backend::chv::ID, "chv-linux");
         let error = check_can_bind(&instance).unwrap_err().to_string();
         assert!(error.contains("guest-only door"), "{error}");
+    }
+
+    /// VZ's door is the guest's own loopback, carried out over this
+    /// instance's virtio socket. What the seed tells the guest has to be
+    /// that address and nothing else: a bridge address would be reachable
+    /// by every other guest on the same NAT.
+    #[test]
+    fn vz_binds_and_points_the_guest_at_its_own_loopback() {
+        let mut instance = recorded_on(crate::backend::vz::ID, "vz-linux");
+        instance.image_kind = asterism_core::hv::ImageKind::OciRootfs;
+        check_can_bind(&instance).expect("vz declares a guest-only door");
+        assert_eq!(gateway(&instance).unwrap(), "127.0.0.1");
+    }
+
+    /// The door is only as real as the agent that opens it. A VZ instance
+    /// created from a cloud image has the cloud-init agent, which does not
+    /// carry one — so the binding is refused before the row changes rather
+    /// than discovered as a guest holding a handle nothing honours.
+    #[test]
+    fn a_vz_cloud_image_has_no_agent_to_open_the_door_and_is_refused() {
+        let instance = recorded_on(crate::backend::vz::ID, "vz-linux");
+        assert_eq!(instance.image_kind, asterism_core::hv::ImageKind::Disk);
+        let error = check_can_bind(&instance).unwrap_err().to_string();
+        assert!(error.contains("OCI root filesystem"), "{error}");
     }
 
     /// A VM proxy is on loopback, and that is the whole of why it is safe.
@@ -1698,6 +1792,182 @@ mod tests {
         proxy_task.abort();
         *EXTRA_ROOT.lock().unwrap() = None;
         ALLOW_LOOPBACK.store(false, Ordering::Relaxed);
+    }
+
+    /// The whole vz door, minus Virtualization.framework: a guest agent
+    /// listening on the *guest's* loopback, an authenticated vsock hop, and
+    /// the private unix socket the plane owns. A real bound request crosses
+    /// all three and comes back substituted, and the value never appears on
+    /// the guest side of the hop.
+    ///
+    /// The vsock itself is a socket pair here, which is exactly what it is
+    /// on the wire: a stream between one guest and one helper. What this
+    /// proves is the protocol and the splice, not Apple's transport.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_vz_door_carries_a_bound_request_over_an_authenticated_hop() {
+        use asterism_core::egress_door::{door_guest_handshake, door_host_handshake, pump};
+        use std::io::BufReader;
+        use std::os::unix::net::UnixStream as StdUnixStream;
+        use tokio::io::copy_bidirectional;
+        use tokio::net::UnixStream;
+
+        const SENTINEL: &str = "NEVER-WRITE-THIS-PLAINTEXT";
+
+        let _exclusive = exclusive().await;
+        ALLOW_LOOPBACK.store(true, Ordering::Relaxed);
+        let up = upstream().await;
+        *EXTRA_ROOT.lock().unwrap() = Some(up.ca_pem.clone());
+        let bound = binding(&format!("localhost:{}", up.port));
+        let handle_text = bound.guest_handle.as_str().to_owned();
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let authority = Authority::load_or_create(dir.path(), "vzdoor").unwrap();
+        let ca_pem = authority.ca_pem.clone();
+        let socket = dir.path().join("proxy.sock");
+        let unix = UnixListener::bind(&socket).unwrap();
+        let ctx = Arc::new(ProxyCtx {
+            instance: "vzdoor".into(),
+            bindings: vec![bound],
+            authority,
+            source: Arc::new(FakeSource { seen: seen.clone() }),
+            revoked: Arc::new(AtomicBool::new(false)),
+        });
+        let proxy_task = tokio::spawn(accept_unix_loop(unix, ctx));
+
+        // The key both ends of the hop prove. One per instance; a guest
+        // holding another instance's key is refused by the host half, which
+        // `asterism_core::egress_door` proves on its own.
+        let key = [0x7au8; 32];
+
+        // The guest's side of the hop, and the door the guest's own agent
+        // puts on the guest's loopback.
+        let guest_side = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let guest_port = guest_side.local_addr().unwrap().port();
+        let crossed = Arc::new(StdMutex::new(Vec::new()));
+        let watched = crossed.clone();
+        let host_socket = socket.clone();
+        let hop = tokio::task::spawn_blocking(move || {
+            let (agent_end, helper_end) = StdUnixStream::pair().unwrap();
+            // Guest half: prove the key, then splice the guest's loopback
+            // connection onto the hop.
+            let guest_half = std::thread::spawn(move || {
+                let mut reader = BufReader::new(agent_end.try_clone().unwrap());
+                let mut writer = agent_end.try_clone().unwrap();
+                door_guest_handshake(&mut reader, &mut writer, &key, "guest-nonce").unwrap();
+                agent_end
+            });
+            // Host half: prove the key, then splice onto the plane's socket.
+            let mut reader = BufReader::new(helper_end.try_clone().unwrap());
+            let mut writer = helper_end.try_clone().unwrap();
+            door_host_handshake(&mut reader, &mut writer, &key, "host-nonce").unwrap();
+            let agent_end = guest_half.join().unwrap();
+            let proxy = StdUnixStream::connect(&host_socket).unwrap();
+            (agent_end, helper_end, proxy)
+        })
+        .await
+        .unwrap();
+        let (agent_end, helper_end, proxy) = hop;
+
+        // Everything the guest sends is recorded on the way past, so the
+        // test can look for a plaintext the guest must never have held.
+        let listener_task = tokio::task::spawn_blocking(move || {
+            let helper_up = helper_end.try_clone().unwrap();
+            let proxy_up = proxy.try_clone().unwrap();
+            std::thread::spawn(move || {
+                let _ = pump(&helper_up, &proxy_up);
+                let _ = proxy_up.shutdown(std::net::Shutdown::Write);
+            });
+            let _ = pump(&proxy, &helper_end);
+            let _ = helper_end.shutdown(std::net::Shutdown::Write);
+        });
+        let agent_task = tokio::spawn(async move {
+            let (guest_conn, _) = guest_side.accept().await.unwrap();
+            let mut guest_conn = guest_conn;
+            agent_end.set_nonblocking(true).unwrap();
+            let mut hop = UnixStream::from_std(agent_end).unwrap();
+            let mut tapped = Tap {
+                inner: &mut hop,
+                seen: watched,
+            };
+            let _ = copy_bidirectional(&mut guest_conn, &mut tapped).await;
+        });
+
+        let response = guest(guest_port, &ca_pem)
+            .post(format!("https://localhost:{}/v1/messages", up.port))
+            .header("x-api-key", handle_text.clone())
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(seen.lock().unwrap().len(), 1, "the source was asked once");
+
+        let bytes = crossed.lock().unwrap().clone();
+        assert!(
+            !bytes
+                .windows(SENTINEL.len())
+                .any(|window| window == SENTINEL.as_bytes()),
+            "a secret value crossed the guest side of the door"
+        );
+
+        agent_task.abort();
+        listener_task.abort();
+        proxy_task.abort();
+        *EXTRA_ROOT.lock().unwrap() = None;
+        ALLOW_LOOPBACK.store(false, Ordering::Relaxed);
+    }
+
+    /// Records everything written *towards* the guest, which is the half a
+    /// compromised guest could read.
+    #[cfg(unix)]
+    struct Tap<'a> {
+        inner: &'a mut tokio::net::UnixStream,
+        seen: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    #[cfg(unix)]
+    impl tokio::io::AsyncRead for Tap<'_> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let before = buf.filled().len();
+            let polled = std::pin::Pin::new(&mut *self.inner).poll_read(cx, buf);
+            if let std::task::Poll::Ready(Ok(())) = &polled {
+                let fresh = buf.filled()[before..].to_vec();
+                self.seen.lock().unwrap().extend_from_slice(&fresh);
+            }
+            polled
+        }
+    }
+
+    #[cfg(unix)]
+    impl tokio::io::AsyncWrite for Tap<'_> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.seen.lock().unwrap().extend_from_slice(buf);
+            std::pin::Pin::new(&mut *self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut *self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut *self.inner).poll_shutdown(cx)
+        }
     }
 
     /// An available remembered port wins without consulting the allocator.
