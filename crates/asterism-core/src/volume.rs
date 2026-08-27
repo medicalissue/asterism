@@ -334,6 +334,111 @@ impl std::fmt::Display for Sharing {
     }
 }
 
+/// What a volume's bytes are *for*, and therefore what rolling an instance
+/// back is allowed to do to them.
+///
+/// A root disk and an agent's memory are two different things that happen to
+/// be stored the same way. Rewinding a box twenty minutes should undo what
+/// the agent *did* and keep what the agent *learned*: `claude --resume` has
+/// to still find the conversation, and three forks of one box should share
+/// one warm cargo registry rather than each downloading the crates world.
+/// That distinction cannot be inferred from a mount point, so it is
+/// declared here, once, and every rollback surface reads it.
+///
+/// The variants are a lifetime, not a permission:
+///
+/// * [`Lifecycle::Instance`] — ordinary data. Owned by the instance,
+///   captured by a snapshot, rolled back with it. The default, and what
+///   every volume written before this field existed loads as, which is
+///   correct: they were created when rollback did not distinguish.
+/// * [`Lifecycle::Memory`] — instance-owned state that must outlive a
+///   rollback of the instance. Captured by a snapshot, so it *can* be rolled
+///   back, but only when a human asks for it with `--include-memory`.
+///   Copied on fork, because two agents must not share one conversation.
+/// * [`Lifecycle::Cache`] — rebuildable bytes shared by [`BlockVolume::key`]
+///   between every instance that wants that key. Never captured and never
+///   rolled back: a snapshot of a cache is a bigger copy of something whose
+///   only property is that losing it costs time, and rolling one back would
+///   throw away work done by instances that were never being rewound.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Lifecycle {
+    #[default]
+    Instance,
+    Memory,
+    Cache,
+}
+
+impl Lifecycle {
+    /// The word `ast volume ls` prints in its TYPE column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Lifecycle::Instance => "instance",
+            Lifecycle::Memory => "memory",
+            Lifecycle::Cache => "cache",
+        }
+    }
+
+    /// Every value, for a refusal that lists what was on offer.
+    pub const ALL: &'static [Lifecycle] =
+        &[Lifecycle::Instance, Lifecycle::Memory, Lifecycle::Cache];
+}
+
+impl std::fmt::Display for Lifecycle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Lifecycle {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        Lifecycle::ALL
+            .iter()
+            .copied()
+            .find(|candidate| candidate.as_str() == value)
+            .with_context(|| {
+                format!(
+                    "no volume lifecycle called {value:?} — it is one of {}",
+                    Lifecycle::ALL
+                        .iter()
+                        .map(|l| l.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+    }
+}
+
+/// Does rolling an instance back to a snapshot roll this volume back too?
+///
+/// The one predicate every rollback surface calls, so that `ast restore` and
+/// `ast rewind` cannot drift into disagreeing about what a rewind means.
+/// `include_memory` is the user having asked for the stronger thing —
+/// `ast restore --include-memory`, and whatever `ast rewind` spells it as.
+///
+/// A cache is never rolled back, with or without the flag: it is shared with
+/// instances that are not being rewound, and its contents are derivable.
+pub fn reverts_with_instance(lifecycle: Lifecycle, include_memory: bool) -> bool {
+    match lifecycle {
+        Lifecycle::Instance => true,
+        Lifecycle::Memory => include_memory,
+        Lifecycle::Cache => false,
+    }
+}
+
+/// Does taking a snapshot of an instance capture this volume?
+///
+/// Wider than [`reverts_with_instance`] on purpose: a snapshot that did not
+/// capture memory could never honour `--include-memory` later, and capturing
+/// is cheap (a copy-on-write clone) while *not having captured* is
+/// unrecoverable. A cache is still excluded, because nothing will ever roll
+/// one back and the clone would be the largest file in the orbit.
+pub fn captured_by_snapshot(lifecycle: Lifecycle) -> bool {
+    !matches!(lifecycle, Lifecycle::Cache)
+}
+
 /// The retired exporter binary, used only to adopt and safely stop leases
 /// written by older builds. New exports are native threads inside `astd`.
 pub const LEGACY_EXPORT_BIN: &str = "qemu-storage-daemon";
@@ -423,6 +528,18 @@ pub struct BlockVolume {
     pub epoch: u64,
     #[serde(default)]
     pub lease: Option<Lease>,
+    /// What the bytes are for, and therefore what a rollback may do to them.
+    /// Defaulted, so a volume book written before rollback distinguished
+    /// loads every row as [`Lifecycle::Instance`] — which is what those rows
+    /// meant.
+    #[serde(default)]
+    pub lifecycle: Lifecycle,
+    /// What a [`Lifecycle::Cache`] volume is shared *by*: a preset name, a
+    /// repository URL, whatever two instances have to agree on before it is
+    /// sensible for them to warm the same registry. `None` on every other
+    /// lifecycle, where the volume's own name is its identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
 }
 
 impl BlockVolume {
@@ -515,6 +632,23 @@ impl Store {
     /// bookkeeping half, and it refuses a name that is already spoken for on
     /// this device.
     pub fn create(&mut self, name: &str, size_bytes: u64) -> Result<BlockVolume> {
+        self.create_with(name, size_bytes, Lifecycle::Instance, None)
+    }
+
+    /// Record a new volume with a declared [`Lifecycle`].
+    ///
+    /// A cache is shared by key, so it always has one: an explicit `--key`,
+    /// or its own name when the user gave none, which is the honest reading
+    /// of "share this with anything that asks for this volume". Anything
+    /// else with a key would be a promise nothing enforces, so it is refused
+    /// rather than quietly ignored.
+    pub fn create_with(
+        &mut self,
+        name: &str,
+        size_bytes: u64,
+        lifecycle: Lifecycle,
+        key: Option<&str>,
+    ) -> Result<BlockVolume> {
         check_name(name)?;
         if self.volumes.contains_key(name) {
             bail!("this device already has a volume called {name:?}");
@@ -522,6 +656,19 @@ impl Store {
         if size_bytes == 0 {
             bail!("a volume needs a size — try --size 10G");
         }
+        let key = match (lifecycle, key) {
+            (Lifecycle::Cache, Some(key)) => {
+                check_key(key)?;
+                Some(key.to_owned())
+            }
+            (Lifecycle::Cache, None) => Some(name.to_owned()),
+            (other, Some(_)) => bail!(
+                "--key is what a cache volume is shared by; {other} volumes belong to one \
+                 instance, so there is nothing to share — drop --key, or pass \
+                 --lifecycle cache"
+            ),
+            (_, None) => None,
+        };
         let vol = BlockVolume {
             name: name.to_owned(),
             size_bytes,
@@ -530,9 +677,22 @@ impl Store {
             sharing: Sharing::SingleWriter,
             epoch: 0,
             lease: None,
+            lifecycle,
+            key,
         };
         self.volumes.insert(name.to_owned(), vol.clone());
         Ok(vol)
+    }
+
+    /// The volume on this device serving one cache key, if any holds it.
+    ///
+    /// What makes `ast create --profile claude` twice reuse one warm cargo
+    /// registry instead of making a second one: the key is looked up before
+    /// anything is created.
+    pub fn by_key(&self, key: &str) -> Option<&BlockVolume> {
+        self.volumes
+            .values()
+            .find(|v| v.lifecycle == Lifecycle::Cache && v.key.as_deref() == Some(key))
     }
 
     /// Forget a volume. Refuses one that is leased: deleting bytes out from
@@ -1074,6 +1234,22 @@ pub fn check_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Cache keys are compared byte for byte across devices and printed in
+/// listings, so they are held to a shape a person can retype: what a volume
+/// name allows, plus the punctuation a repository URL is made of.
+pub fn check_key(key: &str) -> Result<()> {
+    if key.is_empty() || key.len() > 120 {
+        bail!("a cache key must be 1-120 characters (got {key:?})");
+    }
+    if !key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-_.:/@+".contains(c))
+    {
+        bail!("a cache key may hold letters, digits and - _ . : / @ + (got {key:?})");
+    }
+    Ok(())
+}
+
 /// `<device>:<volume>`, the way a remote volume is written on the command
 /// line. `None` when this is not that shape — an absolute path, most often,
 /// which is a directory volume and goes down the 9p road instead.
@@ -1191,6 +1367,8 @@ mod tests {
                 sharing: Sharing::SingleWriter,
                 epoch: 0,
                 lease: None,
+                lifecycle: Lifecycle::Instance,
+                key: None,
             },
         }
     }
@@ -1924,5 +2102,116 @@ mod tests {
             .get("tank")
             .expect("the volume is not forgotten because a page went");
         assert_eq!(vol.size_bytes, 5 << 30);
+    }
+
+    // ---- lifecycle ---------------------------------------------------------
+
+    /// The predicate `ast restore` and `ast rewind` both call. Written as a
+    /// table because the interesting property is the whole table: memory is
+    /// the only row the flag moves, and cache is the row it must not.
+    #[test]
+    fn only_memory_is_what_include_memory_changes() {
+        for (lifecycle, plain, with_flag) in [
+            (Lifecycle::Instance, true, true),
+            (Lifecycle::Memory, false, true),
+            (Lifecycle::Cache, false, false),
+        ] {
+            assert_eq!(
+                reverts_with_instance(lifecycle, false),
+                plain,
+                "{lifecycle} without --include-memory"
+            );
+            assert_eq!(
+                reverts_with_instance(lifecycle, true),
+                with_flag,
+                "{lifecycle} with --include-memory"
+            );
+        }
+    }
+
+    /// A snapshot has to capture everything a later restore could be asked
+    /// to roll back, or `--include-memory` would be a flag with nothing
+    /// behind it.
+    #[test]
+    fn a_snapshot_captures_everything_a_restore_can_revert() {
+        for lifecycle in Lifecycle::ALL.iter().copied() {
+            assert!(
+                !reverts_with_instance(lifecycle, true) || captured_by_snapshot(lifecycle),
+                "{lifecycle} can be reverted but is never captured"
+            );
+        }
+        assert!(!captured_by_snapshot(Lifecycle::Cache));
+    }
+
+    #[test]
+    fn lifecycles_round_trip_through_the_word_the_cli_takes() {
+        for lifecycle in Lifecycle::ALL.iter().copied() {
+            assert_eq!(lifecycle.as_str().parse::<Lifecycle>().unwrap(), lifecycle);
+        }
+        let err = "durable".parse::<Lifecycle>().unwrap_err().to_string();
+        assert!(err.contains("instance, memory, cache"), "{err}");
+    }
+
+    /// A cache is shared by key, so it always ends up with one; nothing else
+    /// may carry a key it could not honour.
+    #[test]
+    fn a_cache_always_has_a_key_and_nothing_else_may_have_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(&dir.path().join("volumes.json")).unwrap();
+        let named = store
+            .create_with("warm", 1 << 30, Lifecycle::Cache, Some("profile:claude"))
+            .unwrap();
+        assert_eq!(named.key.as_deref(), Some("profile:claude"));
+        let unnamed = store
+            .create_with("scratch", 1 << 30, Lifecycle::Cache, None)
+            .unwrap();
+        assert_eq!(unnamed.key.as_deref(), Some("scratch"));
+
+        let memory = store
+            .create_with("brain", 1 << 30, Lifecycle::Memory, None)
+            .unwrap();
+        assert_eq!(memory.lifecycle, Lifecycle::Memory);
+        assert_eq!(memory.key, None);
+
+        let err = store
+            .create_with("mine", 1 << 30, Lifecycle::Memory, Some("k"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--lifecycle cache"), "{err}");
+
+        assert_eq!(
+            store.by_key("profile:claude").map(|v| v.name.clone()),
+            Some("warm".to_owned())
+        );
+        assert_eq!(store.by_key("brain"), None);
+    }
+
+    /// A volume book written before lifecycles existed has to load, and
+    /// every row in it has to load as the thing it meant: an ordinary
+    /// instance volume that a restore rolls back.
+    #[test]
+    fn a_volume_book_written_before_lifecycles_loads_as_instance_volumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("volumes.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"volumes":{"tank":{"name":"tank","size_bytes":1073741824,
+               "created_at":10,"durability":"single_device","sharing":"single_writer",
+               "epoch":3,"lease":null}}}"#,
+        )
+        .unwrap();
+        let store = Store::load(&path).unwrap();
+        let tank = store.get("tank").unwrap().clone();
+        assert_eq!(tank.lifecycle, Lifecycle::Instance);
+        assert_eq!(tank.key, None);
+        assert_eq!(tank.epoch, 3);
+        assert!(reverts_with_instance(tank.lifecycle, false));
+
+        // And it is written back with the field, so the next reader does not
+        // have to infer it either.
+        store.save().unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("\"lifecycle\": \"instance\""), "{written}");
+        assert!(!written.contains("\"key\""), "{written}");
     }
 }

@@ -87,6 +87,41 @@ pub struct Check {
     pub remedy: &'static str,
 }
 
+/// A volume a profile wants to exist, and where in the guest it belongs.
+///
+/// Declared rather than scripted: `ast create --profile claude` reads this
+/// list and makes what is missing, so the thing that decides an agent's
+/// memory lives off the root disk is four lines of data next to the profile
+/// that needs it, not a branch in the create path.
+///
+/// The names are derived, never written here, so two profiles cannot collide
+/// and a user can predict them: `<instance>-<profile>-<role>` for an
+/// instance-owned volume, `cache-<key>` for a shared one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefaultVolume {
+    /// Short word naming what this volume is to the profile — the last
+    /// component of a derived volume name.
+    pub role: &'static str,
+    pub lifecycle: crate::volume::Lifecycle,
+    /// What a [`crate::volume::Lifecycle::Cache`] volume is shared by. Every
+    /// instance created with this profile, on this device, gets the same
+    /// one — which is the whole point: three forks, one warm cargo registry.
+    pub key: Option<&'static str>,
+    pub size_bytes: u64,
+    /// Where the guest mounts it. An absolute path; the guest's user owns
+    /// what lands there.
+    pub guest_path: &'static str,
+    /// `(link, subdirectory)` pairs: paths inside the guest that become
+    /// symlinks into the mounted volume. How one cache volume serves
+    /// `~/.cargo/registry`, `~/.npm` and `~/.cache/pip` at once, without
+    /// three disks and three leases.
+    pub links: &'static [(&'static str, &'static str)],
+}
+
+/// The user a cloud-init guest gives an agent, and the home its state lives
+/// in. Written once here because both agent profiles spell the same paths.
+pub const GUEST_USER: &str = "ast";
+
 /// A named, versioned set of bootstrap work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Profile {
@@ -105,6 +140,9 @@ pub struct Profile {
     /// One fragment per step, each run under `set -e`.
     pub steps: &'static [&'static str],
     pub checks: &'static [Check],
+    /// Volumes this profile wants under the guest's state and cache paths.
+    /// Created on first `ast create --profile …` if they are not there yet.
+    pub volumes: &'static [DefaultVolume],
 }
 
 /// Every profile Asterism ships, in the order they are applied.
@@ -173,6 +211,31 @@ impl Bootstrap {
 
     pub fn profiles(&self) -> &[&'static Profile] {
         &self.profiles
+    }
+
+    /// The volumes this set of profiles wants, resolved into the names they
+    /// would have on `instance`, in the order they should be created.
+    ///
+    /// Two profiles asking for the same guest path is one volume, not two:
+    /// `--profile claude --profile codex` share one build cache, because a
+    /// cache is keyed by what is in it and both of them want the same
+    /// registries warm. The first profile in catalog order wins the mount
+    /// point, and the second one's identical request is dropped rather than
+    /// becoming a second disk fighting for the same directory.
+    pub fn volumes(&self, instance: &str) -> Vec<WantedVolume> {
+        let mut out: Vec<WantedVolume> = Vec::new();
+        for profile in &self.profiles {
+            for want in profile.volumes {
+                if out.iter().any(|w| w.want.guest_path == want.guest_path) {
+                    continue;
+                }
+                out.push(WantedVolume {
+                    name: volume_name(instance, profile.name, want),
+                    want: *want,
+                });
+            }
+        }
+        out
     }
 
     /// What this set *is*, as one short string: names and versions.
@@ -285,6 +348,41 @@ impl Bootstrap {
         out.push_str(CHECK_TAIL);
         out
     }
+}
+
+/// One of [`Bootstrap::volumes`]'s answers: what to make, and what to call it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WantedVolume {
+    /// The volume's name on the device that will hold its bytes.
+    pub name: String,
+    pub want: DefaultVolume,
+}
+
+/// What a profile's declared volume is called on the device holding it.
+///
+/// A cache is named after its key and nothing else, because that is what
+/// makes the second instance find the first one's bytes instead of making a
+/// parallel copy. Everything else is named after the instance that owns it,
+/// so `ast volume ls` reads as a list of whose-is-what.
+pub fn volume_name(instance: &str, profile: &str, want: &DefaultVolume) -> String {
+    match (want.lifecycle, want.key) {
+        (crate::volume::Lifecycle::Cache, Some(key)) => format!("cache-{}", sanitize(key)),
+        _ => format!("{instance}-{profile}-{}", want.role),
+    }
+}
+
+/// Reduce a cache key to something [`crate::volume::check_name`] accepts. A
+/// key may be a repository URL; a volume name may not.
+fn sanitize(key: &str) -> String {
+    key.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 impl Profile {
@@ -423,6 +521,7 @@ const BASE: Profile = Profile {
                      /etc/ssh/sshd_config",
         },
     ],
+    volumes: &[],
 };
 
 /// The runtime both agent CLIs are written in.
@@ -470,6 +569,7 @@ const NODE: Profile = Profile {
             remedy: "no npm on this guest — journalctl -u asterism-bootstrap",
         },
     ],
+    volumes: &[],
 };
 
 /// Claude Code, from the registry its publisher publishes it to.
@@ -482,35 +582,130 @@ const NODE: Profile = Profile {
 /// `asterism-check` can say which version answered.
 const CLAUDE: Profile = Profile {
     name: "claude",
-    version: 1,
-    summary: "Claude Code, with its credential arriving as a handle rather than a key",
+    version: 2,
+    summary: "Claude Code, with its memory on a volume a rewind does not touch",
     requires: &["base", "node"],
     packages: &[],
     files: &[],
-    steps: &["npm install -g --no-fund --no-audit @anthropic-ai/claude-code"],
-    checks: &[Check {
-        what: "claude",
-        probe: "claude --version",
-        remedy: "Claude Code is not installed — journalctl -u asterism-bootstrap, then \
-                 npm install -g @anthropic-ai/claude-code",
-    }],
+    steps: &[
+        "npm install -g --no-fund --no-audit @anthropic-ai/claude-code",
+        LINK_CACHE,
+    ],
+    checks: &[
+        Check {
+            what: "claude",
+            probe: "claude --version",
+            remedy: "Claude Code is not installed — journalctl -u asterism-bootstrap, then \
+                     npm install -g @anthropic-ai/claude-code",
+        },
+        Check {
+            what: "memory volume",
+            probe: "mountpoint -q /home/ast/.claude && echo '/home/ast/.claude is a volume'",
+            remedy: "the agent's state directory is on the root disk, so a rewind would take \
+                     the conversation with it — ast status <instance> to see whether the \
+                     memory volume attached, and journalctl -u asterism-blockmount for why",
+        },
+        Check {
+            what: "cache volume",
+            probe: "mountpoint -q /var/cache/asterism && echo '/var/cache/asterism is a volume'",
+            remedy: "the shared build cache did not mount, so this box will warm its own — \
+                     journalctl -u asterism-blockmount",
+        },
+    ],
+    volumes: &[
+        // The conversation, the settings, the project memory. Instance-owned
+        // and copied on fork: two agents must not share one transcript.
+        DefaultVolume {
+            role: "memory",
+            lifecycle: crate::volume::Lifecycle::Memory,
+            key: None,
+            size_bytes: 8 << 30,
+            guest_path: "/home/ast/.claude",
+            links: &[],
+        },
+        AGENT_CACHE,
+    ],
 };
+
+/// The build caches every agent box refills and none of them owns.
+///
+/// One volume and three symlinks rather than three volumes: a cache is one
+/// failure domain and one lease, and the paths it serves are an
+/// implementation detail of whichever toolchain is installed.
+const AGENT_CACHE: DefaultVolume = DefaultVolume {
+    role: "cache",
+    lifecycle: crate::volume::Lifecycle::Cache,
+    key: Some("agent-toolchain"),
+    size_bytes: 64 << 30,
+    guest_path: "/var/cache/asterism",
+    links: &[
+        ("/home/ast/.cargo/registry", "cargo-registry"),
+        ("/home/ast/.npm", "npm"),
+        ("/home/ast/.cache/pip", "pip"),
+    ],
+};
+
+/// Point the toolchains' cache paths at the shared volume, if it mounted.
+///
+/// Idempotent, and it never destroys anything: a real directory already
+/// holding bytes is moved onto the volume the first time and left alone
+/// afterwards, so a box that ran without a cache volume does not lose its
+/// registry the day one is attached. A guest with no cache volume falls
+/// through and keeps its own paths.
+const LINK_CACHE: &str = "\
+    if mountpoint -q /var/cache/asterism; then\n\
+    \x20 for pair in 'cargo-registry:/home/ast/.cargo/registry' 'npm:/home/ast/.npm' \
+    'pip:/home/ast/.cache/pip'; do\n\
+    \x20   sub=${pair%%:*}; link=${pair#*:}\n\
+    \x20   mkdir -p \"/var/cache/asterism/$sub\" \"$(dirname \"$link\")\"\n\
+    \x20   if [ -L \"$link\" ]; then continue; fi\n\
+    \x20   if [ -d \"$link\" ]; then\n\
+    \x20     cp -a \"$link/.\" \"/var/cache/asterism/$sub/\" 2>/dev/null || true\n\
+    \x20     rm -rf \"$link\"\n\
+    \x20   fi\n\
+    \x20   ln -sfn \"/var/cache/asterism/$sub\" \"$link\"\n\
+    \x20 done\n\
+    \x20 chown -R ast:ast /var/cache/asterism /home/ast/.cargo /home/ast/.cache 2>/dev/null || true\n\
+    fi";
 
 /// Codex, on the same terms as Claude Code above.
 const CODEX: Profile = Profile {
     name: "codex",
-    version: 1,
-    summary: "the Codex CLI, with its credential arriving as a handle rather than a key",
+    version: 2,
+    summary: "the Codex CLI, with its memory on a volume a rewind does not touch",
     requires: &["base", "node"],
     packages: &[],
     files: &[],
-    steps: &["npm install -g --no-fund --no-audit @openai/codex"],
-    checks: &[Check {
-        what: "codex",
-        probe: "codex --version",
-        remedy: "the Codex CLI is not installed — journalctl -u asterism-bootstrap, then \
-                 npm install -g @openai/codex",
-    }],
+    steps: &[
+        "npm install -g --no-fund --no-audit @openai/codex",
+        LINK_CACHE,
+    ],
+    checks: &[
+        Check {
+            what: "codex",
+            probe: "codex --version",
+            remedy: "the Codex CLI is not installed — journalctl -u asterism-bootstrap, then \
+                     npm install -g @openai/codex",
+        },
+        Check {
+            what: "memory volume",
+            probe: "mountpoint -q /home/ast/.codex && echo '/home/ast/.codex is a volume'",
+            remedy: "the agent's state directory is on the root disk, so a rewind would take \
+                     the session with it — ast status <instance>, then journalctl -u \
+                     asterism-blockmount",
+        },
+    ],
+    volumes: &[
+        DefaultVolume {
+            role: "memory",
+            lifecycle: crate::volume::Lifecycle::Memory,
+            key: None,
+            size_bytes: 8 << 30,
+            guest_path: "/home/ast/.codex",
+            links: &[],
+        },
+        AGENT_CACHE,
+    ],
 };
 
 // ---- what runs in the guest ------------------------------------------------
@@ -780,7 +975,7 @@ mod tests {
     #[test]
     fn the_stamp_names_every_profile_and_its_version() {
         let resolved = Bootstrap::resolve(&names(&["claude"])).unwrap();
-        assert_eq!(resolved.stamp(), "base@2 node@1 claude@1");
+        assert_eq!(resolved.stamp(), "base@2 node@1 claude@2");
         assert_eq!(
             Bootstrap::resolve(&names(&["base"])).unwrap().stamp(),
             "base@2"
@@ -790,6 +985,103 @@ mod tests {
             Bootstrap::resolve(&names(&["claude"])).unwrap().stamp(),
             Bootstrap::resolve(&names(&["codex"])).unwrap().stamp()
         );
+    }
+
+    /// The scene this exists for: an agent box gets a memory volume at its
+    /// state directory and a cache volume it shares with every other agent
+    /// box on the device, and neither of them is the root disk.
+    #[test]
+    fn an_agent_profile_wants_a_memory_volume_and_a_shared_cache() {
+        use crate::volume::Lifecycle;
+        let wanted = Bootstrap::resolve(&names(&["claude"]))
+            .unwrap()
+            .volumes("bot");
+        let paths: Vec<(&str, &str, Lifecycle)> = wanted
+            .iter()
+            .map(|w| (w.name.as_str(), w.want.guest_path, w.want.lifecycle))
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                ("bot-claude-memory", "/home/ast/.claude", Lifecycle::Memory),
+                (
+                    "cache-agent-toolchain",
+                    "/var/cache/asterism",
+                    Lifecycle::Cache
+                ),
+            ]
+        );
+
+        // Memory is the instance's; the cache is the key's, so a second box
+        // asks for the very same volume and finds it already warm.
+        let other = Bootstrap::resolve(&names(&["claude"]))
+            .unwrap()
+            .volumes("other");
+        assert_eq!(other[0].name, "other-claude-memory");
+        assert_eq!(other[1].name, wanted[1].name);
+
+        // Every derived name is a name `ast volume create` would accept.
+        for w in &wanted {
+            crate::volume::check_name(&w.name).unwrap();
+        }
+    }
+
+    /// Two agent profiles on one box is one cache, not two disks fighting
+    /// over `/var/cache/asterism`.
+    #[test]
+    fn two_agent_profiles_share_one_cache_volume() {
+        let wanted = Bootstrap::resolve(&names(&["claude", "codex"]))
+            .unwrap()
+            .volumes("bot");
+        let mounts: Vec<&str> = wanted.iter().map(|w| w.want.guest_path).collect();
+        assert_eq!(
+            mounts,
+            vec![
+                "/home/ast/.claude",
+                "/var/cache/asterism",
+                "/home/ast/.codex"
+            ]
+        );
+        assert_eq!(
+            mounts.len(),
+            mounts
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            "two volumes want the same directory"
+        );
+    }
+
+    /// The catalog cannot declare something the volume plane would refuse:
+    /// a cache without a key is not shared by anything, and a non-cache with
+    /// one is a promise nothing keeps.
+    #[test]
+    fn every_declared_volume_is_one_the_volume_plane_would_accept() {
+        use crate::volume::Lifecycle;
+        for profile in CATALOG {
+            for want in profile.volumes {
+                assert_eq!(
+                    want.key.is_some(),
+                    want.lifecycle == Lifecycle::Cache,
+                    "{}/{}",
+                    profile.name,
+                    want.role
+                );
+                if let Some(key) = want.key {
+                    crate::volume::check_key(key).unwrap();
+                }
+                assert!(want.size_bytes > 0, "{}/{}", profile.name, want.role);
+                assert!(
+                    want.guest_path.starts_with('/'),
+                    "{}/{}",
+                    profile.name,
+                    want.role
+                );
+                for (link, _) in want.links {
+                    assert!(link.starts_with('/'), "{link}");
+                }
+            }
+        }
     }
 
     /// An empty set writes nothing and runs nothing: an instance created

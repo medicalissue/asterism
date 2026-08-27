@@ -221,6 +221,12 @@ pub enum Request {
         host: Option<String>,
         #[serde(default)]
         mount_point: Option<String>,
+        /// What this share's bytes are for, which decides what a rollback
+        /// does to them. Defaulted to [`crate::volume::Lifecycle::Instance`],
+        /// which is what every share written before this field existed meant
+        /// and what `--volume /some/dir` still means.
+        #[serde(default)]
+        lifecycle: crate::volume::Lifecycle,
     },
     /// Attach a block volume — one created with `ast volume create` on
     /// `device` — to an instance.
@@ -234,6 +240,11 @@ pub enum Request {
         volume: String,
         /// The device that holds them.
         device: String,
+        /// Where the guest should mount it, if the user said. Absent is the
+        /// behaviour block volumes have always had: a bare disk, and the
+        /// guest decides. Defaulted, so an older CLI keeps getting that.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mount_point: Option<String>,
     },
     /// Attach an orbit storage part by its volume name. The daemon holding
     /// the instance reads the live catalog, checks placement, and only then
@@ -246,6 +257,9 @@ pub enum Request {
         owner_device: Option<String>,
         #[serde(default)]
         max_latency_ms: Option<u64>,
+        /// Where the guest should mount it. See [`Request::AttachBlock`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mount_point: Option<String>,
     },
     /// Attach one hardware GPU provider to a stopped instance. The initiating
     /// daemon resolves this into token-free durable metadata before routing
@@ -387,6 +401,16 @@ pub enum Request {
     SnapshotRestore {
         name: String,
         tag: String,
+        /// Roll the instance's [`crate::volume::Lifecycle::Memory`] volumes
+        /// back too — the agent's state directory along with its root disk.
+        ///
+        /// Additive and defaulted, and the default is the safe direction: a
+        /// daemon too old to read this field restores the root disk and
+        /// leaves memory alone, which is what it did before the field
+        /// existed and what a caller who did not ask for the stronger thing
+        /// wants. Cache volumes are never rolled back and have no flag.
+        #[serde(default)]
+        include_memory: bool,
     },
     /// Delete one snapshot. Additive: a daemon too old to know this frame
     /// refuses it by name rather than doing something else with it.
@@ -408,6 +432,12 @@ pub enum Request {
     Rewind {
         name: String,
         to: crate::rewind::Target,
+        /// Roll the instance's [`crate::volume::Lifecycle::Memory`] volumes
+        /// back too. Additive and defaulted, and the default is the safe
+        /// direction — see [`Request::SnapshotRestore`], which spells the
+        /// same flag for the same reason.
+        #[serde(default)]
+        include_memory: bool,
     },
     /// Change this instance's snapshot interval and retention. `None` on
     /// either leaves that half where it was; both `None` puts the instance
@@ -651,6 +681,14 @@ pub enum Request {
     VolumeCreate {
         name: String,
         size_bytes: u64,
+        /// What the bytes are for. Defaulted, so a frame from an older CLI
+        /// asks for exactly the volume it always asked for.
+        #[serde(default)]
+        lifecycle: crate::volume::Lifecycle,
+        /// What a cache volume is shared by. Ignored on any other lifecycle,
+        /// which the provider refuses rather than silently dropping.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key: Option<String>,
     },
     /// This device's block volumes, with their sizes and leases.
     VolumeList,
@@ -1517,6 +1555,12 @@ pub enum Response {
         export: String,
         socket: String,
         size_bytes: u64,
+        /// What the provider says these bytes are for. Copied onto the
+        /// consumer's attachment so a rollback there never has to reach a
+        /// provider that may be asleep. Defaulted: a provider too old to say
+        /// is a provider whose volumes are all ordinary instance data.
+        #[serde(default)]
+        lifecycle: crate::volume::Lifecycle,
     },
 
     // ---- secrets ------------------------------------------------------------
@@ -1822,6 +1866,7 @@ pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
                 volume: String::new(),
                 owner_device: None,
                 max_latency_ms: None,
+                mount_point: None,
             }
             .since(),
         ),
@@ -2018,6 +2063,7 @@ mod tests {
             export: "lease-7".into(),
             socket: "/run/asterism/tank.sock".into(),
             size_bytes: 1,
+            lifecycle: crate::volume::Lifecycle::Instance,
         };
         assert_eq!(lease.since(), 7);
         assert!(!lease.speakable_at(6));
@@ -2377,17 +2423,20 @@ mod tests {
                 path: "/t".into(),
                 host: None,
                 mount_point: None,
+                lifecycle: crate::volume::Lifecycle::Instance,
             },
             Request::AttachBlock {
                 name: "dev".into(),
                 volume: "tank".into(),
                 device: "desktop".into(),
+                mount_point: None,
             },
             Request::AttachStorage {
                 name: "dev".into(),
                 volume: "tank".into(),
                 owner_device: None,
                 max_latency_ms: Some(5),
+                mount_point: None,
             },
             Request::Detach {
                 name: "dev".into(),
@@ -2402,6 +2451,7 @@ mod tests {
             Request::SnapshotRestore {
                 name: "dev".into(),
                 tag: "t".into(),
+                include_memory: false,
             },
             Request::Logs {
                 name: "dev".into(),
@@ -2479,6 +2529,7 @@ mod tests {
                 name: "dev".into(),
                 volume: "tank".into(),
                 device: "desktop".into(),
+                mount_point: None,
             })
             .unwrap(),
             r#"{"cmd":"attach_block","name":"dev","volume":"tank","device":"desktop"}"#
@@ -2514,7 +2565,9 @@ mod tests {
         assert_eq!(
             Request::VolumeCreate {
                 name: "tank".into(),
-                size_bytes: 1 << 30
+                size_bytes: 1 << 30,
+                lifecycle: crate::volume::Lifecycle::Instance,
+                key: None,
             }
             .subject(),
             None
@@ -2526,7 +2579,8 @@ mod tests {
             Request::AttachBlock {
                 name: "dev".into(),
                 volume: "tank".into(),
-                device: "desktop".into()
+                device: "desktop".into(),
+                mount_point: None,
             }
             .subject(),
             Some("dev")
@@ -2537,6 +2591,7 @@ mod tests {
                 volume: "tank".into(),
                 owner_device: None,
                 max_latency_ms: None,
+                mount_point: None,
             }
             .subject(),
             Some("dev")

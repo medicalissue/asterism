@@ -81,6 +81,69 @@ impl Share {
     }
 }
 
+/// A block volume the guest is expected to find, put a filesystem on, and
+/// mount somewhere in particular.
+///
+/// Not every block volume is one of these. `ast attach --volume tank` with
+/// no `--at` still hands the guest a bare disk and lets it decide, which is
+/// the right answer for a volume whose contents are the user's business. A
+/// mount point is the user saying "this is `~/.claude`", and from that
+/// moment the guest has to make it so before the agent looks there — which
+/// is why this exists at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskMount {
+    /// Filesystem label, 16 bytes at most so ext4 will take it. Derived from
+    /// the volume's identity, so the disk claimed at first boot is the same
+    /// disk found at every boot after, whatever `/dev/vdX` it landed on.
+    pub label: String,
+    /// Virtual size, as the provider reports it. Used to tell one blank disk
+    /// from another the first time, before any of them has a label.
+    pub size_bytes: u64,
+    /// Absolute path in the guest.
+    pub guest_path: String,
+    /// The user that should own what lands there.
+    pub owner: String,
+    /// `host:volume`, for a human reading the guest's journal.
+    pub label_text: String,
+}
+
+impl DiskMount {
+    /// The block volumes an instance has asked to have mounted somewhere.
+    ///
+    /// Deliberately not filtered by `is_local`: a block volume on another
+    /// device arrives over NBD as an ordinary disk, and the guest has no way
+    /// of telling. Where the bytes are is the host's problem.
+    pub fn of(inst: &Instance) -> Vec<DiskMount> {
+        inst.volumes
+            .iter()
+            .filter(|v| v.is_block())
+            .filter_map(|v| {
+                let guest_path = v.mount_point.clone()?;
+                Some(DiskMount {
+                    label: disk_label(&v.host, &v.path),
+                    size_bytes: v.size_bytes.unwrap_or(0),
+                    guest_path,
+                    owner: crate::profile::GUEST_USER.to_owned(),
+                    label_text: format!("{}:{}", v.host, v.path),
+                })
+            })
+            .collect()
+    }
+}
+
+/// The filesystem label one block volume is claimed under.
+///
+/// Sixteen bytes exactly, which is what ext4 allows: `ast` plus twelve hex
+/// digits of the same fixed hash a directory share's mount tag uses. Fixed
+/// so the label survives a daemon restart and a toolchain upgrade — a label
+/// that moved would be a guest that reformats its own memory.
+pub fn disk_label(host: &str, volume: &str) -> String {
+    format!(
+        "ast{:012x}",
+        crate::instance::fnv1a(&format!("{host}:{volume}")) >> 16
+    )
+}
+
 /// What a guest is told about its egress proxy, and the whole of what a seed
 /// says about secrets.
 ///
@@ -119,6 +182,10 @@ pub struct Egress {
 pub struct Input<'a> {
     pub shares: &'a [Share],
     pub share_kind: Option<ShareKind>,
+    /// Block volumes with a mount point, which the guest formats once and
+    /// mounts at every boot. Empty for every instance that has none, so a
+    /// guest that predates them gets a byte-identical seed.
+    pub disks: &'a [DiskMount],
     pub extra: &'a str,
     pub network_config: Option<&'a str>,
     pub egress: &'a Egress,
@@ -172,15 +239,7 @@ pub fn ensure(name: &str, seed: &Path, input: Input<'_>) -> Result<()> {
         bail!("cannot build mount units without a directory-share transport");
     }
     let stamp_path = seed.with_file_name("seed.stamp");
-    let stamp = fingerprint(
-        name,
-        input.shares,
-        input.share_kind,
-        input.extra,
-        input.network_config,
-        input.egress,
-        input.bootstrap,
-    );
+    let stamp = fingerprint(name, &input);
     let current = std::fs::read_to_string(&stamp_path).unwrap_or_default();
     if seed.exists() && current.trim() == stamp {
         return Ok(());
@@ -200,15 +259,25 @@ pub fn ensure(name: &str, seed: &Path, input: Input<'_>) -> Result<()> {
 /// seed of every instance that does not use any — a reissued seed carries a
 /// new `instance-id`, which makes a guest run its first-boot work again.
 /// A missing or empty `network` is folded the same way, for the same reason.
-fn fingerprint(
-    name: &str,
-    shares: &[Share],
-    share_kind: Option<ShareKind>,
-    extra: &str,
-    network: Option<&str>,
-    egress: &Egress,
-    bootstrap: &Bootstrap,
-) -> String {
+fn fingerprint(name: &str, input: &Input<'_>) -> String {
+    let Input {
+        shares,
+        share_kind,
+        disks,
+        extra,
+        network_config: network,
+        egress,
+        bootstrap,
+    } = input;
+    let (shares, share_kind, disks, extra, network, egress, bootstrap) = (
+        *shares,
+        *share_kind,
+        *disks,
+        *extra,
+        *network,
+        *egress,
+        *bootstrap,
+    );
     let mut material = format!("v{SEED_TEMPLATE_VERSION}\n{name}\n");
     if !shares.is_empty() {
         // `ensure` proved this. Keeping the option at the public boundary
@@ -257,21 +326,23 @@ fn fingerprint(
         material.push_str(&bootstrap.stamp());
         material.push('\n');
     }
+    // Folded in the same way and for the same reason: an instance with no
+    // mounted block volumes folds in nothing, so adding this section
+    // reissued no existing seed. A guest that *has* one could only have been
+    // created by a daemon that already knew about them.
+    for disk in disks {
+        material.push_str(&format!(
+            "{}\t{}\t{}\n",
+            disk.label, disk.guest_path, disk.size_bytes
+        ));
+    }
     format!("{:016x}", instance::fnv1a(&material))
 }
 
 /// Guests get an `ast` user carrying the dedicated Asterism key plus any
 /// keys already in ~/.ssh, so both `ast ssh` and plain ssh work.
 fn build(name: &str, seed: &Path, input: &Input<'_>) -> Result<()> {
-    let stamp = fingerprint(
-        name,
-        input.shares,
-        input.share_kind,
-        input.extra,
-        input.network_config,
-        input.egress,
-        input.bootstrap,
-    );
+    let stamp = fingerprint(name, input);
     let mut keys = vec![ensure_asterism_key()?];
     if let Ok(home) = std::env::var("HOME") {
         if let Ok(entries) = std::fs::read_dir(PathBuf::from(home).join(".ssh")) {
@@ -292,11 +363,12 @@ fn build(name: &str, seed: &Path, input: &Input<'_>) -> Result<()> {
     // merged key by key rather than concatenated. A key that cannot be
     // merged says so instead of quietly losing one side.
     let config = merge(
-        &asterism_config(
+        &asterism_config_with_disks(
             input.shares,
             input.share_kind,
             input.egress,
             input.bootstrap,
+            input.disks,
         ),
         input.extra,
     )
@@ -414,22 +486,41 @@ fn write_nocloud_files(
 /// One function because it is one cloud-config: `write_files` and `runcmd`
 /// are written once each, whether or not there are volumes, and merged with
 /// the backend's own half by [`merge`].
+#[cfg(test)]
 fn asterism_config(
     shares: &[Share],
     share_kind: Option<ShareKind>,
     egress: &Egress,
     bootstrap: &Bootstrap,
 ) -> String {
+    asterism_config_with_disks(shares, share_kind, egress, bootstrap, &[])
+}
+
+fn asterism_config_with_disks(
+    shares: &[Share],
+    share_kind: Option<ShareKind>,
+    egress: &Egress,
+    bootstrap: &Bootstrap,
+    disks: &[DiskMount],
+) -> String {
     let mut out = String::from("bootcmd:\n");
     out.push_str(HOSTKEY_BOOTCMD);
     out.push_str("write_files:\n");
     out.push_str(HOSTKEY_UNIT);
     out.push_str(&mount_units(shares, share_kind));
+    out.push_str(&disk_files(disks));
     out.push_str(&egress_files(egress));
     out.push_str(&bootstrap_files(bootstrap));
     out.push_str("runcmd:\n");
     out.push_str(&isolated_runcmd(HOSTKEY_RUNCMD));
     out.push_str(&isolated_runcmd(&mount_runcmd(shares, share_kind)));
+    // Before the bootstrap, and that ordering is the feature. cloud-init
+    // concatenates these into one script, so by the time the profile that
+    // installs the agent runs — and long before anybody attaches to the
+    // agent's tmux session — `~/.claude` is the volume and not a directory
+    // on the root disk. An agent that wrote its first transcript into the
+    // wrong filesystem would lose it at the first rewind, silently.
+    out.push_str(&isolated_runcmd(&disk_runcmd(disks)));
     out.push_str(&isolated_runcmd(&egress_runcmd(egress)));
     out.push_str(&isolated_runcmd(&bootstrap_runcmd(bootstrap)));
     out
@@ -621,6 +712,154 @@ fn mount_units(shares: &[Share], share_kind: Option<ShareKind>) -> String {
     }
     out
 }
+
+/// The `write_files` entries that turn attached block volumes into the
+/// directories an agent expects to find.
+///
+/// Three files: the table of what should be mounted where, the script that
+/// makes it so, and a unit that runs the script at every boot. A unit rather
+/// than only a `runcmd`, for the same reason the directory shares get one —
+/// cloud-init runs once, and a reboot two months later still has to end with
+/// `~/.claude` on the volume.
+fn disk_files(disks: &[DiskMount]) -> String {
+    if disks.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\x20 - path: /etc/asterism/blockmounts\n\
+         \x20   permissions: '0644'\n\
+         \x20   content: |\n",
+    );
+    for disk in disks {
+        // Space-separated, and the free-form field is last so `read` absorbs
+        // the rest of the line into it. Not tabs: a tab inside a YAML block
+        // scalar is a portability question nobody should have to ask, and
+        // `IFS=$'\t'` is not POSIX sh. Nothing before the last field can
+        // contain a space — a label is hex, a size is digits, a mount point
+        // is refused at attach time if it holds whitespace.
+        out.push_str(&format!(
+            "\x20     {} {} {} {} {}\n",
+            disk.label, disk.size_bytes, disk.guest_path, disk.owner, disk.label_text
+        ));
+    }
+    out.push_str(
+        "\x20 - path: /usr/local/lib/asterism/blockmount\n\
+         \x20   permissions: '0755'\n\
+         \x20   content: |\n",
+    );
+    for line in BLOCKMOUNT.lines() {
+        out.push_str(&format!("\x20     {line}\n"));
+    }
+    out.push_str(
+        "\x20 - path: /etc/systemd/system/asterism-blockmount.service\n\
+         \x20   permissions: '0644'\n\
+         \x20   content: |\n\
+         \x20     [Unit]\n\
+         \x20     Description=Asterism: mount this instance's block volumes\n\
+         \x20     DefaultDependencies=no\n\
+         \x20     After=systemd-udev-settle.service local-fs.target\n\
+         \x20     Before=multi-user.target\n\
+         \x20     [Service]\n\
+         \x20     Type=oneshot\n\
+         \x20     RemainAfterExit=yes\n\
+         \x20     ExecStart=/usr/local/lib/asterism/blockmount\n\
+         \x20     [Install]\n\
+         \x20     WantedBy=multi-user.target\n",
+    );
+    out
+}
+
+/// The `runcmd` entry that mounts them now, and at every boot after.
+///
+/// `enable --now` rather than `start`: this boot is cloud-init's, and every
+/// boot after it is the unit's. A guest whose disk did not turn up says so
+/// in the journal and keeps going — a box with no cache is slow, and a box
+/// that refuses to boot is gone.
+fn disk_runcmd(disks: &[DiskMount]) -> String {
+    if disks.is_empty() {
+        return String::new();
+    }
+    String::from(
+        "\x20 - |\n\
+         \x20   if command -v systemctl >/dev/null 2>&1 \\\n\
+         \x20     && [ \"$(cat /proc/1/comm 2>/dev/null)\" = systemd ]; then\n\
+         \x20     systemctl daemon-reload\n\
+         \x20     systemctl enable --now asterism-blockmount.service >/dev/null 2>&1 \\\n\
+         \x20       || echo 'asterism: asterism-blockmount did not finish — \
+         journalctl -u asterism-blockmount' >&2\n\
+         \x20   else\n\
+         \x20     /usr/local/lib/asterism/blockmount || true\n\
+         \x20   fi\n\
+         \x20   exit 0\n",
+    )
+}
+
+/// What the guest does with a disk it has never seen before.
+///
+/// The hard part is identity, and it is solved once: a volume is claimed
+/// under a filesystem *label* derived from `host:volume`, so after the first
+/// boot the question "which disk is `~/.claude`" is answered by the
+/// filesystem itself and not by a device name that moves when another volume
+/// is attached. Only the very first boot has to guess, and it guesses from
+/// the one thing the host knows and the disk shows: its size.
+///
+/// Three rules keep that guess from ever being destructive:
+///
+/// * Only a disk with *no* filesystem signature at all is a candidate. A
+///   disk somebody else formatted is never touched, whatever its size.
+/// * The root disk and anything already mounted are excluded before size is
+///   even looked at.
+/// * A size that matches nothing leaves the volume unmounted and says so.
+///   An unmounted `~/.claude` is a slow day; a reformatted one is a lost
+///   conversation.
+const BLOCKMOUNT: &str = "#!/bin/sh\n\
+    # Written by Asterism. Mounts this instance's block volumes at the paths\n\
+    # they were attached to. Regenerated from the seed at every boot.\n\
+    set -u\n\
+    table=/etc/asterism/blockmounts\n\
+    [ -r \"$table\" ] || exit 0\n\
+    root=$(findmnt -n -o SOURCE / 2>/dev/null | sed 's/[0-9]*$//')\n\
+    claim() {\n\
+    \x20 # $1 label, $2 size in bytes. Echoes a blank disk of that size.\n\
+    \x20 for dev in /dev/vd? /dev/sd? /dev/nvme?n?; do\n\
+    \x20   [ -b \"$dev\" ] || continue\n\
+    \x20   [ \"$dev\" = \"$root\" ] && continue\n\
+    \x20   findmnt -n -S \"$dev\" >/dev/null 2>&1 && continue\n\
+    \x20   [ -n \"$(blkid -p -o value -s TYPE \"$dev\" 2>/dev/null)\" ] && continue\n\
+    \x20   [ -n \"$(blkid -p -o value -s PTTYPE \"$dev\" 2>/dev/null)\" ] && continue\n\
+    \x20   size=$(blockdev --getsize64 \"$dev\" 2>/dev/null || echo 0)\n\
+    \x20   [ \"$size\" = \"$2\" ] || continue\n\
+    \x20   echo \"$dev\"\n\
+    \x20   return 0\n\
+    \x20 done\n\
+    \x20 return 1\n\
+    }\n\
+    while read -r label size where owner what; do\n\
+    \x20 [ -n \"${label:-}\" ] || continue\n\
+    \x20 if ! blkid -L \"$label\" >/dev/null 2>&1; then\n\
+    \x20   dev=$(claim \"$label\" \"$size\") || {\n\
+    \x20     echo \"asterism: no unformatted disk of $size bytes for $what — \
+    $where is still on the root disk\" >&2\n\
+    \x20     continue\n\
+    \x20   }\n\
+    \x20   echo \"asterism: putting a filesystem on $dev for $what ($where)\"\n\
+    \x20   mkfs.ext4 -q -F -L \"$label\" \"$dev\" || { echo \"asterism: mkfs on $dev \
+    failed\" >&2; continue; }\n\
+    \x20 fi\n\
+    \x20 dev=$(blkid -L \"$label\") || continue\n\
+    \x20 mkdir -p \"$where\"\n\
+    \x20 if ! mountpoint -q \"$where\"; then\n\
+    \x20   mount -o noatime \"$dev\" \"$where\" || { echo \"asterism: $dev did not \
+    mount at $where\" >&2; continue; }\n\
+    \x20 fi\n\
+    \x20 if [ -n \"${owner:-}\" ] && id \"$owner\" >/dev/null 2>&1; then\n\
+    \x20   chown \"$owner:$owner\" \"$where\"\n\
+    \x20 fi\n\
+    \x20 grep -q \"^LABEL=$label[[:space:]]\" /etc/fstab 2>/dev/null \\\n\
+    \x20   || printf 'LABEL=%s\\t%s\\text4\\tnoatime,nofail\\t0\\t2\\n' \"$label\" \
+    \"$where\" >>/etc/fstab\n\
+    done <\"$table\"\n\
+    exit 0\n";
 
 /// The `write_files` entries that make a guest trust this instance's CA and
 /// send bound traffic through the proxy.
@@ -918,7 +1157,7 @@ const INDENT: &str = "  ";
 /// it runs it at boot — this is here so a backend's test can run it now.
 pub fn mergeable(guest_config: &str) -> Result<()> {
     merge(
-        &asterism_config(&[], None, &Egress::default(), &Bootstrap::default()),
+        &asterism_config_with_disks(&[], None, &Egress::default(), &Bootstrap::default(), &[]),
         guest_config,
     )
     .map(|_| ())
@@ -1084,7 +1323,44 @@ mod tests {
         egress: &Egress,
         bootstrap: &Bootstrap,
     ) -> String {
-        super::fingerprint(name, shares, share_kind, extra, None, egress, bootstrap)
+        fingerprint_of(
+            name,
+            shares,
+            share_kind,
+            extra,
+            None,
+            egress,
+            bootstrap,
+            &[],
+        )
+    }
+
+    /// The pre-seam positional shape, kept for the tests that vary one thing
+    /// at a time: an `Input` literal per assertion would bury what is being
+    /// varied under six fields that are not.
+    #[allow(clippy::too_many_arguments)]
+    fn fingerprint_of(
+        name: &str,
+        shares: &[Share],
+        share_kind: Option<ShareKind>,
+        extra: &str,
+        network_config: Option<&str>,
+        egress: &Egress,
+        bootstrap: &Bootstrap,
+        disks: &[DiskMount],
+    ) -> String {
+        super::fingerprint(
+            name,
+            &Input {
+                shares,
+                share_kind,
+                disks,
+                extra,
+                network_config,
+                egress,
+                bootstrap,
+            },
+        )
     }
 
     /// The shape a backend's `Hypervisor::guest_config` has: keys of its
@@ -1324,6 +1600,195 @@ mod tests {
             .unwrap();
         assert!(egress < exit && exit < bootstrap, "{actual}");
         assert!(actual[exit..bootstrap].contains("\n)\n"), "{actual}");
+    }
+
+    // ---- block volumes with a mount point ----------------------------------
+
+    fn instance_with(volumes: Vec<Volume>) -> Instance {
+        let mut inst =
+            crate::registry::Shard::load(&std::env::temp_dir().join("nonexistent-registry.json"))
+                .unwrap()
+                .create(
+                    "bot",
+                    "here",
+                    "debian:13",
+                    Default::default(),
+                    crate::hv::Machine {
+                        backend: "qemu".into(),
+                        machine_type: "virt".into(),
+                        cpu: "host".into(),
+                        hv_version: "test".into(),
+                    },
+                )
+                .unwrap();
+        inst.volumes = volumes;
+        inst
+    }
+
+    fn mounted(volume: &str, size: u64, at: &str) -> DiskMount {
+        let inst = instance_with(vec![Volume::block(volume, "here", 1, size)
+            .placed(Some(at.to_owned()), crate::volume::Lifecycle::Memory)]);
+        DiskMount::of(&inst).pop().expect("one mounted disk")
+    }
+
+    /// A block volume with no `--at` is still the bare disk it always was:
+    /// only a mount point turns one into something the guest is told to
+    /// format. Adding this feature must not have changed what an existing
+    /// instance's guest does with its `tank`.
+    #[test]
+    fn only_a_block_volume_with_a_mount_point_is_mounted_for_the_guest() {
+        let inst = instance_with(vec![
+            Volume::dir("/tank/media", "here", None),
+            Volume::block("tank", "here", 1, 1 << 30),
+            Volume::block("brain", "here", 1, 2 << 30).placed(
+                Some("/home/ast/.claude".to_owned()),
+                crate::volume::Lifecycle::Memory,
+            ),
+        ]);
+        let disks = DiskMount::of(&inst);
+        assert_eq!(disks.len(), 1);
+        assert_eq!(disks[0].guest_path, "/home/ast/.claude");
+        assert_eq!(disks[0].owner, "ast");
+        assert_eq!(disks[0].size_bytes, 2 << 30);
+        // A label ext4 will take, and one that is a function of identity
+        // rather than of attach order.
+        assert_eq!(disks[0].label.len(), 15);
+        assert_eq!(disks[0].label, disk_label("here", "brain"));
+        assert_ne!(disks[0].label, disk_label("here", "tank"));
+        assert_ne!(disks[0].label, disk_label("elsewhere", "brain"));
+
+        // And a guest with none of these gets exactly the seed it got before.
+        assert!(disk_files(&[]).is_empty());
+        assert!(disk_runcmd(&[]).is_empty());
+    }
+
+    /// The mounts have to be in place before the thing that installs the
+    /// agent runs, or the agent's first transcript lands on the root disk
+    /// and the first rewind eats it.
+    #[test]
+    fn block_volumes_are_mounted_before_the_bootstrap_installs_the_agent() {
+        let bootstrap = Bootstrap::resolve(&["claude".to_owned()]).unwrap();
+        let disks = vec![mounted("brain", 2 << 30, "/home/ast/.claude")];
+        let config = asterism_config_with_disks(&[], None, &Egress::default(), &bootstrap, &disks);
+
+        // The table, the script and the unit all reach the guest.
+        assert!(
+            config.contains("- path: /etc/asterism/blockmounts"),
+            "{config}"
+        );
+        assert!(
+            config.contains("- path: /usr/local/lib/asterism/blockmount"),
+            "{config}"
+        );
+        assert!(
+            config.contains("- path: /etc/systemd/system/asterism-blockmount.service"),
+            "{config}"
+        );
+        assert!(config.contains(&format!(
+            "{} {} /home/ast/.claude ast here:brain",
+            disks[0].label,
+            2u64 << 30
+        )));
+
+        // The script reads that with a bare `read -r`, so every field before
+        // the last one has to be a single word. A mount point with a space in
+        // it would not fail in the guest, it would mount somewhere else.
+        let row = config
+            .lines()
+            .find(|l| l.contains("/home/ast/.claude"))
+            .expect("the table row")
+            .trim();
+        assert_eq!(row.split(' ').count(), 5, "{row}");
+        assert!(!row.contains('\t'), "{row}");
+
+        let script = compiled_runcmd(&config);
+        let mount = script.find("asterism-blockmount.service").expect("mount");
+        let boot = script
+            .find("asterism-bootstrap.service")
+            .expect("bootstrap");
+        assert!(
+            mount < boot,
+            "the agent is installed before its state directory is mounted:\n{script}"
+        );
+    }
+
+    /// The script goes into a guest where nothing can tell us it did not
+    /// parse, so it is parsed here.
+    #[test]
+    fn the_block_mount_script_is_shell_a_guest_can_run() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-n")
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("running /bin/sh");
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(BLOCKMOUNT.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}\n{BLOCKMOUNT}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // The three rules that keep a first-boot guess from destroying
+        // somebody's data. Losing any of them is the bug this test exists
+        // for, and none of them is visible from the outside.
+        assert!(
+            BLOCKMOUNT.contains("blkid -p -o value -s TYPE"),
+            "a formatted disk must never be a candidate"
+        );
+        assert!(BLOCKMOUNT.contains("[ \"$dev\" = \"$root\" ] && continue"));
+        assert!(BLOCKMOUNT.contains("findmnt -n -S"));
+        assert!(BLOCKMOUNT.contains("is still on the root disk"));
+        // Claimed by label from the second boot onwards, never by device name.
+        assert!(BLOCKMOUNT.contains("blkid -L \"$label\""));
+    }
+
+    /// A mounted block volume is part of what the seed says, so attaching
+    /// one to an instance that has already booted reissues the seed — which
+    /// is what makes the guest apply it. An instance with none is untouched.
+    #[test]
+    fn a_mounted_block_volume_moves_the_fingerprint() {
+        let bare = fingerprint_of(
+            "dev",
+            &[],
+            None,
+            "",
+            None,
+            &Egress::default(),
+            &Bootstrap::default(),
+            &[],
+        );
+        let one = fingerprint_of(
+            "dev",
+            &[],
+            None,
+            "",
+            None,
+            &Egress::default(),
+            &Bootstrap::default(),
+            &[mounted("brain", 2 << 30, "/home/ast/.claude")],
+        );
+        assert_ne!(bare, one);
+        assert_ne!(
+            one,
+            fingerprint_of(
+                "dev",
+                &[],
+                None,
+                "",
+                None,
+                &Egress::default(),
+                &Bootstrap::default(),
+                &[mounted("brain", 2 << 30, "/home/ast/.codex")],
+            ),
+            "the same volume mounted somewhere else is a different guest"
+        );
     }
 
     /// Reproduce the one part of cloud-init's `runcmd` compiler this module
@@ -1748,7 +2213,7 @@ mod tests {
 
     #[test]
     fn a_network_config_reissues_the_seed_and_an_empty_one_does_not() {
-        let none = super::fingerprint(
+        let none = fingerprint_of(
             "dev",
             &[],
             None,
@@ -1756,10 +2221,11 @@ mod tests {
             None,
             &Egress::default(),
             &Bootstrap::default(),
+            &[],
         );
         assert_eq!(
             none,
-            super::fingerprint(
+            fingerprint_of(
                 "dev",
                 &[],
                 None,
@@ -1767,11 +2233,12 @@ mod tests {
                 Some(""),
                 &Egress::default(),
                 &Bootstrap::default(),
+                &[],
             )
         );
         assert_ne!(
             none,
-            super::fingerprint(
+            fingerprint_of(
                 "dev",
                 &[],
                 None,
@@ -1779,6 +2246,7 @@ mod tests {
                 Some("version: 2\n"),
                 &Egress::default(),
                 &Bootstrap::default(),
+                &[],
             )
         );
     }

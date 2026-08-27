@@ -120,6 +120,201 @@ Portable backups record the external volume binding and
 restore it as a part that must be rebound rather than copying or silently
 claiming provider bytes.
 
+## Memory and cache volumes
+
+A root disk and an agent's memory are two different things stored the same
+way. Rewinding a box twenty minutes should undo what the agent *did* and keep
+what it *learned*: `claude --resume` has to still find the conversation. And
+three forks of one box should share one warm cargo registry rather than each
+downloading the crates world.
+
+Neither can be inferred from a mount point, so a volume declares it:
+
+```console
+$ ast volume create brain --size 8G --lifecycle memory
+$ ast volume create warm  --size 64G --lifecycle cache --key agent-toolchain
+```
+
+| Lifecycle | Owned by | `ast snapshot` captures | `ast restore` rolls back | On fork |
+| --- | --- | --- | --- | --- |
+| `instance` (default) | one instance | yes | yes | copied |
+| `memory` | one instance | yes | only with `--include-memory` | copied |
+| `cache` | every instance with the same `--key` | no | never | shared |
+
+"`ast restore` rolls back" reads the same for `ast rewind`: they are two ways
+of naming a snapshot, not two rollback policies.
+
+`instance` is what every volume created before this field existed loads as,
+which is what those volumes meant — and it is a change in what a restore does
+to them: an attached instance-lifecycle volume on the device taking the
+snapshot is now captured with the instance and rolled back with it. That is
+the reading of "roll this instance back" the flag exists to carve an exception
+out of, and the clone is copy-on-write, so capturing costs nothing until the
+two diverge. `ast volume ls` shows the lifecycle in its
+TYPE column, and `ast status` shows it on each attached part.
+
+### The one predicate
+
+Both rollback surfaces call the same function, so `ast restore` and
+`ast rewind` cannot drift into disagreeing about what a rewind means:
+
+```rust
+asterism_core::volume::reverts_with_instance(lifecycle, include_memory) -> bool
+```
+
+`ast restore TAG --include-memory` and `ast rewind 20m --include-memory` are
+the same flag on the two surfaces, and `daemon/rewind.rs`'s `roll_back` reads
+the predicate above rather than deciding for itself which parts a rewind may
+put back. `include_memory` is the user having asked for the stronger thing. A
+cache is never rolled back, with or without it: it is shared with instances
+that are not being rewound, and its contents are derivable.
+
+A snapshot is deliberately wider than a restore —
+`volume::captured_by_snapshot(lifecycle)` excludes only `cache`. A snapshot
+that had not captured memory could never honour `--include-memory` later, and
+capturing is a copy-on-write clone while *not having captured* is
+unrecoverable. A cache is excluded because the clone would be the largest file
+in the orbit and nothing will ever roll it back.
+
+Volume snapshots live beside the volume's bytes, in
+`$ASTERISM_HOME/volumes/<name>/snapshots/<tag>.raw`, under the same tag as the
+instance's root-disk snapshot — because a volume outlives every instance that
+ever mounted it, and its clones belong with it rather than inside one
+instance's directory. Deleting a tag therefore has to reach two places, and
+does: `ast snapshot rm` and the automatic-snapshot pruner both release the
+volume clones a tag captured before removing the instance's own.
+
+`ast snapshot` and the automatic snapshotter go through one engine
+(`daemon::rewind::take`), so a hand-typed tag captures exactly what an
+automatic one does. They used to differ, and the difference was invisible
+until it mattered: a manual tag captured only the root disk, appeared on the
+timeline beside the automatic ones, and then rolled back less than they did —
+`ast rewind --to <it>` left every attached directory where it was. Only volumes whose bytes are on the device
+taking the snapshot are captured: a clone is a filesystem operation, and a
+file on another device's disk is not one this device can clone. A memory
+volume served from elsewhere is reported at snapshot time rather than
+silently producing a tag that `--include-memory` would find nothing behind.
+
+### Sharing, and what "shared" means today
+
+`cache` volumes are shared *by key*, not shared *concurrently*. The volume
+plane still offers exactly one `Sharing` mode — `single-writer`, fenced by a
+monotonic epoch — so two running instances cannot hold one cache volume at
+the same time. What the key buys is that the second instance attaches the
+*same* warm volume instead of creating a parallel copy, and that a fork
+inherits the key rather than the bytes. Copy-on-write sharing between
+simultaneous writers would need a new `Sharing` variant and a filesystem that
+tolerates two writers; neither exists yet, and claiming it would be a promise
+nothing enforces. Fork behaviour itself is AST-152.
+
+### Two kinds of part, one lifecycle
+
+A lifecycle is a property of the *bytes*, so both kinds of part carry one.
+
+A **block volume** gets it at creation (`ast volume create … --lifecycle`) and
+carries it into every attachment. A **directory share** has nowhere to keep
+one, so it is given one at attach time:
+
+```console
+$ ast attach bot --volume ~/.asterism/memory/bot --at /root/.claude --lifecycle memory
+```
+
+Directory shares matter here because that is what an agent preset uses. The
+workspace, the agent's memory and its shared caches are host directories
+shared into the guest — the host can see them, a fork can copy one with `cp`,
+and `ast rewind` already knows how to clone and restore a tree. Naming a
+lifecycle on a block volume's attachment is refused rather than accepted as a
+second answer to a question `ast volume ls` already answers.
+
+### Preset mounts
+
+`presets/*.json` declare what an agent needs past its workspace:
+
+```json
+"mounts": [
+  { "at": "/root/.claude", "lifecycle": "memory" },
+  { "at": "/root/.npm",    "lifecycle": "cache", "key": "agent-toolchain" },
+  { "at": "/root/.cache",  "lifecycle": "cache", "key": "agent-toolchain" }
+]
+```
+
+`ast create --agent claude-code` makes and attaches each of them. A memory
+mount is `~/.asterism/memory/<instance>/…` and belongs to one box; a cache
+mount is `~/.asterism/cache/<key>/…`, so the second agent box attaches the
+directory the first one warmed. Two cache mounts under one key are two
+directories under that key — a single directory mounted at both `~/.npm` and
+`~/.cache` would have each guest path eating the other's contents.
+
+The workspace itself stays `instance`: rolling the box back and leaving the
+repository as it was would be a rewind that undid nothing anybody cares about.
+
+A preset with no `mounts` is the preset it was before the field existed.
+
+### Profile defaults
+
+The cloud-image lane has the same idea in its own vocabulary: a
+`--profile claude` guest gets block volumes rather than directory shares,
+because a cloud image is a machine that formats and mounts its own disks.
+`ast create --profile claude` makes what the profile declares, if it is not
+already there:
+
+| Volume | Lifecycle | Guest path |
+| --- | --- | --- |
+| `<instance>-claude-memory` | `memory` | `/home/ast/.claude` |
+| `cache-agent-toolchain` | `cache`, key `agent-toolchain` | `/var/cache/asterism` |
+
+`--profile codex` declares `/home/ast/.codex` and the same cache. Two agent
+profiles on one box is one cache volume, not two disks fighting over one
+directory: the resolution drops a second request for a guest path already
+claimed.
+
+The cache volume serves several paths through symlinks the profile creates —
+`~/.cargo/registry`, `~/.npm`, `~/.cache/pip` — because a cache is one
+failure domain and one lease, and which paths a toolchain uses is the
+toolchain's business. A directory that already holds bytes is moved onto the
+volume the first time and left alone afterwards, so attaching a cache to a box
+that ran without one does not lose its registry.
+
+Failures here do not undo the instance. A box with its agent state on the root
+disk is a working box that will lose its conversation at the first rewind —
+worth a loud warning, not worth refusing to create what somebody asked for.
+`ast status` shows which volumes actually attached, and the profile's
+`asterism-check` says so from inside the guest.
+
+### The guest side, and why the ordering matters
+
+A block volume has always reached the guest as a bare disk that the guest
+formats and mounts itself. `ast attach bot --volume brain --at /home/ast/.claude`
+asks the guest to do that once, at boot, before anything looks there.
+
+The seed carries three things for it: a table at `/etc/asterism/blockmounts`,
+the script `/usr/local/lib/asterism/blockmount`, and
+`asterism-blockmount.service`, which is `Before=multi-user.target` and enabled,
+so the mounts come back on every later boot without cloud-init running again.
+
+Identity is solved once. A volume is claimed under a filesystem *label*
+derived from `host:volume`, so from the second boot onwards "which disk is
+`~/.claude`" is answered by the filesystem and not by a device name that moves
+when another volume is attached. Only the first boot has to guess, and it
+guesses from the one thing the host knows and the disk shows — its size —
+under three rules that keep the guess from ever being destructive:
+
+* only a disk with no filesystem signature at all is a candidate, so a disk
+  somebody else formatted is never touched, whatever its size;
+* the root disk and anything already mounted are excluded before size is
+  looked at;
+* a size that matches nothing leaves the volume unmounted and says so. An
+  unmounted `~/.claude` is a slow day; a reformatted one is a lost
+  conversation.
+
+The mount fragment is emitted into `runcmd` *before* the bootstrap fragment,
+and cloud-init concatenates those into one script. So by the time the profile
+that installs the agent runs — and long before anybody attaches to the guest's
+tmux session, which happens over ssh after boot — `~/.claude` is the volume.
+An agent that wrote its first transcript into the wrong filesystem would lose
+it at the first rewind, silently, which is why the ordering is asserted in
+`seed.rs` rather than left to the order the fragments happen to be written in.
+
 ## The exporter
 
 The provider serves a volume from inside `astd` itself. There is no
@@ -203,6 +398,19 @@ ordinary block disk. Provider loss is fail-closed: an operation already in
 flight may fail, and new I/O is asserted only after status declares the same
 epoch reconnected. See the
 [2026-08-26 real-host evidence](evidence/oci-parts-parity-2026-08-26/README.md).
+
+`scripts/e2e-volume-lifecycle.sh` is the lane for what a rollback does to
+which bytes. It drives a real daemon through the real snapshot and restore
+path with an `instance`, a `memory` and a `cache` volume attached, writes
+markers into the images themselves, and asserts on those markers afterwards —
+so what a restore replaces is observed rather than inferred from an exit
+status. It drives both rollback surfaces — `ast restore` and `ast rewind`,
+with and without `--include-memory` — against the same volumes, which is the
+assertion that the one shared predicate is really shared. It also creates a
+second box with `--profile claude` and proves the
+declared volumes are made, attached at the guest paths the profile names, and
+that the cache the first box warmed is the one the second box attaches. See
+the [2026-08-27 real-host evidence](evidence/volume-lifecycle-2026-08-27/README.md).
 
 The move lane proves attached-part records survive compute relocation without
 turning a remote provider into guest-visible topology. The durability lane

@@ -1187,6 +1187,7 @@ pub(crate) async fn handle(req: Request, node: &Node) -> Response {
         volume: volume_name,
         owner_device,
         max_latency_ms,
+        mount_point,
     } = &req
     {
         match volume::place(volume_name, owner_device.as_deref(), name, *max_latency_ms).await {
@@ -1196,6 +1197,7 @@ pub(crate) async fn handle(req: Request, node: &Node) -> Response {
                 device,
                 device_id,
                 owner_device.is_none(),
+                mount_point.clone(),
             )),
             Err(e) => {
                 return Response::Error {
@@ -1218,7 +1220,9 @@ pub(crate) async fn handle(req: Request, node: &Node) -> Response {
         return refusal;
     }
 
-    if let Some((name, volume_name, device, device_id, auto_placed)) = storage_placement {
+    if let Some((name, volume_name, device, device_id, auto_placed, mount_point)) =
+        storage_placement
+    {
         return instance::attach_storage_placed(
             &mut reg,
             &name,
@@ -1226,6 +1230,7 @@ pub(crate) async fn handle(req: Request, node: &Node) -> Response {
             &device,
             &device_id,
             auto_placed,
+            mount_point.as_deref(),
         )
         .await;
     }

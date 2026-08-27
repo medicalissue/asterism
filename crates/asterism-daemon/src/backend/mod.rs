@@ -506,6 +506,11 @@ pub fn boot_req<'a>(inst: &'a Instance, hv: &dyn Hypervisor) -> Result<BootReq<'
 
     let shares = seed::shares(inst);
     let share_kind = hv.caps().shared_dir;
+    // Block volumes the user gave a mount point to. Unlike a directory
+    // share this needs no transport capability: the disk is already going
+    // into the guest, and all the seed adds is the guest knowing what to do
+    // with it.
+    let disks = seed::DiskMount::of(inst);
 
     // Gate on the capability, not on which backend this is.
     if !shares.is_empty() && share_kind.is_none() {
@@ -582,6 +587,7 @@ pub fn boot_req<'a>(inst: &'a Instance, hv: &dyn Hypervisor) -> Result<BootReq<'
         seed::Input {
             shares: &shares,
             share_kind,
+            disks: &disks,
             extra: &guest_config,
             network_config: network_config.as_deref(),
             egress: &egress,

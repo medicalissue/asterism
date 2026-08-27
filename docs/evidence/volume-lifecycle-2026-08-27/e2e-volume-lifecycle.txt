@@ -1,0 +1,51 @@
+== volume lifecycle e2e in /private/tmp/ast-vollife-45071 (backend vz)
+ok: an ordinary volume is instance data
+ok: a memory volume says a restore will leave it alone
+ok: a cache volume says what it is shared by
+ok: ast volume ls has a TYPE column
+ok: the listing names the memory volume's lifecycle
+ok: the listing names the cache volume's lifecycle
+ok: a key on a non-cache volume is refused rather than ignored
+ok: an unknown lifecycle lists the ones that exist
+ok: the instance is created
+ok: all three volumes are attached, each with a guest mount point
+ok: ast status names the memory volume and where the guest puts it
+ok: ast status names the cache volume
+ok: every image carries a 'before' marker
+ok: snapshot before taken
+ok: the memory volume was captured beside its bytes
+ok: the cache volume was not captured
+ok: every image now carries an 'after' marker
+ok: a plain restore says what it does not touch
+ok: the root disk went back
+ok: an instance volume went back with it
+ok: the agent's memory did not
+ok: the shared cache did not
+ok: the root disk went back again
+ok: --include-memory rolled the memory volume back
+ok: --include-memory still left the shared cache alone
+ok: deleting a tag releases the volume clones it captured
+ok: and leaves every other tag's alone
+ok: a plain rewind says what it does not touch
+ok: the rewind put the root disk back
+ok: and an instance volume with it
+ok: and left the agent's memory where it was
+ok: and left the shared cache where it was
+ok: rewind --include-memory put the root disk back
+ok: rewind --include-memory rolled the memory volume back
+ok: rewind --include-memory still left the shared cache alone
+ok: ast status says which share is the agent's memory
+ok: a block volume's lifecycle is not overridden at attach time
+ok: a rewind rolls an instance-lifecycle directory share back
+ok: and leaves a memory-lifecycle one exactly where the agent left it
+ok: rewind --include-memory rolls the memory share back too
+ok: a box created with --profile claude is created
+ok: the profile made a memory volume for the agent's state directory
+ok: and attached it where the agent will look
+ok: the profile's memory volume is memory, not ordinary data
+ok: and it attached the cache the first box already warmed
+ok: the shared cache still holds what the first box wrote
+ok: a second volume cannot claim the same name
+
+VOLUME LIFECYCLE E2E PASS
+kept: /var/folders/lr/v65fp3p92qlg5lhl05m_952m0000gn/T//asterism-harness-artifacts-45071/volume-lifecycle

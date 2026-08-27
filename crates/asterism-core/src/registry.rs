@@ -53,6 +53,21 @@ pub struct BlockAuthority {
     pub attach_intent_id: Option<String>,
 }
 
+/// What the provider granted, past who is allowed to write it.
+///
+/// Separate from [`BlockAuthority`] because it is a different kind of fact:
+/// authority is identity, this is the grant — the epoch it was made at, how
+/// big the thing is, what its bytes are for, and where the guest should put
+/// it. All of it is copied onto the attachment so a rollback and a `status`
+/// can read it without a round trip to a provider that may be asleep.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlockGrant {
+    pub epoch: u64,
+    pub size_bytes: u64,
+    pub mount_point: Option<String>,
+    pub lifecycle: crate::volume::Lifecycle,
+}
+
 /// The shard file format this build writes.
 ///
 /// Version 1 is `{"version": 1, "instances": {...}}`. What came before it had
@@ -587,6 +602,7 @@ impl Shard {
         path: &str,
         host: &str,
         mount_point: Option<&str>,
+        lifecycle: crate::volume::Lifecycle,
     ) -> Result<Instance> {
         let mount_point = mount_point
             .map(str::to_owned)
@@ -611,8 +627,9 @@ impl Shard {
                 clash.path
             );
         }
-        inst.volumes
-            .push(Volume::dir(path, host, Some(mount_point)));
+        inst.volumes.push(
+            Volume::dir(path, host, Some(mount_point.clone())).placed(Some(mount_point), lifecycle),
+        );
         Ok(inst.clone())
     }
 
@@ -636,8 +653,11 @@ impl Shard {
             volume,
             host,
             BlockAuthority::default(),
-            epoch,
-            size_bytes,
+            BlockGrant {
+                epoch,
+                size_bytes,
+                ..Default::default()
+            },
         )
     }
 
@@ -647,13 +667,18 @@ impl Shard {
         volume: &str,
         host: &str,
         authority: BlockAuthority,
-        epoch: u64,
-        size_bytes: u64,
+        grant: BlockGrant,
     ) -> Result<Instance> {
         let BlockAuthority {
             provider_device_id: host_id,
             attach_intent_id,
         } = authority;
+        let BlockGrant {
+            epoch,
+            size_bytes,
+            mount_point,
+            lifecycle,
+        } = grant;
         let inst = self.get_mut(name)?;
         if let Some(existing) = inst
             .volumes
@@ -676,10 +701,16 @@ impl Shard {
                 attach_intent_id.or_else(|| existing.attach_intent_id.clone());
             existing.epoch = Some(epoch);
             existing.size_bytes = Some(size_bytes);
+            // A re-attach that names no mount point keeps the one the guest
+            // is already using: reattaching after a reboot must not silently
+            // move `~/.claude` back onto the root disk.
+            existing.mount_point = mount_point.or_else(|| existing.mount_point.clone());
+            existing.lifecycle = Some(lifecycle);
         } else {
-            inst.volumes.push(Volume::block_owned(
-                volume, host, host_id, epoch, size_bytes,
-            ));
+            inst.volumes.push(
+                Volume::block_owned(volume, host, host_id, epoch, size_bytes)
+                    .placed(mount_point, lifecycle),
+            );
             if let Some(last) = inst.volumes.last_mut() {
                 last.attach_intent_id = attach_intent_id;
             }
@@ -942,7 +973,7 @@ mod tests {
             .create("dev", "laptop", "ubuntu:24.04", Shape::default(), machine())
             .unwrap();
         shard
-            .attach_volume("dev", "/tank/media", "desktop", None)
+            .attach_volume("dev", "/tank/media", "desktop", None, Default::default())
             .unwrap();
         shard.save().unwrap();
 
@@ -1030,7 +1061,7 @@ mod tests {
             .unwrap();
 
         let inst = shard
-            .attach_volume("dev", "/tank/media", "desktop", None)
+            .attach_volume("dev", "/tank/media", "desktop", None, Default::default())
             .unwrap();
         assert_eq!(
             inst.volumes[0].mount_point.as_deref(),
@@ -1039,20 +1070,26 @@ mod tests {
 
         // Same host path twice is a duplicate.
         assert!(shard
-            .attach_volume("dev", "/tank/media", "desktop", None)
+            .attach_volume("dev", "/tank/media", "desktop", None, Default::default())
             .is_err());
         // Different path, same basename: would shadow, so it is refused.
         assert!(shard
-            .attach_volume("dev", "/srv/media", "desktop", None)
+            .attach_volume("dev", "/srv/media", "desktop", None, Default::default())
             .is_err());
         // ...unless the caller says where to put it.
         let inst = shard
-            .attach_volume("dev", "/srv/media", "desktop", Some("/opt/media"))
+            .attach_volume(
+                "dev",
+                "/srv/media",
+                "desktop",
+                Some("/opt/media"),
+                Default::default(),
+            )
             .unwrap();
         assert_eq!(inst.volumes[1].guest_path(), "/opt/media");
         // Relative mount points are nonsense inside the guest.
         assert!(shard
-            .attach_volume("dev", "/srv/x", "desktop", Some("rel"))
+            .attach_volume("dev", "/srv/x", "desktop", Some("rel"), Default::default())
             .is_err());
     }
 
@@ -1154,7 +1191,7 @@ mod tests {
         // A directory and a block volume are different parts, and one cannot
         // quietly become the other.
         shard
-            .attach_volume("dev", "/tank/media", "desktop", None)
+            .attach_volume("dev", "/tank/media", "desktop", None, Default::default())
             .unwrap();
         let err = shard
             .attach_block("dev", "/tank/media", "desktop", 1, 1 << 30)

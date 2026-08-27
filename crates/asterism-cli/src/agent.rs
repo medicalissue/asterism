@@ -57,6 +57,34 @@ pub(crate) fn workspace_dir(name: &str) -> PathBuf {
     paths::home_dir().join("work").join(name)
 }
 
+/// Make and attach everything past the workspace that a preset declares.
+///
+/// Each mount is a host directory shared into the guest, for the same reasons
+/// the workspace is: the host can see it, a fork can copy it, and the rewind
+/// engine already knows how to clone and restore a tree. What the lifecycle
+/// adds is which of them a rewind puts back — `ast rewind` rolls the
+/// workspace and the root disk back and leaves memory and cache alone, so the
+/// box comes back twenty minutes ago still holding the conversation.
+///
+/// A cache directory is named after its key, so the second agent box on this
+/// device attaches the very directory the first one warmed.
+fn attach_preset_mounts(name: &str, preset: &Preset) -> Result<()> {
+    let root = paths::home_dir();
+    for mount in &preset.mounts {
+        let dir = mount.host_dir(&root, name);
+        std::fs::create_dir_all(&dir).with_context(|| format!("making {}", dir.display()))?;
+        ok(&Request::AttachVolume {
+            name: name.to_owned(),
+            path: dir.display().to_string(),
+            host: None,
+            mount_point: Some(mount.at.clone()),
+            lifecycle: mount.lifecycle,
+        })
+        .with_context(|| format!("attaching {} to {name} at {}", dir.display(), mount.at))?;
+    }
+    Ok(())
+}
+
 /// The refusal for a required secret this orbit does not have.
 ///
 /// A [`Fixable`], so the sentence stays exactly what the user should read and
@@ -148,8 +176,18 @@ pub(crate) fn create(
         path: workspace.display().to_string(),
         host: None,
         mount_point: Some(preset.workdir.clone()),
+        // Instance data: the workspace is what a rewind is *for*. Rolling the
+        // box back twenty minutes and leaving the repository as it is would
+        // be a rewind that undid nothing anybody cares about.
+        lifecycle: asterism_core::volume::Lifecycle::Instance,
     })
     .with_context(|| format!("attaching the workspace to {name}"))?;
+
+    // The agent's memory, and the caches it shares with every other agent box
+    // on this device. Declared in the preset rather than decided here, so the
+    // thing that keeps `claude --resume` working across `ast rewind` is three
+    // lines of JSON next to the agent that needs it.
+    attach_preset_mounts(name, &preset)?;
 
     for binding in secret_bindings(name, &preset, &have)? {
         ok(&binding).with_context(|| format!("binding a secret to {name}"))?;
