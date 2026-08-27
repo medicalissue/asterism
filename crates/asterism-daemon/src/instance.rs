@@ -119,17 +119,20 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             backend: requested,
             publish,
             profiles,
-        } => create_instance(
-            reg,
-            cpu_device,
-            &name,
-            &image,
-            shape,
-            RuntimeKind::Vm,
-            requested,
-            publish,
-            profiles,
-        ),
+        } => {
+            create_instance(
+                reg,
+                cpu_device,
+                &name,
+                &image,
+                shape,
+                RuntimeKind::Vm,
+                requested,
+                publish,
+                profiles,
+            )
+            .await
+        }
         Request::CreateNetwork {
             name,
             image,
@@ -137,17 +140,20 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             backend: requested,
             publish,
             profiles,
-        } => create_instance(
-            reg,
-            cpu_device,
-            &name,
-            &image,
-            shape,
-            RuntimeKind::Vm,
-            requested,
-            publish,
-            profiles,
-        ),
+        } => {
+            create_instance(
+                reg,
+                cpu_device,
+                &name,
+                &image,
+                shape,
+                RuntimeKind::Vm,
+                requested,
+                publish,
+                profiles,
+            )
+            .await
+        }
         Request::CreateRuntime {
             name,
             image,
@@ -156,9 +162,12 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             backend: requested,
             publish,
             profiles,
-        } => create_instance(
-            reg, cpu_device, &name, &image, shape, runtime, requested, publish, profiles,
-        ),
+        } => {
+            create_instance(
+                reg, cpu_device, &name, &image, shape, runtime, requested, publish, profiles,
+            )
+            .await
+        }
         // Recorded now, applied at the next boot. Saying so is the CLI's
         // job; refusing a name the catalog does not know is this one's.
         Request::SetProfiles { name, profiles } => reg
@@ -256,6 +265,7 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             path,
             host,
             mount_point,
+            lifecycle,
         } => {
             let host = host.unwrap_or_else(local_host);
             // Recording a volume the instance's backend could never show
@@ -268,7 +278,9 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
                     RuntimeKind::Container => Ok(()),
                 })
                 .and_then(|()| resolve_volume_path(&path, &host))
-                .and_then(|path| reg.attach_volume(&name, &path, &host, mount_point.as_deref()))
+                .and_then(|path| {
+                    reg.attach_volume(&name, &path, &host, mount_point.as_deref(), lifecycle)
+                })
         }
         // A block volume is taken, not merely recorded: the lease is asked
         // for now, from the device that holds the bytes, so that "somebody
@@ -278,6 +290,7 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             name,
             volume: vol,
             device,
+            mount_point,
         } => {
             if reg
                 .get(&name)
@@ -292,7 +305,16 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
                 Err(e) => return attach_response(Err(e)),
             };
             return attach_response(
-                attach_block_owned(reg, &name, &vol, &device, &provider_id, false).await,
+                attach_block_owned(
+                    reg,
+                    &name,
+                    &vol,
+                    &device,
+                    &provider_id,
+                    false,
+                    mount_point.as_deref(),
+                )
+                .await,
             );
         }
         // Catalog placement is deliberately a separate frame from the
@@ -304,6 +326,7 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
             volume: vol,
             owner_device,
             max_latency_ms,
+            mount_point,
         } => {
             if reg
                 .get(&name)
@@ -314,7 +337,15 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
                 )));
             }
             return attach_response(
-                attach_storage(reg, &name, &vol, owner_device.as_deref(), max_latency_ms).await,
+                attach_storage(
+                    reg,
+                    &name,
+                    &vol,
+                    owner_device.as_deref(),
+                    max_latency_ms,
+                    mount_point.as_deref(),
+                )
+                .await,
             );
         }
         Request::Detach {
@@ -438,7 +469,7 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard, cpu_device: &str) -> Re
 // remains parseable only so an older experimental client receives an explicit
 // refusal instead of accidentally creating a different machine.
 #[allow(clippy::too_many_arguments)]
-fn create_instance(
+async fn create_instance(
     reg: &mut Shard,
     cpu_device: &str,
     name: &str,
@@ -462,9 +493,84 @@ fn create_instance(
         reg.set_policy(name, Policy::never())?;
     }
     if !profiles.is_empty() {
-        reg.set_profiles(name, profiles)?;
+        reg.set_profiles(name, profiles.clone())?;
     }
-    reg.set_source(name, image.kind, publish)
+    let created = reg.set_source(name, image.kind, publish)?;
+    provision_profile_volumes(reg, name, cpu_device, &profiles).await?;
+    reg.get(name).cloned().or(Ok(created))
+}
+
+/// Make and attach the volumes this instance's profiles declare.
+///
+/// The whole of what makes `ast create --profile claude` a box whose memory
+/// is not on its root disk: the profile says `~/.claude` is a memory volume
+/// and this puts one there, so nobody has to know to type
+/// `ast volume create … --lifecycle memory` first.
+///
+/// Failures here do not undo the instance. A box with its agent state on the
+/// root disk is a working box that will lose its conversation at the first
+/// rewind — worth a loud warning, not worth refusing to create the instance
+/// somebody asked for. `ast status` shows which volumes are actually
+/// attached, and the profile's own `asterism-check` says so from inside.
+async fn provision_profile_volumes(
+    reg: &mut Shard,
+    name: &str,
+    cpu_device: &str,
+    profiles: &[String],
+) -> Result<()> {
+    let bootstrap = match asterism_core::profile::Bootstrap::resolve(profiles) {
+        Ok(bootstrap) => bootstrap,
+        Err(e) => return Err(e),
+    };
+    let wanted = bootstrap.volumes(name);
+    if wanted.is_empty() {
+        return Ok(());
+    }
+    let provider_id = match volume::consumer_device_id() {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!(
+                "astd: {name:?} has no identity for this device yet, so its profile volumes \
+                 were not made: {e:#}"
+            );
+            return Ok(());
+        }
+    };
+    for want in wanted {
+        let made = volume::ensure(
+            &want.name,
+            want.want.size_bytes,
+            want.want.lifecycle,
+            want.want.key,
+        )
+        .await;
+        if let Err(e) = made {
+            eprintln!(
+                "astd: {name:?} wanted a {} volume at {} and it could not be made, so that \
+                 directory stays on the root disk: {e:#}",
+                want.want.lifecycle, want.want.guest_path
+            );
+            continue;
+        }
+        if let Err(e) = attach_block_owned(
+            reg,
+            name,
+            &want.name,
+            cpu_device,
+            &provider_id,
+            false,
+            Some(want.want.guest_path),
+        )
+        .await
+        {
+            eprintln!(
+                "astd: volume {:?} exists but did not attach to {name:?}, so {} stays on the \
+                 root disk: {e:#}",
+                want.name, want.want.guest_path
+            );
+        }
+    }
+    Ok(())
 }
 
 fn ensure_new_runtime_is_vm(runtime: RuntimeKind) -> Result<()> {
@@ -1372,6 +1478,7 @@ async fn attach_block_owned(
     device: &str,
     provider_device_id: &str,
     auto_placed: bool,
+    mount_point: Option<&str>,
 ) -> Result<Instance> {
     let inst = reg.get(name)?.clone();
     refuse_running_block_attach(name, inst.status)?;
@@ -1415,7 +1522,7 @@ async fn attach_block_owned(
     }
     intents.begin_durable(intent.clone())?;
 
-    let (epoch, _export, size) = match volume::take_lease(
+    let (epoch, _export, size, lifecycle) = match volume::take_lease(
         vol,
         device,
         Some(provider_device_id),
@@ -1446,8 +1553,12 @@ async fn attach_block_owned(
             provider_device_id: Some(provider_device_id.to_owned()),
             attach_intent_id: Some(intent.intent_id.clone()),
         },
-        epoch,
-        size,
+        registry::BlockGrant {
+            epoch,
+            size_bytes: size,
+            mount_point: mount_point.map(str::to_owned),
+            lifecycle,
+        },
     ) {
         Ok(instance) => instance,
         Err(e) => {
@@ -1723,6 +1834,7 @@ async fn attach_storage(
     vol: &str,
     owner_device: Option<&str>,
     max_latency_ms: Option<u64>,
+    mount_point: Option<&str>,
 ) -> Result<Instance> {
     let inst = reg.get(name)?.clone();
     let hv = backend::for_instance(&inst)?;
@@ -1736,6 +1848,7 @@ async fn attach_storage(
         &device,
         &provider_device_id,
         owner_device.is_none(),
+        mount_point,
     )
     .await
 }
@@ -1749,9 +1862,19 @@ pub(crate) async fn attach_storage_placed(
     device: &str,
     provider_device_id: &str,
     auto_placed: bool,
+    mount_point: Option<&str>,
 ) -> Response {
     attach_response(
-        attach_block_owned(reg, name, vol, device, provider_device_id, auto_placed).await,
+        attach_block_owned(
+            reg,
+            name,
+            vol,
+            device,
+            provider_device_id,
+            auto_placed,
+            mount_point,
+        )
+        .await,
     )
 }
 

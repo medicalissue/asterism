@@ -368,11 +368,22 @@ enum Command {
     ///
     /// The snapshot survives its own restore, so the same one can be rolled
     /// back to again.
+    ///
+    /// The root disk is rolled back; MEMORY and CACHE volumes are not.
+    /// That is the point of them: rewind the box twenty minutes and
+    /// `claude --resume` still continues the same conversation, because
+    /// ~/.claude is a volume this command does not touch. `ast volume ls`
+    /// shows which volumes are which.
     Restore {
         /// The instance to roll back.
         name: String,
         /// The snapshot to roll back to, as `ast snapshots` lists it.
         tag: String,
+        /// Roll the instance's memory volumes back too — undo what the
+        /// agent learned, not only what it did. Cache volumes are shared
+        /// with other instances and are never rolled back.
+        #[arg(long)]
+        include_memory: bool,
     },
     /// Go back to how this instance was, minutes or hours ago.
     ///
@@ -414,6 +425,16 @@ enum Command {
         /// Forget this instance's own interval and follow the device again.
         #[arg(long, conflicts_with_all = ["every", "keep"])]
         reset: bool,
+        /// Roll the instance's memory volumes back too — undo what the
+        /// agent learned, not only what it did.
+        ///
+        /// Without it, a rewind puts the root disk back and leaves the
+        /// agent's state directory alone, which is what makes
+        /// `claude --resume` continue the same conversation across a
+        /// rewind. Cache volumes are shared with other instances and are
+        /// never rolled back, with or without this.
+        #[arg(long)]
+        include_memory: bool,
     },
     /// Export, inspect and restore portable content-addressed backups.
     #[command(subcommand)]
@@ -509,10 +530,12 @@ enum Command {
     /// the same mount in Asterism's generated pid 1.
     ///
     /// A BLOCK VOLUME (`--volume tank`, made with `ast volume create`) arrives
-    /// as a plain disk: /dev/vdb, /dev/vdc and so on. The
+    /// as a plain disk: /dev/vdb, /dev/vdc and so on. Without `--at` the
     /// guest partitions, formats and mounts it itself, and never learns which
     /// device the bytes are on — put a filesystem on it once with
-    /// `mkfs.ext4 /dev/vdb`, then mount it. It can come from any device in
+    /// `mkfs.ext4 /dev/vdb`, then mount it. With `--at /home/ast/.claude`
+    /// the guest does that itself, once, before the agent session starts.
+    /// It can come from any device in
     /// the orbit. One instance may hold it at a time; attaching takes that
     /// lease.
     ///
@@ -538,11 +561,20 @@ enum Command {
         /// than this. A provider without a live measurement is also refused.
         #[arg(long, value_name = "MS", requires = "volume")]
         max_latency_ms: Option<u64>,
-        /// Where a directory volume mounts in the guest (default:
-        /// /mnt/ast/<name>). Meaningless for a block volume: the guest
-        /// decides where its own disks go.
+        /// Where the volume mounts in the guest. A directory share
+        /// defaults to /mnt/ast/<name>. A block volume with no --at stays
+        /// a bare disk the guest decides about; give it one and the guest
+        /// puts a filesystem on it at first boot and mounts it there
+        /// before the agent session starts.
         #[arg(long, value_name = "PATH", requires = "volume")]
         at: Option<String>,
+        /// What this volume's bytes are for, which decides what `ast restore`
+        /// and `ast rewind` do to them: instance (default, rolled back with
+        /// the box), memory (kept, unless --include-memory), or cache (never
+        /// rolled back). A block volume carries the lifecycle it was created
+        /// with; this is how a directory share is given one.
+        #[arg(long, value_name = "KIND", requires = "volume")]
+        lifecycle: Option<String>,
         /// An orbit secret to bind, by the name `ast secret ls` shows.
         #[arg(long, value_name = "NAME")]
         secret: Option<String>,
@@ -858,6 +890,27 @@ enum VolumeCommand {
         /// How big, e.g. 10G, 500G, 2T.
         #[arg(long)]
         size: String,
+        /// What the bytes are for, which decides what a rollback does to
+        /// them.
+        ///
+        /// instance (default) - ordinary data, rolled back with the
+        /// instance by `ast restore`.
+        ///
+        /// memory - the agent's own state: ~/.claude, ~/.codex. Owned by
+        /// one instance and kept across a rollback, so a rewound box
+        /// resumes the same conversation. `ast restore --include-memory`
+        /// is how you roll one back on purpose.
+        ///
+        /// cache - rebuildable bytes shared with every instance asking for
+        /// the same --key: a warm cargo registry, an npm cache. Never
+        /// rolled back, because other instances are using it.
+        #[arg(long, default_value = "instance", value_name = "KIND")]
+        lifecycle: String,
+        /// What a cache volume is shared by - a preset name, a repository
+        /// URL. Defaults to the volume's own name. Only for
+        /// `--lifecycle cache`.
+        #[arg(long, value_name = "KEY")]
+        key: Option<String>,
     },
     /// List orbit storage, its owners, access latency and attachment policy.
     Ls,
@@ -1351,6 +1404,7 @@ fn run() -> Result<()> {
             host,
             max_latency_ms,
             at,
+            lifecycle,
             secret,
             to,
             placement,
@@ -1383,17 +1437,34 @@ fn run() -> Result<()> {
             },
             Attaching::Volume(volume) => match storage_ref(&volume, host.as_deref()) {
                 Some((owner_device, volume)) => {
-                    if at.is_some() {
+                    if lifecycle.is_some() {
                         bail!(
-                            "--at is for directory volumes; a block volume arrives as a \
-                                 disk and the guest mounts it wherever it likes"
+                            "a block volume already has a lifecycle — it was set by \
+                             `ast volume create --lifecycle`, and `ast volume ls` shows it. \
+                             --lifecycle here is for directory shares, which have nowhere \
+                             else to carry one"
                         );
+                    }
+                    if let Some(at) = &at {
+                        if !at.starts_with('/') {
+                            bail!("--at needs an absolute path in the guest (got {at:?})");
+                        }
+                        // The guest reads this out of a whitespace-separated
+                        // table in its seed. A path with a space in it would
+                        // not fail there, it would mount somewhere else.
+                        if at.chars().any(char::is_whitespace) {
+                            bail!(
+                                "a block volume's mount point cannot contain whitespace \
+                                 (got {at:?})"
+                            );
+                        }
                     }
                     Request::AttachStorage {
                         name,
                         volume,
                         owner_device,
                         max_latency_ms,
+                        mount_point: at,
                     }
                 }
                 None => {
@@ -1405,6 +1476,10 @@ fn run() -> Result<()> {
                         path: volume_path(&volume, host.as_deref())?,
                         host,
                         mount_point: at,
+                        lifecycle: match &lifecycle {
+                            Some(word) => word.parse()?,
+                            None => Default::default(),
+                        },
                     }
                 }
             },
@@ -1470,9 +1545,16 @@ fn run() -> Result<()> {
         }
         // A volume is a device's part of the pool, so these are about the
         // daemon in front of you unless `--device` aims them elsewhere.
-        Command::Volume(VolumeCommand::Create { name, size }) => Request::VolumeCreate {
+        Command::Volume(VolumeCommand::Create {
+            name,
+            size,
+            lifecycle,
+            key,
+        }) => Request::VolumeCreate {
             name,
             size_bytes: asterism_core::volume::parse_size(&size)?,
+            lifecycle: lifecycle.parse()?,
+            key,
         },
         Command::Volume(VolumeCommand::Ls) if device.is_some() => Request::VolumeList,
         Command::Volume(VolumeCommand::Ls) => Request::VolumeCatalog,
@@ -1536,7 +1618,11 @@ fn run() -> Result<()> {
             return take_snapshot(name, tag, device.as_deref());
         }
         Command::Snapshots { name } => return print_snapshots(&name, device.as_deref()),
-        Command::Restore { name, tag } => return restore_snapshot(&name, &tag, device.as_deref()),
+        Command::Restore {
+            name,
+            tag,
+            include_memory,
+        } => return restore_snapshot(&name, &tag, include_memory, device.as_deref()),
         Command::Rewind {
             name,
             back,
@@ -1545,6 +1631,7 @@ fn run() -> Result<()> {
             every,
             keep,
             reset,
+            include_memory,
         } => {
             return rewind(
                 &name,
@@ -1554,6 +1641,7 @@ fn run() -> Result<()> {
                 every.as_deref(),
                 keep.as_deref(),
                 reset,
+                include_memory,
                 device.as_deref(),
             )
         }
@@ -3654,13 +3742,17 @@ fn print_volumes(volumes: &[asterism_core::volume::BlockVolume]) {
     // No "used" column: the bytes may be on a device this process cannot
     // see, and a column that is right locally and blank remotely teaches the
     // wrong thing about where volumes live.
-    println!("{:<20} {:>8}  {:<6} HELD BY", "NAME", "SIZE", "AGE");
+    println!(
+        "{:<20} {:>8}  {:<6} {:<9} HELD BY",
+        "NAME", "SIZE", "AGE", "TYPE"
+    );
     for v in volumes {
         println!(
-            "{:<20} {:>8}  {:<6} {}",
+            "{:<20} {:>8}  {:<6} {:<9} {}",
             v.name,
             asterism_core::volume::format_size(v.size_bytes),
             age(v.created_at),
+            volume_type(v),
             v.holder_summary(),
         );
     }
@@ -3675,8 +3767,8 @@ fn print_volume_catalog(catalog: &asterism_core::volume::Catalog) {
         );
     } else {
         println!(
-            "{:<20} {:<14} {:>8} {:>9} {:<13} {:<14} HELD BY",
-            "NAME", "OWNER", "SIZE", "LATENCY", "DURABILITY", "SHARING"
+            "{:<20} {:<14} {:>8} {:>9} {:<9} {:<13} {:<14} HELD BY",
+            "NAME", "OWNER", "SIZE", "LATENCY", "TYPE", "DURABILITY", "SHARING"
         );
         for part in &catalog.volumes {
             let latency = match part.latency_micros {
@@ -3686,11 +3778,12 @@ fn print_volume_catalog(catalog: &asterism_core::volume::Catalog) {
                 None => "unknown".to_owned(),
             };
             println!(
-                "{:<20} {:<14} {:>8} {:>9} {:<13} {:<14} {}",
+                "{:<20} {:<14} {:>8} {:>9} {:<9} {:<13} {:<14} {}",
                 part.volume.name,
                 part.owner_device,
                 asterism_core::volume::format_size(part.volume.size_bytes),
                 latency,
+                volume_type(&part.volume),
                 part.volume.durability,
                 part.volume.sharing,
                 part.volume.holder_summary(),
@@ -3710,13 +3803,35 @@ fn print_volume_catalog(catalog: &asterism_core::volume::Catalog) {
 /// `ast volume create`. Says what the thing is, because an empty block device
 /// is not self-explanatory and the next step is not obvious.
 fn print_volume_made(volumes: &[asterism_core::volume::BlockVolume]) {
+    use asterism_core::volume::Lifecycle;
     let Some(v) = volumes.first() else { return };
     println!(
-        "{}  {}  created",
+        "{}  {}  {}  created",
         v.name,
-        asterism_core::volume::format_size(v.size_bytes)
+        asterism_core::volume::format_size(v.size_bytes),
+        volume_type(v),
     );
     println!("no filesystem on it yet — the guest that attaches it puts one there");
+    // What is different about this volume, said once, at the moment the
+    // choice was made. A lifecycle is invisible until something rolls back,
+    // and finding out then is finding out too late.
+    match v.lifecycle {
+        Lifecycle::Instance => {}
+        Lifecycle::Memory => println!(
+            "ast restore rolls the instance back and leaves this volume alone — \
+             --include-memory rolls it back too"
+        ),
+        Lifecycle::Cache => println!(
+            "shared by key {:?}: every instance asking for that key attaches this one, \
+             and no rollback touches it",
+            v.key.as_deref().unwrap_or(&v.name)
+        ),
+    }
+}
+
+/// The TYPE column: what a volume's bytes are for, in one word.
+fn volume_type(v: &asterism_core::volume::BlockVolume) -> String {
+    v.lifecycle.to_string()
 }
 
 /// A volume on this device may be named the way the user's shell would name
@@ -4333,15 +4448,34 @@ fn take_snapshot(name: &str, tag: Option<String>, device: Option<&str>) -> Resul
     Ok(())
 }
 
-fn restore_snapshot(name: &str, tag: &str, device: Option<&str>) -> Result<()> {
+fn restore_snapshot(
+    name: &str,
+    tag: &str,
+    include_memory: bool,
+    device: Option<&str>,
+) -> Result<()> {
     send_ok(&aimed(
         Request::SnapshotRestore {
             name: name.into(),
             tag: tag.into(),
+            include_memory,
         },
         device,
     ))?;
     println!("{name}  restored to {tag}");
+    // Say what a restore does *not* touch, because that is the surprising
+    // half and the half somebody may have wanted. Phrased as a fact about
+    // the command rather than a claim about this instance's parts: the
+    // reply says the rollback succeeded, not which volumes were in it.
+    // Only when it was not asked for — repeating the flag back at the person
+    // who typed it is noise.
+    if !include_memory {
+        println!(
+            "memory and cache volumes are not rolled back — ast restore {name} {tag} \
+             --include-memory \
+             rolls memory back too"
+        );
+    }
     Ok(())
 }
 
@@ -4398,6 +4532,7 @@ fn rewind(
     every: Option<&str>,
     keep: Option<&str>,
     reset: bool,
+    include_memory: bool,
     device: Option<&str>,
 ) -> Result<()> {
     if every.is_some() || keep.is_some() || reset {
@@ -4425,6 +4560,7 @@ fn rewind(
         Request::Rewind {
             name: name.into(),
             to: target,
+            include_memory,
         },
         device,
     );
@@ -4444,6 +4580,15 @@ fn rewind(
     };
     let now = asterism_core::instance::now_unix();
     println!("{}", report.render(rewind::local_offset(now), now));
+    // The same sentence `ast restore` prints, for the same reason: what a
+    // rewind does *not* touch is the surprising half, and it is the half
+    // that makes `claude --resume` still work on the other side of one.
+    if !include_memory {
+        println!(
+            "memory and cache volumes are not rolled back — add --include-memory to roll \
+             memory back too"
+        );
+    }
     Ok(())
 }
 

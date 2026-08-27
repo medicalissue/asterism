@@ -23,5 +23,21 @@
       "env": "GITHUB_TOKEN",
       "required": false
     }
+  ],
+  "mounts": [
+    {
+      "at": "/root/.codex",
+      "lifecycle": "memory"
+    },
+    {
+      "at": "/root/.npm",
+      "lifecycle": "cache",
+      "key": "agent-toolchain"
+    },
+    {
+      "at": "/root/.cache",
+      "lifecycle": "cache",
+      "key": "agent-toolchain"
+    }
   ]
 }

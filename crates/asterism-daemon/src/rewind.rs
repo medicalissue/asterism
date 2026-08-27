@@ -85,7 +85,11 @@ pub(crate) async fn serve(req: Request, reg: &mut Shard) -> Response {
             Ok(timeline) => Response::RewindTimeline { timeline },
             Err(e) => error(e),
         },
-        Request::Rewind { name, to } => match rewind(reg, &name, &to).await {
+        Request::Rewind {
+            name,
+            to,
+            include_memory,
+        } => match rewind(reg, &name, &to, include_memory).await {
             Ok(report) => Response::Rewound { report },
             Err(e) => error(e),
         },
@@ -198,6 +202,13 @@ pub(crate) fn take(inst: &Instance, tag: &str, kind: Kind) -> Result<Meta> {
     for (index, volume) in inst.volumes.iter().enumerate() {
         volumes.push(shoot_volume(&dir, tag, index, volume));
     }
+    // Block volumes on this device are captured beside their own bytes,
+    // under this same tag, by the module that also knows how to put them
+    // back. Never fatal: an automatic snapshot that refused because a volume
+    // could not be cloned would be an instance that stops being snapshotted.
+    if let Err(error) = crate::snapshot::capture_volumes(inst, tag) {
+        eprintln!("astd: {error:#}");
+    }
 
     let meta = Meta {
         tag: tag.to_owned(),
@@ -234,6 +245,21 @@ fn shoot_volume(
     // complete. Saying it here is what lets the timeline and the rewind
     // report both say it.
     if volume.kind == VolumeKind::Block {
+        // A block volume on this device is captured — beside its own bytes
+        // rather than inside this instance's snapshot directory, because a
+        // volume outlives every instance that ever mounted it. There is
+        // nothing for this shot to point at, and nothing missing to report:
+        // `crate::snapshot` owns both halves of it.
+        //
+        // A cache volume is deliberately not captured and is deliberately
+        // not reported as missing either. Nothing will ever roll one back,
+        // so "not snapshotted" would be a warning about the design working.
+        if volume.is_local() {
+            return shot;
+        }
+        // Somebody else's bytes, reached over NBD. The volume protocol has
+        // no snapshot request — there is nothing to send — so this records
+        // the fact rather than pretending the rewind was complete.
         shot.not_snapshotted = Some(format!(
             "volume not snapshotted: {:?} is a block volume on {} and its provider \
              has no snapshot request",
@@ -304,7 +330,12 @@ pub(crate) fn changed_since(inst: &Instance, previous: &Meta) -> Result<bool> {
 // ---- rolling back ----------------------------------------------------------
 
 /// Stop, keep, roll back, start, republish.
-async fn rewind(reg: &mut Shard, name: &str, to: &Target) -> Result<model::Report> {
+async fn rewind(
+    reg: &mut Shard,
+    name: &str,
+    to: &Target,
+    include_memory: bool,
+) -> Result<model::Report> {
     let inst = reg.get(name)?.clone();
     let dir = paths::instance_dir(name);
     if let Some(note) = unsupported(&inst, &dir) {
@@ -344,7 +375,9 @@ async fn rewind(reg: &mut Shard, name: &str, to: &Target) -> Result<model::Repor
             false
         });
 
-    let rolled = tokio::task::block_in_place(|| roll_back(&inst, &dir, &chosen, &mut warnings));
+    let rolled = tokio::task::block_in_place(|| {
+        roll_back(&inst, &dir, &chosen, include_memory, &mut warnings)
+    });
     // Whatever happened to the disk, the guest goes back up if it was up:
     // an instance left stopped by a failed rewind is the worst of both.
     let mut restarted = false;
@@ -428,6 +461,7 @@ fn roll_back(
     inst: &Instance,
     dir: &Path,
     chosen: &model::Entry,
+    include_memory: bool,
     warnings: &mut Vec<String>,
 ) -> Result<()> {
     let disk = model::root_disk(dir)?;
@@ -436,17 +470,23 @@ fn roll_back(
         let Some(clone) = &shot.clone_dir else {
             continue; // already reported on the timeline and in the report
         };
-        // Only a volume that is still attached where it was is put back. One
-        // that has been detached or re-pointed since is not this snapshot's
-        // to write over.
-        let attached = inst
-            .volumes
-            .iter()
-            .any(|v| v.path == shot.source && v.kind == VolumeKind::Dir && v.is_local());
+        // Only a volume that is still attached where it was is put back, and
+        // only one whose lifecycle says a rewind may touch it. One that has
+        // been detached or re-pointed since is not this snapshot's to write
+        // over; one holding the agent's memory is not this rewind's to undo
+        // unless the user asked with --include-memory. The predicate lives
+        // in `asterism_core::volume` so this and `ast restore` cannot drift
+        // into two different answers to the same question.
+        let attached = inst.volumes.iter().any(|v| {
+            v.path == shot.source
+                && v.kind == VolumeKind::Dir
+                && v.is_local()
+                && asterism_core::volume::reverts_with_instance(v.lifecycle(), include_memory)
+        });
         if !attached {
             warnings.push(format!(
                 "{:?} was not put back: it is no longer attached to {} as a local \
-                 directory",
+                 directory a rewind may roll back",
                 shot.source, inst.name
             ));
             continue;
@@ -457,6 +497,14 @@ fn roll_back(
             warnings.push(format!("{:?} was not put back: {error:#}", shot.source));
         }
     }
+    // Block volumes are not clones inside this instance's snapshot
+    // directory: a volume outlives every instance that ever mounted it, so
+    // its clones live beside its own bytes. Same tag, same predicate, one
+    // function that `ast restore` calls too.
+    if let Err(error) = crate::snapshot::revert_volumes(inst, &chosen.tag, include_memory) {
+        warnings.push(format!("{error:#}"));
+    }
+
     // The disk is the snapshot now, so the staged copy of what it replaced
     // is the undo — and only now is it safe to claim the name, because the
     // rollback may have been reading from the snapshot that name refers to.
@@ -484,6 +532,7 @@ mod tests {
             Request::Rewind {
                 name: "bot".into(),
                 to: Target::Back { seconds: 1_200 },
+                include_memory: false,
             },
             Request::RewindSettings {
                 name: "bot".into(),
@@ -494,6 +543,24 @@ mod tests {
         ] {
             assert!(claims(&req), "{req:?}");
         }
+    }
+
+    /// The two rollback surfaces have to agree, and the only way to be sure
+    /// is that they ask the same function. This is the seam: a directory
+    /// part a rewind may put back is one whose lifecycle says so, and
+    /// `ast restore` reads the same table.
+    #[test]
+    fn a_rewind_and_a_restore_ask_the_same_question_about_a_volume() {
+        use asterism_core::volume::{reverts_with_instance, Lifecycle};
+        // A part written before lifecycles existed is instance data, and a
+        // rewind puts it back exactly as it always did.
+        assert!(reverts_with_instance(Lifecycle::default(), false));
+        // The agent's memory is the one thing the flag moves...
+        assert!(!reverts_with_instance(Lifecycle::Memory, false));
+        assert!(reverts_with_instance(Lifecycle::Memory, true));
+        // ...and a shared cache is never a rewind's to undo, because the
+        // instances sharing it are not the ones being rewound.
+        assert!(!reverts_with_instance(Lifecycle::Cache, true));
     }
 
     /// A rewind is about one instance, so it resolves across the orbit like
@@ -511,6 +578,7 @@ mod tests {
                 to: Target::Tag {
                     tag: "before-refactor".into()
                 },
+                include_memory: false,
             }
             .subject(),
             Some("bot")

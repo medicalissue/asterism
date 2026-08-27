@@ -108,6 +108,10 @@ fn pass(inst: &Instance) {
     let now = asterism_core::instance::now_unix();
 
     for tag in model::expired(&entries, now, settings.keep_secs) {
+        // A tag is not only the instance's disk. Block volumes captured
+        // under it are clones beside their own bytes, which this directory's
+        // prune cannot see, so they are released by name here.
+        crate::snapshot::release_volumes(inst, &tag);
         match snapshot::remove(&dir, &tag) {
             Ok(()) => {}
             Err(error) => eprintln!(

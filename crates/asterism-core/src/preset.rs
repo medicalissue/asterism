@@ -85,6 +85,69 @@ impl PresetSecret {
     }
 }
 
+/// A directory an agent preset wants mounted, and what its bytes are for.
+///
+/// The workspace is where the agent *works*; these are the two other places
+/// an agent box writes that the root disk is the wrong home for.
+///
+/// `memory` is the agent's own state — the conversation, the settings — and
+/// the point of declaring it is that `ast rewind` puts the box back twenty
+/// minutes and leaves this alone, so `claude --resume` continues the same
+/// conversation across the rewind. `cache` is rebuildable bytes shared by
+/// `key` with every agent box that asks for the same key, so three boxes
+/// warm one cargo registry between them instead of three.
+///
+/// Like the workspace, these are host directories shared into the guest
+/// rather than block volumes: the host can see them, a fork can copy one
+/// with `cp`, and the rewind engine already knows how to clone a tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresetMount {
+    /// Where it appears in the guest. Absolute.
+    pub at: String,
+    /// What the bytes are for. `instance` would be a mount a rewind rolls
+    /// back with the box, which is what the workspace deliberately is not —
+    /// so in practice this is `memory` or `cache`.
+    pub lifecycle: crate::volume::Lifecycle,
+    /// What a `cache` mount is shared by. Required on a cache — that is what
+    /// makes the second box find the first one's bytes — and refused on
+    /// anything else, where there is nothing to share.
+    #[serde(default)]
+    pub key: Option<String>,
+}
+
+impl PresetMount {
+    /// The directory on this device that backs this mount.
+    ///
+    /// A memory mount belongs to one instance and is named after it. A cache
+    /// belongs to its key, and that is the whole of how sharing works: two
+    /// boxes asking for one key are handed one directory. One mount point per
+    /// key, though — a preset that warms both `~/.npm` and `~/.cache` under
+    /// one key gets two directories under that key, not one directory
+    /// mounted twice with each guest path overwriting the other's contents.
+    pub fn host_dir(&self, root: &Path, instance: &str) -> PathBuf {
+        match (self.lifecycle, &self.key) {
+            (crate::volume::Lifecycle::Cache, Some(key)) => {
+                root.join("cache").join(safe(key)).join(safe(&self.at))
+            }
+            _ => root.join("memory").join(instance).join(safe(&self.at)),
+        }
+    }
+}
+
+/// Reduce a key to one path component. A key may be a repository URL; a
+/// directory name may not be.
+fn safe(key: &str) -> String {
+    key.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
 /// A named, self-contained description of an agent that can be run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Preset {
@@ -116,6 +179,12 @@ pub struct Preset {
     /// The secrets to bind, required ones first in refusal order.
     #[serde(default)]
     pub secrets: Vec<PresetSecret>,
+    /// Directories to mount past the workspace: the agent's memory and the
+    /// caches it shares. Empty is a preset that keeps everything but its
+    /// workspace on the root disk, which is what every preset meant before
+    /// this field existed.
+    #[serde(default)]
+    pub mounts: Vec<PresetMount>,
 }
 
 impl Preset {
@@ -160,6 +229,49 @@ impl Preset {
         }
         if self.version_probe.trim().is_empty() {
             bail!("preset {} has no version probe", self.name);
+        }
+        for mount in &self.mounts {
+            if !mount.at.starts_with('/') {
+                bail!(
+                    "preset {} mounts {:?}, which is not an absolute path",
+                    self.name,
+                    mount.at
+                );
+            }
+            if mount.at == self.workdir {
+                bail!(
+                    "preset {} mounts {:?} on top of its own workdir",
+                    self.name,
+                    mount.at
+                );
+            }
+            let is_cache = mount.lifecycle == crate::volume::Lifecycle::Cache;
+            if is_cache != mount.key.is_some() {
+                bail!(
+                    "preset {} declares {:?} as a {} mount with{} a key — a cache is \
+                     shared by key and nothing else is",
+                    self.name,
+                    mount.at,
+                    mount.lifecycle,
+                    if mount.key.is_some() { "" } else { "out" }
+                );
+            }
+            if let Some(key) = &mount.key {
+                crate::volume::check_key(key)
+                    .with_context(|| format!("preset {} shares {:?}", self.name, mount.at))?;
+            }
+        }
+        let mut seen: Vec<&str> = Vec::new();
+        for mount in &self.mounts {
+            if seen.contains(&mount.at.as_str()) {
+                bail!(
+                    "preset {} mounts {:?} twice — two directories at one guest path \
+                     shadow each other",
+                    self.name,
+                    mount.at
+                );
+            }
+            seen.push(&mount.at);
         }
         for secret in &self.secrets {
             if !is_env_name(secret.env_var()) {
@@ -439,6 +551,151 @@ mod tests {
             .find(|(n, _)| *n == name)
             .expect("a built-in preset");
         Preset::parse(text).expect("the built-in preset parses")
+    }
+
+    /// The scene, as data: every agent this device ships keeps its own state
+    /// off the root disk and shares its caches with the others.
+    #[test]
+    fn every_agent_preset_keeps_its_memory_off_the_root_disk() {
+        use crate::volume::Lifecycle;
+        for (name, text) in BUILTIN {
+            let preset = Preset::parse(text).expect("a built-in preset");
+            let memory: Vec<&PresetMount> = preset
+                .mounts
+                .iter()
+                .filter(|m| m.lifecycle == Lifecycle::Memory)
+                .collect();
+            assert_eq!(
+                memory.len(),
+                1,
+                "{name} declares {} memory mounts",
+                memory.len()
+            );
+            assert!(memory[0].at.starts_with('/'), "{name}: {:?}", memory[0].at);
+            assert!(
+                preset
+                    .mounts
+                    .iter()
+                    .any(|m| m.lifecycle == Lifecycle::Cache),
+                "{name} shares no cache"
+            );
+        }
+    }
+
+    /// Two boxes, one warm cache; two boxes, two separate memories. This is
+    /// the whole of how sharing works, and it is a function of the directory
+    /// names — so it is asserted on the directory names.
+    #[test]
+    fn a_cache_is_named_after_its_key_and_a_memory_after_its_instance() {
+        use crate::volume::Lifecycle;
+        let root = Path::new("/home/me/.asterism");
+        let preset = claude();
+        let dirs = |instance: &str| -> Vec<PathBuf> {
+            preset
+                .mounts
+                .iter()
+                .map(|m| m.host_dir(root, instance))
+                .collect()
+        };
+        let bot = dirs("bot");
+        let other = dirs("other");
+        for (i, mount) in preset.mounts.iter().enumerate() {
+            match mount.lifecycle {
+                Lifecycle::Cache => {
+                    assert_eq!(bot[i], other[i], "two boxes must share {:?}", mount.at)
+                }
+                _ => assert_ne!(bot[i], other[i], "two boxes must not share {:?}", mount.at),
+            }
+        }
+        // And two cache mounts under one key are two directories, not one
+        // directory mounted twice with each guest path eating the other.
+        let caches: Vec<&PathBuf> = preset
+            .mounts
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.lifecycle == Lifecycle::Cache)
+            .map(|(i, _)| &bot[i])
+            .collect();
+        assert!(caches.len() > 1, "nothing to check");
+        assert_eq!(
+            caches.len(),
+            caches
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        );
+    }
+
+    /// A cache is shared by key and nothing else is, so declaring a key on a
+    /// memory mount — or leaving one off a cache — is refused rather than
+    /// becoming a promise nothing keeps.
+    #[test]
+    fn a_mount_that_could_not_be_honoured_is_refused() {
+        use crate::volume::Lifecycle;
+        let mut preset = claude();
+
+        preset.mounts = vec![PresetMount {
+            at: "/root/.claude".into(),
+            lifecycle: Lifecycle::Memory,
+            key: Some("k".into()),
+        }];
+        assert!(preset.validate().unwrap_err().to_string().contains("key"));
+
+        preset.mounts = vec![PresetMount {
+            at: "/root/.cache".into(),
+            lifecycle: Lifecycle::Cache,
+            key: None,
+        }];
+        assert!(preset.validate().unwrap_err().to_string().contains("key"));
+
+        preset.mounts = vec![PresetMount {
+            at: "root/.claude".into(),
+            lifecycle: Lifecycle::Memory,
+            key: None,
+        }];
+        assert!(preset
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("absolute path"));
+
+        // Two mounts at one guest path shadow each other, and the workspace
+        // is a mount point too.
+        preset.mounts = vec![
+            PresetMount {
+                at: "/root/.claude".into(),
+                lifecycle: Lifecycle::Memory,
+                key: None,
+            },
+            PresetMount {
+                at: "/root/.claude".into(),
+                lifecycle: Lifecycle::Cache,
+                key: Some("k".into()),
+            },
+        ];
+        assert!(preset.validate().unwrap_err().to_string().contains("twice"));
+
+        preset.mounts = vec![PresetMount {
+            at: preset.workdir.clone(),
+            lifecycle: Lifecycle::Memory,
+            key: None,
+        }];
+        assert!(preset
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("workdir"));
+    }
+
+    /// A preset written before mounts existed still parses, and declares
+    /// none — the same instance it always described.
+    #[test]
+    fn a_preset_without_mounts_declares_none() {
+        let text = r#"{"name":"old","summary":"s","image":"ghcr.io/x/y:1",
+            "start":"y","workdir":"/work","version_probe":"y --version",
+            "docs":"https://example.com"}"#;
+        let preset = Preset::parse(text).unwrap();
+        assert!(preset.mounts.is_empty());
     }
 
     #[test]

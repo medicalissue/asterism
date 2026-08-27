@@ -623,7 +623,12 @@ pub async fn serve_authenticated(
 
 async fn serve_for(req: Request, requester: Option<(&str, &str)>) -> Result<Response> {
     match req {
-        Request::VolumeCreate { name, size_bytes } => create(&name, size_bytes).await,
+        Request::VolumeCreate {
+            name,
+            size_bytes,
+            lifecycle,
+            key,
+        } => create(&name, size_bytes, lifecycle, key.as_deref()).await,
         Request::VolumeList => list().await,
         Request::VolumeRemove { name } => remove(&name).await,
         Request::VolumeLease {
@@ -706,11 +711,16 @@ fn authorize_peer(orbit: &Orbit, requester_device: &str, requester_device_id: &s
     }
 }
 
-async fn create(name: &str, size_bytes: u64) -> Result<Response> {
+async fn create(
+    name: &str,
+    size_bytes: u64,
+    lifecycle: asterism_core::volume::Lifecycle,
+    key: Option<&str>,
+) -> Result<Response> {
     let plane = plane()?;
     let mut store = plane.store.lock().await;
     let mut next = store.clone();
-    let vol = next.create(name, size_bytes)?;
+    let vol = next.create_with(name, size_bytes, lifecycle, key)?;
 
     // The bytes, then the bookkeeping: a saved record with no image behind it
     // would be a volume that exists until you use it.
@@ -747,6 +757,48 @@ async fn create(name: &str, size_bytes: u64) -> Result<Response> {
     }
     *store = next;
     Ok(Response::Volumes { volumes: vec![vol] })
+}
+
+/// Make a volume this device does not have yet, and say nothing if it does.
+///
+/// What `ast create --profile claude` calls for each volume the profile
+/// declares. Idempotent by name, which is what lets a cache volume be
+/// *shared*: the second agent box asks for `cache-agent-toolchain`, finds it
+/// already there, and attaches the warm one instead of making a second copy
+/// of the crates world.
+///
+/// An existing volume is returned as it is, including its lifecycle. A user
+/// who made `brain` by hand as an ordinary volume and then created an
+/// instance whose profile wanted a memory volume of that name keeps what
+/// they made; the mismatch is reported rather than silently rewritten,
+/// because changing a volume's lifecycle changes what a rewind does to it.
+pub(crate) async fn ensure(
+    name: &str,
+    size_bytes: u64,
+    lifecycle: asterism_core::volume::Lifecycle,
+    key: Option<&str>,
+) -> Result<asterism_core::volume::BlockVolume> {
+    {
+        let plane = plane()?;
+        let store = plane.store.lock().await;
+        if let Ok(existing) = store.get(name) {
+            if existing.lifecycle != lifecycle {
+                eprintln!(
+                    "astd: volume {name:?} already exists as a {} volume, not a {lifecycle} \
+                     one — leaving it as it is",
+                    existing.lifecycle
+                );
+            }
+            return Ok(existing.clone());
+        }
+    }
+    match create(name, size_bytes, lifecycle, key).await? {
+        Response::Volumes { volumes } => volumes
+            .into_iter()
+            .next()
+            .context("the volume plane made a volume and did not say which"),
+        other => bail!("creating volume {name:?} answered {other:?}"),
+    }
 }
 
 async fn list() -> Result<Response> {
@@ -836,6 +888,7 @@ async fn grant(
             .display()
             .to_string(),
         size_bytes: vol.size_bytes,
+        lifecycle: vol.lifecycle,
     })
 }
 
@@ -873,6 +926,7 @@ async fn resume(
         export: lease.export,
         socket: socket.display().to_string(),
         size_bytes: vol.size_bytes,
+        lifecycle: vol.lifecycle,
     })
 }
 
@@ -1824,7 +1878,7 @@ pub async fn take_lease(
     holder: &str,
     holder_id: &str,
     intent_id: Option<&str>,
-) -> Result<(u64, String, u64)> {
+) -> Result<(u64, String, u64, asterism_core::volume::Lifecycle)> {
     let plane = plane()?;
     let holder_device = plane.node.device_name().await;
     let response = ask_authority(
@@ -1845,8 +1899,9 @@ pub async fn take_lease(
             epoch,
             export,
             size_bytes,
+            lifecycle,
             ..
-        } => Ok((epoch, export, size_bytes)),
+        } => Ok((epoch, export, size_bytes, lifecycle)),
         Response::Error { message } => bail!(message),
         other => bail!("device {device:?} answered a lease request with {other:?}"),
     }
@@ -2089,7 +2144,7 @@ async fn raise_all(instance: &Instance, blocks: &[Volume], boot_intent_id: &str)
     let mut out = Raised::default();
     let mut raised = Vec::new();
     for vol in blocks {
-        let (epoch, export, size_bytes) = take_lease(
+        let (epoch, export, size_bytes, _lifecycle) = take_lease(
             &vol.path,
             &vol.host,
             vol.host_id.as_deref(),
@@ -2603,7 +2658,9 @@ mod tests {
         assert!(!is_plane_request(&Request::VolumeCatalog));
         assert!(is_plane_request(&Request::VolumeCreate {
             name: "tank".into(),
-            size_bytes: 1
+            size_bytes: 1,
+            lifecycle: asterism_core::volume::Lifecycle::Instance,
+            key: None,
         }));
         assert!(is_plane_request(&Request::VolumeLease {
             volume: "tank".into(),
@@ -2618,6 +2675,7 @@ mod tests {
             name: "dev".into(),
             volume: "tank".into(),
             device: "desktop".into(),
+            mount_point: None,
         }));
         assert!(!is_orbit_request(&Request::VolumeList));
     }

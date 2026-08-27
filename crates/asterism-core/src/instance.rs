@@ -116,6 +116,14 @@ pub struct Volume {
     /// Size of a block volume as its provider reported it, for `ast status`.
     #[serde(default)]
     pub size_bytes: Option<u64>,
+    /// What the provider said this block volume's bytes are *for*
+    /// ([`crate::volume::Lifecycle`]), copied onto the attachment so that
+    /// rollback and `ast status` can read it without asking the provider
+    /// again — which matters most at exactly the moment a provider may be
+    /// unreachable. `None` on directory shares and on attachments written
+    /// before lifecycles existed, both of which mean "instance".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<crate::volume::Lifecycle>,
     /// What the daemon supplying compute most recently observed about this
     /// part while the guest was running.
     ///
@@ -138,6 +146,7 @@ impl Volume {
             epoch: None,
             attach_intent_id: None,
             size_bytes: None,
+            lifecycle: None,
             runtime: None,
         }
     }
@@ -163,8 +172,33 @@ impl Volume {
             epoch: Some(epoch),
             attach_intent_id: None,
             size_bytes: Some(size_bytes),
+            lifecycle: None,
             runtime: None,
         }
+    }
+
+    /// Record what the provider said about this block volume, and where the
+    /// guest should put it.
+    ///
+    /// A builder rather than four more positional arguments: every existing
+    /// caller of [`Volume::block_owned`] keeps meaning what it meant, and
+    /// the attach path that has a mount point and a lifecycle says so in one
+    /// readable line.
+    pub fn placed(
+        mut self,
+        mount_point: Option<String>,
+        lifecycle: crate::volume::Lifecycle,
+    ) -> Self {
+        self.mount_point = mount_point;
+        self.lifecycle = Some(lifecycle);
+        self
+    }
+
+    /// What this volume's bytes are for. Directory shares and attachments
+    /// written before lifecycles existed are ordinary instance data, which
+    /// is what they have always been treated as.
+    pub fn lifecycle(&self) -> crate::volume::Lifecycle {
+        self.lifecycle.unwrap_or_default()
     }
 
     pub fn is_block(&self) -> bool {
@@ -921,24 +955,33 @@ impl Instance {
                 ),
                 VolumeKind::Block => (
                     format!(
-                        "{}{} -> a disk in the guest",
+                        "{}{} -> {}",
                         v.path,
                         v.size_bytes
                             .map(|b| format!(" ({})", crate::volume::format_size(b)))
-                            .unwrap_or_default()
+                            .unwrap_or_default(),
+                        // A mount point is the difference between a disk the
+                        // guest was handed and a directory the guest has, and
+                        // it is the fact somebody reading `ast status` after a
+                        // rewind actually wants.
+                        match &v.mount_point {
+                            Some(at) => at.clone(),
+                            None => "a disk in the guest".to_owned(),
+                        }
                     ),
                     Some(
-                        match v.epoch {
-                            Some(epoch) if !v.is_local() => {
-                                format!("nbd over the mesh · lease epoch {epoch}")
+                        format!("{} · ", v.lifecycle())
+                            + &match v.epoch {
+                                Some(epoch) if !v.is_local() => {
+                                    format!("nbd over the mesh · lease epoch {epoch}")
+                                }
+                                Some(epoch) => format!("nbd on this device · lease epoch {epoch}"),
+                                None => "nbd · no lease yet".to_owned(),
                             }
-                            Some(epoch) => format!("nbd on this device · lease epoch {epoch}"),
-                            None => "nbd · no lease yet".to_owned(),
-                        } + &v
-                            .runtime
-                            .as_ref()
-                            .map(|runtime| format!(" · {}", runtime.summary()))
-                            .unwrap_or_default(),
+                            + &v.runtime
+                                .as_ref()
+                                .map(|runtime| format!(" · {}", runtime.summary()))
+                                .unwrap_or_default(),
                     ),
                 ),
             };
@@ -1412,7 +1455,7 @@ mod tests {
         assert_eq!(part.detail, "tank (10G) -> a disk in the guest");
         assert_eq!(
             part.note.as_deref(),
-            Some("nbd over the mesh · lease epoch 7")
+            Some("instance · nbd over the mesh · lease epoch 7")
         );
 
         // ...and it round-trips, epoch and all.
@@ -1420,6 +1463,41 @@ mod tests {
         let back: Volume = serde_json::from_str(&json).unwrap();
         assert_eq!(back, inst.volumes[0]);
         assert!(back.is_block());
+    }
+
+    /// The row a person reads after a rewind. Both facts that decide whether
+    /// this box's `claude --resume` still works are on it: that `~/.claude`
+    /// is a volume, and that the volume is memory rather than ordinary data.
+    #[test]
+    fn a_memory_volume_says_what_it_is_and_where_the_guest_puts_it() {
+        let mut inst = Instance::new("bot", "laptop", "debian:13", Shape::default(), machine());
+        inst.volumes.push(
+            Volume::block("bot-claude-memory", "laptop", 3, 8 << 30).placed(
+                Some("/home/ast/.claude".to_owned()),
+                crate::volume::Lifecycle::Memory,
+            ),
+        );
+        let part = inst
+            .parts()
+            .into_iter()
+            .find(|p| p.kind == "volume")
+            .expect("volume");
+        assert_eq!(part.detail, "bot-claude-memory (8G) -> /home/ast/.claude");
+        assert!(
+            part.note
+                .as_deref()
+                .is_some_and(|n| n.starts_with("memory · ")),
+            "{part:?}"
+        );
+
+        // A row written before lifecycles existed reads as instance data,
+        // which is what it was.
+        let mut value = serde_json::to_value(&inst.volumes[0]).unwrap();
+        value.as_object_mut().unwrap().remove("lifecycle");
+        let back: Volume = serde_json::from_value(value).unwrap();
+        assert_eq!(back.lifecycle, None);
+        assert_eq!(back.lifecycle(), crate::volume::Lifecycle::Instance);
+        assert_eq!(back.mount_point.as_deref(), Some("/home/ast/.claude"));
     }
 
     #[test]
