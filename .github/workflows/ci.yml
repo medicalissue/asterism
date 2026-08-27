@@ -72,10 +72,10 @@ jobs:
           GIT_CONFIG_COUNT=1 \
             GIT_CONFIG_KEY_0=core.commitGraph \
             GIT_CONFIG_VALUE_0=false \
-            gitleaks git --no-banner --redact=100 --config .gitleaks.toml --log-opts=--all .
+            gitleaks git --no-banner --verbose --redact=100 --config .gitleaks.toml --log-opts=--all .
           # Git traversal does not include uncommitted/generated files, so the
           # checked-out directory is a separate, explicit fail-closed scan.
-          gitleaks dir --no-banner --redact=100 --config .gitleaks.toml .
+          gitleaks dir --no-banner --verbose --redact=100 --config .gitleaks.toml .
 
       - name: Prove supply-chain metadata is deterministic
         run: |
