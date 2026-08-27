@@ -109,54 +109,80 @@ export, and the provider image ended at 51184 KiB for the same 1 GiB volume
 that the VZ lane left at 1988 KiB. That difference is the consumer's, not the
 exporter's.
 
-## Linux / Cloud Hypervisor — attempted, did not run
+## Linux / Cloud Hypervisor — ran, 57 of 78, one consumer-side failure
 
-This lane was set up on dev5 and started, but the host became unreachable
-before it produced a verdict, and it had not come back at the time of
-writing. **Nothing about the CHV consumer, the kernel `nbd-client` path, or
-the root-owned `asterism-nbd` wrapper is claimed here.**
+- host: `DESTOP-DEV5`, WSL2 kernel `6.6.87.2-microsoft-standard-WSL2`,
+  x86_64, Ubuntu 26.04, real KVM
+- consumer: the kernel `nbd-client` through the root-owned `asterism-nbd`
+  wrapper, below Cloud Hypervisor v53.0, with a real Debian 13 guest
 
-What was prepared on dev5 (`DESTOP-DEV5`, WSL2 kernel
-`6.6.87.2-microsoft-standard-WSL2`, x86_64, Ubuntu 26.04) and what a human
-should re-run:
+QEMU is installed at `/usr/bin` on that host, so the lane was run inside a
+mount namespace where a mode-0000 file is bind-mounted over every QEMU
+binary. Nothing outside the namespace is affected, and the refusal is real:
 
 ```console
-# once: the runtime the lane needs, and nothing from QEMU
-$ apt-get install -y nbd-client virtiofsd
-$ curl -fsSLo /root/ast109-run/bin/cloud-hypervisor \
-    https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v53.0/cloud-hypervisor-static
-$ echo "448af3d4e59b22c2987f7df94c213ad40fb53a10d437e42b5ee6c4fce7c29ecc  /root/ast109-run/bin/cloud-hypervisor" | sha256sum -c -
-$ chmod 0755 /root/ast109-run/bin/cloud-hypervisor
-$ install -d -m 0755 /usr/local/libexec/asterism
-$ install -m 0755 -o root -g root packaging/asterism-nbd /usr/local/libexec/asterism/asterism-nbd
-$ install -d -m 0700 -o root -g root /run/asterism-nbd
-$ touch /run/lock/asterism-nbd.lock && chmod 0600 /run/lock/asterism-nbd.lock
-$ modprobe nbd nbds_max=64
-
-# the gate, in a mount namespace where no QEMU binary is executable
-$ unshare -m --propagation private sh -c '
-    : >/tmp/blocked; chmod 0000 /tmp/blocked
-    for f in /usr/bin/qemu* /usr/local/bin/qemu* /usr/sbin/qemu* /bin/qemu*; do
-      [ -e "$f" ] && mount --bind /tmp/blocked "$f"
-    done
-    command -v qemu-storage-daemon qemu-img qemu-system-x86_64   # must print nothing
-    AST_BIN=$PWD/target/release/ast ASTD_BIN=$PWD/target/release/astd \
-    ASTERISM_CLOUD_HYPERVISOR=/root/ast109-run/bin/cloud-hypervisor \
-    ASTERISM_VIRTIOFSD=/usr/bin/virtiofsd \
-    ASTERISM_MESH=local ASTERISM_NBD_TRACE=1 \
-    E2E_VOLUME_BACKEND=chv E2E_VOLUME_GIB=1 \
-    E2E_VOLUME_TRANSFER_BYTES=1048576 \
-    E2E_VOLUME_SKIP_COMPUTE_MOVE=1 E2E_VOLUME_SKIP_LIVE_THROUGHPUT=1 \
-      bash scripts/e2e-volume.sh'
+== proof the paths are unusable:
+/usr/bin/qemu-storage-daemon: Permission denied
 ```
 
-The bind mounts live only inside that namespace and disappear with it; the
-host's own QEMU is untouched. The state left on dev5 by the attempt —
-`/root/ast109`, `/root/ast109-run`, `/root/.cache/asterism`, the two
-`apt` packages, `/usr/local/libexec/asterism/asterism-nbd`,
-`/run/asterism-nbd`, `/run/lock/asterism-nbd.lock`, the loaded `nbd` module,
-and whatever the interrupted lane left running under `/tmp/ast-vol-*` — has
-not been cleaned up, because the host has not been reachable since.
+Cloud Hypervisor booted with the remote volume as an ordinary disk —
+`--disk path=/dev/nbd10,readonly=off,image_type=raw,id=astvol0` — after the
+kernel client negotiated with the in-process exporter across the mesh:
+
+```text
+Negotiation: ..size = 1024MB
+Connected /dev/nbd10
+```
+
+57 assertions passed: catalog and placement, attach, the export being a
+private Unix socket with no child process, a real boot, the guest formatting
+and mounting the volume and writing a 1 MiB marker whose SHA-256 matched on
+the provider, down/up survival, the second-claimant and live-re-attach
+refusals, backup recording the external part, detach stopping the export and
+removing its socket, and reattach advancing to a new epoch with the old
+door gone.
+
+The lane then failed at the provider-daemon-restart step:
+
+```text
+ok: restarted the provider daemon serving epoch 6 under a live guest
+VOLUME E2E FAIL: the provider returned but the volume did not reconnect
+```
+
+**This is a consumer-side gap, not an exporter one, and it is not fixed
+here.** The bridge's recovery is written for a client that reconnects: when
+the remote session ends the consumer marks the part degraded and waits for
+the next connection to its local bridge socket, which is what VZ and QEMU
+both do. The kernel `nbd-client` does not — it holds one connection for the
+life of the device, so when that connection closes the `/dev/nbd10` device
+stays dead until something re-attaches it. The provider's own state was
+correct throughout: the lease and epoch 6 survived on disk, and the export is
+re-established at the same epoch by the next `open_export`. Closing this
+needs a change in `backend/chv.rs`, which belongs to the Cloud Hypervisor
+lane, so it is reported rather than patched.
+
+### What the kernel `nbd-client` actually negotiates
+
+```text
+2 negotiated selected_by=GO no_zeroes=true structured=false base_allocation=false
+2 first READ
+1 first WRITE
+1 first FLUSH
+1 first TRIM
+1 first DISC
+```
+
+Like VZ, and unlike QEMU, it asks for neither structured replies nor
+`base:allocation`. So of the three consumers only QEMU negotiates the context
+that `NBD_CMD_BLOCK_STATUS` needs, and none of the three was observed sending
+that command.
+
+Nothing was left behind on dev5: the lane's own cleanup removed its homes,
+daemons and guests, `/dev/nbd10` was detached afterwards, and the checkout,
+the pinned Cloud Hypervisor, the NBD wrapper and its `/run` state were
+removed. The `nbd-client` and `virtiofsd` packages and the loaded `nbd`
+kernel module were left in place; both are what the Linux installer puts
+there anyway.
 
 ## Host-neutral
 
@@ -178,28 +204,26 @@ hole preservation for `TRIM` and `WRITE_ZEROES` on both sides of
 ## Proves
 
 - a remote block volume works end to end, through a real guest, with no QEMU
-  binary reachable on the machine serving the bytes or the machine running the
-  guest — on macOS with the VZ consumer;
+  binary reachable on the machine serving the bytes or the machine running
+  the guest — on macOS with the VZ consumer, and on Linux/KVM through the
+  kernel `nbd-client` below Cloud Hypervisor up to the point noted above;
 - the epoch-fenced single-writer lease survives the exporter becoming part of
-  the daemon: same-epoch re-establishment after a provider daemon restart, and
-  after a consumer daemon restart under a live guest;
+  the daemon: on macOS, same-epoch re-establishment after a provider daemon
+  restart and after a consumer daemon restart, both under a live guest;
 - a guest's discard returns space to the provider rather than allocating the
   volume's whole advertised size there;
-- what the VZ and QEMU consumers each negotiate, measured rather than
-  assumed;
+- what all three consumers negotiate, measured rather than assumed;
 - that the QEMU compatibility consumer still works against the exporter which
   replaced `qemu-storage-daemon`.
 
 ## Does not prove
 
-- the Linux/Cloud Hypervisor consumer, the kernel `nbd-client` path, or the
-  root-owned `asterism-nbd` wrapper — see the section above for what was
-  prepared and what a human still has to run;
+- provider-daemon-restart recovery under a live Cloud Hypervisor guest: that
+  step failed, for the consumer-side reason recorded above, and remains open;
 - the OCI guest-control variant of this lane (`E2E_VOLUME_OCI=1`);
 - compute move or the live-throughput assertion, both skipped by the flags
   above;
 - Windows, where Hyper-V advertises no NBD disk capability at all;
 - any volume larger than 1 GiB, or any filesystem other than APFS on the
-  provider side. The Linux hole-punching path
-  (`FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE`) has host-neutral test coverage
-  only; no real Linux filesystem measured it here.
+  provider side. The Linux lane's provider image sat on WSL2's `/private/tmp`
+  and its sparse behaviour was not measured the way the macOS lane's was.
