@@ -111,10 +111,11 @@ provider and each attempt has a 30-second deadline. A timeout leaves the
 durable intent fenced for the next retry; it cannot stall every registry read
 or silently admit a guest.
 
-Relocating an instance (parked; see
+Moving an instance between devices (see
 [Compute is the device an instance runs on](compute-device.md)) is independent
 of this. It changes which device supplies CPU and RAM, while attached volume
-ownership stays fixed; the bridge becomes local or remote as required.
+ownership stays fixed: the volume is not copied, it is re-attached from the
+new device and the bridge becomes local or remote as required.
 Portable backups record the external volume binding and
 restore it as a part that must be rebound rather than copying or silently
 claiming provider bytes.
