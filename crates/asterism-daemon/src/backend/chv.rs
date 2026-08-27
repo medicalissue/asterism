@@ -3117,16 +3117,45 @@ mod tests {
         assert!(record.exists());
     }
 
+    /// Stand in for an unrecorded VMM: a process whose argv carries `api`,
+    /// which is the only thing [`scan_start_intent`] recognises it by.
+    ///
+    /// Returning from `Command::spawn` means the fork happened, not that the
+    /// child reached `exec` — and until it does, `/proc/<pid>/cmdline` still
+    /// holds *this* test binary's argv, so a scan finds nothing and the test
+    /// fails. That is a race the runner wins nearly always and loses under
+    /// load, which is the worst kind of test (AST-165). So the child's first
+    /// act after exec is to create a file, and this does not return until
+    /// that file exists: waiting for it is waiting for the exec, and after
+    /// the exec the cmdline is the one the scan is looking for.
+    #[cfg(target_os = "linux")]
+    fn spawn_unrecorded_vmm(dir: &Path, api: &Path) -> std::process::Child {
+        let ready = dir.join("vmm.ready");
+        let child = Command::new("sh")
+            // $0=sh, $1=the API path the scan matches on, $2=the ready file.
+            .args(["-c", ": > \"$2\"; while :; do sleep 1; done", "sh"])
+            .arg(api)
+            .arg(&ready)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the stand-in VMM never reached exec; {} was never created",
+                ready.display()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        child
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn start_intent_finds_the_exact_unrecorded_vmm() {
         let dir = tempfile::tempdir().unwrap();
         let api = dir.path().join(API_NAME);
-        let mut child = Command::new("sh")
-            .args(["-c", "while :; do sleep 1; done", "sh"])
-            .arg(&api)
-            .spawn()
-            .unwrap();
+        let mut child = spawn_unrecorded_vmm(dir.path(), &api);
         let shell = PathBuf::from("sh");
         let intent = StartIntent {
             version: 1,
@@ -3177,11 +3206,8 @@ mod tests {
     fn migration_retry_recovers_its_exact_receiver_and_refuses_cross_operation_adoption() {
         let dir = tempfile::tempdir().unwrap();
         let api = dir.path().join(API_NAME);
-        let mut child = Command::new("sh")
-            .args(["-c", "while :; do sleep 1; done", "sh"])
-            .arg(&api)
-            .spawn()
-            .unwrap();
+        // Same race, same wait: this scan reaches `scan_start_intent` too.
+        let mut child = spawn_unrecorded_vmm(dir.path(), &api);
         let instance = asterism_core::instance::Instance::new(
             "migration-recovery",
             "device",
