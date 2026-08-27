@@ -77,14 +77,21 @@ v0.1.0/
   asterism-v0.1.0-darwin-arm64.tar.gz   # ast, astd, astd-vz, asterism-update — flat
   asterism-v0.1.0-linux-x86_64.tar.gz   # ast, astd, guest-gpu/, cloud-hypervisor, virtiofsd, updater, share/
   asterism-v0.1.0-linux-arm64.tar.gz    # same layout, aarch64 Cloud Hypervisor pin
+  asterism-v0.1.0-windows-x86_64.tar.gz # ast.exe, astd.exe, astd-hyperv.exe, both update scripts
+  asterism-v0.1.0-windows-arm64.tar.gz  # same layout
   RELEASE.json                          # exact build, URLs, digests, minimum updater
   RELEASE.json.sig                      # mandatory detached update signature
+  asterism-release-manifest.json        # the signed envelope the asterism.run Worker reads
   asterism.rb                           # the Homebrew formula for this tag
   asterism-v0.1.0-sbom.cdx.json         # deterministic CycloneDX dependency SBOM
   asterism-v0.1.0-licenses.json         # deterministic third-party license manifest
   SHA256SUMS                            # hashes payloads, metadata, and formula
-  SHA256SUMS.sig                        # when a signing key exists
 ```
+
+`RELEASE.json` and `asterism-release-manifest.json` are two different
+documents for two different readers, signed with two different keys under two
+different schemes — see [`docs/RELEASE.md`](../docs/RELEASE.md), which is the
+single reference for how a release is cut and what signs what.
 
 The CLI tarball is flat on purpose: the installer unpacks it and expects `ast` and
 `astd` at the top, and refuses a tarball missing either rather than installing
@@ -277,6 +284,9 @@ what is already there, which is the wrong formula when the version being
 installed lives in a different tap. Every command is printed before it runs.
 
 ## Cutting a release
+
+The runbook — prerequisites by exact secret name, post-cut verification and
+rollback — is [`docs/RELEASE.md`](../docs/RELEASE.md). In short:
 
 ```console
 $ gh workflow run release.yml -f version=v0.1.0    # dry run: build, checksum, test

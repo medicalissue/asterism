@@ -205,6 +205,14 @@ jobs:
       - name: The harness's own suite
         run: bash scripts/harness-test.sh
 
+      # The release manifest the asterism.run Worker reads is signed with a
+      # scheme and a shape neither the installer nor `ast update` shares, so
+      # nothing else in this suite would notice it drifting. Cheap, hermetic,
+      # and the only thing standing between a format change and an update
+      # endpoint that 502s for everyone.
+      - name: The Worker release manifest round-trip
+        run: bash scripts/worker-manifest-test.sh
+
       - name: The installer's test suite
         run: bash scripts/install-test.sh
 
