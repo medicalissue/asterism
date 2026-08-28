@@ -126,7 +126,7 @@ expect() {
   local desc="$1" needle="$2"; shift 2
   local out
   out="$("$@" 2>&1)" || fail "$desc: command failed:"$'\n'"$out"
-  grep -qF "$needle" <<<"$out" || fail "$desc: expected \"$needle\" in:"$'\n'"$out"
+  grep -qF -- "$needle" <<<"$out" || fail "$desc: expected \"$needle\" in:"$'\n'"$out"
   echo "ok: $desc"
 }
 
@@ -137,7 +137,7 @@ refute() {
   if out="$("$@" 2>&1)"; then
     fail "$desc: command unexpectedly succeeded:"$'\n'"$out"
   fi
-  grep -qF "$needle" <<<"$out" || fail "$desc: expected \"$needle\" in:"$'\n'"$out"
+  grep -qF -- "$needle" <<<"$out" || fail "$desc: expected \"$needle\" in:"$'\n'"$out"
   echo "ok: $desc"
 }
 
@@ -217,7 +217,10 @@ echo "ok: both orbit stores list each other"
 DEVICES="$(ASTERISM_HOME="$A" "$AST" devices 2>&1)" || fail "ast devices failed:"$'\n'"$DEVICES"
 grep -qE "^$A_NAME \(this device\) +\S+ +online" <<<"$DEVICES" \
   || fail "A did not mark itself as self and online:"$'\n'"$DEVICES"
-grep -qE "^$B_NAME +\S+ +online +direct" <<<"$DEVICES" \
+# DEVICE ID, STATUS, then HOSTED — which came later than this assertion did —
+# and only then PATH. Naming the column between them is what keeps this from
+# failing every time a column is added to its left.
+grep -qE "^$B_NAME +\S+ +online +\S+ +direct" <<<"$DEVICES" \
   || fail "A does not see B online over a direct path:"$'\n'"$DEVICES"
 echo "ok: ast devices shows this device and B online"
 
@@ -276,18 +279,19 @@ grep -qF "no instances" <<<"$LOCAL_LS" \
 echo "ok: a refused claim leaves no half-created instance"
 
 # `ast ls` is the orbit's registry, not this device's shard of it, so the same
-# one row appears on both daemons — with a COMPUTE column saying which device is
-# supplying it, and no per-device grouping anywhere.
+# one row appears on both daemons — with a DEVICE column saying which device is
+# supplying it, and no per-device grouping anywhere. (AST-167 renamed that
+# column from COMPUTE and AST-151 added TODAY beside it.)
 for home in "$A" "$B"; do
   ORBIT_LS="$(ASTERISM_HOME="$home" "$AST" ls 2>&1)" || fail "ast ls failed:"$'\n'"$ORBIT_LS"
-  grep -qE "^NAME +STATUS +IMAGE +SHAPE +COMPUTE +AGE +SSH$" <<<"$ORBIT_LS" \
-    || fail "ast ls has no COMPUTE column:"$'\n'"$ORBIT_LS"
+  grep -qE "^NAME +STATUS +IMAGE +SHAPE +DEVICE +AGE +TODAY +ACCESS$" <<<"$ORBIT_LS" \
+    || fail "ast ls has no DEVICE column:"$'\n'"$ORBIT_LS"
   grep -qE "^$INST +defined .*$B_NAME" <<<"$ORBIT_LS" \
     || fail "ast ls does not show $INST with its compute on $B_NAME:"$'\n'"$ORBIT_LS"
   [ "$(grep -c "^$INST " <<<"$ORBIT_LS")" = "1" ] \
     || fail "$INST appears more than once, so the namespace is not flat:"$'\n'"$ORBIT_LS"
 done
-echo "ok: ast ls shows one namespace from both daemons, with a COMPUTE column"
+echo "ok: ast ls shows one namespace from both daemons, with a DEVICE column"
 
 # --local is the debugging view, and it is the one that differs per device.
 expect "ls --local on B holds the row" "$INST" \
@@ -326,8 +330,9 @@ expect "snapshots resolve across the orbit" "no snapshots" \
   env ASTERISM_HOME="$A" "$AST" snapshots "$INST"
 
 # A name nowhere in the orbit is refused in the orbit's words, not one
-# device's.
-refute "an unknown instance is unknown to the orbit" "no instance named \"ghost\" in this orbit" \
+# device's. AST-167 gave that refusal the orbit's whole namespace, so it names
+# what the orbit does have rather than only what it does not.
+refute "an unknown instance is unknown to the orbit" "unknown instance \"ghost\"" \
   env ASTERISM_HOME="$A" "$AST" status ghost
 
 # ---- 6. ast ping reports a latency -----------------------------------------

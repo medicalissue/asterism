@@ -241,7 +241,7 @@ expect "boot it" "$INST  running" "$AST" up "$INST"
 expect "the agent can see its work" "three" guest "$INST" "cat /work/parser.txt"
 
 # ---- refusals happen before anything moves ---------------------------------
-refuses "a parent that is not here is refused" "no instance named" \
+refuses "a parent that is not here is refused" 'unknown instance "nosuch"' \
   "$AST" fork nosuch --n 2
 refuses "a double-digit fleet wants saying twice" "--yes" \
   "$AST" fork "$INST" --n 12

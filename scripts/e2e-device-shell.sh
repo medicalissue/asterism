@@ -63,7 +63,7 @@ refute() {
   if output="$("$@" 2>&1)"; then
     fail "$description unexpectedly succeeded: $output"
   fi
-  grep -qF "$needle" <<<"$output" || fail "$description did not say $needle: $output"
+  grep -qF -- "$needle" <<<"$output" || fail "$description did not say $needle: $output"
   echo "ok: $description"
 }
 
