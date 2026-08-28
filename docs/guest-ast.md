@@ -60,6 +60,12 @@ faster agent.
 volumes are left alone unless somebody asks, so `claude --resume` on the other
 side of a rewind is still the same conversation.
 
+When something the agent asked for fails, it reads the daemon's own sentence
+rather than a second translation of it: the box's `ast rewind --to x` whose
+guest will not come back prints the same *boot failed: … — the disk is rolled
+back, so* `ast up bot` *is the …* a person gets on the host, because
+`Response::Error` is passed through verbatim.
+
 `ast fork` inside the box forks *this* machine and takes `--yes` for granted:
 there is nobody at a terminal for it to confirm the soft limit to, and asking
 would be the approval gate this feature does not have. The children inherit
