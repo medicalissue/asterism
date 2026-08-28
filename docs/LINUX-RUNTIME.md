@@ -115,10 +115,14 @@ construction.
 In-app updates over a packaged install are refused the way Homebrew is:
 `ast update status` reports `manager dpkg` or `manager rpm`, `check` still
 verifies the signed manifest and reports what is available, and `apply`
-refuses with `apt-get install --only-upgrade asterism` or
-`dnf upgrade asterism`. Files under `/usr` belong to the package database,
-and rewriting them from underneath it would leave that database describing
-bytes that are no longer on disk.
+refuses with `sudo apt-get install --only-upgrade asterism` or
+`sudo dnf upgrade asterism` on its `fix:` line. Files under `/usr` belong to
+the package database, and rewriting them from underneath it would leave that
+database describing bytes that are no longer on disk. `ast` asks the same
+question `ast doctor` asks — `dpkg-query -S` then `rpm -qf` against its own
+path — so the refusal happens before the updater is even started, and the
+`receipt` row reports `installed by package asterism <version> (dpkg)`
+instead of claiming the tree was never installed.
 
 ## Host integration
 

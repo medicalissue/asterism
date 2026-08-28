@@ -189,12 +189,12 @@ managed_by_package() {
 	if command -v dpkg-query >/dev/null 2>&1 &&
 		dpkg-query -S "$AST" >/dev/null 2>&1; then
 		package_manager=dpkg
-		package_upgrade="apt-get install --only-upgrade asterism"
+		package_upgrade="sudo apt-get install --only-upgrade asterism"
 		return 0
 	fi
 	if command -v rpm >/dev/null 2>&1 && rpm -qf "$AST" >/dev/null 2>&1; then
 		package_manager=rpm
-		package_upgrade="dnf upgrade asterism"
+		package_upgrade="sudo dnf upgrade asterism"
 		return 0
 	fi
 	return 1

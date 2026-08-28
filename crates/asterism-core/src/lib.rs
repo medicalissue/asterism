@@ -50,6 +50,7 @@ pub mod names;
 pub mod oci;
 pub mod open;
 pub mod orbit;
+pub mod package;
 pub mod paths;
 pub mod power;
 pub mod preset;

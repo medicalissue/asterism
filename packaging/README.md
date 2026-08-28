@@ -335,8 +335,29 @@ unit.
 
 `ast update` over a packaged install reports `manager dpkg` or `manager rpm`,
 still verifies the signed manifest on `check`, and refuses `apply` with
-`apt-get install --only-upgrade asterism` or `dnf upgrade asterism` — the
-same boundary Homebrew gets, for the same reason.
+`sudo apt-get install --only-upgrade asterism` or `sudo dnf upgrade asterism` — the
+same boundary Homebrew gets, for the same reason. `ast` refuses before it
+starts the updater at all: `asterism_core::package` asks `dpkg-query -S` and
+then `rpm -qf` who owns the running binary, so the distribution command
+arrives on the CLI's ordinary `fix:` line. That same answer is what `ast
+doctor` reports on its `receipt` row — `installed by package asterism 0.0.2-1
+(dpkg)` rather than the "this tree was not installed by install.sh" a
+packaged install used to be told.
+
+### The two Linux gates
+
+`scripts/e2e-linux-package.sh` installs the `.deb` on a clean container and
+runs the whole lifecycle to removal. A container has no init, so it cannot
+answer the question that follows: does any of this come back after the
+machine reboots? `scripts/e2e-linux-reboot.sh` is that gate, in two phases —
+`prepare` installs the package, enables lingering, installs the user unit and
+starts an instance with `--restart always` and a published port; the harness
+reboots the machine; `verify` asserts that `astd` is back inside
+`astd.service`'s cgroup with nobody logged in, that the instance is running
+again, that `ast status` attributes it to `restart=always resurrection`, and
+that the published port answers on the same host port. It needs a machine
+that can boot — a host, a VM, or a systemd container the harness restarts —
+and refuses to run where `/run/systemd/system` is absent.
 
 ### Where this runs
 
