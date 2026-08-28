@@ -967,6 +967,40 @@ pub enum Request {
         name: String,
         epoch: u64,
     },
+
+    // ---- the channel between an agent and its owner --------------------------
+    //
+    // Leverage, not restriction. An agent inside the box gets tools it can
+    // run for itself — `ast snapshot`, `ast cost`, `ast notify`, `ast ask` —
+    // and the person who owns it gets a channel rather than an approval gate.
+    // Nothing here can refuse anything the agent was going to do anyway.
+    /// Type one line into an instance's agent session, as if somebody had.
+    ///
+    /// Routed by bare name like every other instance command, so it reaches
+    /// the agent wherever in the orbit it is running.
+    Tell {
+        name: String,
+        /// One line. It is typed literally and followed by Enter.
+        message: String,
+    },
+    /// Everything the agents on this device have said or asked.
+    ///
+    /// Device-local on purpose, like `ast cost --all`: the inbox is written
+    /// by the device whose daemon answered the agent, and that is the device
+    /// whose `ast inbox reply` can hand an answer back to a waiting `ast ask`.
+    Inbox {
+        /// Only this instance's entries.
+        #[serde(default)]
+        name: Option<String>,
+        /// Include entries that are already answered or already read.
+        #[serde(default)]
+        all: bool,
+    },
+    /// Answer a waiting `ast ask`.
+    InboxReply {
+        seq: u64,
+        text: String,
+    },
 }
 
 impl Request {
@@ -1025,7 +1059,16 @@ impl Request {
             | Request::DetachSecret { name, .. }
             | Request::BackupExport { name, .. }
             | Request::SshEndpoint { name }
-            | Request::ContainerExec { name, .. } => Some(name),
+            | Request::ContainerExec { name, .. }
+            // Typed at a bare name from anywhere in the orbit, and delivered
+            // on whichever device is actually running the agent.
+            | Request::Tell { name, .. } => Some(name),
+
+            // The inbox is written by the device whose daemon answered the
+            // agent, and only that device can hand an answer back to an `ast
+            // ask` that is still waiting on it. Device-local, like
+            // `ast cost --all`, and for the same reason.
+            Request::Inbox { .. } | Request::InboxReply { .. } => None,
 
             // Named: routed to the device whose door wrote the ledger.
             // Unnamed (`ast cost --all`): a question about this device.
@@ -1155,6 +1198,7 @@ impl Request {
             // envelope cannot be spoken at an earlier protocol than it.
             Request::Proxy { inner, .. } => inner.since(),
             Request::Compat => 2,
+            Request::Tell { .. } | Request::Inbox { .. } | Request::InboxReply { .. } => 20,
             Request::RewindTimeline { .. }
             | Request::Rewind { .. }
             | Request::RewindSettings { .. } => 15,
@@ -1216,6 +1260,9 @@ impl Request {
             // routing envelope, in a compatibility refusal.
             Request::Proxy { inner, .. } => inner.versioned_name(),
             Request::Compat => Some("compat"),
+            Request::Tell { .. } => Some("tell"),
+            Request::Inbox { .. } => Some("inbox"),
+            Request::InboxReply { .. } => Some("inbox_reply"),
             Request::Cost { .. } => Some("cost"),
             Request::BackupExport { .. } => Some("backup_export"),
             Request::BackupImport { .. } => Some("backup_import"),
@@ -1714,6 +1761,24 @@ pub enum Response {
         needs_base: bool,
     },
 
+    /// Reply to [`Request::Tell`]: the line landed in the agent's session.
+    Told {
+        name: String,
+    },
+    /// Reply to [`Request::Inbox`].
+    Inbox {
+        entries: Vec<crate::inbox::Entry>,
+    },
+    /// Reply to [`Request::InboxReply`]: the answer reached a waiting agent.
+    Replied {
+        /// Whose question it was, so the CLI can say it by name.
+        name: String,
+        /// False when the agent had already given up waiting. The answer is
+        /// still written down — it is what the person said — but nothing was
+        /// unblocked by it, and saying so is the honest line.
+        delivered: bool,
+    },
+
     Error {
         message: String,
     },
@@ -1786,6 +1851,7 @@ impl Response {
             Response::OpenPort { .. } => 16,
             Response::Forked { .. } | Response::ForkDiff { .. } | Response::Picked { .. } => 18,
             Response::Resolved { .. } => 19,
+            Response::Told { .. } | Response::Inbox { .. } | Response::Replied { .. } => 20,
             Response::Instance { instance, .. } if instance.runtime == RuntimeKind::Container => 8,
             Response::Instances { instances }
                 if instances
@@ -1830,6 +1896,30 @@ impl Response {
 pub fn versioned_frames() -> std::collections::BTreeMap<String, u32> {
     [
         ("compat", Request::Compat.since()),
+        (
+            "tell",
+            Request::Tell {
+                name: String::new(),
+                message: String::new(),
+            }
+            .since(),
+        ),
+        (
+            "inbox",
+            Request::Inbox {
+                name: None,
+                all: false,
+            }
+            .since(),
+        ),
+        (
+            "inbox_reply",
+            Request::InboxReply {
+                seq: 0,
+                text: String::new(),
+            }
+            .since(),
+        ),
         (
             "cost",
             Request::Cost {

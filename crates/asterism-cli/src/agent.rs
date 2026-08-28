@@ -47,6 +47,14 @@ use crate::{send, ssh_banner_up, Conversation};
 /// How long the guest gets to come up far enough to answer guest control.
 const READY_TIMEOUT: Duration = Duration::from_secs(240);
 
+/// What to tell an agent about the machine it woke up on.
+///
+/// Compiled in rather than read from disk at run time: a `--agent` create
+/// works from a release tarball on a machine with no source tree, and an
+/// instruction file that is sometimes missing is worse than one that is
+/// sometimes out of date.
+const AGENT_SNIPPET: &str = include_str!("../../../presets/AGENT-SNIPPET.md");
+
 /// Where an agent's workspace lives on this device.
 ///
 /// Under the Asterism home rather than under the instance's own directory, so
@@ -213,6 +221,11 @@ pub(crate) fn create(
         .collect::<Vec<_>>()
         .join("\n");
     guest_write(name, &format!("{state}/authorized_keys"), &public_key)?;
+    // What `ast` in here is for, in the box, in words the agent reads. Written
+    // rather than baked into the image so that upgrading Asterism upgrades the
+    // instructions, and put beside the start script rather than into the
+    // repository because the repository belongs to whoever cloned it.
+    guest_write(name, &format!("{state}/AGENT-SNIPPET.md"), AGENT_SNIPPET)?;
     guest_write(name, &format!("{state}/agent.vars"), &vars)?;
     guest_write(name, &format!("{state}/start.sh"), &record.start_script())?;
     guest(
@@ -392,6 +405,7 @@ pub(crate) fn logs(name: &str, follow: bool, lines: u32) -> Result<()> {
     .trim()
     .parse::<u64>()
     .unwrap_or(0);
+    let mut inbox = InboxTail::from_here(name);
     loop {
         std::thread::sleep(Duration::from_millis(500));
         let more = guest(
@@ -405,6 +419,58 @@ pub(crate) fn logs(name: &str, follow: bool, lines: u32) -> Result<()> {
             std::io::stdout().flush()?;
             offset += more.len() as u64;
         }
+        // The agent's own output and the things it says to you, on one
+        // screen. A person watching an agent work is exactly the person who
+        // should not have to poll a second command to find out that it has
+        // been waiting twenty minutes for an answer.
+        inbox.drain(name)?;
+    }
+}
+
+/// The part of `ast logs <name> -f` that is not the agent's pane.
+///
+/// `ast notify` and `ast ask` land in this device's inbox file. Following a
+/// log means "tell me what is happening", and one of the things that happens
+/// is that the agent asks you something.
+struct InboxTail {
+    seen: u64,
+}
+
+impl InboxTail {
+    /// Start from now. Everything already in the inbox was there before this
+    /// command was typed, and `ast inbox` is where you read that.
+    fn from_here(name: &str) -> Self {
+        Self {
+            seen: Self::entries(name)
+                .last()
+                .map(|entry| entry.seq)
+                .unwrap_or(0),
+        }
+    }
+
+    fn entries(name: &str) -> Vec<asterism_core::inbox::Entry> {
+        let path = asterism_core::paths::home_dir().join("inbox.jsonl");
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        let mut entries = asterism_core::inbox::fold(&text);
+        entries.retain(|entry| entry.instance == name);
+        entries
+    }
+
+    fn drain(&mut self, name: &str) -> Result<()> {
+        let mut out = std::io::stdout();
+        for entry in Self::entries(name) {
+            if entry.seq <= self.seen {
+                continue;
+            }
+            self.seen = entry.seq;
+            // A bell, because this is the one thing on this stream that is
+            // addressed to the person rather than describing the machine.
+            writeln!(out, "\x07{}", asterism_core::inbox::stream_line(&entry))?;
+        }
+        out.flush()?;
+        Ok(())
     }
 }
 

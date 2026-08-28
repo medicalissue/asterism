@@ -84,7 +84,13 @@ use serde::{Deserialize, Serialize};
 pub const PORT: u32 = 1023;
 
 /// Protocol versions this build of the helper can speak, newest last.
-pub const VERSIONS: &[u32] = &[1, 2];
+///
+/// * **1** — status, ping, sync, stop.
+/// * **2** — bounded `exec` of one argv.
+/// * **3** — the agent's own channel out: the host arms the guest with a
+///   per-instance token, long-polls for `ast` calls the agent made inside the
+///   box, and hands the answers back. See [`Session::agent_arm`].
+pub const VERSIONS: &[u32] = &[1, 2, 3];
 
 /// TCP port used by the static agent injected into direct-kernel OCI guests.
 ///
@@ -199,6 +205,9 @@ impl Artifact {
              $BB chmod 0600 /etc/asterism/agent.key\n\
              printf '%s' '{}' | $BB base64 -d > /.asterism/guest\n\
              $BB chmod 0755 /.asterism/guest\n\
+             $BB mkdir -p /usr/local/bin\n\
+             $BB ln -sf /.asterism/guest '{ast}'\n\
+             $BB rm -f '{socket}'\n\
              $BB rm -f '{ready}'\n\
              /.asterism/guest >>/var/log/asterism-guest.log 2>&1 &\n\
              guest_control_pid=$!\n\
@@ -218,6 +227,8 @@ impl Artifact {
              fi\n",
             key.hex(),
             BASE64.encode(&self.bytes),
+            ast = GUEST_AST_PATH,
+            socket = AGENT_CLI_SOCKET,
             ready = OCI_ADMITTED_PATH,
         )
     }
@@ -240,6 +251,23 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024;
 /// Where the guest keeps its copy of the key. Root-only, written by the
 /// seed's `bootcmd` on every boot.
 pub const GUEST_KEY_PATH: &str = "/etc/asterism/agent.key";
+
+/// Where `ast` is on the guest's own PATH.
+///
+/// A symlink to the guest agent rather than a second binary: invoked under
+/// this name the agent is the small client that hands one `ast` command to
+/// the host and prints the answer. Nothing about the guest image carries it —
+/// the link is made at boot beside the agent itself, so an agent image stays
+/// a plain OCI image that anyone can `docker run`.
+pub const GUEST_AST_PATH: &str = "/usr/local/bin/ast";
+
+/// The guest-local socket that `ast` inside the box connects to.
+///
+/// Root-owned but world-connectable on purpose: everything in the box is the
+/// agent, and the point of the feature is that the agent can reach it. It
+/// grants nothing an instance did not already have — every call is executed
+/// by the daemon against the one instance the host armed this guest for.
+pub const AGENT_CLI_SOCKET: &str = "/run/asterism-ast.sock";
 
 /// Where the guest's agent is installed.
 pub const GUEST_AGENT_PATH: &str = "/usr/local/sbin/asterism-guest";
@@ -414,6 +442,19 @@ pub struct Request {
     /// Guest-side lifecycle deadline for protocol-v2 `exec`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// Protocol-v3 `agent_arm`: the per-instance token the guest agent is to
+    /// stamp on every `ast` call it forwards from inside the box.
+    ///
+    /// It travels only on this already-authenticated channel and the guest
+    /// agent keeps it in memory. Nothing in the guest writes it down, so it
+    /// is in no disk, no snapshot and no bug report — and the agent in the
+    /// box cannot read it, which is the point: the token says *which
+    /// instance is calling*, and an instance does not get to choose that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// Protocol-v3 `agent_reply`: what the host made of one forwarded call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_reply: Option<AgentReply>,
 }
 
 /// One answer.
@@ -433,6 +474,65 @@ pub struct Answer {
     /// bytes stay valid JSON without becoming arrays four times their size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exec: Option<ExecWireResult>,
+    /// Protocol-v3 `agent_next`: one `ast` call the agent made inside the
+    /// box, or absent when it made none before the poll expired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentCall>,
+}
+
+/// One `ast …` an agent typed inside the box, on its way out to the daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct AgentCall {
+    /// Unique within this guest's boot; the answer carries it back.
+    pub id: u64,
+    /// The token the host armed this guest with. The daemon uses it to decide
+    /// which instance the call is about, and it will not accept the
+    /// instance's own opinion on that.
+    pub token: String,
+    /// The words after `ast`, exactly as typed.
+    pub argv: Vec<String>,
+}
+
+/// What the host made of one forwarded call: what to print, and what to exit.
+///
+/// More than one of these may answer a single call. `status: None` is an
+/// interim write — print it and keep waiting — which is what lets `ast ask`
+/// say *waiting for a reply…* the moment the question has been delivered and
+/// then print the answer whenever it arrives, minutes or hours later. The
+/// first reply carrying a status ends the call.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct AgentReply {
+    pub id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<i32>,
+    #[serde(default)]
+    pub stdout_b64: String,
+    #[serde(default)]
+    pub stderr_b64: String,
+}
+
+impl AgentReply {
+    /// Print this and stop.
+    pub fn done(id: u64, status: i32, stdout: &str, stderr: &str) -> Self {
+        use data_encoding::BASE64;
+        Self {
+            id,
+            status: Some(status),
+            stdout_b64: BASE64.encode(stdout.as_bytes()),
+            stderr_b64: BASE64.encode(stderr.as_bytes()),
+        }
+    }
+
+    /// Print this and keep waiting.
+    pub fn interim(id: u64, stdout: &str) -> Self {
+        use data_encoding::BASE64;
+        Self {
+            id,
+            status: None,
+            stdout_b64: BASE64.encode(stdout.as_bytes()),
+            stderr_b64: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -697,6 +797,61 @@ impl<R: BufRead, W: Write> Session<R, W> {
         })
     }
 
+    /// Hand the guest agent the token it is to stamp on every `ast` call the
+    /// agent inside the box makes, and have it start listening for them.
+    ///
+    /// Idempotent and re-armable: a fresh token replaces the one before it,
+    /// which is how a rewind or a fork revokes the old one without anything
+    /// in the guest having to be told.
+    pub fn agent_arm(&mut self, token: &str) -> Result<()> {
+        self.require_agent_channel("agent_arm")?;
+        self.send(
+            "agent_arm",
+            None,
+            Vec::new(),
+            None,
+            Some(token.to_owned()),
+            None,
+        )
+        .map(|_| ())
+    }
+
+    /// Wait up to `wait` for the agent in the box to run one `ast` command.
+    ///
+    /// A long poll rather than a callback because the control channel is, and
+    /// stays, host-initiated: the guest never dials the host. `Ok(None)` is
+    /// the ordinary answer — it means the agent was busy doing its job.
+    pub fn agent_next(&mut self, wait: Duration) -> Result<Option<AgentCall>> {
+        self.require_agent_channel("agent_next")?;
+        let answer = self.send(
+            "agent_next",
+            Some(wait.as_millis().min(u128::from(u64::MAX)) as u64),
+            Vec::new(),
+            None,
+            None,
+            None,
+        )?;
+        Ok(answer.agent)
+    }
+
+    /// Complete one forwarded call. The `ast` waiting inside the box prints
+    /// this and exits with this status.
+    pub fn agent_reply(&mut self, reply: AgentReply) -> Result<()> {
+        self.require_agent_channel("agent_reply")?;
+        self.send("agent_reply", None, Vec::new(), None, None, Some(reply))
+            .map(|_| ())
+    }
+
+    fn require_agent_channel(&self, op: &str) -> Result<()> {
+        if self.version < 3 {
+            bail!(
+                "the guest agent speaks protocol {}, which has no {op} operation",
+                self.version
+            );
+        }
+        Ok(())
+    }
+
     fn call(&mut self, op: &str) -> Result<Answer> {
         self.request(op, None)
     }
@@ -712,6 +867,19 @@ impl<R: BufRead, W: Write> Session<R, W> {
         argv: Vec<String>,
         timeout_ms: Option<u64>,
     ) -> Result<Answer> {
+        self.send(op, wait_ms, argv, timeout_ms, None, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send(
+        &mut self,
+        op: &str,
+        wait_ms: Option<u64>,
+        argv: Vec<String>,
+        timeout_ms: Option<u64>,
+        token: Option<String>,
+        agent_reply: Option<AgentReply>,
+    ) -> Result<Answer> {
         let id = self.next_id;
         self.next_id += 1;
         write_line(
@@ -722,6 +890,8 @@ impl<R: BufRead, W: Write> Session<R, W> {
                 wait_ms,
                 argv,
                 timeout_ms,
+                token: token.clone(),
+                agent_reply: agent_reply.clone(),
             },
         )?;
         let answer: Answer = read_line(&mut self.reader)
@@ -1522,6 +1692,8 @@ mod tests {
                 wait_ms: None,
                 argv: Vec::new(),
                 timeout_ms: None,
+                token: None,
+                agent_reply: None,
             })
             .unwrap(),
             r#"{"id":7,"op":"status"}"#
@@ -1533,6 +1705,8 @@ mod tests {
                 wait_ms: Some(500),
                 argv: Vec::new(),
                 timeout_ms: None,
+                token: None,
+                agent_reply: None,
             })
             .unwrap(),
             r#"{"id":8,"op":"status","wait_ms":500}"#
@@ -1578,7 +1752,12 @@ mod tests {
     #[test]
     fn version_negotiation_takes_the_newest_in_common_and_refuses_none() {
         assert_eq!(pick_version(&[1]), Some(1));
-        assert_eq!(pick_version(&[1, 2, 3]), Some(2), "what we can both speak");
+        assert_eq!(
+            pick_version(&[1, 2, 3, 4]),
+            Some(3),
+            "what we can both speak"
+        );
+        assert_eq!(pick_version(&[1, 2]), Some(2), "a guest a release behind");
         assert_eq!(pick_version(&[]), None);
         assert_eq!(pick_version(&[7, 9]), None, "a guest from another release");
     }

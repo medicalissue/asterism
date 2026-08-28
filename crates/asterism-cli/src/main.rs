@@ -225,6 +225,41 @@ enum Command {
         #[arg(long)]
         local: bool,
     },
+    /// Say one line to a running agent, as if you had typed it.
+    ///
+    /// The line goes into the instance's agent session and Enter follows it,
+    /// so the agent reads it the way it reads anything else you type. It is
+    /// how you steer one from a phone, from another machine, or from a
+    /// script — without attaching to it and without stopping it.
+    ///
+    ///   ast tell bot "run the test suite and fix what fails"
+    Tell {
+        /// The instance, by bare name, wherever in the orbit it runs.
+        name: String,
+        /// One line.
+        message: String,
+    },
+    /// What the agents on this device have said, and what they are waiting on.
+    ///
+    /// An agent inside the box says things with `ast notify` and asks with
+    /// `ast ask`. This is the other end of both.
+    ///
+    ///   ast inbox                        what they said, oldest first
+    ///
+    ///   ast inbox reply 1 A               answer the one numbered 1
+    Inbox {
+        #[command(subcommand)]
+        command: Option<InboxCommand>,
+        /// Only this instance's messages.
+        #[arg(long, value_name = "NAME")]
+        instance: Option<String>,
+        /// Everything, including what has already been answered.
+        #[arg(long)]
+        all: bool,
+        /// One JSON object per message, on its own line.
+        #[arg(long)]
+        json: bool,
+    },
     /// What an instance has spent on model APIs.
     ///
     /// Every call an agent makes through a bound secret already passes
@@ -901,6 +936,18 @@ enum Command {
     Doctor,
 }
 
+/// The one thing you do to an inbox besides read it.
+#[derive(Subcommand)]
+enum InboxCommand {
+    /// Answer a question an agent is waiting on.
+    Reply {
+        /// The number in the left-hand column.
+        seq: u64,
+        /// What to tell it. One line.
+        text: String,
+    },
+}
+
 /// `ast snapshot ...` — taking one, and deleting one.
 ///
 /// Taking is the bare form (`ast snapshot dev nightly`), which is what
@@ -1499,6 +1546,17 @@ fn run() -> Result<()> {
             since,
             json,
         } => return print_cost(name, all, today, week, since.as_deref(), json),
+        Command::Tell { name, message } => Request::Tell { name, message },
+        Command::Inbox {
+            command: Some(InboxCommand::Reply { seq, text }),
+            ..
+        } => Request::InboxReply { seq, text },
+        Command::Inbox {
+            instance,
+            all,
+            json,
+            ..
+        } => return print_inbox(instance, all, json),
         Command::Status { name } => Request::Status { name },
         // One flag, two parts. `--volume desktop:tank` names a block volume
         // on a device; anything that looks like a path is a directory share.
@@ -2015,6 +2073,20 @@ fn run() -> Result<()> {
                 print_cost_line(report, &report.window, true);
             }
         }
+        Response::Told { name } => {
+            println!("sent to {name} — follow with: ast logs {name} -f")
+        }
+        Response::Replied { name, delivered } => {
+            if delivered {
+                println!("replied to {name}");
+            } else {
+                // Said rather than hidden: the answer is written down either
+                // way, but "it is in the log" and "the agent acted on it" are
+                // different facts and only one of them is what you wanted.
+                println!("replied to {name} — it had already stopped waiting, so it read on without it");
+            }
+        }
+        Response::Inbox { entries } => print_inbox_entries(&entries, false)?,
         Response::VolumeCatalog { catalog } => print_volume_catalog(&catalog),
         Response::Orbit { rows } => print_table(&rows),
         // One device's shard, asked for by `--local` or by `--on` on a
@@ -6111,42 +6183,41 @@ fn print_cost_all(reports: &[asterism_core::ledger::Report], window: &Window) ->
 }
 
 /// One window's line: the money, and — for the leading line — what bought it.
-fn print_cost_line(report: &asterism_core::ledger::Report, label: &str, detail: bool) {
-    if !detail {
-        println!("{label:<10} {}", money(report.usd));
-        return;
-    }
-    if report.calls == 0 {
-        println!("{label:<10} {}   no calls", money(report.usd));
-        return;
-    }
-    let mut parts = vec![format!(
-        "{} in · {} out",
-        count(report.input_tokens),
-        count(report.output_tokens)
-    )];
-    let cached = report.cache_read_tokens + report.cache_write_tokens;
-    if cached > 0 {
-        parts.push(format!("cache {}", count(cached)));
-    }
-    // The busiest model, named. A list of eight would be a different command;
-    // what somebody wants on this line is which model this is.
-    let models = match report.models.first() {
-        Some(top) if report.models.len() == 1 => format!("{} ({})", top.model, calls(top.calls)),
-        Some(top) => format!(
-            "{} ({}) +{} more",
-            top.model,
-            calls(top.calls),
-            report.models.len() - 1
-        ),
-        None => calls(report.calls),
+/// `ast inbox` — what this device's agents have said.
+fn print_inbox(instance: Option<String>, all: bool, json: bool) -> Result<()> {
+    let entries = match send(&Request::Inbox {
+        name: instance,
+        all,
+    })? {
+        Response::Inbox { entries } => entries,
+        Response::Error { message } => bail!("{message}"),
+        other => bail!("astd answered an inbox request with {other:?}"),
     };
+    print_inbox_entries(&entries, json)
+}
+
+fn print_inbox_entries(entries: &[asterism_core::inbox::Entry], json: bool) -> Result<()> {
+    if json {
+        for entry in entries {
+            println!("{}", serde_json::to_string(entry)?);
+        }
+        return Ok(());
+    }
+    let now = now_unix();
     println!(
-        "{label:<10} {}   {}   {}",
-        money(report.usd),
-        parts.join(" · "),
-        models
+        "{}",
+        asterism_core::inbox::render(entries, asterism_core::rewind::local_offset(now))
     );
+    Ok(())
+}
+
+fn print_cost_line(report: &asterism_core::ledger::Report, label: &str, detail: bool) {
+    // The line itself is `asterism_core::ledger::line`, because `ast cost`
+    // typed inside an agent's own box prints the same one, and two spellings
+    // of it would eventually be two numbers.
+    let mut report = report.clone();
+    label.clone_into(&mut report.window);
+    println!("{}", asterism_core::ledger::line(&report, detail));
 }
 
 /// What the figure does *not* cover, said once and only when it is true.
@@ -6238,35 +6309,7 @@ fn parse_duration(spec: &str) -> Result<u64> {
         .context("--since is longer than this program can count")
 }
 
-/// A dollar figure, or a dash when this device cannot price what it saw.
-///
-/// Two decimal places always: a column of `$4.1` and `$19.8` is harder to
-/// read down than one of `$4.12` and `$19.80`, and cents is the unit people
-/// hold these numbers in.
-fn money(usd: Option<f64>) -> String {
-    match usd {
-        Some(amount) => format!("${amount:.2}"),
-        None => "-".into(),
-    }
-}
-
-/// "1 call", "312 calls". A count in a sentence, not in a column.
-fn calls(count: u64) -> String {
-    match count {
-        1 => "1 call".into(),
-        other => format!("{other} calls"),
-    }
-}
-
-/// A token count at the precision anybody reads it at.
-fn count(tokens: u64) -> String {
-    match tokens {
-        0 => "0".into(),
-        1..=9_999 => tokens.to_string(),
-        10_000..=999_999 => format!("{}k", tokens / 1_000),
-        _ => format!("{:.2}M", tokens as f64 / 1_000_000.0),
-    }
-}
+use asterism_core::ledger::{calls, money};
 
 /// Today's spend per instance, for the TODAY column of `ast ls`.
 ///
@@ -7160,6 +7203,52 @@ mod tests {
 
     fn parse_cli(args: &[&str]) -> Cli {
         Cli::try_parse_from(std::iter::once("ast").chain(args.iter().copied())).unwrap()
+    }
+
+    #[test]
+    fn tell_takes_a_bare_name_and_one_line() {
+        let Command::Tell { name, message } =
+            parse_cli(&["tell", "bot", "run the test suite and fix what fails"]).command
+        else {
+            panic!("not a tell");
+        };
+        assert_eq!(name, "bot");
+        assert_eq!(message, "run the test suite and fix what fails");
+        // Two words where one line goes is a quoting mistake, and clap is
+        // where it should be caught rather than in the guest.
+        assert!(Cli::try_parse_from(["ast", "tell", "bot", "run", "the", "tests"]).is_err());
+        assert!(Cli::try_parse_from(["ast", "tell", "bot"]).is_err());
+    }
+
+    #[test]
+    fn the_inbox_reads_by_default_and_replies_when_told_to() {
+        let Command::Inbox {
+            command,
+            instance,
+            all,
+            json,
+        } = parse_cli(&["inbox"]).command
+        else {
+            panic!("not an inbox");
+        };
+        assert!(command.is_none() && instance.is_none() && !all && !json);
+
+        let Command::Inbox {
+            command: Some(InboxCommand::Reply { seq, text }),
+            ..
+        } = parse_cli(&["inbox", "reply", "1", "A"]).command
+        else {
+            panic!("not a reply");
+        };
+        assert_eq!((seq, text.as_str()), (1, "A"));
+
+        let Command::Inbox { instance, all, .. } =
+            parse_cli(&["inbox", "--instance", "bot", "--all"]).command
+        else {
+            panic!("not an inbox");
+        };
+        assert_eq!(instance.as_deref(), Some("bot"));
+        assert!(all);
     }
 
     #[test]
